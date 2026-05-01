@@ -1221,6 +1221,8 @@ class ResponseGenerator:
                 prompt_progress_callback=progress,
                 prefill_step_size=self.cli_args.prefill_step_size,
                 mtp=getattr(self.cli_args, "mtp", False),
+                turbo_kv_bits=self.cli_args.turbo_kv_bits,
+                turbo_fp16_layers=self.cli_args.turbo_fp16_layers,
             ):
                 finish_reason = gen.finish_reason
                 sm_state, match_sequence, current_state = sm.match(sm_state, gen.token)

@@ -737,7 +737,8 @@ def mtp_generate_step(
         mtp_cache = prompt_cache[n_main:] or model.make_mtp_cache()
         if turbo_kv_bits is not None and mtp_cache:
             from mlx_lm.models.turboquant_cache import TurboQuantKVCache
-            mtp_cache = [TurboQuantKVCache(bits=turbo_kv_bits) if isinstance(c, cache.KVCache) else c for c in mtp_cache]
+            # Force convert all caches to TurboQuantKVCache for MTP layers
+            mtp_cache = [TurboQuantKVCache(bits=turbo_kv_bits) for _ in mtp_cache]
 
     # Exact-match acceptance for greedy (sampler=None); probabilistic
     # acceptance min(1, p_target/p_draft) for stochastic samplers.
@@ -845,6 +846,8 @@ def mtp_generate_step(
             main_tok, main_lp = toks[0], lps[0]
             ntoks += 1
             yield main_tok.item(), main_lp, False
+            cache.trim_prompt_cache(model_cache, 1)
+            mx.clear_cache()
             if ntoks >= max_tokens:
                 return
             hidden_at_main = hidden[:, -1:, :]
@@ -879,6 +882,9 @@ def mtp_generate_step(
                 _clear_rollback()
                 ntoks += 1
                 yield draft_tok_id, draft_lp, True
+                cache.trim_prompt_cache(mtp_cache, 1)
+                cache.trim_prompt_cache(model_cache, 1)
+                mx.clear_cache()
                 if ntoks >= max_tokens:
                     return
                 ntoks += 1
