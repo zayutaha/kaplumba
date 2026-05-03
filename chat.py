@@ -201,7 +201,7 @@ class ChatUI(App):
 
      .bubble-assistant {
          margin-bottom: 1;
-         padding: 0 2;
+         padding: 1 2 0 2;
          color: #f0a500;
      }
 
