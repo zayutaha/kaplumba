@@ -400,13 +400,6 @@ class ChatUI(App):
         buf = ""
         last_update = 0
         chat = self.query_one("#chat", VerticalScroll)
-        in_thinking = False
-
-        def is_thinking(buffer):
-            """Check if we're currently inside a thinking block."""
-            start_count = buffer.count("<think>")
-            end_count = buffer.count("</think>")
-            return start_count > end_count
 
         def get_display_text(buffer):
             """Extract display text (after thinking blocks)."""
@@ -416,25 +409,13 @@ class ChatUI(App):
             if last_end >= 0:
                 # Return text after the last </think> tag
                 return buffer[last_end + len("</think>"):].strip()
-            elif "<think>" in buffer:
-                # We're inside a thinking block, no display text yet
-                return ""
             
-            # No thinking tags, return buffer as-is
-            return buffer.strip()
+            # No thinking end tag found yet
+            return ""
 
         # Spinner state
-        spinner_task = None
         spinner_index = 0
         spinner_frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
-
-        async def update_spinner():
-            """Animate spinner in markdown widget."""
-            nonlocal spinner_index
-            while in_thinking:
-                spinner_index = (spinner_index + 1) % len(spinner_frames)
-                await self.current_md.update(f"Thinking... {spinner_frames[spinner_index]}")
-                await asyncio.sleep(0.1)
 
         while True:
             chunk = await self.proc.stdout.read(256)
@@ -445,47 +426,27 @@ class ChatUI(App):
             if buf.endswith(">> "):
                 break
 
-            # Check thinking state
-            currently_thinking = is_thinking(buf)
-
-            if currently_thinking and not in_thinking:
-                # Thinking just started
-                in_thinking = True
-                # Start spinner animation
-                spinner_task = asyncio.create_task(update_spinner())
-            elif not currently_thinking and in_thinking:
-                # Thinking just ended
-                in_thinking = False
-                if spinner_task:
-                    spinner_task.cancel()
-                    try:
-                        await spinner_task
-                    except asyncio.CancelledError:
-                        pass
-                    spinner_task = None
-
-            # Update display if not thinking
-            if not in_thinking:
-                now = asyncio.get_event_loop().time()
-                if now - last_update > 0.05:
+            now = asyncio.get_event_loop().time()
+            if now - last_update > 0.05:
+                # Check if we're still waiting for </think>
+                if "<think>" in buf and "</think>" not in buf:
+                    # Still thinking - show spinner
+                    spinner_index = (spinner_index + 1) % len(spinner_frames)
+                    await self.current_md.update(f"Thinking... {spinner_frames[spinner_index]}")
+                else:
+                    # Thinking done or not enabled - show response
                     display = strip_prompt_markers(transform_math(get_display_text(buf)))
-                    await self.current_md.update(f"{display} ▌")
-                    chat.scroll_end(animate=False)
-                    last_update = now
+                    if display:
+                        await self.current_md.update(f"{display} ▌")
+                
+                chat.scroll_end(animate=False)
+                last_update = now
 
         # Final update
         display = strip_prompt_markers(transform_math(get_display_text(buf)))
         if self.interrupted:
             display += "\n\n*— stopped*"
             self.interrupted = False
-
-        # Clean up spinner if still active
-        if spinner_task:
-            spinner_task.cancel()
-            try:
-                await spinner_task
-            except asyncio.CancelledError:
-                pass
 
         await self.current_md.update(display)
         chat.scroll_end(animate=False)
