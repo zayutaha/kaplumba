@@ -111,35 +111,8 @@ class ThinkingSpinner(Static):
 
 class ChatInput(TextArea):
     def on_mount(self) -> None:
-        """Set initial height and watch for changes."""
+        """Initialize the input."""
         self.show_line_numbers = False
-        # More frequent checks
-        self.set_interval(0.05, self.check_size)
-
-    def check_size(self):
-        """Check content size and update parent container height."""
-        try:
-            text = self.text
-            
-            if not text:
-                new_height = 1
-            else:
-                # Calculate lines from actual document
-                lines = self.document.line_count
-                # Cap at 5 lines max
-                new_height = min(lines, 5)
-                new_height = max(new_height, 1)  # Min 1 line
-            
-            # Update the parent input-card min_height
-            parent = self.parent
-            if parent and parent.id == "input-card":
-                parent.styles.min_height = new_height
-            
-            # Also set own min_height instead of height
-            self.styles.min_height = new_height
-            
-        except Exception:
-            pass
 
     async def _on_key(self, event: Key) -> None:
         if event.key is None:
@@ -241,8 +214,7 @@ class ChatUI(App):
         width: 88;
         background: #161616;
         border: round #252525;
-        height: auto;
-        max-height: 5;
+        height: 3;
         layout: horizontal;
     }
 
@@ -252,8 +224,6 @@ class ChatUI(App):
         border: none;
         width: 1fr;
         margin: 0 1;
-        min-height: 1;
-        max-height: 5;
     }
 
     #send-btn {
@@ -262,6 +232,7 @@ class ChatUI(App):
         color: #000;
         text-style: bold;
         text-align: center;
+        content-align: center middle;
         height: 100%;
     }
 
