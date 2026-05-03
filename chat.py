@@ -388,7 +388,7 @@ class ChatUI(App):
                 break
         return buf
 
-    async def run_model(self, user_text: str):
+     async def run_model(self, user_text: str):
         # Add extra delay for first message to ensure model is ready
         if self.first_message:
             await asyncio.sleep(2)
@@ -400,6 +400,7 @@ class ChatUI(App):
         buf = ""
         last_update = 0
         chat = self.query_one("#chat", VerticalScroll)
+        thinking_enabled = user_text.startswith("/think")
 
         def get_display_text(buffer):
             """Extract display text (after thinking blocks)."""
@@ -428,22 +429,31 @@ class ChatUI(App):
 
             now = asyncio.get_event_loop().time()
             if now - last_update > 0.05:
-                # Check if we have the closing tag
-                if "</think>" not in buf:
-                    # Still waiting - show spinner
-                    spinner_index = (spinner_index + 1) % len(spinner_frames)
-                    await self.current_md.update(f"Thinking... {spinner_frames[spinner_index]}")
+                if thinking_enabled:
+                    # Check if we have the closing tag
+                    if "</think>" not in buf:
+                        # Still waiting - show spinner
+                        spinner_index = (spinner_index + 1) % len(spinner_frames)
+                        await self.current_md.update(f"Thinking... {spinner_frames[spinner_index]}")
+                    else:
+                        # Got closing tag - show response
+                        display = strip_prompt_markers(transform_math(get_display_text(buf)))
+                        if display:
+                            await self.current_md.update(f"{display} ▌")
                 else:
-                    # Got closing tag - show response
-                    display = strip_prompt_markers(transform_math(get_display_text(buf)))
-                    if display:
-                        await self.current_md.update(f"{display} ▌")
+                    # Not thinking - show response immediately
+                    display = strip_prompt_markers(transform_math(buf))
+                    await self.current_md.update(f"{display} ▌")
                 
                 chat.scroll_end(animate=False)
                 last_update = now
 
         # Final update
-        display = strip_prompt_markers(transform_math(get_display_text(buf)))
+        if thinking_enabled:
+            display = strip_prompt_markers(transform_math(get_display_text(buf)))
+        else:
+            display = strip_prompt_markers(transform_math(buf))
+            
         if self.interrupted:
             display += "\n\n*— stopped*"
             self.interrupted = False
