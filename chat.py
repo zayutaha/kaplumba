@@ -110,6 +110,14 @@ class ThinkingSpinner(Static):
 
 
 class ChatInput(TextArea):
+    def on_mount(self) -> None:
+        """Set initial height when mounted."""
+        self.update_height()
+
+    def watch_text(self, text: str) -> None:
+        """Update height whenever text changes."""
+        self.update_height()
+
     async def _on_key(self, event: Key) -> None:
         if event.key is None:
             return
@@ -133,7 +141,6 @@ class ChatInput(TextArea):
             return
 
         await super()._on_key(event)
-        self.update_height()
 
     def update_height(self):
         """Update input height based on number of lines."""
@@ -228,7 +235,6 @@ class ChatUI(App):
         border: none;
         width: 1fr;
         margin: 0 1;
-        height: 1;
     }
 
     #send-btn {
@@ -237,6 +243,7 @@ class ChatUI(App):
         color: #000;
         text-style: bold;
         text-align: center;
+        height: 100%;
     }
 
      #send-btn.stopping {
