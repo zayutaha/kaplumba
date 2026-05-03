@@ -40,6 +40,7 @@ def chat(
     turbo_kv_bits: Optional[int] = None,
     turbo_fp16_layers: int = 1,
     mtp: bool = False,
+    enable_thinking: bool = False,
     chat_template_kwargs: Optional[dict] = None,
 ) -> str:
     """Generate a chat response from the model.
@@ -63,6 +64,7 @@ def chat(
         turbo_kv_bits (int): TurboQuant KV cache bits. Default: None.
         turbo_fp16_layers (int): Number of FP16 layers for TurboQuant. Default: 1.
         mtp (bool): Use multi-token prediction. Default: False.
+        enable_thinking (bool): Enable thinking mode for supported models. Default: False.
         chat_template_kwargs (dict): Additional kwargs for apply_chat_template. Default: None.
 
     Returns:
@@ -77,6 +79,7 @@ def chat(
             prompt = tokens
     else:
         chat_template_kwargs = chat_template_kwargs or {}
+        chat_template_kwargs["enable_thinking"] = enable_thinking
         prompt = tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
@@ -136,6 +139,7 @@ def stream_chat(
     turbo_kv_bits: Optional[int] = None,
     turbo_fp16_layers: int = 1,
     mtp: bool = False,
+    enable_thinking: bool = False,
     chat_template_kwargs: Optional[dict] = None,
 ) -> Generator[GenerationResponse, None, None]:
     """Stream chat responses from the model.
@@ -157,6 +161,7 @@ def stream_chat(
         turbo_kv_bits (int): TurboQuant KV cache bits. Default: None.
         turbo_fp16_layers (int): Number of FP16 layers for TurboQuant. Default: 1.
         mtp (bool): Use multi-token prediction. Default: False.
+        enable_thinking (bool): Enable thinking mode for supported models. Default: False.
         chat_template_kwargs (dict): Additional kwargs for apply_chat_template. Default: None.
 
     Yields:
@@ -171,6 +176,7 @@ def stream_chat(
             prompt = tokens
     else:
         chat_template_kwargs = chat_template_kwargs or {}
+        chat_template_kwargs["enable_thinking"] = enable_thinking
         prompt = tokenizer.apply_chat_template(
             messages,
             add_generation_prompt=True,
@@ -345,6 +351,7 @@ def main():
         rprint("- 'r' to reset the chat")
         rprint("- '/clear' to clear the conversation")
         rprint("- 'h' to display these commands")
+        rprint("- '/think <message>' to enable thinking mode for that message")
 
     rprint(f"[INFO] Starting chat session with {args.model}.")
     print_help()
@@ -398,11 +405,20 @@ def main():
             messages = []
             if args.system_prompt is not None:
                 messages.append({"role": "system", "content": args.system_prompt})
+
+            # Check for /think prefix to enable thinking for this message
+            thinking_kwargs = dict(chat_template_kwargs)
+            if query.startswith("/think"):
+                query = query[6:].lstrip()
+                thinking_kwargs["enable_thinking"] = True
+            else:
+                thinking_kwargs["enable_thinking"] = False
+
             messages.append({"role": "user", "content": query})
             prompt = tokenizer.apply_chat_template(
                 messages,
                 add_generation_prompt=True,
-                **chat_template_kwargs,
+                **thinking_kwargs,
             )
 
         last_response = None

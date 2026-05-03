@@ -213,11 +213,22 @@ class ChatUI(App):
     }
 
      #send-btn.stopping {
-         background: #e05a5a;
-         color: #fff;
+          background: #e05a5a;
+          color: #fff;
+      }
+
+     #brain-btn {
+         width: 3;
+         color: #444;
+         text-align: center;
+         content-align: center middle;
      }
 
-     .bubble-prompt {
+     #brain-btn.active {
+         color: #f0a500;
+     }
+
+      .bubble-prompt {
          margin: 3 0;
          padding: 3;
          width: 100%;
@@ -238,12 +249,14 @@ class ChatUI(App):
         with Center(id="input-center"):
             with Horizontal(id="input-card"):
                 yield ChatInput(id="input")
+                yield Static("🧠", id="brain-btn")
                 yield Static(" SEND ", id="send-btn")
 
     async def on_mount(self):
         self.busy = False
         self.interrupted = False
         self.first_message = True
+        self.thinking_enabled = False
         asyncio.create_task(self.initialize_model())
 
     async def initialize_model(self):
@@ -283,6 +296,11 @@ class ChatUI(App):
         user_text = box.text.strip()
         if not user_text:
             return
+
+        # Prefix with /think if brain toggle is enabled
+        if self.thinking_enabled:
+            user_text = "/think " + user_text
+
         box.clear()
 
         chat = self.query_one("#chat", VerticalScroll)
@@ -302,6 +320,12 @@ class ChatUI(App):
         btn.set_class(busy, "stopping")
 
     async def on_static_click(self, event: Click):
+        if event.widget.id == "brain-btn":
+            self.thinking_enabled = not self.thinking_enabled
+            btn = self.query_one("#brain-btn", Static)
+            btn.set_class(self.thinking_enabled, "active")
+            return
+
         if event.widget.id == "send-btn":
             if self.busy:
                 await self.action_interrupt()
@@ -336,29 +360,78 @@ class ChatUI(App):
 
         buf = ""
         last_update = 0
+        thinking_spinner = None
+        chat = self.query_one("#chat", VerticalScroll)
+        in_thinking = False
+
+        def is_thinking(buffer):
+            """Check if we're currently inside a thinking block."""
+            start_count = buffer.count("<think>")
+            end_count = buffer.count("</think>")
+            return start_count > end_count
+
+        def get_display_text(buffer):
+            """Extract display text (after thinking blocks)."""
+            # Find the last occurrence of </think>
+            last_end = buffer.rfind("</think>")
+            
+            if last_end >= 0:
+                # Return text after the last </think> tag
+                return buffer[last_end + len("</think>"):].strip()
+            elif "<think>" in buffer:
+                # We're inside a thinking block, no display text yet
+                return ""
+            
+            # No thinking tags, return buffer as-is
+            return buffer.strip()
 
         while True:
             chunk = await self.proc.stdout.read(256)
             if not chunk:
                 break
             buf += chunk.decode(errors="ignore")
+
             if buf.endswith(">> "):
                 break
 
-            now = asyncio.get_event_loop().time()
-            if now - last_update > 0.05:
-                display = strip_prompt_markers(transform_math(buf))
-                await self.current_md.update(f"{display} ▌")
-                self.query_one("#chat").scroll_end(animate=False)
-                last_update = now
+            # Check thinking state
+            currently_thinking = is_thinking(buf)
 
-        display = strip_prompt_markers(transform_math(buf))
+            if currently_thinking and not in_thinking:
+                # Thinking just started
+                in_thinking = True
+                thinking_spinner = LoadingSpinner()
+                await chat.mount(thinking_spinner)
+                # Clear the current markdown to hide thinking text
+                await self.current_md.update("")
+            elif not currently_thinking and in_thinking:
+                # Thinking just ended
+                in_thinking = False
+                if thinking_spinner:
+                    await thinking_spinner.remove()
+                    thinking_spinner = None
+
+            # Update display if not thinking
+            if not in_thinking:
+                now = asyncio.get_event_loop().time()
+                if now - last_update > 0.05:
+                    display = strip_prompt_markers(transform_math(get_display_text(buf)))
+                    await self.current_md.update(f"{display} ▌")
+                    chat.scroll_end(animate=False)
+                    last_update = now
+
+        # Final update
+        display = strip_prompt_markers(transform_math(get_display_text(buf)))
         if self.interrupted:
             display += "\n\n*— stopped*"
             self.interrupted = False
 
+        # Clean up spinner if still active
+        if thinking_spinner:
+            await thinking_spinner.remove()
+
         await self.current_md.update(display)
-        self.query_one("#chat").scroll_end(animate=False)
+        chat.scroll_end(animate=False)
         self._set_busy(False)
 
 
