@@ -109,20 +109,6 @@ class ThinkingSpinner(Static):
         self.update(f"Thinking... {self.SPINNERS[self.spinner_index]}")
 
 
-class BrainButton(Static):
-    """Compact brain toggle button that doesn't steal focus."""
-    
-    def __init__(self, **kwargs):
-        super().__init__("🧠", **kwargs)
-        self.can_focus = False
-    
-    @on(Click)
-    def handle_click(self, event: Click) -> None:
-        self.app.thinking_enabled = not self.app.thinking_enabled
-        self.set_class(self.app.thinking_enabled, "active")
-        self.app.query_one("#input", ChatInput).focus()
-
-
 class ChatInput(TextArea):
     async def _on_key(self, event: Key) -> None:
         if event.key is None:
@@ -147,6 +133,14 @@ class ChatInput(TextArea):
             return
 
         await super()._on_key(event)
+        self.update_height()
+
+    def update_height(self):
+        """Update input height based on number of lines."""
+        lines = len(self.text.split("\n"))
+        max_lines = 6
+        new_height = min(lines, max_lines)
+        self.styles.height = max(3, new_height)
 
 
 class ChatUI(App):
@@ -220,11 +214,11 @@ class ChatUI(App):
         display: none;
     }
 
-    #input-card {
+     #input-card {
         width: 88;
         background: #161616;
         border: round #252525;
-        height: 3;
+        height: auto;
         layout: horizontal;
     }
 
@@ -249,38 +243,14 @@ class ChatUI(App):
           color: #fff;
       }
 
-     #brain-btn {
-         width: 3;
-         min-width: 3;
-         padding: 0;
-         border: none;
-         background: transparent;
-         color: #444;
-         text-align: center;
-         content-align: center middle;
-     }
-
-     #brain-btn.active {
-         color: #f0a500;
-     }
-
-     #brain-btn:hover {
-         background: #252525;
-     }
-
-     #brain-btn:focus {
-         background: transparent;
-         border: none;
-     }
-
-      .bubble-prompt {
-         margin: 3 0;
-         padding: 3;
-         width: 100%;
-         color: #f0a500;
-         text-style: bold;
-         height: auto;
-     }
+     .bubble-prompt {
+        margin: 3 0;
+        padding: 3;
+        width: 100%;
+        color: #f0a500;
+        text-style: bold;
+        height: auto;
+    }
      """
 
     def compose(self) -> ComposeResult:
@@ -293,15 +263,13 @@ class ChatUI(App):
 
         with Center(id="input-center"):
             with Horizontal(id="input-card"):
-                yield BrainButton(id="brain-btn", classes="brain-btn")
                 yield ChatInput(id="input")
                 yield Static(" SEND ", id="send-btn")
 
-    async def on_mount(self):
+     async def on_mount(self):
         self.busy = False
         self.interrupted = False
         self.first_message = True
-        self.thinking_enabled = False
         asyncio.create_task(self.initialize_model())
 
     async def initialize_model(self):
@@ -333,7 +301,7 @@ class ChatUI(App):
         
         self.query_one("#input").focus()
 
-    async def action_submit(self):
+     async def action_submit(self):
         if self.busy:
             return
 
@@ -341,10 +309,6 @@ class ChatUI(App):
         user_text = box.text.strip()
         if not user_text:
             return
-
-        # Prefix with /think if brain toggle is enabled
-        if self.thinking_enabled:
-            user_text = "/think " + user_text
 
         box.clear()
 
