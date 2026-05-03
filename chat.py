@@ -14,7 +14,8 @@ import re
 import os
 import random
 from textual.app import App, ComposeResult
-from textual.widgets import Markdown, TextArea, Static
+from textual.widgets import Markdown, TextArea, Static, Button
+from textual import on
 from textual.containers import VerticalScroll, Vertical, Horizontal, Center
 from textual.events import Key, Click
 from pylatexenc.latex2text import LatexNodes2Text
@@ -82,13 +83,27 @@ class LoadingSpinner(Static):
         super().__init__(**kwargs)
         self.spinner_index = 0
         self.update(f"[bold #f0a500]{self.SPINNERS[0]} Loading...")
-
+    
     def on_mount(self):
         self.set_interval(0.1, self.update_spinner)
-
+    
     def update_spinner(self):
         self.spinner_index = (self.spinner_index + 1) % len(self.SPINNERS)
         self.update(f"[bold #f0a500]{self.SPINNERS[self.spinner_index]} Loading...")
+
+
+class BrainButton(Static):
+    """Compact brain toggle button that doesn't steal focus."""
+    
+    def __init__(self, **kwargs):
+        super().__init__("🧠", **kwargs)
+        self.can_focus = False
+    
+    @on(Click)
+    def handle_click(self, event: Click) -> None:
+        self.app.thinking_enabled = not self.app.thinking_enabled
+        self.set_class(self.app.thinking_enabled, "active")
+        self.app.query_one("#input", ChatInput).focus()
 
 
 class ChatInput(TextArea):
@@ -219,6 +234,10 @@ class ChatUI(App):
 
      #brain-btn {
          width: 3;
+         min-width: 3;
+         padding: 0;
+         border: none;
+         background: transparent;
          color: #444;
          text-align: center;
          content-align: center middle;
@@ -226,6 +245,15 @@ class ChatUI(App):
 
      #brain-btn.active {
          color: #f0a500;
+     }
+
+     #brain-btn:hover {
+         background: #252525;
+     }
+
+     #brain-btn:focus {
+         background: transparent;
+         border: none;
      }
 
       .bubble-prompt {
@@ -248,8 +276,8 @@ class ChatUI(App):
 
         with Center(id="input-center"):
             with Horizontal(id="input-card"):
+                yield BrainButton(id="brain-btn", classes="brain-btn")
                 yield ChatInput(id="input")
-                yield Static("🧠", id="brain-btn")
                 yield Static(" SEND ", id="send-btn")
 
     async def on_mount(self):
@@ -320,12 +348,6 @@ class ChatUI(App):
         btn.set_class(busy, "stopping")
 
     async def on_static_click(self, event: Click):
-        if event.widget.id == "brain-btn":
-            self.thinking_enabled = not self.thinking_enabled
-            btn = self.query_one("#brain-btn", Static)
-            btn.set_class(self.thinking_enabled, "active")
-            return
-
         if event.widget.id == "send-btn":
             if self.busy:
                 await self.action_interrupt()
