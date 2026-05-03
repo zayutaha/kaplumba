@@ -428,13 +428,13 @@ class ChatUI(App):
 
             now = asyncio.get_event_loop().time()
             if now - last_update > 0.05:
-                # Check if we're still waiting for </think>
-                if "<think>" in buf and "</think>" not in buf:
-                    # Still thinking - show spinner
+                # Check if we have the closing tag
+                if "</think>" not in buf:
+                    # Still waiting - show spinner
                     spinner_index = (spinner_index + 1) % len(spinner_frames)
                     await self.current_md.update(f"Thinking... {spinner_frames[spinner_index]}")
                 else:
-                    # Thinking done or not enabled - show response
+                    # Got closing tag - show response
                     display = strip_prompt_markers(transform_math(get_display_text(buf)))
                     if display:
                         await self.current_md.update(f"{display} ▌")
