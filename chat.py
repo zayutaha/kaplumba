@@ -112,9 +112,30 @@ class ThinkingSpinner(Static):
 class ChatInput(TextArea):
     def on_mount(self) -> None:
         """Set initial height and watch for changes."""
-        self.update_height()
-        # Check height periodically to catch paste events
-        self.set_interval(0.1, self.update_height)
+        self.show_line_numbers = False
+        # More frequent checks
+        self.set_interval(0.05, self.check_size)
+
+    def check_size(self):
+        """Check content size and update height based on text length."""
+        try:
+            text = self.text
+            
+            if not text:
+                self.styles.height = 1
+                return
+            
+            # Calculate lines from actual document
+            lines = self.document.line_count
+            
+            # Cap at 5 lines max
+            new_height = min(lines, 5)
+            new_height = max(new_height, 1)  # Min 1 line
+            
+            self.styles.height = new_height
+            
+        except Exception as e:
+            pass
 
     async def _on_key(self, event: Key) -> None:
         if event.key is None:
@@ -139,19 +160,6 @@ class ChatInput(TextArea):
             return
 
         await super()._on_key(event)
-        self.call_later(self.update_height)
-
-    def update_height(self):
-        """Update input height based on document line count."""
-        if not self.text:
-            new_height = 1
-        else:
-            # Get actual line count from document
-            line_count = self.document.line_count
-            max_lines = 5
-            new_height = min(max(1, line_count), max_lines)
-        
-        self.styles.height = new_height
 
 
 class ChatUI(App):
@@ -239,6 +247,7 @@ class ChatUI(App):
         border: none;
         width: 1fr;
         margin: 0 1;
+        overflow: hidden;
     }
 
     #send-btn {
