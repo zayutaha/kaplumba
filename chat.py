@@ -139,16 +139,17 @@ class ChatInput(TextArea):
             return
 
         await super()._on_key(event)
-        self.update_height()
+        self.call_later(self.update_height)
 
     def update_height(self):
-        """Update input height based on number of lines."""
+        """Update input height based on document line count."""
         if not self.text:
             new_height = 1
         else:
-            lines = len(self.text.split("\n"))
+            # Get actual line count from document
+            line_count = self.document.line_count
             max_lines = 5
-            new_height = min(max(1, lines), max_lines)
+            new_height = min(max(1, line_count), max_lines)
         
         self.styles.height = new_height
 
