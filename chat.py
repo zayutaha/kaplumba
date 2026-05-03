@@ -138,9 +138,9 @@ class ChatInput(TextArea):
     def update_height(self):
         """Update input height based on number of lines."""
         lines = len(self.text.split("\n"))
-        max_lines = 6
+        max_lines = 5
         new_height = min(lines, max_lines)
-        self.styles.height = max(3, new_height)
+        self.styles.height = max(1, new_height)
 
 
 class ChatUI(App):
@@ -222,12 +222,13 @@ class ChatUI(App):
         layout: horizontal;
     }
 
-    #input {
+     #input {
         background: #161616;
         color: #e0e0e0;
         border: none;
         width: 1fr;
         margin: 0 1;
+        height: 1;
     }
 
     #send-btn {
