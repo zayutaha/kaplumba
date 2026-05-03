@@ -388,7 +388,7 @@ class ChatUI(App):
                 break
         return buf
 
-     async def run_model(self, user_text: str):
+    async def run_model(self, user_text: str):
         # Add extra delay for first message to ensure model is ready
         if self.first_message:
             await asyncio.sleep(2)
