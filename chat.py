@@ -165,7 +165,10 @@ class ChatInput(TextArea):
 
 
 class ChatUI(App):
-    BINDINGS = [("ctrl+c", "quit", "Quit")]
+    BINDINGS = [
+        ("ctrl+c", "quit", "Quit"),
+        ("ctrl+r", "reload_model", "Reload Model"),
+    ]
     CSS = """
 Screen {
     layout: vertical;
@@ -508,6 +511,25 @@ Screen {
             self.query_one("#crash-reload").press()
             event.prevent_default()
             event.stop()
+
+    async def action_reload_model(self) -> None:
+        """Manually reload model with loading screen and warm-up."""
+        self._set_busy(False)
+        self.crash_dialog_visible = False
+        self.query_one("#crash-dialog-container").display = False
+        # Clear chat history
+        chat = self.query_one("#chat", VerticalScroll)
+        await chat.remove()
+        await self.query_one("#chat-center").mount(VerticalScroll(id="chat"))
+        self.crash_count = 0
+        self._show_loading_ui("Reloading model...")
+        if self.proc and self.proc.returncode is None:
+            try:
+                self.proc.kill()
+                await self.proc.wait()
+            except Exception:
+                pass
+        asyncio.create_task(self.initialize_model())
 
     async def on_button_pressed(self, event: Button.Pressed):
         """Handle crash dialog button presses."""
