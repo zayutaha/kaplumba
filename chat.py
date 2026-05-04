@@ -140,7 +140,7 @@ class ChatInput(TextArea):
             return
 
         # Don't capture keys if crash dialog is visible
-        if self.app.query_one("#crash-dialog-container").display:
+        if self.app.crash_dialog_visible:
             return
 
         if event.key == "enter":
@@ -337,6 +337,7 @@ Screen {
         self.reloading = False
         self.crash_count = 0
         self.max_crashes = 3
+        self.crash_dialog_visible = False
         asyncio.create_task(self.initialize_model())
 
     async def initialize_model(self):
@@ -495,6 +496,7 @@ Screen {
 
         # Show crash dialog for runtime crashes
         self.reloading = True
+        self.crash_dialog_visible = True
         self.query_one("#crash-dialog-container").display = True
         self.query_one("#crash-message").update(f"Model crashed (attempt {self.crash_count}/{self.max_crashes}). Reload or quit?")
         self.query_one("#crash-reload").focus()
@@ -502,7 +504,7 @@ Screen {
     async def on_key(self, event: Key) -> None:
         """Handle key presses globally."""
         # If crash dialog is visible and Enter is pressed, trigger reload
-        if event.key == "enter" and self.query_one("#crash-dialog-container").display:
+        if event.key == "enter" and self.crash_dialog_visible:
             self.query_one("#crash-reload").press()
             event.prevent_default()
             event.stop()
@@ -510,6 +512,7 @@ Screen {
     async def on_button_pressed(self, event: Button.Pressed):
         """Handle crash dialog button presses."""
         if event.button.id == "crash-reload":
+            self.crash_dialog_visible = False
             self.query_one("#crash-dialog-container").display = False
             self._show_loading_ui(f"Reloading model (crash #{self.crash_count})...")
             if self.proc and self.proc.returncode is None:
