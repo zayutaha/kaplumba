@@ -476,7 +476,20 @@ Screen {
             self.exit("Too many crashes, giving up")
             return
 
-        # Show crash dialog
+        # If still initializing (no chat UI yet), auto-reload without dialog
+        if self.query_one("#chat-center").display == False:
+            self.reloading = True
+            self._show_loading_ui(f"Reloading model (crash #{self.crash_count})...")
+            if self.proc and self.proc.returncode is None:
+                try:
+                    self.proc.kill()
+                    await self.proc.wait()
+                except Exception:
+                    pass
+            asyncio.create_task(self.initialize_model())
+            return
+
+        # Show crash dialog for runtime crashes
         self.reloading = True
         self.query_one("#crash-dialog-container").display = True
         self.query_one("#crash-message").update(f"Model crashed (attempt {self.crash_count}/{self.max_crashes}). Reload or quit?")
