@@ -163,167 +163,167 @@ class ChatInput(TextArea):
 class ChatUI(App):
     BINDINGS = [("ctrl+c", "quit", "Quit")]
     CSS = """
-    Screen {
-        layout: vertical;
-        background: #0f0f0f;
-    }
+Screen {
+    layout: vertical;
+    background: #0f0f0f;
+}
 
-    #splash-container {
-        layout: vertical;
-        width: 100%;
-        height: 100%;
-        align: center middle;
-    }
+#splash-container {
+    layout: vertical;
+    width: 100%;
+    height: 100%;
+    align: center middle;
+}
 
-    #splash-logo {
-        text-align: center;
-        color: #f0a500;
-        margin-bottom: 1;
-    }
+#splash-logo {
+    text-align: center;
+    color: #f0a500;
+    margin-bottom: 1;
+}
 
-    #load-spinner {
-        width: 1fr;
-        border: none;
-        text-align: center;
-    }
+#load-spinner {
+    width: 1fr;
+    border: none;
+    text-align: center;
+}
 
-    #chat-center {
-        height: 1fr;
-        width: 100%;
-        align: center top;
-        display: none;
-    }
+#chat-center {
+    height: 1fr;
+    width: 100%;
+    align: center top;
+    display: none;
+}
 
-    #chat {
-        height: 100%;
-        width: 88;
-        padding: 2;
-        layout: vertical;
-        align: center top;
-    }
+#chat {
+    height: 100%;
+    width: 88;
+    padding: 2;
+    layout: vertical;
+    align: center top;
+}
 
-    .bubble-user {
-        margin-top: 1;
-        padding: 1 2;
-        background: #1a1a1a;
-        border: round #282828;
-        color: #d8d8d8;
-    }
+.bubble-user {
+    margin-top: 1;
+    padding: 1 2;
+    background: #1a1a1a;
+    border: round #282828;
+    color: #d8d8d8;
+}
 
-    .bubble-assistant {
-        margin-bottom: 1;
-        padding: 1 2 0 2;
-        color: #f0a500;
-    }
+.bubble-assistant {
+    margin-bottom: 1;
+    padding: 1 2 0 2;
+    color: #f0a500;
+}
 
-    .bubble-welcome {
-        margin-bottom: 1;
-        padding: 0 2;
-        color: #7a7a7a;
-        text-align: center;
-        width: 100%;
-    }
+.bubble-welcome {
+    margin-bottom: 1;
+    padding: 0 2;
+    color: #7a7a7a;
+    text-align: center;
+    width: 100%;
+}
 
-    #input-center {
-        width: 100%;
-        align: center bottom;
-        padding-bottom: 1;
-        display: none;
-    }
+#input-center {
+    width: 100%;
+    align: center bottom;
+    padding-bottom: 1;
+    display: none;
+}
 
-    #input-card {
-        width: 88;
-        background: #161616;
-        border: round #252525;
-        height: auto;
-        layout: horizontal;
-    }
+#input-card {
+    width: 88;
+    background: #161616;
+    border: round #252525;
+    height: auto;
+    layout: horizontal;
+}
 
-    #input {
-        background: #161616;
-        color: #e0e0e0;
-        border: none;
-        width: 1fr;
-        margin: 0 1;
-    }
+#input {
+    background: #161616;
+    color: #e0e0e0;
+    border: none;
+    width: 1fr;
+    margin: 0 1;
+}
 
-    #send-btn {
-        width: 8;
-        background: #f0a500;
-        color: #000;
-        text-style: bold;
-        text-align: center;
-        content-align: center middle;
-        height: 100%;
-    }
+#send-btn {
+    width: 8;
+    background: #f0a500;
+    color: #000;
+    text-style: bold;
+    text-align: center;
+    content-align: center middle;
+    height: 100%;
+}
 
-    #send-btn.stopping {
-        background: #e05a5a;
-        color: #fff;
-    }
+#send-btn.stopping {
+    background: #e05a5a;
+    color: #fff;
+}
 
-    .bubble-prompt {
-        margin: 3 0;
-        padding: 3;
-        width: 100%;
-        color: #f0a500;
-        text-style: bold;
-        height: auto;
-    }
+.bubble-prompt {
+    margin: 3 0;
+    padding: 3;
+    width: 100%;
+    color: #f0a500;
+    text-style: bold;
+    height: auto;
+}
 
-    #crash-dialog-container {
-        layout: vertical;
-        width: 100%;
-        height: 100%;
-        align: center middle;
-        display: none;
-        background: rgba(0, 0, 0, 0.7);
-    }
+#crash-dialog-container {
+    layout: vertical;
+    width: 100%;
+    height: 100%;
+    align: center middle;
+    display: none;
+    background: rgba(0, 0, 0, 0.7);
+}
 
-    #crash-dialog {
-        width: 40;
-        height: auto;
-        background: #1a1a1a;
-        border: round #f0a500;
-        padding: 2;
-        align: center middle;
-    }
+#crash-dialog {
+    width: 40;
+    height: auto;
+    background: #1a1a1a;
+    border: round #f0a500;
+    padding: 2;
+    align: center middle;
+}
 
-    .crash-message {
-        color: #f0a500;
-        text-align: center;
-        margin-bottom: 1;
-    }
+.crash-message {
+    color: #f0a500;
+    text-align: center;
+    margin-bottom: 1;
+}
 
-    .crash-buttons {
-        align: center middle;
-        height: auto;
-    }
+.crash-buttons {
+    align: center middle;
+    height: auto;
+}
 
-    .crash-buttons Button {
-        margin: 0 1;
-    }
+.crash-buttons Button {
+    margin: 0 1;
+}
     """
 
-     def compose(self) -> ComposeResult:
-         with Center(id="splash-container"):
-             yield Static(LOGO, id="splash-logo")
-             yield LoadingSpinner(id="load-spinner")
+    def compose(self) -> ComposeResult:
+        with Center(id="splash-container"):
+            yield Static(LOGO, id="splash-logo")
+            yield LoadingSpinner(id="load-spinner")
 
-         with Vertical(id="chat-center"):
-             yield VerticalScroll(id="chat")
+        with Vertical(id="chat-center"):
+            yield VerticalScroll(id="chat")
 
-         with Center(id="input-center"):
-             with Horizontal(id="input-card"):
-                 yield ChatInput(id="input")
-                 yield Static(" SEND ", id="send-btn")
+        with Center(id="input-center"):
+            with Horizontal(id="input-card"):
+                yield ChatInput(id="input")
+                yield Static(" SEND ", id="send-btn")
 
-         with Middle(id="crash-dialog-container"):
-             with Vertical(id="crash-dialog", classes="crash-dialog"):
-                 yield Static("Model crashed. What do you want to do?", id="crash-message", classes="crash-message")
-                 with Horizontal(classes="crash-buttons"):
-                     yield Button("Reload", id="crash-reload", variant="primary")
-                     yield Button("Quit", id="crash-quit", variant="error")
+        with Middle(id="crash-dialog-container"):
+            with Vertical(id="crash-dialog", classes="crash-dialog"):
+                yield Static("Model crashed. What do you want to do?", id="crash-message", classes="crash-message")
+                with Horizontal(classes="crash-buttons"):
+                    yield Button("Reload", id="crash-reload", variant="primary")
+                    yield Button("Quit", id="crash-quit", variant="error")
 
     async def on_mount(self):
         self.busy = False
