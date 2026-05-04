@@ -17,8 +17,24 @@ from textual.app import App, ComposeResult
 from textual.widgets import Markdown, TextArea, Static, Button
 from textual.containers import VerticalScroll, Vertical, Horizontal, Center, Middle
 from textual.events import Key, Click
-from pylatexenc.latex2text import LatexNodes2Text
-from sympy import sympify, pretty
+from latex_parser import parser as _latex_parser
+class LatexParser:
+    """Simple LaTeX to text converter for terminal output."""
+
+    # Greek letters
+    GREEK = {
+        'alpha': 'α', 'beta': 'β', 'gamma': 'γ', 'delta': 'δ', 'epsilon': 'ε',
+        'zeta': 'ζ', 'eta': 'η', 'theta': 'θ', 'iota': 'ι', 'kappa': 'κ',
+        'lambda': 'λ', 'mu': 'μ', 'nu': 'ν', 'xi': 'ξ', 'omicron': 'ο',
+        'pi': 'π', 'rho': 'ρ', 'sigma': 'σ', 'tau': 'τ', 'upsilon': 'υ',
+        'phi': 'φ', 'chi': 'χ', 'psi': 'ψ', 'omega': 'ω',
+        'Gamma': 'Γ', 'Delta': 'Δ', 'Theta': 'Θ', 'Lambda': 'Λ',
+        'Xi': 'Ξ', 'Pi': 'Π', 'Sigma': 'Σ', 'Upsilon': 'Υ',
+        'Phi': 'Φ', 'Psi': 'Ψ', 'Omega': 'Ω',
+    }
+
+# Global parser instance
+_latex_parser = LatexParser()
 
 SYSTEM_PROMPT = """AI PERSONA AND STYLE GUIDELINES
 
@@ -67,8 +83,6 @@ LOGO = """
 
 WELCOME_MESSAGES = [LOGO]
 
-latex_converter = LatexNodes2Text()
-
 
 def normalize_latex(text: str) -> str:
     text = re.sub(r"\\\((.*?)\\\)", r"$\1$", text, flags=re.DOTALL)
@@ -78,20 +92,10 @@ def normalize_latex(text: str) -> str:
     return text
 
 
-def try_sympy(expr: str) -> str:
-    try:
-        return f"\n```\n{pretty(sympify(expr))}\n```\n"
-    except Exception:
-        try:
-            return latex_converter.latex_to_text(expr)
-        except Exception:
-            return expr
-
-
 def transform_math(text: str) -> str:
     text = normalize_latex(text)
-    text = re.sub(r"\$\$(.*?)\$\$", lambda m: try_sympy(m.group(1).strip()), text, flags=re.DOTALL)
-    text = re.sub(r"\$(.*?)\$", lambda m: try_sympy(m.group(1).strip()), text)
+    text = re.sub(r"\$\$(.*?)\$\$", lambda m: _latex_parser.parse(m.group(1).strip()), text, flags=re.DOTALL)
+    text = re.sub(r"\$(.*?)\$", lambda m: _latex_parser.parse(m.group(1).strip()), text)
     return text
 
 
