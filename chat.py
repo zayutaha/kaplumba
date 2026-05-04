@@ -446,6 +446,14 @@ Screen {
         box.clear()
 
         chat = self.query_one("#chat", VerticalScroll)
+
+        # If /clear command, clear the chat display
+        if user_text == "/clear":
+            await chat.remove()
+            await self.query_one("#chat-center").mount(VerticalScroll(id="chat"))
+            self._set_busy(False)
+            return
+
         await chat.mount(Markdown(user_text, classes="bubble-user"))
 
         self.current_md = Markdown("▌", classes="bubble-assistant")
