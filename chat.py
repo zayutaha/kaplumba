@@ -14,6 +14,7 @@ import re
 import os
 import json
 import random
+import subprocess
 from pathlib import Path
 from textual.app import App, ComposeResult
 from textual.widgets import Markdown, TextArea, Static, Button
@@ -451,6 +452,7 @@ Screen {
         self.crash_dialog_visible = False
         self.selected_model = None
         self.proc = None
+        self.proc_pid = None
         self.query_one("#model-selector-container").display = True
         self.query_one("#model-selector").focus()
 
@@ -483,6 +485,9 @@ Screen {
             stderr=asyncio.subprocess.DEVNULL,
             env=env,
         )
+        
+        # Store PID for later killing
+        self.proc_pid = self.proc.pid
 
         buf = await self._read_until_prompt()
 
@@ -558,28 +563,20 @@ Screen {
         """Handle model selection from the selector screen."""
         self.selected_model = model_name
         self.query_one("#model-selector-container").display = False
-        
-        # Terminate current model process in background (don't block UI)
-        if self.proc and self.proc.returncode is None:
-            async def kill_proc():
-                try:
-                    # Send Ctrl+C to exit cleanly
-                    self.proc.stdin.write(b"\x03")
-                    await self.proc.stdin.drain()
-                    
-                    # Wait a bit for graceful exit
-                    try:
-                        await asyncio.wait_for(self.proc.wait(), timeout=1.0)
-                    except asyncio.TimeoutError:
-                        # Force kill if needed
-                        self.proc.kill()
-                except:
-                    pass
-            
-            # Start killing in background without blocking
-            asyncio.create_task(kill_proc())
-        
         self._show_loading_ui(f"Loading {model_name}...")
+        
+        # Kill old process via pkill in background (don't block UI)
+        if hasattr(self, 'proc_pid') and self.proc_pid:
+            try:
+                subprocess.Popen(["pkill", "-P", str(self.proc_pid)], 
+                               stdout=subprocess.DEVNULL, 
+                               stderr=subprocess.DEVNULL)
+                subprocess.Popen(["kill", "-9", str(self.proc_pid)], 
+                               stdout=subprocess.DEVNULL, 
+                               stderr=subprocess.DEVNULL)
+            except:
+                pass
+        
         asyncio.create_task(self.initialize_model())
 
     async def action_dismiss_model_selector(self):
