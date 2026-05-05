@@ -305,28 +305,59 @@ class PersonalitySelector(Static):
 class SlashCommandMenu(Static):
     """Show matching slash commands inline."""
 
+    def __init__(self, **kwargs):
+        super().__init__(**kwargs)
+        self.matches: list[tuple[str, str]] = []
+        self.selected_index = 0
+
     def update_matches(self, query: str) -> bool:
         normalized = query.strip().lower()
         if not normalized.startswith("/"):
+            self.matches = []
+            self.selected_index = 0
             self.display = False
             return False
 
-        matches = [
-            (command, description)
-            for command, description in SLASH_COMMANDS.items()
-            if command.startswith(normalized)
-        ]
-        if not matches:
+        if normalized == "/":
+            self.matches = list(SLASH_COMMANDS.items())
+        else:
+            self.matches = [
+                (command, description)
+                for command, description in SLASH_COMMANDS.items()
+                if command.startswith(normalized)
+            ]
+        if not self.matches:
+            self.selected_index = 0
             self.display = False
             return False
 
-        lines = ["[bold #f0a500]Commands[/bold #f0a500]\n"]
-        for command, description in matches:
-            lines.append(f"[bold]{command}[/bold]")
-            lines.append(f"[dim]{description}[/dim]")
-        self.update("\n".join(lines))
+        self.selected_index = min(self.selected_index, len(self.matches) - 1)
+        self.render_list()
         self.display = True
         return True
+
+    def render_list(self) -> None:
+        lines = ["[bold #f0a500]Commands[/bold #f0a500]\n"]
+        for index, (command, description) in enumerate(self.matches):
+            if index == self.selected_index:
+                lines.append(f"[bold #f0a500]❯ {command}[/bold #f0a500]")
+            else:
+                lines.append(f"  [bold]{command}[/bold]")
+            lines.append(f"  [dim]{description}[/dim]")
+        lines.append("\n[dim](↑/↓ navigate, Enter select)[/dim]")
+        self.update("\n".join(lines))
+
+    def move_selection(self, direction: int) -> bool:
+        if not self.matches:
+            return False
+        self.selected_index = (self.selected_index + direction) % len(self.matches)
+        self.render_list()
+        return True
+
+    def selected_command(self) -> str | None:
+        if not self.matches:
+            return None
+        return self.matches[self.selected_index][0]
 
 class ChatInput(TextArea):
     def on_mount(self) -> None:
@@ -352,7 +383,18 @@ class ChatInput(TextArea):
         if self.app.crash_dialog_visible:
             return
 
+        if event.key in ("up", "down") and self.app.command_menu_visible:
+            event.prevent_default()
+            event.stop()
+            self.app.move_command_selection(-1 if event.key == "up" else 1)
+            return
+
         if event.key == "enter":
+            if self.app.command_menu_visible:
+                event.prevent_default()
+                event.stop()
+                self.app.apply_selected_command()
+                return
             event.prevent_default()
             event.stop()
             await self.app.action_submit()
@@ -365,6 +407,11 @@ class ChatInput(TextArea):
             return
 
         if event.key == "escape":
+            if self.app.command_menu_visible:
+                event.prevent_default()
+                event.stop()
+                self.app.hide_command_menu()
+                return
             event.prevent_default()
             event.stop()
             await self.app.action_interrupt()
@@ -573,7 +620,7 @@ Screen {
     color: #d8d8d8;
     padding: 1 2;
     height: auto;
-    max-height: 10;
+    max-height: 14;
 }
     """
 
@@ -737,6 +784,10 @@ Screen {
     def current_system_prompt(self) -> str:
         return PERSONALITIES.get(self.selected_personality, PERSONALITIES["default"])
 
+    @property
+    def command_menu_visible(self) -> bool:
+        return bool(self.query_one("#command-menu-container").display)
+
     def refresh_command_menu(self) -> None:
         if (
             self.loading
@@ -752,11 +803,34 @@ Screen {
         menu = self.query_one("#command-menu", SlashCommandMenu)
         container.display = menu.update_matches(box.text)
 
+    def hide_command_menu(self) -> None:
+        menu = self.query_one("#command-menu", SlashCommandMenu)
+        menu.matches = []
+        menu.selected_index = 0
+        self.query_one("#command-menu-container").display = False
+
+    def move_command_selection(self, direction: int) -> None:
+        menu = self.query_one("#command-menu", SlashCommandMenu)
+        if menu.move_selection(direction):
+            self.query_one("#command-menu-container").display = True
+
+    def apply_selected_command(self) -> None:
+        menu = self.query_one("#command-menu", SlashCommandMenu)
+        selected = menu.selected_command()
+        if not selected:
+            return
+        box = self.query_one("#input", ChatInput)
+        box.load_text(selected)
+        self.hide_command_menu()
+
     def _mount_welcome_screen(self) -> None:
         chat = self.query_one("#chat", VerticalScroll)
+        existing_ids = {child.id for child in chat.children}
+        if "welcome-logo" in existing_ids or "welcome-prompt" in existing_ids:
+            return
         welcome = random.choice(WELCOME_MESSAGES)
-        chat.mount(Markdown(f"```\n{welcome}\n```", classes="bubble-welcome"))
-        chat.mount(Static("How can I help you?", classes="bubble-prompt"))
+        chat.mount(Markdown(f"```\n{welcome}\n```", id="welcome-logo", classes="bubble-welcome"))
+        chat.mount(Static("How can I help you?", id="welcome-prompt", classes="bubble-prompt"))
         chat.scroll_end(animate=False)
 
     async def _reset_chat_history(self) -> None:
