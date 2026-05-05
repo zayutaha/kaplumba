@@ -14,7 +14,7 @@ import re
 import os
 import json
 import random
-import subprocess
+import signal
 from pathlib import Path
 from textual.app import App, ComposeResult
 from textual.widgets import Markdown, TextArea, Static, Button
@@ -70,6 +70,55 @@ LOGO = """
 """
 
 WELCOME_MESSAGES = [LOGO]
+
+BASE_STYLE_PROMPT = """AI PERSONA AND STYLE GUIDELINES
+
+CORE TONE AND VOICE
+
+Directness: Answer the point immediately. No warmup, no stage-setting, no fake enthusiasm, no recap headers, no "great question", no "here's the summary".
+
+Human-Centric Flow: Write like a sharp person with opinions and domain knowledge, not a corporate assistant. Keep the prose natural, compact, and specific.
+
+Minimalist Punctuation: Do not use em-dashes unless they are genuinely needed for grammar.
+
+ENGAGEMENT RULES
+
+No AI Disclaimers: Never say "as an AI", "I am an AI", or anything similar.
+
+No Filler: Do not pad with obvious caveats, softeners, or generic safety boilerplate. If something is uncertain, say what is uncertain and move on.
+
+Language: Casual profanity is allowed when it fits the tone. Avoid sounding sanitized."""
+
+PERSONALITIES: dict[str, str] = {
+    "default": f"""{BASE_STYLE_PROMPT}
+
+Default behavior: Be blunt, useful, and efficient. Cut the bullshit and answer cleanly.""",
+    "doctor": f"""{BASE_STYLE_PROMPT}
+
+Role: You are a doctor-like medical explainer, not a customer support bot.
+
+Behavior:
+- Start by asking the most relevant clarifying questions before acting confident, unless the user is clearly asking for general background information.
+- Triage first: duration, severity, age, meds, conditions, triggers, red flags.
+- Be practical and concise.
+- Do not moralize or act robotic.
+- Swear lightly when it fits, but stay clinically useful.""",
+    "historian": f"""{BASE_STYLE_PROMPT}
+
+Role: You are a historian with strong interpretive judgment.
+
+Behavior:
+- Have an opinion when the evidence supports one. Do not hide behind fake neutrality.
+- Explain what mattered, who had leverage, and what the downstream consequences were.
+- Call bad strategy, propaganda, or delusion what it was when warranted.
+- Swear a bit more freely than default when emphasis helps, but keep the analysis sharp.""",
+}
+
+SLASH_COMMANDS: dict[str, str] = {
+    "/clear": "Clear the conversation, but keep the Kaplumba welcome screen.",
+    "/models": "Open the model picker and switch models safely.",
+    "/personality": "Open the personality picker: default, doctor, or historian.",
+}
 
 
 def get_available_models() -> list[tuple[str, str, dict]]:
@@ -206,6 +255,79 @@ class ModelSelector(Static):
             event.prevent_default()
             self.app.exit()
 
+
+class PersonalitySelector(Static):
+    """Personality selection widget."""
+
+    can_focus = True
+
+    def __init__(self, personalities: list[tuple[str, str]], **kwargs):
+        super().__init__(**kwargs)
+        self.personalities = personalities
+        self.selected_index = 0
+        self.render_list()
+
+    def render_list(self):
+        lines = ["[bold #f0a500]Select a personality:[/bold #f0a500]\n"]
+        for i, (name, description) in enumerate(self.personalities):
+            label = name.title()
+            if i == self.selected_index:
+                lines.append(f"[bold #f0a500]❯ {label}[/bold #f0a500]")
+                lines.append(f"  [dim]{description}[/dim]")
+            else:
+                lines.append(f"  {label}")
+                lines.append(f"  [dim]{description}[/dim]")
+
+        lines.append("\n[dim](↑/↓ navigate, Enter select, Esc back, Ctrl+C quit)[/dim]")
+        self.update("\n".join(lines))
+
+    async def on_key(self, event: Key) -> None:
+        if event.key == "up":
+            event.prevent_default()
+            self.selected_index = (self.selected_index - 1) % len(self.personalities)
+            self.render_list()
+        elif event.key == "down":
+            event.prevent_default()
+            self.selected_index = (self.selected_index + 1) % len(self.personalities)
+            self.render_list()
+        elif event.key == "enter":
+            event.prevent_default()
+            selected = self.personalities[self.selected_index][0]
+            await self.app.action_personality_selected(selected)
+        elif event.key == "escape":
+            event.prevent_default()
+            await self.app.action_dismiss_personality_selector()
+        elif event.key == "ctrl+c":
+            event.prevent_default()
+            self.app.exit()
+
+
+class SlashCommandMenu(Static):
+    """Show matching slash commands inline."""
+
+    def update_matches(self, query: str) -> bool:
+        normalized = query.strip().lower()
+        if not normalized.startswith("/"):
+            self.display = False
+            return False
+
+        matches = [
+            (command, description)
+            for command, description in SLASH_COMMANDS.items()
+            if command.startswith(normalized)
+        ]
+        if not matches:
+            self.display = False
+            return False
+
+        lines = ["[bold #f0a500]Commands[/bold #f0a500]\n"]
+        for command, description in matches:
+            lines.append(f"[bold]{command}[/bold]")
+            lines.append(f"[dim]{description}[/dim]")
+        self.update("\n".join(lines))
+        self.display = True
+        return True
+
 class ChatInput(TextArea):
     def on_mount(self) -> None:
         """Initialize the input."""
@@ -249,6 +371,7 @@ class ChatInput(TextArea):
             return
 
         await super()._on_key(event)
+        self.app.refresh_command_menu()
 
 
 class ChatUI(App):
@@ -416,11 +539,57 @@ Screen {
     align: center middle;
     color: #d8d8d8;
 }
+
+#personality-selector-container {
+    layout: vertical;
+    width: 100%;
+    height: 100%;
+    align: center middle;
+    display: none;
+}
+
+#personality-selector {
+    width: 80;
+    height: auto;
+    max-height: 24;
+    background: #1a1a1a;
+    border: round #f0a500;
+    padding: 2;
+    align: center middle;
+    color: #d8d8d8;
+}
+
+#command-menu-container {
+    width: 100%;
+    align: center bottom;
+    padding-bottom: 0;
+    display: none;
+}
+
+#command-menu {
+    width: 88;
+    background: #131313;
+    border: round #252525;
+    color: #d8d8d8;
+    padding: 1 2;
+    height: auto;
+    max-height: 10;
+}
     """
 
     def compose(self) -> ComposeResult:
         with Center(id="model-selector-container"):
             yield ModelSelector(get_available_models(), id="model-selector")
+
+        with Center(id="personality-selector-container"):
+            yield PersonalitySelector(
+                [
+                    ("default", "Blunt, compact answers with no fake politeness."),
+                    ("doctor", "Medical explainer who asks follow-up questions first."),
+                    ("historian", "Opinionated historical analysis with sharper language."),
+                ],
+                id="personality-selector",
+            )
 
         with Center(id="splash-container"):
             yield Static(LOGO, id="splash-logo")
@@ -428,6 +597,9 @@ Screen {
 
         with Vertical(id="chat-center"):
             yield VerticalScroll(id="chat")
+
+        with Center(id="command-menu-container"):
+            yield SlashCommandMenu(id="command-menu")
 
         with Center(id="input-center"):
             with Horizontal(id="input-card"):
@@ -451,8 +623,10 @@ Screen {
         self.max_crashes = 3
         self.crash_dialog_visible = False
         self.selected_model = None
+        self.selected_personality = "default"
         self.proc = None
         self.proc_pid = None
+        self.proc_pgid = None
         self.query_one("#model-selector-container").display = True
         self.query_one("#model-selector").focus()
 
@@ -475,7 +649,7 @@ Screen {
             "--turbo-kv-bits", "3",
             "--turbo-fp16-layers", "2",
             "--chat-template-args", '{"enable_thinking":false}',
-            "--system-prompt", SYSTEM_PROMPT,
+            "--system-prompt", self.current_system_prompt,
         ]
         
         self.proc = await asyncio.create_subprocess_exec(
@@ -484,10 +658,12 @@ Screen {
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
             env=env,
+            start_new_session=True,
         )
         
         # Store PID for later killing
         self.proc_pid = self.proc.pid
+        self.proc_pgid = self.proc.pid
 
         buf = await self._read_until_prompt()
 
@@ -536,22 +712,20 @@ Screen {
         self.query_one("#splash-container").display = False
         self.query_one("#chat-center").display = True
         self.query_one("#input-center").display = True
+        self.refresh_command_menu()
 
         if self.reloading:
             self.reloading = False
             self.query_one("#input").focus()
             return
 
-        chat = self.query_one("#chat", VerticalScroll)
-        welcome = random.choice(WELCOME_MESSAGES)
-        chat.mount(Markdown(f"```\n{welcome}\n```", classes="bubble-welcome"))
-        chat.mount(Static("How can I help you?", classes="bubble-prompt"))
-        chat.scroll_end(animate=False)
+        self.call_after_refresh(self._mount_welcome_screen)
         self.query_one("#input").focus()
 
     def _show_loading_ui(self, message="Loading model..."):
         self.query_one("#chat-center").display = False
         self.query_one("#input-center").display = False
+        self.query_one("#command-menu-container").display = False
         splash = self.query_one("#splash-container")
         splash.display = True
         spinner = self.query_one("#load-spinner", LoadingSpinner)
@@ -559,41 +733,125 @@ Screen {
         spinner.spinner_index = 0
         spinner.update(f"[bold #f0a500]{spinner.SPINNERS[0]} {spinner.message}")
 
+    @property
+    def current_system_prompt(self) -> str:
+        return PERSONALITIES.get(self.selected_personality, PERSONALITIES["default"])
+
+    def refresh_command_menu(self) -> None:
+        if (
+            self.loading
+            or self.busy
+            or self.query_one("#chat-center").display is False
+            or self.query_one("#input-center").display is False
+        ):
+            self.query_one("#command-menu-container").display = False
+            return
+
+        box = self.query_one("#input", ChatInput)
+        container = self.query_one("#command-menu-container")
+        menu = self.query_one("#command-menu", SlashCommandMenu)
+        container.display = menu.update_matches(box.text)
+
+    def _mount_welcome_screen(self) -> None:
+        chat = self.query_one("#chat", VerticalScroll)
+        welcome = random.choice(WELCOME_MESSAGES)
+        chat.mount(Markdown(f"```\n{welcome}\n```", classes="bubble-welcome"))
+        chat.mount(Static("How can I help you?", classes="bubble-prompt"))
+        chat.scroll_end(animate=False)
+
+    async def _reset_chat_history(self) -> None:
+        old_chat = self.query_one("#chat", VerticalScroll)
+        await old_chat.remove()
+        await self.query_one("#chat-center").mount(VerticalScroll(id="chat"))
+        self._mount_welcome_screen()
+
+    async def _stop_model_process(self) -> None:
+        proc = self.proc
+        pgid = self.proc_pgid
+        self.proc = None
+        self.proc_pid = None
+        self.proc_pgid = None
+
+        if not proc or proc.returncode is not None:
+            return
+
+        for sig in (signal.SIGTERM, signal.SIGKILL):
+            try:
+                if pgid:
+                    os.killpg(pgid, sig)
+                else:
+                    proc.send_signal(sig)
+            except ProcessLookupError:
+                break
+            except Exception:
+                pass
+
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=10 if sig == signal.SIGTERM else 5)
+                break
+            except asyncio.TimeoutError:
+                continue
+
     async def action_model_selected(self, model_name: str):
         """Handle model selection from the selector screen."""
         self.selected_model = model_name
         self.query_one("#model-selector-container").display = False
         self._show_loading_ui(f"Loading {model_name}...")
-        
-        # Kill old process via pkill in background (don't block UI)
-        if hasattr(self, 'proc_pid') and self.proc_pid:
-            try:
-                subprocess.Popen(["pkill", "-P", str(self.proc_pid)], 
-                               stdout=subprocess.DEVNULL, 
-                               stderr=subprocess.DEVNULL)
-                subprocess.Popen(["kill", "-9", str(self.proc_pid)], 
-                               stdout=subprocess.DEVNULL, 
-                               stderr=subprocess.DEVNULL)
-            except:
-                pass
-        
-        asyncio.create_task(self.initialize_model())
+
+        await self._reset_chat_history()
+        await self._stop_model_process()
+        await self.initialize_model()
 
     async def action_dismiss_model_selector(self):
         """Dismiss model selector and return to chat."""
         self.query_one("#model-selector-container").display = False
         self.query_one("#chat-center").display = True
         self.query_one("#input-center").display = True
+        self.refresh_command_menu()
         self.query_one("#input").focus()
 
     async def show_model_selector(self):
         """Show model selector during chat to switch models."""
         self.query_one("#chat-center").display = False
         self.query_one("#input-center").display = False
+        self.query_one("#command-menu-container").display = False
         self.query_one("#model-selector-container").display = True
         selector = self.query_one("#model-selector", ModelSelector)
         selector.models = get_available_models()
-        selector.selected_index = 0
+        if self.selected_model:
+            selected_names = [model[0] for model in selector.models]
+            selector.selected_index = selected_names.index(self.selected_model) if self.selected_model in selected_names else 0
+        else:
+            selector.selected_index = 0
+        selector.render_list()
+        selector.focus()
+
+    async def action_personality_selected(self, personality_name: str):
+        self.selected_personality = personality_name
+        self.query_one("#personality-selector-container").display = False
+        self.reloading = True
+        self._show_loading_ui(f"Loading {personality_name} personality...")
+
+        await self._reset_chat_history()
+        await self._stop_model_process()
+        await self.initialize_model()
+
+    async def action_dismiss_personality_selector(self):
+        self.query_one("#personality-selector-container").display = False
+        self.query_one("#chat-center").display = True
+        self.query_one("#input-center").display = True
+        self.refresh_command_menu()
+        self.query_one("#input").focus()
+
+    async def show_personality_selector(self):
+        self.query_one("#chat-center").display = False
+        self.query_one("#input-center").display = False
+        self.query_one("#command-menu-container").display = False
+        self.query_one("#personality-selector-container").display = True
+        selector = self.query_one("#personality-selector", PersonalitySelector)
+        personalities = list(selector.personalities)
+        names = [name for name, _ in personalities]
+        selector.selected_index = names.index(self.selected_personality) if self.selected_personality in names else 0
         selector.render_list()
         selector.focus()
 
@@ -612,14 +870,19 @@ Screen {
 
         # If /clear command, clear the chat display
         if user_text == "/clear":
-            await chat.remove()
-            await self.query_one("#chat-center").mount(VerticalScroll(id="chat"))
+            await self._reset_chat_history()
             self._set_busy(False)
+            self.refresh_command_menu()
+            self.query_one("#input").focus()
             return
 
         # If /models command, show model selector
         if user_text == "/models":
             await self.show_model_selector()
+            return
+
+        if user_text == "/personality":
+            await self.show_personality_selector()
             return
 
         await chat.mount(Markdown(user_text, classes="bubble-user"))
@@ -664,12 +927,7 @@ Screen {
         if self.query_one("#chat-center").display == False:
             self.reloading = True
             self._show_loading_ui(f"Reloading model (crash #{self.crash_count})...")
-            if self.proc and self.proc.returncode is None:
-                try:
-                    self.proc.kill()
-                    await self.proc.wait()
-                except Exception:
-                    pass
+            await self._stop_model_process()
             asyncio.create_task(self.initialize_model())
             return
 
@@ -703,9 +961,7 @@ Screen {
         self.query_one("#crash-dialog-container").display = False
         
         # Clear chat history
-        chat = self.query_one("#chat", VerticalScroll)
-        await chat.remove()
-        await self.query_one("#chat-center").mount(VerticalScroll(id="chat"))
+        await self._reset_chat_history()
         self.crash_count = 0
         self.reloading = True
         self._show_loading_ui("Reloading model...")
@@ -717,12 +973,7 @@ Screen {
             self.crash_dialog_visible = False
             self.query_one("#crash-dialog-container").display = False
             self._show_loading_ui(f"Reloading model (crash #{self.crash_count})...")
-            if self.proc and self.proc.returncode is None:
-                try:
-                    self.proc.kill()
-                    await self.proc.wait()
-                except Exception:
-                    pass
+            await self._stop_model_process()
             asyncio.create_task(self.initialize_model())
         elif event.button.id == "crash-quit":
             self.exit("Model crashed")
