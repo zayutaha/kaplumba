@@ -16,11 +16,13 @@ from .utils import load, sharded_load
 
 DEFAULT_TEMP = 0.0
 DEFAULT_TOP_P = 1.0
+DEFAULT_TOP_K = 0
 DEFAULT_XTC_PROBABILITY = 0.0
 DEFAULT_XTC_THRESHOLD = 0.0
 DEFAULT_SEED = 0
 DEFAULT_MAX_TOKENS = 256
 DEFAULT_MODEL = "mlx-community/Llama-3.2-3B-Instruct-4bit"
+DEFAULT_PROMPT_MARKER = ">> "
 
 
 def chat(
@@ -32,6 +34,7 @@ def chat(
     max_tokens: int = 256,
     temp: float = DEFAULT_TEMP,
     top_p: float = DEFAULT_TOP_P,
+    top_k: int = DEFAULT_TOP_K,
     xtc_probability: float = DEFAULT_XTC_PROBABILITY,
     xtc_threshold: float = DEFAULT_XTC_THRESHOLD,
     sampler=None,
@@ -56,6 +59,7 @@ def chat(
         max_tokens (int): Maximum number of tokens to generate. Default: 256.
         temp (float): Sampling temperature. Default: 0.0.
         top_p (float): Nucleus sampling top-p. Default: 1.0.
+        top_k (int): Top-k sampling cutoff. Default: 0.
         xtc_probability (float): XTC sampling probability. Default: 0.0.
         xtc_threshold (float): XTC threshold. Default: 0.0.
         sampler: Optional custom sampler. Default: None.
@@ -90,6 +94,7 @@ def chat(
         sampler = make_sampler(
             temp,
             top_p,
+            top_k=top_k,
             xtc_threshold=xtc_threshold,
             xtc_probability=xtc_probability,
             xtc_special_tokens=(
@@ -131,6 +136,7 @@ def stream_chat(
     max_tokens: int = 256,
     temp: float = DEFAULT_TEMP,
     top_p: float = DEFAULT_TOP_P,
+    top_k: int = DEFAULT_TOP_K,
     xtc_probability: float = DEFAULT_XTC_PROBABILITY,
     xtc_threshold: float = DEFAULT_XTC_THRESHOLD,
     sampler=None,
@@ -153,6 +159,7 @@ def stream_chat(
         max_tokens (int): Maximum number of tokens to generate. Default: 256.
         temp (float): Sampling temperature. Default: 0.0.
         top_p (float): Nucleus sampling top-p. Default: 1.0.
+        top_k (int): Top-k sampling cutoff. Default: 0.
         xtc_probability (float): XTC sampling probability. Default: 0.0.
         xtc_threshold (float): XTC threshold. Default: 0.0.
         sampler: Optional custom sampler. Default: None.
@@ -187,6 +194,7 @@ def stream_chat(
         sampler = make_sampler(
             temp,
             top_p,
+            top_k=top_k,
             xtc_threshold=xtc_threshold,
             xtc_probability=xtc_probability,
             xtc_special_tokens=(
@@ -240,6 +248,9 @@ def setup_arg_parser():
     )
     parser.add_argument(
         "--top-p", type=float, default=DEFAULT_TOP_P, help="Sampling top-p"
+    )
+    parser.add_argument(
+        "--top-k", type=int, default=DEFAULT_TOP_K, help="Sampling top-k"
     )
     parser.add_argument(
         "--xtc-probability",
@@ -314,6 +325,12 @@ def setup_arg_parser():
         default=None,
         help="Pre-tokenized input tokens (comma-separated integers). If provided, takes precedence over --prompt/--message and chat template is not applied.",
     )
+    parser.add_argument(
+        "--prompt-marker",
+        type=str,
+        default=DEFAULT_PROMPT_MARKER,
+        help="Prompt marker used for interactive input.",
+    )
     return parser
 
 
@@ -376,7 +393,7 @@ def main():
     while True:
         if prompt is None:
             try:
-                query = input(">> " if rank == 0 else "")
+                query = input(args.prompt_marker if rank == 0 else "")
             except EOFError:
                 rprint("\n[INFO] Exiting...")
                 break
@@ -431,6 +448,7 @@ def main():
             sampler=make_sampler(
                 args.temp,
                 args.top_p,
+                top_k=args.top_k,
                 xtc_threshold=args.xtc_threshold,
                 xtc_probability=args.xtc_probability,
                 xtc_special_tokens=(
