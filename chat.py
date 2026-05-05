@@ -559,11 +559,10 @@ Screen {
         self.selected_model = model_name
         self.query_one("#model-selector-container").display = False
         
-        # Kill current model process before loading new one (only if it's running)
+        # Kill current model process (don't wait, just terminate it)
         if self.proc and self.proc.returncode is None:
             try:
                 self.proc.kill()
-                await self.proc.wait()
             except Exception:
                 pass
         
