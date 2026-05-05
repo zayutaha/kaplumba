@@ -127,18 +127,22 @@ class ModelSelector(Static):
         lines.append("\n[dim](↑/↓ to navigate, Enter to select, Ctrl+C to quit)[/dim]")
         self.update("\n".join(lines))
 
-    async def _on_key(self, event: Key) -> None:
+    async def on_key(self, event: Key) -> None:
         """Handle key navigation."""
         if event.key == "up":
+            event.prevent_default()
             self.selected_index = (self.selected_index - 1) % len(self.models)
             self.render_list()
         elif event.key == "down":
+            event.prevent_default()
             self.selected_index = (self.selected_index + 1) % len(self.models)
             self.render_list()
         elif event.key == "enter":
+            event.prevent_default()
             selected_model = self.models[self.selected_index]
             await self.app.action_model_selected(selected_model)
         elif event.key == "ctrl+c":
+            event.prevent_default()
             self.app.exit()
 
 class ChatInput(TextArea):
