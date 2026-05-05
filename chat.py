@@ -13,6 +13,7 @@ import asyncio
 import re
 import os
 import random
+from pathlib import Path
 from textual.app import App, ComposeResult
 from textual.widgets import Markdown, TextArea, Static, Button
 from textual.containers import VerticalScroll, Vertical, Horizontal, Center, Middle
@@ -69,6 +70,19 @@ LOGO = """
 WELCOME_MESSAGES = [LOGO]
 
 
+def get_available_models() -> list[str]:
+    """Scan .omlx/models directory and return available model names."""
+    models_dir = Path.home() / ".omlx" / "models"
+    if not models_dir.exists():
+        return []
+    
+    models = []
+    for item in sorted(models_dir.iterdir()):
+        if item.is_dir():
+            models.append(item.name)
+    return models
+
+
 def strip_prompt_markers(text: str) -> str:
     lines = text.splitlines()
     clean = [l for l in lines if not l.strip().startswith(">>") and not l.startswith("[INFO]")]
@@ -92,6 +106,40 @@ class LoadingSpinner(Static):
         self.spinner_index = (self.spinner_index + 1) % len(self.SPINNERS)
         self.update(f"[bold #f0a500]{self.SPINNERS[self.spinner_index]} {self.message}")
 
+
+class ModelSelector(Static):
+    """Model selection widget."""
+
+    def __init__(self, models: list[str], **kwargs):
+        super().__init__(**kwargs)
+        self.models = models
+        self.selected_index = 0
+        self.render_list()
+
+    def render_list(self):
+        """Render the model list with selection indicator."""
+        lines = ["Select a model:\n"]
+        for i, model in enumerate(self.models):
+            if i == self.selected_index:
+                lines.append(f"[bold #f0a500]> {model}[/bold #f0a500]")
+            else:
+                lines.append(f"  {model}")
+        lines.append("\n[dim](↑/↓ to navigate, Enter to select, Ctrl+C to quit)[/dim]")
+        self.update("\n".join(lines))
+
+    async def _on_key(self, event: Key) -> None:
+        """Handle key navigation."""
+        if event.key == "up":
+            self.selected_index = (self.selected_index - 1) % len(self.models)
+            self.render_list()
+        elif event.key == "down":
+            self.selected_index = (self.selected_index + 1) % len(self.models)
+            self.render_list()
+        elif event.key == "enter":
+            selected_model = self.models[self.selected_index]
+            await self.app.action_model_selected(selected_model)
+        elif event.key == "ctrl+c":
+            self.app.exit()
 
 class ChatInput(TextArea):
     def on_mount(self) -> None:
@@ -284,9 +332,30 @@ Screen {
 .crash-buttons Button {
     margin: 0 1;
 }
+
+#model-selector-container {
+    layout: vertical;
+    width: 100%;
+    height: 100%;
+    align: center middle;
+    display: none;
+}
+
+#model-selector {
+    width: 50;
+    height: auto;
+    background: #1a1a1a;
+    border: round #f0a500;
+    padding: 2;
+    align: center middle;
+    color: #d8d8d8;
+}
     """
 
     def compose(self) -> ComposeResult:
+        with Center(id="model-selector-container"):
+            yield ModelSelector(get_available_models(), id="model-selector")
+
         with Center(id="splash-container"):
             yield Static(LOGO, id="splash-logo")
             yield LoadingSpinner(id="load-spinner")
@@ -315,14 +384,34 @@ Screen {
         self.crash_count = 0
         self.max_crashes = 3
         self.crash_dialog_visible = False
-        asyncio.create_task(self.initialize_model())
+        self.selected_model = None
+        self.query_one("#model-selector-container").display = True
+        self.query_one("#model-selector").focus()
 
     async def initialize_model(self):
         self.loading = True
         env = os.environ.copy()
         env["PYTHONPATH"] = os.getcwd()
+        
+        # Build command with selected model
+        model_path = str(Path.home() / ".omlx" / "models" / self.selected_model)
+        cmd = [
+            "uv", "run", "python", "-m", "mlx_lm.chat",
+            "--model", model_path,
+            "--temp", "0.7",
+            "--top-p", "0.8",
+            "--max-tokens", "16384",
+            "--xtc-probability", "0.0",
+            "--xtc-threshold", "0.0",
+            "--mtp",
+            "--turbo-kv-bits", "3",
+            "--turbo-fp16-layers", "2",
+            "--chat-template-args", '{"enable_thinking":false}',
+            "--system-prompt", SYSTEM_PROMPT,
+        ]
+        
         self.proc = await asyncio.create_subprocess_exec(
-            *BASE_CMD,
+            *cmd,
             stdin=asyncio.subprocess.PIPE,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.DEVNULL,
@@ -398,6 +487,13 @@ Screen {
         spinner.message = message
         spinner.spinner_index = 0
         spinner.update(f"[bold #f0a500]{spinner.SPINNERS[0]} {spinner.message}")
+
+    async def action_model_selected(self, model_name: str):
+        """Handle model selection from the selector screen."""
+        self.selected_model = model_name
+        self.query_one("#model-selector-container").display = False
+        self._show_loading_ui(f"Loading {model_name}...")
+        asyncio.create_task(self.initialize_model())
 
     async def action_submit(self):
         if self.busy or self.loading or not self.proc or self.proc.returncode is not None:
