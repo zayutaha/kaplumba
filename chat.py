@@ -51,7 +51,7 @@ BASE_CMD = [
     "--model", MODEL_PATH,
     "--temp", "0.7",
     "--top-p", "0.8",
-    "--max-tokens", "16384",
+    "--max-tokens", "32768",
     "--xtc-probability", "0.0",
     "--xtc-threshold", "0.0",
     "--mtp",
@@ -1253,13 +1253,33 @@ Screen {
 
     async def action_personality_selected(self, personality_name: str):
         self.selected_personality = personality_name
+        
+        # Send personality change and clear to subprocess
+        if self.proc and self.proc.returncode is None:
+            try:
+                # Send /clear command first to reset conversation state
+                self.proc.stdin.write(b"/clear\n")
+                await self.proc.stdin.drain()
+                await self._read_until_prompt(timeout=5)
+                
+                # Send personality change command
+                cmd = f"/personality_set {personality_name}\n"
+                self.proc.stdin.write(cmd.encode())
+                await self.proc.stdin.drain()
+                await self._read_until_prompt(timeout=5)
+            except Exception:
+                pass
+        
+        # Hide personality selector and show chat/input
         self.query_one("#personality-selector-container").display = False
-        self.reloading = True
-        self._show_loading_ui(f"Loading {personality_name} personality...")
-
+        self.query_one("#chat-center").display = True
+        self.query_one("#input-center").display = True
+        
+        # Clear UI the same way /clear does
         await self._reset_chat_history()
-        await self._stop_model_process()
-        await self.initialize_model()
+        self._set_busy(False)
+        self.refresh_command_menu()
+        self.query_one("#input").focus()
 
     async def action_dismiss_personality_selector(self):
         self.query_one("#personality-selector-container").display = False
