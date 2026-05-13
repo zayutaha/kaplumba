@@ -238,6 +238,14 @@ def setup_arg_parser():
         default=3,
     )
     parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=2048,
+        help="Step size for prompt prefill processing. "
+        "Larger values process more tokens per forward pass "
+        "but use more memory. Default: 2048.",
+    )
+    parser.add_argument(
         "--mtp",
         action="store_true",
         help="Use native Multi-Token Prediction for speculative decoding "
@@ -397,7 +405,7 @@ def generate_step(
             "Either input_embeddings or prompt (or both) must be provided."
         )
 
-    tokens = None
+    token_buf = TokenBuffer()
 
     # Create the KV cache for generation
     if prompt_cache is None:
@@ -428,7 +436,7 @@ def generate_step(
             return model(input_tokens, cache=prompt_cache)
 
     def _step(input_tokens: mx.array, input_embeddings: Optional[mx.array] = None):
-        nonlocal tokens
+        nonlocal token_buf
 
         with mx.stream(generation_stream):
             logits = _model_call(
@@ -441,11 +449,7 @@ def generate_step(
             logits = logits[:, -1, :]
 
             if logits_processors and len(input_tokens) > 0:
-                tokens = (
-                    mx.concat([tokens, input_tokens])
-                    if tokens is not None
-                    else input_tokens
-                )
+                tokens = token_buf.update_and_fetch(input_tokens)
                 for processor in logits_processors:
                     logits = processor(tokens, logits)
 
@@ -461,9 +465,17 @@ def generate_step(
         )
         prompt_processed_tokens = 0
         prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
+
+        # Memory-adaptive prefill: start with user step, reduce if memory tight
+        current_step = prefill_step_size
+        if mx.metal.is_available():
+            limit = mx.device_info().get("max_recommended_working_set_size", 0)
+        else:
+            limit = 0
+
         while total_prompt_tokens - prompt_processed_tokens > 1:
             remaining = (total_prompt_tokens - prompt_processed_tokens) - 1
-            n_to_process = min(prefill_step_size, remaining)
+            n_to_process = min(current_step, remaining)
             _model_call(
                 input_tokens=prompt[:n_to_process][None],
                 input_embeddings=(
@@ -484,23 +496,31 @@ def generate_step(
             )
             mx.clear_cache()
 
+            # Reduce step size if memory pressure is high (peak approaching limit)
+            if limit > 0 and mx.get_peak_memory() > 0.85 * limit:
+                current_step = max(256, current_step // 2)
+
         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
 
-    mx.async_eval(y, logprobs)
+    y0, lp0 = _step(input_tokens=prompt, input_embeddings=input_embeddings)
+    mx.async_eval(y0, lp0)
+    y1, lp1 = _step(y0)
+    mx.async_eval(y1, lp1)
     n = 0
     while True:
         if n != max_tokens:
-            next_y, next_logprobs = _step(y)
-            mx.async_eval(next_y, next_logprobs)
+            y2, lp2 = _step(y1)
+            mx.async_eval(y2, lp2)
         if n == 0:
-            mx.eval(y)
+            mx.eval(y0)
             prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
         if n == max_tokens:
             break
-        yield y.item(), logprobs
+        yield y0.item(), lp0
         if n % 256 == 0:
             mx.clear_cache()
-        y, logprobs = next_y, next_logprobs
+        y0, lp0 = y1, lp1
+        y1, lp1 = y2, lp2
         n += 1
 
 
@@ -550,7 +570,7 @@ def speculative_generate_step(
     """
 
     y = prompt.astype(mx.uint32)
-    prev_tokens = None
+    token_buf = TokenBuffer()
 
     # Create the KV cache for generation
     if prompt_cache is None:
@@ -591,17 +611,13 @@ def speculative_generate_step(
 
             quantize_cache_fn(cache)
             if logits_processors:
-                nonlocal prev_tokens
+                nonlocal token_buf
                 out_y, out_logprobs = [], []
                 if n_predict > 1:
                     y = y[: -(n_predict - 1)]
                 for i in range(n_predict):
-                    prev_tokens = (
-                        mx.concatenate([prev_tokens, y])
-                        if prev_tokens is not None
-                        else y
-                    )
-                    y, logprobs = _process_and_sample(prev_tokens, logits[:, i, :])
+                    tokens = token_buf.update_and_fetch(y)
+                    y, logprobs = _process_and_sample(tokens, logits[:, i, :])
                     out_y.append(y)
                     out_logprobs.append(logprobs)
                 return mx.concatenate(out_y, axis=0), mx.concatenate(
@@ -610,14 +626,22 @@ def speculative_generate_step(
             else:
                 return _process_and_sample(None, logits.squeeze(0))
 
+    _spec_limit = (
+        mx.device_info().get("max_recommended_working_set_size", 0)
+        if mx.metal.is_available() else 0
+    )
+
     def _prefill(model, cache, y):
+        current_step = prefill_step_size
         while y.size > 1:
-            n_to_process = min(prefill_step_size, y.size - 1)
+            n_to_process = min(current_step, y.size - 1)
             model(y[:n_to_process][None], cache=cache)
             quantize_cache_fn(cache)
             mx.eval([c.state for c in cache])
             y = y[n_to_process:]
             mx.clear_cache()
+            if _spec_limit > 0 and mx.get_peak_memory() > 0.85 * _spec_limit:
+                current_step = max(256, current_step // 2)
         return y
 
     def _rewind_cache(num_draft, num_accept):
@@ -809,6 +833,8 @@ def mtp_generate_step(
                         if prev_tokens is not None
                         else y[i : i + 1]
                     )
+                    if prev_tokens.size > 512:
+                        prev_tokens = prev_tokens[-512:]
                 tok, lp = _process_and_sample(prev_tokens, logits[:, i, :].squeeze(0))
                 toks.append(tok)
                 lps.append(lp)
@@ -827,21 +853,31 @@ def mtp_generate_step(
                     if prev_tokens is not None
                     else main_tok.reshape(-1)
                 )
+                if tokens_for_proc.size > 512:
+                    tokens_for_proc = tokens_for_proc[-512:]
             else:
                 tokens_for_proc = prev_tokens
             draft_tok, draft_lp = _process_and_sample(tokens_for_proc, mtp_logits)
         return draft_tok, draft_lp
 
+    _mtp_limit = (
+        mx.device_info().get("max_recommended_working_set_size", 0)
+        if mx.metal.is_available() else 0
+    )
+
     def _prefill(y):
         # Leave exactly 1 token for _step_backbone: return_hidden=True keeps
         # the hidden state [1, N, d_model] live, so N must be 1.
+        current_step = prefill_step_size
         while y.size > 1:
-            n = min(prefill_step_size, y.size - 1)
+            n = min(current_step, y.size - 1)
             model(y[:n][None], cache=model_cache)
             quantize_cache_fn(model_cache)
             mx.eval([c.state for c in model_cache if hasattr(c, "state")])
             y = y[n:]
             mx.clear_cache()
+            if _mtp_limit > 0 and mx.get_peak_memory() > 0.85 * _mtp_limit:
+                current_step = max(256, current_step // 2)
         return y
 
     with mx.stream(generation_stream):
@@ -2376,6 +2412,7 @@ def main():
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
         mtp=args.mtp,
+        prefill_step_size=args.prefill_step_size,
     )
     if not args.verbose:
         print(response)

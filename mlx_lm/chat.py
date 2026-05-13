@@ -351,6 +351,14 @@ def setup_arg_parser():
         "when using --turbo-kv-bits. Default: 1.",
     )
     parser.add_argument(
+        "--prefill-step-size",
+        type=int,
+        default=2048,
+        help="Step size for prompt prefill processing. "
+        "Larger values process more tokens per forward pass "
+        "but use more memory. Default: 2048.",
+    )
+    parser.add_argument(
         "--mtp",
         action="store_true",
         help="Use native Multi-Token Prediction for speculative decoding",
@@ -540,6 +548,7 @@ def main():
             turbo_kv_bits=args.turbo_kv_bits,
             turbo_fp16_layers=args.turbo_fp16_layers,
             mtp=args.mtp,
+            prefill_step_size=args.prefill_step_size,
         ):
             response_text += response.text
             rprint(response.text, flush=True, end="")
