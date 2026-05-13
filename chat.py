@@ -17,6 +17,7 @@ import random
 import signal
 import subprocess
 from pathlib import Path
+from latex_parser import parser as latex_parser
 from textual.app import App, ComposeResult
 from textual.widgets import Markdown, TextArea, Static, Button
 from textual.containers import VerticalScroll, Vertical, Horizontal, Center, Middle
@@ -368,6 +369,30 @@ def get_model_capabilities(model_name: str) -> dict[str, bool]:
     return {"vision": has_vision, "mtp": has_mtp}
 
 
+def parse_latex(text: str) -> str:
+    """Render LaTeX expressions ($...$ and $$...$$) to terminal Unicode."""
+    # Handle display math $$...$$ first (so $ signs inside aren't caught by inline)
+    def replace_display(m):
+        inner = m.group(1).strip()
+        try:
+            return latex_parser.parse(inner)
+        except Exception:
+            return inner
+
+    def replace_inline(m):
+        inner = m.group(1).strip()
+        try:
+            return latex_parser.parse(inner)
+        except Exception:
+            return inner
+
+    # Do display math first ($$...$$)
+    text = re.sub(r'\$\$(.+?)\$\$', replace_display, text, flags=re.DOTALL)
+    # Then inline math ($...$)
+    text = re.sub(r'\$(.+?)\$', replace_inline, text)
+    return text
+
+
 def escape_markdown(text: str) -> str:
     """Escape markdown special characters by wrapping in backticks."""
     # Escape special markdown characters
@@ -376,6 +401,13 @@ def escape_markdown(text: str) -> str:
     for char in chars_to_escape:
         result = result.replace(char, f'\\{char}')
     return result
+
+
+def format_for_display(text: str) -> str:
+    """Format model output for display: parse LaTeX then escape Markdown."""
+    if '$' in text:
+        text = parse_latex(text)
+    return escape_markdown(text)
 
 
 def strip_prompt_markers(text: str) -> str:
@@ -1535,11 +1567,11 @@ Screen {
                     else:
                         display = strip_prompt_markers(get_display_text(buf))
                         if display:
-                            await self.current_md.update(f"{escape_markdown(display)} ▌")
+                            await self.current_md.update(f"{format_for_display(display)} ▌")
                 else:
                     display = strip_prompt_markers(buf)
                     if display:  # Only update if there's actual content
-                        await self.current_md.update(f"{escape_markdown(display)} ▌")
+                        await self.current_md.update(f"{format_for_display(display)} ▌")
 
                 last_update = now
 
@@ -1553,7 +1585,7 @@ Screen {
             self.interrupted = False
 
         try:
-            await self.current_md.update(escape_markdown(display))
+            await self.current_md.update(format_for_display(display))
         except Exception as e:
             # Widget might have been removed, show error in chat
             error_msg = f'<error: {e}>'

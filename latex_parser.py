@@ -13,8 +13,15 @@ class LatexParser:
         'Phi': 'Φ', 'Psi': 'Ψ', 'Omega': 'Ω',
     }
 
-    # Superscript mapping
-    SUPERSCRIPT = str.maketrans('0123456789', '⁰¹²³⁴⁵⁶⁷⁸⁹')
+    # Superscript mapping (digits + common letters)
+    SUPERSCRIPT = str.maketrans(
+        '0123456789abcdefghijklmnoprstuvwxyzABDEGHIJKLMNOPRTUW',
+        '⁰¹²³⁴⁵⁶⁷⁸⁹ᵃᵇᶜᵈᵉᶠᵍʰⁱʲᵏˡᵐⁿᵒᵖʳˢᵗᵘᵛʷˣʸᶻᴬᴮᴰᴱᴳᴴᴵᴶᴷᴸᴹᴺᴼᴾᴿᵀᵁᵂ',
+    )
+    SUBSCRIPT = str.maketrans(
+        '0123456789aehijklmnoprstuvx',
+        '₀₁₂₃₄₅₆₇₈₉ₐₑₕᵢⱼₖₗₘₙₒₚᵣₛₜᵤᵥₓ',
+    )
 
     def __init__(self):
         self.pos = 0
@@ -51,17 +58,17 @@ class LatexParser:
                 self._advance()
                 if self._peek() == '{':
                     self._advance()
-                    sub = self._parse_until('}')
+                    sub = self._parse_expr_inline('}')
                     self._advance()
                 else:
                     sub = self._peek(1)
                     self._advance()
-                result.append(sub.translate(self.SUPERSCRIPT))
+                result.append(sub.translate(self.SUBSCRIPT))
             elif char == '^':
                 self._advance()
                 if self._peek() == '{':
                     self._advance()
-                    sup = self._parse_until('}')
+                    sup = self._parse_expr_inline('}')
                     self._advance()
                 else:
                     sup = self._peek(1)
@@ -85,6 +92,57 @@ class LatexParser:
                 depth -= 1
             self._advance()
         return self.text[start:self.pos]
+
+    def _parse_expr_inline(self, end_char):
+        """Parse a LaTeX expression until we hit end_char.
+        
+        Unlike _parse_until which returns raw text, this recursively
+        processes commands (\\alpha, \\pi, etc.) inside the braces.
+        """
+        result = []
+        depth = 1
+        while self.pos < len(self.text):
+            char = self._peek()
+            if char == end_char and depth == 1:
+                break
+            elif char == '{':
+                depth += 1
+                self._advance()
+                inner = self._parse_expr_inline('}')
+                self._advance()  # skip }
+                result.append(inner)
+            elif char == '}':
+                depth -= 1
+                if depth == 0:
+                    break
+                result.append(char)
+                self._advance()
+            elif char == '\\':
+                result.append(self._parse_command())
+            elif char == '_':
+                self._advance()
+                if self._peek() == '{':
+                    self._advance()
+                    sub = self._parse_expr_inline('}')
+                    self._advance()
+                else:
+                    sub = self._peek(1)
+                    self._advance()
+                result.append(sub.translate(self.SUBSCRIPT))
+            elif char == '^':
+                self._advance()
+                if self._peek() == '{':
+                    self._advance()
+                    sup = self._parse_expr_inline('}')
+                    self._advance()
+                else:
+                    sup = self._peek(1)
+                    self._advance()
+                result.append(sup.translate(self.SUPERSCRIPT))
+            else:
+                result.append(char)
+                self._advance()
+        return ''.join(result)
 
     def _parse_command(self):
         self._advance()  # skip backslash
@@ -176,7 +234,7 @@ class LatexParser:
         # Parse numerator
         if self._peek() == '{':
             self._advance()
-            num = self._parse_until('}')
+            num = self._parse_expr_inline('}')
             self._advance()
         else:
             num = self._peek(1)
@@ -185,7 +243,7 @@ class LatexParser:
         # Parse denominator
         if self._peek() == '{':
             self._advance()
-            den = self._parse_until('}')
+            den = self._parse_expr_inline('}')
             self._advance()
         else:
             den = self._peek(1)
@@ -198,12 +256,12 @@ class LatexParser:
         root = None
         if self._peek() == '[':
             self._advance()
-            root = self._parse_until(']')
+            root = self._parse_expr_inline(']')
             self._advance()
 
         if self._peek() == '{':
             self._advance()
-            content = self._parse_until('}')
+            content = self._parse_expr_inline('}')
             self._advance()
         else:
             content = self._peek(1)
