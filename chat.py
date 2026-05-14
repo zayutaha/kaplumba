@@ -108,9 +108,9 @@ Behavior:
 - Swear lightly when it fits, but stay clinically useful.""",
     "historian": f"""{BASE_STYLE_PROMPT}
 
-Role: You are a historian with strong interpretive judgment.
+$\\textbf{{Role:}}$ You are a historian with strong interpretive judgment.
 
-Behavior:
+$\\textbf{{Behavior:}}$
 - Have an opinion when the evidence supports one. Do not hide behind fake neutrality.
 - Explain what mattered, who had leverage, and what the downstream consequences were.
 - Call bad strategy, propaganda, or delusion what it was when warranted.
@@ -740,7 +740,7 @@ class ChatInput(TextArea):
         if event.key == "ctrl+c":
             event.prevent_default()
             event.stop()
-            self.app.exit()
+            await self.app.action_quit()
             return
 
         if event.key == "escape":
@@ -1436,6 +1436,10 @@ Screen {
             await self.proc.stdin.drain()
             self.interrupted = True
 
+    async def action_quit(self):
+        await self._stop_model_process()
+        self.exit()
+
     async def _handle_crash(self, error_msg):
         """Handle model crash: show dialog with quit/reload options."""
         self._set_busy(False)
@@ -1558,7 +1562,13 @@ Screen {
 
         while True:
             try:
-                chunk = await self.proc.stdout.read(256)
+                chunk = await asyncio.wait_for(
+                    self.proc.stdout.read(256), timeout=0.05
+                )
+            except asyncio.TimeoutError:
+                if self.interrupted:
+                    break
+                continue
             except Exception:
                 await self._handle_crash("")
                 return
@@ -1585,10 +1595,14 @@ Screen {
                             await self.current_md.update(f"{format_for_display(display)} ▌")
                 else:
                     display = strip_prompt_markers(buf)
-                    if display:  # Only update if there's actual content
+                    if display:
                         await self.current_md.update(f"{format_for_display(display)} ▌")
-
                 last_update = now
+
+        if self.interrupted:
+            remaining = await self._read_until_prompt(timeout=10)
+            if remaining:
+                buf += remaining
 
         if thinking_enabled:
             display = strip_prompt_markers(get_display_text(buf))
