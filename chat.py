@@ -18,7 +18,6 @@ import signal
 import subprocess
 from pathlib import Path
 from latex_parser import parser as latex_parser
-from simple_markdown import render as render_markdown
 from textual.app import App, ComposeResult
 from textual.widgets import Markdown, TextArea, Static, Button
 from textual.containers import VerticalScroll, Vertical, Horizontal, Center, Middle
@@ -473,9 +472,8 @@ def parse_latex(text: str) -> str:
 
 
 def format_for_display(text: str) -> str:
-    """Format model output: parse LaTeX, render markdown → Rich markup."""
+    """Format model output: parse LaTeX, preserve markdown for Textual."""
     text = parse_latex(text)
-    text = render_markdown(text)
     return text
 
 
@@ -1464,7 +1462,7 @@ Screen {
 
         await chat.mount(Markdown(user_text, classes="bubble-user"))
 
-        self.current_md = Static("▌", classes="bubble-assistant")
+        self.current_md = Markdown("▌", classes="bubble-assistant")
         await chat.mount(self.current_md)
         chat.scroll_end(animate=False)
 
