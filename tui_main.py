@@ -19,7 +19,7 @@ from textual.containers import VerticalScroll, Vertical, Horizontal, Center, Mid
 from textual.events import Key, Click
 
 from tui_commands import BASE_CMD, MODEL_PATH, TUI_PROMPT_MARKER, ModelRunner
-from tui_styles import CHAT_CSS
+from tui_styles import CHAT_CSS, LOGO, WELCOME_MESSAGES
 from tui_config import (
     DEFAULT_MODEL_OPTIONS,
     MODEL_CONFIGS_PATH,
@@ -33,16 +33,7 @@ from tui_config import (
 from tui_latex import format_for_display, strip_prompt_markers
 from tui_personalities import SYSTEM_PROMPT, PERSONALITIES
 
-LOGO = """
-██╗  ██╗ █████╗ ██████╗ ██╗     ██╗   ██╗███╗   ███╗██████╗  █████╗ 
-██║ ██╔╝██╔══██╗██╔══██╗██║     ██║   ██║████╗ ████║██╔══██╗██╔══██╗
-█████╔╝ ███████║██████╔╝██║     ██║   ██║██╔████╔██║██████╔╝███████║
-██╔═██╗ ██╔══██║██╔═══╝ ██║     ██║   ██║██║╚██╔╝██║██╔══██╗██╔══██║
-██║  ██╗██║  ██║██║     ███████╗╚██████╔╝██║ ╚═╝ ██║██████╔╝██║  ██║
-╚═╝  ╚═╝╚═╝  ╚═╝╚═╝     ╚══════╝ ╚═════╝ ╚═╝     ╚═╝╚═════╝ ╚═╝  ╚═╝
-"""
 
-WELCOME_MESSAGES = [LOGO]
 
 from tui_loading_spinner import LoadingSpinner
 from tui_model_picker import ModelSelector, get_available_models
