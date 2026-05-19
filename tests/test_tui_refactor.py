@@ -228,22 +228,24 @@ class TestChatUINavigation(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertTrue(app.query_one("#chat-center").display)
 
-    async def test_ascii_kaplumba_stays_visible_in_chat_header_while_chatting(self):
+    async def test_ascii_kaplumba_stays_in_scrollable_chat_content_while_chatting(self):
         with patch("tui_main.list_models", return_value=sample_models()):
             port = StubPort(running=True, chunks=["Hi"])
             app = ChatUI(port=port)
             app.first_message = False
             async with app.run_test() as pilot:
                 app.show_chat_ui()
-                header = app.query_one("#chat-header-logo")
-                self.assertTrue(header.display)
+                child_ids = [child.id for child in app.query_one("#chat").children]
+                self.assertIn("welcome-logo", child_ids)
+                self.assertIn("welcome-prompt", child_ids)
 
                 app.query_one("#input").load_text("hello")
                 await app.action_submit()
                 await app.controller._stream_task
                 await pilot.pause()
 
-                self.assertTrue(app.query_one("#chat-header-logo").display)
+                child_ids = [child.id for child in app.query_one("#chat").children]
+                self.assertIn("welcome-logo", child_ids)
 
 
 if __name__ == "__main__":

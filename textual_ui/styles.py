@@ -41,13 +41,6 @@ Screen {
     display: none;
 }
 
-#chat-header-logo {
-    width: 88;
-    color: #7a7a7a;
-    text-align: center;
-    margin-top: 1;
-}
-
 #chat {
     height: 1fr;
     width: 88;

@@ -78,7 +78,6 @@ class ChatUI(App):
             yield LoadingSpinner(id="load-spinner")
 
         with Vertical(id="chat-center"):
-            yield Static(LOGO, id="chat-header-logo")
             yield VerticalScroll(id="chat")
 
         with Center(id="command-menu-container"):
@@ -123,6 +122,7 @@ class ChatUI(App):
         self.query_one("#model-editor-container").display = False
         self.query_one("#chat-center").display = True
         self.query_one("#input-center").display = True
+        self._mount_welcome_screen()
         self.refresh_command_menu()
         self.query_one("#input").focus()
 
