@@ -4,24 +4,6 @@ import signal
 from pathlib import Path
 
 from tui_config import load_model_configs
-from tui_personalities import SYSTEM_PROMPT
-
-MODEL_PATH = os.getenv("MLX_MODEL", "/Users/zayaantaha/.omlx/models/SSHVL")
-
-BASE_CMD = [
-    "uv", "run", "python", "-m", "mlx_lm.chat",
-    "--model", MODEL_PATH,
-    "--temp", "0.7",
-    "--top-p", "0.8",
-    "--max-tokens", "32768",
-    "--xtc-probability", "0.0",
-    "--xtc-threshold", "0.0",
-    "--mtp",
-    "--turbo-kv-bits", "3",
-    "--turbo-fp16-layers", "2",
-    "--chat-template-args", '{"enable_thinking":false}',
-    "--system-prompt", SYSTEM_PROMPT,
-]
 
 TUI_PROMPT_MARKER = "<<KAPLUMBA_READY>> "
 

@@ -10,7 +10,6 @@ tk.key_to_character = safe_key_to_character
 
 
 import asyncio
-import os
 import random
 from pathlib import Path
 from textual.app import App, ComposeResult
@@ -18,12 +17,10 @@ from textual.widgets import Markdown, Static, Button
 from textual.containers import VerticalScroll, Vertical, Horizontal, Center, Middle
 from textual.events import Key, Click
 
-from tui_commands import BASE_CMD, MODEL_PATH, TUI_PROMPT_MARKER, ModelOrchestrator
+from tui_commands import TUI_PROMPT_MARKER, ModelOrchestrator
 from tui_styles import CHAT_CSS, LOGO, WELCOME_MESSAGES
 from tui_config import (
     DEFAULT_MODEL_OPTIONS,
-    MODEL_CONFIGS_PATH,
-    OPTIONS_STATE_PATH,
     load_model_configs,
     load_saved_model_options,
     normalize_model_options,
@@ -31,7 +28,7 @@ from tui_config import (
     save_model_options,
 )
 from tui_latex import format_for_display, strip_prompt_markers
-from tui_personalities import SYSTEM_PROMPT, PERSONALITIES
+from tui_personalities import PERSONALITIES
 
 
 
@@ -113,36 +110,6 @@ class ChatUI(App):
         self.query_one("#model-selector", ModelSelector).render_list()
         self.query_one("#model-selector-container").display = True
         self.query_one("#model-selector").focus()
-
-    def _build_model_command(self, model_path: str) -> list[str]:
-        # Merge per-model config overrides
-        opts = dict(self.model_options)
-        model_name = Path(model_path).name
-        configs = load_model_configs()
-        model_cfg = configs.get(model_name, {})
-        if model_cfg.get("options"):
-            opts.update(model_cfg["options"])
-
-        cmd = [
-            "uv", "run", "python", "-m", "mlx_lm.chat",
-            "--model", model_path,
-            "--prompt-marker", TUI_PROMPT_MARKER,
-            "--temp", str(opts["temp"]),
-            "--top-p", str(opts["top_p"]),
-            "--top-k", str(opts["top_k"]),
-            "--max-tokens", str(opts["max_tokens"]),
-            "--chat-template-args", '{"enable_thinking":false}',
-            "--system-prompt", self.current_system_prompt,
-        ]
-        if opts["mtp"]:
-            cmd.append("--mtp")
-        if opts["max_kv_size"] is not None:
-            cmd.extend(["--max-kv-size", str(opts["max_kv_size"])])
-        if opts["turbo_kv_bits"] is not None:
-            cmd.extend(["--turbo-kv-bits", str(int(opts["turbo_kv_bits"]))])
-        if opts["turbo_fp16_layers"] is not None:
-            cmd.extend(["--turbo-fp16-layers", str(opts["turbo_fp16_layers"])])
-        return cmd
 
     async def initialize_model(self):
         self.loading = True
