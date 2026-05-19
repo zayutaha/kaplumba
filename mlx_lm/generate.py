@@ -251,6 +251,17 @@ def setup_arg_parser():
         help="Use native Multi-Token Prediction for speculative decoding "
         "(requires a model with an MTP head, e.g. Qwen3.5).",
     )
+    parser.add_argument(
+        "--parallel-shards",
+        action="store_true",
+        help="Load safetensors shards in parallel for faster model loading.",
+    )
+    parser.add_argument(
+        "--fast-load",
+        action="store_true",
+        help="Overlap I/O with model construction and use madvise readahead "
+        "hints for faster model loading.",
+    )
     return parser
 
 
@@ -2336,6 +2347,8 @@ def main():
         adapter_path=args.adapter_path,
         tokenizer_config=tokenizer_config,
         model_config={"quantize_activations": args.quantize_activations},
+        parallel_shards=args.parallel_shards,
+        fast_load=args.fast_load,
     )
     for eos_token in args.extra_eos_token:
         tokenizer.add_eos_token(eos_token)
@@ -2380,7 +2393,11 @@ def main():
         prompt = tokenizer.encode(prompt)
 
     if args.draft_model is not None:
-        draft_model, draft_tokenizer = load(args.draft_model)
+        draft_model, draft_tokenizer = load(
+            args.draft_model,
+            parallel_shards=args.parallel_shards,
+            fast_load=args.fast_load,
+        )
         if draft_tokenizer.vocab_size != tokenizer.vocab_size:
             raise ValueError("Draft model tokenizer does not match model tokenizer.")
     else:

@@ -5,9 +5,12 @@ import glob
 import importlib
 import inspect
 import json
+import mmap
 import os
 import resource
 import shutil
+import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from textwrap import dedent
 from typing import (
@@ -279,12 +282,38 @@ def load_config(model_path: Path) -> dict:
     return config
 
 
+def _parse_safetensor_keys(filepath):
+    """Read safetensor header to extract tensor names (no data loading)."""
+    with open(filepath, "rb") as f:
+        nbytes = int.from_bytes(f.read(8), "little")
+        header = json.loads(f.read(nbytes))
+    return set(header.keys())
+
+
+def _prefetch_mmap(filepath):
+    """mmap + madvise WILLNEED to trigger async readahead."""
+    try:
+        fd = os.open(filepath, os.O_RDONLY)
+        size = os.fstat(fd).st_size
+        if size == 0:
+            os.close(fd)
+            return
+        mm = mmap.mmap(fd, size, access=mmap.ACCESS_READ)
+        mm.madvise(mmap.MADV_WILLNEED, 0, size)
+        mm.close()
+        os.close(fd)
+    except (OSError, AttributeError, mmap.error):
+        pass
+
+
 def load_model(
     model_path: Path,
     lazy: bool = False,
     strict: bool = True,
     model_config: Optional[Dict[str, Any]] = None,
     get_model_classes: Callable[[dict], Tuple[Type[nn.Module], Type]] = _get_classes,
+    parallel_shards: bool = False,
+    fast_load: bool = False,
 ) -> Tuple[nn.Module, dict]:
     """
     Load and initialize the model from a given path.
@@ -301,6 +330,10 @@ def load_model(
         get_model_classes (Callable[[dict], Tuple[Type[nn.Module], Type]], optional):
             A function that returns the model class and model args class given a config.
             Defaults to the ``_get_classes`` function.
+        parallel_shards (bool): If True, load safetensors shards in parallel
+            using a thread pool. Default: ``False``
+        fast_load (bool): If True, overlap I/O with model construction and
+            use madvise readahead hints. Default: ``False``
 
     Returns:
         Tuple[nn.Module, dict[str, Any]]: The loaded and initialized model and config.
@@ -313,41 +346,93 @@ def load_model(
     if model_config is not None:
         config.update(model_config)
 
-    weight_files = glob.glob(str(model_path / "model*.safetensors"))
+    weight_files = sorted(glob.glob(str(model_path / "model*.safetensors")))
 
     if not weight_files and strict:
         raise FileNotFoundError(f"No safetensors found in {model_path}")
 
+    # --- Load weights (standard or fast/overlapped) ---
     weights = {}
-    for wf in weight_files:
-        weights.update(mx.load(wf))
+    model_class = model_args_class = model_args = model = None
 
-    if (model_file := config.get("model_file")) is not None:
-        spec = importlib.util.spec_from_file_location(
-            "custom_model",
-            model_path / model_file,
-        )
-        arch = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(arch)
-        model_class, model_args_class = arch.Model, arch.ModelArgs
+    if fast_load and weight_files:
+        import threading as _threading
+
+        _loader_exc = None
+        _lock = _threading.Lock()
+
+        def _load_all():
+            nonlocal _loader_exc
+            try:
+                for wf in weight_files:
+                    loaded = mx.load(wf)
+                    with _lock:
+                        weights.update(loaded)
+            except Exception as e:
+                _loader_exc = e
+
+        loader = _threading.Thread(target=_load_all, daemon=True)
+        loader.start()
+
+        # Build skeleton in main thread while I/O runs
+        if (model_file := config.get("model_file")) is not None:
+            spec = importlib.util.spec_from_file_location(
+                "custom_model",
+                model_path / model_file,
+            )
+            arch = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(arch)
+            model_class, model_args_class = arch.Model, arch.ModelArgs
+        else:
+            model_class, model_args_class = get_model_classes(config=config)
+
+        if "quantization_config" not in config:
+            text_config = config.get("text_config", {})
+            if "quantization_config" in text_config:
+                config["quantization_config"] = text_config["quantization_config"]
+
+        model_args = model_args_class.from_dict(config)
+        model = model_class(model_args)
+
+        loader.join()
+        if _loader_exc is not None:
+            raise _loader_exc
+
     else:
-        model_class, model_args_class = get_model_classes(config=config)
+        if parallel_shards and len(weight_files) > 1:
+            with ThreadPoolExecutor(max_workers=len(weight_files)) as pool:
+                futures = {pool.submit(mx.load, wf): wf for wf in weight_files}
+                for future in as_completed(futures):
+                    weights.update(future.result())
+        else:
+            for wf in weight_files:
+                weights.update(mx.load(wf))
 
-    if "quantization_config" not in config:
-        text_config = config.get("text_config", {})
-        if "quantization_config" in text_config:
-            config["quantization_config"] = text_config["quantization_config"]
+        if (model_file := config.get("model_file")) is not None:
+            spec = importlib.util.spec_from_file_location(
+                "custom_model",
+                model_path / model_file,
+            )
+            arch = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(arch)
+            model_class, model_args_class = arch.Model, arch.ModelArgs
+        else:
+            model_class, model_args_class = get_model_classes(config=config)
 
-    model_args = model_args_class.from_dict(config)
+        if "quantization_config" not in config:
+            text_config = config.get("text_config", {})
+            if "quantization_config" in text_config:
+                config["quantization_config"] = text_config["quantization_config"]
 
-    model = model_class(model_args)
+        model_args = model_args_class.from_dict(config)
+        model = model_class(model_args)
 
+    # --- Shared: sanitize + quantize + load_weights ---
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
 
     def _quantize(quantization):
         def class_predicate(p, m):
-            # Handle custom per layer quantizations
             if p in config["quantization"]:
                 return config["quantization"][p]
             if not hasattr(m, "to_quantized"):
@@ -366,7 +451,6 @@ def load_model(
         _quantize(quantization)
 
     elif quantization_config := config.get("quantization_config", False):
-        # Handle legacy quantization config
         quant_method = quantization_config["quant_method"]
         if quant_method == "bitnet":
             from .models.bitlinear_layers import bitnet_quantize
@@ -383,7 +467,6 @@ def load_model(
             config["quantization_config"] = quantization
             _quantize(quantization)
         elif quant_method in ("awq", "gptq"):
-            # Transform AutoAWQ/GPTQ packed weights to MLX format
             weights, quantization = _transform_awq_weights(weights, quantization_config)
             config["quantization"] = quantization
             config["quantization_config"] = quantization
@@ -404,11 +487,11 @@ def load_model(
                 out_dims, in_dims = m.weight.shape
                 in_dims *= 32 // m.bits
                 return nn.QQLinear(in_dims, out_dims, m.group_size, m.bits, m.mode)
-            else:
-                return m
+            return m
 
-        leaves = tree_map(_maybe_qq, model.leaf_modules(), is_leaf=nn.Module.is_module)
-
+        leaves = tree_map(
+            _maybe_qq, model.leaf_modules(), is_leaf=nn.Module.is_module
+        )
         model.update_modules(leaves)
 
     model.eval()
@@ -458,6 +541,8 @@ def load(
     lazy: bool = False,
     return_config: bool = False,
     revision: Optional[str] = None,
+    parallel_shards: bool = False,
+    fast_load: bool = False,
 ) -> Union[
     Tuple[nn.Module, TokenizerWrapper],
     Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]],
@@ -478,6 +563,8 @@ def load(
             when needed. Default: ``False``
         return_config (bool: If ``True`` return the model config as the last item..
         revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
+        parallel_shards (bool): If True, load safetensors shards in parallel.
+        fast_load (bool): If True, use madvise readahead + overlap I/O with model construction.
     Returns:
         Union[Tuple[nn.Module, TokenizerWrapper], Tuple[nn.Module, TokenizerWrapper, Dict[str, Any]]]:
             A tuple containing the loaded model, tokenizer and, if requested, the model config.
@@ -488,7 +575,13 @@ def load(
     """
     model_path = _download(path_or_hf_repo, revision=revision)
 
-    model, config = load_model(model_path, lazy, model_config=model_config)
+    model, config = load_model(
+        model_path,
+        lazy,
+        model_config=model_config,
+        parallel_shards=parallel_shards,
+        fast_load=fast_load,
+    )
     if adapter_path is not None:
         model = load_adapters(model, adapter_path)
         model.eval()
@@ -778,6 +871,9 @@ def quantize_model(
     bits: Optional[int],
     mode: str = "affine",
     quant_predicate: Optional[Callable[[str, nn.Module], Union[bool, dict]]] = None,
+    turboquant: bool = False,
+    tq_group_dim: int = 16,
+    tq_seed: int = 42,
 ) -> Tuple[nn.Module, dict]:
     """
     Applies quantization to the model weights.
@@ -785,18 +881,44 @@ def quantize_model(
     Args:
         model (nn.Module): The model to be quantized.
         config (dict): Model configuration.
-        group_size (Optional[int]): Group size for quantization.
+        group_size (Optional[int]): Group size for quantization (affine).
         bits (Optional[int]): Bits per weight for quantization.
         mode (str): The quantization mode.
         quant_predicate (Callable): A callable that decides how to quantize
           each layer based on the path. Accepts the layer `path` and the
           `module`. Returns either a bool to signify quantize/no quantize or
           a dict of quantization parameters to pass to `to_quantized`.
+        turboquant (bool): Use TurboQuant (PolarQuant) instead of affine.
+        tq_group_dim (int): Group/vector dimension for TurboQuant.
+        tq_seed (int): Random seed for TurboQuant rotation.
 
     Returns:
         Tuple: Tuple containing quantized model and config.
     """
 
+    if turboquant:
+        from .quant.turboquant_weights import (
+            turboquant_quantize_model,
+            effective_bpw,
+        )
+        bits = bits or 4
+        bpw = effective_bpw(bits, tq_group_dim)
+        model = turboquant_quantize_model(
+            model, bits=bits, group_dim=tq_group_dim, seed=tq_seed,
+        )
+        quantized_config = copy.deepcopy(config)
+        quantized_config["quantization"] = {
+            "turboquant": True,
+            "bits": bits,
+            "group_dim": tq_group_dim,
+            "seed": tq_seed,
+            "bpw": bpw,
+        }
+        quantized_config["quantization_config"] = quantized_config["quantization"]
+        print(f"[INFO] Quantized model with {bpw:.3f} bits per weight (TurboQuant).")
+        return model, quantized_config
+
+    # Original affine quantization logic follows
     def defaults_for_mode(mode, group_size, bits):
         mode_defaults = {
             "affine": (64, 4),

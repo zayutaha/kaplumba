@@ -9,7 +9,7 @@ from urllib import request
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten, tree_map, tree_map_with_path
+from mlx.utils import tree_flatten, tree_map, tree_map_with_path, tree_unflatten
 from tqdm import tqdm
 
 from mlx_lm.models.base import create_attention_mask
@@ -140,11 +140,41 @@ deepseek_v2_awq = AWQConfig(
     ],
 )
 
+qwen3_5_awq = AWQConfig(
+    embed="embed_tokens",
+    lm_head="lm_head",
+    lm_key="language_model",
+    no_clip=["q_proj", "k_proj", "in_proj_qkv"],
+    scale_configs=[
+        ScaleConfig(
+            block="self_attn",
+            prev="input_layernorm",
+            layers=["q_proj", "k_proj", "v_proj"],
+            kwargs=["mask"],
+            use_config=lambda b: hasattr(b, "self_attn"),
+        ),
+        ScaleConfig(
+            block="linear_attn",
+            prev="input_layernorm",
+            layers=["in_proj_qkv", "in_proj_z", "in_proj_b", "in_proj_a"],
+            kwargs=["mask"],
+            use_config=lambda b: hasattr(b, "linear_attn"),
+        ),
+        ScaleConfig(prev="mlp.up_proj", layers=["mlp.down_proj"]),
+        ScaleConfig(
+            block="mlp",
+            prev="post_attention_layernorm",
+            layers=["gate_proj", "up_proj"],
+        ),
+    ],
+)
+
 AWQ_MODEL_CONFIGS = {
     "llama": llama_awq,
     "mistral": llama_awq,
     "qwen2": llama_awq,
     "qwen3": llama_awq,
+    "qwen3_5": qwen3_5_awq,
     "gemma3_text": gemma3_text_awq,
     "gemma3": update(gemma3_text_awq, lm_key="language_model"),
     "deepseek_v2": deepseek_v2_awq,
@@ -449,6 +479,19 @@ def awq_quantize(
 
         return Catcher()
 
+    def dequantize_block(b):
+        updates = []
+        for name, m in b.named_modules():
+            if isinstance(m, nn.QuantizedLinear):
+                w = mx.dequantize(
+                    m.weight, m.scales, m.biases, m.group_size, m.bits, m.mode
+                )
+                new_linear = nn.Linear(w.shape[0], w.shape[1], bias=False)
+                new_linear.weight = w
+                updates.append((name, new_linear))
+        if updates:
+            b.update_modules(tree_unflatten(updates))
+
     for e, block in enumerate(tqdm(model.layers)):
         # Capture the input features for each of the layers in the transformer block
         orig_leaves = block.leaf_modules()
@@ -457,6 +500,11 @@ def awq_quantize(
         outputs = run_layer(block, inputs, mask=mask)
         block.update_modules(orig_leaves)
         del capture_leaves
+
+        # If model is already quantized, dequantize block to get fp16 weights for AWQ
+        dequantize_block(block)
+        orig_leaves = block.leaf_modules()
+        orig_params = block.parameters()
 
         # Quantize the block without AWQ to obtain a reference loss
         nn.quantize(block, group_size=group_size, bits=bits)
