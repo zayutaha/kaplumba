@@ -1,4 +1,5 @@
 import asyncio
+import re
 
 from textual.containers import VerticalScroll
 
@@ -18,6 +19,15 @@ def _has_thinking_end(text: str) -> bool:
     return "</think>" in text or "<channel|>" in text
 
 
+def _remove_thinking_blocks(text: str) -> str:
+    """Remove all thinking block content (everything between opening and closing tags)."""
+    # Remove Qwen thinking blocks: <think>...content...</think>
+    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    # Remove Gemma thinking blocks: <|channel>...content...<channel|>
+    text = re.sub(r'<\|channel>.*?<channel\|>', '', text, flags=re.DOTALL)
+    return text
+
+
 async def run_model_stream(chat, port, user_text: str):
     if chat.first_message:
         await asyncio.sleep(2)
@@ -33,13 +43,13 @@ async def run_model_stream(chat, port, user_text: str):
     buf = ""
     thinking_spinner_frame = 0
     in_thinking = False  # Track if we're currently in a thinking block
+    thinking_processed = False  # Track if we've already handled thinking
 
     def get_display_text(buffer):
         """Extract text after the last closing think tag."""
         # Handle both </think> and <channel|>
         last_think_end = buffer.rfind("</think>")
         last_channel_end = buffer.rfind("<channel|>")
-        last_end = max(last_think_end, last_channel_end)
         
         if last_think_end > last_channel_end:
             last_end = last_think_end + len("</think>")
@@ -48,7 +58,7 @@ async def run_model_stream(chat, port, user_text: str):
         else:
             return ""
             
-        if last_end >= 0:
+        if last_end > 0:
             return buffer[last_end:].strip()
         return ""
 
@@ -56,8 +66,8 @@ async def run_model_stream(chat, port, user_text: str):
         async for chunk in port.send_message(user_text):
             buf += chunk
             
-            # Auto-detect thinking if it appears (for Gemma 4) or if explicitly enabled
-            if not in_thinking and _detect_thinking_start(buf):
+            # Auto-detect thinking if it appears (for Gemma 4) and we haven't processed it yet
+            if not thinking_processed and not in_thinking and _detect_thinking_start(buf):
                 in_thinking = True
             
             # Handle thinking mode (either explicit /think or auto-detected)
@@ -68,11 +78,17 @@ async def run_model_stream(chat, port, user_text: str):
                     await chat.handle_stream_chunk(f"Thinking {spinner_char}", show_cursor=False)
                     thinking_spinner_frame += 1
                 else:
-                    # Thinking is done - show content after thinking block
+                    # Thinking is done - extract content after thinking block
                     display = strip_prompt_markers(get_display_text(buf))
                     if display:
                         await chat.handle_stream_chunk(format_for_display(display))
                     in_thinking = False
+                    thinking_processed = True
+            elif thinking_processed:
+                # After thinking was processed, continue showing content
+                display = strip_prompt_markers(get_display_text(buf))
+                if display:
+                    await chat.handle_stream_chunk(format_for_display(display))
             else:
                 # No thinking - display normally
                 display = strip_prompt_markers(buf)
@@ -84,12 +100,12 @@ async def run_model_stream(chat, port, user_text: str):
         return
 
     if chat.interrupted:
-        display = strip_prompt_markers(buf) + "\n\n*— stopped*"
+        display = _remove_thinking_blocks(strip_prompt_markers(buf)) + "\n\n*— stopped*"
         chat.interrupted = False
     elif in_thinking or explicit_thinking:
-        display = strip_prompt_markers(get_display_text(buf))
+        display = _remove_thinking_blocks(strip_prompt_markers(get_display_text(buf)))
     else:
-        display = strip_prompt_markers(buf)
+        display = _remove_thinking_blocks(strip_prompt_markers(buf))
 
     try:
         await chat.handle_stream_finished(format_for_display(display))

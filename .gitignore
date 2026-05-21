@@ -140,3 +140,4 @@ dmypy.json
 
 bench*
 mlx-vlm/
+opencode/
