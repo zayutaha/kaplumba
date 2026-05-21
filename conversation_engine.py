@@ -43,6 +43,7 @@ async def run_model_stream(chat, port, user_text: str):
     buf = ""
     thinking_spinner_frame = 0
     in_thinking = False  # Track if we're currently in a thinking block
+    thinking_processed = False  # Track if we've already handled thinking
 
     def get_display_text(buffer):
         """Extract text after the last closing think tag."""
@@ -65,9 +66,8 @@ async def run_model_stream(chat, port, user_text: str):
         async for chunk in port.send_message(user_text):
             buf += chunk
             
-            # Auto-detect thinking only if NOT explicitly triggered by /think
-            # (avoid auto-detecting on every message if model naturally outputs thinking tags)
-            if not explicit_thinking and not in_thinking and _detect_thinking_start(buf):
+            # Auto-detect thinking if it appears (for Gemma 4) and we haven't processed it yet
+            if not thinking_processed and not in_thinking and _detect_thinking_start(buf):
                 in_thinking = True
             
             # Handle thinking mode (either explicit /think or auto-detected)
@@ -83,6 +83,12 @@ async def run_model_stream(chat, port, user_text: str):
                     if display:
                         await chat.handle_stream_chunk(format_for_display(display))
                     in_thinking = False
+                    thinking_processed = True
+            elif thinking_processed:
+                # After thinking was processed, continue showing content
+                display = strip_prompt_markers(get_display_text(buf))
+                if display:
+                    await chat.handle_stream_chunk(format_for_display(display))
             else:
                 # No thinking - display normally
                 display = strip_prompt_markers(buf)
