@@ -325,10 +325,11 @@ class ChatUI(App):
         except Exception:
             pass
 
-    async def handle_stream_chunk(self, display: str) -> None:
+    async def handle_stream_chunk(self, display: str, show_cursor: bool = True) -> None:
         try:
             if self.current_md and getattr(self.current_md, "_generation", 0) == self._stream_generation:
-                await self.current_md.update(f"{display} ▌")
+                cursor = " ▌" if show_cursor else ""
+                await self.current_md.update(f"{display}{cursor}")
         except Exception:
             pass
 

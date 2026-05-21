@@ -5,6 +5,9 @@ from textual.containers import VerticalScroll
 from textual_ui.latex import format_for_display, strip_prompt_markers
 
 
+THINKING_SPINNER = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+
+
 async def run_model_stream(chat, port, user_text: str):
     if chat.first_message:
         await asyncio.sleep(2)
@@ -18,6 +21,7 @@ async def run_model_stream(chat, port, user_text: str):
     chat_widget = chat.query_one("#chat", VerticalScroll)
     thinking_enabled = user_text.startswith("/think")
     buf = ""
+    thinking_spinner_frame = 0
 
     def get_display_text(buffer):
         last_end = buffer.rfind("</think>")
@@ -30,7 +34,9 @@ async def run_model_stream(chat, port, user_text: str):
             buf += chunk
             if thinking_enabled:
                 if "</think>" not in buf:
-                    await chat.handle_stream_chunk("Thinking...")
+                    spinner_char = THINKING_SPINNER[thinking_spinner_frame % len(THINKING_SPINNER)]
+                    await chat.handle_stream_chunk(f"Thinking {spinner_char}", show_cursor=False)
+                    thinking_spinner_frame += 1
                 else:
                     display = strip_prompt_markers(get_display_text(buf))
                     if display:
