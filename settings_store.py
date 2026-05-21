@@ -18,11 +18,16 @@ DEFAULT_MODEL_OPTIONS = {
     "turbo_kv_bits": 3,
     "turbo_fp16_layers": 2,
     "mtp": True,
+    "min_p": 0.0,
+    "repetition_penalty": 1.0,
+    "enable_thinking": False,
 }
 
 OPTIONS_STATE_PATH = Path.home() / ".omlx" / "chat_options.json"
 
 MODEL_CONFIGS_PATH = Path.home() / ".omlx" / "model_configs.json"
+
+PERSONALITY_CHOICES = ["default", "doctor", "historian"]
 
 OPTION_SPECS = [
     {
@@ -42,6 +47,18 @@ OPTION_SPECS = [
         "label": "Top-k",
         "choices": [0, 20, 40, 60, 80, 100, 120, 200],
         "description": "0 disables it. Higher keeps more candidates.",
+    },
+    {
+        "key": "min_p",
+        "label": "Min-p",
+        "choices": [0.0, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5],
+        "description": "Minimum token probability (scaled by top token). 0 = off.",
+    },
+    {
+        "key": "repetition_penalty",
+        "label": "Rep penalty",
+        "choices": [1.0, 1.05, 1.1, 1.15, 1.2, 1.3, 1.5, 2.0],
+        "description": "Penalizes repeated tokens. 1.0 = off.",
     },
     {
         "key": "max_tokens",
@@ -73,6 +90,12 @@ OPTION_SPECS = [
         "choices": [0, 1, 2, 4, 8],
         "description": "Higher keeps more layers in FP16.",
     },
+    {
+        "key": "enable_thinking",
+        "label": "Thinking",
+        "choices": [True, False],
+        "description": "Enable thinking tags for supported models.",
+    },
 ]
 
 
@@ -89,19 +112,22 @@ def normalize_model_options(options: dict[str, object] | None) -> dict[str, obje
     return normalized
 
 
-def load_saved_model_options() -> dict[str, object]:
-    try:
-        with open(OPTIONS_STATE_PATH) as f:
-            data = json.load(f)
-    except Exception:
-        return dict(DEFAULT_MODEL_OPTIONS)
-    return normalize_model_options(data)
+def _model_config_for(model_name: str) -> dict:
+    return load_model_configs().get(model_name, {})
 
 
-def save_model_options(options: dict[str, object]) -> None:
-    OPTIONS_STATE_PATH.parent.mkdir(parents=True, exist_ok=True)
-    with open(OPTIONS_STATE_PATH, "w") as f:
-        json.dump(normalize_model_options(options), f, indent=2, sort_keys=True)
+def get_model_options(model_name: str) -> dict[str, object]:
+    return normalize_model_options(_model_config_for(model_name).get("options", {}))
+
+
+def get_model_personality(model_name: str) -> str:
+    return _model_config_for(model_name).get("personality", "default")
+
+
+def save_model_config(model_name: str, options: dict, personality: str) -> None:
+    configs = load_model_configs()
+    configs[model_name] = {"options": normalize_model_options(options), "personality": personality}
+    save_model_configs(configs)
 
 
 def load_model_configs() -> dict:

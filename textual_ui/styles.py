@@ -198,24 +198,6 @@ Screen {
 }
 
 #options-selector {
-    width: 60;
-    height: auto;
-    max-height: 30;
-    background: #1a1a1a;
-    border: round #f0a500;
-    padding: 2;
-    color: #d8d8d8;
-}
-
-#model-editor-container {
-    layout: vertical;
-    width: 100%;
-    height: 100%;
-    align: center middle;
-    display: none;
-}
-
-#model-editor {
     width: 70;
     height: auto;
     max-height: 35;

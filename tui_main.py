@@ -25,7 +25,6 @@ from textual_ui.personas import PERSONALITIES
 from textual_ui.widgets.chat_input import ChatInput
 from textual_ui.widgets.loading_spinner import LoadingSpinner
 from textual_ui.widgets.model_picker import ModelSelector
-from textual_ui.widgets.model_config_editor import ModelConfigEditor
 from textual_ui.widgets.options_selector import OptionsSelector
 from textual_ui.widgets.personality_selector import PersonalitySelector
 from textual_ui.widgets.slash_command_menu import SlashCommandMenu
@@ -70,9 +69,6 @@ class ChatUI(App):
         with Center(id="options-selector-container"):
             yield OptionsSelector({}, id="options-selector")
 
-        with Center(id="model-editor-container"):
-            yield ModelConfigEditor("", {}, id="model-editor")
-
         with Center(id="splash-container"):
             yield Static(LOGO, id="splash-logo")
             yield LoadingSpinner(id="load-spinner")
@@ -105,7 +101,6 @@ class ChatUI(App):
         self.query_one("#model-selector-container").display = True
         self.query_one("#personality-selector-container").display = False
         self.query_one("#options-selector-container").display = False
-        self.query_one("#model-editor-container").display = False
         self.query_one("#chat-center").display = False
         self.query_one("#input-center").display = False
         self.query_one("#command-menu-container").display = False
@@ -119,7 +114,6 @@ class ChatUI(App):
         self.query_one("#model-selector-container").display = False
         self.query_one("#personality-selector-container").display = False
         self.query_one("#options-selector-container").display = False
-        self.query_one("#model-editor-container").display = False
         self.query_one("#chat-center").display = True
         self.query_one("#input-center").display = True
         self._mount_welcome_screen()
@@ -131,7 +125,6 @@ class ChatUI(App):
         self.query_one("#model-selector-container").display = False
         self.query_one("#personality-selector-container").display = False
         self.query_one("#options-selector-container").display = False
-        self.query_one("#model-editor-container").display = False
         self.query_one("#chat-center").display = False
         self.query_one("#input-center").display = False
         self.query_one("#command-menu-container").display = False
@@ -233,22 +226,19 @@ class ChatUI(App):
         await self.controller.handle_model_selected(model_name)
 
     async def action_model_edit(self, model_name: str) -> None:
-        self.query_one("#model-editor-container").display = True
+        config = self.controller.get_model_config(model_name)
+        sel = self.query_one("#options-selector", OptionsSelector)
+        sel.set_editor_mode(model_name=model_name, options=config.get("options", {}), personality=config.get("personality", "default"))
+        self.query_one("#options-selector-container").display = True
         self.query_one("#model-selector-container").display = False
-        self.query_one("#options-selector-container").display = False
         self.query_one("#personality-selector-container").display = False
         self.query_one("#chat-center").display = False
         self.query_one("#input-center").display = False
-        editor = self.query_one("#model-editor", ModelConfigEditor)
-        editor.load_config(model_name, self.controller.get_model_config(model_name))
-        editor.focus()
+        sel.focus()
 
-    async def action_model_editor_save(self, config: dict) -> None:
-        await self.controller.handle_model_config_saved(
-            self.query_one("#model-editor", ModelConfigEditor).model_name,
-            config,
-        )
-        self.query_one("#model-editor-container").display = False
+    async def action_model_editor_save(self, model_name: str, config: dict) -> None:
+        await self.controller.handle_model_config_saved(model_name, config)
+        self.query_one("#options-selector-container").display = False
         self.query_one("#model-selector-container").display = True
         self.query_one("#model-selector", ModelSelector).focus()
 
@@ -294,18 +284,15 @@ class ChatUI(App):
         self.query_one("#command-menu-container").display = False
         self.query_one("#personality-selector-container").display = False
         self.query_one("#options-selector-container").display = False
-        self.query_one("#model-editor-container").display = False
         self.query_one("#model-selector-container").display = True
         self.query_one("#model-selector").focus()
 
     async def show_options_selector(self):
-        self.query_one("#splash-container").display = False
         self.query_one("#chat-center").display = False
         self.query_one("#input-center").display = False
         self.query_one("#command-menu-container").display = False
         self.query_one("#model-selector-container").display = False
         self.query_one("#personality-selector-container").display = False
-        self.query_one("#model-editor-container").display = False
         self.query_one("#options-selector", OptionsSelector).set_options(
             self.controller.model_options
         )
@@ -319,7 +306,6 @@ class ChatUI(App):
         self.query_one("#command-menu-container").display = False
         self.query_one("#model-selector-container").display = False
         self.query_one("#options-selector-container").display = False
-        self.query_one("#model-editor-container").display = False
         self.query_one("#personality-selector-container").display = True
         self.query_one("#personality-selector").focus()
 

@@ -6,10 +6,12 @@ from pathlib import Path
 from conversation_engine import run_model_stream
 from model_interface import FakeModelPort, MLXSubprocessAdapter, ModelPort
 from settings_store import (
+    DEFAULT_MODEL_OPTIONS,
+    get_model_options,
+    get_model_personality,
     load_model_configs,
-    load_saved_model_options,
+    save_model_config,
     save_model_configs,
-    save_model_options,
 )
 from textual_ui.personas import PERSONALITIES
 
@@ -20,7 +22,7 @@ class Orchestrator:
         self.port: ModelPort = port or MLXSubprocessAdapter()
         self.selected_model: str | None = None
         self.selected_personality = "default"
-        self.model_options = load_saved_model_options()
+        self.model_options = dict(DEFAULT_MODEL_OPTIONS)
         self.crash_count = 0
         self.max_crashes = 3
         self.reloading = False
@@ -67,11 +69,10 @@ class Orchestrator:
 
         await self.chat.handle_stream_text(user_text)
         self.chat._set_busy(True)
-        
-        # Cancel previous stream task to avoid race condition
+
         if self._stream_task and not self._stream_task.done():
             self._stream_task.cancel()
-        
+
         self._stream_task = asyncio.create_task(self._run_stream(user_text))
 
     async def _run_stream(self, user_text: str) -> None:
@@ -103,9 +104,8 @@ class Orchestrator:
 
     async def handle_model_selected(self, model_name: str) -> None:
         self.selected_model = model_name
-        configs = load_model_configs()
-        model_cfg = configs.get(model_name, {})
-        self.selected_personality = model_cfg.get("personality", "default")
+        self.model_options = get_model_options(model_name)
+        self.selected_personality = get_model_personality(model_name)
         self.chat.show_model_loading(f"Loading {model_name}...")
         await self.port.stop()
         await self._load_model()
@@ -139,8 +139,11 @@ class Orchestrator:
         self.chat.show_model_selector()
 
     async def handle_options_selected(self, options: dict) -> None:
-        self.model_options = options
-        save_model_options(self.model_options)
+        if not self.selected_model:
+            return
+        personality = get_model_personality(self.selected_model)
+        save_model_config(self.selected_model, options, personality)
+        self.model_options = get_model_options(self.selected_model)
         if self.port.running:
             self.chat.show_model_loading("Reloading model...")
             await self.port.stop()
@@ -149,11 +152,12 @@ class Orchestrator:
         self.chat.show_model_selector()
 
     async def handle_model_config_saved(self, model_name: str, config: dict) -> None:
-        configs = load_model_configs()
-        configs[model_name] = config
-        save_model_configs(configs)
+        options = config.get("options", {})
+        personality = config.get("personality", "default")
+        save_model_config(model_name, options, personality)
         if self.selected_model == model_name:
-            self.selected_personality = config.get("personality", self.selected_personality)
+            self.model_options = get_model_options(model_name)
+            self.selected_personality = personality
 
     async def handle_crash_from_chat(self, message: str = "") -> None:
         self.chat._set_busy(False)
