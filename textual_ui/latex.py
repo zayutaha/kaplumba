@@ -80,12 +80,4 @@ def format_for_display(text: str) -> str:
 def strip_prompt_markers(text: str) -> str:
     lines = text.splitlines()
     clean = [l for l in lines if not l.startswith("[INFO]")]
-    result = "\n".join(clean).strip()
-    
-    # Remove Qwen thinking tags
-    result = result.replace("<think>", "").replace("</think>", "")
-    
-    # Remove Gemma thinking tags
-    result = result.replace("<|channel>", "").replace("<channel|>", "")
-    
-    return result
+    return "\n".join(clean).strip()
