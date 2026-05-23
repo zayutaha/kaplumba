@@ -20,11 +20,12 @@ class SmallModelManager:
     Before loading, unloads enough layers from the main model to fit.
     """
 
-    def __init__(self):
+    def __init__(self, turbo_kv_bits: int = 3):
         self.model = None
         self.tokenizer = None
         self._loaded = False
         self._restore = lambda: None
+        self.turbo_kv_bits = turbo_kv_bits
 
     @property
     def loaded(self) -> bool:
@@ -70,7 +71,7 @@ class SmallModelManager:
             add_generation_prompt=True,
             add_special_tokens=True,
         )
-        cache = make_prompt_cache(self.model)
+        cache = make_prompt_cache(self.model, turbo_kv_bits=self.turbo_kv_bits)
         sampler = make_sampler(
             temp, top_p=1.0, top_k=0,
             xtc_special_tokens=(
