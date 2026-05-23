@@ -111,21 +111,26 @@ def run_research(topic: str, model, tokenizer, args,
         # 4. Coverage-Aware Selection
         selected = coverage_aware_selection(memory, count=8)
 
-        # 5. Scrape selected docs
+        # 5. Scrape selected docs — filter low-quality pages
+        LOW_QUALITY_DOMAINS = ["youtube.com", "pinterest.com", "facebook.com",
+                               "twitter.com", "instagram.com", "tiktok.com"]
         scraped_docs = []
         for doc in selected:
             url = doc.get("url", "")
             if not url:
                 continue
+            # Skip low-value domains
+            if any(d in url.lower() for d in LOW_QUALITY_DOMAINS):
+                continue
             content = scrape_url(url)
-            if content:
+            if content and len(content) > 200:  # Skip near-empty pages
                 scraped_docs.append({
                     "title": doc.get("title", ""),
                     "url": url,
                     "content": content,
                 })
 
-        # 6. Normalize (one batch call) — still uses small model
+        # 6. Normalize (optional enhancement) — then build context with RAW content
         normalized = normalize_docs(
             scraped_docs, model, tokenizer, args, chat_template_kwargs
         )
@@ -136,16 +141,15 @@ def run_research(topic: str, model, tokenizer, args,
 
         # 7. Build context package for big model
         context_section = ""
-        for nd in normalized:
+        for i, nd in enumerate(normalized):
             context_section += f"\n## {nd['title']}\n"
             context_section += f"Source: {nd['url']}\n"
-            context_section += f"Summary: {nd['summary']}\n"
-            if nd.get("key_facts"):
-                context_section += f"Key facts: {'; '.join(nd['key_facts'][:10])}\n"
-            if nd.get("entities"):
-                context_section += f"Entities: {', '.join(nd['entities'][:10])}\n"
-            if nd.get("themes"):
-                context_section += f"Themes: {', '.join(nd['themes'][:5])}\n"
+            if nd.get("summary"):
+                context_section += f"Summary: {nd['summary']}\n"
+            # Include raw content so big model isn't limited by Qwen's summaries
+            if i < len(scraped_docs) and scraped_docs[i].get("content"):
+                raw = scraped_docs[i]["content"]
+                context_section += f"Content: {raw[:3000]}\n"
             context_section += "\n"
 
         return {

@@ -1,6 +1,6 @@
 """Document normalization — batch process scraped docs into structured format."""
 
-from ._utils import call_cheap, call_model
+from ._utils import call_model
 
 
 def normalize_docs(scraped_docs: list[dict], model, tokenizer, args,
@@ -16,7 +16,8 @@ def normalize_docs(scraped_docs: list[dict], model, tokenizer, args,
     for i, doc in enumerate(scraped_docs):
         title = doc.get("title", "Untitled")
         content = doc.get("content", "")
-        docs_text += f"\n--- DOC {i+1}: {title} ---\n{content[:2000]}\n"
+        # Use more content so the model has enough to work with
+        docs_text += f"\n--- DOC {i+1}: {title} ---\n{content[:3000]}\n"
 
     messages = [
         {"role": "system", "content": f"""You are a document normalizer.
@@ -42,12 +43,10 @@ DOC 2:
 Be factual. Do not add information not in the source. Prefer structure over prose."""},
         {"role": "user", "content": f"Topic context. Extract structured information from these documents:\n{docs_text}"},
     ]
-    result = call_cheap(messages, max_tokens=2048, temp=0.0)
-    if not result:
-        result = call_model(messages, max_tokens=2048, model=model,
-                            tokenizer=tokenizer, args=args,
-                            chat_template_kwargs=chat_template_kwargs,
-                            temp=0.0)
+    result = call_model(messages, max_tokens=2048, model=model,
+                        tokenizer=tokenizer, args=args,
+                        chat_template_kwargs=chat_template_kwargs,
+                        temp=0.0)
 
     # Parse results
     normalized = []
