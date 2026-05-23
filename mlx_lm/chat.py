@@ -498,16 +498,33 @@ def main():
                 try:
                     from .web_search import search_web, scrape_url
 
+                    def _is_relevant(title: str, snippet: str, original: str) -> bool:
+                        """Check if a search result is relevant to the original query."""
+                        keywords = set(original.lower().split())
+                        # Keep only meaningful words (3+ chars, not stopwords)
+                        stopwords = {"what", "who", "where", "when", "why", "how", "the",
+                                     "and", "for", "are", "was", "were", "has", "had",
+                                     "did", "does", "do", "is", "of", "to", "in", "on",
+                                     "at", "by", "with", "from", "that", "this", "its"}
+                        keywords = {k for k in keywords if len(k) >= 3 and k not in stopwords}
+                        if not keywords:
+                            return True
+                        combined = (title + " " + snippet).lower()
+                        matches = sum(1 for k in keywords if k in combined)
+                        # At least one keyword must match, or 30%+ of keywords
+                        return matches >= 1 or (len(keywords) > 0 and matches / len(keywords) >= 0.3)
+
                     # ── Pass 1: Generate 3 search queries using the model ──
                     rprint("[INFO] Generating search queries...")
                     qgen_messages = [
-                        {"role": "system", "content": "You generate diverse web search queries. Given a question, output 3 different search queries on separate lines. Each query should cover a different angle or phrasing. Do not number them. Do not include any other text."},
-                        {"role": "user", "content": f"Generate 3 search queries for: {search_query}"},
+                        {"role": "system", "content": "You are a search query generator. Given a question, output 3 concise web search queries on separate lines. Each query should cover a different angle of the question. Use proper names and keywords. Do NOT number the lines. Do NOT include any explanation. Example:\n\nQuestion: what happened to elon musk?\nOutput:\nelon musk news 2026\nelon musk latest updates\nelon musk biography history\n\nQuestion: biden climate policy changes\nOutput:\nBiden administration climate regulations 2026\nUS clean energy policy updates\nClimate change legislation 2025 2026"},
+                        {"role": "user", "content": f"Question: {search_query}\nOutput:"},
                     ]
                     qgen_prompt = tokenizer.apply_chat_template(
                         qgen_messages,
                         add_generation_prompt=True,
                         add_special_tokens=True,
+                        **chat_template_kwargs,
                     )
                     qgen_cache = make_prompt_cache(
                         model, args.max_kv_size,
@@ -537,30 +554,56 @@ def main():
                     ):
                         qgen_text += resp.text
 
-                    # Parse the 3 queries from the output
+                    # Parse queries from output
                     queries = [
                         line.strip().lstrip("0123456789.)- ")
                         for line in qgen_text.splitlines()
-                        if line.strip()
+                        if line.strip() and len(line.strip()) > 3
                     ][:3]
                     if not queries:
                         queries = [search_query]
+                    # Ensure original query is always included
+                    if search_query not in queries:
+                        queries.append(search_query)
                     rprint(f"[INFO] Generated {len(queries)} search queries")
 
                     # ── Pass 2: Search + scrape each query ──
                     search_context = ""
                     seen_urls = set()
+                    any_relevant = False
                     for q in queries:
                         rprint(f"[INFO] Searching: {q}")
-                        results = search_web(q, num_results=3)
+                        results = search_web(q, num_results=5)
                         for result in results:
                             url = result.get("url", "")
+                            title = result.get("title", "")
+                            snippet = result.get("snippet", "")
+                            if not url or url in seen_urls:
+                                continue
+                            # Skip if completely irrelevant to original query
+                            if not _is_relevant(title, snippet, search_query):
+                                continue
+                            seen_urls.add(url)
+                            any_relevant = True
+                            rprint(f"  -> scraping: {title}")
+                            scraped = scrape_url(url)
+                            if scraped:
+                                search_context += f"## {title}\nSource: {url}\n\n{scraped}\n\n---\n\n"
+                            break  # one result per query
+
+                    # If no relevant results from model queries, fall back to original query
+                    if not any_relevant:
+                        rprint("[INFO] No relevant results, trying original query...")
+                        results = search_web(search_query, num_results=5)
+                        for result in results:
+                            url = result.get("url", "")
+                            title = result.get("title", "")
                             if url and url not in seen_urls:
                                 seen_urls.add(url)
-                                rprint(f"  -> scraping: {result['title']}")
+                                rprint(f"  -> scraping: {title}")
                                 scraped = scrape_url(url)
                                 if scraped:
-                                    search_context += f"## {result['title']}\nSource: {url}\n\n{scraped}\n\n---\n\n"
+                                    search_context += f"## {title}\nSource: {url}\n\n{scraped}\n\n---\n\n"
                                 break
 
                     if not search_context:
@@ -571,7 +614,7 @@ def main():
                     messages = []
                     if current_system_prompt is not None:
                         messages.append({"role": "system", "content": current_system_prompt})
-                    messages.append({"role": "user", "content": f"""You are a search results analyst. Based ONLY on the search results below, answer the question. If the results don't contain enough info, say so. Cite sources.
+                    messages.append({"role": "user", "content": f"""Based ONLY on the search results below, answer the question. Cite sources. If the results are not about the question, say so.
 
 Question: {search_query}
 
