@@ -1,7 +1,7 @@
 """Topic framing — classify topic type and build dimension map."""
 
 from .memory import DIMENSION_TEMPLATES
-from ._utils import call_model
+from ._utils import call_cheap, call_model
 
 
 KNOWN_TYPES = set(DIMENSION_TEMPLATES.keys())
@@ -14,10 +14,12 @@ def infer_topic_type(topic: str, model, tokenizer, args,
         {"role": "system", "content": f"Classify this topic into exactly one type: {', '.join(sorted(KNOWN_TYPES))}. Output only the type name."},
         {"role": "user", "content": topic},
     ]
-    result = call_model(messages, max_tokens=16, model=model,
-                        tokenizer=tokenizer, args=args,
-                        chat_template_kwargs=chat_template_kwargs,
-                        temp=0.0)
+    result = call_cheap(messages, max_tokens=16, temp=0.0)
+    if not result:
+        result = call_model(messages, max_tokens=16, model=model,
+                            tokenizer=tokenizer, args=args,
+                            chat_template_kwargs=chat_template_kwargs,
+                            temp=0.0)
     result = result.strip().lower().rstrip(".")
     if result in KNOWN_TYPES:
         return result

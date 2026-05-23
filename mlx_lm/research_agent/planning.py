@@ -2,16 +2,13 @@
 
 import json
 
-from ._utils import call_model
+from ._utils import call_cheap, call_model
 from .memory import ResearchMemory
 
 
 def evaluate_coverage(memory: ResearchMemory, model, tokenizer, args,
                       chat_template_kwargs=None) -> dict:
-    """Assess which dimensions need more coverage.
-    
-    Returns updated dimension coverage dict.
-    """
+    """Assess which dimensions need more coverage."""
     dims_str = "\n".join(f"- {d}: {v:.1f}" for d, v in memory.dimensions.items())
     messages = [
         {"role": "system", "content": f"""You are a research coverage evaluator.
@@ -21,10 +18,12 @@ Output JSON: {{"dimension": score, ...}}
 Only output the JSON object."""},
         {"role": "user", "content": f"Topic: {memory.topic}\nType: {memory.topic_type}\nCurrent coverage:\n{dims_str}\nEntities seen: {memory.entities_seen[:10]}\nConcepts seen: {memory.concepts_seen[:10]}"},
     ]
-    result = call_model(messages, max_tokens=256, model=model,
-                        tokenizer=tokenizer, args=args,
-                        chat_template_kwargs=chat_template_kwargs,
-                        temp=0.0)
+    result = call_cheap(messages, max_tokens=256, temp=0.0)
+    if not result:
+        result = call_model(messages, max_tokens=256, model=model,
+                            tokenizer=tokenizer, args=args,
+                            chat_template_kwargs=chat_template_kwargs,
+                            temp=0.0)
     try:
         # Find JSON in output
         start = result.index("{")
@@ -60,10 +59,12 @@ Queries should be specific, use proper names and keywords.
 Do NOT number. Do NOT explain."""},
         {"role": "user", "content": f"Topic: {memory.topic}\nType: {memory.topic_type}\nDimensions needing coverage: {dims_str}\nAlready searched: {memory.searched_queries[-5:]}"},
     ]
-    result = call_model(messages, max_tokens=128, model=model,
-                        tokenizer=tokenizer, args=args,
-                        chat_template_kwargs=chat_template_kwargs,
-                        temp=0.3)
+    result = call_cheap(messages, max_tokens=128, temp=0.3)
+    if not result:
+        result = call_model(messages, max_tokens=128, model=model,
+                            tokenizer=tokenizer, args=args,
+                            chat_template_kwargs=chat_template_kwargs,
+                            temp=0.3)
     queries = []
     for line in result.splitlines():
         line = line.strip().lstrip("0123456789.)- ")
