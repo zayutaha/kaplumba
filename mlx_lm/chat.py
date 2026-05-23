@@ -613,6 +613,9 @@ Output the full research report now. Be extremely detailed — write pages, not 
 
                     message_history.append({"role": "user", "content": f"Research: {topic}"})
                     prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True, add_special_tokens=True, **chat_template_kwargs)
+                    # Disable MTP for research synthesis — re-enabled after generation
+                    model._saved_mtp = args.mtp
+                    args.mtp = False
                     rprint("[INFO] Synthesizing research report...\n")
                     continue
                 except Exception as e:
@@ -790,6 +793,12 @@ Output the full research report now. Be extremely detailed — write pages, not 
                     rprint(f"[INFO] Research output logged to {_rpath}")
                 except Exception:
                     pass
+
+            # Restore MTP after research synthesis
+            saved_mtp = getattr(model, '_saved_mtp', None)
+            if saved_mtp is not None:
+                args.mtp = saved_mtp
+                del model._saved_mtp
             
             rprint(
                 f"[INFO] Generated {last_response.generation_tokens} tokens "

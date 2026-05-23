@@ -46,7 +46,7 @@ Be factual. Do not add information not in the source. Prefer structure over pros
     result = call_model(messages, max_tokens=2048, model=model,
                         tokenizer=tokenizer, args=args,
                         chat_template_kwargs=chat_template_kwargs,
-                        temp=0.0)
+                        temp=0.0, mtp=False)
 
     # Parse results
     normalized = []

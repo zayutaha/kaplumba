@@ -32,7 +32,7 @@ def call_cheap(messages, max_tokens, temp=0.0):
 
 
 def call_model(messages, max_tokens, model, tokenizer, args,
-               chat_template_kwargs=None, temp=0.0):
+               chat_template_kwargs=None, temp=0.0, mtp=None):
     """Call the main model with messages and return generated text."""
     if model is None or tokenizer is None:
         return call_cheap(messages, max_tokens, temp=temp) if has_small_model() else ""
@@ -66,7 +66,7 @@ def call_model(messages, max_tokens, model, tokenizer, args,
         kv_bits=args.kv_bits,
         kv_group_size=args.kv_group_size,
         quantized_kv_start=args.quantized_kv_start,
-        mtp=args.mtp,
+        mtp=mtp if mtp is not None else args.mtp,
         prefill_step_size=args.prefill_step_size,
     ):
         text += resp.text
