@@ -490,109 +490,48 @@ def main():
                 rprint(f"[INFO] Cache memory: {cache_mem:.2f} GB | Peak memory: {peak_mem:.2f} GB")
                 continue
             
-            # Handle /search and /research commands
-            is_search = query.startswith("/search ")
-            is_research = query.startswith("/research ")
-            if is_search or is_research:
-                prefix = "/research " if is_research else "/search "
-                topic = query[len(prefix):].strip()
-                depth = 8 if is_research else 3
-                if not topic:
-                    rprint("[ERROR] Usage: /search <query> or /research <topic>")
+            # Handle /search — quick web answer
+            if query.startswith("/search "):
+                search_query = query[8:].strip()
+                if not search_query:
+                    rprint("[ERROR] Usage: /search <query>")
                     continue
                 try:
                     from .web_search import search_web, scrape_url, is_relevant
 
-                    # ── Pass 1: Generate N search queries ──
-                    rprint(f"[INFO] Generating {depth} search queries...")
+                    # Generate 3 queries
+                    rprint("[INFO] Generating search queries...")
                     qgen_messages = [
-                        {"role": "system", "content": f"You are a search query generator. Given a question, output {depth} concise web search queries on separate lines. Each query must cover a different angle. Use proper names and keywords. Do NOT number. Do NOT explain. Example:\n\nQuestion: what happened to elon musk?\nOutput:\nelon musk news 2026\nelon musk latest updates\nelon musk biography history\nelon musk companies tesla spacex\nelon musk controversies\n\nQuestion: biden climate policy changes\nOutput:\nBiden administration climate regulations 2026\nUS clean energy policy updates\nClimate change legislation 2025 2026\nEPA emissions rules biden\nParis agreement biden 2026"},
-                        {"role": "user", "content": f"Question: {topic}\nOutput:"},
+                        {"role": "system", "content": "You are a search query generator. Given a question, output 3 concise web search queries on separate lines. Each query must cover a different angle. Use proper names and keywords. Do NOT number. Do NOT explain.\n\nExample:\nQuestion: what happened to elon musk?\nOutput:\nelon musk news 2026\nelon musk latest updates\nelon musk biography history"},
+                        {"role": "user", "content": f"Question: {search_query}\nOutput:"},
                     ]
                     qgen_prompt = tokenizer.apply_chat_template(
-                        qgen_messages,
-                        add_generation_prompt=True,
-                        add_special_tokens=True,
-                        **chat_template_kwargs,
+                        qgen_messages, add_generation_prompt=True, add_special_tokens=True, **chat_template_kwargs,
                     )
-                    qgen_cache = make_prompt_cache(
-                        model, args.max_kv_size,
-                        turbo_kv_bits=args.turbo_kv_bits,
-                        turbo_fp16_layers=args.turbo_fp16_layers,
-                    )
-                    qgen_sampler = make_sampler(
-                        args.temp, args.top_p, top_k=args.top_k,
-                        xtc_threshold=args.xtc_threshold,
-                        xtc_probability=args.xtc_probability,
-                        xtc_special_tokens=(
-                            tokenizer.encode("\n") + list(tokenizer.eos_token_ids)
-                        ),
-                    )
+                    qgen_cache = make_prompt_cache(model, args.max_kv_size, turbo_kv_bits=args.turbo_kv_bits, turbo_fp16_layers=args.turbo_fp16_layers)
+                    qgen_sampler = make_sampler(args.temp, args.top_p, top_k=args.top_k, xtc_threshold=args.xtc_threshold, xtc_probability=args.xtc_probability, xtc_special_tokens=(tokenizer.encode("\n") + list(tokenizer.eos_token_ids)))
                     qgen_text = ""
-                    for resp in stream_generate(
-                        model, tokenizer, qgen_prompt,
-                        max_tokens=256, sampler=qgen_sampler,
-                        prompt_cache=qgen_cache,
-                        turbo_kv_bits=args.turbo_kv_bits,
-                        turbo_fp16_layers=args.turbo_fp16_layers,
-                        kv_bits=args.kv_bits,
-                        kv_group_size=args.kv_group_size,
-                        quantized_kv_start=args.quantized_kv_start,
-                        mtp=args.mtp,
-                        prefill_step_size=args.prefill_step_size,
-                    ):
+                    for resp in stream_generate(model, tokenizer, qgen_prompt, max_tokens=256, sampler=qgen_sampler, prompt_cache=qgen_cache, turbo_kv_bits=args.turbo_kv_bits, turbo_fp16_layers=args.turbo_fp16_layers, kv_bits=args.kv_bits, kv_group_size=args.kv_group_size, quantized_kv_start=args.quantized_kv_start, mtp=args.mtp, prefill_step_size=args.prefill_step_size):
                         qgen_text += resp.text
-
-                    queries = [
-                        line.strip().lstrip("0123456789.)- ")
-                        for line in qgen_text.splitlines()
-                        if line.strip() and len(line.strip()) > 3
-                    ][:depth]
+                    queries = [l.strip().lstrip("0123456789.)- ") for l in qgen_text.splitlines() if l.strip() and len(l.strip()) > 3][:3]
                     if not queries:
-                        queries = [topic]
-                    if topic not in queries:
-                        queries.append(topic)
-                    rprint(f"[INFO] Generated {len(queries)} search queries")
+                        queries = [search_query]
+                    if search_query not in queries:
+                        queries.append(search_query)
 
-                    # ── Pass 2: Search + scrape each query ──
+                    # Search + scrape 3 pages
                     search_context = ""
                     seen_urls = set()
-                    any_relevant = False
                     for q in queries:
                         rprint(f"[INFO] Searching: {q}")
-                        results = search_web(q, num_results=5)
-                        for result in results:
+                        for result in search_web(q, num_results=5):
                             url = result.get("url", "")
                             title = result.get("title", "")
-                            snippet = result.get("snippet", "")
-                            if not url or url in seen_urls:
-                                continue
-                            if not is_relevant(title, snippet, topic):
-                                continue
-                            seen_urls.add(url)
-                            any_relevant = True
-                            rprint(f"  -> scraping: {title}")
-                            scraped = scrape_url(url)
-                            if scraped:
-                                # Truncate each page to ~8K chars for research
-                                if is_research and len(scraped) > 8000:
-                                    scraped = scraped[:8000]
-                                search_context += f"## {title}\nSource: {url}\n\n{scraped}\n\n---\n\n"
-                            break
-
-                    if not any_relevant:
-                        rprint("[INFO] No relevant results, trying original query...")
-                        results = search_web(topic, num_results=5)
-                        for result in results:
-                            url = result.get("url", "")
-                            title = result.get("title", "")
-                            if url and url not in seen_urls:
+                            if url and url not in seen_urls and is_relevant(title, result.get("snippet", ""), search_query):
                                 seen_urls.add(url)
                                 rprint(f"  -> scraping: {title}")
                                 scraped = scrape_url(url)
                                 if scraped:
-                                    if is_research and len(scraped) > 8000:
-                                        scraped = scraped[:8000]
                                     search_context += f"## {title}\nSource: {url}\n\n{scraped}\n\n---\n\n"
                                 break
 
@@ -600,56 +539,76 @@ def main():
                         rprint("[ERROR] No content could be scraped.")
                         continue
 
-                    # ── Pass 3: Generate output (quick answer or detailed report) ──
                     messages = []
                     if current_system_prompt is not None:
                         messages.append({"role": "system", "content": current_system_prompt})
-                    
-                    if is_research:
-                        messages.append({"role": "user", "content": f"""You are creating an extremely detailed research report about "{topic}". Below are {len(seen_urls)} pages of search results.
+                    messages.append({"role": "user", "content": f"Based on the search results below, provide a concise answer to: {search_query}\n\n{search_context}"})
 
-YOUR JOB:
-1. Extract EVERY substantive piece of information from each page
-2. Identify common themes and facts that appear across multiple pages
-3. Note unique information that only specific pages provide
-4. Create a comprehensive, extremely detailed report covering EVERYTHING someone might ask about this topic
-5. Organize into clear sections with subsections
-6. Include specific dates, names, numbers, statistics, quotes
-7. Note controversies, different perspectives, or conflicting information
-8. Cover: background/history, key events, current status, people involved, impact, future outlook
-9. The report should be exhaustive — assume the reader wants to become an expert
-
-RULES:
-- Remove all navigation, boilerplate, references, ads, categories
-- Keep ONLY substantive content
-- Output ONLY the report — no preamble, no "here is your report"
-
-Raw material:
-{search_context}"""})
-                    else:
-                        messages.append({"role": "user", "content": f"""Based on the search results below, provide a concise answer to: {topic}
-
-Search results:
-{search_context}"""})
-                    
-                    # Log to file
                     import datetime as _dt
-                    _logpath = f"/tmp/mlx_{'research' if is_research else 'search'}_{_dt.datetime.now():%Y%m%d_%H%M%S}.log"
+                    _logpath = f"/tmp/mlx_search_{_dt.datetime.now():%Y%m%d_%H%M%S}.log"
                     with open(_logpath, "w") as _f:
                         _f.write(messages[-1]["content"])
                     rprint(f"[INFO] Context logged to {_logpath}")
 
-                    message_history.append({"role": "user", "content": topic})
-                    prompt = tokenizer.apply_chat_template(
-                        messages,
-                        add_generation_prompt=True,
-                        add_special_tokens=True,
-                        **chat_template_kwargs,
-                    )
-                    rprint(f"[INFO] Generating {'research report' if is_research else 'answer'}...\n")
-                    continue  # Skip to generation with search-augmented prompt
+                    message_history.append({"role": "user", "content": search_query})
+                    prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True, add_special_tokens=True, **chat_template_kwargs)
+                    rprint("[INFO] Generating answer...\n")
+                    continue
                 except Exception as e:
                     rprint(f"[ERROR] Search failed: {str(e)}")
+                    continue
+
+            # Handle /research — deep context research via research_agent
+            if query.startswith("/research "):
+                topic = query[10:].strip()
+                if not topic:
+                    rprint("[ERROR] Usage: /research <topic>")
+                    continue
+                try:
+                    from research_agent.orchestrator import run_research
+
+                    rprint(f"[INFO] Researching: {topic}")
+                    result = run_research(
+                        topic=topic, model=model, tokenizer=tokenizer,
+                        args=args, chat_template_kwargs=chat_template_kwargs,
+                    )
+
+                    coverage_pct = int(result["coverage"].get("overview", 0) * 100) if "overview" in result["coverage"] else int(sum(result["coverage"].values()) / max(1, len(result["coverage"])) * 100)
+                    rprint(f"[INFO] Research complete: {result['num_sources']} sources, coverage ~{coverage_pct}%")
+
+                    # Build big model prompt with context
+                    messages = []
+                    if current_system_prompt is not None:
+                        messages.append({"role": "system", "content": current_system_prompt})
+
+                    # Inject research context as system-level reference
+                    messages.append({"role": "system", "content": f"The following research context about \"{topic}\" was gathered from web sources. Use it to inform your responses throughout this conversation."})
+
+                    messages.append({"role": "user", "content": f"""You are a research synthesis engine. Below is structured research material about "{topic}".
+
+Create an extremely detailed research report covering EVERYTHING someone might want to know about this topic. The report should be comprehensive, factual, and organized.
+
+Cover these dimensions: {', '.join(result['dimensions'])}
+
+Sources analyzed: {result['num_sources']}
+
+Research material:
+{result['context_section']}
+
+Output a comprehensive research report with clear section headers."""})
+
+                    import datetime as _dt
+                    _logpath = f"/tmp/mlx_research_{_dt.datetime.now():%Y%m%d_%H%M%S}.log"
+                    with open(_logpath, "w") as _f:
+                        _f.write(messages[-1]["content"])
+                    rprint(f"[INFO] Research context logged to {_logpath}")
+
+                    message_history.append({"role": "user", "content": f"Research: {topic}"})
+                    prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True, add_special_tokens=True, **chat_template_kwargs)
+                    rprint("[INFO] Synthesizing research report...\n")
+                    continue
+                except Exception as e:
+                    rprint(f"[ERROR] Research failed: {str(e)}")
                     continue
             elif query.startswith("/unload "):
                 # Parse unload percentage
