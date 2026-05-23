@@ -625,55 +625,46 @@ Output the full research report now. Be extremely detailed — write pages, not 
             elif query.startswith("/unload "):
                 try:
                     unload_pct = int(query[8:].strip())
-                    if not (0 <= unload_pct <= 100):
-                        rprint("[ERROR] Unload percentage must be between 0 and 100")
-                        continue
-
-                    # Find actual writable layer storage
-                    parent, attr = None, None
-                    # Pattern: model.model.layers
-                    inner = getattr(model, 'model', None)
-                    if inner is not None and hasattr(inner, 'layers') and not isinstance(getattr(type(inner), 'layers', None), property):
-                        parent, attr = inner, 'layers'
-                    # Pattern: model.language_model.model.layers
-                    if parent is None:
-                        lm = getattr(model, 'language_model', None)
-                        if lm is not None:
-                            inner2 = getattr(lm, 'model', None)
-                            if inner2 is not None and hasattr(inner2, 'layers') and not isinstance(getattr(type(inner2), 'layers', None), property):
-                                parent, attr = inner2, 'layers'
-                    # Pattern: model.transformer.layers
-                    if parent is None:
-                        tr = getattr(model, 'transformer', None)
-                        if tr is not None and hasattr(tr, 'layers') and not isinstance(getattr(type(tr), 'layers', None), property):
-                            parent, attr = tr, 'layers'
-                    # Pattern: model.layers (direct, non-property)
-                    if parent is None and hasattr(model, 'layers') and not isinstance(getattr(type(model), 'layers', None), property):
-                        parent, attr = model, 'layers'
-
-                    if parent is None:
-                        rprint("[ERROR] Could not find writable model layers for this model type")
-                        continue
-
-                    layers = getattr(parent, attr)
-                    n = len(layers)
-
-                    if not hasattr(model, '_saved_layers'):
-                        model._saved_layers = layers[:]
-
-                    to_drop = max(1, int(n * unload_pct / 100))
-                    kept = n - to_drop
-                    setattr(parent, attr, layers[:kept])
-
-                    gc.collect()
-                    if hasattr(mx, 'metal') and hasattr(mx.metal, 'clear_cache'):
-                        mx.metal.clear_cache()
-
-                    after = mx.get_active_memory() / 1e9
-                    rprint(f"[INFO] Unloaded {to_drop}/{n} layers ({unload_pct}%). "
-                           f"Active memory: {after:.2f} GB")
                 except ValueError:
                     rprint("[ERROR] Usage: /unload <percentage>")
+                    continue
+                if not (0 <= unload_pct <= 100):
+                    rprint("[ERROR] Unload percentage must be between 0 and 100")
+                    continue
+
+                # Find actual writable layer storage
+                parent, attr = None, None
+                for src_name, src_obj in [('model', model), ('language_model', getattr(model, 'language_model', None))]:
+                    if src_obj is None:
+                        continue
+                    inner = getattr(src_obj, 'model', None)
+                    if inner is not None and hasattr(inner, 'layers') and not isinstance(getattr(type(inner), 'layers', None), property):
+                        parent, attr = inner, 'layers'
+                        break
+                if parent is None:
+                    tr = getattr(model, 'transformer', None)
+                    if tr is not None and hasattr(tr, 'layers') and not isinstance(getattr(type(tr), 'layers', None), property):
+                        parent, attr = tr, 'layers'
+                if parent is None and hasattr(model, 'layers') and not isinstance(getattr(type(model), 'layers', None), property):
+                    parent, attr = model, 'layers'
+
+                if parent is None:
+                    rprint(f"[ERROR] Could not find writable layers for {type(model).__name__}")
+                    continue
+
+                layers = getattr(parent, attr)
+                n = len(layers)
+                if not hasattr(model, '_saved_layers'):
+                    model._saved_layers = layers[:]
+                to_drop = max(1, int(n * unload_pct / 100))
+                kept = n - to_drop
+                setattr(parent, attr, layers[:kept])
+                gc.collect()
+                if hasattr(mx, 'metal') and hasattr(mx.metal, 'clear_cache'):
+                    mx.metal.clear_cache()
+                after = mx.get_active_memory() / 1e9
+                rprint(f"[INFO] Unloaded {to_drop}/{n} layers ({unload_pct}%). "
+                       f"Active memory: {after:.2f} GB")
                 continue
 
             elif query == "/reload":
@@ -683,15 +674,13 @@ Output the full research report now. Be extremely detailed — write pages, not 
                     continue
 
                 parent, attr = None, None
-                inner = getattr(model, 'model', None)
-                if inner is not None and hasattr(inner, 'layers') and not isinstance(getattr(type(inner), 'layers', None), property):
-                    parent, attr = inner, 'layers'
-                if parent is None:
-                    lm = getattr(model, 'language_model', None)
-                    if lm is not None:
-                        inner2 = getattr(lm, 'model', None)
-                        if inner2 is not None and hasattr(inner2, 'layers') and not isinstance(getattr(type(inner2), 'layers', None), property):
-                            parent, attr = inner2, 'layers'
+                for src_name, src_obj in [('model', model), ('language_model', getattr(model, 'language_model', None))]:
+                    if src_obj is None:
+                        continue
+                    inner = getattr(src_obj, 'model', None)
+                    if inner is not None and hasattr(inner, 'layers') and not isinstance(getattr(type(inner), 'layers', None), property):
+                        parent, attr = inner, 'layers'
+                        break
                 if parent is None:
                     tr = getattr(model, 'transformer', None)
                     if tr is not None and hasattr(tr, 'layers') and not isinstance(getattr(type(tr), 'layers', None), property):
