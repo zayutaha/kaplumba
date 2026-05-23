@@ -522,6 +522,13 @@ def main():
                         messages.append({"role": "system", "content": current_system_prompt})
                     messages.append({"role": "user", "content": f"Based on this search context, answer the question.\n\nContext:\n{search_context}\n\nQuestion: {search_query}"})
                     
+                    # Log search context to file
+                    import datetime as _dt
+                    _logpath = f"/tmp/mlx_search_{_dt.datetime.now():%Y%m%d_%H%M%S}.log"
+                    with open(_logpath, "w") as _f:
+                        _f.write(messages[-1]["content"])
+                    rprint(f"[INFO] Search context logged to {_logpath}")
+
                     message_history.append({"role": "user", "content": search_query})
                     prompt = tokenizer.apply_chat_template(
                         messages,
