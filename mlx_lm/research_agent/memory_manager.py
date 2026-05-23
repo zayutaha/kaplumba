@@ -73,7 +73,7 @@ def _find_layers(model):
 
 
 def unload_for_small_model(main_model) -> callable:
-    """Unload enough layers to fit Qwen 2B.
+    """Unload 50% of big model layers to fit the small model.
     
     Returns a restore function to call when done.
     """
@@ -86,18 +86,9 @@ def unload_for_small_model(main_model) -> callable:
         if layers:
             if not hasattr(main_model, '_saved_layers'):
                 main_model._saved_layers = layers[:]
-
-            main_mem = _estimate_model_memory(main_model)
-            small_mem = _estimate_small_model_memory()
-            context_mem = 0.5
-            needed = small_mem + context_mem
-
             n = len(layers)
-            if main_mem > needed and n > 1:
-                mem_per_layer = main_mem / n
-                layers_to_free = int(needed / mem_per_layer) + 1
-                layers_to_keep = max(1, n - layers_to_free)
-                setattr(parent, attr, layers[:layers_to_keep])
+            kept = max(1, n // 2)
+            setattr(parent, attr, layers[:kept])
 
     # Always free cache memory, even if we couldn't find layers
     gc.collect()

@@ -586,16 +586,24 @@ def main():
 
                     messages.append({"role": "user", "content": f"""You are a research synthesis engine. Below is structured research material about "{topic}".
 
-Create an extremely detailed research report covering EVERYTHING someone might want to know about this topic. The report should be comprehensive, factual, and organized.
+Your task: Generate a massively detailed research report. This report must be EXHAUSTIVE — cover every possible detail someone might want to know.
 
-Cover these dimensions: {', '.join(result['dimensions'])}
+Rules:
+- Extract ALL facts, dates, names, numbers, statistics from the material
+- Cover every dimension in depth: {', '.join(result['dimensions'])}
+- Include background context, key events, chronology
+- Note controversies, criticisms, different perspectives
+- Include specific quotes, data points, source references
+- Organize into clear sections with subsections
+- The report should be LONG and THOROUGH — do not summarize, do not condense
+- If the source material is thin on a dimension, state what's known and note the gap
 
 Sources analyzed: {result['num_sources']}
 
 Research material:
 {result['context_section']}
 
-Output a comprehensive research report with clear section headers."""})
+Output the full research report now. Be extremely detailed — write pages, not paragraphs."""})
 
                     import datetime as _dt
                     _logpath = f"/tmp/mlx_research_{_dt.datetime.now():%Y%m%d_%H%M%S}.log"
