@@ -47,9 +47,9 @@ def run_research(topic: str, model, tokenizer, args,
 
     memory = ResearchMemory(topic=topic)
 
-    # Load small model for cheap calls
+    # Load small model for cheap calls (unloads big model layers if needed)
     small = SmallModelManager()
-    small_ok = small.load()
+    small_ok = small.load(main_model=model)
     if small_ok:
         set_small_model(small)
         import sys

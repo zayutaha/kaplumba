@@ -1,6 +1,7 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
+import gc
 import json
 import os
 import select
@@ -611,22 +612,63 @@ Output a comprehensive research report with clear section headers."""})
                     rprint(f"[ERROR] Research failed: {str(e)}")
                     continue
             elif query.startswith("/unload "):
-                # Parse unload percentage
                 try:
-                    pct_str = query[8:].strip()
-                    unload_pct = int(pct_str)
+                    unload_pct = int(query[8:].strip())
                     if not (0 <= unload_pct <= 100):
                         rprint("[ERROR] Unload percentage must be between 0 and 100")
                         continue
-                    rprint(f"[INFO] Unloading {unload_pct}% of model layers not yet implemented.")
-                    # TODO: Implement layer unloading when MLX supports it
+
+                    # Find layer list (common patterns: model.model.layers, model.layers)
+                    layers = getattr(getattr(model, 'model', None), 'layers',
+                                     getattr(model, 'layers', None))
+                    if layers is None:
+                        rprint("[ERROR] Could not find model layers")
+                        continue
+
+                    # Save original layers on first unload
+                    if not hasattr(model, '_saved_layers'):
+                        model._saved_layers = layers[:]
+
+                    n = len(layers)
+                    to_drop = max(1, int(n * unload_pct / 100))
+                    kept = n - to_drop
+
+                    # Truncate in-place
+                    if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+                        model.model.layers = layers[:kept]
+                    else:
+                        model.layers = layers[:kept]
+
+                    gc.collect()
+                    if hasattr(mx, 'metal') and hasattr(mx.metal, 'clear_cache'):
+                        mx.metal.clear_cache()
+
+                    before = mx.get_active_memory() / 1e9
+                    rprint(f"[INFO] Unloaded {to_drop}/{n} layers ({unload_pct}%). "
+                           f"Active memory: {before:.2f} GB")
                 except ValueError:
                     rprint("[ERROR] Usage: /unload <percentage>")
                 continue
+
             elif query == "/reload":
-                rprint("[INFO] Reloading model layers not yet implemented.")
-                # TODO: Implement layer reloading when MLX supports it
-                continue
+                saved = getattr(model, '_saved_layers', None)
+                if saved is None:
+                    rprint("[INFO] No layers to reload")
+                    continue
+
+                layers = getattr(getattr(model, 'model', None), 'layers',
+                                 getattr(model, 'layers', None))
+                if layers is None:
+                    rprint("[ERROR] Could not find model layers")
+                    continue
+
+                if hasattr(model, 'model') and hasattr(model.model, 'layers'):
+                    model.model.layers = saved
+                else:
+                    model.layers = saved
+
+                del model._saved_layers
+                rprint("[INFO] All layers restored")
             
             # Check for /think prefix to enable thinking for this message
             thinking_kwargs = dict(chat_template_kwargs)
