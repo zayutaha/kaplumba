@@ -504,6 +504,7 @@ def main():
                         continue
                     # Scrape ALL results for full context
                     rprint(f"[INFO] Scraping {len(results)} pages...")
+                    search_context = ""
                     for result in results:
                         if result.get("url"):
                             scraped = scrape_url(result["url"])
