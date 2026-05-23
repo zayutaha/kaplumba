@@ -514,13 +514,13 @@ def main():
                         rprint("[INFO] Scraping top result...")
                         scraped = scrape_url(results[0]["url"])
                         if scraped:
-                            search_context += f"Full content from {results[0]['url']}:\n{scraped[:2000]}...\n"
+                            search_context += f"Full content from {results[0]['url']}:\n{scraped[:4000]}...\n"
                     
                     # Create a message with search context
                     messages = []
                     if current_system_prompt is not None:
                         messages.append({"role": "system", "content": current_system_prompt})
-                    messages.append({"role": "user", "content": f"Based on this search context, answer the question.\n\nContext:\n{search_context}\n\nQuestion: {search_query}"})
+                    messages.append({"role": "user", "content": f"You are given web search results below. Summarize the key findings in a clear, concise way. Cite sources. Ignore navigation boilerplate.\n\nSearch results for: {search_query}\n\n{search_context}"})
                     
                     # Log search context to file
                     import datetime as _dt
