@@ -166,6 +166,28 @@ def scaled_dot_product_attention(
     mask: Optional[mx.array],
     sinks: Optional[mx.array] = None,
 ) -> mx.array:
+    # TurboQuant quantized attention (no dequantization)
+    if type(cache).__name__ == "TurboQuantKVCache":
+        if sinks is not None:
+            raise ValueError("TurboQuant KV cache does not support attention sinks.")
+        if queries.shape[-2] == 1:
+            return cache.decode_attention(
+                queries, keys_state=keys, values_state=values, scale=scale, mask=mask,
+            )
+        result = cache.prefill_attention(
+            queries, keys_state=keys, values_state=values, scale=scale, mask=mask,
+        )
+        if result is not None:
+            return result
+        dequantized_keys, dequantized_values = cache.dequantize(keys, values)
+        return mx.fast.scaled_dot_product_attention(
+            queries,
+            dequantized_keys.astype(queries.dtype),
+            dequantized_values.astype(queries.dtype),
+            scale=scale,
+            mask=mask,
+        )
+
     # Mixed-precision quantized: K and V at different bit widths
     if hasattr(cache, "k_bits") and hasattr(cache, "v_bits"):
         if sinks is not None:
