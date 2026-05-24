@@ -10,6 +10,9 @@ from typing import Generator, List, Optional, Union
 
 import mlx.core as mx
 
+if __name__ == "__main__" and __package__ is None:
+    __package__ = "mlx_lm"
+
 from .generate import GenerationResponse, stream_generate
 from .models.cache import make_prompt_cache
 from .sample_utils import make_sampler
@@ -320,7 +323,7 @@ def setup_arg_parser():
     )
     parser.add_argument(
         "--turbo-kv-bits",
-        type=int,
+        type=float,
         default=None,
         help="TurboQuant KV cache compression bits (1-4). "
         "3-bit gives 4.6x compression. Default: no compression.",

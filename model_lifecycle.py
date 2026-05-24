@@ -17,7 +17,7 @@ def build_model_command(model_path: str, options: dict, system_prompt: str) -> l
         opts.update(model_cfg["options"])
 
     cmd = [
-        "uv", "run", "python", "-m", "mlx_lm.chat",
+        "uv", "run", "python", "-m", "mlx_lm", "chat",
         "--model", model_path,
         "--prompt-marker", TUI_PROMPT_MARKER,
         "--temp", str(opts["temp"]),
