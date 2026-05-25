@@ -875,12 +875,11 @@ def mtp_generate_step(
             ntoks += 1
             yield main_tok.item(), main_lp, False
             cache.trim_prompt_cache(model_cache, 1)
-            mx.clear_cache()
             if ntoks >= max_tokens:
                 return
             hidden_at_main = hidden[:, -1:, :]
             draft_tok, draft_lp = _step_mtp(hidden_at_main, main_tok, prev_tokens)
-            mx.eval(draft_tok)
+            mx.async_eval(draft_tok, draft_lp)
             y = mx.array([main_tok.item()], mx.uint32)
         else:
             # Verify draft: run backbone over [y, draft_tok].
@@ -890,7 +889,7 @@ def mtp_generate_step(
             toks, lps, hidden, prev_tokens = _step_backbone(
                 y_with_draft, prev_tokens, n_predict=2, n_confirmed=1
             )
-            mx.eval(toks, draft_tok)
+            mx.eval(toks)
 
             verify_pred, bonus_tok = toks[0], toks[1]
             verify_lp, bonus_lp = lps[0], lps[1]
@@ -912,16 +911,14 @@ def mtp_generate_step(
                 yield draft_tok_id, draft_lp, True
                 cache.trim_prompt_cache(mtp_cache, 1)
                 cache.trim_prompt_cache(model_cache, 1)
-                mx.clear_cache()
                 if ntoks >= max_tokens:
                     return
                 ntoks += 1
                 yield bonus_tok.item(), bonus_lp, False
                 if ntoks >= max_tokens:
                     return
-                # Next draft from MTP at draft_tok's hidden state.
                 draft_tok, draft_lp = _step_mtp(hidden_at_draft, bonus_tok, prev_tokens)
-                mx.eval(draft_tok)
+                mx.async_eval(draft_tok, draft_lp)
                 y = mx.array([bonus_tok.item()], mx.uint32)
             else:
                 _rollback_draft()
@@ -932,12 +929,14 @@ def mtp_generate_step(
                 yield verify_tok_id, verify_lp, False
                 if ntoks >= max_tokens:
                     return
-                # Next draft from MTP at y's hidden state.
                 draft_tok, draft_lp = _step_mtp(
                     hidden_at_confirmed, verify_pred, prev_tokens
                 )
-                mx.eval(draft_tok)
+                mx.async_eval(draft_tok, draft_lp)
                 y = mx.array([verify_tok_id], mx.uint32)
+
+        if ntoks % 256 == 0:
+            mx.clear_cache()
 
 
 def stream_generate(
