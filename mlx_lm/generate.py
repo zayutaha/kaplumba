@@ -744,12 +744,10 @@ def mtp_generate_step(
     y = prompt.astype(mx.uint32)
     prev_tokens = None
 
-    # Use regular KVCache during prefill to avoid memory spike from TurboQuant dequant buffers
-    # After prefill completes, convert to TurboQuant for memory-efficient generation
     if prompt_cache is None:
         model_cache = cache.make_prompt_cache(
             model,
-            turbo_kv_bits=None,  # No TurboQuant during prefill
+            turbo_kv_bits=turbo_kv_bits,
             turbo_fp16_layers=turbo_fp16_layers,
         )
         mtp_cache = model.make_mtp_cache()
@@ -757,24 +755,6 @@ def mtp_generate_step(
         n_main = len(model.layers)
         model_cache = prompt_cache[:n_main]
         mtp_cache = prompt_cache[n_main:] or model.make_mtp_cache()
-
-    # Prefill phase (runs before entering main loop)
-    def _convert_to_turbo():
-        if turbo_kv_bits is not None:
-            from mlx_lm.models.turboquant_cache import TurboQuantKVCache
-            # Convert model cache to TurboQuant after prefill
-            for i, c in enumerate(model_cache):
-                if hasattr(c, 'is_trimmable') and not isinstance(c, TurboQuantKVCache):
-                    tqc = TurboQuantKVCache(bits=turbo_kv_bits)
-                    if hasattr(c, 'state') and c.state:
-                        tqc.state = c.state
-                    if hasattr(c, 'meta_state'):
-                        tqc.meta_state = c.meta_state
-                    model_cache[i] = tqc
-            # Convert MTP cache to TurboQuant
-            if mtp_cache:
-                mtp_cache = [TurboQuantKVCache(bits=turbo_kv_bits) for _ in mtp_cache]
-            logging.info(f"Converted caches to TurboQuant({turbo_kv_bits}bit) after prefill")
 
     # Exact-match acceptance for greedy (sampler=None); probabilistic
     # acceptance min(1, p_target/p_draft) for stochastic samplers.
@@ -882,12 +862,6 @@ def mtp_generate_step(
 
     with mx.stream(generation_stream):
         y = _prefill(y)
-
-    # Skip TurboQuant conversion - KVCache and TurboQuant have incompatible formats
-    # Keep using regular KVCache (already uses less memory than uncompressed)
-    # Note: TurboQuant compression benefit applies mainly to cached prompts
-    if turbo_kv_bits is not None:
-        logging.info("Using regular KVCache (TurboQuant conversion skipped)")
 
     ntoks = 0
     draft_tok = draft_lp = None
