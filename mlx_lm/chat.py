@@ -457,6 +457,7 @@ def main():
     )
 
     message_history: list = []
+    _cache_stale = False
 
     while True:
         if prompt is None:
@@ -577,6 +578,7 @@ def main():
 
                     message_history.append({"role": "user", "content": search_query})
                     prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True, add_special_tokens=True, **chat_template_kwargs)
+                    _cache_stale = True
                     rprint("[INFO] Generating answer...\n")
                     continue
                 except Exception as e:
@@ -640,6 +642,7 @@ Output the full research report now. Be extremely detailed — write pages, not 
                     # Disable MTP for research synthesis — re-enabled after generation
                     model._saved_mtp = args.mtp
                     args.mtp = False
+                    _cache_stale = True
                     rprint("[INFO] Synthesizing research report...\n")
                     continue
                 except Exception as e:
@@ -745,11 +748,15 @@ Output the full research report now. Be extremely detailed — write pages, not 
             # already in the KV cache at correct RoPE positions. Only
             # tokenize the new user message to eliminate redundant prefill
             # of the full conversation history each turn.
-            is_first_turn = not message_history
+            is_first_turn = not message_history or _cache_stale
+            _cache_stale = False
             if is_first_turn:
                 messages = []
                 if current_system_prompt is not None:
                     messages.append({"role": "system", "content": current_system_prompt})
+                # Include full conversation history when cache was reset
+                if message_history:
+                    messages.extend(message_history)
                 messages.append({"role": "user", "content": query})
             else:
                 messages = [{"role": "user", "content": query}]
@@ -839,6 +846,18 @@ Output the full research report now. Be extremely detailed — write pages, not 
                     turbo_fp16_layers=args.turbo_fp16_layers,
                 )
                 rprint("[INFO] Thinking cache cleared.")
+
+            # If the last generation was a search or research response,
+            # reset the prompt cache so the massive search context doesn't
+            # pollute subsequent turns.
+            if _cache_stale:
+                prompt_cache = make_prompt_cache(
+                    model,
+                    args.max_kv_size,
+                    turbo_kv_bits=args.turbo_kv_bits,
+                    turbo_fp16_layers=args.turbo_fp16_layers,
+                )
+                _cache_stale = False
 
         prompt = None
         if stop_generation:
