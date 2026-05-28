@@ -14,7 +14,7 @@ if __name__ == "__main__" and __package__ is None:
     __package__ = "mlx_lm"
 
 from .generate import GenerationResponse, stream_generate
-from .models.cache import make_prompt_cache
+from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
 from .sample_utils import make_sampler
 from .utils import load, sharded_load
 
@@ -848,6 +848,12 @@ Read the material and then ask me what I'd like to know about {topic}."""})
 
         prompt = None
         if stop_generation:
+            if last_response and last_response.generation_tokens > 0:
+                trim_prompt_cache(prompt_cache, last_response.generation_tokens)
+                rprint(
+                    f"[INFO] Trimmed {last_response.generation_tokens} tokens from cache "
+                    f"to avoid corrupting the next response."
+                )
             rprint("[INFO] Press Ctrl-d again to exit or enter a new message.")
 
 

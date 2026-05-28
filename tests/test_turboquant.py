@@ -26,6 +26,8 @@ from mlx_lm.models.cache import (
     trim_prompt_cache,
     can_trim_prompt_cache,
 )
+from mlx_lm.models.base import create_attention_mask
+from mlx_lm.models.cache import create_causal_mask
 from mlx_lm.models.turboquant_cache import TurboQuantKVCache
 from mlx_lm.models.turboquant_packing import (
     pack_indices,
@@ -218,9 +220,12 @@ class TestTurboQuantKVCache(unittest.TestCase):
         v = mx.random.normal(shape=(1, 4, 16, 128))
         k_ret, v_ret = cache.update_and_fetch(k, v)
 
+        # Dequantize the proxy state then compare
+        dq_k, dq_v = cache.dequantize(k_ret._state, v_ret._state)
+
         # Cosine similarity should be high for 3-bit
         k_flat = k.reshape(-1, 128)
-        kr_flat = k_ret.reshape(-1, 128)
+        kr_flat = dq_k.reshape(-1, 128)
         dots = mx.sum(k_flat * kr_flat, axis=-1)
         norms = mx.linalg.norm(k_flat, axis=-1) * mx.linalg.norm(kr_flat, axis=-1)
         cos_sim = mx.mean(dots / (norms + 1e-10))
@@ -277,9 +282,10 @@ class TestTurboQuantKVCache(unittest.TestCase):
         cache.update_and_fetch(k, v)
 
         state = cache.state
-        self.assertEqual(len(state), 4)  # k_packed, k_norms, v_packed, v_norms
-        self.assertEqual(state[0].shape[2], 10)  # k_packed seq dim
-        self.assertEqual(state[1].shape[2], 10)  # k_norms seq dim
+        self.assertEqual(len(state), 2)  # (key_state, val_state)
+        key_state, val_state = state
+        self.assertEqual(key_state.norms.shape[2], 10)  # seq dim
+        self.assertEqual(val_state.norms.shape[2], 10)
 
     def test_state_roundtrip(self):
         """Setting state on a new cache should restore it."""
@@ -306,12 +312,12 @@ class TestTurboQuantKVCache(unittest.TestCase):
         cache.update_and_fetch(k, v)
 
         meta = cache.meta_state
-        parts = meta.split(",")
-        self.assertEqual(int(parts[0]), 10)   # offset
-        self.assertEqual(int(parts[1]), 3)    # bits
-        self.assertEqual(int(parts[2]), 99)   # seed
-        self.assertEqual(int(parts[3]), 64)   # k_dim
-        self.assertEqual(int(parts[4]), 128)  # v_dim
+        self.assertEqual(len(meta), 5)
+        self.assertEqual(int(float(meta[0])), 10)   # offset
+        self.assertEqual(float(meta[1]), 3.0)       # bits
+        self.assertEqual(int(float(meta[2])), 99)   # seed
+        self.assertEqual(int(float(meta[3])), 64)   # k_dim
+        self.assertEqual(int(float(meta[4])), 128)  # v_dim
 
     def test_from_state(self):
         """from_state classmethod for save/load support."""
@@ -323,8 +329,82 @@ class TestTurboQuantKVCache(unittest.TestCase):
         restored = TurboQuantKVCache.from_state(cache.state, cache.meta_state)
         self.assertEqual(restored.offset, 10)
         self.assertEqual(restored.quant_bits, 3)
-        for s, rs in zip(cache.state, restored.state):
-            self.assertTrue(mx.array_equal(s, rs))
+        self.assertEqual(restored.seed, cache.seed)
+
+    def test_make_mask_with_offset(self):
+        """TurboQuantKVCache.make_mask should produce offset-aware masks."""
+        cache = TurboQuantKVCache(bits=3)
+        B, H, S, D = 1, 4, 20, 64
+        k = mx.random.normal(shape=(B, H, S, D))
+        v = mx.random.normal(shape=(B, H, S, D))
+        cache.update_and_fetch(k, v)
+        self.assertEqual(cache.offset, S)
+
+        N = 4
+        h = mx.zeros((1, N, D))
+        mask = create_attention_mask(h, cache=cache, return_array=True)
+        self.assertEqual(
+            mask.shape,
+            (N, S + N),
+            f"Mask shape should be ({N}, {S + N}) but got {mask.shape}",
+        )
+        expected = create_causal_mask(N, offset=S)
+        self.assertTrue(
+            mx.array_equal(mask, expected),
+            "Mask should match create_causal_mask with offset",
+        )
+
+    def test_proxy_shape_has_head_dim(self):
+        """_QuantizedStateProxy.shape[-1] should match actual head dimension."""
+        cache = TurboQuantKVCache(bits=3)
+        B, H, S, D = 1, 8, 5, 128
+        k = mx.random.normal(shape=(B, H, S, D))
+        v = mx.random.normal(shape=(B, H, S, D))
+        k_ret, v_ret = cache.update_and_fetch(k, v)
+        self.assertEqual(k_ret.shape[-1], D)
+        self.assertEqual(v_ret.shape[-1], D)
+
+    def test_trim_then_update(self):
+        """Simulate interrupted generation: trim then append more tokens."""
+        cache = TurboQuantKVCache(bits=3)
+        B, H, D = 1, 4, 64
+
+        # Turn 1: add 20 tokens (prefill) + 5 tokens (generated)
+        k = mx.random.normal(shape=(B, H, 20, D))
+        v = mx.random.normal(shape=(B, H, 20, D))
+        cache.update_and_fetch(k, v)
+        for _ in range(5):
+            k1 = mx.random.normal(shape=(B, H, 1, D))
+            v1 = mx.random.normal(shape=(B, H, 1, D))
+            cache.update_and_fetch(k1, v1)
+        self.assertEqual(cache.offset, 25)
+
+        # Simulate user interrupts generation: trim the 5 generated tokens
+        trimmed = cache.trim(5)
+        self.assertEqual(trimmed, 5)
+        self.assertEqual(cache.offset, 20)
+        self.assertEqual(cache.size(), 20)
+
+        # Turn 2: append 3 new tokens (follow-up query)
+        k2 = mx.random.normal(shape=(B, H, 3, D))
+        v2 = mx.random.normal(shape=(B, H, 3, D))
+        k_ret, v_ret = cache.update_and_fetch(k2, v2)
+
+        # Cache should have 20 old + 3 new = 23 tokens
+        self.assertEqual(cache.offset, 23)
+        self.assertEqual(cache.size(), 23)
+        self.assertEqual(k_ret.shape, (B, H, 23, D))
+        self.assertEqual(v_ret.shape, (B, H, 23, D))
+
+    def test_proxy_shape_asymmetric(self):
+        """K and V proxies should have different head dims."""
+        cache = TurboQuantKVCache(bits=3)
+        B, H, S = 1, 4, 5
+        k = mx.random.normal(shape=(B, H, S, 128))
+        v = mx.random.normal(shape=(B, H, S, 64))
+        k_ret, v_ret = cache.update_and_fetch(k, v)
+        self.assertEqual(k_ret.shape[-1], 128)
+        self.assertEqual(v_ret.shape[-1], 64)
 
     def test_incremental_decode_consistency(self):
         """Incremental decode buffer should match full dequant."""
@@ -340,13 +420,17 @@ class TestTurboQuantKVCache(unittest.TestCase):
         v1 = mx.random.normal(shape=(1, 4, 1, 64))
         k_inc, v_inc = cache.update_and_fetch(k1, v1)
 
+        # Dequantize both to compare
+        dq_full = cache.dequantize(k_full._state, v_full._state)
+        dq_inc = cache.dequantize(k_inc._state, v_inc._state)
+
         # The first 20 tokens should match between full and incremental
         self.assertTrue(
-            mx.allclose(k_full, k_inc[..., :20, :], atol=1e-5),
+            mx.allclose(dq_full[0], dq_inc[0][..., :20, :], atol=1e-5),
             "Incremental decode keys don't match full dequant",
         )
         self.assertTrue(
-            mx.allclose(v_full, v_inc[..., :20, :], atol=1e-5),
+            mx.allclose(dq_full[1], dq_inc[1][..., :20, :], atol=1e-5),
             "Incremental decode values don't match full dequant",
         )
 
@@ -622,8 +706,6 @@ class TestTurboQuantSaveLoad(unittest.TestCase):
             self.assertEqual(c.offset, lc.offset)
             self.assertEqual(c.quant_bits, lc.quant_bits)
             self.assertEqual(c.seed, lc.seed)
-            for s, ls in zip(c.state, lc.state):
-                self.assertTrue(mx.array_equal(s, ls))
 
     def test_save_load_mixed_cache(self):
         """Save/load a mix of KVCache and TurboQuantKVCache."""

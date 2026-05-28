@@ -4904,10 +4904,10 @@ class _QuantizedStateProxy:
 
     __slots__ = ("_state", "shape")
 
-    def __init__(self, state, n_tokens: int, n_heads: int):
+    def __init__(self, state, n_tokens: int, n_heads: int, head_dim: int = 0):
         self._state = state
-        # Mimic (B, H, T, D) shape — only T is needed by downstream code
-        self.shape = (1, n_heads, n_tokens, 0)
+        # Mimic (B, H, T, D) shape
+        self.shape = (1, n_heads, n_tokens, head_dim)
 
     def __getattr__(self, name):
         return getattr(self._state, name)
@@ -5048,7 +5048,8 @@ class TurboQuantKVCache(_BaseCache):
         _write_state(self.values, new_values, self.offset)
 
         B, n_heads = keys.shape[0], keys.shape[1]
-        D = keys.shape[-1]
+        k_head_dim = keys.shape[-1]
+        v_head_dim = values.shape[-1]
         n_new = keys.shape[2]
 
         self.offset = new_end
@@ -5058,8 +5059,8 @@ class TurboQuantKVCache(_BaseCache):
             mx.eval(self.keys, self.values)
         ks, vs = self.state
         return (
-            _QuantizedStateProxy(ks, self.offset, n_heads),
-            _QuantizedStateProxy(vs, self.offset, n_heads),
+            _QuantizedStateProxy(ks, self.offset, n_heads, k_head_dim),
+            _QuantizedStateProxy(vs, self.offset, n_heads, v_head_dim),
         )
 
     @staticmethod
@@ -5994,9 +5995,13 @@ class TurboQuantKVCache(_BaseCache):
         return self.offset
 
     @property
+    def quant_bits(self):
+        return int(self.bits)
+
+    @property
     def state(self):
         if self.keys is None:
-            return None, None
+            return []
         if self._cached_state_offset == self.offset:
             return self._cached_state
         sliced = _slice_state(self.keys, self.offset), _slice_state(
@@ -6006,26 +6011,44 @@ class TurboQuantKVCache(_BaseCache):
         self._cached_state_offset = self.offset
         return sliced
 
+    def _maybe_wrap_state(self, s):
+        """Convert a list back to a TurboQuant state object after tree_unflatten."""
+        if not isinstance(s, list):
+            return s
+        # tree_unflatten reconstructs NamedTuples as lists; convert back
+        if len(s) == 2 and hasattr(s[0], "shape"):
+            return TurboQuantMSEState(s[0], s[1])
+        if len(s) == 2:
+            return TurboQuantProdState(*s)
+        return s
+
     @state.setter
     def state(self, value):
         self._cached_state = None
         self._cached_state_offset = -1
-        if value is None:
+        if value is None or value == []:
             self.keys, self.values = None, None
             self.offset = 0
             return
-        self.keys, self.values = value
-        self.offset = _state_length(self.keys)
+        if isinstance(value, (list, tuple)) and len(value) == 2:
+            self.keys, self.values = value
+            self.keys = self._maybe_wrap_state(self.keys)
+            self.values = self._maybe_wrap_state(self.values)
+            self.offset = _state_length(self.keys)
+            return
+        raise ValueError(f"Expected (key_state, val_state) tuple, got {type(value)}")
 
     @property
     def meta_state(self):
-        return tuple(map(str, (self.offset, self.bits, self.seed)))
+        k_dim = self.key_codec.dim if self.key_codec else 0
+        v_dim = self.value_codec.dim if self.value_codec else 0
+        return tuple(map(str, (self.offset, self.bits, self.seed, k_dim, v_dim)))
 
     @meta_state.setter
     def meta_state(self, value):
-        self.offset = int(value[0])
+        self.offset = int(float(value[0]))
         self.bits = float(value[1])
-        self.seed = int(value[2])
+        self.seed = int(float(value[2]))
 
     def is_trimmable(self):
         return True
