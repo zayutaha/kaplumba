@@ -19,23 +19,59 @@ from textual.events import Click, Key
 from textual.widgets import Button, Markdown, Static
 
 
+_selected_bubbles: list["CopyableMarkdown"] = []
+
 class CopyableMarkdown(Markdown):
-    """Markdown that copies its content on click."""
+    """Markdown that toggles selection on click; copies selected on double-click."""
 
     def on_click(self, event: Click):
         text = self._markdown if hasattr(self, '_markdown') and self._markdown else self._initial_markdown or ""
         if not text:
             return
-        try:
-            p = subprocess.run(["pbcopy"], input=text.encode(), check=False)
-            if p.returncode == 0:
-                self.app.notify("Copied to clipboard", timeout=1.5)
-            else:
-                self.app.notify("Failed to copy", severity="error", timeout=1.5)
-        except FileNotFoundError:
-            self.app.notify("pbcopy not available", severity="error", timeout=1.5)
+        app = self.app
+        if not isinstance(app, ChatUI):
+            return
+        if event.is_double:
+            _copy_selected(app)
+            return
+        # Toggle selection
+        if self in _selected_bubbles:
+            _selected_bubbles.remove(self)
+            self.remove_class("bubble-selected")
+        else:
+            _selected_bubbles.append(self)
+            self.add_class("bubble-selected")
+        app._update_selection_ui()
         event.prevent_default()
         event.stop()
+
+
+def _copy_selected(app: "ChatUI"):
+    if not _selected_bubbles:
+        app.notify("No bubbles selected — click to select", timeout=1.5)
+        return
+    parts = []
+    for b in _selected_bubbles:
+        t = b._markdown if hasattr(b, '_markdown') and b._markdown else b._initial_markdown or ""
+        if t:
+            parts.append(t)
+    if not parts:
+        return
+    text = "\n\n".join(parts)
+    try:
+        p = subprocess.run(["pbcopy"], input=text.encode(), check=False)
+        if p.returncode == 0:
+            msg = f"Copied {len(parts)} message{'' if len(parts) == 1 else 's'} to clipboard"
+            app.notify(msg, timeout=2)
+        else:
+            app.notify("Failed to copy", severity="error", timeout=1.5)
+    except FileNotFoundError:
+        app.notify("pbcopy not available", severity="error", timeout=1.5)
+    # Clear selections
+    for b in _selected_bubbles:
+        b.remove_class("bubble-selected")
+    _selected_bubbles.clear()
+    app._update_selection_ui()
 
 from model_catalog import list_models
 from textual_ui.styles import CHAT_CSS, LOGO, WELCOME_MESSAGES
@@ -55,6 +91,7 @@ class ChatUI(App):
     BINDINGS = [
         ("ctrl+c", "quit", "Quit"),
         ("ctrl+r", "reload_model", "Reload Model"),
+        ("ctrl+y", "copy_selected", "Copy Selected"),
     ]
     CSS = CHAT_CSS
 
@@ -163,6 +200,21 @@ class ChatUI(App):
         chat = self.query_one("#chat", VerticalScroll)
         for child in list(chat.children):
             await child.remove()
+        _selected_bubbles.clear()
+        self._update_selection_ui()
+
+    def _update_selection_ui(self):
+        n = len(_selected_bubbles)
+        btn = self.query_one("#send-btn", Static)
+        if n > 0:
+            btn.update(f" COPY {n} ")
+            btn.remove_class("stopping")
+        else:
+            btn.update(" SEND ")
+            btn.set_class(self.busy, "stopping")
+
+    async def action_copy_selected(self):
+        _copy_selected(self)
 
     # ── Chat UI internals ──
 
@@ -216,13 +268,16 @@ class ChatUI(App):
 
     def _set_busy(self, busy: bool):
         self.busy = busy
-        btn = self.query_one("#send-btn", Static)
-        btn.update(" STOP " if busy else " SEND ")
-        btn.set_class(busy, "stopping")
+        if busy:
+            self.query_one("#send-btn", Static).update(" STOP ")
+        else:
+            self._update_selection_ui()
 
     async def on_static_click(self, event: Click):
         if event.widget.id == "send-btn":
-            if self.busy:
+            if _selected_bubbles:
+                _copy_selected(self)
+            elif self.busy:
                 await self.action_interrupt()
             else:
                 await self.action_submit()
