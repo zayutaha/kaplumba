@@ -84,7 +84,7 @@ HELP_TEXT = """\
   [bold]/memory[/]     Show GPU memory
   [bold]/personality[/] Change personality
 
-[dim]Press [bold]Ctrl+H[/] or click outside to close[/]"""
+[dim]Press [bold]Ctrl+Shift+H[/] or click outside to close[/]"""
 from textual_ui.latex import format_for_display, strip_prompt_markers
 from textual_ui.personas import PERSONALITIES
 
@@ -103,7 +103,7 @@ class ChatUI(App):
         ("ctrl+r", "reload_model", "Reload Model"),
         ("v", "toggle_select_mode", "Select"),
         ("c", "copy_selected", "Copy"),
-        ("ctrl+h", "show_help", "Help"),
+        ("ctrl+shift+h", "show_help", "Help"),
         ("escape", "close_help", "Close"),
     ]
     CSS = CHAT_CSS
