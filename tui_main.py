@@ -9,8 +9,8 @@ def safe_key_to_character(key):
 tk.key_to_character = safe_key_to_character
 
 
+import asyncio
 import random
-import subprocess
 from pathlib import Path
 
 from textual.app import App, ComposeResult
@@ -28,7 +28,7 @@ class CopyableMarkdown(Markdown):
 
     _last_click: float = 0.0
 
-    def on_click(self, event: Click):
+    async def on_click(self, event: Click):
         text = self._markdown if hasattr(self, '_markdown') and self._markdown else self._initial_markdown or ""
         if not text:
             return
@@ -38,7 +38,7 @@ class CopyableMarkdown(Markdown):
         now = _time.monotonic()
         if now - self._last_click < 0.4:
             self._last_click = 0
-            _copy_selected(app)
+            await _copy_selected(app)
             event.prevent_default()
             event.stop()
             return
@@ -55,7 +55,7 @@ class CopyableMarkdown(Markdown):
         event.stop()
 
 
-def _copy_selected(app: "ChatUI"):
+async def _copy_selected(app: "ChatUI"):
     if not _selected_bubbles:
         app.notify("No bubbles selected — click to select", timeout=1.5)
         return
@@ -68,8 +68,11 @@ def _copy_selected(app: "ChatUI"):
         return
     text = "\n\n".join(parts)
     try:
-        p = subprocess.run(["pbcopy"], input=text.encode(), check=False)
-        if p.returncode == 0:
+        proc = await asyncio.create_subprocess_exec(
+            "pbcopy", stdin=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate(input=text.encode())
+        if proc.returncode == 0:
             msg = f"Copied {len(parts)} message{'' if len(parts) == 1 else 's'} to clipboard"
             app.notify(msg, timeout=2)
         else:
@@ -223,7 +226,7 @@ class ChatUI(App):
             btn.set_class(self.busy, "stopping")
 
     async def action_copy_selected(self):
-        _copy_selected(self)
+        await _copy_selected(self)
 
     # ── Chat UI internals ──
 
@@ -285,7 +288,7 @@ class ChatUI(App):
     async def on_static_click(self, event: Click):
         if event.widget.id == "send-btn":
             if _selected_bubbles:
-                _copy_selected(self)
+                await _copy_selected(self)
             elif self.busy:
                 await self.action_interrupt()
             else:
