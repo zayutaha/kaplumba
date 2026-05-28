@@ -242,6 +242,14 @@ class ChatUI(App):
             self.query_one("#chat-center").display = True
             self.query_one("#input-center").display = True
 
+    async def show_overlay(self, title: str, body: str):
+        """Show the help overlay with custom content."""
+        content = self.query_one("#help-content", Static)
+        content.update(f"[bold]{title}[/]\n\n{body}\n\n[dim]Esc or click outside to close[/]")
+        self.query_one("#chat-center").display = False
+        self.query_one("#input-center").display = False
+        self.query_one("#help-overlay").display = True
+
     async def action_show_help(self):
         box = self.query_one("#help-overlay")
         if not box.display:

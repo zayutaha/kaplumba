@@ -69,18 +69,14 @@ class Orchestrator:
 
         # Non-generation slash commands handled locally
         if user_text == "/memory":
-            self.chat._set_busy(True)
             try:
                 resp = await self.port.send_command("/memory")
-                if resp:
-                    lines = [l for l in resp.splitlines() if not l.startswith("[INFO]")]
-                    display = "\n".join(lines).strip() or resp.strip()
-                    await self.chat.handle_stream_text(user_text)
-                    await self.chat.handle_stream_finished(display)
+                display = resp or "No memory info"
+                lines = [l for l in display.splitlines() if not l.startswith("[INFO]")]
+                display = "\n".join(lines).strip() or display.strip()
             except Exception:
-                await self.chat.handle_stream_text(user_text)
-                await self.chat.handle_stream_finished("Failed to get memory info")
-            self.chat._set_busy(False)
+                display = "Failed to get memory info"
+            await self.chat.show_overlay("Memory", display)
             self.chat.refresh_command_menu()
             self.chat.query_one("#input").focus()
             return
