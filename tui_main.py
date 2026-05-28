@@ -58,6 +58,33 @@ async def _copy_selected(app: "ChatUI"):
 
 from model_catalog import list_models
 from textual_ui.styles import CHAT_CSS, LOGO, WELCOME_MESSAGES
+
+HELP_TEXT = """\
+[bright_white]Help[/]
+
+[bold]Chat[/]
+  Type a message and press Enter to send
+  [bold]Ctrl+C[/]     Quit
+  [bold]Ctrl+R[/]     Reload model
+
+[bold]Copy messages[/]
+  [bold]V[/]           Toggle select mode
+            (click bubbles to mark them)
+  [bold]C[/]           Copy all marked messages
+  [bold]Esc[/]         Exit select mode
+
+[bold]Copy text[/]
+  [bold]Shift+drag[/]  Select text with mouse
+  [bold]Cmd+C[/]       Copy selected text
+
+[bold]Commands[/]
+  [bold]/clear[/]      Reset conversation
+  [bold]/models[/]     Switch model
+  [bold]/options[/]    Change model options
+  [bold]/memory[/]     Show GPU memory
+  [bold]/personality[/] Change personality
+
+[dim]Press [bold]Ctrl+H[/] or click outside to close[/]"""
 from textual_ui.latex import format_for_display, strip_prompt_markers
 from textual_ui.personas import PERSONALITIES
 
@@ -76,6 +103,8 @@ class ChatUI(App):
         ("ctrl+r", "reload_model", "Reload Model"),
         ("v", "toggle_select_mode", "Select"),
         ("c", "copy_selected", "Copy"),
+        ("ctrl+h", "show_help", "Help"),
+        ("escape", "close_help", "Close"),
     ]
     CSS = CHAT_CSS
 
@@ -125,6 +154,10 @@ class ChatUI(App):
             with Horizontal(id="input-card"):
                 yield ChatInput(id="input")
                 yield Static(" SEND ", id="send-btn")
+
+        with Middle(id="help-overlay"):
+            with Vertical(id="help-box", classes="help-box"):
+                yield Static("", id="help-content")
 
         with Middle(id="crash-dialog-container"):
             with Vertical(id="crash-dialog", classes="crash-dialog"):
@@ -202,9 +235,28 @@ class ChatUI(App):
             btn.update(" SEND ")
             btn.set_class(False, "stopping")
 
+    async def action_close_help(self):
+        box = self.query_one("#help-overlay")
+        if box.display:
+            box.display = False
+            self.query_one("#chat-center").display = True
+            self.query_one("#input-center").display = True
+
+    async def action_show_help(self):
+        box = self.query_one("#help-overlay")
+        if not box.display:
+            content = self.query_one("#help-content", Static)
+            content.update(HELP_TEXT)
+            self.query_one("#chat-center").display = False
+            self.query_one("#input-center").display = False
+        else:
+            self.query_one("#chat-center").display = True
+            self.query_one("#input-center").display = True
+        box.display = not box.display
+
     async def action_copy_selected(self):
         if not _selected_bubbles:
-            self.notify("Ctrl+click a bubble to select it, then press C to copy", timeout=3)
+            self.notify("Press V to enter select mode, click bubble to mark, C to copy", timeout=3)
             return
         await _copy_selected(self)
 
@@ -283,6 +335,12 @@ class ChatUI(App):
             await self.controller.handle_submit()
 
     async def on_click(self, event: Click):
+        help_overlay = self.query_one("#help-overlay")
+        if help_overlay.display:
+            help_overlay.display = False
+            self.query_one("#chat-center").display = True
+            self.query_one("#input-center").display = True
+            return
         if not self.select_mode:
             return
         widget = event.widget

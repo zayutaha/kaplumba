@@ -132,6 +132,28 @@ Screen {
     background: rgba(0, 0, 0, 0.7);
 }
 
+#help-overlay {
+    layer: overlay;
+    width: 100%;
+    height: 100%;
+    align: center middle;
+    display: none;
+    background: rgba(0, 0, 0, 0.75);
+}
+
+.help-box {
+    width: 52;
+    height: auto;
+    background: #1a1a1a;
+    border: round #555;
+    padding: 1 2;
+}
+
+#help-content {
+    color: #ccc;
+    text-style: bold;
+}
+
 #crash-dialog {
     width: 40;
     height: auto;
