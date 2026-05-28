@@ -759,6 +759,7 @@ Read the material and then ask me what I'd like to know about {topic}."""})
         last_response = None
         stop_generation = False
         response_text = ""
+        offset_before = prompt_cache[0].offset if prompt_cache else 0
         for response in stream_generate(
             model,
             tokenizer,
@@ -848,12 +849,24 @@ Read the material and then ask me what I'd like to know about {topic}."""})
 
         prompt = None
         if stop_generation:
-            if last_response and last_response.generation_tokens > 0:
-                trim_prompt_cache(prompt_cache, last_response.generation_tokens)
-                rprint(
-                    f"[INFO] Trimmed {last_response.generation_tokens} tokens from cache "
-                    f"to avoid corrupting the next response."
-                )
+            tokens_added = prompt_cache[0].offset - offset_before
+            if tokens_added > 0:
+                if offset_before > 0:
+                    trim_prompt_cache(prompt_cache, tokens_added)
+                    rprint(
+                        f"[INFO] Trimmed {tokens_added} tokens from cache."
+                    )
+                else:
+                    # First turn: reset entire cache so next turn re-encodes
+                    # the full conversation from message_history
+                    prompt_cache = make_prompt_cache(
+                        model,
+                        args.max_kv_size,
+                        turbo_kv_bits=args.turbo_kv_bits,
+                        turbo_fp16_layers=args.turbo_fp16_layers,
+                    )
+                    _cache_stale = True
+                    rprint("[INFO] Cache reset for next conversation.")
             rprint("[INFO] Press Ctrl-d again to exit or enter a new message.")
 
 
