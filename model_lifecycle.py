@@ -95,11 +95,7 @@ class ModelRunner:
             if buf.endswith(TUI_PROMPT_MARKER):
                 break
 
-        try:
-            self.proc.stdin.write(b"\x04")
-            await self.proc.stdin.drain()
-        except Exception:
-            pass
+        await self.interrupt()
         try:
             await self._read_until_prompt(timeout=5)
         except Exception:
