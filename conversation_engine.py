@@ -20,12 +20,31 @@ def _has_thinking_end(text: str) -> bool:
 
 
 def _remove_thinking_blocks(text: str) -> str:
-    """Remove all thinking block content (everything between opening and closing tags)."""
+    """Remove all thinking block content (everything between opening and closing tags).
+    
+    If the entire response is inside a thinking block (Gemma 4 sometimes puts
+    the answer inside <|channel>...<channel|> instead of after it), extract
+    the inner content and strip the 'thought' header.
+    """
     # Remove Qwen thinking blocks: <think>...content...</think>
-    text = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
+    cleaned = re.sub(r'<think>.*?</think>', '', text, flags=re.DOTALL)
     # Remove Gemma thinking blocks: <|channel>...content...<channel|>
-    text = re.sub(r'<\|channel>.*?<channel\|>', '', text, flags=re.DOTALL)
-    return text
+    cleaned = re.sub(r'<\|channel>.*?<channel\|>', '', cleaned, flags=re.DOTALL)
+    cleaned = cleaned.strip()
+    
+    # If nothing is left but there were Gemma thinking tags, the answer
+    # is inside the thinking block — extract it.
+    if not cleaned and ('<|channel>' in text or '<channel|>' in text):
+        m = re.search(r'<\|channel>(.*?)<channel\|>', text, flags=re.DOTALL)
+        if m:
+            inner = m.group(1).strip()
+            # Strip the "thought\n" header that Gemma 4 prepends
+            if inner.startswith('thought'):
+                inner = inner[7:].lstrip('\n').strip()
+            if inner:
+                return inner
+    
+    return cleaned
 
 
 async def run_model_stream(chat, port, user_text: str):
@@ -101,8 +120,15 @@ async def run_model_stream(chat, port, user_text: str):
         if chat.interrupted:
             display = _remove_thinking_blocks(strip_prompt_markers(buf)) + "\n\n*— stopped*"
             chat.interrupted = False
-        elif in_thinking or explicit_thinking:
+        elif in_thinking:
+            # Still waiting for closing tag at end — nothing to show
             display = _remove_thinking_blocks(strip_prompt_markers(get_display_text(buf)))
+        elif explicit_thinking:
+            # Explicit thinking: extract post-tag text; if empty, content is
+            # inside the thinking block — _remove_thinking_blocks handles both
+            display = _remove_thinking_blocks(strip_prompt_markers(get_display_text(buf)))
+            if not display:
+                display = _remove_thinking_blocks(strip_prompt_markers(buf))
         else:
             display = _remove_thinking_blocks(strip_prompt_markers(buf))
         try:
