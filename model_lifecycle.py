@@ -95,13 +95,11 @@ class ModelRunner:
             if buf.endswith(TUI_PROMPT_MARKER):
                 break
 
+        # Wait for the test generation to finish and the subprocess to
+        # return to the input() prompt.  No Ctrl-D byte is written (it
+        # would leak into stdin and contaminate the first real message).
         try:
-            self.proc.stdin.write(b"\x04")
-            await self.proc.stdin.drain()
-        except Exception:
-            pass
-        try:
-            await self._read_until_prompt(timeout=5)
+            await self._read_until_prompt(timeout=10)
         except Exception:
             pass
 
