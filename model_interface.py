@@ -131,6 +131,11 @@ class MLXSubprocessAdapter:
     async def interrupt(self) -> None:
         self._interrupted = True
         await self._runner.interrupt()
+        # Wait for the subprocess to actually process SIGINT and return to
+        # input().  Read and discard any output up to the prompt marker.
+        # This prevents partial tokens from the interrupted generation
+        # leaking into the next send_message response.
+        await self._drain_stale_stdout()
 
     async def stop(self) -> None:
         await self._runner.stop()
