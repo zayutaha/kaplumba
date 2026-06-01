@@ -642,8 +642,8 @@ Read the material and then ask me what I'd like to know about {topic}."""})
 
                     message_history.append({"role": "user", "content": f"Research: {topic}"})
                     prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True, add_special_tokens=True, **chat_template_kwargs)
-                    # Disable MTP for research synthesis — re-enabled after generation
-                    model._saved_mtp = args.mtp
+                    # Disable MTP — research adds massive context that makes
+                    # speculative decoding overhead not worth it.
                     args.mtp = False
                     rprint("[INFO] Research loaded. Ask me anything about it.\n")
                     continue
@@ -829,12 +829,6 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                 except Exception:
                     pass
 
-            # Restore MTP after research synthesis
-            saved_mtp = getattr(model, '_saved_mtp', None)
-            if saved_mtp is not None:
-                args.mtp = saved_mtp
-                del model._saved_mtp
-            
             rprint(
                 f"[INFO] Generated {last_response.generation_tokens} tokens "
                 f"at {last_response.generation_tps:.2f} tokens/sec "
