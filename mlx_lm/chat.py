@@ -386,6 +386,11 @@ def setup_arg_parser():
         default=DEFAULT_PROMPT_MARKER,
         help="Prompt marker used for interactive input.",
     )
+    parser.add_argument(
+        "--mfa",
+        action="store_true",
+        help="Use mlx-mfa STEEL kernel for optimized attention (causal prefill only).",
+    )
     return parser
 
 
@@ -403,6 +408,15 @@ def main():
             print(*args, **kwargs)
 
     mx.random.seed(args.seed)
+
+    if args.mfa:
+        try:
+            from mlx_mfa.integrations.mlx_lm import patch_mlx_lm
+            patch_mlx_lm(verbose=True)
+        except ImportError:
+            print("[WARNING] mlx-mfa not installed.")
+        except Exception as e:
+            print(f"[WARNING] mlx-mfa patch failed: {e}")
 
     if group.size() > 1:
         if args.adapter_path:

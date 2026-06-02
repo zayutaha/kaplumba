@@ -485,7 +485,7 @@ def generate_step(
                 ),
             )
             quantize_cache_fn(prompt_cache)
-            mx.eval([c.state for c in prompt_cache])
+            mx.async_eval([c.state for c in prompt_cache])
             prompt_processed_tokens += n_to_process
             prompt_progress_callback(prompt_processed_tokens, total_prompt_tokens)
             prompt = prompt[n_to_process:]
@@ -637,7 +637,7 @@ def speculative_generate_step(
             n_to_process = min(current_step, y.size - 1)
             model(y[:n_to_process][None], cache=cache)
             quantize_cache_fn(cache)
-            mx.eval([c.state for c in cache])
+            mx.async_eval([c.state for c in cache])
             y = y[n_to_process:]
             mx.clear_cache()
             if _spec_limit > 0 and mx.get_peak_memory() > 0.85 * _spec_limit:
@@ -752,7 +752,7 @@ def mtp_generate_step(
         )
         mtp_cache = model.make_mtp_cache()
     else:
-        n_main = len(prompt_cache) - len(model.make_mtp_cache())
+        n_main = len(model.layers)
         model_cache = prompt_cache[:n_main]
         mtp_cache = prompt_cache[n_main:] or model.make_mtp_cache()
 
@@ -853,7 +853,7 @@ def mtp_generate_step(
             n = min(current_step, y.size - 1)
             model(y[:n][None], cache=model_cache)
             quantize_cache_fn(model_cache)
-            mx.eval([c.state for c in model_cache if hasattr(c, "state")])
+            mx.async_eval([c.state for c in model_cache if hasattr(c, "state")])
             y = y[n:]
             mx.clear_cache()
             if _mtp_limit > 0 and mx.get_peak_memory() > 0.85 * _mtp_limit:
@@ -1474,7 +1474,7 @@ class PromptProcessingBatch:
         while tokens.shape[1] > 0:
             n_to_process = min(self.prefill_step_size, tokens.shape[1])
             self.model(tokens[:, :n_to_process], cache=self.prompt_cache)
-            mx.eval([c.state for c in self.prompt_cache])
+            mx.async_eval([c.state for c in self.prompt_cache])
             mx.clear_cache()
             tokens = tokens[:, n_to_process:]
 
