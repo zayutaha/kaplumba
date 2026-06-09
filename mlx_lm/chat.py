@@ -4,7 +4,6 @@ import argparse
 import gc
 import json
 import signal
-import sys
 from typing import Generator, List, Optional, Union
 
 import mlx.core as mx
@@ -13,7 +12,7 @@ if __name__ == "__main__" and __package__ is None:
     __package__ = "mlx_lm"
 
 from .generate import GenerationResponse, stream_generate
-from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
+from mlx_lm.models.cache import make_prompt_cache
 from .sample_utils import make_sampler
 from .utils import load, sharded_load
 
@@ -353,7 +352,7 @@ def setup_arg_parser():
     parser.add_argument(
         "--prefill-step-size",
         type=int,
-        default=256,
+        default=128,
         help="Step size for prompt prefill processing. "
         "Larger values process more tokens per forward pass "
         "but use more memory. Default: 256.",
@@ -785,6 +784,9 @@ Read the material and then ask me what I'd like to know about {topic}."""})
         stop_generation = False
         response_text = ""
 
+        # Explicitly clear any stale interrupt flag before starting generation
+        _interrupted[0] = False
+
         def _cache_offset(cache):
             for c in cache:
                 if hasattr(c, "offset"):
@@ -823,13 +825,19 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                 rprint("\n[INFO] Generation stopped by user.")
                 stop_generation = True
                 break
+        
+        # Always append whatever text was generated to history, 
+        # even if interrupted, to keep history and cache in sync.
+        if response_text:
+            message_history.append({"role": "assistant", "content": response_text})
+
         if not stop_generation:
             rprint()
         if last_response and not stop_generation:
-            message_history.append({"role": "assistant", "content": response_text})
+            # message_history already appended above
             
             # Log research output to file
-            if message_history and message_history[-2].get("content", "").startswith("Research:"):
+            if message_history and len(message_history) >= 2 and message_history[-2].get("content", "").startswith("Research:"):
                 import datetime as _dt
                 _rpath = f"/tmp/mlx_research_output_{_dt.datetime.now():%Y%m%d_%H%M%S}.log"
                 try:
