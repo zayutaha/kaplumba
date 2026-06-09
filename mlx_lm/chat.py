@@ -866,6 +866,11 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                     turbo_fp16_layers=args.turbo_fp16_layers,
                 )
                 _cache_stale = False
+        elif stop_generation and response_text:
+            # If stopped mid-generation, append the partial response to history 
+            # to let the model know what it already said, but don't count it 
+            # as a full turn. This might be causing issues. Let's NOT append it.
+            rprint(f"[INFO] Interrupted. Partial response discarded from history.")
 
         prompt = None
         if stop_generation:
