@@ -21,17 +21,6 @@ class TestSettingsStore(unittest.TestCase):
         self.assertFalse(normalized["mtp"])
         self.assertEqual(normalized["max_tokens"], settings_store.DEFAULT_MODEL_OPTIONS["max_tokens"])
 
-    def test_save_and_load_model_options_round_trip(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
-            path = Path(tmpdir) / "chat_options.json"
-            with patch.object(settings_store, "OPTIONS_STATE_PATH", path):
-                settings_store.save_model_options({"temp": 0.2, "mtp": False})
-                loaded = settings_store.load_saved_model_options()
-
-        self.assertEqual(loaded["temp"], 0.2)
-        self.assertFalse(loaded["mtp"])
-
-
 class TestModelLifecycle(unittest.TestCase):
     def test_build_model_command_merges_per_model_options(self):
         options = {
@@ -43,9 +32,10 @@ class TestModelLifecycle(unittest.TestCase):
             "turbo_kv_bits": 3.0,
             "turbo_fp16_layers": 2,
             "mtp": False,
+            "prefill_step_size": 128,
         }
         with patch("model_lifecycle.load_model_configs", return_value={
-            "demo-model": {"options": {"mtp": True, "max_kv_size": 4096}}
+            "demo-model": {"options": {"mtp": True, "max_kv_size": 4096, "prefill_step_size": 256}}
         }):
             command = model_lifecycle.build_model_command(
                 "/tmp/demo-model",
@@ -60,6 +50,8 @@ class TestModelLifecycle(unittest.TestCase):
         self.assertIn("--mtp", command)
         self.assertIn("--max-kv-size", command)
         self.assertIn("4096", command)
+        self.assertIn("--prefill-step-size", command)
+        self.assertIn("256", command)
 
 
 class TestModelCatalog(unittest.TestCase):

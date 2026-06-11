@@ -71,6 +71,11 @@ class OptionsSelector(Static):
         try:
             if isinstance(sample, bool):
                 return raw.lower() in ("true", "on", "1", "yes")
+            if "." in raw:
+                try:
+                    return float(raw)
+                except ValueError:
+                    pass
             if isinstance(sample, int):
                 return int(raw)
             if isinstance(sample, float):

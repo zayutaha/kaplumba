@@ -27,6 +27,7 @@ DEFAULT_MODEL_OPTIONS = {
     "min_p": 0.0,
     "repetition_penalty": 1.0,
     "enable_thinking": False,
+    "prefill_step_size": 128,
 }
 
 OPTIONS_STATE_PATH = Path.home() / ".omlx" / "chat_options.json"
@@ -104,6 +105,12 @@ OPTION_SPECS = [
         "choices": [True, False],
         "description": "Enable thinking tags for supported models.",
     },
+    {
+        "key": "prefill_step_size",
+        "label": "Prefill step",
+        "choices": [32, 64, 128, 256, 512, 1024],
+        "description": "Step size for prompt prefill processing.",
+    },
 ]
 
 
@@ -116,6 +123,20 @@ def normalize_model_options(options: dict[str, object] | None) -> dict[str, obje
         if key not in options:
             continue
         value = options[key]
+        if key == "top_p" and isinstance(value, (int, float)) and not (0.0 <= value <= 1.0):
+            continue
+        if key == "min_p" and isinstance(value, (int, float)) and not (0.0 <= value <= 1.0):
+            continue
+        if key == "temp" and isinstance(value, (int, float)) and value < 0.0:
+            continue
+        if key == "top_k" and isinstance(value, int) and value < 0:
+            continue
+        if key == "repetition_penalty" and isinstance(value, (int, float)) and value < 0.0:
+            continue
+        if key in ("max_tokens", "prefill_step_size") and isinstance(value, int) and value <= 0:
+            continue
+        if key == "turbo_kv_bits" and value is not None and isinstance(value, (int, float)) and not (1 <= value <= 8):
+            continue
         normalized[key] = value
     return normalized
 
