@@ -6026,10 +6026,15 @@ class TurboQuantKVCache(_BaseCache):
     def state(self, value):
         self._cached_state = None
         self._cached_state_offset = -1
-        if value is None or value == []:
+        if value is None or value == [] or value == {}:
             self.keys, self.values = None, None
             self.offset = 0
             return
+        
+        # Handle dicts if tree_unflatten returned them
+        if isinstance(value, dict):
+            value = (value.get("keys"), value.get("values"))
+
         if isinstance(value, (list, tuple)) and len(value) == 2:
             self.keys, self.values = value
             self.keys = self._maybe_wrap_state(self.keys)

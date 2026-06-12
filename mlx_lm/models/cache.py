@@ -78,13 +78,25 @@ def save_prompt_cache(file_name: str, cache: List[Any], metadata: Dict[str, str]
         metadata (Dict[str, str]): Optional metadata to save along with model
             state.
     """
-    cache_data = [c.state for c in cache]
+    def _safe_tensor(x):
+        if x is None:
+            return mx.zeros((1,), dtype=mx.float16)
+        if isinstance(x, mx.array) and x.size == 0:
+            return mx.zeros((1,), dtype=mx.float16)
+        return x
+
+    cache_data = [tree_map(_safe_tensor, c.state) for c in cache]
     cache_info = [c.meta_state for c in cache]
-    cache_data = dict(tree_flatten(cache_data))
+    
+    # Flatten and then filter out any remaining None if tree_map missed it
+    flat_cache_data = tree_flatten(cache_data)
+    filtered_cache_data = {k: v for k, v in flat_cache_data if v is not None}
+    
     cache_classes = [type(c).__name__ for c in cache]
     cache_metadata = [cache_info, metadata, cache_classes]
     cache_metadata = dict(tree_flatten(cache_metadata))
-    mx.save_safetensors(file_name, cache_data, cache_metadata)
+    
+    mx.save_safetensors(file_name, filtered_cache_data, cache_metadata)
 
 
 def load_prompt_cache(file_name, return_metadata=False):
@@ -261,7 +273,16 @@ class ConcatenateKVCache(_BaseCache):
 
     @state.setter
     def state(self, v):
-        self.keys, self.values = v
+        k, v_ = v
+        # Verify if sentinel (shape (1, 1, 0, 1))
+        if k.ndim == 4 and k.shape[2] == 0:
+            self.keys, self.values = None, None
+            self.offset = 0
+            self._idx = 0
+        else:
+            self.keys, self.values = k, v_
+            self.offset = k.shape[2]
+            self._idx = self.offset
         self.offset = self.keys.shape[-2]
 
     def is_trimmable(self):
@@ -349,7 +370,16 @@ class QuantizedKVCache(_BaseCache):
 
     @state.setter
     def state(self, v):
-        self.keys, self.values = v
+        k, v_ = v
+        # Verify if sentinel (shape (1, 1, 0, 1))
+        if k.ndim == 4 and k.shape[2] == 0:
+            self.keys, self.values = None, None
+            self.offset = 0
+            self._idx = 0
+        else:
+            self.keys, self.values = k, v_
+            self.offset = k.shape[2]
+            self._idx = self.offset
 
     @property
     def meta_state(self):
@@ -415,6 +445,13 @@ class KVCache(_BaseCache):
 
     @property
     def state(self):
+        if self.keys is None:
+            # If empty, return a sentinel with correct dimensions (B, n_kv_heads, 0, head_dim)
+            return (
+                mx.zeros((1, 1, 0, 1), dtype=mx.float16), 
+                mx.zeros((1, 1, 0, 1), dtype=mx.float16)
+            )
+        
         if self.offset == self.keys.shape[2]:
             return self.keys, self.values
         else:
@@ -425,8 +462,22 @@ class KVCache(_BaseCache):
 
     @state.setter
     def state(self, v):
-        self.keys, self.values = v
-        self.offset = self.keys.shape[2]
+        k, v_ = v
+        # Verify shape to prevent index out of range for sentinel values
+        if k.ndim >= 3 and k.shape[2] > 0:
+            self.keys, self.values = k, v_
+            self.offset = k.shape[2]
+        else:
+            self.keys, self.values = None, None
+            self.offset = 0
+
+    @property
+    def meta_state(self):
+        return str(self.offset)
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self.offset = int(v)
 
     def is_trimmable(self):
         return True
@@ -586,6 +637,10 @@ class RotatingKVCache(_BaseCache):
 
     @property
     def state(self):
+        if self.keys is None:
+            # If empty, return empty tensors or a sentinel
+            return mx.zeros((1, 1, 0, 1), dtype=mx.float16), mx.zeros((1, 1, 0, 1), dtype=mx.float16)
+
         if self.offset < self.keys.shape[2]:
             return self.keys[..., : self.offset, :], self.values[..., : self.offset, :]
         else:
@@ -593,7 +648,16 @@ class RotatingKVCache(_BaseCache):
 
     @state.setter
     def state(self, v):
-        self.keys, self.values = v
+        k, v_ = v
+        # Verify if sentinel (shape (1, 1, 0, 1))
+        if k.ndim == 4 and k.shape[2] == 0:
+            self.keys, self.values = None, None
+            self.offset = 0
+            self._idx = 0
+        else:
+            self.keys, self.values = k, v_
+            self.offset = k.shape[2]
+            self._idx = self.offset
 
     @property
     def meta_state(self):
@@ -698,7 +762,29 @@ class ArraysCache(_BaseCache):
 
     @state.setter
     def state(self, v):
-        self.cache = v
+        # ArraysCache v is a list of tensors [conv_state, ssm_state]
+        processed_v = []
+        for i, c in enumerate(v):
+            if c is None or (isinstance(c, mx.array) and c.size == 0):
+                if i == 0:
+                    # conv_state: (B, kernel_size-1, conv_dim)
+                    processed_v.append(mx.zeros((1, 3, 10240), dtype=mx.float16))
+                else:
+                    # ssm_state: (B, num_v_heads, head_v_dim)
+                    processed_v.append(mx.zeros((1, 48, 128), dtype=mx.float16))
+            else:
+                processed_v.append(c)
+        self.cache = processed_v
+
+    @property
+    def meta_state(self):
+        # ArraysCache state is just the list of tensors, 
+        # but it might have padding/lengths metadata if used.
+        return str(len(self.cache))
+
+    @meta_state.setter
+    def meta_state(self, v):
+        pass
 
     def filter(self, batch_indices):
         """
@@ -843,6 +929,13 @@ class ChunkedKVCache(_BaseCache):
 
     @property
     def state(self):
+        if self.keys is None:
+            # If empty, return a sentinel with correct dimensions (B, n_kv_heads, 0, head_dim)
+            return (
+                mx.zeros((1, 1, 0, 1), dtype=mx.float16), 
+                mx.zeros((1, 1, 0, 1), dtype=mx.float16)
+            )
+        
         if self.offset == self.keys.shape[2]:
             return self.keys, self.values
         else:
@@ -853,8 +946,22 @@ class ChunkedKVCache(_BaseCache):
 
     @state.setter
     def state(self, v):
-        self.keys, self.values = v
-        self.offset = self.keys.shape[2]
+        k, v_ = v
+        # Verify shape to prevent index out of range for sentinel values
+        if k.ndim >= 3 and k.shape[2] > 0:
+            self.keys, self.values = k, v_
+            self.offset = k.shape[2]
+        else:
+            self.keys, self.values = None, None
+            self.offset = 0
+
+    @property
+    def meta_state(self):
+        return str(self.offset)
+
+    @meta_state.setter
+    def meta_state(self, v):
+        self.offset = int(v)
 
     def is_trimmable(self):
         return True

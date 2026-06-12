@@ -4,7 +4,8 @@ import argparse
 import gc
 import json
 import signal
-import sys
+from pathlib import Path
+import datetime as dt
 from typing import Generator, List, Optional, Union
 
 import mlx.core as mx
@@ -13,7 +14,12 @@ if __name__ == "__main__" and __package__ is None:
     __package__ = "mlx_lm"
 
 from .generate import GenerationResponse, stream_generate
-from mlx_lm.models.cache import make_prompt_cache, trim_prompt_cache
+from mlx_lm.models.cache import (
+    make_prompt_cache,
+    save_prompt_cache,
+    load_prompt_cache,
+    ArraysCache,
+)
 from .sample_utils import make_sampler
 from .utils import load, sharded_load
 
@@ -47,11 +53,7 @@ When writing mathematical expressions or scientific notation, use standard LaTeX
 - Use \\text{...} for text inside math: $\\text{if } x > 0$
 """
 
-PERSONALITIES: dict[str, str] = {
-    "default": """Answer in as few words as needed. No preamble, no disclaimers, no filler. If unsure, say "I don't know" and stop. Be direct. Swear if it fits. Never mention being an AI.""",
-    "doctor": """Explain medical stuff like you're a paramedic in a bar. Direct, practical, no bullshit. Ask what matters, tell them what to watch for, and say when they need to see a real doctor. No AI talk. No padding. Swear if the situation warrants it.""",
-    "historian": """Tell history like you're recounting it to a friend over drinks. Focus on the people, the decisions, the luck, and the fuck-ups. Big themes, not just dates. Analogies to now are fine if they land. No "objectively speaking" or "it's complicated" cop-outs.""",
-}
+from textual_ui.personas import PERSONALITIES
 
 
 def chat(
@@ -357,7 +359,7 @@ def setup_arg_parser():
     parser.add_argument(
         "--prefill-step-size",
         type=int,
-        default=256,
+        default=128,
         help="Step size for prompt prefill processing. "
         "Larger values process more tokens per forward pass "
         "but use more memory. Default: 256.",
@@ -468,6 +470,8 @@ def main():
         turbo_kv_bits=args.turbo_kv_bits,
         turbo_fp16_layers=args.turbo_fp16_layers,
     )
+    if args.mtp and hasattr(model, "mtp_forward"):
+        prompt_cache.extend(model.make_mtp_cache())
 
     message_history: list = []
     _cache_stale = False
@@ -543,6 +547,209 @@ def main():
                 cache_mem = mx.get_cache_memory() / 1e9
                 peak_mem = mx.get_peak_memory() / 1e9
                 rprint(f"[INFO] Cache memory: {cache_mem:.2f} GB | Peak memory: {peak_mem:.2f} GB")
+                continue
+
+            # Handle /save command
+            if query == "/save" or query.startswith("/save "):
+                chat_name = query[len("/save ") :].strip()
+                is_complex = any(isinstance(c, ArraysCache) for c in prompt_cache)
+                
+                if is_complex:
+                    rprint("[INFO] Model uses complex cache (ArraysCache), skipping KV cache save.")
+                    if not chat_name:
+                        chat_name = "chat_" + dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+                else:
+                    if not chat_name:
+                        rprint("[INFO] Naming chat with AI...")
+                        name_messages = [
+                            {
+                                "role": "system",
+                                "content": "You are a chat namer. Given a conversation history, provide a concise 3-word name for it. No explanation. No punctuation.",
+                            },
+                            {
+                                "role": "user",
+                                "content": f"Conversation:\n{message_history[-6:]}\n\nName:",
+                            },
+                        ]
+                        name_prompt = tokenizer.apply_chat_template(
+                            name_messages,
+                            add_generation_prompt=True,
+                            add_special_tokens=True,
+                            **chat_template_kwargs,
+                        )
+                        temp_cache = make_prompt_cache(
+                            model,
+                            args.max_kv_size,
+                            turbo_kv_bits=args.turbo_kv_bits,
+                            turbo_fp16_layers=args.turbo_fp16_layers,
+                        )
+                        name_text = ""
+                        for resp in stream_generate(
+                            model,
+                            tokenizer,
+                            name_prompt,
+                            max_tokens=20,
+                            prompt_cache=temp_cache,
+                            turbo_kv_bits=args.turbo_kv_bits,
+                            turbo_fp16_layers=args.turbo_fp16_layers,
+                        ):
+                            name_text += resp.text
+                        chat_name = name_text.strip().replace(" ", "_").lower()
+                        chat_name = "".join(
+                            c for c in chat_name if c.isalnum() or c == "_"
+                        )[:50]
+
+                if not chat_name:
+                    chat_name = "chat_" + dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+
+                chats_dir = Path("chats")
+                chats_dir.mkdir(exist_ok=True)
+                json_path = chats_dir / f"{chat_name}.json"
+
+                if not is_complex:
+                    cache_path = chats_dir / f"{chat_name}.safetensors"
+                    # Evaluate cache before saving
+                    try:
+                        full_cache_to_save = prompt_cache
+                        mx.eval(full_cache_to_save)
+                        save_prompt_cache(
+                            str(cache_path), full_cache_to_save, metadata={"chat_name": chat_name}
+                        )
+                    except Exception as e:
+                        import traceback
+                        log_file = Path("/tmp/mlx_lm_persistence.log")
+                        with open(log_file, "a") as f:
+                            f.write(f"\n[{dt.datetime.now()}] SAVE ERROR: {chat_name}\n")
+                            f.write(traceback.format_exc())
+                            f.write("-" * 40 + "\n")
+                        rprint(f"[ERROR] Failed to save KV cache. Details logged to {log_file}")
+                        continue
+
+                with open(json_path, "w") as f:
+                    json.dump(
+                        {
+                            "message_history": message_history,
+                            "current_system_prompt": current_system_prompt,
+                            "model_name": Path(args.model).name,
+                            "model_type": getattr(model, "model_type", "unknown"),
+                            "mtp_enabled": args.mtp,
+                            "has_cache": not is_complex,
+                        },
+                        f,
+                        indent=2,
+                    )
+
+                rprint(f"[INFO] Chat saved as '{chat_name}'")
+                continue
+
+            # Handle /chat <name> command
+            if query == "/chat" or query.startswith("/chat "):
+                chat_name = query[6:].strip()
+                chats_dir = Path("chats")
+                chats_dir.mkdir(exist_ok=True)
+
+                if not chat_name:
+                    rprint("[INFO] Available chats:")
+                    chat_files = list(chats_dir.glob("*.json"))
+                    if not chat_files:
+                        rprint("  No saved chats found.")
+                    else:
+                        # Sort by modification time (most recent first)
+                        chat_files.sort(key=lambda x: x.stat().st_mtime, reverse=True)
+                        for cf in chat_files:
+                            mtime = dt.datetime.fromtimestamp(cf.stat().st_mtime)
+                            time_str = mtime.strftime("%Y-%m-%d %H:%M:%S")
+                            rprint(f"  - {cf.stem} [dim]({time_str})[/dim]")
+                    continue
+
+                json_path = chats_dir / f"{chat_name}.json"
+                cache_path = chats_dir / f"{chat_name}.safetensors"
+
+                if not json_path.exists() or not cache_path.exists():
+                    rprint(f"[ERROR] Chat '{chat_name}' not found.")
+                    continue
+
+                with open(json_path, "r") as f:
+                    data = json.load(f)
+
+                # Architecture check
+                saved_type = data.get("model_type", "unknown")
+                current_type = getattr(model, "model_type", "unknown")
+                if saved_type != current_type:
+                    rprint(
+                        f"[ERROR] Architecture mismatch: chat saved with '{saved_type}', current model is '{current_type}'."
+                    )
+                    continue
+                
+                # MTP sync
+                saved_mtp = data.get("mtp_enabled", False)
+                if saved_mtp != args.mtp:
+                    rprint(f"[INFO] Switching MTP to {'enabled' if saved_mtp else 'disabled'} to match saved chat.")
+                    args.mtp = saved_mtp
+                
+                # Check for MTP cache if model supports it
+                has_mtp_head = hasattr(model, "mtp_forward")
+
+                message_history = data["message_history"]
+                current_system_prompt = data.get("current_system_prompt")
+
+                # Clear and load cache
+                try:
+                    rprint(f"[INFO] Clearing current cache for '{getattr(model, 'model_type', 'unknown')}'...")
+                    del prompt_cache
+                    mx.clear_cache()
+                    
+                    rprint(f"[INFO] Attempting to load tensors from {cache_path}...")
+                    prompt_cache = load_prompt_cache(str(cache_path))
+                    
+                    # Evaluate after load
+                    rprint("[INFO] Evaluating tensors...")
+                    mx.eval(prompt_cache)
+                    
+                    # WARM-UP PASS:
+                    rprint("[INFO] Performing warm-up forward pass...")
+                    dummy_tokens = mx.array([[tokenizer.bos_token_id or 1]], dtype=mx.uint32)
+                    model(dummy_tokens, cache=prompt_cache)
+                    mx.eval(prompt_cache)
+                    rprint("[INFO] Warm-up complete.")
+
+                except Exception as e:
+                    import traceback
+                    log_file = Path("/tmp/mlx_lm_persistence.log")
+                    with open(log_file, "a") as f:
+                        f.write(f"\n[{dt.datetime.now()}] LOAD ERROR: {chat_name}\n")
+                        f.write(traceback.format_exc())
+                        f.write("-" * 40 + "\n")
+                    rprint(f"[ERROR] Failed to load KV cache. Details logged to {log_file}")
+                    # Re-initialize empty cache to recover
+                    prompt_cache = make_prompt_cache(
+                        model,
+                        args.max_kv_size,
+                        turbo_kv_bits=args.turbo_kv_bits,
+                        turbo_fp16_layers=args.turbo_fp16_layers,
+                    )
+                    continue
+                
+                # IMPORTANT: Mark cache as NOT stale so the loop doesn't try to 
+                # re-tokenize the whole history on the next turn.
+                _cache_stale = False
+                
+                # Debug info
+                offset = 0
+                if prompt_cache:
+                    for c in prompt_cache:
+                        if hasattr(c, "offset"):
+                            offset = c.offset
+                            break
+                rprint(f"[INFO] Loaded chat '{chat_name}' (Arch: {saved_type}, Cache Offset: {offset})")
+                # Signal history back to TUI if needed
+                rprint(f"[INFO] Sending JSON history length: {len(message_history)}")
+                rprint(f"JSON:{json.dumps(message_history)}")
+                # Ensure we don't accidentally fall into the generation part of the current iteration
+                prompt = None
+                last_response = None
+                response_text = ""
+                _cache_stale = False
                 continue
             
             # Handle /search — quick web answer
@@ -764,7 +971,17 @@ Read the material and then ask me what I'd like to know about {topic}."""})
             # already in the KV cache at correct RoPE positions. Only
             # tokenize the new user message to eliminate redundant prefill
             # of the full conversation history each turn.
-            is_first_turn = not message_history or _cache_stale
+            
+            # Check if the cache is actually warm
+            cache_has_data = False
+            if prompt_cache:
+                mx.eval(prompt_cache)
+                for c in prompt_cache:
+                    if hasattr(c, "offset") and c.offset > 0:
+                        cache_has_data = True
+                        break
+
+            is_first_turn = (not message_history or _cache_stale) and not cache_has_data
             _cache_stale = False
             if is_first_turn:
                 messages = []
@@ -785,9 +1002,27 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                 **thinking_kwargs,
             )
 
+            # --- MTP CACHE SYNC ---
+            # If MTP is enabled, the generation loop expects a prompt_cache
+            # that includes the backbone layers followed by the MTP layers.
+            if args.mtp and hasattr(model, "mtp_forward"):
+                num_backbone = len(model.layers)
+                if len(prompt_cache) == num_backbone:
+                    # Append MTP cache layers if they are missing
+                    prompt_cache.extend(model.make_mtp_cache())
+            elif not args.mtp and hasattr(model, "mtp_forward"):
+                num_backbone = len(model.layers)
+                if len(prompt_cache) > num_backbone:
+                    # Strip MTP layers if MTP was disabled
+                    prompt_cache = prompt_cache[:num_backbone]
+            # -----------------------
+
         last_response = None
         stop_generation = False
         response_text = ""
+
+        # Explicitly clear any stale interrupt flag before starting generation
+        _interrupted[0] = False
 
         def _cache_offset(cache):
             for c in cache:
@@ -827,13 +1062,19 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                 rprint("\n[INFO] Generation stopped by user.")
                 stop_generation = True
                 break
+        
+        # Always append whatever text was generated to history, 
+        # even if interrupted, to keep history and cache in sync.
+        if response_text:
+            message_history.append({"role": "assistant", "content": response_text})
+
         if not stop_generation:
             rprint()
         if last_response and not stop_generation:
-            message_history.append({"role": "assistant", "content": response_text})
+            # message_history already appended above
             
             # Log research output to file
-            if message_history and message_history[-2].get("content", "").startswith("Research:"):
+            if message_history and len(message_history) >= 2 and message_history[-2].get("content", "").startswith("Research:"):
                 import datetime as _dt
                 _rpath = f"/tmp/mlx_research_output_{_dt.datetime.now():%Y%m%d_%H%M%S}.log"
                 try:
@@ -873,26 +1114,7 @@ Read the material and then ask me what I'd like to know about {topic}."""})
 
         prompt = None
         if stop_generation:
-
-            tokens_added = _cache_offset(prompt_cache) - offset_before
-            if tokens_added > 0:
-                if offset_before > 0:
-                    trim_prompt_cache(prompt_cache, tokens_added)
-                    rprint(
-                        f"[INFO] Trimmed {tokens_added} tokens from cache."
-                    )
-                else:
-                    # First turn: reset entire cache so next turn re-encodes
-                    # the full conversation from message_history
-                    prompt_cache = make_prompt_cache(
-                        model,
-                        args.max_kv_size,
-                        turbo_kv_bits=args.turbo_kv_bits,
-                        turbo_fp16_layers=args.turbo_fp16_layers,
-                    )
-                    _cache_stale = True
-                    rprint("[INFO] Cache reset for next conversation.")
-            rprint("[INFO] Press Ctrl-d again to exit or enter a new message.")
+            rprint("[INFO] Generation stopped. Ready for next message.")
 
 
 if __name__ == "__main__":

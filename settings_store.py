@@ -4,12 +4,14 @@ from pathlib import Path
 
 SLASH_COMMANDS: dict[str, str] = {
     "/clear": "Clear the conversation, but keep the Kaplumba welcome screen.",
+    "/save": "Save the current conversation and KV cache to ./chats/.",
+    "/chat": "List saved chats or load one: /chat <name>.",
     "/models": "Open the model picker and switch models safely.",
     "/options": "Open launch options for MTP, context, sampling, and cache knobs.",
     "/personality": "Open the personality picker: default, doctor, or historian.",
-    "/search <query>": "Search 3 pages and answer concisely.",
-    "/research <topic>": "Deep research: 8 pages, exhaustive report stored as conversation context.",
-    "/unload <pct>": "Unload N% of model layers to free GPU memory.",
+    "/search": "Search the web and answer concisely: /search <query>.",
+    "/research": "Deep research: /research <topic>.",
+    "/unload": "Unload N% of model layers to free GPU memory: /unload <pct>.",
     "/reload": "Reload all previously unloaded layers.",
     "/memory": "Show current GPU memory usage.",
     "/mtp": "Toggle multi-token prediction on/off.",
@@ -27,13 +29,16 @@ DEFAULT_MODEL_OPTIONS = {
     "min_p": 0.0,
     "repetition_penalty": 1.0,
     "enable_thinking": False,
+    "prefill_step_size": 128,
 }
 
 OPTIONS_STATE_PATH = Path.home() / ".omlx" / "chat_options.json"
 
 MODEL_CONFIGS_PATH = Path.home() / ".omlx" / "model_configs.json"
 
-PERSONALITY_CHOICES = ["default", "doctor", "historian"]
+from textual_ui.personas import PERSONALITIES
+
+PERSONALITY_CHOICES = list(PERSONALITIES.keys())
 
 OPTION_SPECS = [
     {
@@ -102,6 +107,12 @@ OPTION_SPECS = [
         "choices": [True, False],
         "description": "Enable thinking tags for supported models.",
     },
+    {
+        "key": "prefill_step_size",
+        "label": "Prefill step",
+        "choices": [32, 64, 128, 256, 512, 1024],
+        "description": "Step size for prompt prefill processing.",
+    },
 ]
 
 
@@ -114,6 +125,20 @@ def normalize_model_options(options: dict[str, object] | None) -> dict[str, obje
         if key not in options:
             continue
         value = options[key]
+        if key == "top_p" and isinstance(value, (int, float)) and not (0.0 <= value <= 1.0):
+            continue
+        if key == "min_p" and isinstance(value, (int, float)) and not (0.0 <= value <= 1.0):
+            continue
+        if key == "temp" and isinstance(value, (int, float)) and value < 0.0:
+            continue
+        if key == "top_k" and isinstance(value, int) and value < 0:
+            continue
+        if key == "repetition_penalty" and isinstance(value, (int, float)) and value < 0.0:
+            continue
+        if key in ("max_tokens", "prefill_step_size") and isinstance(value, int) and value <= 0:
+            continue
+        if key == "turbo_kv_bits" and value is not None and isinstance(value, (int, float)) and not (1 <= value <= 8):
+            continue
         normalized[key] = value
     return normalized
 

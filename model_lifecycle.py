@@ -35,6 +35,8 @@ def build_model_command(model_path: str, options: dict, system_prompt: str) -> l
         cmd.extend(["--turbo-kv-bits", str(int(opts["turbo_kv_bits"]))])
     if opts["turbo_fp16_layers"] is not None:
         cmd.extend(["--turbo-fp16-layers", str(opts["turbo_fp16_layers"])])
+    if opts.get("prefill_step_size") is not None:
+        cmd.extend(["--prefill-step-size", str(opts["prefill_step_size"])])
     return cmd
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from pathlib import Path
 
 from conversation_engine import run_model_stream
@@ -52,6 +53,62 @@ class Orchestrator:
                     await self.port.send_command("/clear")
                 except Exception:
                     pass
+            self.chat._set_busy(False)
+            self.chat.refresh_command_menu()
+            self.chat.query_one("#input").focus()
+            return
+
+        if user_text == "/chat":
+            await self.chat.show_chat_selector()
+            return
+
+        if user_text.startswith("/chat "):
+            self.chat._set_busy(True)
+            try:
+                resp = await self.port.send_command(user_text)
+                if resp:
+                    # Look for JSON: history marker
+                    json_start = resp.find("JSON:")
+                    if json_start >= 0:
+                        history_json = resp[json_start + 5 :].strip()
+                        self.chat.notify(f"Received history: {len(history_json)} bytes")
+                        history = json.loads(history_json)
+                        await self.chat.clear_chat()
+                        for msg in history:
+                            role = msg["role"]
+                            content = msg["content"]
+                            if role == "user":
+                                await self.chat.append_user_message(content)
+                            elif role == "assistant":
+                                await self.chat.append_assistant_message(content)
+                    
+                    # Also show any [INFO] messages (like the list of chats)
+                    lines = [l for l in resp.splitlines() if "[INFO]" in l or "[ERROR]" in l or l.strip().startswith("- ")]
+                    if lines:
+                        # Convert info/list lines to a readable display
+                        display = "\n".join(lines).strip()
+                        if "Available chats:" in display or "not found" in display:
+                            await self.chat.show_overlay("Chats", display)
+                        else:
+                            self.chat.notify(display)
+            except Exception as e:
+                self.chat.notify(f"Failed to load chat: {str(e)}", severity="error")
+            
+            self.chat._set_busy(False)
+            self.chat.refresh_command_menu()
+            self.chat.query_one("#input").focus()
+            return
+
+        if user_text == "/save" or user_text.startswith("/save "):
+            self.chat._set_busy(True)
+            try:
+                resp = await self.port.send_command(user_text)
+                if resp:
+                    lines = [l for l in resp.splitlines() if "[INFO]" in l or "[ERROR]" in l]
+                    if lines:
+                        self.chat.notify("\n".join(lines).strip())
+            except Exception:
+                pass
             self.chat._set_busy(False)
             self.chat.refresh_command_menu()
             self.chat.query_one("#input").focus()
@@ -141,6 +198,35 @@ class Orchestrator:
     async def handle_quit(self) -> None:
         await self.port.stop()
         self.chat.exit()
+
+    async def handle_chat_selected(self, chat_name: str) -> None:
+        self.chat._set_busy(True)
+        self.chat.show_chat_ui()
+        try:
+            resp = await self.port.send_command(f"/chat {chat_name}")
+            if resp:
+                json_start = resp.find("JSON:")
+                if json_start >= 0:
+                    history_json = resp[json_start + 5 :].strip()
+                    history = json.loads(history_json)
+                    await self.chat.clear_chat()
+                    for msg in history:
+                        role = msg["role"]
+                        content = msg["content"]
+                        if role == "user":
+                            await self.chat.append_user_message(content)
+                        elif role == "assistant":
+                            await self.chat.append_assistant_message(content)
+                
+                lines = [l for l in resp.splitlines() if "[INFO]" in l or "[ERROR]" in l]
+                if lines:
+                    self.chat.notify("\n".join(lines).strip())
+        except Exception as e:
+            self.chat.notify(f"Failed to load chat: {str(e)}", severity="error")
+        
+        self.chat._set_busy(False)
+        self.chat.refresh_command_menu()
+        self.chat.query_one("#input").focus()
 
     async def handle_model_selected(self, model_name: str) -> None:
         self.selected_model = model_name

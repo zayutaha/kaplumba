@@ -86,9 +86,10 @@ HELP_TEXT = """\
 
 [dim]Press [bold]Ctrl+\\[/] or Esc or click outside to close[/]"""
 from textual_ui.latex import format_for_display, strip_prompt_markers
-from textual_ui.personas import PERSONALITIES
+from textual_ui.personas import PERSONALITY_INFO
 
 from textual_ui.widgets.chat_input import ChatInput
+from textual_ui.widgets.chat_selector import ChatSelector
 from textual_ui.widgets.loading_spinner import LoadingSpinner
 from textual_ui.widgets.model_picker import ModelSelector
 from textual_ui.widgets.options_selector import OptionsSelector
@@ -130,15 +131,17 @@ class ChatUI(App):
         with Center(id="personality-selector-container"):
             yield PersonalitySelector(
                 [
-                    ("default", "Blunt, compact answers with no fake politeness."),
-                    ("doctor", "Medical explainer who asks follow-up questions first."),
-                    ("historian", "Opinionated historical analysis with sharper language."),
+                    (name, info["description"])
+                    for name, info in PERSONALITY_INFO.items()
                 ],
                 id="personality-selector",
             )
 
         with Center(id="options-selector-container"):
             yield OptionsSelector({}, id="options-selector")
+
+        with Center(id="chat-selector-container"):
+            yield ChatSelector(id="chat-selector")
 
         with Center(id="splash-container"):
             yield Static(LOGO, id="splash-logo")
@@ -176,6 +179,7 @@ class ChatUI(App):
         self.query_one("#model-selector-container").display = True
         self.query_one("#personality-selector-container").display = False
         self.query_one("#options-selector-container").display = False
+        self.query_one("#chat-selector-container").display = False
         self.query_one("#chat-center").display = False
         self.query_one("#input-center").display = False
         self.query_one("#command-menu-container").display = False
@@ -189,6 +193,7 @@ class ChatUI(App):
         self.query_one("#model-selector-container").display = False
         self.query_one("#personality-selector-container").display = False
         self.query_one("#options-selector-container").display = False
+        self.query_one("#chat-selector-container").display = False
         self.query_one("#chat-center").display = True
         self.query_one("#input-center").display = True
         self._mount_welcome_screen()
@@ -200,6 +205,7 @@ class ChatUI(App):
         self.query_one("#model-selector-container").display = False
         self.query_one("#personality-selector-container").display = False
         self.query_one("#options-selector-container").display = False
+        self.query_one("#chat-selector-container").display = False
         self.query_one("#chat-center").display = False
         self.query_one("#input-center").display = False
         self.query_one("#command-menu-container").display = False
@@ -435,6 +441,28 @@ class ChatUI(App):
         elif event.button.id == "crash-quit":
             await self.controller.handle_quit()
 
+    async def action_chat_selected(self, chat_name: str) -> None:
+        await self.controller.handle_chat_selected(chat_name)
+
+    async def action_dismiss_chat_selector(self) -> None:
+        if self.controller.port.running:
+            self.show_chat_ui()
+            return
+        self.query_one("#chat-selector-container").display = False
+        self.query_one("#model-selector-container").display = True
+        self.query_one("#model-selector", ModelSelector).focus()
+
+    async def show_chat_selector(self):
+        self.query_one("#chat-selector", ChatSelector).refresh_chats()
+        self.query_one("#chat-center").display = False
+        self.query_one("#input-center").display = False
+        self.query_one("#command-menu-container").display = False
+        self.query_one("#model-selector-container").display = False
+        self.query_one("#personality-selector-container").display = False
+        self.query_one("#options-selector-container").display = False
+        self.query_one("#chat-selector-container").display = True
+        self.query_one("#chat-selector").focus()
+
     async def show_model_selector(self):
         self.query_one("#splash-container").display = False
         self.query_one("#chat-center").display = False
@@ -490,6 +518,16 @@ class ChatUI(App):
                 await self.current_md.update(f"{display}{cursor}")
         except Exception:
             pass
+
+    async def append_user_message(self, text: str):
+        chat = self.query_one("#chat", VerticalScroll)
+        await chat.mount(CopyableMarkdown(text, classes="bubble-user"))
+        chat.scroll_end(animate=False)
+
+    async def append_assistant_message(self, text: str):
+        chat = self.query_one("#chat", VerticalScroll)
+        await chat.mount(CopyableMarkdown(text, classes="bubble-assistant"))
+        chat.scroll_end(animate=False)
 
     def show_model_loading(self, message="Loading model..."):
         self.show_loading(message)
