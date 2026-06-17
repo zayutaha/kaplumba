@@ -428,14 +428,6 @@ def generate_step(
     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
 
     def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
-        # Deep debug: check cache shapes
-        if prompt_cache:
-            for i, c in enumerate(prompt_cache):
-                if hasattr(c, "keys") and c.keys is not None:
-                    # Just log a few layers to avoid spam
-                    if i % 10 == 0:
-                        print(f"[DEBUG] Layer {i} Key shape: {c.keys.shape}")
-        
         if input_embeddings is not None:
             return model(
                 input_tokens, cache=prompt_cache, input_embeddings=input_embeddings

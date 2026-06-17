@@ -9,7 +9,6 @@ import mmap
 import os
 import resource
 import shutil
-import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from textwrap import dedent
@@ -26,6 +25,25 @@ from typing import (
 
 import mlx.core as mx
 import mlx.nn as nn
+
+MODEL_ROOT = Path("~/.omlx/models").expanduser()
+
+
+def resolve_model_path(path_or_hf_repo: str) -> str:
+    path = Path(path_or_hf_repo).expanduser()
+
+    # Explicit local path
+    if path.exists():
+        return str(path)
+
+    # ~/.omlx/models/<repo-id>
+    local_path = MODEL_ROOT / path_or_hf_repo
+
+    if local_path.exists():
+        return str(local_path)
+
+    # Fall back to Hugging Face / ModelScope
+    return path_or_hf_repo
 
 if os.getenv("MLXLM_USE_MODELSCOPE", "False").lower() == "true":
     try:
@@ -223,18 +241,8 @@ def _download(
     revision: Optional[str] = None,
     allow_patterns: List[str] = None,
 ) -> Path:
-    """
-    Ensures the model is available locally. If the path does not exist locally,
-    it is downloaded from the Hugging Face Hub.
-
-    Args:
-        path_or_hf_repo (str): The local path or Hugging Face repository ID of the model.
-        revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
-
-    Returns:
-        Path: The local file path.
-    """
-    model_path = Path(path_or_hf_repo)
+    resolved = resolve_model_path(path_or_hf_repo)
+    model_path = Path(resolved)
 
     if not model_path.exists():
         allow_patterns = allow_patterns or [
@@ -248,9 +256,10 @@ def _download(
             "*.jsonl",
             "*.jinja",
         ]
+
         model_path = Path(
             snapshot_download(
-                path_or_hf_repo,
+                resolved,
                 revision=revision,
                 allow_patterns=allow_patterns,
             )
@@ -260,9 +269,13 @@ def _download(
 
 
 def hf_repo_to_path(hf_repo):
-    return Path(snapshot_download(hf_repo, local_files_only=True))
+    resolved = resolve_model_path(hf_repo)
+    path = Path(resolved)
 
+    if path.exists():
+        return path
 
+    return Path(snapshot_download(resolved, local_files_only=True))
 def load_config(model_path: Path) -> dict:
     with open(model_path / "config.json", "r") as f:
         config = json.load(f)
