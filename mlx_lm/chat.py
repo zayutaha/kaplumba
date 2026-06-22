@@ -423,8 +423,7 @@ def main():
         rprint("- '/search <query>' to search the web and generate a response")
         rprint("- '/research <topic>' to research a topic in-depth (8 pages, detailed report)")
         rprint("- '/memory' to show current GPU memory usage")
-        rprint("- '/unload <pct>' to unload N% of model layers")
-        rprint("- '/restore' to restore all previously unloaded layers")
+        rprint("- '/unload <pct>' to unload N% of model layers (auto-restores on next prompt)")
         rprint("- '/mtp' to toggle multi-token prediction on/off")
 
     rprint(f"[INFO] Starting chat session with {args.model}.")
@@ -657,7 +656,6 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                     rprint("[ERROR] Unload percentage must be between 0 and 100")
                     continue
 
-                # Find actual writable layer storage
                 parent, attr = None, None
                 for src_name, src_obj in [('model', model), ('language_model', getattr(model, 'language_model', None))]:
                     if src_obj is None:
@@ -672,52 +670,23 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                         parent, attr = tr, 'layers'
                 if parent is None and hasattr(model, 'layers') and not isinstance(getattr(type(model), 'layers', None), property):
                     parent, attr = model, 'layers'
-
                 if parent is None:
                     rprint(f"[ERROR] Could not find writable layers for {type(model).__name__}")
                     continue
 
-                layers = getattr(parent, attr)
-                n = len(layers)
-                if not hasattr(model, '_saved_layers'):
-                    model._saved_layers = layers[:]
+                all_layers = getattr(parent, attr)
+                n = len(all_layers)
                 to_drop = max(1, int(n * unload_pct / 100))
                 kept = n - to_drop
-                setattr(parent, attr, layers[:kept])
+                model._unload_info = dict(parent=parent, attr=attr, kept=kept, n=n)
+                setattr(parent, attr, all_layers[:kept])
+                del all_layers
                 gc.collect()
                 mx.clear_cache()
                 after = mx.get_active_memory() / 1e9
                 rprint(f"[INFO] Unloaded {to_drop}/{n} layers ({unload_pct}%). "
                        f"Active memory: {after:.2f} GB")
                 continue
-
-            elif query == "/restore":
-                saved = getattr(model, '_saved_layers', None)
-                if saved is None:
-                    rprint("[INFO] No layers to reload")
-                    continue
-
-                parent, attr = None, None
-                for src_name, src_obj in [('model', model), ('language_model', getattr(model, 'language_model', None))]:
-                    if src_obj is None:
-                        continue
-                    inner = getattr(src_obj, 'model', None)
-                    if inner is not None and hasattr(inner, 'layers') and not isinstance(getattr(type(inner), 'layers', None), property):
-                        parent, attr = inner, 'layers'
-                        break
-                if parent is None:
-                    tr = getattr(model, 'transformer', None)
-                    if tr is not None and hasattr(tr, 'layers') and not isinstance(getattr(type(tr), 'layers', None), property):
-                        parent, attr = tr, 'layers'
-                if parent is None and hasattr(model, 'layers') and not isinstance(getattr(type(model), 'layers', None), property):
-                    parent, attr = model, 'layers'
-                if parent is None:
-                    rprint("[ERROR] Could not find writable model layers")
-                    continue
-
-                setattr(parent, attr, saved)
-                del model._saved_layers
-                rprint("[INFO] All layers restored")
             
             # Handle /mtp toggle
             if query == "/mtp":
@@ -778,6 +747,36 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                 **thinking_kwargs,
             )
 
+            # --- AUTO-RESTORE UNLOADED LAYERS ---
+            unload_info = getattr(model, '_unload_info', None)
+            if unload_info is not None:
+                p, a, kept, n = unload_info["parent"], unload_info["attr"], unload_info["kept"], unload_info["n"]
+                current = getattr(p, a)
+                if len(current) < n:
+                    rprint(f"[INFO] Restoring {n - kept} unloaded layers from disk...")
+                    fresh_model, _ = load(args.model)
+                    fresh_parent, fresh_attr = None, None
+                    for src_name, src_obj in [('model', fresh_model), ('language_model', getattr(fresh_model, 'language_model', None))]:
+                        if src_obj is None:
+                            continue
+                        inner = getattr(src_obj, 'model', None)
+                        if inner is not None and hasattr(inner, 'layers') and not isinstance(getattr(type(inner), 'layers', None), property):
+                            fresh_parent, fresh_attr = inner, 'layers'
+                            break
+                    if fresh_parent is None:
+                        tr = getattr(fresh_model, 'transformer', None)
+                        if tr is not None and hasattr(tr, 'layers') and not isinstance(getattr(type(tr), 'layers', None), property):
+                            fresh_parent, fresh_attr = tr, 'layers'
+                    if fresh_parent is None and hasattr(fresh_model, 'layers') and not isinstance(getattr(type(fresh_model), 'layers', None), property):
+                        fresh_parent, fresh_attr = fresh_model, 'layers'
+                    if fresh_parent is not None:
+                        fresh_layers = getattr(fresh_parent, fresh_attr)
+                        setattr(p, a, list(current) + list(fresh_layers[kept:]))
+                        del fresh_model
+                        gc.collect()
+                        mx.clear_cache()
+                        rprint(f"[INFO] Restored layers. Active memory: {mx.get_active_memory() / 1e9:.2f} GB")
+                del model._unload_info
             # --- MTP CACHE SYNC ---
             # If MTP is enabled, the generation loop expects a prompt_cache
             # that includes the backbone layers followed by the MTP layers.

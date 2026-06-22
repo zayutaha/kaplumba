@@ -29,6 +29,7 @@ Speculative decoding that generates 2–3 tokens per forward pass instead of 1. 
 
 | Command | Description |
 |---------|-------------|
+| `/help` | Show help overlay |
 | `/clear` | Reset conversation |
 | `/models` | Open model picker |
 | `/options` | Change temperature, top-p, top-k, min-p, repetition penalty, max tokens, KV size, MTP, turbo KV bits, FP16 layers, thinking, prefill step |
@@ -36,8 +37,7 @@ Speculative decoding that generates 2–3 tokens per forward pass instead of 1. 
 | `/search <query>` | Web search — generates 3 queries, scrapes 3 pages, answers concisely |
 | `/research <topic>` | Deep research — gathers ~8 sources via research agent, produces structured context for follow-up |
 | `/think <message>` | Send with thinking tags enabled |
-| `/unload <N%>` | Unload N% of model layers to free GPU memory |
-| `/restore` | Restore all unloaded layers |
+| `/unload <N%>` | Drop N% of model layers to free GPU memory (auto-restores on next prompt) |
 | `/memory` | Show GPU cache / peak memory |
 | `/mtp` | Toggle multi-token prediction on/off |
 
@@ -60,16 +60,10 @@ Model output is processed through a comprehensive LaTeX→Unicode converter cove
 `/research` deploys a multi-step agent (plan → retrieve 8 pages → extract → structure) for deep topic exploration. The structured context is loaded into the conversation for follow-up Q&A.
 
 ### Layer Unloading
-`/unload N%` dynamically trims model layers to free GPU memory. `/restore` restores them. Useful for freeing memory mid-session without restarting.
+`/unload N%` drops model layers to free GPU memory — auto-restores them from disk on your next prompt so you don't have to think about it.
 
-### Crash Recovery & Auto-Reload
-Models can sometimes crash on startup due to transient OOMs, even when enough memory is available. Kaplumba automatically retries loading the model up to **3 times** before showing a crash dialog. If the model crashes mid-session, a dialog offers reload or quit. Since the model runs in an isolated subprocess, a crash never takes down the UI — it restarts cleanly in the background.
-
-### Subprocess Architecture
-The model runs as a separate process with a stdin/stdout protocol. This means:
-- A model crash doesn't kill the UI
-- You can switch models without restarting
-- SIGINT passthrough for reliable interruption
+### Phoenix Resilience
+Kaplumba runs the model in an **isolated subprocess** with its own stdin/stdout protocol. If the model crashes (transient OOM, segfault, or cosmic ray), the UI stays up. It auto-retries loading **3 times** before showing a dialog. You can switch models without restarting the app. SIGINT is relayed reliably for clean interruption. Think of it as a bulletproof vest for your inference engine.
 
 ### Message Selection & Copy
 Click any message bubble to select it (orange highlight), then press **`C`** to copy all selected messages to the clipboard. Click a selected bubble again to deselect. The send button shows the count of selected messages.
@@ -82,7 +76,7 @@ Click any message bubble to select it (orange highlight), then press **`C`** to 
 | `Ctrl+C` | Quit |
 | `Ctrl+R` | Reload model |
 | `C` | Copy selected messages |
-| `Ctrl+\` | Help overlay |
+| `Ctrl+\` or `/help` | Help overlay |
 | `Esc` | Close overlay |
 
 ---

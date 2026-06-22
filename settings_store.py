@@ -37,6 +37,7 @@ def set_models_dir(path: str | Path) -> None:
 
 
 SLASH_COMMANDS: dict[str, str] = {
+    "/help": "Show this help menu",
     "/clear": "Reset conversation",
     "/models": "Open model picker",
     "/options": "Change sampling, MTP, KV cache, and performance knobs",
@@ -45,17 +46,16 @@ SLASH_COMMANDS: dict[str, str] = {
     "/research": "Deep research: /research <topic>",
     "/think": "Send with thinking tags: /think <message>",
     "/unload": "Free GPU memory: /unload <pct>",
-    "/restore": "Restore unloaded layers",
     "/memory": "Show GPU memory usage",
     "/mtp": "Toggle multi-token prediction",
 }
 
 NO_ARG_COMMANDS: set[str] = {
+    "/help",
     "/clear",
     "/models",
     "/options",
     "/personality",
-    "/restore",
     "/memory",
     "/mtp",
 }
