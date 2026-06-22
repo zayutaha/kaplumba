@@ -138,8 +138,17 @@ class Orchestrator:
             self.chat.query_one("#input").focus()
             return
 
-        if user_text == "/reload":
-            await self.handle_reload()
+        if user_text == "/restore":
+            self.chat._set_busy(True)
+            try:
+                resp = await self.port.send_command("/restore")
+            except Exception:
+                pass
+            await self.chat.handle_stream_text(user_text)
+            await self.chat.handle_stream_finished("")
+            self.chat._set_busy(False)
+            self.chat.refresh_command_menu()
+            self.chat.query_one("#input").focus()
             return
 
         if user_text.startswith("/unload "):

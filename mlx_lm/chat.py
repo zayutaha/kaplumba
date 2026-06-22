@@ -424,7 +424,7 @@ def main():
         rprint("- '/research <topic>' to research a topic in-depth (8 pages, detailed report)")
         rprint("- '/memory' to show current GPU memory usage")
         rprint("- '/unload <pct>' to unload N% of model layers")
-        rprint("- '/reload' to reload all previously unloaded layers")
+        rprint("- '/restore' to restore all previously unloaded layers")
         rprint("- '/mtp' to toggle multi-token prediction on/off")
 
     rprint(f"[INFO] Starting chat session with {args.model}.")
@@ -691,7 +691,7 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                        f"Active memory: {after:.2f} GB")
                 continue
 
-            elif query == "/reload":
+            elif query == "/restore":
                 saved = getattr(model, '_saved_layers', None)
                 if saved is None:
                     rprint("[INFO] No layers to reload")

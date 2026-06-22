@@ -11,7 +11,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "/research": "Deep research: /research <topic>",
     "/think": "Send with thinking tags: /think <message>",
     "/unload": "Free GPU memory: /unload <pct>",
-    "/reload": "Restore unloaded layers",
+    "/restore": "Restore unloaded layers",
     "/memory": "Show GPU memory usage",
     "/mtp": "Toggle multi-token prediction",
 }
@@ -21,7 +21,7 @@ NO_ARG_COMMANDS: set[str] = {
     "/models",
     "/options",
     "/personality",
-    "/reload",
+    "/restore",
     "/memory",
     "/mtp",
 }

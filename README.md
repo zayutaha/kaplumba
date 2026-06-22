@@ -37,7 +37,7 @@ Speculative decoding that generates 2–3 tokens per forward pass instead of 1. 
 | `/research <topic>` | Deep research — gathers ~8 sources via research agent, produces structured context for follow-up |
 | `/think <message>` | Send with thinking tags enabled |
 | `/unload <N%>` | Unload N% of model layers to free GPU memory |
-| `/reload` | Restore all unloaded layers |
+| `/restore` | Restore all unloaded layers |
 | `/memory` | Show GPU cache / peak memory |
 | `/mtp` | Toggle multi-token prediction on/off |
 
@@ -60,7 +60,7 @@ Model output is processed through a comprehensive LaTeX→Unicode converter cove
 `/research` deploys a multi-step agent (plan → retrieve 8 pages → extract → structure) for deep topic exploration. The structured context is loaded into the conversation for follow-up Q&A.
 
 ### Layer Unloading
-`/unload N%` dynamically trims model layers to free GPU memory. `/reload` restores them. Useful for freeing memory mid-session without restarting.
+`/unload N%` dynamically trims model layers to free GPU memory. `/restore` restores them. Useful for freeing memory mid-session without restarting.
 
 ### Crash Recovery & Auto-Reload
 Models can sometimes crash on startup due to transient OOMs, even when enough memory is available. Kaplumba automatically retries loading the model up to **3 times** before showing a crash dialog. If the model crashes mid-session, a dialog offers reload or quit. Since the model runs in an isolated subprocess, a crash never takes down the UI — it restarts cleanly in the background.
