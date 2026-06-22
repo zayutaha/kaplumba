@@ -37,7 +37,6 @@ Speculative decoding that generates 2–3 tokens per forward pass instead of 1. 
 | `/search <query>` | Web search — generates 3 queries, scrapes 3 pages, answers concisely |
 | `/research <topic>` | Deep research — gathers ~8 sources via research agent, produces structured context for follow-up |
 | `/think <message>` | Send with thinking tags enabled |
-| `/unload <N%>` | Drop N% of model layers to free GPU memory (auto-restores on next prompt) |
 | `/memory` | Show GPU cache / peak memory |
 | `/mtp` | Toggle multi-token prediction on/off |
 
@@ -58,9 +57,6 @@ Model output is processed through a comprehensive LaTeX→Unicode converter cove
 
 ### Research Agent
 `/research` deploys a multi-step agent (plan → retrieve 8 pages → extract → structure) for deep topic exploration. The structured context is loaded into the conversation for follow-up Q&A.
-
-### Layer Unloading
-`/unload N%` drops model layers to free GPU memory — silently restored from cache on your next prompt so you don't have to think about it.
 
 ### Phoenix Resilience
 Kaplumba runs the model in an **isolated subprocess** with its own stdin/stdout protocol. If the model crashes (transient OOM, segfault, or cosmic ray), the UI stays up. It auto-retries loading **3 times** before showing a dialog. You can switch models without restarting the app. SIGINT is relayed reliably for clean interruption. Think of it as a bulletproof vest for your inference engine.
@@ -148,7 +144,7 @@ Per-model config at `~/.omlx/model_configs.json`:
 │   └── turboquant_validate_weights.py
 │
 └── mlx_lm/                     # Inference engine (mlx-lm based)
-    ├── chat.py                 # Chat REPL with slash commands, search, research, unload
+    ├── chat.py                 # Chat REPL with slash commands, search, research
     ├── __init__.py             # Public API
     ├── generate.py             # TurboQuant, MTP, prefill_step_size
     ├── utils.py                # TurboQuant-aware loading

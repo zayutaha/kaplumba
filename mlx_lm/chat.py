@@ -2,15 +2,12 @@
 
 import argparse
 import gc
-import importlib
-import inspect
 import json
 import signal
 from pathlib import Path
 from typing import Generator, List, Optional, Union
 
 import mlx.core as mx
-import mlx.nn as nn
 
 if __name__ == "__main__" and __package__ is None:
     __package__ = "mlx_lm"
@@ -18,7 +15,7 @@ if __name__ == "__main__" and __package__ is None:
 from .generate import GenerationResponse, stream_generate
 from mlx_lm.models.cache import make_prompt_cache
 from .sample_utils import make_sampler
-from .utils import load, load_config, sharded_load
+from .utils import load, sharded_load
 
 DEFAULT_TEMP = 0.0
 DEFAULT_TOP_P = 1.0
@@ -427,7 +424,6 @@ def main():
         rprint("- '/search <query>' to search the web and generate a response")
         rprint("- '/research <topic>' to research a topic in-depth (8 pages, detailed report)")
         rprint("- '/memory' to show current GPU memory usage")
-        rprint("- '/unload <pct>' to unload N% of model layers")
         rprint("- '/mtp' to toggle multi-token prediction on/off")
 
     rprint(f"[INFO] Starting chat session with {args.model}.")
@@ -650,96 +646,6 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                 except Exception as e:
                     rprint(f"[ERROR] Research failed: {str(e)}")
                     continue
-            elif query.startswith("/unload "):
-                try:
-                    unload_pct = int(query[8:].strip())
-                except ValueError:
-                    rprint("[ERROR] Usage: /unload <percentage>")
-                    continue
-                if not (0 <= unload_pct <= 100):
-                    rprint("[ERROR] Unload percentage must be between 0 and 100")
-                    continue
-
-                # Find writable layers parent and its container (for args lookup)
-                parent, attr, container = None, None, None
-                for src_name, src_obj in [('model', model), ('language_model', getattr(model, 'language_model', None))]:
-                    if src_obj is None:
-                        continue
-                    inner = getattr(src_obj, 'model', None)
-                    if inner is not None and hasattr(inner, 'layers') and not isinstance(getattr(type(inner), 'layers', None), property):
-                        parent, attr, container = inner, 'layers', src_obj
-                        break
-                if parent is None:
-                    tr = getattr(model, 'transformer', None)
-                    if tr is not None and hasattr(tr, 'layers') and not isinstance(getattr(type(tr), 'layers', None), property):
-                        parent, attr, container = tr, 'layers', model
-                if parent is None and hasattr(model, 'layers') and not isinstance(getattr(type(model), 'layers', None), property):
-                    parent, attr, container = model, 'layers', model
-                if parent is None:
-                    rprint(f"[ERROR] Could not find writable layers for {type(model).__name__}")
-                    continue
-
-                all_layers = getattr(parent, attr)
-                n = len(all_layers)
-                target_kept = max(1, n - max(1, int(n * unload_pct / 100)))
-                if target_kept >= n:
-                    rprint(f"[INFO] Already at {unload_pct}% or less unloaded")
-                    continue
-
-                to_drop = n - target_kept
-                kept = target_kept
-
-                # Save each unloaded layer's weights + metadata to temp dir
-                import hashlib, tempfile
-                from pathlib import Path
-                _hash = hashlib.md5(args.model.encode()).hexdigest()[:12]
-                _swap = Path(tempfile.gettempdir()) / "kaplumba" / _hash
-                _swap.mkdir(parents=True, exist_ok=True)
-
-                # Find the right args holder: the layer parent may not store .args
-                # (e.g. Qwen3_5TextModel), but its containing model does (TextModel)
-                import dataclasses as _dc
-                _args_src = parent if hasattr(parent, 'args') else container
-                _args_dict = _dc.asdict(_args_src.args) if (_args_src is not None and _dc.is_dataclass(_args_src.args)) else {}
-
-                # Save quantization config if model has quantized layers
-                _quant_cfg = load_config(Path(args.model)).get("quantization")
-
-                _manifest = {"total": n, "count": to_drop, "pct": unload_pct, "layers": [], "args": _args_dict, "quantization": _quant_cfg}
-                for i in range(kept, n):
-                    layer = all_layers[i]
-                    w_path = _swap / f"layer_{i}.safetensors"
-                    mx.save_safetensors(str(w_path), dict(layer.parameters()))
-
-                    entry = {
-                        "class_path": f"{type(layer).__module__}.{type(layer).__qualname__}",
-                        "weights": str(w_path),
-                    }
-                    # Save extra init kwargs (use_sliding, layer_idx, etc.)
-                    sig = inspect.signature(type(layer).__init__)
-                    for pname in list(sig.parameters.keys())[1:]:
-                        if pname in ("args", "config"):
-                            continue
-                        if hasattr(layer, pname):
-                            entry[pname] = getattr(layer, pname)
-                        elif pname == "layer_idx":
-                            entry[pname] = i
-                    _manifest["layers"].append(entry)
-
-                m_path = _swap / "manifest.json"
-                with open(m_path, "w") as f:
-                    json.dump(_manifest, f)
-
-                model._unload_manifest = str(m_path)
-
-                setattr(parent, attr, all_layers[:kept])
-                del all_layers
-                gc.collect()
-                mx.clear_cache()
-                after = mx.get_active_memory() / 1e9
-                rprint(f"[INFO] Unloaded {to_drop}/{n} layers ({unload_pct}%). "
-                       f"Active memory: {after:.2f} GB")
-                continue
             
             # Handle /mtp toggle
             if query == "/mtp":
@@ -800,91 +706,6 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                 **thinking_kwargs,
             )
 
-            # --- RESTORE UNLOADED LAYERS FROM TEMP FILES ---
-            _manifest_path = getattr(model, '_unload_manifest', None)
-            _layers_restored = False
-            if _manifest_path is not None:
-                try:
-                    with open(_manifest_path) as _f:
-                        _manifest = json.load(_f)
-                    _swap_dir = Path(_manifest_path).parent
-
-                    # Find writable layers parent and its container (for args lookup)
-                    parent, attr, container = None, None, None
-                    for src_name, src_obj in [('model', model), ('language_model', getattr(model, 'language_model', None))]:
-                        if src_obj is None:
-                            continue
-                        inner = getattr(src_obj, 'model', None)
-                        if inner is not None and hasattr(inner, 'layers') and not isinstance(getattr(type(inner), 'layers', None), property):
-                            parent, attr, container = inner, 'layers', src_obj
-                            break
-                    if parent is None:
-                        tr = getattr(model, 'transformer', None)
-                        if tr is not None and hasattr(tr, 'layers') and not isinstance(getattr(type(tr), 'layers', None), property):
-                            parent, attr, container = tr, 'layers', model
-                    if parent is None and hasattr(model, 'layers') and not isinstance(getattr(type(model), 'layers', None), property):
-                        parent, attr, container = model, 'layers', model
-
-                    if parent is not None:
-                        current = list(getattr(parent, attr))
-                        # Recreate ModelArgs from saved dict
-                        _args_src = parent if hasattr(parent, 'args') else container
-                        if _args_src is not None and hasattr(_args_src, 'args'):
-                            _fresh_args = type(_args_src.args).from_dict(_manifest.get("args", {}))
-                        else:
-                            _fresh_args = type(model.args).from_dict(_manifest.get("args", {}))
-
-                        for _entry in _manifest["layers"]:
-                            _mod_path, _cls_name = _entry["class_path"].rsplit(".", 1)
-                            _mod = importlib.import_module(_mod_path)
-                            _layer_class = getattr(_mod, _cls_name)
-
-                            _sig = inspect.signature(_layer_class.__init__)
-                            _first_param = list(_sig.parameters.keys())[1]
-
-                            _init_kwargs = {_first_param: _fresh_args}
-                            for _k in _entry:
-                                if _k in ("class_path", "weights"):
-                                    continue
-                                _init_kwargs[_k] = _entry[_k]
-
-                            _new_layer = _layer_class(**_init_kwargs)
-                            # Apply quantization to match the original model's quantized layers
-                            _quant = _manifest.get("quantization")
-                            if _quant is not None:
-                                nn.quantize(_new_layer, group_size=_quant["group_size"], bits=_quant["bits"], mode=_quant.get("mode", "affine"))
-                            _new_layer.load_weights(_entry["weights"], strict=False)
-                            current.append(_new_layer)
-
-                        setattr(parent, attr, current)
-                        mx.eval(model.parameters())
-                        _layers_restored = True
-
-                    del model._unload_manifest
-                    # Clean up temp files
-                    import shutil
-                    shutil.rmtree(_swap_dir, ignore_errors=True)
-                except Exception as e:
-                    rprint(f"[WARNING] Layer restore failed: {e}")
-                    # Clear manifest so user can continue with remaining layers
-                    del model._unload_manifest
-                    import shutil
-                    shutil.rmtree(_swap_dir, ignore_errors=True)
-                    rprint("[WARNING] Unloaded layers lost. Restart the model to recover full accuracy.")
-
-            # --- WARMUP: 1-token forward pass to prove model works ---
-            if _layers_restored:
-                _wm_prompt = mx.array([tokenizer.bos_token_id or 1], mx.uint32)
-                _wm_cache = make_prompt_cache(model, args.max_kv_size)
-                for _w in stream_generate(
-                    model, tokenizer, _wm_prompt, max_tokens=1,
-                    sampler=make_sampler(0.0, 1.0),
-                    prompt_cache=_wm_cache,
-                ):
-                    pass
-                del _wm_cache, _wm_prompt
-                gc.collect()
-                mx.clear_cache()
             # --- MTP CACHE SYNC ---
             # If MTP is enabled, the generation loop expects a prompt_cache
             # that includes the backbone layers followed by the MTP layers.

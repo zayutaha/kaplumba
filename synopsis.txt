@@ -1,0 +1,401 @@
+================================================================================
+  KAPLUMBA — A Terminal-Based Interface for Local Large Language Models
+                             Project Synopsis
+================================================================================
+
+  GitHub: https://github.com/zayutaha/kaplumba
+  Built on: Apple MLX framework · mlx-lm inference engine · Textual TUI toolkit
+
+================================================================================
+1. PROJECT OVERVIEW
+================================================================================
+
+Kaplumba is a full-featured terminal user interface for interacting with large
+language models (LLMs) locally on Apple Silicon hardware. Named after the Turkish
+word for "turtle," the project provides a rich, keyboard-driven chat experience
+that runs entirely inside a terminal emulator — no web browser, no Electron shell,
+no cloud dependency. All inference happens on-device using Apple's MLX framework,
+which leverages the unified memory architecture of Apple Silicon (M-series chips)
+to run models efficiently without a discrete GPU.
+
+The project is built as a fork and significant extension of Apple's open-source
+mlx-lm library, adding an interactive TUI layer on top of the existing inference
+engine while preserving full compatibility with the underlying model loading,
+generation, and quantization infrastructure. Kaplumba supports over 80 model
+architectures including LLaMA, Mistral, Qwen 2/3/3.5, DeepSeek V2/V3, Gemma 1-4,
+Phi, Mixtral, Cohere, and many more.
+
+The core architectural insight of Kaplumba is its separate-process IPC pattern:
+the user interface runs as a Textual Python application in one process, while the
+model runs as an isolated child subprocess communicating via stdin/stdout with a
+custom marker-based framing protocol. This separation provides several benefits:
+
+  • Crash resilience — if the model subprocess crashes (OOM, segfault), the UI
+    remains alive and can automatically restart the model up to three times
+    before presenting a recovery dialog.
+  • Clean interruption — generation can be interrupted mid-stream by sending
+    SIGINT to the subprocess process group, with the UI immediately responsive.
+  • Model switching — users can switch between different models without
+    restarting the application; the old subprocess is killed and a new one
+    spawned.
+  • Resource isolation — model memory is managed in a separate process, so UI
+    responsiveness is never impacted by model computation.
+
+
+================================================================================
+2. USER INTERFACE
+================================================================================
+
+Kaplumba's user interface is built with Textual, a Python TUI framework that
+provides reactive widget composition, CSS-based styling, and async event handling
+for terminal applications. The interface is organized into several screens and
+panels:
+
+2.1 Splash Screen
+
+On startup, Kaplumba displays a stylized ASCII art logo of a turtle rendered in
+gold (#f0a500) on a dark background (#0f0f0f). Below the logo, a loading spinner
+animates while the previously-selected model (if any) loads from disk. The color
+scheme throughout the application follows a consistent dark theme with gold
+accents.
+
+2.2 Model Selector
+
+The model picker lists all models found in the models directory (default:
+~/.omlx/models/, configurable via a .env file). For each model, the picker
+displays:
+
+  • The model name (directory name)
+  • The architecture type extracted from config.json (e.g., "llama", "qwen3_5",
+    "gemma4")
+  • Estimated memory footprint calculated as total file size plus 1 GB overhead
+    for KV cache and runtime
+  • Live system memory readings (free + inactive + speculative + purgeable +
+    compressed pages, fetched via macOS vm_stat)
+
+Models that fit within available memory are highlighted in green; models that
+risk out-of-memory conditions are highlighted in red. Memory statistics refresh
+automatically every 5 seconds so users can see memory free up as they close
+other applications. The refresh pauses when the picker has focus or is being
+edited to prevent interference with navigation.
+
+Users can star favorite models with a key press; favorited models persist to
+~/.omlx/favorites.json and appear at the top of the list for quick access.
+Pressing 'd' enters directory editing mode, allowing users to change the model
+path inline.
+
+2.3 Chat View
+
+The main chat area displays messages as bubble widgets mounted inside a
+VerticalScroll container. User messages appear on the left with a dark
+background and subtle border; assistant messages appear on the right in gold
+text. During streaming generation, a blinking cursor ("▌") follows the
+latest output token. The view auto-scrolls to the bottom as new content arrives.
+
+2.4 Input Area
+
+The input widget is a multi-line TextArea that auto-resizes between 1 and 5
+lines. Users type messages and press Enter to send. A context-sensitive send
+button dynamically changes its label:
+
+  • "SEND" — default state when idle
+  • "STOP" — displayed during generation, allows interruption
+  • "COPY N" — displayed when one or more message bubbles are selected, allows
+    batch copy to clipboard
+
+2.5 Message Selection and Copy
+
+Clicking any message bubble toggles its selection state, visually indicated by
+an orange border highlight (via the .bubble-selected CSS class). Pressing C
+copies all selected messages to the system clipboard via macOS pbcopy, with a
+banner notification confirming the copy. Clicking a selected bubble again
+deselects it. The selection system does not use a separate toggle mode — clicks
+directly select or deselect.
+
+2.6 Help Overlay
+
+Pressing Ctrl+\ or typing /help opens a full-screen help overlay listing all
+keyboard shortcuts and commands. The overlay can be dismissed with Escape or by
+clicking outside it.
+
+2.7 Banner Notifications
+
+All transient notifications (errors, confirmations, status updates) display as a
+docked bar at the top of the chat area using a dedicated #banner widget that
+floats above the scrollable chat content. Notifications use gold background for
+informational messages and red for errors. They auto-dismiss after a configurable
+timeout (default 2 seconds). Unlike the previous implementation, the banner is
+positioned outside the scroll container so it never causes the chat content to
+shift or scroll.
+
+2.8 Crash Dialog
+
+If the model subprocess crashes more than three times, Kaplumba displays a crash
+dialog with two options: "Reload" (retry loading the model) and "Quit" (exit the
+application). This dialog is rendered as a modal overlay with centered text and
+buttons.
+
+
+================================================================================
+3. SLASH COMMAND SYSTEM
+================================================================================
+
+Kaplumba provides 10 slash commands accessible by typing "/" in the input area.
+As the user types, an auto-completing menu appears showing matching commands
+with descriptions, scrolled in a window of 5 visible items navigable with arrow
+keys. Commands that take arguments (e.g., /search <query>, /think <message>) insert
+the command text followed by a space and keep the menu visible for further
+typing. Commands with no arguments auto-execute immediately on Enter.
+
+3.1 /help
+  Opens the help overlay showing all keyboard shortcuts and command
+  descriptions. Handled entirely in the TUI layer — no subprocess communication
+  needed.
+
+3.2 /clear
+  Resets the conversation by clearing the prompt cache and message history.
+  Executed in both the TUI (resets local UI state) and the subprocess (clears
+  KV cache via make_prompt_cache and empties message_history).
+
+3.3 /models
+  Opens the model picker to select or switch models. Handled in the TUI layer.
+
+3.4 /options
+  Opens the options selector dialog where users can adjust all 12 sampling and
+  performance parameters: temperature, top-p, top-k, min-p, repetition penalty,
+  max tokens, max KV size, multi-token prediction, TurboQuant KV bits, TurboQuant
+  FP16 layers, enable thinking, and prefill step size. Each option has discrete
+  choices with labels and descriptions. Changes persist per-model across sessions
+  in ~/.omlx/model_configs.json.
+
+3.5 /personality
+  Opens the personality selector to switch between available system prompts.
+  Two bundled personalities: "default" (direct, honest, uncensored) and
+  "historian" (gritty narrative voice). On selection, the subprocess is notified
+  via /personality_set and the conversation cache is reset.
+
+3.6 /search <query>
+  An AI-powered web search feature. The model generates 3 search queries
+  covering different angles of the user's question. Each query is searched on
+  DuckDuckGo (via the ddgs library), and the most relevant result from each is
+  scraped using requests and BeautifulSoup with heuristic main-content extraction
+  (targeting <article>, <main>, .mw-parser-output, and similar selectors). The
+  scraped content is compiled into context, and the model generates a concise
+  answer. Search context is logged to /tmp/mlx_search_<timestamp>.log. After
+  search, the prompt cache is reset to prevent search context from contaminating
+  subsequent conversation turns.
+
+3.7 /research <topic>
+  Deploys a multi-step autonomous research agent located in
+  mlx_lm/research_agent/. The agent: (1) plans a research strategy covering
+  multiple angles of the topic, (2) retrieves up to 8 web pages, (3) extracts
+  and normalizes content, (4) structures the context with coverage percentages,
+  and (5) loads the structured context into the conversation for follow-up Q&A.
+  MTP speculative decoding is automatically disabled after research since the
+  massive context makes speculative overhead not worthwhile. Research context is
+  logged to /tmp/mlx_research_<timestamp>.log.
+
+3.8 /think <message>
+  Sends a message with thinking mode enabled in the chat template kwargs.
+  Supported by models that expose thinking tokens (e.g., Qwen and Gemma
+  families). During generation, the TUI detects <think>...</think> and
+  <|channel>...<channel|> blocks, shows an animated spinner while the model
+  is in the thinking block, and strips thinking blocks from the final displayed
+  text.
+
+3.9 /memory
+  Displays current GPU memory statistics from the MLX runtime: cache memory
+  (currently allocated for tensor operations) and peak memory (high-water mark
+  since model load). Shown in an overlay.
+
+3.10 /mtp
+  Toggles multi-token prediction (speculative decoding) on or off mid-session.
+  A banner notification confirms the new state. No chat bubble is generated for
+  this command.
+
+
+================================================================================
+4. MODEL MANAGEMENT AND LIFECYCLE
+================================================================================
+
+4.1 Model Discovery
+
+Models are stored in a configurable directory (default: ~/.omlx/models/). The
+model catalog scans this directory recursively, reading each model's config.json
+to determine architecture type, then computes total disk size by summing all
+file bytes. Memory estimation uses a simple formula: total model file size plus
+1 GB overhead for KV cache and runtime structures.
+
+4.2 Model Loading
+
+When a user selects a model, Kaplumba constructs a CLI command with all sampling
+parameters, KV cache options, and system prompt, then launches the model as an
+isolated subprocess via asyncio.create_subprocess_exec. The command uses uv run
+python -m mlx_lm.chat with the --prompt-marker flag set to "<<KAPLUMBA_READY>>"
+for response framing. After launch, the TUI waits for the startup prompt marker,
+then sends a priming message ("test\n") and verifies the model produces at least
+4 tokens before declaring the model ready.
+
+4.3 Subprocess Protocol
+
+Communication uses a simple marker-based framing protocol over stdin/stdout:
+
+  • TUI writes user_text + "\n" to subprocess stdin
+  • Subprocess reads via input(), processes, and writes output via print()
+  • When the subprocess is ready for the next input, it prints
+    "<<KAPLUMBA_READY>> "
+  • For streaming: the TUI reads stdout in 256-byte chunks with a 50 ms timeout,
+    yielding each chunk to the caller until it detects the prompt marker
+  • For commands: the TUI reads all output until the prompt marker and returns
+    the full response as a string
+  • Before sending each message, stale stdout data from previous interrupted
+    reads is drained to prevent marker contamination
+
+4.4 Model Switching
+
+Switching models kills the old subprocess (SIGTERM followed by SIGKILL after
+grace period) and spawns a new one with the new model's parameters. Per-model
+options and personality are loaded from ~/.omlx/model_configs.json. The TUI
+remains running throughout.
+
+4.5 Crash Recovery
+
+If the subprocess crashes, the TUI detects it via a failed read (empty chunk or
+non-zero return code). The orchestrator auto-restarts the subprocess up to 3
+times. If crashes exceed the limit, a crash dialog is presented with "Reload"
+and "Quit" options. Subprocess stderr is logged to /tmp/mlx_lm_chat_<model>.log
+for debugging.
+
+
+================================================================================
+5. INFERENCE ENGINE INTEGRATION
+================================================================================
+
+Kaplumba inherits the full capabilities of the underlying mlx-lm inference
+engine, which provides:
+
+  • Support for 80+ model architectures implemented in 127 Python modules
+  • Multiple quantization formats: AWQ, GPTQ, DWQ, dynamic quantization,
+    TurboQuant weights
+  • Multi-token prediction (MTP) speculative decoding — generates 2-3 tokens
+    per forward pass instead of 1
+  • TurboQuant KV cache compression — quantizes the KV cache to 1-4 bits using
+    Gaussian-optimized codebooks with Metal-accelerated kernels, achieving ~4.6x
+    compression at 3-bit with negligible quality loss
+  • Mixed-precision KV cache — keeps attention-critical layers (first/last N)
+    in FP16 while compressing the rest
+  • Configurable prefill step size for controlling prompt processing throughput
+  • XTC sampling and min-p sampling for diverse generation
+  • Repetition penalty for reducing loops
+  • Prompt caching for multi-turn conversation efficiency (only re-tokenizes the
+    new user message on subsequent turns)
+  • Distributed inference with tensor and pipeline parallelism
+
+The Kaplumba-specific additions to the inference engine include:
+
+  • MTP cache synchronization — when MTP is toggled, the prompt cache is
+    extended or trimmed to include or exclude MTP head cache layers
+
+
+================================================================================
+6. KEYBOARD SHORTCUTS
+================================================================================
+
+  ┌─────────────┬──────────────────────────────────────────────┐
+  │ Key         │ Action                                       │
+  ├─────────────┼──────────────────────────────────────────────┤
+  │ Enter       │ Send message / execute slash command         │
+  │ Ctrl+C      │ Quit the application                         │
+  │ Ctrl+R      │ Reload the current model                     │
+  │ C           │ Copy all selected messages to clipboard      │
+  │ Ctrl+\      │ Toggle help overlay                          │
+  │ Esc         │ Close overlay / interrupt generation         │
+  │ Up/Down     │ Navigate command menu / selector lists       │
+  │ Click       │ Toggle message bubble selection              │
+  └─────────────┴──────────────────────────────────────────────┘
+
+
+================================================================================
+7. DEPENDENCIES AND TECHNOLOGY STACK
+================================================================================
+
+  ┌────────────────────┬──────────────────────────────────────────┐
+  │ Component          │ Purpose                                  │
+  ├────────────────────┼──────────────────────────────────────────┤
+  │ Python ≥3.10       │ Runtime environment                      │
+  │ mlx ≥0.31.2        │ Apple ML array framework (core engine)   │
+  │ textual ≥8.2.7     │ Terminal UI framework                    │
+  │ transformers ≥5.0  │ Hugging Face model loading/tokenization  │
+  │ huggingface-hub    │ Model download from Hugging Face Hub     │
+  │ safetensors        │ Safe tensor serialization for weights    │
+  │ sentencepiece      │ Tokenizer support                        │
+  │ jinja2             │ Chat template rendering                  │
+  │ requests           │ HTTP client for web search/scraping      │
+  │ beautifulsoup4     │ HTML parsing for web scraping            │
+  │ ddgs               │ DuckDuckGo search API                    │
+  │ numpy              │ Numerical computing                      │
+  │ pyyaml             │ Configuration file parsing               │
+  │ protobuf           │ Protocol buffer support                  │
+  └────────────────────┴──────────────────────────────────────────┘
+
+
+================================================================================
+8. PROJECT STRUCTURE
+================================================================================
+
+  kaplumba/
+  ├── tui_main.py                  # ChatUI application (Textual App class)
+  ├── orchestrator.py              # UI-to-model coordination layer
+  ├── model_lifecycle.py           # Subprocess lifecycle manager
+  ├── model_interface.py           # Async IPC protocol (marker-based framing)
+  ├── model_catalog.py             # Model discovery, memory estimation
+  ├── conversation_engine.py       # Streaming and thinking block handler
+  ├── settings_store.py            # Persistence layer (options, .env)
+  ├── simple_markdown.py           # Markdown-to-Rich converter
+  ├── latex_parser.py              # LaTeX-to-Unicode converter (886 lines)
+  ├── textual_ui/
+  │   ├── styles.py                # All Textual CSS (264 lines)
+  │   ├── personas.py              # Personality system definitions
+  │   ├── latex.py                 # LaTeX display integration
+  │   └── widgets/
+  │       ├── chat_input.py        # Auto-resizing input with key handling
+  │       ├── model_picker.py      # Model selector with memory monitoring
+  │       ├── options_selector.py  # Interactive options dialog
+  │       ├── personality_selector.py
+  │       ├── chat_selector.py     # Saved conversation loader
+  │       ├── loading_spinner.py   # Animated spinner widget
+  │       └── slash_command_menu.py # Auto-completing command menu
+  ├── mlx_lm/                      # Inference engine (upstream mlx-lm)
+  │   ├── chat.py                  # Subprocess REPL (1008 lines)
+  │   ├── generate.py              # Core generation (2416 lines)
+  │   ├── utils.py                 # Model loading utilities (1131 lines)
+  │   ├── models/                  # 127 model architecture implementations
+  │   ├── research_agent/          # Autonomous research framework
+  │   └── ...                      # Server, LoRA, evaluation, etc.
+  └── synopsis.txt                 # This document
+
+
+================================================================================
+9. CONCLUSION
+================================================================================
+
+Kaplumba demonstrates that a rich, responsive LLM chat interface can be built
+entirely within a terminal emulator on commodity Apple Silicon hardware. The
+project's key contributions include:
+
+  • A separate-process IPC architecture that provides crash isolation, clean
+    interruption, and seamless model switching without restarting the UI
+  • A full-featured slash command system with AI-powered web search and
+    autonomous research capabilities
+  • Real-time memory monitoring with green/red model compatibility indicators
+  • Thinking block detection with visual spinner feedback
+  • LaTeX rendering for mathematical and scientific output
+  • Message selection and batch copy to clipboard
+  • Per-model persistent configuration for 12 sampling and performance
+    parameters
+  • Crash recovery with automatic restart and user-facing recovery dialog
+
+By building on Apple's MLX framework and mlx-lm inference engine, Kaplumba
+inherits support for 80+ model architectures, advanced quantization schemes,
+speculative decoding, and efficient KV cache management — all while adding a
+polished, keyboard-driven user experience that runs entirely in the terminal.
