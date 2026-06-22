@@ -66,8 +66,8 @@ class ModelSelector(Static):
             fit_text = f"needs {c.estimated_memory} / free {c.available_memory} / total {c.total_memory}"
             disabled = not c.fits_memory
             if i == self.selected_index and not disabled:
-                lines.append(f"[bold #f0a500]❯ {prefix}{m.name}[/bold #f0a500]")
-                lines.append(f"  [dim]{m.size_gib} | {caps_display} | {fit_text}[/dim]")
+                lines.append(f"[bold #4caf50]❯ {prefix}{m.name}[/bold #4caf50]")
+                lines.append(f"  [#4caf50]{m.size_gib} | {caps_display} | {fit_text}[/#4caf50]")
             elif i == self.selected_index and disabled:
                 lines.append(f"[bold #cc6666]❯ {prefix}{m.name}[/bold #cc6666]")
                 lines.append(f"  [#cc6666]{m.size_gib} | {caps_display} | {fit_text}[/#cc6666]")
@@ -75,8 +75,8 @@ class ModelSelector(Static):
                 lines.append(f"  {prefix}{m.name}")
                 lines.append(f"  [#886666]{m.size_gib} | {caps_display} | {fit_text}[/#886666]")
             else:
-                lines.append(f"  {prefix}{m.name}")
-                lines.append(f"  [dim]{m.size_gib} | {caps_display} | {fit_text}[/dim]")
+                lines.append(f"  [bold #4caf50]{prefix}{m.name}[/bold #4caf50]")
+                lines.append(f"  [#4caf50]{m.size_gib} | {caps_display} | {fit_text}[/#4caf50]")
         lines.append("\n[dim](↑/↓ navigate, Enter select, f favorite, e edit config, d change dir, red entries are risky, Esc back, Ctrl+C quit)[/dim]")
         self.update("\n".join(lines))
 
