@@ -695,8 +695,14 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                 _swap = Path(tempfile.gettempdir()) / "kaplumba" / _hash
                 _swap.mkdir(parents=True, exist_ok=True)
 
-                _manifest = {"total": n, "count": to_drop, "pct": unload_pct, "layers": [], "args": _args_dict}
+                _manifest = {"total": n, "count": to_drop, "pct": unload_pct, "layers": [], "args": {}}
                 import dataclasses as _dc
+                # Use the inner model's args (parent is the model holding .layers)
+                # This ensures we capture the arch-specific ModelArgs (e.g. TextModelArgs),
+                # not the outer wrapper (e.g. ModelArgs with text_config as a dict)
+                _inner_args = getattr(parent, 'args', model.args)
+                if _dc.is_dataclass(_inner_args):
+                    _manifest["args"] = _dc.asdict(_inner_args)
                 _args_dict = _dc.asdict(model.args) if _dc.is_dataclass(model.args) else {}
                 for i in range(kept, n):
                     layer = all_layers[i]
@@ -819,8 +825,9 @@ Read the material and then ask me what I'd like to know about {topic}."""})
 
                     if parent is not None:
                         current = list(getattr(parent, attr))
-                        # Recreate ModelArgs from saved dict (exact same as when model was loaded)
-                        _fresh_args = type(model.args).from_dict(_manifest.get("args", {}))
+                        # Recreate ModelArgs from saved dict using the INNER model's class
+                        _inner_args_holder = getattr(parent, 'args', model.args)
+                        _fresh_args = type(_inner_args_holder).from_dict(_manifest.get("args", {}))
 
                         for _entry in _manifest["layers"]:
                             _mod_path, _cls_name = _entry["class_path"].rsplit(".", 1)
