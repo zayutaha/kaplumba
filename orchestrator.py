@@ -108,7 +108,7 @@ class Orchestrator:
             return
 
         if user_text == "/unload":
-            self.chat._set_busy(True)
+            await self.chat.show_banner("Unloading model…", timeout=10)
             try:
                 resp = await self.port.send_command("/unload")
                 if resp:
@@ -119,7 +119,6 @@ class Orchestrator:
                             break
             except Exception:
                 await self.chat.show_banner("Failed to unload model", severity="error", timeout=3)
-            self.chat._set_busy(False)
             self.chat.refresh_command_menu()
             self.chat.query_one("#input").focus()
             return

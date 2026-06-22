@@ -58,6 +58,7 @@ NO_ARG_COMMANDS: set[str] = {
     "/options",
     "/personality",
     "/memory",
+    "/unload",
     "/mtp",
 }
 
