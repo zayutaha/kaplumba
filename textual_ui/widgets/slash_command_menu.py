@@ -45,21 +45,20 @@ class SlashCommandMenu(Static):
         if end - start < MAX_VISIBLE and start > 0:
             start = max(0, end - MAX_VISIBLE)
 
-        lines = ["[bold #f0a500]Commands[/bold #f0a500]\n"]
+        lines = ["[bold #f0a500]Commands[/bold #f0a500]"]
         if start > 0:
-            lines.append("  [dim]↑ {} more[/dim]\n".format(start))
+            lines.append("[dim]↑ {} more[/dim]".format(start))
         for i in range(start, end):
             command, description = self.matches[i]
             if i == self.selected_index:
-                lines.append(f"[bold #f0a500]❯ {command}[/bold #f0a500]")
+                lines.append(f"[bold #f0a500]❯ {command}[/bold #f0a500]  [dim]{description}[/dim]")
             else:
-                lines.append(f"  [bold]{command}[/bold]")
-            lines.append(f"  [dim]{description}[/dim]\n")
+                lines.append(f"  [bold]{command}[/bold]  [dim]{description}[/dim]")
         if end < total:
-            remaining = total - end
-            lines.append("  [dim]↓ {} more[/dim]".format(remaining))
-        lines.append("\n[dim](↑/↓ navigate, Enter select)[/dim]")
+            lines.append("[dim]↓ {} more[/dim]".format(total - end))
+        lines.append("[dim](↑/↓ navigate, Enter select)[/dim]")
         self.update("\n".join(lines))
+        self.refresh()
 
     def move_selection(self, direction: int) -> bool:
         if not self.matches:
