@@ -62,8 +62,8 @@ Model output is processed through a comprehensive LaTeX→Unicode converter cove
 ### Layer Unloading
 `/unload N%` dynamically trims model layers to free GPU memory. `/reload` restores them. Useful for freeing memory mid-session without restarting.
 
-### Crash Recovery
-If the model subprocess crashes, a dialog offers reload or quit. Auto-reloads up to 3 times before giving up. The model runs in an isolated subprocess, so a crash never takes down the UI.
+### Crash Recovery & Auto-Reload
+Models can sometimes crash on startup due to transient OOMs, even when enough memory is available. Kaplumba automatically retries loading the model up to **3 times** before showing a crash dialog. If the model crashes mid-session, a dialog offers reload or quit. Since the model runs in an isolated subprocess, a crash never takes down the UI — it restarts cleanly in the background.
 
 ### Subprocess Architecture
 The model runs as a separate process with a stdin/stdout protocol. This means:
