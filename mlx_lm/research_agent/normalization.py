@@ -1,125 +1,76 @@
-"""Document normalization — batch process scraped docs into structured format."""
+"""Document cleaning — swap in small model, clean pages one by one, swap back."""
 
-from ._utils import call_model
+import gc
+import hashlib
+from pathlib import Path
+
+import mlx.core as mx
+from mlx_lm.utils import load
+from mlx_lm.generate import stream_generate
+from mlx_lm.models.cache import make_prompt_cache
+from mlx_lm.sample_utils import make_sampler
+
+CLEANER_MODEL = str(Path.home() / ".omlx" / "models" / "inferencerlabs")
+
+
+def _clean_one(text: str, model, tokenizer, args) -> str:
+    """Run one page through the cleaner model and return cleaned text."""
+    messages = [
+        {"role": "system", "content": "Strip HTML tags, scripts, nav menus, and ads from the page below. Return the EXACT readable text content word for word — no summaries, no paraphrasing, no truncation. Output every sentence exactly as written."},
+        {"role": "user", "content": text},
+    ]
+    prompt = tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True, add_special_tokens=True,
+        enable_thinking=False,
+    )
+    prompt = tokenizer.apply_chat_template(
+        messages, add_generation_prompt=True, add_special_tokens=True,
+    )
+    cache = make_prompt_cache(model, None)
+    sampler = make_sampler(0.0, 1.0)
+    result = ""
+    for resp in stream_generate(
+        model, tokenizer, prompt, max_tokens=2048,
+        sampler=sampler, prompt_cache=cache,
+    ):
+        result += resp.text
+    return result.strip()
 
 
 def normalize_docs(scraped_docs: list[dict], model, tokenizer, args,
-                   chat_template_kwargs=None) -> list[dict]:
-    """Batch normalize all scraped docs into structured format.
-    
-    One model call processes all docs. Returns list of normalized dicts.
-    """
+                   chat_template_kwargs=None) -> tuple[str, object, object]:
+    """Clean all pages using a separate small model. Returns (cleaned_text, new_model, new_tokenizer)."""
     if not scraped_docs:
-        return []
+        return "", model, tokenizer
 
-    docs_text = ""
+    # 1. Unload main model
+    del model, tokenizer
+    gc.collect()
+    mx.clear_cache()
+
+    # 2. Load cleaner model
+    print("[INFO] Loading cleaner model...")
+    cleaner, clean_tok = load(CLEANER_MODEL)
+
+    # 3. Process each page individually
+    cleaned_parts = []
     for i, doc in enumerate(scraped_docs):
         title = doc.get("title", "Untitled")
         content = doc.get("content", "")
-        # Use more content so the model has enough to work with
-        docs_text += f"\n--- DOC {i+1}: {title} ---\n{content[:3000]}\n"
+        print(f"[INFO] Cleaning page {i+1}/{len(scraped_docs)}: {title[:50]}...")
+        cleaned = _clean_one(content, cleaner, clean_tok, args)
+        cleaned_parts.append(f"## {title}\nSource: {doc.get('url', '')}\n\n{cleaned}")
 
-    messages = [
-        {"role": "system", "content": f"""You are a document normalizer.
+    # 4. Unload cleaner model
+    del cleaner, clean_tok
+    gc.collect()
+    mx.clear_cache()
 
-Extract structured information from {len(scraped_docs)} documents about a topic.
+    # 5. Reload main model
+    print("[INFO] Reloading main model...")
+    new_model, new_tok = load(
+        str(Path(args.model).expanduser().resolve()),
+        tokenizer_config={"trust_remote_code": True if args.trust_remote_code else None},
+    )
 
-For each document, extract:
-- summary: 2-3 sentence factual summary
-- key_facts: list of specific facts, dates, numbers, names
-- entities: key people, places, organizations mentioned
-- themes: main topics covered
-
-Output format — one block per document:
-DOC 1:
-summary: ...
-key_facts: [fact1, fact2, ...]
-entities: [entity1, entity2, ...]
-themes: [theme1, theme2, ...]
-
-DOC 2:
-...
-
-Be factual. Do not add information not in the source. Prefer structure over prose."""},
-        {"role": "user", "content": f"Topic context. Extract structured information from these documents:\n{docs_text}"},
-    ]
-    result = call_model(messages, max_tokens=2048, model=model,
-                        tokenizer=tokenizer, args=args,
-                        chat_template_kwargs=chat_template_kwargs,
-                        temp=0.0, mtp=False)
-
-    # Parse results
-    normalized = []
-    blocks = result.split("\nDOC ")
-    for block in blocks:
-        if not block.strip():
-            continue
-        if not block[0].isdigit():
-            continue
-        doc_num = block[0]
-        body = block[2:].strip() if len(block) > 2 else ""
-
-        summary = ""
-        key_facts = []
-        entities = []
-        themes = []
-
-        for line in body.splitlines():
-            line = line.strip()
-            if line.startswith("summary:"):
-                summary = line[8:].strip()
-            elif line.startswith("key_facts:"):
-                raw = line[10:].strip()
-                if raw.startswith("[") and raw.endswith("]"):
-                    import json
-                    try:
-                        key_facts = json.loads(raw)
-                    except json.JSONDecodeError:
-                        key_facts = [raw.strip("[]")]
-                else:
-                    key_facts = [raw]
-            elif line.startswith("entities:"):
-                raw = line[9:].strip()
-                if raw.startswith("["):
-                    import json
-                    try:
-                        entities = json.loads(raw)
-                    except json.JSONDecodeError:
-                        entities = [raw.strip("[]")]
-                else:
-                    entities = [raw]
-            elif line.startswith("themes:"):
-                raw = line[7:].strip()
-                if raw.startswith("["):
-                    import json
-                    try:
-                        themes = json.loads(raw)
-                    except json.JSONDecodeError:
-                        themes = [raw.strip("[]")]
-                else:
-                    themes = [raw]
-
-        idx = int(doc_num) - 1
-        if idx < len(scraped_docs):
-            normalized.append({
-                "title": scraped_docs[idx].get("title", ""),
-                "url": scraped_docs[idx].get("url", ""),
-                "summary": summary,
-                "key_facts": key_facts,
-                "entities": entities,
-                "themes": themes,
-            })
-
-    # Fallback: if we couldn't parse, return basic structure
-    if not normalized:
-        for doc in scraped_docs:
-            normalized.append({
-                "title": doc.get("title", ""),
-                "url": doc.get("url", ""),
-                "summary": doc.get("content", "")[:300],
-                "key_facts": [],
-                "entities": [],
-                "themes": [],
-            })
-
-    return normalized
+    return "\n\n---\n\n".join(cleaned_parts), new_model, new_tok

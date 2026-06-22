@@ -641,32 +641,20 @@ def main():
                     coverage_pct = int(result["coverage"].get("overview", 0) * 100) if "overview" in result["coverage"] else int(sum(result["coverage"].values()) / max(1, len(result["coverage"])) * 100)
                     rprint(f"[INFO] Research complete: {result['num_sources']} sources, coverage ~{coverage_pct}%")
 
-                    # Build big model prompt with context
+                    # Use the reloaded model (research agent swapped models for page cleaning)
+                    model = result["model"]
+                    tokenizer = result["tokenizer"]
+
+                    # Inject cleaned context as system prompt
                     sys_parts = []
                     if current_system_prompt is not None:
                         sys_parts.append(current_system_prompt)
-                    sys_parts.append(f"The following research context about \"{topic}\" was gathered from web sources. Use it to inform your responses throughout this conversation.")
+                    sys_parts.append(f"Here is research material about \"{topic}\" gathered from web sources:\n\n{result['context_section']}")
                     messages = [{"role": "system", "content": "\n\n".join(sys_parts)}]
 
-                    messages.append({"role": "user", "content": f"""Below is structured research material about "{topic}".
-
-Do NOT write a report. Instead, read the material and then ask me what specific aspect I want to know about. Wait for my follow-up question before answering.
-
-Research material:
-{result['context_section']}
-
-Read the material and then ask me what I'd like to know about {topic}."""})
-
-                    import datetime as _dt
-                    _logpath = f"/tmp/mlx_research_{_dt.datetime.now():%Y%m%d_%H%M%S}.log"
-                    with open(_logpath, "w") as _f:
-                        _f.write(messages[-1]["content"])
-                    rprint(f"[INFO] Research context logged to {_logpath}")
-
-                    message_history.append({"role": "user", "content": f"Research: {topic}"})
+                    message_history.append({"role": "user", "content": f"I've gathered research on: {topic}"})
                     prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True, add_special_tokens=True, **chat_template_kwargs)
-                    # Disable MTP — research adds massive context that makes
-                    # speculative decoding overhead not worth it.
+                    _cache_stale = True
                     args.mtp = False
                     rprint("[INFO] Research loaded. Ask me anything about it.\n")
                     continue
@@ -817,7 +805,7 @@ Read the material and then ask me what I'd like to know about {topic}."""})
             # message_history already appended above
             
             # Log research output to file
-            if message_history and len(message_history) >= 2 and message_history[-2].get("content", "").startswith("Research:"):
+            if message_history and len(message_history) >= 2 and "research on:" in message_history[-2].get("content", ""):
                 import datetime as _dt
                 _rpath = f"/tmp/mlx_research_output_{_dt.datetime.now():%Y%m%d_%H%M%S}.log"
                 try:

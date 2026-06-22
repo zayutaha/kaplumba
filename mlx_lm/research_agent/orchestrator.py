@@ -134,23 +134,17 @@ def run_research(topic: str, model, tokenizer, args,
         set_small_model(None)
         small.unload()
 
-        # 7. Normalize using the fully restored big model
-        normalized = normalize_docs(
+        # 7. Batch clean using a separate small model (never both in memory)
+        context_section, new_model, new_tok = normalize_docs(
             scraped_docs, model, tokenizer, args, chat_template_kwargs
         )
 
-        # 8. Build context package for big model synthesis
-        context_section = ""
-        for i, nd in enumerate(normalized):
-            context_section += f"\n## {nd['title']}\n"
-            context_section += f"Source: {nd['url']}\n"
-            if nd.get("summary"):
-                context_section += f"Summary: {nd['summary']}\n"
-            # Include raw content so big model isn't limited by Qwen's summaries
-            if i < len(scraped_docs) and scraped_docs[i].get("content"):
-                raw = scraped_docs[i]["content"]
-                context_section += f"Content: {raw[:3000]}\n"
-            context_section += "\n"
+        # 8. Log and return
+        import datetime as _dt
+        _logpath = f"/tmp/mlx_research_{_dt.datetime.now():%Y%m%d_%H%M%S}.log"
+        with open(_logpath, "w") as _f:
+            _f.write(context_section)
+        print(f"[INFO] Research context ({len(context_section)} chars) logged to {_logpath}")
 
         return {
             "topic": topic,
@@ -159,8 +153,8 @@ def run_research(topic: str, model, tokenizer, args,
             "coverage": dict(memory.dimensions),
             "num_sources": len(selected),
             "context_section": context_section,
-            "normalized_docs": normalized,
-            "memory": memory,
+            "model": new_model,
+            "tokenizer": new_tok,
         }
     finally:
         # Ensure small model is always unloaded
