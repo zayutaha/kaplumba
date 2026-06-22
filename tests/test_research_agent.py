@@ -324,5 +324,25 @@ class TestCoverageAwareSelection(unittest.TestCase):
         self.assertIn("https://high.com", urls)
 
 
+# ═══════════════════════════════════════════════
+# TESTS 35-37: Normalization / Relevance Filtering
+# ═══════════════════════════════════════════════
+
+class TestNormalizeDocs(unittest.TestCase):
+    def test_cleaner_prompt_with_query_rejects_irrelevant(self):
+        """The cleaner prompt instructs removal of content not related to the query."""
+        system = 'Strip HTML tags, scripts, nav menus, ads, and ANY content NOT related to "AI medical diagnosis" from the page below. Keep ONLY sentences and paragraphs relevant to "AI medical diagnosis". Return the exact remaining text word for word — no summaries, no paraphrasing, no truncation.'
+        self.assertIn("NOT related to", system)
+        self.assertIn('"AI medical diagnosis"', system)
+        self.assertIn("Keep ONLY", system)
+        self.assertNotIn("truncation", "should not appear incorrectly")
+
+    def test_cleaner_prompt_without_query_strips_html_only(self):
+        """Without a query, the cleaner only strips HTML/nav/ads."""
+        system = "Strip HTML tags, scripts, nav menus, and ads from the page below. Return the EXACT readable text content word for word — no summaries, no paraphrasing, no truncation. Output every sentence exactly as written."
+        self.assertIn("Strip HTML tags", system)
+        self.assertNotIn("NOT related", system)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

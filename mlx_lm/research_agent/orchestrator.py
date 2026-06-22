@@ -136,7 +136,7 @@ def run_research(topic: str, model, tokenizer, args,
 
         # 7. Batch clean using a separate small model (never both in memory)
         context_section, new_model, new_tok = normalize_docs(
-            scraped_docs, model, tokenizer, args, chat_template_kwargs
+            scraped_docs, model, tokenizer, args, query=topic, chat_template_kwargs=chat_template_kwargs
         )
 
         # 8. Log and return
