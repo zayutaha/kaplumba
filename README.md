@@ -22,7 +22,7 @@ Config files (favorites, model options, etc.) are stored in `.kaplumba/` in the 
 ## Run
 
 ```bash
-uv run python tui_main.py
+uv run python chat.py
 ```
 
 ---
