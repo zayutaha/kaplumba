@@ -151,6 +151,23 @@ class Orchestrator:
             self.chat.query_one("#input").focus()
             return
 
+        if user_text == "/mtp":
+            try:
+                resp = await self.port.send_command("/mtp")
+                if resp:
+                    for line in resp.splitlines():
+                        line = line.strip()
+                        if line.startswith("[INFO]"):
+                            self.chat.notify(line.replace("[INFO]", "").strip(), timeout=3)
+                            break
+                    else:
+                        self.chat.notify("MTP toggled", timeout=3)
+            except Exception:
+                self.chat.notify("Failed to toggle MTP", severity="error", timeout=3)
+            self.chat.refresh_command_menu()
+            self.chat.query_one("#input").focus()
+            return
+
         if user_text.startswith("/unload "):
             self.chat._set_busy(True)
             try:
