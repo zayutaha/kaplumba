@@ -659,21 +659,21 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                     rprint("[ERROR] Unload percentage must be between 0 and 100")
                     continue
 
-                # Find writable layers parent
-                parent, attr = None, None
+                # Find writable layers parent and its container (for args lookup)
+                parent, attr, container = None, None, None
                 for src_name, src_obj in [('model', model), ('language_model', getattr(model, 'language_model', None))]:
                     if src_obj is None:
                         continue
                     inner = getattr(src_obj, 'model', None)
                     if inner is not None and hasattr(inner, 'layers') and not isinstance(getattr(type(inner), 'layers', None), property):
-                        parent, attr = inner, 'layers'
+                        parent, attr, container = inner, 'layers', src_obj
                         break
                 if parent is None:
                     tr = getattr(model, 'transformer', None)
                     if tr is not None and hasattr(tr, 'layers') and not isinstance(getattr(type(tr), 'layers', None), property):
-                        parent, attr = tr, 'layers'
+                        parent, attr, container = tr, 'layers', model
                 if parent is None and hasattr(model, 'layers') and not isinstance(getattr(type(model), 'layers', None), property):
-                    parent, attr = model, 'layers'
+                    parent, attr, container = model, 'layers', model
                 if parent is None:
                     rprint(f"[ERROR] Could not find writable layers for {type(model).__name__}")
                     continue
@@ -695,14 +695,13 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                 _swap = Path(tempfile.gettempdir()) / "kaplumba" / _hash
                 _swap.mkdir(parents=True, exist_ok=True)
 
-                _manifest = {"total": n, "count": to_drop, "pct": unload_pct, "layers": [], "args": {}}
+                # Find the right args holder: the layer parent may not store .args
+                # (e.g. Qwen3_5TextModel), but its containing model does (TextModel)
                 import dataclasses as _dc
-                # Use the inner model's args (parent is the model holding .layers)
-                # This ensures we capture the arch-specific ModelArgs (e.g. TextModelArgs),
-                # not the outer wrapper (e.g. ModelArgs with text_config as a dict)
-                _inner_args = getattr(parent, 'args', model.args)
-                if _dc.is_dataclass(_inner_args):
-                    _manifest["args"] = _dc.asdict(_inner_args)
+                _args_src = parent if hasattr(parent, 'args') else container
+                _args_dict = _dc.asdict(_args_src.args) if (_args_src is not None and _dc.is_dataclass(_args_src.args)) else {}
+
+                _manifest = {"total": n, "count": to_drop, "pct": unload_pct, "layers": [], "args": _args_dict}
                 _args_dict = _dc.asdict(model.args) if _dc.is_dataclass(model.args) else {}
                 for i in range(kept, n):
                     layer = all_layers[i]
@@ -807,27 +806,30 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                         _manifest = json.load(_f)
                     _swap_dir = Path(_manifest_path).parent
 
-                    # Find writable layers parent
-                    parent, attr = None, None
+                    # Find writable layers parent and its container (for args lookup)
+                    parent, attr, container = None, None, None
                     for src_name, src_obj in [('model', model), ('language_model', getattr(model, 'language_model', None))]:
                         if src_obj is None:
                             continue
                         inner = getattr(src_obj, 'model', None)
                         if inner is not None and hasattr(inner, 'layers') and not isinstance(getattr(type(inner), 'layers', None), property):
-                            parent, attr = inner, 'layers'
+                            parent, attr, container = inner, 'layers', src_obj
                             break
                     if parent is None:
                         tr = getattr(model, 'transformer', None)
                         if tr is not None and hasattr(tr, 'layers') and not isinstance(getattr(type(tr), 'layers', None), property):
-                            parent, attr = tr, 'layers'
+                            parent, attr, container = tr, 'layers', model
                     if parent is None and hasattr(model, 'layers') and not isinstance(getattr(type(model), 'layers', None), property):
-                        parent, attr = model, 'layers'
+                        parent, attr, container = model, 'layers', model
 
                     if parent is not None:
                         current = list(getattr(parent, attr))
-                        # Recreate ModelArgs from saved dict using the INNER model's class
-                        _inner_args_holder = getattr(parent, 'args', model.args)
-                        _fresh_args = type(_inner_args_holder).from_dict(_manifest.get("args", {}))
+                        # Recreate ModelArgs from saved dict
+                        _args_src = parent if hasattr(parent, 'args') else container
+                        if _args_src is not None and hasattr(_args_src, 'args'):
+                            _fresh_args = type(_args_src.args).from_dict(_manifest.get("args", {}))
+                        else:
+                            _fresh_args = type(model.args).from_dict(_manifest.get("args", {}))
 
                         for _entry in _manifest["layers"]:
                             _mod_path, _cls_name = _entry["class_path"].rsplit(".", 1)
