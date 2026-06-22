@@ -85,7 +85,7 @@ class ModelSelector(Static):
                 lines.append(f"[bold #cc6666]❯ {prefix}{m.name}[/bold #cc6666]")
                 lines.append(f"  [#cc6666]{m.size_gib} | {arch} | {fit_text}[/#cc6666]")
             elif disabled:
-                lines.append(f"  {prefix}{m.name}")
+                lines.append(f"  [#cc6666]{prefix}{m.name}[/#cc6666]")
                 lines.append(f"  [#886666]{m.size_gib} | {arch} | {fit_text}[/#886666]")
             else:
                 lines.append(f"  [bold #4caf50]{prefix}{m.name}[/bold #4caf50]")
