@@ -50,7 +50,7 @@ def get_available_memory_bytes() -> int:
     except Exception:
         return 0
     page = 4096
-    free = inactive = speculative = 0
+    free = inactive = speculative = purgeable = compressed = 0
     for line in out.splitlines():
         m = re.match(r"Pages ([^:]+):\s+(\d+)\.", line.strip())
         if m:
@@ -62,7 +62,11 @@ def get_available_memory_bytes() -> int:
                 inactive = v
             elif k == "speculative":
                 speculative = v
-    return max(0, (free + inactive + speculative) * page)
+            elif k == "purgeable":
+                purgeable = v
+            elif "compressed" in k:
+                compressed = v
+    return max(0, (free + inactive + speculative + purgeable + compressed) * page)
 
 
 def get_total_memory_bytes() -> int:
