@@ -320,18 +320,6 @@ wheels = [
 ]
 
 [[package]]
-name = "bs4"
-version = "0.0.2"
-source = { registry = "https://pypi.org/simple" }
-dependencies = [
-    { name = "beautifulsoup4" },
-]
-sdist = { url = "https://files.pythonhosted.org/packages/c9/aa/4acaf814ff901145da37332e05bb510452ebed97bc9602695059dd46ef39/bs4-0.0.2.tar.gz", hash = "sha256:a48685c58f50fe127722417bae83fe6badf500d54b55f7e39ffe43b798653925", size = 698, upload-time = "2024-01-17T18:15:47.371Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/51/bb/bf7aab772a159614954d84aa832c129624ba6c32faa559dfb200a534e50b/bs4-0.0.2-py2.py3-none-any.whl", hash = "sha256:abf8742c0805ef7f662dce4b51cca104cffe52b835238afc169142ab9b3fbccc", size = 1189, upload-time = "2024-01-17T18:15:48.613Z" },
-]
-
-[[package]]
 name = "certifi"
 version = "2026.5.20"
 source = { registry = "https://pypi.org/simple" }
@@ -1306,8 +1294,9 @@ name = "mlx-lm"
 version = "0.31.3"
 source = { editable = "." }
 dependencies = [
-    { name = "bs4" },
+    { name = "beautifulsoup4" },
     { name = "ddgs" },
+    { name = "huggingface-hub" },
     { name = "jinja2" },
     { name = "mlx" },
     { name = "numpy", version = "2.2.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.11'" },
@@ -1315,8 +1304,10 @@ dependencies = [
     { name = "protobuf" },
     { name = "pyyaml" },
     { name = "requests" },
+    { name = "safetensors" },
     { name = "sentencepiece" },
     { name = "textual" },
+    { name = "tokenizers" },
     { name = "transformers" },
 ]
 
@@ -1336,10 +1327,11 @@ train = [
 
 [package.metadata]
 requires-dist = [
-    { name = "bs4", specifier = ">=0.0.2" },
+    { name = "beautifulsoup4", specifier = ">=4.12.0" },
     { name = "datasets", marker = "extra == 'test'" },
     { name = "datasets", marker = "extra == 'train'" },
     { name = "ddgs", specifier = ">=9.14.4" },
+    { name = "huggingface-hub", specifier = ">=0.30.0" },
     { name = "jinja2" },
     { name = "lm-eval", marker = "extra == 'evaluate'" },
     { name = "lm-eval", marker = "extra == 'test'" },
@@ -1348,8 +1340,10 @@ requires-dist = [
     { name = "protobuf" },
     { name = "pyyaml" },
     { name = "requests", specifier = ">=2.34.2" },
+    { name = "safetensors", specifier = ">=0.8.0" },
     { name = "sentencepiece" },
     { name = "textual", specifier = ">=8.2.7" },
+    { name = "tokenizers", specifier = ">=0.22.0" },
     { name = "tqdm", marker = "extra == 'evaluate'" },
     { name = "tqdm", marker = "extra == 'train'" },
     { name = "transformers", specifier = ">=5.0.0" },
