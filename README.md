@@ -63,7 +63,7 @@ Speculative decoding that generates 2–3 tokens per forward pass instead of 1. 
 | `/mtp` | Toggle multi-token prediction on/off |
 
 ### Personality System
-Configurable system prompts that persist per-model in `~/.omlx/model_configs.json`. Bundled personalities: default (direct, honest ally), historian (gritty narrative style). Switch mid-session with `/personality` or the menu.
+Configurable system prompts that persist per-model in `.kaplumba/model_configs.json`. Bundled personalities: default (direct, honest ally), historian (gritty narrative style). Switch mid-session with `/personality` or the menu.
 
 ### Options Dialogs
 Graphical selector for every sampling and performance parameter. Per-model settings persist across sessions.
@@ -113,7 +113,7 @@ Model directory: `~/.omlx/models/` — drop MLX-converted models here.
 
 ## Configuration
 
-Per-model config at `~/.omlx/model_configs.json`:
+Per-model config at `.kaplumba/model_configs.json`:
 
 ```json
 {
@@ -156,7 +156,7 @@ Per-model config at `~/.omlx/model_configs.json`:
 ├── model_lifecycle.py          # Subprocess model runner
 ├── model_interface.py          # Async IPC protocol
 ├── model_catalog.py            # Model discovery & memory estimation
-├── settings_store.py           # ~/.omlx/ persistence
+├── settings_store.py           # .kaplumba/ persistence
 ├── conversation_engine.py      # Streaming & thinking block handling
 ├── simple_markdown.py          # Markdown → Rich converter
 ├── latex_parser.py             # LaTeX → Unicode
