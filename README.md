@@ -1,6 +1,6 @@
 # Kaplumba
 
-<img src="logo.png" width="120" alt="Kaplumba logo">
+<img src="logo.png" width="400" alt="Kaplumba logo">
 
 A **terminal UI** for running large language models locally on Apple Silicon. Built on [MLX](https://github.com/ml-explore/mlx) and the [mlx-lm](https://github.com/ml-explore/mlx-lm) inference engine — supports 80+ model architectures with memory-efficient features that let you run heavy models on smaller Macs.
 
