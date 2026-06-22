@@ -25,15 +25,19 @@ class ModelSelector(Static):
         self.set_interval(5, self._refresh_memory)
 
     def _refresh_memory(self) -> None:
-        selected = self._sorted_models()[self.selected_index].name if self.models else None
+        if self._editing_dir or self.has_focus:
+            return
+        current_name = self._sorted_models()[self.selected_index].name if self.models else None
         self.models = list_models({})
-        if selected:
-            for i, m in enumerate(self.models):
-                if m.name == selected:
+        if current_name:
+            sorted_models = self._sorted_models()
+            for i, m in enumerate(sorted_models):
+                if m.name == current_name:
                     self.selected_index = i
                     break
+            else:
+                self.selected_index = 0
         self.render_list()
-        self.refresh()
 
     def _load_favorites(self) -> set[str]:
         try:
@@ -72,7 +76,7 @@ class ModelSelector(Static):
             prefix = "* " if m.name in self.favorites else "  "
             c = m.capabilities
             arch = m.model_type if m.model_type else "—"
-            fit_text = f"needs {c.estimated_memory} / freeable {c.available_memory}"
+            fit_text = f"needs {c.estimated_memory} / free {c.available_memory}"
             disabled = not c.fits_memory
             if i == self.selected_index and not disabled:
                 lines.append(f"[bold #4caf50]❯ {prefix}{m.name}[/bold #4caf50]")
