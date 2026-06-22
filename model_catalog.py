@@ -79,26 +79,7 @@ def get_total_memory_bytes() -> int | None:
 
 
 def estimate_model_memory_bytes(model_size_bytes: int, options: dict) -> int:
-    kv_tokens = int(options.get("max_kv_size") or 8192)
-    turbo_kv_bits = options.get("turbo_kv_bits")
-    turbo_fp16_layers = int(options.get("turbo_fp16_layers") or 0)
-    mtp_enabled = bool(options.get("mtp"))
-    runtime_overhead = max(int(1.5 * GIB), int(model_size_bytes * 0.12))
-    kv_cache = int(0.75 * GIB * (kv_tokens / 8192))
-    if turbo_kv_bits is None:
-        kv_cache = int(kv_cache * 1.8)
-    elif turbo_kv_bits == 4:
-        kv_cache = int(kv_cache * 1.25)
-    elif turbo_kv_bits == 3:
-        kv_cache = int(kv_cache * 1.0)
-    elif turbo_kv_bits == 2:
-        kv_cache = int(kv_cache * 0.75)
-    elif turbo_kv_bits == 1:
-        kv_cache = int(kv_cache * 0.55)
-    fp16_overhead = int(turbo_fp16_layers * 0.12 * GIB)
-    mtp_overhead = int(0.6 * GIB) if mtp_enabled else 0
-    estimated = model_size_bytes + runtime_overhead + kv_cache + fp16_overhead + mtp_overhead
-    return max(estimated, model_size_bytes + GIB)
+    return model_size_bytes + GIB
 
 
 def get_model_capabilities(model_name: str) -> ModelCapabilities:

@@ -46,14 +46,14 @@ class ModelSelector(Static):
         if self._editing_dir:
             lines = ["[bold #f0a500]Model directory[/bold #f0a500]\n"]
             lines.append("[dim]Type the new path, Enter to confirm, Esc to cancel[/dim]\n")
-            lines.append(f"[bold]Path:[/bold] {self._dir_buffer}")
+            lines.append(f"[bold #f0a500]/──\\[/bold #f0a500] [bold]{self._dir_buffer}[/bold]")
             self.update("\n".join(lines))
             return
 
         models_dir = get_models_dir()
         sorted_models = self._sorted_models()
         lines = ["[bold #f0a500]Select a model:[/bold #f0a500]\n"]
-        lines.append(f"[dim]📁 {models_dir}[/dim]\n")
+        lines.append(f"[bold #f0a500]/──\\ {models_dir}[/bold #f0a500]\n")
         for i, m in enumerate(sorted_models):
             prefix = "* " if m.name in self.favorites else "  "
             c = m.capabilities

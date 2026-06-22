@@ -192,8 +192,9 @@ Screen {
     max-height: 30;
     background: #1a1a1a;
     border: round #f0a500;
-    padding: 2;
+    padding: 1 2;
     align: center middle;
+    text-align: center;
     color: #d8d8d8;
 }
 
