@@ -38,6 +38,7 @@ Speculative decoding that generates 2–3 tokens per forward pass instead of 1. 
 | `/research <topic>` | Deep research — gathers ~8 sources via research agent, produces structured context for follow-up |
 | `/think <message>` | Send with thinking tags enabled |
 | `/memory` | Show GPU cache / peak memory |
+| `/unload` | Offload model from GPU (preserves KV cache, conversation continues on next prompt) |
 | `/mtp` | Toggle multi-token prediction on/off |
 
 ### Personality System

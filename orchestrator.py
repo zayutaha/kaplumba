@@ -107,6 +107,23 @@ class Orchestrator:
             self.chat.query_one("#input").focus()
             return
 
+        if user_text == "/unload":
+            self.chat._set_busy(True)
+            try:
+                resp = await self.port.send_command("/unload")
+                if resp:
+                    for line in resp.splitlines():
+                        line = line.strip()
+                        if line.startswith("[INFO]"):
+                            await self.chat.show_banner(line.replace("[INFO]", "").strip(), timeout=3)
+                            break
+            except Exception:
+                await self.chat.show_banner("Failed to unload model", severity="error", timeout=3)
+            self.chat._set_busy(False)
+            self.chat.refresh_command_menu()
+            self.chat.query_one("#input").focus()
+            return
+
         await self.chat.handle_stream_text(user_text)
         self.chat._set_busy(True)
 

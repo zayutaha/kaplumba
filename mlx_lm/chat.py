@@ -424,6 +424,7 @@ def main():
         rprint("- '/search <query>' to search the web and generate a response")
         rprint("- '/research <topic>' to research a topic in-depth (8 pages, detailed report)")
         rprint("- '/memory' to show current GPU memory usage")
+        rprint("- '/unload' to offload model (frees GPU memory, preserves KV cache)")
         rprint("- '/mtp' to toggle multi-token prediction on/off")
 
     rprint(f"[INFO] Starting chat session with {args.model}.")
@@ -453,6 +454,9 @@ def main():
 
     message_history: list = []
     _cache_stale = False
+
+    # KV cache preservation for /unload
+    _saved_cache = []  # mutable container so inner scope can write to it
 
     # SIGINT handler for TUI interrupts — stays active permanently
     _interrupted = [False]
@@ -646,6 +650,37 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                 except Exception as e:
                     rprint(f"[ERROR] Research failed: {str(e)}")
                     continue
+
+            # Handle /unload — free model weights, keep KV cache alive
+            if query == "/unload":
+                _saved_cache.append(prompt_cache)
+                del model
+                gc.collect()
+                mx.clear_cache()
+                after = mx.get_active_memory() / 1e9
+                rprint(f"[INFO] Model unloaded. Active memory: {after:.2f} GB. "
+                       f"KV cache preserved ({len(prompt_cache)} layers).")
+                continue
+
+            # Auto-reload if model was unloaded
+            if "model" not in dir() or model is None:
+                rprint("[INFO] Reloading model...")
+                import time as _tr
+                _t0 = _tr.time()
+                _new_model, _new_tok = load(
+                    args.model,
+                    adapter_path=args.adapter_path,
+                    tokenizer_config={
+                        "trust_remote_code": True if args.trust_remote_code else None
+                    },
+                )
+                model = _new_model
+                tokenizer = _new_tok
+                if _saved_cache:
+                    prompt_cache = _saved_cache.pop()
+                    _cache_stale = False
+                rprint(f"[INFO] Model reloaded in {(_tr.time()-_t0)*1000:.0f}ms. "
+                       f"Conversation continues.")
             
             # Handle /mtp toggle
             if query == "/mtp":

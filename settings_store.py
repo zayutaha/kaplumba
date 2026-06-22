@@ -46,6 +46,7 @@ SLASH_COMMANDS: dict[str, str] = {
     "/research": "Deep research: /research <topic>",
     "/think": "Send with thinking tags: /think <message>",
     "/memory": "Show GPU memory usage",
+    "/unload": "Offload model (frees GPU, preserves conversation)",
     "/mtp": "Toggle multi-token prediction",
 }
 
