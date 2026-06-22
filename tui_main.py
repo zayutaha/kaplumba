@@ -326,8 +326,11 @@ class ChatUI(App):
 
     async def show_banner(self, message: str, timeout: int = 2, severity: str = "info"):
         chat = self.query_one("#chat", VerticalScroll)
+        existing = chat.query(".banner")
+        if existing:
+            await existing.remove()
         color = "#e05a5a" if severity == "error" else "#f0a500"
-        banner = Static(f"[bold {color}]{message}[/bold {color}]", id="banner")
+        banner = Static(f"[bold {color}]{message}[/bold {color}]", classes="banner")
         banner.styles.text_align = "center"
         banner.styles.padding = (1, 0)
         await chat.mount(banner, before=0)
