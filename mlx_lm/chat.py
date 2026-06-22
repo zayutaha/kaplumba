@@ -850,6 +850,11 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                     shutil.rmtree(_swap_dir, ignore_errors=True)
                 except Exception as e:
                     rprint(f"[WARNING] Layer restore failed: {e}")
+                    # Clear manifest so user can continue with remaining layers
+                    del model._unload_manifest
+                    import shutil
+                    shutil.rmtree(_swap_dir, ignore_errors=True)
+                    rprint("[WARNING] Unloaded layers lost. Restart the model to recover full accuracy.")
 
             # --- WARMUP: 1-token forward pass to prove model works ---
             if _layers_restored:
@@ -882,11 +887,6 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                     # Strip MTP layers if MTP was disabled
                     prompt_cache = prompt_cache[:num_backbone]
             # -----------------------
-
-        # If layers are still unloaded (restore failed), skip generation
-        if getattr(model, '_unload_manifest', None) is not None:
-            rprint("[WARNING] Model layers still unloaded. Type /unload 0 or restart.")
-            continue
 
         last_response = None
         stop_generation = False
