@@ -758,5 +758,15 @@ class TestChatUINavigation(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(menu.selected_index, 9)
 
 
+    async def test_slash_commands_work_without_running_model(self):
+        with patch("tui_main.list_models", return_value=sample_models()):
+            app = ChatUI(port=StubPort(running=False))
+            async with app.run_test() as pilot:
+                app.query_one("#input").load_text("/models")
+                await app.action_submit()
+                await pilot.pause()
+                self.assertTrue(app.query_one("#model-selector-container").display)
+
+
 if __name__ == "__main__":
     unittest.main()

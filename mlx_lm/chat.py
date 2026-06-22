@@ -750,24 +750,33 @@ Read the material and then ask me what I'd like to know about {topic}."""})
             # --- SILENTLY RESTORE UNLOADED LAYERS ---
             unloaded = getattr(model, '_unloaded_layers', None)
             if unloaded is not None:
-                parent, attr = None, None
-                for src_name, src_obj in [('model', model), ('language_model', getattr(model, 'language_model', None))]:
-                    if src_obj is None:
-                        continue
-                    inner = getattr(src_obj, 'model', None)
-                    if inner is not None and hasattr(inner, 'layers') and not isinstance(getattr(type(inner), 'layers', None), property):
-                        parent, attr = inner, 'layers'
-                        break
-                if parent is None:
-                    tr = getattr(model, 'transformer', None)
-                    if tr is not None and hasattr(tr, 'layers') and not isinstance(getattr(type(tr), 'layers', None), property):
-                        parent, attr = tr, 'layers'
-                if parent is None and hasattr(model, 'layers') and not isinstance(getattr(type(model), 'layers', None), property):
-                    parent, attr = model, 'layers'
-                if parent is not None:
-                    current = getattr(parent, attr)
-                    setattr(parent, attr, list(current) + list(unloaded))
-                del model._unloaded_layers
+                restored = False
+                try:
+                    for src_name, src_obj in [('model', model), ('language_model', getattr(model, 'language_model', None))]:
+                        if src_obj is None:
+                            continue
+                        inner = getattr(src_obj, 'model', None)
+                        if inner is not None and hasattr(inner, 'layers') and not isinstance(getattr(type(inner), 'layers', None), property):
+                            cur = getattr(inner, 'layers')
+                            setattr(inner, 'layers', list(cur) + list(unloaded))
+                            restored = True
+                            break
+                    if not restored:
+                        tr = getattr(model, 'transformer', None)
+                        if tr is not None and hasattr(tr, 'layers') and not isinstance(getattr(type(tr), 'layers', None), property):
+                            cur = getattr(tr, 'layers')
+                            setattr(tr, 'layers', list(cur) + list(unloaded))
+                            restored = True
+                    if not restored and hasattr(model, 'layers') and not isinstance(getattr(type(model), 'layers', None), property):
+                        cur = getattr(model, 'layers')
+                        setattr(model, 'layers', list(cur) + list(unloaded))
+                        restored = True
+                    if not restored:
+                        rprint("[WARNING] Could not find layers to restore.")
+                except Exception as e:
+                    rprint(f"[WARNING] Layer restore failed: {e}")
+                if restored:
+                    del model._unloaded_layers
             # --- MTP CACHE SYNC ---
             # If MTP is enabled, the generation loop expects a prompt_cache
             # that includes the backbone layers followed by the MTP layers.

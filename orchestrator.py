@@ -38,83 +38,15 @@ class Orchestrator:
         return load_model_configs().get(model_name, {})
 
     async def handle_submit(self) -> None:
-        if self.chat.busy or self.chat.loading or not self.port.running:
-            return
-
         box = self.chat.query_one("#input")
         user_text = box.text.strip()
         if not user_text:
             return
         box.clear()
 
+        # Slash commands that work even without a running model
         if user_text == "/help":
             asyncio.create_task(self.chat.action_show_help())
-            return
-
-        if user_text == "/clear":
-            await self.chat.reset_chat()
-            if self.port.running:
-                try:
-                    await self.port.send_command("/clear")
-                except Exception:
-                    pass
-            self.chat._set_busy(False)
-            self.chat.refresh_command_menu()
-            self.chat.query_one("#input").focus()
-            return
-
-        if user_text == "/chat":
-            await self.chat.show_chat_selector()
-            return
-
-        if user_text.startswith("/chat "):
-            self.chat._set_busy(True)
-            try:
-                resp = await self.port.send_command(user_text)
-                if resp:
-                    # Look for JSON: history marker
-                    json_start = resp.find("JSON:")
-                    if json_start >= 0:
-                        history_json = resp[json_start + 5 :].strip()
-                        await self.chat.show_banner(f"Received history: {len(history_json)} bytes")
-                        history = json.loads(history_json)
-                        await self.chat.clear_chat()
-                        for msg in history:
-                            role = msg["role"]
-                            content = msg["content"]
-                            if role == "user":
-                                await self.chat.append_user_message(content)
-                            elif role == "assistant":
-                                await self.chat.append_assistant_message(content)
-                    
-                    # Also show any [INFO] messages (like the list of chats)
-                    lines = [l for l in resp.splitlines() if "[INFO]" in l or "[ERROR]" in l or l.strip().startswith("- ")]
-                    if lines:
-                        # Convert info/list lines to a readable display
-                        display = "\n".join(lines).strip()
-                        if "Available chats:" in display or "not found" in display:
-                            await self.chat.show_overlay("Chats", display)
-                        else:
-                            await self.chat.show_banner(display)
-            except Exception as e:
-                await self.chat.show_banner(f"Failed to load chat: {str(e)}", severity="error")
-            
-            self.chat._set_busy(False)
-            self.chat.refresh_command_menu()
-            self.chat.query_one("#input").focus()
-            return
-
-        if user_text == "/save" or user_text.startswith("/save "):
-            self.chat._set_busy(True)
-            try:
-                resp = await self.port.send_command(user_text)
-                if resp:
-                    lines = [l for l in resp.splitlines() if "[INFO]" in l or "[ERROR]" in l]
-                    if lines:
-                        await self.chat.show_banner("\n".join(lines).strip())
-            except Exception:
-                pass
-            self.chat._set_busy(False)
             self.chat.refresh_command_menu()
             self.chat.query_one("#input").focus()
             return
@@ -127,6 +59,21 @@ class Orchestrator:
             return
         if user_text == "/personality":
             await self.chat.show_personality_selector()
+            return
+
+        if self.chat.busy or self.chat.loading or not self.port.running:
+            return
+
+        if user_text == "/clear":
+            await self.chat.reset_chat()
+            if self.port.running:
+                try:
+                    await self.port.send_command("/clear")
+                except Exception:
+                    pass
+            self.chat._set_busy(False)
+            self.chat.refresh_command_menu()
+            self.chat.query_one("#input").focus()
             return
 
         # Non-generation slash commands handled locally
