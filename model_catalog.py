@@ -7,7 +7,6 @@ from pathlib import Path
 from settings_store import get_models_dir
 
 GIB = 1024 ** 3
-MEMORY_SAFETY_MARGIN_BYTES = int(1.5 * GIB)
 
 
 @dataclass
@@ -45,38 +44,33 @@ def get_model_size_bytes(model_name: str) -> int:
     return total
 
 
-def get_available_memory_bytes() -> int | None:
+def get_available_memory_bytes() -> int:
     try:
-        output = subprocess.check_output(["vm_stat"], text=True)
+        out = subprocess.check_output(["vm_stat"], text=True)
     except Exception:
-        return None
-    page_size_match = re.search(r"page size of (\d+) bytes", output)
-    if not page_size_match:
-        return None
-    page_size = int(page_size_match.group(1))
-    counts: dict[str, int] = {}
-    for line in output.splitlines():
-        match = re.match(r"Pages ([^:]+):\s+(\d+)\.", line.strip())
-        if match:
-            counts[match.group(1).strip().lower()] = int(match.group(2))
-    available = (
-        counts.get("free", 0)
-        + counts.get("inactive", 0)
-        + counts.get("speculative", 0)
-        + counts.get("purgeable", 0)
-    ) * page_size - MEMORY_SAFETY_MARGIN_BYTES
-    return max(0, available)
+        return 0
+    page = 4096
+    free = inactive = speculative = 0
+    for line in out.splitlines():
+        m = re.match(r"Pages ([^:]+):\s+(\d+)\.", line.strip())
+        if m:
+            k = m.group(1).strip().lower()
+            v = int(m.group(2))
+            if k == "free":
+                free = v
+            elif k == "inactive":
+                inactive = v
+            elif k == "speculative":
+                speculative = v
+    return max(0, (free + inactive + speculative) * page)
 
 
-def get_total_memory_bytes() -> int | None:
+def get_total_memory_bytes() -> int:
     try:
-        output = subprocess.check_output(["hostinfo"], text=True)
+        out = subprocess.check_output(["sysctl", "-n", "hw.memsize"], text=True)
+        return int(out.strip())
     except Exception:
-        return None
-    match = re.search(r"Primary memory available:\s+([0-9.]+)\s+gigabytes", output)
-    if not match:
-        return None
-    return int(float(match.group(1)) * GIB)
+        return 0
 
 
 def estimate_model_memory_bytes(model_size_bytes: int, options: dict) -> int:
