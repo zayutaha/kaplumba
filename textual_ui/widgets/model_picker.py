@@ -90,7 +90,7 @@ class ModelSelector(Static):
             else:
                 lines.append(f"  [bold #4caf50]{prefix}{m.name}[/bold #4caf50]")
                 lines.append(f"  [#4caf50]{m.size_gib} | {arch} | {fit_text}[/#4caf50]")
-        lines.append("\n[dim](↑/↓ navigate, Enter select, f favorite, e edit config, d change dir, red entries are risky, Esc back, Ctrl+C quit)[/dim]")
+        lines.append("\n[dim](↑/↓ navigate, Enter select, f favorite, e edit config, d edit model dir, red entries are risky, Esc back, Ctrl+C quit)[/dim]")
         self.update("\n".join(lines))
 
     async def on_key(self, event: Key) -> None:
