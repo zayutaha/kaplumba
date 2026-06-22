@@ -10,6 +10,7 @@ from settings_store import (
     DEFAULT_MODEL_OPTIONS,
     get_model_options,
     get_model_personality,
+    get_models_dir,
     load_model_configs,
     save_model_config,
     save_model_configs,
@@ -254,7 +255,7 @@ class Orchestrator:
         await self._load_model()
 
     async def _load_model(self) -> None:
-        model_path = str(Path.home() / ".omlx" / "models" / (self.selected_model or ""))
+        model_path = str(get_models_dir() / (self.selected_model or ""))
         ok = await self.port.start(model_path, self.model_options, self.current_system_prompt)
         self.reloading = False
         if ok:

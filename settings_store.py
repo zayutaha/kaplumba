@@ -2,6 +2,40 @@ import json
 from pathlib import Path
 
 
+DEFAULT_MODELS_DIR = Path.home() / ".omlx" / "models"
+ENV_PATH = Path.cwd() / ".env"
+
+
+def get_models_dir() -> Path:
+    try:
+        if ENV_PATH.exists():
+            for line in ENV_PATH.read_text().splitlines():
+                line = line.strip()
+                if line.startswith("MODELS_DIR="):
+                    val = line[len("MODELS_DIR="):].strip().strip("\"'")
+                    if val:
+                        return Path(val).expanduser()
+    except Exception:
+        pass
+    return DEFAULT_MODELS_DIR
+
+
+def set_models_dir(path: str | Path) -> None:
+    path = Path(path).expanduser().resolve()
+    lines = []
+    found = False
+    if ENV_PATH.exists():
+        for line in ENV_PATH.read_text().splitlines():
+            if line.startswith("MODELS_DIR="):
+                lines.append(f"MODELS_DIR={path}")
+                found = True
+            else:
+                lines.append(line)
+    if not found:
+        lines.append(f"MODELS_DIR={path}")
+    ENV_PATH.write_text("\n".join(lines) + "\n")
+
+
 SLASH_COMMANDS: dict[str, str] = {
     "/clear": "Reset conversation",
     "/models": "Open model picker",

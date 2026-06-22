@@ -3,7 +3,7 @@ import os
 import signal
 from pathlib import Path
 
-from settings_store import load_model_configs
+from settings_store import get_models_dir, load_model_configs
 
 TUI_PROMPT_MARKER = "<<KAPLUMBA_READY>> "
 
@@ -180,7 +180,7 @@ class ModelOrchestrator:
         return self.runner.running
 
     async def start_model(self, model_name: str, options: dict, system_prompt: str) -> bool:
-        model_path = str(Path.home() / ".omlx" / "models" / model_name)
+        model_path = str(get_models_dir() / model_name)
         ok = await self.runner.start(model_path, options, system_prompt)
         if ok:
             self.crash_count = 0

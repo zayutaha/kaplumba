@@ -4,6 +4,8 @@ import subprocess
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from settings_store import get_models_dir
+
 GIB = 1024 ** 3
 MEMORY_SAFETY_MARGIN_BYTES = int(1.5 * GIB)
 
@@ -32,7 +34,7 @@ def format_bytes_gib(num_bytes: int) -> str:
 
 
 def get_model_size_bytes(model_name: str) -> int:
-    model_dir = Path.home() / ".omlx" / "models" / model_name
+    model_dir = get_models_dir() / model_name
     if not model_dir.exists():
         return 0
     total = 0
@@ -95,11 +97,12 @@ def estimate_model_memory_bytes(model_size_bytes: int, options: dict) -> int:
         kv_cache = int(kv_cache * 0.55)
     fp16_overhead = int(turbo_fp16_layers * 0.12 * GIB)
     mtp_overhead = int(0.6 * GIB) if mtp_enabled else 0
-    return model_size_bytes + runtime_overhead + kv_cache + fp16_overhead + mtp_overhead
+    estimated = model_size_bytes + runtime_overhead + kv_cache + fp16_overhead + mtp_overhead
+    return max(estimated, model_size_bytes + GIB)
 
 
 def get_model_capabilities(model_name: str) -> ModelCapabilities:
-    model_dir = Path.home() / ".omlx" / "models" / model_name
+    model_dir = get_models_dir() / model_name
     caps = ModelCapabilities()
     config_path = model_dir / "config.json"
     if config_path.exists():
@@ -117,7 +120,7 @@ def get_model_capabilities(model_name: str) -> ModelCapabilities:
 
 
 def list_models(options: dict) -> list[ModelInfo]:
-    models_dir = Path.home() / ".omlx" / "models"
+    models_dir = get_models_dir()
     if not models_dir.exists():
         return []
 
