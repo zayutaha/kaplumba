@@ -3,18 +3,27 @@ from pathlib import Path
 
 
 SLASH_COMMANDS: dict[str, str] = {
-    "/clear": "Clear the conversation, but keep the Kaplumba welcome screen.",
-    "/save": "Save the current conversation and KV cache to ./chats/.",
-    "/chat": "List saved chats or load one: /chat <name>.",
-    "/models": "Open the model picker and switch models safely.",
-    "/options": "Open launch options for MTP, context, sampling, and cache knobs.",
-    "/personality": "Open the personality picker: default, doctor, or historian.",
-    "/search": "Search the web and answer concisely: /search <query>.",
-    "/research": "Deep research: /research <topic>.",
-    "/unload": "Unload N% of model layers to free GPU memory: /unload <pct>.",
-    "/reload": "Reload all previously unloaded layers.",
-    "/memory": "Show current GPU memory usage.",
-    "/mtp": "Toggle multi-token prediction on/off.",
+    "/clear": "Reset conversation",
+    "/models": "Open model picker",
+    "/options": "Change sampling, MTP, KV cache, and performance knobs",
+    "/personality": "Switch personality: /personality <name>",
+    "/search": "Web search: /search <query>",
+    "/research": "Deep research: /research <topic>",
+    "/think": "Send with thinking tags: /think <message>",
+    "/unload": "Free GPU memory: /unload <pct>",
+    "/reload": "Restore unloaded layers",
+    "/memory": "Show GPU memory usage",
+    "/mtp": "Toggle multi-token prediction",
+}
+
+NO_ARG_COMMANDS: set[str] = {
+    "/clear",
+    "/models",
+    "/options",
+    "/personality",
+    "/reload",
+    "/memory",
+    "/mtp",
 }
 
 DEFAULT_MODEL_OPTIONS = {

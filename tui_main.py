@@ -87,6 +87,8 @@ HELP_TEXT = """\
 [dim]Press [bold]Ctrl+\\[/] or Esc or click outside to close[/]"""
 from textual_ui.latex import format_for_display, strip_prompt_markers
 from textual_ui.personas import PERSONALITY_INFO
+from settings_store import NO_ARG_COMMANDS
+from textual.widgets._text_area import Selection
 
 from textual_ui.widgets.chat_input import ChatInput
 from textual_ui.widgets.chat_selector import ChatSelector
@@ -306,8 +308,15 @@ class ChatUI(App):
         if not selected:
             return
         box = self.query_one("#input", ChatInput)
-        box.load_text(selected)
-        self.hide_command_menu()
+        if selected in NO_ARG_COMMANDS:
+            box.load_text(selected)
+            self.hide_command_menu()
+            asyncio.create_task(self.action_submit())
+        else:
+            text = selected + " "
+            box.load_text(text)
+            box.selection = Selection(start=(0, len(text)), end=(0, len(text)))
+            self.query_one("#command-menu-container").display = True
 
     def _mount_welcome_screen(self) -> None:
         chat = self.query_one("#chat", VerticalScroll)

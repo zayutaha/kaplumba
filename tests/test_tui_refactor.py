@@ -7,6 +7,7 @@ from unittest.mock import patch
 from model_catalog import ModelCapabilities, ModelInfo
 from settings_store import DEFAULT_MODEL_OPTIONS
 from textual_ui.widgets.options_selector import OptionsSelector
+from textual_ui.widgets.slash_command_menu import SlashCommandMenu
 from tui_main import ChatUI
 
 
@@ -666,6 +667,44 @@ class TestChatUINavigation(unittest.IsolatedAsyncioTestCase):
 
                 child_ids = [child.id for child in app.query_one("#chat").children]
                 self.assertIn("welcome-logo", child_ids)
+
+
+    async def test_no_arg_command_auto_submits_on_menu_enter(self):
+        with patch("tui_main.list_models", return_value=sample_models()):
+            port = StubPort(running=True)
+            app = ChatUI(port=port)
+            async with app.run_test() as pilot:
+                app.show_chat_ui()
+                await pilot.pause()
+                box = app.query_one("#input")
+                menu = app.query_one("#command-menu", SlashCommandMenu)
+                box.load_text("/clear")
+                menu.update_matches("/clear")
+                menu.selected_index = 0
+                app.apply_selected_command()
+                await pilot.pause()
+                self.assertIn("/clear", port.commands)
+                child_ids = {child.id for child in app.query_one("#chat").children}
+                self.assertIn("welcome-logo", child_ids)
+
+    async def test_arg_command_keeps_menu_visible_and_cursor_at_end(self):
+        with patch("tui_main.list_models", return_value=sample_models()):
+            port = StubPort(running=True)
+            app = ChatUI(port=port)
+            async with app.run_test() as pilot:
+                app.show_chat_ui()
+                await pilot.pause()
+                box = app.query_one("#input")
+                menu = app.query_one("#command-menu", SlashCommandMenu)
+                box.load_text("/research")
+                menu.update_matches("/research")
+                menu.selected_index = 0
+                app.apply_selected_command()
+                await pilot.pause()
+                expected = "/research "
+                self.assertEqual(box.text, expected)
+                self.assertTrue(app.query_one("#command-menu-container").display)
+                self.assertEqual(box.selection.end, (0, len(expected)))
 
 
 if __name__ == "__main__":
