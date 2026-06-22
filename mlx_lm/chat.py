@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Generator, List, Optional, Union
 
 import mlx.core as mx
+import mlx.nn as nn
 
 if __name__ == "__main__" and __package__ is None:
     __package__ = "mlx_lm"
@@ -17,7 +18,7 @@ if __name__ == "__main__" and __package__ is None:
 from .generate import GenerationResponse, stream_generate
 from mlx_lm.models.cache import make_prompt_cache
 from .sample_utils import make_sampler
-from .utils import load, sharded_load
+from .utils import load, load_config, sharded_load
 
 DEFAULT_TEMP = 0.0
 DEFAULT_TOP_P = 1.0
@@ -701,8 +702,10 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                 _args_src = parent if hasattr(parent, 'args') else container
                 _args_dict = _dc.asdict(_args_src.args) if (_args_src is not None and _dc.is_dataclass(_args_src.args)) else {}
 
-                _manifest = {"total": n, "count": to_drop, "pct": unload_pct, "layers": [], "args": _args_dict}
-                _args_dict = _dc.asdict(model.args) if _dc.is_dataclass(model.args) else {}
+                # Save quantization config if model has quantized layers
+                _quant_cfg = load_config(Path(args.model)).get("quantization")
+
+                _manifest = {"total": n, "count": to_drop, "pct": unload_pct, "layers": [], "args": _args_dict, "quantization": _quant_cfg}
                 for i in range(kept, n):
                     layer = all_layers[i]
                     w_path = _swap / f"layer_{i}.safetensors"
@@ -846,6 +849,10 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                                 _init_kwargs[_k] = _entry[_k]
 
                             _new_layer = _layer_class(**_init_kwargs)
+                            # Apply quantization to match the original model's quantized layers
+                            _quant = _manifest.get("quantization")
+                            if _quant is not None:
+                                nn.quantize(_new_layer, group_size=_quant["group_size"], bits=_quant["bits"], mode=_quant.get("mode", "affine"))
                             _new_layer.load_weights(_entry["weights"], strict=False)
                             current.append(_new_layer)
 
