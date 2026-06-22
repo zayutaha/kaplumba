@@ -61,6 +61,7 @@ Screen {
     margin-bottom: 1;
     padding: 1 2 0 2;
     color: #f0a500;
+    border: round transparent;
 }
 
 .bubble-selected {

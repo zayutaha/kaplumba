@@ -50,11 +50,15 @@ async def _copy_selected(app: "ChatUI"):
             await app.show_banner("Failed to copy", severity="error", timeout=2)
     except FileNotFoundError:
         await app.show_banner("pbcopy not available", severity="error", timeout=2)
-    # Clear selections
+    # Save scroll Y before DOM mutation, restore after
+    chat_scroll = app.query_one("#chat-center")
+    saved_y = chat_scroll.scroll_y
     for b in _selected_bubbles:
         b.remove_class("bubble-selected")
     _selected_bubbles.clear()
     app._update_selection_ui()
+    # Schedule scroll restore after render settles
+    app.set_timer(0.0, lambda: chat_scroll.scroll_to(saved_y, animate=False))
 
 from model_catalog import list_models
 from textual_ui.styles import CHAT_CSS, LOGO, WELCOME_MESSAGES
@@ -271,8 +275,6 @@ class ChatUI(App):
             await self.show_banner("Click a bubble to select, then C to copy", timeout=2)
             return
         await _copy_selected(self)
-        # Restore scroll position after copy (clearing selections can trigger re-render)
-        self.query_one("#chat-center").scroll_end(animate=False)
 
     # ── Chat UI internals ──
 
