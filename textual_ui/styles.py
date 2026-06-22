@@ -115,6 +115,17 @@ Screen {
     color: #fff;
 }
 
+#banner {
+    display: none;
+    dock: top;
+    text-align: center;
+    padding: 1 2;
+    background: #3a3a1a;
+    color: #f0a500;
+    width: 100%;
+    height: auto;
+}
+
 .bubble-prompt {
     margin: 3 0;
     padding: 3;

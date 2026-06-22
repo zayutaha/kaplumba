@@ -151,6 +151,7 @@ class ChatUI(App):
             yield LoadingSpinner(id="load-spinner")
 
         with Vertical(id="chat-center"):
+            yield Static(id="banner", classes="banner")
             yield VerticalScroll(id="chat")
 
         with Center(id="command-menu-container"):
@@ -329,19 +330,13 @@ class ChatUI(App):
         chat.scroll_end(animate=False)
 
     async def show_banner(self, message: str, timeout: int = 2, severity: str = "info"):
-        chat = self.query_one("#chat", VerticalScroll)
-        existing = chat.query(".banner")
-        if existing:
-            await existing.remove()
-        color = "#e05a5a" if severity == "error" else "#f0a500"
-        banner = Static(f"[bold {color}]{message}[/bold {color}]", classes="banner")
-        banner.styles.text_align = "center"
-        banner.styles.padding = (1, 0)
-        await chat.mount(banner, before=0)
-        chat.scroll_home(animate=False)
+        banner = self.query_one("#banner", Static)
+        bg = "#5a1a1a" if severity == "error" else "#3a3a1a"
+        fg = "#e05a5a" if severity == "error" else "#f0a500"
+        banner.update(f"[bold {fg} on {bg}]{message}[/bold {fg} on {bg}]")
+        banner.display = True
         await asyncio.sleep(timeout)
-        if banner in chat.children:
-            await banner.remove()
+        banner.display = False
 
     # ── Action handlers ──
 
