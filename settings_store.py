@@ -3,6 +3,7 @@ from pathlib import Path
 
 
 DEFAULT_MODELS_DIR = Path.home() / ".omlx" / "models"
+KAPLUMBA_DIR = Path.cwd() / ".kaplumba"
 ENV_PATH = Path.cwd() / ".env"
 
 
@@ -75,9 +76,9 @@ DEFAULT_MODEL_OPTIONS = {
     "prefill_step_size": 128,
 }
 
-OPTIONS_STATE_PATH = Path.home() / ".omlx" / "chat_options.json"
+OPTIONS_STATE_PATH = KAPLUMBA_DIR / "chat_options.json"
 
-MODEL_CONFIGS_PATH = Path.home() / ".omlx" / "model_configs.json"
+MODEL_CONFIGS_PATH = KAPLUMBA_DIR / "model_configs.json"
 
 from textual_ui.personas import PERSONALITIES
 

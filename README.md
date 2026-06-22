@@ -14,7 +14,8 @@ cd kaplumba
 uv sync
 ```
 
-Models go in `~/.omlx/models/` (or set `MODELS_DIR` in a `.env` file).
+Models go in `~/.omlx/models/` (or set `MODELS_DIR` in a `.env` file).  
+Config files (favorites, model options, etc.) are stored in `.kaplumba/` in the project root.
 
 ## Run
 

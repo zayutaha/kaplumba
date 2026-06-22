@@ -5,12 +5,12 @@ from textual.events import Key
 from textual.widgets import Static
 
 from model_catalog import ModelInfo, list_models
-from settings_store import get_models_dir, set_models_dir
+from settings_store import KAPLUMBA_DIR, get_models_dir, set_models_dir
 
 
 class ModelSelector(Static):
     can_focus = True
-    FAVORITES_FILE = Path.home() / ".omlx" / "favorites.json"
+    FAVORITES_FILE = KAPLUMBA_DIR / "favorites.json"
 
     def __init__(self, models: list[ModelInfo], **kwargs):
         super().__init__(**kwargs)
