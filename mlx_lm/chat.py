@@ -17,7 +17,7 @@ if __name__ == "__main__" and __package__ is None:
 from .generate import GenerationResponse, stream_generate
 from mlx_lm.models.cache import make_prompt_cache
 from .sample_utils import make_sampler
-from .utils import load, load_config, sharded_load
+from .utils import load, sharded_load
 
 DEFAULT_TEMP = 0.0
 DEFAULT_TOP_P = 1.0
@@ -695,7 +695,9 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                 _swap = Path(tempfile.gettempdir()) / "kaplumba" / _hash
                 _swap.mkdir(parents=True, exist_ok=True)
 
-                _manifest = {"total": n, "count": to_drop, "pct": unload_pct, "layers": []}
+                _manifest = {"total": n, "count": to_drop, "pct": unload_pct, "layers": [], "args": _args_dict}
+                import dataclasses as _dc
+                _args_dict = _dc.asdict(model.args) if _dc.is_dataclass(model.args) else {}
                 for i in range(kept, n):
                     layer = all_layers[i]
                     w_path = _swap / f"layer_{i}.safetensors"
@@ -817,9 +819,8 @@ Read the material and then ask me what I'd like to know about {topic}."""})
 
                     if parent is not None:
                         current = list(getattr(parent, attr))
-                        # Refresh ModelArgs from config.json to ensure all attrs
-                        _cfg = load_config(Path(args.model))
-                        _fresh_args = type(model.args).from_dict(_cfg)
+                        # Recreate ModelArgs from saved dict (exact same as when model was loaded)
+                        _fresh_args = type(model.args).from_dict(_manifest.get("args", {}))
 
                         for _entry in _manifest["layers"]:
                             _mod_path, _cls_name = _entry["class_path"].rsplit(".", 1)
@@ -881,6 +882,11 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                     # Strip MTP layers if MTP was disabled
                     prompt_cache = prompt_cache[:num_backbone]
             # -----------------------
+
+        # If layers are still unloaded (restore failed), skip generation
+        if getattr(model, '_unload_manifest', None) is not None:
+            rprint("[WARNING] Model layers still unloaded. Type /unload 0 or restart.")
+            continue
 
         last_response = None
         stop_generation = False
