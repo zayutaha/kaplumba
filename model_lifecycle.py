@@ -76,7 +76,7 @@ class ModelRunner:
         # Send a priming message and interrupt on first token to prove
         # the model loads and generates, without burning a full reply.
         try:
-            self.proc.stdin.write(b"test\n")
+            self.proc.stdin.write(b"say yes nothing else\n")
             await self.proc.stdin.drain()
         except Exception:
             return False
