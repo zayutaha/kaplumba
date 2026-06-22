@@ -72,7 +72,7 @@ The model runs as a separate process with a stdin/stdout protocol. This means:
 - SIGINT passthrough for reliable interruption
 
 ### Message Selection & Copy
-Press **`V`** to enter select mode, then click message bubbles to mark them. Press **`C`** to copy all selected messages to the clipboard. Press **`V`** again or **`Esc`** to exit select mode. Notifications appear as banners at the top of the chat.
+Click any message bubble to select it (orange highlight), then press **`C`** to copy all selected messages to the clipboard. Click a selected bubble again to deselect. The send button shows the count of selected messages.
 
 ### Keyboard Shortcuts
 
@@ -81,7 +81,6 @@ Press **`V`** to enter select mode, then click message bubbles to mark them. Pre
 | `Enter` | Send message |
 | `Ctrl+C` | Quit |
 | `Ctrl+R` | Reload model |
-| `V` | Toggle select mode (click bubbles to mark) |
 | `C` | Copy selected messages |
 | `Ctrl+\` | Help overlay |
 | `Esc` | Close overlay |

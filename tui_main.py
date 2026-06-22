@@ -68,10 +68,9 @@ HELP_TEXT = """\
   [bold]Ctrl+R[/]     Reload model
 
 [bold]Copy messages[/]
-  [bold]V[/]           Toggle select mode
-            (click bubbles to mark them)
-  [bold]C[/]           Copy all marked messages
-  [bold]Esc[/]         Exit select mode
+  Click a bubble to select it
+  [bold]C[/]           Copy all selected messages
+  Click again to deselect
 
 [bold]Copy text[/]
   [bold]Shift+drag[/]  Select text with mouse
@@ -104,7 +103,6 @@ class ChatUI(App):
     BINDINGS = [
         ("ctrl+c", "quit", "Quit"),
         ("ctrl+r", "reload_model", "Reload Model"),
-        ("v", "toggle_select_mode", "Select"),
         ("c", "copy_selected", "Copy"),
         ("ctrl+backslash", "show_help", "Help"),
         ("escape", "close_help", "Close"),
@@ -120,7 +118,6 @@ class ChatUI(App):
         self.loading = False
         self.busy = False
         self.interrupted = False
-        self.select_mode = False
         self.first_message = True
         self.crash_dialog_visible = False
         self.current_md = None
@@ -232,10 +229,9 @@ class ChatUI(App):
     def _update_selection_ui(self):
         btn = self.query_one("#send-btn", Static)
         n = len(_selected_bubbles)
-        if self.select_mode:
-            label = f" SELECT {n} " if n else " SELECT "
-            btn.update(label)
-            btn.set_class(self.busy, "stopping")
+        if n:
+            btn.update(f" COPY {n} ")
+            btn.set_class(False, "stopping")
         elif self.busy:
             btn.update(" STOP ")
             btn.set_class(True, "stopping")
@@ -342,14 +338,6 @@ class ChatUI(App):
 
     # ── Action handlers ──
 
-    async def action_toggle_select_mode(self):
-        self.select_mode = not self.select_mode
-        self._update_selection_ui()
-        if self.select_mode:
-            await self.show_banner("SELECT: click bubble to mark, C to copy all", timeout=2)
-        else:
-            await self.show_banner("Shift+drag to select text, Cmd+C to copy", timeout=2)
-
     async def action_submit(self):
         await self.controller.handle_submit()
 
@@ -376,8 +364,6 @@ class ChatUI(App):
             self.query_one("#chat-center").display = True
             self.query_one("#input-center").display = True
             return
-        if not self.select_mode:
-            return
         widget = event.widget
         if isinstance(widget, CopyableMarkdown):
             text = widget._markdown if hasattr(widget, '_markdown') and widget._markdown else widget._initial_markdown or ""
@@ -390,6 +376,7 @@ class ChatUI(App):
                 _selected_bubbles.append(widget)
                 widget.add_class("bubble-selected")
             self._update_selection_ui()
+            asyncio.create_task(self.show_banner("Press C to copy"))
             event.stop()
 
     async def action_interrupt(self):
