@@ -6,6 +6,24 @@ A **terminal UI** for running large language models locally on Apple Silicon. Bu
 
 ---
 
+## Setup
+
+```bash
+git clone https://github.com/zayutaha/kaplumba.git
+cd kaplumba
+uv sync
+```
+
+Models go in `~/.omlx/models/` (or set `MODELS_DIR` in a `.env` file).
+
+## Run
+
+```bash
+uv run python tui_main.py
+```
+
+---
+
 ## Features
 
 ### Terminal UI
