@@ -2,6 +2,8 @@ from textual.widgets import Static
 
 from settings_store import SLASH_COMMANDS
 
+MAX_VISIBLE = 5
+
 
 class SlashCommandMenu(Static):
     def __init__(self, **kwargs):
@@ -36,13 +38,26 @@ class SlashCommandMenu(Static):
         return True
 
     def render_list(self) -> None:
+        total = len(self.matches)
+        half = MAX_VISIBLE // 2
+        start = max(0, self.selected_index - half)
+        end = min(total, start + MAX_VISIBLE)
+        if end - start < MAX_VISIBLE and start > 0:
+            start = max(0, end - MAX_VISIBLE)
+
         lines = ["[bold #f0a500]Commands[/bold #f0a500]\n"]
-        for index, (command, description) in enumerate(self.matches):
-            if index == self.selected_index:
+        if start > 0:
+            lines.append("  [dim]↑ {} more[/dim]\n".format(start))
+        for i in range(start, end):
+            command, description = self.matches[i]
+            if i == self.selected_index:
                 lines.append(f"[bold #f0a500]❯ {command}[/bold #f0a500]")
             else:
                 lines.append(f"  [bold]{command}[/bold]")
-            lines.append(f"  [dim]{description}[/dim]")
+            lines.append(f"  [dim]{description}[/dim]\n")
+        if end < total:
+            remaining = total - end
+            lines.append("  [dim]↓ {} more[/dim]".format(remaining))
         lines.append("\n[dim](↑/↓ navigate, Enter select)[/dim]")
         self.update("\n".join(lines))
 

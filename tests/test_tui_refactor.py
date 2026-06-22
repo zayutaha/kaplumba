@@ -706,6 +706,58 @@ class TestChatUINavigation(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(app.query_one("#command-menu-container").display)
                 self.assertEqual(box.selection.end, (0, len(expected)))
 
+    async def test_command_menu_scrolls_visible_window(self):
+        menu = SlashCommandMenu()
+        menu.matches = [
+            ("/cmd" + str(i), "desc" + str(i)) for i in range(10)
+        ]
+        menu.selected_index = 0
+        menu.render_list()
+        rendered = menu.content
+        self.assertIn("❯ /cmd0", rendered)
+        self.assertNotIn("cmd9", rendered)
+
+        menu.selected_index = 9
+        menu.render_list()
+        rendered = menu.content
+        self.assertIn("❯ /cmd9", rendered)
+        self.assertNotIn("cmd0", rendered)
+
+        menu.selected_index = 5
+        menu.render_list()
+        rendered = menu.content
+        self.assertIn("❯ /cmd5", rendered)
+        self.assertNotIn("cmd0", rendered)
+        self.assertIn("cmd7", rendered)
+
+        menu.selected_index = 3
+        menu.render_list()
+        rendered = menu.content
+        self.assertIn("❯ /cmd3", rendered)
+        self.assertIn("↑", rendered)
+        self.assertNotIn("cmd0", rendered)
+        self.assertIn("cmd5", rendered)
+
+    async def test_command_menu_arrows_navigate_all_items(self):
+        menu = SlashCommandMenu()
+        menu.matches = [
+            ("/cmd" + str(i), "desc" + str(i)) for i in range(10)
+        ]
+        menu.selected_index = 0
+        for _ in range(3):
+            menu.move_selection(1)
+        self.assertEqual(menu.selected_index, 3)
+        rendered = menu.content
+        self.assertIn("❯ /cmd3", rendered)
+        self.assertIn("↑", rendered)
+        self.assertIn("↓", rendered)
+
+        for _ in range(7):
+            menu.move_selection(1)
+        self.assertEqual(menu.selected_index, 0)
+        menu.move_selection(-1)
+        self.assertEqual(menu.selected_index, 9)
+
 
 if __name__ == "__main__":
     unittest.main()
