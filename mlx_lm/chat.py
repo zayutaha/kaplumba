@@ -778,6 +778,7 @@ Read the material and then ask me what I'd like to know about {topic}."""})
 
             # --- RESTORE UNLOADED LAYERS FROM ORIGINAL WEIGHTS ---
             unload_info = getattr(model, '_unload_info', None)
+            _layers_restored = False
             if unload_info is not None:
                 try:
                     # Find writable layers parent
@@ -851,10 +852,26 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                             setattr(parent, attr, current)
                             mx.eval(model.parameters())
                             all_weights.clear()
+                            _layers_restored = True
 
                     del model._unload_info
                 except Exception as e:
                     rprint(f"[WARNING] Layer restore failed: {e}")
+
+            # --- WARMUP: 1-token forward pass to prove model works ---
+            if _layers_restored:
+                import time as _time
+                wm = _time.time()
+                wm_prompt = mx.array([tokenizer.bos_token_id or 1], mx.uint32)
+                wm_cache = make_prompt_cache(model, args.max_kv_size)
+                for _w in stream_generate(
+                    model, tokenizer, wm_prompt, max_tokens=1,
+                    sampler=make_sampler(0.0, 1.0),
+                    prompt_cache=wm_cache,
+                ):
+                    pass
+                wm_ms = (_time.time() - wm) * 1000
+                rprint(f"[INFO] Model warmed up in {wm_ms:.0f}ms")
             # --- MTP CACHE SYNC ---
             # If MTP is enabled, the generation loop expects a prompt_cache
             # that includes the backbone layers followed by the MTP layers.
