@@ -268,9 +268,11 @@ class ChatUI(App):
 
     async def action_copy_selected(self):
         if not _selected_bubbles:
-            await self.show_banner("Press V to enter select mode, click bubble to mark, C to copy", timeout=2)
+            await self.show_banner("Click a bubble to select, then C to copy", timeout=2)
             return
         await _copy_selected(self)
+        # Restore scroll position after copy (clearing selections can trigger re-render)
+        self.query_one("#chat-center").scroll_end(animate=False)
 
     # ── Chat UI internals ──
 

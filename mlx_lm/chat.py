@@ -17,7 +17,7 @@ if __name__ == "__main__" and __package__ is None:
 from .generate import GenerationResponse, stream_generate
 from mlx_lm.models.cache import make_prompt_cache
 from .sample_utils import make_sampler
-from .utils import load, sharded_load
+from .utils import load, load_config, sharded_load
 
 DEFAULT_TEMP = 0.0
 DEFAULT_TOP_P = 1.0
@@ -846,8 +846,12 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                                 try:
                                     _new_layer = _layer_class(**_init_kwargs)
                                 except (AttributeError, TypeError):
-                                    _fallback = {_first_param: model.args}
-                                    _new_layer = _layer_class(**_fallback)
+                                    # model.args may lack arch-specific attrs;
+                                    # reload config from disk for a fresh ModelArgs
+                                    _cfg = load_config(Path(args.model))
+                                    _fresh_args = type(model.args).from_dict(_cfg)
+                                    _init_kwargs[_first_param] = _fresh_args
+                                    _new_layer = _layer_class(**_init_kwargs)
 
                                 # Load only this layer's weights from safetensors
                                 _w_prefix = ".".join(
