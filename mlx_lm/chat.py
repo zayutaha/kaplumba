@@ -874,8 +874,6 @@ Read the material and then ask me what I'd like to know about {topic}."""})
 
             # --- WARMUP: 1-token forward pass to prove model works ---
             if _layers_restored:
-                import time as _time
-                _wm = _time.time()
                 _wm_prompt = mx.array([tokenizer.bos_token_id or 1], mx.uint32)
                 _wm_cache = make_prompt_cache(model, args.max_kv_size)
                 for _w in stream_generate(
@@ -887,8 +885,6 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                 del _wm_cache, _wm_prompt
                 gc.collect()
                 mx.clear_cache()
-                _wm_ms = (_time.time() - _wm) * 1000
-                rprint(f"[INFO] Model warmed up in {_wm_ms:.0f}ms")
             # --- MTP CACHE SYNC ---
             # If MTP is enabled, the generation loop expects a prompt_cache
             # that includes the backbone layers followed by the MTP layers.
