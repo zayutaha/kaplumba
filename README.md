@@ -71,6 +71,9 @@ The model runs as a separate process with a stdin/stdout protocol. This means:
 - You can switch models without restarting
 - SIGINT passthrough for reliable interruption
 
+### Message Selection & Copy
+Press **`V`** to enter select mode, then click message bubbles to mark them. Press **`C`** to copy all selected messages to the clipboard. Press **`V`** again or **`Esc`** to exit select mode. Notifications appear as banners at the top of the chat.
+
 ### Keyboard Shortcuts
 
 | Key | Action |

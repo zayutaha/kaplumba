@@ -71,7 +71,7 @@ class Orchestrator:
                     json_start = resp.find("JSON:")
                     if json_start >= 0:
                         history_json = resp[json_start + 5 :].strip()
-                        self.chat.notify(f"Received history: {len(history_json)} bytes")
+                        await self.chat.show_banner(f"Received history: {len(history_json)} bytes")
                         history = json.loads(history_json)
                         await self.chat.clear_chat()
                         for msg in history:
@@ -90,9 +90,9 @@ class Orchestrator:
                         if "Available chats:" in display or "not found" in display:
                             await self.chat.show_overlay("Chats", display)
                         else:
-                            self.chat.notify(display)
+                            await self.chat.show_banner(display)
             except Exception as e:
-                self.chat.notify(f"Failed to load chat: {str(e)}", severity="error")
+                await self.chat.show_banner(f"Failed to load chat: {str(e)}", severity="error")
             
             self.chat._set_busy(False)
             self.chat.refresh_command_menu()
@@ -106,7 +106,7 @@ class Orchestrator:
                 if resp:
                     lines = [l for l in resp.splitlines() if "[INFO]" in l or "[ERROR]" in l]
                     if lines:
-                        self.chat.notify("\n".join(lines).strip())
+                        await self.chat.show_banner("\n".join(lines).strip())
             except Exception:
                 pass
             self.chat._set_busy(False)
@@ -237,9 +237,9 @@ class Orchestrator:
                 
                 lines = [l for l in resp.splitlines() if "[INFO]" in l or "[ERROR]" in l]
                 if lines:
-                    self.chat.notify("\n".join(lines).strip())
+                    await self.chat.show_banner("\n".join(lines).strip())
         except Exception as e:
-            self.chat.notify(f"Failed to load chat: {str(e)}", severity="error")
+            await self.chat.show_banner(f"Failed to load chat: {str(e)}", severity="error")
         
         self.chat._set_busy(False)
         self.chat.refresh_command_menu()

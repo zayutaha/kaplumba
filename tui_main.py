@@ -28,7 +28,7 @@ class CopyableMarkdown(Markdown):
 
 async def _copy_selected(app: "ChatUI"):
     if not _selected_bubbles:
-        app.notify("No bubbles selected — click to select", timeout=1.5)
+        await app.show_banner("No bubbles selected — click to select", timeout=2)
         return
     parts = []
     for b in _selected_bubbles:
@@ -45,11 +45,11 @@ async def _copy_selected(app: "ChatUI"):
         await proc.communicate(input=text.encode())
         if proc.returncode == 0:
             msg = f"Copied {len(parts)} message{'' if len(parts) == 1 else 's'} to clipboard"
-            app.notify(msg, timeout=2)
+            await app.show_banner(msg, timeout=2)
         else:
-            app.notify("Failed to copy", severity="error", timeout=1.5)
+            await app.show_banner("Failed to copy", severity="error", timeout=2)
     except FileNotFoundError:
-        app.notify("pbcopy not available", severity="error", timeout=1.5)
+        await app.show_banner("pbcopy not available", severity="error", timeout=2)
     # Clear selections
     for b in _selected_bubbles:
         b.remove_class("bubble-selected")
@@ -272,7 +272,7 @@ class ChatUI(App):
 
     async def action_copy_selected(self):
         if not _selected_bubbles:
-            self.notify("Press V to enter select mode, click bubble to mark, C to copy", timeout=3)
+            await self.show_banner("Press V to enter select mode, click bubble to mark, C to copy", timeout=2)
             return
         await _copy_selected(self)
 
@@ -328,12 +328,12 @@ class ChatUI(App):
         chat.mount(Static("How can I help you?", id="welcome-prompt", classes="bubble-prompt"))
         chat.scroll_end(animate=False)
 
-    async def show_banner(self, message: str, timeout: int = 2):
+    async def show_banner(self, message: str, timeout: int = 2, severity: str = "info"):
         chat = self.query_one("#chat", VerticalScroll)
-        banner = Static(f"[bold #f0a500]{message}[/bold #f0a500]", id="banner")
+        color = "#e05a5a" if severity == "error" else "#f0a500"
+        banner = Static(f"[bold {color}]{message}[/bold {color}]", id="banner")
         banner.styles.text_align = "center"
         banner.styles.padding = (1, 0)
-        banner.styles.margin = (0, 0, 0, 0)
         await chat.mount(banner, before=0)
         chat.scroll_home(animate=False)
         await asyncio.sleep(timeout)
@@ -346,9 +346,9 @@ class ChatUI(App):
         self.select_mode = not self.select_mode
         self._update_selection_ui()
         if self.select_mode:
-            self.notify("SELECT: click bubble to mark, C to copy all", timeout=3)
+            await self.show_banner("SELECT: click bubble to mark, C to copy all", timeout=2)
         else:
-            self.notify("Shift+drag to select text, Cmd+C to copy", timeout=3)
+            await self.show_banner("Shift+drag to select text, Cmd+C to copy", timeout=2)
 
     async def action_submit(self):
         await self.controller.handle_submit()
