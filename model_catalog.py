@@ -49,7 +49,8 @@ def get_available_memory_bytes() -> int:
         out = subprocess.check_output(["vm_stat"], text=True)
     except Exception:
         return 0
-    page = 4096
+    m = re.search(r"page size of (\d+) bytes", out)
+    page = int(m.group(1)) if m else 16384
     free = inactive = speculative = purgeable = compressed = 0
     for line in out.splitlines():
         m = re.match(r"Pages ([^:]+):\s+(\d+)\.", line.strip())
