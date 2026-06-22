@@ -12,7 +12,7 @@ A **terminal UI** for running large language models locally on Apple Silicon. Bu
 Full-featured Textual-based chat interface with model picker, options dialogs, personality selector, keyboard shortcuts, and crash recovery.
 
 ### Model Picker
-Scans `~/.omlx/models/` for available models, estimates total memory footprint (weights + KV cache + overhead), detects vision/MTP support, and shows whether each model fits your available RAM.
+Scans the model directory for available models, shows architecture type, estimated memory footprint, and live free memory — refreshes every 5 seconds so you can see memory free up as you close other apps. Models that fit are highlighted in green, models that risk OOM show in red. Press `d` to edit the model directory path.
 
 ### TurboQuant KV Cache
 Compresses the KV cache to 1–4 bits per element using Gaussian-optimized codebooks with Metal-accelerated quantize/dequant kernels. At 3-bit, the cache uses ~4.6× less memory than FP16 with negligible quality loss.
