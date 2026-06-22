@@ -8,10 +8,12 @@ A **terminal UI** for running large language models locally on Apple Silicon. Bu
 
 ## Setup
 
+Requires Python 3.10+ and [uv](https://docs.astral.sh/uv/#installation) (install with `curl -LsSf https://astral.sh/uv/install.sh | sh` or `brew install uv`).
+
 ```bash
 git clone https://github.com/zayutaha/kaplumba.git
 cd kaplumba
-uv sync
+uv sync          # installs all dependencies
 ```
 
 Models go in `~/.omlx/models/` (or set `MODELS_DIR` in a `.env` file).  
