@@ -808,15 +808,24 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                             if not safetensors_files:
                                 raise RuntimeError(f"No safetensors files found in {model_dir}")
 
-                            # Peek at first file to determine weight prefix pattern
+                            # Find a key containing "layers" to determine weight prefix pattern
                             import safetensors
-                            _sf0 = safetensors_files[0]
-                            with safetensors.safe_open(str(_sf0), framework="numpy") as _f0:
-                                _sample_key = next(iter(_f0.keys()))
-                            _prefix_parts = _sample_key.split(".")
-                            if "layers" not in _prefix_parts:
-                                raise RuntimeError("Cannot determine weight layout from safetensors keys")
-                            _layers_ix = _prefix_parts.index("layers")
+                            _layer_key = None
+                            _layers_ix = None
+                            for _sf in safetensors_files:
+                                with safetensors.safe_open(str(_sf), framework="numpy") as _f:
+                                    for _k in _f.keys():
+                                        for _kw in (".layers.", ".blocks."):
+                                            if _kw in _k:
+                                                _layer_key = _k
+                                                _layers_lbl = _kw.strip(".")
+                                                break
+                                if _layer_key is not None:
+                                    break
+                            if _layer_key is None:
+                                raise RuntimeError("Cannot find layer weights in safetensors files")
+                            _prefix_parts = _layer_key.split(".")
+                            _layers_ix = _prefix_parts.index(_layers_lbl)
 
                             for _layer_idx_offset, _info in enumerate(unload_info["layer_info"]):
                                 _orig_idx = n_loaded + _layer_idx_offset
