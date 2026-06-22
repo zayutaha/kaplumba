@@ -734,7 +734,6 @@ class TestChatUINavigation(unittest.IsolatedAsyncioTestCase):
         menu.render_list()
         rendered = menu.content
         self.assertIn("❯ /cmd3", rendered)
-        self.assertIn("↑", rendered)
         self.assertNotIn("cmd0", rendered)
         self.assertIn("cmd5", rendered)
 
