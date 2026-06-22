@@ -2,8 +2,11 @@
 
 import argparse
 import gc
+import importlib
+import inspect
 import json
 import signal
+from pathlib import Path
 from typing import Generator, List, Optional, Union
 
 import mlx.core as mx
@@ -656,6 +659,7 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                     rprint("[ERROR] Unload percentage must be between 0 and 100")
                     continue
 
+                # Find writable layers parent
                 parent, attr = None, None
                 for src_name, src_obj in [('model', model), ('language_model', getattr(model, 'language_model', None))]:
                     if src_obj is None:
@@ -676,9 +680,34 @@ Read the material and then ask me what I'd like to know about {topic}."""})
 
                 all_layers = getattr(parent, attr)
                 n = len(all_layers)
-                to_drop = max(1, int(n * unload_pct / 100))
-                kept = n - to_drop
-                model._unloaded_layers = all_layers[kept:]
+                target_kept = max(1, n - max(1, int(n * unload_pct / 100)))
+                if target_kept >= n:
+                    rprint(f"[INFO] Already at {unload_pct}% or less unloaded")
+                    continue
+
+                to_drop = n - target_kept
+                kept = target_kept
+
+                # Save metadata for restoring from original weights
+                layer_info = []
+                for i in range(kept, n):
+                    layer = all_layers[i]
+                    info = {"class_path": f"{type(layer).__module__}.{type(layer).__qualname__}"}
+                    sig = inspect.signature(type(layer).__init__)
+                    for pname in list(sig.parameters.keys())[2:]:
+                        if hasattr(layer, pname):
+                            info[pname] = getattr(layer, pname)
+                        elif pname == "layer_idx":
+                            info[pname] = i
+                    layer_info.append(info)
+
+                model._unload_info = {
+                    "count": to_drop,
+                    "total": n,
+                    "pct": unload_pct,
+                    "layer_info": layer_info,
+                }
+
                 setattr(parent, attr, all_layers[:kept])
                 del all_layers
                 gc.collect()
@@ -747,36 +776,85 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                 **thinking_kwargs,
             )
 
-            # --- SILENTLY RESTORE UNLOADED LAYERS ---
-            unloaded = getattr(model, '_unloaded_layers', None)
-            if unloaded is not None:
-                restored = False
+            # --- RESTORE UNLOADED LAYERS FROM ORIGINAL WEIGHTS ---
+            unload_info = getattr(model, '_unload_info', None)
+            if unload_info is not None:
                 try:
+                    # Find writable layers parent
+                    parent, attr = None, None
                     for src_name, src_obj in [('model', model), ('language_model', getattr(model, 'language_model', None))]:
                         if src_obj is None:
                             continue
                         inner = getattr(src_obj, 'model', None)
                         if inner is not None and hasattr(inner, 'layers') and not isinstance(getattr(type(inner), 'layers', None), property):
-                            cur = getattr(inner, 'layers')
-                            setattr(inner, 'layers', list(cur) + list(unloaded))
-                            restored = True
+                            parent, attr = inner, 'layers'
                             break
-                    if not restored:
+                    if parent is None:
                         tr = getattr(model, 'transformer', None)
                         if tr is not None and hasattr(tr, 'layers') and not isinstance(getattr(type(tr), 'layers', None), property):
-                            cur = getattr(tr, 'layers')
-                            setattr(tr, 'layers', list(cur) + list(unloaded))
-                            restored = True
-                    if not restored and hasattr(model, 'layers') and not isinstance(getattr(type(model), 'layers', None), property):
-                        cur = getattr(model, 'layers')
-                        setattr(model, 'layers', list(cur) + list(unloaded))
-                        restored = True
-                    if not restored:
-                        rprint("[WARNING] Could not find layers to restore.")
+                            parent, attr = tr, 'layers'
+                    if parent is None and hasattr(model, 'layers') and not isinstance(getattr(type(model), 'layers', None), property):
+                        parent, attr = model, 'layers'
+
+                    if parent is not None:
+                        current = list(getattr(parent, attr))
+                        n_loaded = len(current)
+                        n_total = unload_info["total"]
+
+                        if n_loaded < n_total:
+                            # Load original weights from model directory
+                            model_dir = Path(args.model)
+                            safetensors_files = sorted(model_dir.glob("model*.safetensors"))
+                            all_weights = {}
+                            for sf in safetensors_files:
+                                all_weights.update(mx.load(str(sf)))
+
+                            # Determine weight prefix from sample key
+                            sample_key = next(iter(all_weights))
+                            prefix_parts = sample_key.split(".")
+                            if "layers" not in prefix_parts:
+                                rprint("[WARNING] Cannot determine weight layout, skipping restore")
+                                all_weights.clear()
+                                break
+
+                            for layer_idx_offset, info in enumerate(unload_info["layer_info"]):
+                                orig_idx = n_loaded + layer_idx_offset
+
+                                module_path, class_name = info["class_path"].rsplit(".", 1)
+                                module = importlib.import_module(module_path)
+                                layer_class = getattr(module, class_name)
+
+                                sig = inspect.signature(layer_class.__init__)
+                                first_param = list(sig.parameters.keys())[1]
+
+                                init_kwargs = {first_param: model.args}
+                                for k in list(info.keys()):
+                                    if k != "class_path":
+                                        init_kwargs[k] = info[k]
+
+                                new_layer = layer_class(**init_kwargs)
+
+                                # Extract weights for this layer from the original safetensors
+                                weight_prefix = ".".join(
+                                    prefix_parts[:layers_ix + 1] + [str(orig_idx)]
+                                ) + "."
+                                layer_weights = {
+                                    k[len(weight_prefix):]: v
+                                    for k, v in all_weights.items()
+                                    if k.startswith(weight_prefix)
+                                }
+                                if layer_weights:
+                                    new_layer.load_weights(list(layer_weights.items()), strict=False)
+
+                                current.append(new_layer)
+
+                            setattr(parent, attr, current)
+                            mx.eval(model.parameters())
+                            all_weights.clear()
+
+                    del model._unload_info
                 except Exception as e:
                     rprint(f"[WARNING] Layer restore failed: {e}")
-                if restored:
-                    del model._unloaded_layers
             # --- MTP CACHE SYNC ---
             # If MTP is enabled, the generation loop expects a prompt_cache
             # that includes the backbone layers followed by the MTP layers.

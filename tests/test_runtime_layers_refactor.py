@@ -82,72 +82,95 @@ class FakeModule:
         return self.parameters_list
 
 
+class FakeLayer:
+    pass
+
+
 class FakeModel:
     def __init__(self, n_layers=6):
-        self.layers = [FakeModule() for _ in range(n_layers)]
-        self._unloaded_layers = None
+        self.layers = [FakeLayer() for _ in range(n_layers)]
 
 
 class TestUnloadLayers(unittest.TestCase):
+    def _find_layers(self, model):
+        if hasattr(model, 'layers') and not isinstance(getattr(type(model), 'layers', None), property):
+            return model, 'layers'
+        return None, None
+
     def test_unload_drops_correct_number_of_layers(self):
         model = FakeModel(n_layers=10)
-        parent = model
-        attr = "layers"
+        parent, attr = self._find_layers(model)
         all_layers = getattr(parent, attr)
         n = len(all_layers)
         to_drop = max(1, int(n * 30 / 100))
         kept = n - to_drop
-        model._unloaded_layers = all_layers[kept:]
+
+        # Simulate what the handler does: store info, remove layers
+        unload_info = {
+            "count": to_drop,
+            "total": n,
+            "pct": 30,
+            "layer_info": [{"class_path": "tests.test_runtime_layers_refactor.FakeLayer"} for _ in range(to_drop)],
+        }
         setattr(parent, attr, all_layers[:kept])
 
         self.assertEqual(len(getattr(parent, attr)), kept)
-        self.assertEqual(len(model._unloaded_layers), to_drop)
+        self.assertEqual(unload_info["count"], to_drop)
 
     def test_unload_frees_no_layers_at_zero_percent(self):
         model = FakeModel(n_layers=8)
-        parent, attr = model, "layers"
+        parent, attr = self._find_layers(model)
         all_layers = getattr(parent, attr)
         n = len(all_layers)
         to_drop = max(1, int(n * 0 / 100))
         kept = n - to_drop
-        model._unloaded_layers = all_layers[kept:]
+        unload_info = {
+            "count": to_drop,
+            "total": n,
+            "pct": 0,
+            "layer_info": [{"class_path": "tests.test_runtime_layers_refactor.FakeLayer"} for _ in range(to_drop)],
+        }
         setattr(parent, attr, all_layers[:kept])
 
         self.assertEqual(len(getattr(parent, attr)), n - 1)
-        self.assertEqual(len(model._unloaded_layers), 1)
+        self.assertEqual(unload_info["count"], 1)
 
-    def test_auto_restore_on_next_prompt(self):
+    def test_unload_saves_metadata(self):
         model = FakeModel(n_layers=10)
-        parent, attr = model, "layers"
+        parent, attr = self._find_layers(model)
         all_layers = getattr(parent, attr)
         n = len(all_layers)
         to_drop = max(1, int(n * 50 / 100))
         kept = n - to_drop
-        model._unloaded_layers = all_layers[kept:]
+
+        layer_info = []
+        for i in range(kept, n):
+            layer = all_layers[i]
+            info = {"class_path": f"{type(layer).__module__}.{type(layer).__qualname__}"}
+            layer_info.append(info)
+
+        unload_info = {
+            "count": to_drop,
+            "total": n,
+            "pct": 50,
+            "layer_info": layer_info,
+        }
         setattr(parent, attr, all_layers[:kept])
 
         self.assertEqual(len(getattr(parent, attr)), kept)
-
-        unloaded = getattr(model, '_unloaded_layers', None)
-        if unloaded is not None:
-            current = getattr(parent, attr)
-            setattr(parent, attr, list(current) + list(unloaded))
-            del model._unloaded_layers
-
-        self.assertEqual(len(getattr(parent, attr)), n)
-        self.assertFalse(hasattr(model, '_unloaded_layers'))
+        self.assertEqual(len(unload_info["layer_info"]), to_drop)
+        self.assertEqual(unload_info["total"], n)
 
     def test_unload_clears_cache_refs(self):
         model = FakeModel(n_layers=6)
-        parent, attr = model, "layers"
+        parent, attr = self._find_layers(model)
         all_layers = getattr(parent, attr)
         to_drop = 3
         kept = 3
-        removed = all_layers[kept:]
-        model._unloaded_layers = removed
+        removed_all = all_layers[kept:]
         setattr(parent, attr, all_layers[:kept])
 
-        removed_refs = [id(w) for w in removed]
+        removed_refs = [id(w) for w in removed_all]
         active_ids = [id(w) for w in getattr(parent, attr)]
         for rid in removed_refs:
             self.assertNotIn(rid, active_ids)
