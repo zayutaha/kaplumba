@@ -1,283 +1,188 @@
-## MLX LM 
+# Kaplumba
 
-MLX LM is a Python package for generating text and fine-tuning large language
-models on Apple silicon with MLX.
+<img src="logo.png" width="120" alt="Kaplumba logo">
 
-Some key features include:
+A **terminal UI** for running large language models locally on Apple Silicon. Built on [MLX](https://github.com/ml-explore/mlx) and the [mlx-lm](https://github.com/ml-explore/mlx-lm) inference engine — supports 80+ model architectures with memory-efficient features that let you run heavy models on smaller Macs.
 
-* Integration with the Hugging Face Hub to easily use thousands of LLMs with a
-  single command. 
-* Support for quantizing and uploading models to the Hugging Face Hub.
-* [Low-rank and full model
-  fine-tuning](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/LORA.md)
-  with support for quantized models.
-* Distributed inference and fine-tuning with `mx.distributed`
+---
 
-The easiest way to get started is to install the `mlx-lm` package:
+## Features
 
-**With `pip`**:
+### Terminal UI
+Full-featured Textual-based chat interface with model picker, options dialogs, personality selector, keyboard shortcuts, and crash recovery.
+
+### Model Picker
+Scans `~/.omlx/models/` for available models, estimates total memory footprint (weights + KV cache + overhead), detects vision/MTP support, and shows whether each model fits your available RAM.
+
+### TurboQuant KV Cache
+Compresses the KV cache to 1–4 bits per element using Gaussian-optimized codebooks with Metal-accelerated quantize/dequant kernels. At 3-bit, the cache uses ~4.6× less memory than FP16 with negligible quality loss.
+
+Works with MTP (Multi-Token Prediction) so speculative decoding benefits from the same compression.
+
+### Mixed-Precision KV Cache
+Keeps attention-critical layers in FP16 while compressing the rest. Configure how many layers stay at full precision.
+
+### Multi-Token Prediction (MTP)
+Speculative decoding that generates 2–3 tokens per forward pass instead of 1. Combined with TurboQuant, the compressed cache leaves room for MTP heads alongside the backbone model.
+
+### Slash Commands
+
+| Command | Description |
+|---------|-------------|
+| `/clear` | Reset conversation |
+| `/models` | Open model picker |
+| `/options` | Change temperature, top-p, top-k, min-p, repetition penalty, max tokens, KV size, MTP, turbo KV bits, FP16 layers, thinking, prefill step |
+| `/personality` | Change system prompt personality |
+| `/search <query>` | Web search — generates 3 queries, scrapes 3 pages, answers concisely |
+| `/research <topic>` | Deep research — gathers ~8 sources via research agent, produces structured context for follow-up |
+| `/think <message>` | Send with thinking tags enabled |
+| `/unload <N%>` | Unload N% of model layers to free GPU memory |
+| `/reload` | Restore all unloaded layers |
+| `/memory` | Show GPU cache / peak memory |
+| `/mtp` | Toggle multi-token prediction on/off |
+
+### Personality System
+Configurable system prompts that persist per-model in `~/.omlx/model_configs.json`. Bundled personalities: default (direct, honest ally), historian (gritty narrative style). Switch mid-session with `/personality` or the menu.
+
+### Options Dialogs
+Graphical selector for every sampling and performance parameter. Per-model settings persist across sessions.
+
+### Thinking Block Detection
+Detects and strips Qwen `<think>...</think>` and Gemma `<|channel>...<channel|>` blocks. If the entire response is inside a thinking block (Gemma 4 behavior), extracts the inner content.
+
+### LaTeX Rendering
+Model output is processed through a comprehensive LaTeX→Unicode converter covering Greek, math operators, fractions, integrals, matrices, cases, fonts, accents — rendered inline in the terminal.
+
+### Web Search
+`/search` generates 3 search queries from the model, searches DuckDuckGo, scrapes 3 relevant pages, and injects content into context for a concise answer.
+
+### Research Agent
+`/research` deploys a multi-step agent (plan → retrieve 8 pages → extract → structure) for deep topic exploration. The structured context is loaded into the conversation for follow-up Q&A.
+
+### Layer Unloading
+`/unload N%` dynamically trims model layers to free GPU memory. `/reload` restores them. Useful for freeing memory mid-session without restarting.
+
+### Crash Recovery
+If the model subprocess crashes, a dialog offers reload or quit. Auto-reloads up to 3 times before giving up. The model runs in an isolated subprocess, so a crash never takes down the UI.
+
+### Subprocess Architecture
+The model runs as a separate process with a stdin/stdout protocol. This means:
+- A model crash doesn't kill the UI
+- You can switch models without restarting
+- SIGINT passthrough for reliable interruption
+
+### Keyboard Shortcuts
+
+| Key | Action |
+|-----|--------|
+| `Enter` | Send message |
+| `Ctrl+C` | Quit |
+| `Ctrl+R` | Reload model |
+| `V` | Toggle select mode (click bubbles to mark) |
+| `C` | Copy selected messages |
+| `Ctrl+\` | Help overlay |
+| `Esc` | Close overlay |
+
+---
+
+## Quick Start
 
 ```sh
-pip install mlx-lm
+python chat.py
 ```
 
-**With `conda`**:
+On first launch, pick a model from `~/.omlx/models/` and start chatting.
 
-```sh
-conda install -c conda-forge mlx-lm
+Model directory: `~/.omlx/models/` — drop MLX-converted models here.
+
+---
+
+## Configuration
+
+Per-model config at `~/.omlx/model_configs.json`:
+
+```json
+{
+  "Llama-3.2-3B-Instruct-4bit": {
+    "options": {
+      "temp": 0.7,
+      "top_p": 0.8,
+      "max_tokens": 16384,
+      "mtp": true,
+      "turbo_kv_bits": 3,
+      "prefill_step_size": 128
+    },
+    "personality": "default"
+  }
+}
 ```
 
-### Quick Start
+---
 
-To generate text with an LLM use:
-
-```bash
-mlx_lm.generate --prompt "How tall is Mt Everest?"
-```
-
-To chat with an LLM use:
-
-```bash
-mlx_lm.chat
-```
-
-This will give you a chat REPL that you can use to interact with the LLM. The
-chat context is preserved during the lifetime of the REPL.
-
-Commands in `mlx-lm` typically take command line options which let you specify
-the model, sampling parameters, and more. Use `-h` to see a list of available
-options for a command, e.g.:
-
-```bash
-mlx_lm.generate -h
-```
-
-The default model for generation and chat is
-`mlx-community/Llama-3.2-3B-Instruct-4bit`.  You can specify any MLX-compatible
-model with the `--model` flag. Thousands are available in the
-[MLX Community](https://huggingface.co/mlx-community) Hugging Face
-organization.
-
-### Python API
-
-You can use `mlx-lm` as a module:
-
-```python
-from mlx_lm import load, generate
-
-model, tokenizer = load("mlx-community/Mistral-7B-Instruct-v0.3-4bit")
-
-prompt = "Write a story about Einstein"
-
-messages = [{"role": "user", "content": prompt}]
-prompt = tokenizer.apply_chat_template(
-    messages, add_generation_prompt=True,
-)
-
-text = generate(model, tokenizer, prompt=prompt, verbose=True)
-```
-
-To see a description of all the arguments you can do:
+## Project Structure
 
 ```
->>> help(generate)
+./
+├── chat.py                     # Entry point
+├── tui_main.py                 # Textual ChatUI application
+├── textual_ui/                 # TUI widgets
+│   ├── personas.py             # Personality definitions
+│   ├── latex.py                # LaTeX rendering
+│   ├── styles.py               # CSS
+│   └── widgets/
+│       ├── chat_input.py
+│       ├── model_picker.py
+│       ├── options_selector.py
+│       ├── personality_selector.py
+│       ├── chat_selector.py
+│       ├── loading_spinner.py
+│       ├── slash_command_menu.py
+│       └── model_config_editor.py
+├── orchestrator.py             # UI ↔ model coordination
+├── model_lifecycle.py          # Subprocess model runner
+├── model_interface.py          # Async IPC protocol
+├── model_catalog.py            # Model discovery & memory estimation
+├── settings_store.py           # ~/.omlx/ persistence
+├── conversation_engine.py      # Streaming & thinking block handling
+├── simple_markdown.py          # Markdown → Rich converter
+├── latex_parser.py             # LaTeX → Unicode
+├── scripts/                    # TurboQuant helpers
+│   ├── turboquant_quantize_run.py
+│   ├── turboquant_test_gen.py
+│   └── turboquant_validate_weights.py
+│
+└── mlx_lm/                     # Inference engine (mlx-lm based)
+    ├── chat.py                 # Chat REPL with slash commands, search, research, unload
+    ├── __init__.py             # Public API
+    ├── generate.py             # TurboQuant, MTP, prefill_step_size
+    ├── utils.py                # TurboQuant-aware loading
+    ├── models/
+    │   ├── turboquant_*.py     # TurboQuant Metal kernels
+    │   └── mixed_quant_cache.py
+    ├── quant/
+    │   └── turboquant_weights.py
+    ├── research_agent/         # Autonomous research framework
+    ├── web_search.py           # DuckDuckGo + scraping
+    ├── disk_cache.py           # Persistent prompt cache
+    └── ... (80+ model architectures, tuner, server, tool parsers, etc.)
 ```
 
-Check out the [generation
-example](https://github.com/ml-explore/mlx-lm/tree/main/mlx_lm/examples/generate_response.py)
-to see how to use the API in more detail. Check out the [batch generation
-example](https://github.com/ml-explore/mlx-lm/tree/main/mlx_lm/examples/batch_generate_response.py)
-to see how to efficiently generate continuations for a batch of prompts.
+---
 
-The `mlx-lm` package also comes with functionality to quantize and optionally
-upload models to the Hugging Face Hub.
+## Underlying Engine
 
-You can convert models using the Python API:
+The inference engine supports everything you'd expect from `mlx-lm`:
 
-```python
-from mlx_lm import convert
+- **80+ model architectures**: LLaMA, Mistral, Qwen 2/3/3.5, DeepSeek V2/V3/V3.2, Gemma 1-4, Phi, Mixtral, Cohere, OLMo, Mamba, RWKV, DBRX, Jamba, and many more
+- **CLI tools**: `mlx_lm.generate`, `mlx_lm.convert`, `mlx_lm.server`, `mlx_lm.lora`, `mlx_lm.evaluate`, `mlx_lm.benchmark`, and 15+ other commands
+- **Python API**: `load()`, `generate()`, `stream_generate()`, `batch_generate()`, `convert()`
+- **Quantization**: AWQ, GPTQ, DWQ, dynamic quantization, TurboQuant weights
+- **Fine-tuning**: LoRA, DoRA, full fine-tuning with Muon optimizer, gradient checkpointing
+- **Distributed inference**: tensor/pipeline parallelism, peer-to-peer weight sharing
+- **HTTP server**: OpenAI-compatible, streaming, tool calling, multi-model, prompt caching
 
-repo = "mistralai/Mistral-7B-Instruct-v0.3"
-upload_repo = "mlx-community/My-Mistral-7B-Instruct-v0.3-4bit"
+---
 
-convert(repo, quantize=True, upload_repo=upload_repo)
-```
+## License
 
-This will generate a 4-bit quantized Mistral 7B and upload it to the repo
-`mlx-community/My-Mistral-7B-Instruct-v0.3-4bit`. It will also save the
-converted model in the path `mlx_model` by default.
-
-To see a description of all the arguments you can do:
-
-```
->>> help(convert)
-```
-
-#### Streaming
-
-For streaming generation, use the `stream_generate` function. This yields
-a generation response object.
-
-For example,
-
-```python
-from mlx_lm import load, stream_generate
-
-repo = "mlx-community/Mistral-7B-Instruct-v0.3-4bit"
-model, tokenizer = load(repo)
-
-prompt = "Write a story about Einstein"
-
-messages = [{"role": "user", "content": prompt}]
-prompt = tokenizer.apply_chat_template(
-    messages, add_generation_prompt=True,
-)
-
-for response in stream_generate(model, tokenizer, prompt, max_tokens=512):
-    print(response.text, end="", flush=True)
-print()
-```
-
-#### Sampling
-
-The `generate` and `stream_generate` functions accept `sampler` and
-`logits_processors` keyword arguments. A sampler is any callable which accepts
-a possibly batched logits array and returns an array of sampled tokens.  The
-`logits_processors` must be a list of callables which take the token history
-and current logits as input and return the processed logits. The logits
-processors are applied in order.
-
-Some standard sampling functions and logits processors are provided in
-`mlx_lm.sample_utils`.
-
-### Command Line
-
-You can also use `mlx-lm` from the command line with:
-
-```
-mlx_lm.generate --model mistralai/Mistral-7B-Instruct-v0.3 --prompt "hello"
-```
-
-This will download a Mistral 7B model from the Hugging Face Hub and generate
-text using the given prompt.
-
-For a full list of options run:
-
-```
-mlx_lm.generate --help
-```
-
-To quantize a model from the command line run:
-
-```
-mlx_lm.convert --model mistralai/Mistral-7B-Instruct-v0.3 -q
-```
-
-For more options run:
-
-```
-mlx_lm.convert --help
-```
-
-You can upload new models to Hugging Face by specifying `--upload-repo` to
-`convert`. For example, to upload a quantized Mistral-7B model to the
-[MLX Hugging Face community](https://huggingface.co/mlx-community) you can do:
-
-```
-mlx_lm.convert \
-    --model mistralai/Mistral-7B-Instruct-v0.3 \
-    -q \
-    --upload-repo mlx-community/my-4bit-mistral
-```
-
-Models can also be converted and quantized directly in the
-[mlx-my-repo](https://huggingface.co/spaces/mlx-community/mlx-my-repo) Hugging
-Face Space.
-
-### Long Prompts and Generations 
-
-`mlx-lm` has some tools to scale efficiently to long prompts and generations:
-
-- A rotating fixed-size key-value cache.
-- Prompt caching
-
-To use the rotating key-value cache pass the argument `--max-kv-size n` where
-`n` can be any integer. Smaller values like `512` will use very little RAM but
-result in worse quality. Larger values like `4096` or higher will use more RAM
-but have better quality.
-
-Caching prompts can substantially speedup reusing the same long context with
-different queries. To cache a prompt use `mlx_lm.cache_prompt`. For example:
-
-```bash
-cat prompt.txt | mlx_lm.cache_prompt \
-  --model mistralai/Mistral-7B-Instruct-v0.3 \
-  --prompt - \
-  --prompt-cache-file mistral_prompt.safetensors
-``` 
-
-Then use the cached prompt with `mlx_lm.generate`:
-
-```
-mlx_lm.generate \
-    --prompt-cache-file mistral_prompt.safetensors \
-    --prompt "\nSummarize the above text."
-```
-
-The cached prompt is treated as a prefix to the supplied prompt. Also notice
-when using a cached prompt, the model to use is read from the cache and need
-not be supplied explicitly.
-
-Prompt caching can also be used in the Python API in order to avoid
-recomputing the prompt. This is useful in multi-turn dialogues or across
-requests that use the same context. See the
-[example](https://github.com/ml-explore/mlx-lm/blob/main/mlx_lm/examples/chat.py)
-for more usage details.
-
-### Supported Models
-
-`mlx-lm` supports thousands of LLMs available on the Hugging Face Hub. If the
-model you want to run is not supported, file an
-[issue](https://github.com/ml-explore/mlx-lm/issues/new) or better yet, submit
-a pull request. Many supported models are available in various quantization
-formats in the [MLX Community](https://huggingface.co/mlx-community) Hugging
-Face organization.
-
-For some models the tokenizer may require you to enable the `trust_remote_code`
-option. You can do this by passing `--trust-remote-code` in the command line.
-If you don't specify the flag explicitly, you will be prompted to trust remote
-code in the terminal when running the model. 
-
-Tokenizer options can also be set in the Python API. For example:
-
-```python
-model, tokenizer = load(
-    "qwen/Qwen-7B",
-    tokenizer_config={"eos_token": "<|endoftext|>", "trust_remote_code": True},
-)
-```
-
-### Large Models
-
-> [!NOTE]
-    This requires macOS 15.0 or higher to work.
-
-Models which are large relative to the total RAM available on the machine can
-be slow. `mlx-lm` will attempt to make them faster by wiring the memory
-occupied by the model and cache. This requires macOS 15 or higher to
-work.
-
-If you see the following warning message:
-
-> [WARNING] Generating with a model that requires ...
-
-then the model will likely be slow on the given machine. If the model fits in
-RAM then it can often be sped up by increasing the system wired memory limit.
-To increase the limit, set the following `sysctl`:
-
-```bash
-sudo sysctl iogpu.wired_limit_mb=N
-```
-
-The value `N` should be larger than the size of the model in megabytes but
-smaller than the memory size of the machine.
+MIT
