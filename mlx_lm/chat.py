@@ -456,7 +456,8 @@ def main():
     _cache_stale = False
 
     # KV cache preservation for /unload
-    _saved_cache = []  # mutable container so inner scope can write to it
+    _saved_cache = []
+    _model_unloaded = False
 
     # SIGINT handler for TUI interrupts — stays active permanently
     _interrupted = [False]
@@ -481,6 +482,28 @@ def main():
                     continue
                 rprint("\n[INFO] Exiting...")
                 break
+
+            # Auto-reload model if it was unloaded
+            if _model_unloaded:
+                rprint("[INFO] Reloading model...")
+                import time as _tr
+                _t0 = _tr.time()
+                _new_model, _new_tok = load(
+                    args.model,
+                    adapter_path=args.adapter_path,
+                    tokenizer_config={
+                        "trust_remote_code": True if args.trust_remote_code else None
+                    },
+                )
+                model = _new_model
+                tokenizer = _new_tok
+                if _saved_cache:
+                    prompt_cache = _saved_cache.pop()
+                    _cache_stale = False
+                _model_unloaded = False
+                rprint(f"[INFO] Model reloaded in {(_tr.time()-_t0)*1000:.0f}ms. "
+                       f"Conversation continues.")
+
             if query == "q":
                 break
             if query == "r":
@@ -657,31 +680,12 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                 del model
                 gc.collect()
                 mx.clear_cache()
+                _model_unloaded = True
                 after = mx.get_active_memory() / 1e9
                 rprint(f"[INFO] Model unloaded. Active memory: {after:.2f} GB. "
                        f"KV cache preserved ({len(prompt_cache)} layers).")
                 continue
 
-            # Auto-reload if model was unloaded
-            if "model" not in dir() or model is None:
-                rprint("[INFO] Reloading model...")
-                import time as _tr
-                _t0 = _tr.time()
-                _new_model, _new_tok = load(
-                    args.model,
-                    adapter_path=args.adapter_path,
-                    tokenizer_config={
-                        "trust_remote_code": True if args.trust_remote_code else None
-                    },
-                )
-                model = _new_model
-                tokenizer = _new_tok
-                if _saved_cache:
-                    prompt_cache = _saved_cache.pop()
-                    _cache_stale = False
-                rprint(f"[INFO] Model reloaded in {(_tr.time()-_t0)*1000:.0f}ms. "
-                       f"Conversation continues.")
-            
             # Handle /mtp toggle
             if query == "/mtp":
                 # Check if model has MTP support
