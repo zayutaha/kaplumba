@@ -73,7 +73,7 @@ class ModelRunner:
         if buf is None:
             return False
 
-        # Send a priming message and interrupt after 4 tokens to prove
+        # Send a priming message and interrupt on first token to prove
         # the model loads and generates, without burning a full reply.
         try:
             self.proc.stdin.write(b"test\n")
@@ -81,10 +81,10 @@ class ModelRunner:
         except Exception:
             return False
 
-        space_words = 0
+        # Interrupt as soon as ANY output appears (model generated 1+ tokens)
         buf = ""
         start = asyncio.get_event_loop().time()
-        while space_words < 4:
+        while True:
             if asyncio.get_event_loop().time() - start > 30:
                 return False
             try:
@@ -94,16 +94,23 @@ class ModelRunner:
             if not chunk:
                 return False
             buf += chunk.decode(errors="ignore")
-            space_words = len(buf.split())
-        # Interrupt generation so the model stops early
+            if buf.strip():
+                break
+
+        # Interrupt generation immediately
         try:
             os.killpg(self.proc_pgid, signal.SIGINT)
         except Exception:
             pass
 
-        # Wait for the interrupted generation to drain and the subprocess
-        # to return to the input() prompt.
+        # Drain the interrupted output, then clear the test message from history
         try:
+            await self._read_until_prompt(timeout=10)
+        except Exception:
+            pass
+        try:
+            self.proc.stdin.write(b"/clear\n")
+            await self.proc.stdin.drain()
             await self._read_until_prompt(timeout=10)
         except Exception:
             pass
