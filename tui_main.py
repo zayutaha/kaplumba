@@ -328,6 +328,18 @@ class ChatUI(App):
         chat.mount(Static("How can I help you?", id="welcome-prompt", classes="bubble-prompt"))
         chat.scroll_end(animate=False)
 
+    async def show_banner(self, message: str, timeout: int = 2):
+        chat = self.query_one("#chat", VerticalScroll)
+        banner = Static(f"[bold #f0a500]{message}[/bold #f0a500]", id="banner")
+        banner.styles.text_align = "center"
+        banner.styles.padding = (1, 0)
+        banner.styles.margin = (0, 0, 0, 0)
+        await chat.mount(banner, before=0)
+        chat.scroll_home(animate=False)
+        await asyncio.sleep(timeout)
+        if banner in chat.children:
+            await banner.remove()
+
     # ── Action handlers ──
 
     async def action_toggle_select_mode(self):

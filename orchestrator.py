@@ -158,12 +158,12 @@ class Orchestrator:
                     for line in resp.splitlines():
                         line = line.strip()
                         if line.startswith("[INFO]"):
-                            self.chat.notify(line.replace("[INFO]", "").strip(), timeout=3)
+                            await self.chat.show_banner(line.replace("[INFO]", "").strip())
                             break
                     else:
-                        self.chat.notify("MTP toggled", timeout=3)
+                        await self.chat.show_banner("MTP toggled")
             except Exception:
-                self.chat.notify("Failed to toggle MTP", severity="error", timeout=3)
+                await self.chat.show_banner("Failed to toggle MTP")
             self.chat.refresh_command_menu()
             self.chat.query_one("#input").focus()
             return
