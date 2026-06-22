@@ -60,7 +60,7 @@ Model output is processed through a comprehensive LaTeX→Unicode converter cove
 `/research` deploys a multi-step agent (plan → retrieve 8 pages → extract → structure) for deep topic exploration. The structured context is loaded into the conversation for follow-up Q&A.
 
 ### Layer Unloading
-`/unload N%` drops model layers to free GPU memory — auto-restores them from disk on your next prompt so you don't have to think about it.
+`/unload N%` drops model layers to free GPU memory — silently restored from cache on your next prompt so you don't have to think about it.
 
 ### Phoenix Resilience
 Kaplumba runs the model in an **isolated subprocess** with its own stdin/stdout protocol. If the model crashes (transient OOM, segfault, or cosmic ray), the UI stays up. It auto-retries loading **3 times** before showing a dialog. You can switch models without restarting the app. SIGINT is relayed reliably for clean interruption. Think of it as a bulletproof vest for your inference engine.

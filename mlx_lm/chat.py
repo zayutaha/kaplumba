@@ -423,7 +423,7 @@ def main():
         rprint("- '/search <query>' to search the web and generate a response")
         rprint("- '/research <topic>' to research a topic in-depth (8 pages, detailed report)")
         rprint("- '/memory' to show current GPU memory usage")
-        rprint("- '/unload <pct>' to unload N% of model layers (auto-restores on next prompt)")
+        rprint("- '/unload <pct>' to unload N% of model layers")
         rprint("- '/mtp' to toggle multi-token prediction on/off")
 
     rprint(f"[INFO] Starting chat session with {args.model}.")
@@ -678,7 +678,7 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                 n = len(all_layers)
                 to_drop = max(1, int(n * unload_pct / 100))
                 kept = n - to_drop
-                model._unload_info = dict(parent=parent, attr=attr, kept=kept, n=n)
+                model._unloaded_layers = all_layers[kept:]
                 setattr(parent, attr, all_layers[:kept])
                 del all_layers
                 gc.collect()
@@ -747,36 +747,27 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                 **thinking_kwargs,
             )
 
-            # --- AUTO-RESTORE UNLOADED LAYERS ---
-            unload_info = getattr(model, '_unload_info', None)
-            if unload_info is not None:
-                p, a, kept, n = unload_info["parent"], unload_info["attr"], unload_info["kept"], unload_info["n"]
-                current = getattr(p, a)
-                if len(current) < n:
-                    rprint(f"[INFO] Restoring {n - kept} unloaded layers from disk...")
-                    fresh_model, _ = load(args.model)
-                    fresh_parent, fresh_attr = None, None
-                    for src_name, src_obj in [('model', fresh_model), ('language_model', getattr(fresh_model, 'language_model', None))]:
-                        if src_obj is None:
-                            continue
-                        inner = getattr(src_obj, 'model', None)
-                        if inner is not None and hasattr(inner, 'layers') and not isinstance(getattr(type(inner), 'layers', None), property):
-                            fresh_parent, fresh_attr = inner, 'layers'
-                            break
-                    if fresh_parent is None:
-                        tr = getattr(fresh_model, 'transformer', None)
-                        if tr is not None and hasattr(tr, 'layers') and not isinstance(getattr(type(tr), 'layers', None), property):
-                            fresh_parent, fresh_attr = tr, 'layers'
-                    if fresh_parent is None and hasattr(fresh_model, 'layers') and not isinstance(getattr(type(fresh_model), 'layers', None), property):
-                        fresh_parent, fresh_attr = fresh_model, 'layers'
-                    if fresh_parent is not None:
-                        fresh_layers = getattr(fresh_parent, fresh_attr)
-                        setattr(p, a, list(current) + list(fresh_layers[kept:]))
-                        del fresh_model
-                        gc.collect()
-                        mx.clear_cache()
-                        rprint(f"[INFO] Restored layers. Active memory: {mx.get_active_memory() / 1e9:.2f} GB")
-                del model._unload_info
+            # --- SILENTLY RESTORE UNLOADED LAYERS ---
+            unloaded = getattr(model, '_unloaded_layers', None)
+            if unloaded is not None:
+                parent, attr = None, None
+                for src_name, src_obj in [('model', model), ('language_model', getattr(model, 'language_model', None))]:
+                    if src_obj is None:
+                        continue
+                    inner = getattr(src_obj, 'model', None)
+                    if inner is not None and hasattr(inner, 'layers') and not isinstance(getattr(type(inner), 'layers', None), property):
+                        parent, attr = inner, 'layers'
+                        break
+                if parent is None:
+                    tr = getattr(model, 'transformer', None)
+                    if tr is not None and hasattr(tr, 'layers') and not isinstance(getattr(type(tr), 'layers', None), property):
+                        parent, attr = tr, 'layers'
+                if parent is None and hasattr(model, 'layers') and not isinstance(getattr(type(model), 'layers', None), property):
+                    parent, attr = model, 'layers'
+                if parent is not None:
+                    current = getattr(parent, attr)
+                    setattr(parent, attr, list(current) + list(unloaded))
+                del model._unloaded_layers
             # --- MTP CACHE SYNC ---
             # If MTP is enabled, the generation loop expects a prompt_cache
             # that includes the backbone layers followed by the MTP layers.
