@@ -483,8 +483,8 @@ def main():
                 rprint("\n[INFO] Exiting...")
                 break
 
-            # Auto-reload model if it was unloaded
-            if _model_unloaded:
+            # Auto-reload model if it was unloaded (skip for slash commands)
+            if _model_unloaded and not query.startswith("/"):
                 rprint("[INFO] Reloading model...")
                 import time as _tr
                 _t0 = _tr.time()
