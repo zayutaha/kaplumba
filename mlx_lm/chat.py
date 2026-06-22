@@ -803,55 +803,62 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                         n_total = unload_info["total"]
 
                         if n_loaded < n_total:
-                            # Load original weights from model directory
                             model_dir = Path(args.model)
                             safetensors_files = sorted(model_dir.glob("model*.safetensors"))
-                            all_weights = {}
-                            for sf in safetensors_files:
-                                all_weights.update(mx.load(str(sf)))
+                            if not safetensors_files:
+                                raise RuntimeError(f"No safetensors files found in {model_dir}")
 
-                            # Determine weight prefix from sample key
-                            sample_key = next(iter(all_weights))
-                            prefix_parts = sample_key.split(".")
-                            if "layers" not in prefix_parts:
-                                rprint("[WARNING] Cannot determine weight layout, skipping restore")
-                                all_weights.clear()
-                                break
+                            # Peek at first file to determine weight prefix pattern
+                            import safetensors
+                            _sf0 = safetensors_files[0]
+                            with safetensors.safe_open(str(_sf0), framework="numpy") as _f0:
+                                _sample_key = next(iter(_f0.keys()))
+                            _prefix_parts = _sample_key.split(".")
+                            if "layers" not in _prefix_parts:
+                                raise RuntimeError("Cannot determine weight layout from safetensors keys")
+                            _layers_ix = _prefix_parts.index("layers")
 
-                            for layer_idx_offset, info in enumerate(unload_info["layer_info"]):
-                                orig_idx = n_loaded + layer_idx_offset
+                            for _layer_idx_offset, _info in enumerate(unload_info["layer_info"]):
+                                _orig_idx = n_loaded + _layer_idx_offset
 
-                                module_path, class_name = info["class_path"].rsplit(".", 1)
-                                module = importlib.import_module(module_path)
-                                layer_class = getattr(module, class_name)
+                                _mod_path, _cls_name = _info["class_path"].rsplit(".", 1)
+                                _mod = importlib.import_module(_mod_path)
+                                _layer_class = getattr(_mod, _cls_name)
 
-                                sig = inspect.signature(layer_class.__init__)
-                                first_param = list(sig.parameters.keys())[1]
+                                _sig = inspect.signature(_layer_class.__init__)
+                                _first_param = list(_sig.parameters.keys())[1]
 
-                                init_kwargs = {first_param: model.args}
-                                for k in list(info.keys()):
-                                    if k != "class_path":
-                                        init_kwargs[k] = info[k]
+                                # Build init kwargs; if model.args lacks something, fall back
+                                _init_kwargs = {_first_param: model.args}
+                                for _k in list(_info.keys()):
+                                    if _k != "class_path":
+                                        _init_kwargs[_k] = _info[_k]
 
-                                new_layer = layer_class(**init_kwargs)
+                                try:
+                                    _new_layer = _layer_class(**_init_kwargs)
+                                except (AttributeError, TypeError):
+                                    _fallback = {_first_param: model.args}
+                                    _new_layer = _layer_class(**_fallback)
 
-                                # Extract weights for this layer from the original safetensors
-                                weight_prefix = ".".join(
-                                    prefix_parts[:layers_ix + 1] + [str(orig_idx)]
+                                # Load only this layer's weights from safetensors
+                                _w_prefix = ".".join(
+                                    _prefix_parts[:_layers_ix + 1] + [str(_orig_idx)]
                                 ) + "."
-                                layer_weights = {
-                                    k[len(weight_prefix):]: v
-                                    for k, v in all_weights.items()
-                                    if k.startswith(weight_prefix)
-                                }
-                                if layer_weights:
-                                    new_layer.load_weights(list(layer_weights.items()), strict=False)
+                                _layer_w = {}
+                                for _sf in safetensors_files:
+                                    with safetensors.safe_open(str(_sf), framework="numpy") as _f:
+                                        for _key in _f.keys():
+                                            if _key.startswith(_w_prefix):
+                                                _rel_key = _key[len(_w_prefix):]
+                                                _layer_w[_rel_key] = mx.array(_f.get_tensor(_key))
+                                if _layer_w:
+                                    _new_layer.load_weights(list(_layer_w.items()), strict=False)
 
-                                current.append(new_layer)
+                                current.append(_new_layer)
+                                del _new_layer, _layer_w
 
                             setattr(parent, attr, current)
                             mx.eval(model.parameters())
-                            all_weights.clear()
                             _layers_restored = True
 
                     del model._unload_info
@@ -861,17 +868,20 @@ Read the material and then ask me what I'd like to know about {topic}."""})
             # --- WARMUP: 1-token forward pass to prove model works ---
             if _layers_restored:
                 import time as _time
-                wm = _time.time()
-                wm_prompt = mx.array([tokenizer.bos_token_id or 1], mx.uint32)
-                wm_cache = make_prompt_cache(model, args.max_kv_size)
+                _wm = _time.time()
+                _wm_prompt = mx.array([tokenizer.bos_token_id or 1], mx.uint32)
+                _wm_cache = make_prompt_cache(model, args.max_kv_size)
                 for _w in stream_generate(
-                    model, tokenizer, wm_prompt, max_tokens=1,
+                    model, tokenizer, _wm_prompt, max_tokens=1,
                     sampler=make_sampler(0.0, 1.0),
-                    prompt_cache=wm_cache,
+                    prompt_cache=_wm_cache,
                 ):
                     pass
-                wm_ms = (_time.time() - wm) * 1000
-                rprint(f"[INFO] Model warmed up in {wm_ms:.0f}ms")
+                del _wm_cache, _wm_prompt
+                gc.collect()
+                mx.clear_cache()
+                _wm_ms = (_time.time() - _wm) * 1000
+                rprint(f"[INFO] Model warmed up in {_wm_ms:.0f}ms")
             # --- MTP CACHE SYNC ---
             # If MTP is enabled, the generation loop expects a prompt_cache
             # that includes the backbone layers followed by the MTP layers.
