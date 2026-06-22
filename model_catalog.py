@@ -26,6 +26,7 @@ class ModelInfo:
     name: str
     size_bytes: int
     size_gib: str
+    model_type: str = ""
     capabilities: ModelCapabilities = field(default_factory=ModelCapabilities)
 
 
@@ -82,6 +83,17 @@ def estimate_model_memory_bytes(model_size_bytes: int, options: dict) -> int:
     return model_size_bytes + GIB
 
 
+def get_model_type(model_name: str) -> str:
+    config_path = get_models_dir() / model_name / "config.json"
+    if config_path.exists():
+        try:
+            config = json.loads(config_path.read_text())
+            return config.get("model_type", "")
+        except Exception:
+            pass
+    return ""
+
+
 def get_model_capabilities(model_name: str) -> ModelCapabilities:
     model_dir = get_models_dir() / model_name
     caps = ModelCapabilities()
@@ -105,7 +117,6 @@ def list_models(options: dict) -> list[ModelInfo]:
     if not models_dir.exists():
         return []
 
-    total_memory = get_total_memory_bytes()
     available_memory = get_available_memory_bytes()
     models: list[ModelInfo] = []
 
@@ -114,13 +125,11 @@ def list_models(options: dict) -> list[ModelInfo]:
             continue
         size_bytes = get_model_size_bytes(item.name)
         caps = get_model_capabilities(item.name)
+        mt = get_model_type(item.name)
         estimated = estimate_model_memory_bytes(size_bytes, options)
         caps.estimated_bytes = estimated
         caps.estimated_memory = format_bytes_gib(estimated)
         caps.fits_memory = available_memory is None or estimated <= available_memory
-        caps.total_memory = (
-            format_bytes_gib(total_memory) if total_memory is not None else "unknown"
-        )
         caps.available_memory = (
             format_bytes_gib(available_memory) if available_memory is not None else "unknown"
         )
@@ -128,6 +137,7 @@ def list_models(options: dict) -> list[ModelInfo]:
             name=item.name,
             size_bytes=size_bytes,
             size_gib=format_bytes_gib(size_bytes),
+            model_type=mt,
             capabilities=caps,
         ))
 

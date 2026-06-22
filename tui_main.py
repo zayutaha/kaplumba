@@ -482,7 +482,9 @@ class ChatUI(App):
         self.query_one("#personality-selector-container").display = False
         self.query_one("#options-selector-container").display = False
         self.query_one("#model-selector-container").display = True
-        self.query_one("#model-selector").focus()
+        sel = self.query_one("#model-selector", ModelSelector)
+        sel._refresh_memory()
+        sel.focus()
 
     async def show_options_selector(self):
         self.query_one("#chat-center").display = False

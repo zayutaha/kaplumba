@@ -21,6 +21,20 @@ class ModelSelector(Static):
         self._dir_buffer = ""
         self.render_list()
 
+    def on_mount(self) -> None:
+        self.set_interval(5, self._refresh_memory)
+
+    def _refresh_memory(self) -> None:
+        selected = self._sorted_models()[self.selected_index].name if self.models else None
+        self.models = list_models({})
+        if selected:
+            for i, m in enumerate(self.models):
+                if m.name == selected:
+                    self.selected_index = i
+                    break
+        self.render_list()
+        self.refresh()
+
     def _load_favorites(self) -> set[str]:
         try:
             if self.FAVORITES_FILE.exists():
@@ -46,37 +60,32 @@ class ModelSelector(Static):
         if self._editing_dir:
             lines = ["[bold #f0a500]Model directory[/bold #f0a500]\n"]
             lines.append("[dim]Type the new path, Enter to confirm, Esc to cancel[/dim]\n")
-            lines.append(f"[bold #f0a500]/──\\[/bold #f0a500] [bold]{self._dir_buffer}[/bold]")
+            lines.append(f"[bold #f0a500]🗂️[/bold #f0a500] [bold]{self._dir_buffer}[/bold]")
             self.update("\n".join(lines))
             return
 
         models_dir = get_models_dir()
         sorted_models = self._sorted_models()
         lines = ["[bold #f0a500]Select a model:[/bold #f0a500]\n"]
-        lines.append(f"[bold #f0a500]/──\\ {models_dir}[/bold #f0a500]\n")
+        lines.append(f"[bold #f0a500]🗂️ {models_dir}[/bold #f0a500]\n")
         for i, m in enumerate(sorted_models):
             prefix = "* " if m.name in self.favorites else "  "
             c = m.capabilities
-            caps_str = []
-            if c.vision:
-                caps_str.append("👁 Vision")
-            if c.mtp:
-                caps_str.append("🎬 MTP")
-            caps_display = " • ".join(caps_str) if caps_str else "—"
-            fit_text = f"needs {c.estimated_memory} / free {c.available_memory} / total {c.total_memory}"
+            arch = m.model_type if m.model_type else "—"
+            fit_text = f"needs {c.estimated_memory} / free {c.available_memory}"
             disabled = not c.fits_memory
             if i == self.selected_index and not disabled:
                 lines.append(f"[bold #4caf50]❯ {prefix}{m.name}[/bold #4caf50]")
-                lines.append(f"  [#4caf50]{m.size_gib} | {caps_display} | {fit_text}[/#4caf50]")
+                lines.append(f"  [#4caf50]{m.size_gib} | {arch} | {fit_text}[/#4caf50]")
             elif i == self.selected_index and disabled:
                 lines.append(f"[bold #cc6666]❯ {prefix}{m.name}[/bold #cc6666]")
-                lines.append(f"  [#cc6666]{m.size_gib} | {caps_display} | {fit_text}[/#cc6666]")
+                lines.append(f"  [#cc6666]{m.size_gib} | {arch} | {fit_text}[/#cc6666]")
             elif disabled:
                 lines.append(f"  {prefix}{m.name}")
-                lines.append(f"  [#886666]{m.size_gib} | {caps_display} | {fit_text}[/#886666]")
+                lines.append(f"  [#886666]{m.size_gib} | {arch} | {fit_text}[/#886666]")
             else:
                 lines.append(f"  [bold #4caf50]{prefix}{m.name}[/bold #4caf50]")
-                lines.append(f"  [#4caf50]{m.size_gib} | {caps_display} | {fit_text}[/#4caf50]")
+                lines.append(f"  [#4caf50]{m.size_gib} | {arch} | {fit_text}[/#4caf50]")
         lines.append("\n[dim](↑/↓ navigate, Enter select, f favorite, e edit config, d change dir, red entries are risky, Esc back, Ctrl+C quit)[/dim]")
         self.update("\n".join(lines))
 

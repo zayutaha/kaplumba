@@ -67,9 +67,8 @@ class TestModelCatalog(unittest.TestCase):
             (large / "weights.bin").write_bytes(b"x" * 2048)
 
             with patch("model_catalog.get_models_dir", return_value=models_dir):
-                with patch.object(model_catalog, "get_total_memory_bytes", return_value=16 * model_catalog.GIB):
-                    with patch.object(model_catalog, "get_available_memory_bytes", return_value=12 * model_catalog.GIB):
-                        models = model_catalog.list_models({})
+                with patch.object(model_catalog, "get_available_memory_bytes", return_value=12 * model_catalog.GIB):
+                    models = model_catalog.list_models({})
 
         self.assertEqual([model.name for model in models], ["small-model", "large-model"])
         self.assertTrue(all(isinstance(model.capabilities.fits_memory, bool) for model in models))
