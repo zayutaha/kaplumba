@@ -688,25 +688,39 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                 to_drop = n - target_kept
                 kept = target_kept
 
-                # Save metadata for restoring from original weights
-                layer_info = []
+                # Save each unloaded layer's weights + metadata to temp dir
+                import hashlib, tempfile
+                from pathlib import Path
+                _hash = hashlib.md5(args.model.encode()).hexdigest()[:12]
+                _swap = Path(tempfile.gettempdir()) / "kaplumba" / _hash
+                _swap.mkdir(parents=True, exist_ok=True)
+
+                _manifest = {"total": n, "count": to_drop, "pct": unload_pct, "layers": []}
                 for i in range(kept, n):
                     layer = all_layers[i]
-                    info = {"class_path": f"{type(layer).__module__}.{type(layer).__qualname__}"}
-                    sig = inspect.signature(type(layer).__init__)
-                    for pname in list(sig.parameters.keys())[2:]:
-                        if hasattr(layer, pname):
-                            info[pname] = getattr(layer, pname)
-                        elif pname == "layer_idx":
-                            info[pname] = i
-                    layer_info.append(info)
+                    w_path = _swap / f"layer_{i}.safetensors"
+                    mx.save_safetensors(str(w_path), dict(layer.parameters()))
 
-                model._unload_info = {
-                    "count": to_drop,
-                    "total": n,
-                    "pct": unload_pct,
-                    "layer_info": layer_info,
-                }
+                    entry = {
+                        "class_path": f"{type(layer).__module__}.{type(layer).__qualname__}",
+                        "weights": str(w_path),
+                    }
+                    # Save extra init kwargs (use_sliding, layer_idx, etc.)
+                    sig = inspect.signature(type(layer).__init__)
+                    for pname in list(sig.parameters.keys())[1:]:
+                        if pname in ("args", "config"):
+                            continue
+                        if hasattr(layer, pname):
+                            entry[pname] = getattr(layer, pname)
+                        elif pname == "layer_idx":
+                            entry[pname] = i
+                    _manifest["layers"].append(entry)
+
+                m_path = _swap / "manifest.json"
+                with open(m_path, "w") as f:
+                    json.dump(_manifest, f)
+
+                model._unload_manifest = str(m_path)
 
                 setattr(parent, attr, all_layers[:kept])
                 del all_layers
@@ -776,11 +790,15 @@ Read the material and then ask me what I'd like to know about {topic}."""})
                 **thinking_kwargs,
             )
 
-            # --- RESTORE UNLOADED LAYERS FROM ORIGINAL WEIGHTS ---
-            unload_info = getattr(model, '_unload_info', None)
+            # --- RESTORE UNLOADED LAYERS FROM TEMP FILES ---
+            _manifest_path = getattr(model, '_unload_manifest', None)
             _layers_restored = False
-            if unload_info is not None:
+            if _manifest_path is not None:
                 try:
+                    with open(_manifest_path) as _f:
+                        _manifest = json.load(_f)
+                    _swap_dir = Path(_manifest_path).parent
+
                     # Find writable layers parent
                     parent, attr = None, None
                     for src_name, src_obj in [('model', model), ('language_model', getattr(model, 'language_model', None))]:
@@ -799,82 +817,36 @@ Read the material and then ask me what I'd like to know about {topic}."""})
 
                     if parent is not None:
                         current = list(getattr(parent, attr))
-                        n_loaded = len(current)
-                        n_total = unload_info["total"]
+                        # Refresh ModelArgs from config.json to ensure all attrs
+                        _cfg = load_config(Path(args.model))
+                        _fresh_args = type(model.args).from_dict(_cfg)
 
-                        if n_loaded < n_total:
-                            model_dir = Path(args.model)
-                            safetensors_files = sorted(model_dir.glob("model*.safetensors"))
-                            if not safetensors_files:
-                                raise RuntimeError(f"No safetensors files found in {model_dir}")
+                        for _entry in _manifest["layers"]:
+                            _mod_path, _cls_name = _entry["class_path"].rsplit(".", 1)
+                            _mod = importlib.import_module(_mod_path)
+                            _layer_class = getattr(_mod, _cls_name)
 
-                            # Find a key containing "layers" to determine weight prefix pattern
-                            import safetensors
-                            _layer_key = None
-                            _layers_ix = None
-                            for _sf in safetensors_files:
-                                with safetensors.safe_open(str(_sf), framework="numpy") as _f:
-                                    for _k in _f.keys():
-                                        for _kw in (".layers.", ".blocks."):
-                                            if _kw in _k:
-                                                _layer_key = _k
-                                                _layers_lbl = _kw.strip(".")
-                                                break
-                                if _layer_key is not None:
-                                    break
-                            if _layer_key is None:
-                                raise RuntimeError("Cannot find layer weights in safetensors files")
-                            _prefix_parts = _layer_key.split(".")
-                            _layers_ix = _prefix_parts.index(_layers_lbl)
+                            _sig = inspect.signature(_layer_class.__init__)
+                            _first_param = list(_sig.parameters.keys())[1]
 
-                            for _layer_idx_offset, _info in enumerate(unload_info["layer_info"]):
-                                _orig_idx = n_loaded + _layer_idx_offset
+                            _init_kwargs = {_first_param: _fresh_args}
+                            for _k in _entry:
+                                if _k in ("class_path", "weights"):
+                                    continue
+                                _init_kwargs[_k] = _entry[_k]
 
-                                _mod_path, _cls_name = _info["class_path"].rsplit(".", 1)
-                                _mod = importlib.import_module(_mod_path)
-                                _layer_class = getattr(_mod, _cls_name)
+                            _new_layer = _layer_class(**_init_kwargs)
+                            _new_layer.load_weights(_entry["weights"], strict=False)
+                            current.append(_new_layer)
 
-                                _sig = inspect.signature(_layer_class.__init__)
-                                _first_param = list(_sig.parameters.keys())[1]
+                        setattr(parent, attr, current)
+                        mx.eval(model.parameters())
+                        _layers_restored = True
 
-                                # Build init kwargs; if model.args lacks something, fall back
-                                _init_kwargs = {_first_param: model.args}
-                                for _k in list(_info.keys()):
-                                    if _k != "class_path":
-                                        _init_kwargs[_k] = _info[_k]
-
-                                try:
-                                    _new_layer = _layer_class(**_init_kwargs)
-                                except (AttributeError, TypeError):
-                                    # model.args may lack arch-specific attrs;
-                                    # reload config from disk for a fresh ModelArgs
-                                    _cfg = load_config(Path(args.model))
-                                    _fresh_args = type(model.args).from_dict(_cfg)
-                                    _init_kwargs[_first_param] = _fresh_args
-                                    _new_layer = _layer_class(**_init_kwargs)
-
-                                # Load only this layer's weights from safetensors
-                                _w_prefix = ".".join(
-                                    _prefix_parts[:_layers_ix + 1] + [str(_orig_idx)]
-                                ) + "."
-                                _layer_w = {}
-                                for _sf in safetensors_files:
-                                    with safetensors.safe_open(str(_sf), framework="numpy") as _f:
-                                        for _key in _f.keys():
-                                            if _key.startswith(_w_prefix):
-                                                _rel_key = _key[len(_w_prefix):]
-                                                _layer_w[_rel_key] = mx.array(_f.get_tensor(_key))
-                                if _layer_w:
-                                    _new_layer.load_weights(list(_layer_w.items()), strict=False)
-
-                                current.append(_new_layer)
-                                del _new_layer, _layer_w
-
-                            setattr(parent, attr, current)
-                            mx.eval(model.parameters())
-                            _layers_restored = True
-
-                    del model._unload_info
+                    del model._unload_manifest
+                    # Clean up temp files
+                    import shutil
+                    shutil.rmtree(_swap_dir, ignore_errors=True)
                 except Exception as e:
                     rprint(f"[WARNING] Layer restore failed: {e}")
 
