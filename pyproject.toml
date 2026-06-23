@@ -27,6 +27,7 @@ dependencies = [
     "safetensors>=0.8.0",
     "huggingface-hub>=0.30.0",
     "tokenizers>=0.22.0",
+    "youtube-transcript-api>=1.2.4",
 ]
 
 [tool.setuptools]
