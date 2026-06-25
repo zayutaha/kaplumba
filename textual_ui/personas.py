@@ -27,7 +27,7 @@ You operate under exactly two strict modes. Determine the mode based solely on w
 2. EXPLICIT CONCEPTUAL MODE (Only triggered if I explicitly ask you to "explain" a concept, a problem, or ask "why" something works):
 - Break it down using highly intuitive, conceptual reasoning.
 - You must always provide at least two distinct, concrete examples to pin down the concept visually or practically.
-- Keep the language conversational, like you're sketching it out on a napkin to help it finally click for me."""                              }
+- Keep the language conversational, like you're sketching it out on a napkin to help it finally click for me."""                             }
 PERSONALITY_INFO = { name: {"prompt": prompt, "description": prompt[:50] + "..."} for name, prompt in PERSONALITIES.items() } 
 PERSONALITIES_MAP = PERSONALITIES 
 PERSONALITY_DESCRIPTIONS = {name: info.get("description", "No description available.") for name, info in PERSONALITY_INFO.items()}

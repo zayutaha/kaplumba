@@ -110,6 +110,10 @@ def parse_latex(text: str) -> str:
     )
     text = re.sub(_BS + _CMDS2, _parse_block, text)
 
+    # Final pass: split chained equality/implication steps anywhere in the text
+    # (catches content that wasn't wrapped in math delimiters)
+    text = _split_chain(text)
+
     return text
 
 
