@@ -100,19 +100,19 @@ async def run_model_stream(chat, port, user_text: str):
                     # Thinking is done - extract content after thinking block
                     display = strip_prompt_markers(get_display_text(buf))
                     if display:
-                        await chat.handle_stream_chunk(format_for_display(display))
+                        await chat.handle_stream_chunk(format_for_display(display), raw_text=buf)
                     in_thinking = False
                     thinking_processed = True
             elif thinking_processed:
                 # After thinking was processed, continue showing content
                 display = strip_prompt_markers(get_display_text(buf))
                 if display:
-                    await chat.handle_stream_chunk(format_for_display(display))
+                    await chat.handle_stream_chunk(format_for_display(display), raw_text=buf)
             else:
                 # No thinking - display normally
                 display = strip_prompt_markers(buf)
                 if display:
-                    await chat.handle_stream_chunk(format_for_display(display))
+                    await chat.handle_stream_chunk(format_for_display(display), raw_text=buf)
     except Exception:
         if chat._on_crash:
             await chat._on_crash()
@@ -132,7 +132,7 @@ async def run_model_stream(chat, port, user_text: str):
         else:
             display = _remove_thinking_blocks(strip_prompt_markers(buf))
         try:
-            await chat.handle_stream_finished(format_for_display(display))
+            await chat.handle_stream_finished(format_for_display(display), raw_text=buf)
         except Exception:
             pass
         scroll_y = chat_widget.scroll_offset.y

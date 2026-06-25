@@ -155,7 +155,7 @@ class LatexParser:
             den = self._parse_text_arg() or self._peek(1) or ''
         else:
             den = ''
-        return f"{num}/{den}"
+        return f"⌈{num}⌋{den}⌉"
 
     def _parse_sqrt(self):
         root = self._parse_opt_arg()

@@ -788,26 +788,104 @@ class TestChatUINavigation(unittest.IsolatedAsyncioTestCase):
 
         # format_for_display integration
         d = format_for_display("$$y = x^x \\Rightarrow \\ln(y) = \\ln(x^x)$$")
-        self.assertIn("  \n", d)
-        self.assertIn("⇒", d)
+        self.assertIn("   y", d)
+        self.assertIn("   = xˣ", d)
+        self.assertIn("⇒ ln(y)", d)
+        self.assertIn("   = ln(xˣ)", d)
 
         # Separate $$ blocks
         d = format_for_display("$$y = x^x$$\n$$\\implies \\ln(y) = \\ln(x^x)$$")
-        self.assertIn("  \n", d)
-        self.assertIn("⇒", d)
+        self.assertIn("⇒ ln(y)", d)
+        self.assertIn("   = ln(xˣ)", d)
 
         # Plain text unchanged
         d = format_for_display("Regular text.")
-        self.assertNotIn("  \n", d)
+        self.assertEqual(d, "Regular text.")
 
         # Inline math preserved
         d = format_for_display("The derivative of $x^2$ is $2x$.")
         self.assertIn("x²", d)
-        self.assertNotIn("  \n", d)
 
         # Integral (single operator)
         d = format_for_display("$$\\int_a^b f(x) dx$$")
         self.assertIn("∫", d)
+
+    async def test_stacked_fractions(self):
+        """Fractions are stacked (never inline dy/dx), = content on bar line."""
+        from textual_ui.latex import _stack_fractions, format_for_display
+
+        # Single fraction: dy/dx = 2x^2 + 2
+        result = _stack_fractions("⌈dy⌋dx⌉ = 2x² + 2")
+        self.assertIn("dy", result)
+        self.assertIn("──", result)
+        self.assertIn("dx", result)
+        self.assertIn("= 2x² + 2", result)
+
+        # Adjacent fractions: 1/y dy/dx
+        result = _stack_fractions("⌈1⌋y⌉ ⌈dy⌋dx⌉")
+        lines = result.split("\n")
+        self.assertEqual(len(lines), 3)
+        self.assertIn("1", lines[0])
+        self.assertIn("dy", lines[0])
+        self.assertIn("─", lines[1])
+        self.assertIn("y", lines[2])
+        self.assertIn("dx", lines[2])
+
+        # fraction with = rest on bar line
+        result = _stack_fractions("⌈dy⌋dx⌉ = ln(x) + 1")
+        self.assertIn("= ln(x) + 1", result.split("\n")[1])
+
+        # Marker on a bar line inlines to avoid interleaving
+        result = _stack_fractions(
+            "1\n─ ⌈dy⌋dx⌉ = x\n2"
+        )
+        self.assertIn("dy/dx", result)
+        self.assertNotIn("──", result)
+
+        # format_for_display: full chain with fractions
+        d = format_for_display(
+            "$$y = x^x \\implies \\ln(y) = \\ln(x^x) "
+            "\\implies \\frac{1}{y} \\frac{dy}{dx} = \\ln(x) + 1 "
+            "\\implies \\frac{dy}{dx} = x^x(\\ln(x) + 1)$$"
+        )
+        # Fraction 1/y stacked with adjacent dy/dx
+        self.assertIn("1 dy", d)
+        self.assertIn("─ ──", d)
+        self.assertIn("y dx", d)
+        # Second fraction dy/dx stacked separately
+        self.assertIn("⇒ dy", d)
+        self.assertIn("── = xˣ", d)
+        self.assertIn("dx", d)
+
+    async def test_no_inline_fractions(self):
+        """No fraction is rendered as num/den — all are stacked."""
+        from textual_ui.latex import _stack_fractions
+
+        # dy/dx = something — was previously inlined, now stacked
+        result = _stack_fractions("⌈dy⌋dx⌉ = 2x")
+        self.assertNotIn("dy/dx", result)
+        self.assertIn("dy", result.split("\n")[0])
+        self.assertIn("──", result.split("\n")[1])
+        self.assertIn("= 2x", result.split("\n")[1])
+
+    async def test_fraction_indent_preserved(self):
+        """Stacked fractions preserve 3-space indent from chain splitting."""
+        from textual_ui.latex import _parse_with_chain
+
+        # Simulate what _parse_with_chain does: parse, chain-split, merge, stack
+        result = _parse_with_chain(
+            r"\frac{dy}{dx} = 2x^2 + 2 \implies \frac{dy}{dx} = x^x"
+        )
+        lines = result.split("\n")
+        # Each line should start with 3 spaces
+        for line in lines:
+            if line.strip():
+                self.assertTrue(line.startswith("   "), f"Missing indent: {line!r}")
+        # Bar line has = content on same line
+        bar_lines = [l for l in lines if "─" in l]
+        self.assertGreater(len(bar_lines), 0)
+        for bl in bar_lines:
+            self.assertIn("=", bl)
 
 
 if __name__ == "__main__":

@@ -60,6 +60,41 @@ async def _copy_selected(app: "ChatUI"):
     # Schedule scroll restore after render settles
     app.set_timer(0.0, lambda: chat_scroll.scroll_to(saved_y, animate=False))
 
+
+async def _debug_copy_selected(app: "ChatUI"):
+    """Copy the raw (pre-format_for_display) text of selected bubbles."""
+    if not _selected_bubbles:
+        await app.show_banner("No bubbles selected — click to select", timeout=2)
+        return
+    parts = []
+    for b in _selected_bubbles:
+        raw = getattr(b, "_raw_text", None)
+        if raw:
+            parts.append(raw)
+    if not parts:
+        await app.show_banner("No raw text available for selected bubbles", timeout=2)
+        return
+    text = "\n\n".join(parts)
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "pbcopy", stdin=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate(input=text.encode())
+        if proc.returncode == 0:
+            msg = f"Debug-copied {len(parts)} message{'' if len(parts) == 1 else 's'} to clipboard"
+            await app.show_banner(msg, timeout=2)
+        else:
+            await app.show_banner("Failed to copy", severity="error", timeout=2)
+    except FileNotFoundError:
+        await app.show_banner("pbcopy not available", severity="error", timeout=2)
+    chat_scroll = app.query_one("#chat-center")
+    saved_y = chat_scroll.scroll_y
+    for b in _selected_bubbles:
+        b.remove_class("bubble-selected")
+    _selected_bubbles.clear()
+    app._update_selection_ui()
+    app.set_timer(0.0, lambda: chat_scroll.scroll_to(saved_y, animate=False))
+
 from model_catalog import list_models
 from textual_ui.styles import CHAT_CSS, LOGO, WELCOME_MESSAGES
 
@@ -73,7 +108,8 @@ HELP_TEXT = """\
 
 [bold]Copy messages[/]
   Click a bubble to select it
-  [bold]C[/]           Copy all selected messages
+  [bold]C[/]           Copy all selected messages (formatted)
+  [bold]D[/]           Copy all selected messages (raw/LaTeX)
   Click again to deselect
 
 [bold]Copy text[/]
@@ -108,6 +144,7 @@ class ChatUI(App):
         ("ctrl+c", "quit", "Quit"),
         ("ctrl+r", "reload_model", "Reload Model"),
         ("c", "copy_selected", "Copy"),
+        ("d", "debug_copy_selected", "Debug Copy"),
         ("ctrl+backslash", "show_help", "Help"),
         ("escape", "close_help", "Close"),
     ]
@@ -277,6 +314,12 @@ class ChatUI(App):
             return
         await _copy_selected(self)
 
+    async def action_debug_copy_selected(self):
+        if not _selected_bubbles:
+            await self.show_banner("Click a bubble to select, then D to debug copy", timeout=2)
+            return
+        await _debug_copy_selected(self)
+
     # ── Chat UI internals ──
 
     @property
@@ -378,7 +421,7 @@ class ChatUI(App):
                 _selected_bubbles.append(widget)
                 widget.add_class("bubble-selected")
             self._update_selection_ui()
-            asyncio.create_task(self.show_banner("Press C to copy"))
+            asyncio.create_task(self.show_banner("Press C to copy, D to debug copy"))
             event.stop()
 
     async def action_interrupt(self):
@@ -509,25 +552,30 @@ class ChatUI(App):
 
     async def handle_stream_text(self, user_text: str) -> None:
         chat = self.query_one("#chat", VerticalScroll)
-        await chat.mount(CopyableMarkdown(user_text, classes="bubble-user"))
+        bubble = CopyableMarkdown(user_text, classes="bubble-user")
+        bubble._raw_text = user_text
+        await chat.mount(bubble)
         self._stream_generation += 1
         self.current_md = CopyableMarkdown("▌", classes="bubble-assistant")
         self.current_md._generation = self._stream_generation
+        self.current_md._raw_text = ""
         await chat.mount(self.current_md)
         chat.scroll_end(animate=False)
 
-    async def handle_stream_finished(self, display: str) -> None:
+    async def handle_stream_finished(self, display: str, raw_text: str = "") -> None:
         try:
             if self.current_md and getattr(self.current_md, "_generation", 0) == self._stream_generation:
                 await self.current_md.update(display)
+                self.current_md._raw_text = raw_text
         except Exception:
             pass
 
-    async def handle_stream_chunk(self, display: str, show_cursor: bool = True) -> None:
+    async def handle_stream_chunk(self, display: str, raw_text: str = "", show_cursor: bool = True) -> None:
         try:
             if self.current_md and getattr(self.current_md, "_generation", 0) == self._stream_generation:
                 cursor = " ▌" if show_cursor else ""
                 await self.current_md.update(f"{display}{cursor}")
+                self.current_md._raw_text = raw_text
         except Exception:
             pass
 
