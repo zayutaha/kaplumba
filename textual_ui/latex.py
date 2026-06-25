@@ -235,17 +235,22 @@ def _parse_with_chain(inner: str) -> str:
             result = "\n" + result
         if not inner.endswith("\n"):
             result = result + "\n"
-        # Center display math by padding lines
+        # Center display math by padding all lines to the same width
         center_width = 52
-        centered_lines = []
-        for line in result.split("\n"):
-            stripped = line.rstrip()
-            if stripped:
-                pad = max(0, (center_width - len(stripped)) // 2)
-                centered_lines.append(" " * pad + stripped)
-            else:
-                centered_lines.append("")
-        result = "\n".join(centered_lines)
+        lines = result.split("\n")
+        # Only center non-empty lines
+        non_empty = [l for l in lines if l.strip()]
+        if non_empty:
+            max_len = max(len(l.rstrip()) for l in non_empty)
+            pad = max(0, (center_width - max_len) // 2)
+            centered_lines = []
+            for line in lines:
+                stripped = line.rstrip()
+                if stripped:
+                    centered_lines.append(" " * pad + stripped)
+                else:
+                    centered_lines.append("")
+            result = "\n".join(centered_lines)
 
         return result
     except Exception:
