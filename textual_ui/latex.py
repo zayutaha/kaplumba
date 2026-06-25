@@ -41,7 +41,7 @@ def _split_chain(text: str) -> str:
             line = rebuilt
 
         out.append(line)
-    return "\n".join(out)
+    return "  \n".join(out)
 
 
 def parse_latex(text: str) -> str:
@@ -127,6 +127,10 @@ def parse_latex(text: str) -> str:
 
     # Split chained equality/implication steps anywhere in the text
     text = _split_chain(text)
+
+    # Convert newlines before math operators to markdown line breaks
+    # (catches steps split across separate $$...$$ blocks)
+    text = re.sub(r'\n(?=\s*(?:[⇒=\\]|(?:\\\\[a-z]+)))', '  \n', text)
 
     return text
 
