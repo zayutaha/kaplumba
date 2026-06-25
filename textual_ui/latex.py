@@ -235,8 +235,17 @@ def _parse_with_chain(inner: str) -> str:
             result = "\n" + result
         if not inner.endswith("\n"):
             result = result + "\n"
-        # Center display math in the chat bubble
-        result = "\n[center]\n" + result + "\n[/center]\n"
+        # Center display math by padding lines
+        center_width = 52
+        centered_lines = []
+        for line in result.split("\n"):
+            stripped = line.rstrip()
+            if stripped:
+                pad = max(0, (center_width - len(stripped)) // 2)
+                centered_lines.append(" " * pad + stripped)
+            else:
+                centered_lines.append("")
+        result = "\n".join(centered_lines)
 
         return result
     except Exception:
@@ -338,12 +347,11 @@ def parse_latex(text: str) -> str:
     text = re.sub(_BS + _CMDS2, _parse_block, text)
 
     # Final pass: if raw LaTeX commands remain, parse and stack fractions
-    if "[center]" not in text:
-        if re.search(r"\\[a-z]+(?:\{|\(|\[)", text, re.I):
-            try:
-                text = latex_parser.parse(text)
-            except Exception:
-                pass
+    if re.search(r"\\[a-z]+(?:\{|\(|\[)", text, re.I):
+        try:
+            text = latex_parser.parse(text)
+        except Exception:
+            pass
     text = _stack_fractions(text)
 
     return text
