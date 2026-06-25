@@ -727,7 +727,7 @@ class LatexParser:
             return '′'
 
         # === Dots ===
-        if cmd == 'ldots':
+        if cmd in ('ldots', 'dots'):
             return '…'
         if cmd == 'cdots':
             return '⋯'

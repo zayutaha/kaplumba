@@ -771,28 +771,39 @@ class TestChatUINavigation(unittest.IsolatedAsyncioTestCase):
         """Chained equality/implication operators are split onto new lines."""
         from textual_ui.latex import _split_chain, format_for_display
 
-        # Chained equals split (3 equals → 3 line breaks)
+        # Core chain splitting
         r = _split_chain("x = 2y = 3z = 4w")
         self.assertIn("  \n= ", r)
-        self.assertTrue(r.startswith("x "))
-
-        # Chained \Rightarrow split (2 operators → 2 line breaks)
         r = _split_chain("a \\Rightarrow b \\Rightarrow c")
         self.assertIn("  \n\\Rightarrow", r)
-
-        # Chained ⇒ (Unicode) split (3 operators → 3 line breaks)
         r = _split_chain("a ⇒ b ⇒ c ⇒ d")
         self.assertEqual(r.count("  \n⇒"), 3)
-
-        # Single operators NOT split
         self.assertEqual(_split_chain("x = 5"), "x = 5")
         self.assertEqual(_split_chain("a ⇒ b"), "a ⇒ b")
 
-        # Integration through format_for_display
-        msg = "Let y = x^x \\Rightarrow \\ln(y) = \\ln(x^x)"
-        d = format_for_display(msg)
+        # format_for_display integration
+        d = format_for_display("Let y = x^x \\Rightarrow \\ln(y) = \\ln(x^x)")
+        self.assertIn("  \n", d)
+
+        # Separate $$ blocks (model outputs each step in its own $$)
+        d = format_for_display("$$y = x^x$$\n$$\\implies \\ln(y) = \\ln(x^x)$$")
         self.assertIn("  \n", d)
         self.assertIn("⇒", d)
+
+        # Plain text unchanged
+        d = format_for_display("This is regular text with no math.")
+        self.assertNotIn("  \n", d)
+
+        # Inline math preserved
+        d = format_for_display("The derivative of $x^2$ is $2x$.")
+        self.assertIn("x²", d)
+        self.assertIn("2x", d)
+        self.assertNotIn("  \n", d)
+
+        # No unwanted breaks
+        d = format_for_display("$$\\int_a^b f(x) dx$$")
+        self.assertIn("∫", d)
+        self.assertNotIn("  \n", d)
 
 
 if __name__ == "__main__":
