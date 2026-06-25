@@ -20,7 +20,7 @@ def _split_chain(text: str) -> str:
     
     Each step gets 3-space indent and a blank line between steps.
     """
-    # Collect all chain operators in the full text
+    # Collect all chain operators
     ops = []
     for m in _CHAIN_OPS.finditer(text):
         ops.append(("⇒", m.start(), m.end()))
@@ -64,36 +64,10 @@ def _split_chain(text: str) -> str:
         if seg:
             segments.append(seg)
 
-    # Build result with indent and blank lines
     result = []
     for seg in segments:
-        indented = "\n   ".join(seg.split("\n"))
-        result.append("   " + indented)
+        result.append("   " + seg.replace("\n", "\n   "))
     return "  \n\n".join(result)
-
-
-def _stack_fractions(text: str) -> str:
-    """Convert inline fraction markers ⌈num⌋den⌉ to stacked ASCII art."""
-    while True:
-        m = re.search(r"⌈([^⌈⌋]+)⌋([^⌉]+)⌉", text)
-        if not m:
-            break
-        num, den = m.group(1), m.group(2)
-        # If another fraction follows immediately, skip this one (adjacent)
-        rest = text[m.end():]
-        if re.match(r"\s*⌈", rest):
-            # Replace marker with inline fallback so we don't loop forever
-            text = text[:m.start()] + f"{num}/{den}" + text[m.end():]
-            continue
-        width = max(len(num), len(den))
-        num_c = num.center(width)
-        den_c = den.center(width)
-        line = "─" * width
-        prefix = text[:m.start()].split("\n")[-1]
-        indent = " " * (len(prefix) - len(prefix.lstrip()))
-        frac = f"{indent}{num_c}\n{indent}{line}\n{indent}{den_c}"
-        text = text[:m.start()] + "\n" + frac + text[m.end():]
-    return text
 
 
 def parse_latex(text: str) -> str:
@@ -179,9 +153,6 @@ def parse_latex(text: str) -> str:
 
     # Split chained equality/implication steps anywhere in the text
     text = _split_chain(text)
-
-    # Convert inline fraction markers to stacked ASCII art
-    text = _stack_fractions(text)
 
     # Convert newlines before math operators to markdown line breaks
     # (catches steps split across separate $$...$$ blocks)
