@@ -110,8 +110,14 @@ def parse_latex(text: str) -> str:
     )
     text = re.sub(_BS + _CMDS2, _parse_block, text)
 
-    # Final pass: split chained equality/implication steps anywhere in the text
-    # (catches content that wasn't wrapped in math delimiters)
+    # Final pass: if the text contains raw LaTeX commands, parse the whole thing
+    if re.search(r"\\[a-z]+(?:\{|\(|\[)", text, re.I):
+        try:
+            text = latex_parser.parse(text)
+        except Exception:
+            pass
+
+    # Split chained equality/implication steps anywhere in the text
     text = _split_chain(text)
 
     return text

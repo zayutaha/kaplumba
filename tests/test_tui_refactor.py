@@ -767,6 +767,37 @@ class TestChatUINavigation(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertTrue(app.query_one("#model-selector-container").display)
 
+    async def test_chain_splitting_in_chat_display(self):
+        """Chained equality/implication operators are split onto new lines."""
+        from textual_ui.latex import _split_chain, format_for_display
+
+        # Chained equals split (3 equals → 4 segments, 3 splits)
+        r = _split_chain("x = 2y = 3z = 4w")
+        self.assertEqual(r.count("\n= "), 3)
+        self.assertTrue(r.startswith("x "))
+
+        # Chained \Rightarrow split (2 operators → 3 segments, 2 splits)
+        r = _split_chain("a \\Rightarrow b \\Rightarrow c")
+        self.assertEqual(r.count("\n\\Rightarrow"), 2)
+
+        # Chained ⇒ (Unicode) split (3 operators → 4 segments, 3 splits)
+        r = _split_chain("a ⇒ b ⇒ c ⇒ d")
+        self.assertEqual(r.count("\n⇒"), 3)
+
+        # Single operators NOT split
+        self.assertEqual(_split_chain("x = 5"), "x = 5")
+        self.assertEqual(_split_chain("a ⇒ b"), "a ⇒ b")
+
+        # Single operators NOT split
+        self.assertEqual(_split_chain("x = 5"), "x = 5")
+        self.assertEqual(_split_chain("a ⇒ b"), "a ⇒ b")
+
+        # Integration through format_for_display
+        msg = "Let y = x^x \\Rightarrow \\ln(y) = \\ln(x^x)"
+        d = format_for_display(msg)
+        self.assertIn("\n", d)
+        self.assertIn("⇒", d)
+
 
 if __name__ == "__main__":
     unittest.main()
