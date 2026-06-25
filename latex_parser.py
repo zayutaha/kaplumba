@@ -155,6 +155,11 @@ class LatexParser:
             den = self._parse_text_arg() or self._peek(1) or ''
         else:
             den = ''
+        # Use fraction slash for compact inline fractions
+        num_s = num if len(num) <= 1 else num
+        den_s = den if len(den) <= 1 else den
+        if len(num) <= 2 and len(den) <= 2:
+            return f"{num}⁄{den}"
         return f"({num})/({den})"
 
     def _parse_sqrt(self):
