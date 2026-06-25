@@ -32,13 +32,22 @@ def _split_chain(text: str) -> str:
             line = rebuilt
 
         # Check for plain equals signs (two or more → chain)
-        eqs = _PLAIN_EQ.findall(line)
+        eqs = list(_PLAIN_EQ.finditer(line))
         if len(eqs) >= 2:
-            parts = _PLAIN_EQ.split(line)
-            rebuilt = parts[0]
-            for p in parts[1:]:
-                rebuilt += _NL + "= " + p.lstrip()
-            line = rebuilt
+            # Don't split if = signs are separated by commas
+            # (variable assignments like "u = sin x, v = ln x")
+            has_comma_between = True
+            for i in range(len(eqs) - 1):
+                between = line[eqs[i].end():eqs[i+1].start()]
+                if "," not in between:
+                    has_comma_between = False
+                    break
+            if not has_comma_between:
+                parts = _PLAIN_EQ.split(line)
+                rebuilt = parts[0]
+                for p in parts[1:]:
+                    rebuilt += _NL + "= " + p.lstrip()
+                line = rebuilt
 
         out.append(line)
     return "  \n".join(out)
