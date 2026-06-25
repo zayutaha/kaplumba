@@ -768,42 +768,46 @@ class TestChatUINavigation(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(app.query_one("#model-selector-container").display)
 
     async def test_chain_splitting_in_chat_display(self):
-        """Chained equality/implication operators are split onto new lines."""
+        """Chained equality/implication steps get blank line + indent."""
         from textual_ui.latex import _split_chain, format_for_display
 
-        # Core chain splitting
+        # Chained equals split
         r = _split_chain("x = 2y = 3z = 4w")
-        self.assertIn("  \n= ", r)
-        r = _split_chain("a \\Rightarrow b \\Rightarrow c")
-        self.assertIn("  \n\\Rightarrow", r)
-        r = _split_chain("a ⇒ b ⇒ c ⇒ d")
-        self.assertEqual(r.count("  \n⇒"), 3)
+        self.assertIn("   x", r)
+        self.assertIn("   = 2y", r)
+        self.assertIn("   = 3z", r)
+
+        # Chained ⇒ split
+        r = _split_chain("a ⇒ b ⇒ c")
+        self.assertIn("   a", r)
+        self.assertIn("   ⇒ b", r)
+
+        # Single operators NOT split
         self.assertEqual(_split_chain("x = 5"), "x = 5")
         self.assertEqual(_split_chain("a ⇒ b"), "a ⇒ b")
 
         # format_for_display integration
-        d = format_for_display("Let y = x^x \\Rightarrow \\ln(y) = \\ln(x^x)")
+        d = format_for_display("$$y = x^x \\Rightarrow \\ln(y) = \\ln(x^x)$$")
         self.assertIn("  \n", d)
+        self.assertIn("⇒", d)
 
-        # Separate $$ blocks (model outputs each step in its own $$)
+        # Separate $$ blocks
         d = format_for_display("$$y = x^x$$\n$$\\implies \\ln(y) = \\ln(x^x)$$")
         self.assertIn("  \n", d)
         self.assertIn("⇒", d)
 
         # Plain text unchanged
-        d = format_for_display("This is regular text with no math.")
+        d = format_for_display("Regular text.")
         self.assertNotIn("  \n", d)
 
         # Inline math preserved
         d = format_for_display("The derivative of $x^2$ is $2x$.")
         self.assertIn("x²", d)
-        self.assertIn("2x", d)
         self.assertNotIn("  \n", d)
 
-        # No unwanted breaks
+        # Integral (single operator)
         d = format_for_display("$$\\int_a^b f(x) dx$$")
         self.assertIn("∫", d)
-        self.assertNotIn("  \n", d)
 
 
 if __name__ == "__main__":

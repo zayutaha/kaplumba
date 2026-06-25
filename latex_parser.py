@@ -155,12 +155,7 @@ class LatexParser:
             den = self._parse_text_arg() or self._peek(1) or ''
         else:
             den = ''
-        # Stacked fraction with spacing: blank line, num, line, den, blank line
-        width = max(len(num), len(den))
-        num = num.center(width)
-        den = den.center(width)
-        line = "─" * width
-        return f"\n{num}\n{line}\n{den}\n"
+        return f"⌈{num}⌋{den}⌉"
 
     def _parse_sqrt(self):
         root = self._parse_opt_arg()

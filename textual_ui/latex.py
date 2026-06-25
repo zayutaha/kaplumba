@@ -16,41 +16,84 @@ _PLAIN_EQ = re.compile(r"(?<![=<>!])=(?![=<>!])")
 
 
 def _split_chain(text: str) -> str:
-    """Split chained equality/implication steps onto separate lines."""
-    lines = text.splitlines()
-    _NL = "  \n"  # markdown line break: two spaces + newline
-    out = []
-    for line in lines:
-        # Check for implication operators first (two or more → chain)
-        imps = list(_CHAIN_OPS.finditer(line))
-        if len(imps) >= 2:
-            rebuilt = line[:imps[0].start()]
-            for i, m in enumerate(imps):
-                start = m.end()
-                end = imps[i + 1].start() if i + 1 < len(imps) else len(line)
-                rebuilt += _NL + m.group(0) + " " + line[start:end].lstrip()
-            line = rebuilt
+    """Split chained equality/implication steps onto separate lines.
+    
+    Each step gets 3-space indent and a blank line between steps.
+    """
+    # Collect all chain operators in the full text
+    ops = []
+    for m in _CHAIN_OPS.finditer(text):
+        ops.append(("⇒", m.start(), m.end()))
+    for m in _PLAIN_EQ.finditer(text):
+        ops.append(("=", m.start(), m.end()))
+    ops.sort(key=lambda x: x[1])
 
-        # Check for plain equals signs (two or more → chain)
-        eqs = list(_PLAIN_EQ.finditer(line))
-        if len(eqs) >= 2:
-            # Don't split if = signs are separated by commas
-            # (variable assignments like "u = sin x, v = ln x")
-            has_comma_between = True
-            for i in range(len(eqs) - 1):
-                between = line[eqs[i].end():eqs[i+1].start()]
-                if "," not in between:
-                    has_comma_between = False
+    if len(ops) < 2:
+        return text
+
+    # Filter: skip equals that are comma-separated
+    filtered = []
+    for i, (op, start, end) in enumerate(ops):
+        if op == "=":
+            prev_seg = ""
+            next_seg = ""
+            for j in range(i - 1, -1, -1):
+                if ops[j][0] == "=":
+                    prev_seg = text[ops[j][2]:start]
                     break
-            if not has_comma_between:
-                parts = _PLAIN_EQ.split(line)
-                rebuilt = parts[0]
-                for p in parts[1:]:
-                    rebuilt += _NL + "= " + p.lstrip()
-                line = rebuilt
+            for j in range(i + 1, len(ops)):
+                if ops[j][0] == "=":
+                    next_seg = text[end:ops[j][1]]
+                    break
+            if (prev_seg and "," in prev_seg) or (next_seg and "," in next_seg):
+                continue
+        filtered.append((op, start, end))
 
-        out.append(line)
-    return "  \n".join(out)
+    if len(filtered) < 2:
+        return text
+
+    # Split into segments at each operator
+    segments = []
+    before = text[:filtered[0][1]].strip()
+    if before:
+        segments.append(before)
+    for i in range(len(filtered)):
+        start = filtered[i][1]
+        end = filtered[i + 1][1] if i + 1 < len(filtered) else len(text)
+        seg = text[start:end].strip()
+        if seg:
+            segments.append(seg)
+
+    # Build result with indent and blank lines
+    result = []
+    for seg in segments:
+        indented = "\n   ".join(seg.split("\n"))
+        result.append("   " + indented)
+    return "  \n\n".join(result)
+
+
+def _stack_fractions(text: str) -> str:
+    """Convert inline fraction markers ⌈num⌋den⌉ to stacked ASCII art."""
+    while True:
+        m = re.search(r"⌈([^⌈⌋]+)⌋([^⌉]+)⌉", text)
+        if not m:
+            break
+        num, den = m.group(1), m.group(2)
+        # If another fraction follows immediately, skip this one (adjacent)
+        rest = text[m.end():]
+        if re.match(r"\s*⌈", rest):
+            # Replace marker with inline fallback so we don't loop forever
+            text = text[:m.start()] + f"{num}/{den}" + text[m.end():]
+            continue
+        width = max(len(num), len(den))
+        num_c = num.center(width)
+        den_c = den.center(width)
+        line = "─" * width
+        prefix = text[:m.start()].split("\n")[-1]
+        indent = " " * (len(prefix) - len(prefix.lstrip()))
+        frac = f"{indent}{num_c}\n{indent}{line}\n{indent}{den_c}"
+        text = text[:m.start()] + "\n" + frac + text[m.end():]
+    return text
 
 
 def parse_latex(text: str) -> str:
@@ -136,6 +179,9 @@ def parse_latex(text: str) -> str:
 
     # Split chained equality/implication steps anywhere in the text
     text = _split_chain(text)
+
+    # Convert inline fraction markers to stacked ASCII art
+    text = _stack_fractions(text)
 
     # Convert newlines before math operators to markdown line breaks
     # (catches steps split across separate $$...$$ blocks)
