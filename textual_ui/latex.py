@@ -18,6 +18,7 @@ _PLAIN_EQ = re.compile(r"(?<![=<>!])=(?![=<>!])")
 def _split_chain(text: str) -> str:
     """Split chained equality/implication steps onto separate lines."""
     lines = text.splitlines()
+    _NL = "  \n"  # markdown line break: two spaces + newline
     out = []
     for line in lines:
         # Check for implication operators first (two or more → chain)
@@ -27,7 +28,7 @@ def _split_chain(text: str) -> str:
             for i, m in enumerate(imps):
                 start = m.end()
                 end = imps[i + 1].start() if i + 1 < len(imps) else len(line)
-                rebuilt += "<br>" + m.group(0) + " " + line[start:end].lstrip()
+                rebuilt += _NL + m.group(0) + " " + line[start:end].lstrip()
             line = rebuilt
 
         # Check for plain equals signs (two or more → chain)
@@ -36,7 +37,7 @@ def _split_chain(text: str) -> str:
             parts = _PLAIN_EQ.split(line)
             rebuilt = parts[0]
             for p in parts[1:]:
-                rebuilt += "<br>= " + p.lstrip()
+                rebuilt += _NL + "= " + p.lstrip()
             line = rebuilt
 
         out.append(line)
