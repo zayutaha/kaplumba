@@ -2,6 +2,21 @@ import re
 
 from latex_parser import parser as latex_parser
 
+# Unicode subscript → normal character mapping
+_UNICODE_SUB_TO_NORMAL = str.maketrans({
+    '\u2080': '0', '\u2081': '1', '\u2082': '2', '\u2083': '3',
+    '\u2084': '4', '\u2085': '5', '\u2086': '6', '\u2087': '7',
+    '\u2088': '8', '\u2089': '9', '\u207A': '+', '\u207B': '-',
+    '\u207C': '=', '\u207D': '(', '\u207E': ')',
+    '\u2090': 'a', '\u2091': 'e', '\u2092': 'o', '\u2093': 'x',
+    '\u2095': 'h', '\u2096': 'k', '\u2097': 'l', '\u2098': 'm',
+    '\u2099': 'n', '\u209A': 'p', '\u209B': 's', '\u209C': 't',
+    '\u1D62': 'i', '\u1D63': 'r', '\u1D64': 'u', '\u1D65': 'v',
+    '\u1D66': 'β', '\u1D67': 'γ', '\u1D68': 'ρ', '\u1D69': 'φ',
+    '\u1D6A': 'χ',
+})
+_SUB_CHARS = re.compile(r'lim[^a-zA-Z⌈]+?(?=\s*[(\[a-zA-Z⌈]|$)')
+
 # Operators that chain equality/implication steps — both LaTeX commands
 # (before parser) and Unicode (after parser)
 _CHAIN_OPS = re.compile(
@@ -15,6 +30,15 @@ _CHAIN_OPS = re.compile(
 _PLAIN_EQ = re.compile(r"(?<![=<>!])=(?![=<>!])")
 
 _MARKER = re.compile(r"⌈([^⌈⌋]+)⌋([^⌉]+)⌉")
+
+
+def _format_limits(text: str) -> str:
+    """Convert lim with Unicode subscripts (limₓ→₀) to inline lim(subscript) notation."""
+    def _replace(m: re.Match) -> str:
+        sub_original = m.group(0)[3:]  # everything after "lim"
+        sub_normal = sub_original.rstrip().translate(_UNICODE_SUB_TO_NORMAL)
+        return f"lim({sub_normal}) "
+    return _SUB_CHARS.sub(_replace, text)
 
 
 def _stack_fractions(text: str) -> str:
@@ -182,6 +206,7 @@ def _parse_with_chain(inner: str) -> str:
     try:
         inner_stripped = inner.strip("\n")
         parsed = latex_parser.parse(inner_stripped)
+        parsed = _format_limits(parsed)
         chained = _split_chain(parsed)
         segments = chained.split("\n\n")
 
@@ -210,6 +235,8 @@ def _parse_with_chain(inner: str) -> str:
             result = "\n" + result
         if not inner.endswith("\n"):
             result = result + "\n"
+        # Center display math in the chat bubble
+        result = "\n[center]\n" + result + "\n[/center]\n"
 
         return result
     except Exception:
@@ -280,6 +307,7 @@ def parse_latex(text: str) -> str:
     def _parse_inline(inner):
         try:
             parsed = latex_parser.parse(inner)
+            parsed = _format_limits(parsed)
             return _stack_fractions(parsed)
         except Exception:
             return inner
@@ -310,11 +338,12 @@ def parse_latex(text: str) -> str:
     text = re.sub(_BS + _CMDS2, _parse_block, text)
 
     # Final pass: if raw LaTeX commands remain, parse and stack fractions
-    if re.search(r"\\[a-z]+(?:\{|\(|\[)", text, re.I):
-        try:
-            text = latex_parser.parse(text)
-        except Exception:
-            pass
+    if "[center]" not in text:
+        if re.search(r"\\[a-z]+(?:\{|\(|\[)", text, re.I):
+            try:
+                text = latex_parser.parse(text)
+            except Exception:
+                pass
     text = _stack_fractions(text)
 
     return text

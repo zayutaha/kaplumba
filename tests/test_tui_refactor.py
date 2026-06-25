@@ -877,9 +877,9 @@ class TestChatUINavigation(unittest.IsolatedAsyncioTestCase):
             r"\frac{dy}{dx} = 2x^2 + 2 \implies \frac{dy}{dx} = x^x"
         )
         lines = result.split("\n")
-        # Each line should start with 3 spaces
+        # Each content line should start with 3 spaces (skip [center]/[/center] markup)
         for line in lines:
-            if line.strip():
+            if line.strip() and not line.strip().startswith("["):
                 self.assertTrue(line.startswith("   "), f"Missing indent: {line!r}")
         # Bar line has = content on same line
         bar_lines = [l for l in lines if "─" in l]
