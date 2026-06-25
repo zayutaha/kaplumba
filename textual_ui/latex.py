@@ -2,6 +2,46 @@ import re
 
 from latex_parser import parser as latex_parser
 
+# Operators that chain equality/implication steps — both LaTeX commands
+# (before parser) and Unicode (after parser)
+_CHAIN_OPS = re.compile(
+    r"(?<!\\)(?:"
+    r"\\implies\b|\\Rightarrow\b|\\Leftrightarrow\b|\\iff\b|\\equiv\b"
+    r"|=>|<=>|⇒|⇔|≡"
+    r")"
+)
+
+# Plain equals sign — only split if there are at least two on the line
+_PLAIN_EQ = re.compile(r"(?<![=<>!])=(?![=<>!])")
+
+
+def _split_chain(text: str) -> str:
+    """Split chained equality/implication steps onto separate lines."""
+    lines = text.splitlines()
+    out = []
+    for line in lines:
+        # Check for implication operators first (two or more → chain)
+        imps = list(_CHAIN_OPS.finditer(line))
+        if len(imps) >= 2:
+            rebuilt = line[:imps[0].start()]
+            for i, m in enumerate(imps):
+                start = m.end()
+                end = imps[i + 1].start() if i + 1 < len(imps) else len(line)
+                rebuilt += "\n" + m.group(0) + " " + line[start:end].lstrip()
+            line = rebuilt
+
+        # Check for plain equals signs (two or more → chain)
+        eqs = _PLAIN_EQ.findall(line)
+        if len(eqs) >= 2:
+            parts = _PLAIN_EQ.split(line)
+            rebuilt = parts[0]
+            for p in parts[1:]:
+                rebuilt += "\n= " + p.lstrip()
+            line = rebuilt
+
+        out.append(line)
+    return "\n".join(out)
+
 
 def parse_latex(text: str) -> str:
     _BS = re.escape('\\')
@@ -10,7 +50,8 @@ def parse_latex(text: str) -> str:
 
     def _parse(inner):
         try:
-            return latex_parser.parse(inner)
+            parsed = latex_parser.parse(inner)
+            return _split_chain(parsed)
         except Exception:
             return inner
 
