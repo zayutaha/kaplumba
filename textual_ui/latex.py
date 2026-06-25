@@ -27,7 +27,7 @@ def _split_chain(text: str) -> str:
             for i, m in enumerate(imps):
                 start = m.end()
                 end = imps[i + 1].start() if i + 1 < len(imps) else len(line)
-                rebuilt += "\n" + m.group(0) + " " + line[start:end].lstrip()
+                rebuilt += "<br>" + m.group(0) + " " + line[start:end].lstrip()
             line = rebuilt
 
         # Check for plain equals signs (two or more → chain)
@@ -36,7 +36,7 @@ def _split_chain(text: str) -> str:
             parts = _PLAIN_EQ.split(line)
             rebuilt = parts[0]
             for p in parts[1:]:
-                rebuilt += "\n= " + p.lstrip()
+                rebuilt += "<br>= " + p.lstrip()
             line = rebuilt
 
         out.append(line)
@@ -49,6 +49,12 @@ def parse_latex(text: str) -> str:
     _RBRACE = '}'
 
     def _parse(inner):
+        try:
+            return latex_parser.parse(inner)
+        except Exception:
+            return inner
+
+    def _parse_with_chain(inner):
         try:
             parsed = latex_parser.parse(inner)
             return _split_chain(parsed)
@@ -78,11 +84,12 @@ def parse_latex(text: str) -> str:
     )
     text = re.sub(
         r'\$\$(.+?)\$\$',
-        lambda m: _parse(m.group(1)),
+        lambda m: _parse_with_chain(m.group(1)),
         text,
         flags=re.DOTALL,
     )
 
+    # Inline $...$: parse but DON'T chain-split (would break inline rendering)
     text = re.sub(r'\$(.+?)\$', lambda m: _parse(m.group(1)), text)
 
     text = re.sub(

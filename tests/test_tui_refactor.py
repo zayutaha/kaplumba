@@ -771,22 +771,18 @@ class TestChatUINavigation(unittest.IsolatedAsyncioTestCase):
         """Chained equality/implication operators are split onto new lines."""
         from textual_ui.latex import _split_chain, format_for_display
 
-        # Chained equals split (3 equals → 4 segments, 3 splits)
+        # Chained equals split (3 equals → 3 <br> splits)
         r = _split_chain("x = 2y = 3z = 4w")
-        self.assertEqual(r.count("\n= "), 3)
+        self.assertEqual(r.count("<br>= "), 3)
         self.assertTrue(r.startswith("x "))
 
-        # Chained \Rightarrow split (2 operators → 3 segments, 2 splits)
+        # Chained \Rightarrow split (2 operators → 2 <br> splits)
         r = _split_chain("a \\Rightarrow b \\Rightarrow c")
-        self.assertEqual(r.count("\n\\Rightarrow"), 2)
+        self.assertEqual(r.count("<br>\\Rightarrow"), 2)
 
-        # Chained ⇒ (Unicode) split (3 operators → 4 segments, 3 splits)
+        # Chained ⇒ (Unicode) split (3 operators → 3 <br> splits)
         r = _split_chain("a ⇒ b ⇒ c ⇒ d")
-        self.assertEqual(r.count("\n⇒"), 3)
-
-        # Single operators NOT split
-        self.assertEqual(_split_chain("x = 5"), "x = 5")
-        self.assertEqual(_split_chain("a ⇒ b"), "a ⇒ b")
+        self.assertEqual(r.count("<br>⇒"), 3)
 
         # Single operators NOT split
         self.assertEqual(_split_chain("x = 5"), "x = 5")
@@ -795,7 +791,7 @@ class TestChatUINavigation(unittest.IsolatedAsyncioTestCase):
         # Integration through format_for_display
         msg = "Let y = x^x \\Rightarrow \\ln(y) = \\ln(x^x)"
         d = format_for_display(msg)
-        self.assertIn("\n", d)
+        self.assertIn("<br>", d)
         self.assertIn("⇒", d)
 
 
