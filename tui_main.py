@@ -24,6 +24,19 @@ class CopyableMarkdown(Markdown):
     """Pass-through markdown."""
 
 
+async def _copy_single(text: str):
+    """Copy a single string to the clipboard via pbcopy."""
+    if not text:
+        return
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            "pbcopy", stdin=asyncio.subprocess.PIPE,
+        )
+        await proc.communicate(input=text.encode())
+    except FileNotFoundError:
+        pass
+
+
 from model_catalog import list_models
 from textual_ui.styles import CHAT_CSS, LOGO, WELCOME_MESSAGES
 
@@ -35,10 +48,12 @@ HELP_TEXT = """\
   [bold]Ctrl+C[/]     Quit
   [bold]Ctrl+R[/]     Reload model
 
+[bold]Copy messages[/]
+  [bold]Ctrl+click[/] any message bubble to copy it
+
 [bold]Copy text[/]
-  [bold]Shift+drag[/]  Select text with mouse (blue highlight)
+  [bold]Shift+drag[/]  Select text with mouse
   [bold]Cmd+C[/]       Copy selected text
-  [bold]Triple-click[/] Select entire message
 
 [bold]Commands[/]
   [bold]/clear[/]      Reset conversation
@@ -304,6 +319,28 @@ class ChatUI(App):
             if isinstance(s, KaplumbebekScreen):
                 await s._reload_history()
                 break
+
+    async def on_click(self, event: Click):
+        help_overlay = self.query_one("#help-overlay")
+        if help_overlay.display:
+            help_overlay.display = False
+            self.query_one("#chat-center").display = True
+            self.query_one("#input-center").display = True
+            return
+        if not event.ctrl:
+            return
+        widget = event.widget
+        while widget is not None:
+            if isinstance(widget, CopyableMarkdown):
+                text = getattr(widget, "_raw_text", None) or widget._markdown or widget._initial_markdown or ""
+                if text:
+                    await _copy_single(text)
+                    widget.add_class("bubble-flash")
+                    self.set_timer(0.2, lambda w=widget: w.remove_class("bubble-flash"))
+                    self.notify("Copied", timeout=2)
+                event.stop()
+                return
+            widget = widget.parent
 
     async def action_interrupt(self):
         await self.controller.handle_interrupt()
