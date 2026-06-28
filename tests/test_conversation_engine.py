@@ -3,6 +3,7 @@ import unittest
 from unittest.mock import MagicMock
 
 from conversation_engine import (
+    _clean_raw_text,
     _detect_thinking_start,
     _has_thinking_end,
     _remove_thinking_blocks,
@@ -237,6 +238,25 @@ class TestGemma4Streaming(unittest.IsolatedAsyncioTestCase):
                 "still thinking", args[0],
                 "Thinking content should not be streamed to chat",
             )
+
+
+class TestCleanRawText(unittest.TestCase):
+
+    def test_strips_info_lines(self):
+        """_clean_raw_text should remove lines starting with [INFO]."""
+        raw = "Hello world\n[INFO] Generation stopped.\nMore text"
+        cleaned = _clean_raw_text(raw)
+        self.assertNotIn("[INFO]", cleaned)
+
+    def test_preserves_normal_lines(self):
+        """_clean_raw_text should keep non-[INFO] lines."""
+        raw = "Hello world\nMore text"
+        cleaned = _clean_raw_text(raw)
+        self.assertEqual(cleaned, "Hello world\nMore text")
+
+    def test_empty_string(self):
+        """_clean_raw_text should handle empty string."""
+        self.assertEqual(_clean_raw_text(""), "")
 
 
 if __name__ == "__main__":
