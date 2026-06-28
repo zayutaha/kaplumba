@@ -426,6 +426,7 @@ def main():
         rprint("- '/memory' to show current GPU memory usage")
         rprint("- '/unload' to offload model (frees GPU memory, preserves KV cache)")
         rprint("- '/mtp' to toggle multi-token prediction on/off")
+        rprint("- '/minichat <message>' to chat in a separate context (toggle with Cmd+L in TUI)")
 
     rprint(f"[INFO] Starting chat session with {args.model}.")
     print_help()
@@ -454,6 +455,11 @@ def main():
 
     message_history: list = []
     _cache_stale = False
+
+    # Mini-chat state (separate conversation context, persistent across session)
+    minichat_history: list = []
+    minichat_cache = None
+    MINICHAT_SYSTEM_PROMPT = "You are a helpful assistant."
 
     # KV cache preservation for /unload
     _saved_cache = []
@@ -661,6 +667,106 @@ def main():
                 except Exception as e:
                     rprint(f"[ERROR] Research failed: {str(e)}")
                     continue
+
+            # Handle /minichat — separate conversation context
+            if query.startswith("/minichat "):
+                mc_query = query[len("/minichat "):].strip()
+
+                if mc_query == "/clear":
+                    minichat_history.clear()
+                    minichat_cache = None
+                    rprint("[INFO] Mini-chat cleared.")
+                    continue
+
+                if not mc_query:
+                    rprint("[ERROR] Usage: /minichat <message>")
+                    continue
+
+                # Determine if this is the first mini-chat turn
+                mc_cache_has_data = False
+                if minichat_cache:
+                    mx.eval(minichat_cache)
+                    for c in minichat_cache:
+                        if hasattr(c, "offset") and c.offset > 0:
+                            mc_cache_has_data = True
+                            break
+
+                mc_is_first = minichat_cache is None or not mc_cache_has_data
+
+                if mc_is_first:
+                    minichat_cache = make_prompt_cache(
+                        model,
+                        args.max_kv_size,
+                        turbo_kv_bits=args.turbo_kv_bits,
+                        turbo_fp16_layers=args.turbo_fp16_layers,
+                    )
+
+                # MTP cache sync
+                if args.mtp and hasattr(model, "mtp_forward"):
+                    num_backbone = len(model.layers)
+                    if len(minichat_cache) == num_backbone:
+                        minichat_cache.extend(model.make_mtp_cache())
+                elif not args.mtp and hasattr(model, "mtp_forward"):
+                    num_backbone = len(model.layers)
+                    if len(minichat_cache) > num_backbone:
+                        minichat_cache = minichat_cache[:num_backbone]
+
+                if mc_is_first:
+                    mc_messages = [
+                        {"role": "system", "content": MINICHAT_SYSTEM_PROMPT},
+                        *minichat_history,
+                        {"role": "user", "content": mc_query},
+                    ]
+                else:
+                    mc_messages = [{"role": "user", "content": mc_query}]
+
+                minichat_history.append({"role": "user", "content": mc_query})
+
+                mc_prompt = tokenizer.apply_chat_template(
+                    mc_messages,
+                    add_generation_prompt=True,
+                    add_special_tokens=mc_is_first,
+                    enable_thinking=False,
+                )
+
+                # Generate mini-chat response
+                _interrupted[0] = False
+                mc_response = ""
+                for resp in stream_generate(
+                    model,
+                    tokenizer,
+                    mc_prompt,
+                    max_tokens=args.max_tokens,
+                    sampler=make_sampler(
+                        args.temp,
+                        args.top_p,
+                        top_k=args.top_k,
+                        xtc_threshold=args.xtc_threshold,
+                        xtc_probability=args.xtc_probability,
+                        xtc_special_tokens=(
+                            tokenizer.encode("\n") + list(tokenizer.eos_token_ids)
+                        ),
+                    ),
+                    prompt_cache=minichat_cache,
+                    turbo_kv_bits=args.turbo_kv_bits,
+                    turbo_fp16_layers=args.turbo_fp16_layers,
+                    kv_bits=args.kv_bits,
+                    kv_group_size=args.kv_group_size,
+                    quantized_kv_start=args.quantized_kv_start,
+                    mtp=args.mtp,
+                    prefill_step_size=args.prefill_step_size,
+                ):
+                    mc_response += resp.text
+                    rprint(resp.text, flush=True, end="")
+                    if _interrupted[0]:
+                        _interrupted[0] = False
+                        break
+
+                if mc_response:
+                    minichat_history.append({"role": "assistant", "content": mc_response})
+
+                rprint()
+                continue
 
             # Handle /unload — free model weights, keep KV cache alive
             if query == "/unload":
