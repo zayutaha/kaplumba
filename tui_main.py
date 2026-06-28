@@ -132,6 +132,7 @@ from textual.widgets._text_area import Selection
 from textual_ui.widgets.chat_input import ChatInput
 from textual_ui.widgets.chat_selector import ChatSelector
 from textual_ui.widgets.loading_spinner import LoadingSpinner
+from textual_ui.widgets.minichat_popup import MiniChatScreen
 from textual_ui.widgets.model_picker import ModelSelector
 from textual_ui.widgets.options_selector import OptionsSelector
 from textual_ui.widgets.personality_selector import PersonalitySelector
@@ -147,6 +148,7 @@ class ChatUI(App):
         ("d", "debug_copy_selected", "Debug Copy"),
         ("ctrl+backslash", "show_help", "Help"),
         ("escape", "close_help", "Close"),
+        ("cmd+l", "toggle_minichat", "Mini Chat"),
     ]
     CSS = CHAT_CSS
 
@@ -429,6 +431,15 @@ class ChatUI(App):
 
     async def action_quit(self):
         await self.controller.handle_quit()
+
+    async def action_toggle_minichat(self):
+        if self.busy or self.loading or not self.controller.port.running:
+            return
+        for s in self.screen_stack:
+            if isinstance(s, MiniChatScreen):
+                self.pop_screen()
+                return
+        self.push_screen(MiniChatScreen())
 
     async def on_key(self, event: Key) -> None:
         if event.key == "enter" and self.crash_dialog_visible:

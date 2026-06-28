@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import json
 from pathlib import Path
+from typing import AsyncIterator
 
 from conversation_engine import run_model_stream
 from model_interface import FakeModelPort, MLXSubprocessAdapter, ModelPort
@@ -29,6 +30,7 @@ class Orchestrator:
         self.max_crashes = 3
         self.reloading = False
         self._stream_task = None
+        self.minichat_history: list[dict] = []
 
     @property
     def current_system_prompt(self) -> str:
@@ -136,6 +138,10 @@ class Orchestrator:
             await run_model_stream(self.chat, self.port, user_text)
         except asyncio.CancelledError:
             pass
+
+    async def send_minichat(self, text: str) -> AsyncIterator[str]:
+        async for chunk in self.port.send_minichat_message(f"/minichat {text}"):
+            yield chunk
 
     async def handle_interrupt(self) -> None:
         if self.chat.busy and self.port:
