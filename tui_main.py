@@ -313,6 +313,12 @@ class ChatUI(App):
         else:
             await self.controller.handle_submit()
 
+    async def refresh_yavru(self):
+        for s in self.screen_stack:
+            if isinstance(s, YavrukaplumbaScreen):
+                await s._reload_history()
+                break
+
     async def on_click(self, event: Click):
         help_overlay = self.query_one("#help-overlay")
         if help_overlay.display:
