@@ -5,7 +5,7 @@ from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
 from textual.events import Click, Key
 from textual.screen import Screen
-from textual.widgets import Static, TextArea
+from textual.widgets import Markdown, Static, TextArea
 
 
 class _YavruInput(TextArea):
@@ -130,12 +130,12 @@ class YavrukaplumbaScreen(Screen):
         self._chat.remove_children()
         for msg in self.app.controller.yavru_history:
             cls = "yv-user" if msg["role"] == "user" else "yv-assistant"
-            await self._chat.mount(Static(msg["content"], classes=cls))
+            await self._chat.mount(Markdown(msg["content"], classes=cls))
         self._chat.scroll_end(animate=False)
 
     async def _add_bubble(self, text: str, role: str):
         cls = "yv-user" if role == "user" else "yv-assistant"
-        bubble = Static(text, classes=cls)
+        bubble = Markdown(text, classes=cls)
         await self._chat.mount(bubble)
         self._chat.scroll_end(animate=False)
         return bubble
