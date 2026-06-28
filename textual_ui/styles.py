@@ -64,11 +64,6 @@ Screen {
     border: round transparent;
 }
 
-.bubble-selected {
-    background: #2a2a2a !important;
-    border: round #f0a500 !important;
-}
-
 .bubble-welcome {
     margin-bottom: 1;
     padding: 0 2;

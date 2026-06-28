@@ -20,80 +20,21 @@ from textual.widgets import Button, Markdown, Static
 from textual import on
 
 
-_selected_bubbles: list["CopyableMarkdown"] = []
-
 class CopyableMarkdown(Markdown):
-    """Pass-through markdown. No click handling — terminal handles text selection natively."""
+    """Pass-through markdown."""
 
 
-async def _copy_selected(app: "ChatUI"):
-    if not _selected_bubbles:
-        await app.show_banner("No bubbles selected — click to select", timeout=2)
+async def _copy_single(text: str):
+    """Copy a single string to the clipboard via pbcopy."""
+    if not text:
         return
-    parts = []
-    for b in _selected_bubbles:
-        t = b._markdown if hasattr(b, '_markdown') and b._markdown else b._initial_markdown or ""
-        if t:
-            parts.append(t)
-    if not parts:
-        return
-    text = "\n\n".join(parts)
     try:
         proc = await asyncio.create_subprocess_exec(
             "pbcopy", stdin=asyncio.subprocess.PIPE,
         )
         await proc.communicate(input=text.encode())
-        if proc.returncode == 0:
-            msg = f"Copied {len(parts)} message{'' if len(parts) == 1 else 's'} to clipboard"
-            await app.show_banner(msg, timeout=2)
-        else:
-            await app.show_banner("Failed to copy", severity="error", timeout=2)
     except FileNotFoundError:
-        await app.show_banner("pbcopy not available", severity="error", timeout=2)
-    # Save scroll Y before DOM mutation, restore after
-    chat_scroll = app.query_one("#chat-center")
-    saved_y = chat_scroll.scroll_y
-    for b in _selected_bubbles:
-        b.remove_class("bubble-selected")
-    _selected_bubbles.clear()
-    app._update_selection_ui()
-    # Schedule scroll restore after render settles
-    app.set_timer(0.0, lambda: chat_scroll.scroll_to(saved_y, animate=False))
-
-
-async def _debug_copy_selected(app: "ChatUI"):
-    """Copy the raw (pre-format_for_display) text of selected bubbles."""
-    if not _selected_bubbles:
-        await app.show_banner("No bubbles selected — click to select", timeout=2)
-        return
-    parts = []
-    for b in _selected_bubbles:
-        raw = getattr(b, "_raw_text", None)
-        if raw:
-            parts.append(raw)
-    if not parts:
-        await app.show_banner("No raw text available for selected bubbles", timeout=2)
-        return
-    text = "\n\n".join(parts)
-    try:
-        proc = await asyncio.create_subprocess_exec(
-            "pbcopy", stdin=asyncio.subprocess.PIPE,
-        )
-        await proc.communicate(input=text.encode())
-        if proc.returncode == 0:
-            msg = f"Debug-copied {len(parts)} message{'' if len(parts) == 1 else 's'} to clipboard"
-            await app.show_banner(msg, timeout=2)
-        else:
-            await app.show_banner("Failed to copy", severity="error", timeout=2)
-    except FileNotFoundError:
-        await app.show_banner("pbcopy not available", severity="error", timeout=2)
-    chat_scroll = app.query_one("#chat-center")
-    saved_y = chat_scroll.scroll_y
-    for b in _selected_bubbles:
-        b.remove_class("bubble-selected")
-    _selected_bubbles.clear()
-    app._update_selection_ui()
-    app.set_timer(0.0, lambda: chat_scroll.scroll_to(saved_y, animate=False))
+        pass
 
 from model_catalog import list_models
 from textual_ui.styles import CHAT_CSS, LOGO, WELCOME_MESSAGES
@@ -107,10 +48,7 @@ HELP_TEXT = """\
   [bold]Ctrl+R[/]     Reload model
 
 [bold]Copy messages[/]
-  Click a bubble to select it
-  [bold]C[/]           Copy all selected messages (formatted)
-  [bold]D[/]           Copy all selected messages (raw/LaTeX)
-  Click again to deselect
+  Click any message bubble to copy it
 
 [bold]Copy text[/]
   [bold]Shift+drag[/]  Select text with mouse
@@ -144,8 +82,6 @@ class ChatUI(App):
     BINDINGS = [
         ("ctrl+c", "quit", "Quit"),
         ("ctrl+r", "reload_model", "Reload Model"),
-        ("c", "copy_selected", "Copy"),
-        ("d", "debug_copy_selected", "Debug Copy"),
         ("ctrl+backslash", "show_help", "Help"),
         ("escape", "close_help", "Close"),
         ("ctrl+o", "toggle_yavru", "Yavru"),
@@ -267,21 +203,6 @@ class ChatUI(App):
         chat = self.query_one("#chat", VerticalScroll)
         for child in list(chat.children):
             await child.remove()
-        _selected_bubbles.clear()
-        self._update_selection_ui()
-
-    def _update_selection_ui(self):
-        btn = self.query_one("#send-btn", Static)
-        n = len(_selected_bubbles)
-        if n:
-            btn.update(f" COPY {n} ")
-            btn.set_class(False, "stopping")
-        elif self.busy:
-            btn.update(" STOP ")
-            btn.set_class(True, "stopping")
-        else:
-            btn.update(" SEND ")
-            btn.set_class(False, "stopping")
 
     async def action_close_help(self):
         box = self.query_one("#help-overlay")
@@ -309,18 +230,6 @@ class ChatUI(App):
             self.query_one("#chat-center").display = True
             self.query_one("#input-center").display = True
         box.display = not box.display
-
-    async def action_copy_selected(self):
-        if not _selected_bubbles:
-            await self.show_banner("Click a bubble to select, then C to copy", timeout=2)
-            return
-        await _copy_selected(self)
-
-    async def action_debug_copy_selected(self):
-        if not _selected_bubbles:
-            await self.show_banner("Click a bubble to select, then D to debug copy", timeout=2)
-            return
-        await _debug_copy_selected(self)
 
     # ── Chat UI internals ──
 
@@ -392,14 +301,14 @@ class ChatUI(App):
         self.busy = busy
         if busy:
             self.query_one("#send-btn", Static).update(" STOP ")
+            self.query_one("#send-btn", Static).set_class(True, "stopping")
         else:
-            self._update_selection_ui()
+            self.query_one("#send-btn", Static).update(" SEND ")
+            self.query_one("#send-btn", Static).set_class(False, "stopping")
 
     @on(Click, "#send-btn")
     async def on_send_click(self):
-        if _selected_bubbles:
-            await _copy_selected(self)
-        elif self.busy:
+        if self.busy:
             await self.controller.handle_interrupt()
         else:
             await self.controller.handle_submit()
@@ -412,19 +321,15 @@ class ChatUI(App):
             self.query_one("#input-center").display = True
             return
         widget = event.widget
-        if isinstance(widget, CopyableMarkdown):
-            text = widget._markdown if hasattr(widget, '_markdown') and widget._markdown else widget._initial_markdown or ""
-            if not text:
+        while widget is not None:
+            if isinstance(widget, CopyableMarkdown):
+                text = widget._markdown if hasattr(widget, '_markdown') and widget._markdown else widget._initial_markdown or ""
+                if text:
+                    await _copy_single(text)
+                    self.notify("Copied", timeout=2)
+                event.stop()
                 return
-            if widget in _selected_bubbles:
-                _selected_bubbles.remove(widget)
-                widget.remove_class("bubble-selected")
-            else:
-                _selected_bubbles.append(widget)
-                widget.add_class("bubble-selected")
-            self._update_selection_ui()
-            asyncio.create_task(self.show_banner("Press C to copy, D to debug copy"))
-            event.stop()
+            widget = widget.parent
 
     async def action_interrupt(self):
         await self.controller.handle_interrupt()

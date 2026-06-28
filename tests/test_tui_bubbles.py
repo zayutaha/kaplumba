@@ -1,72 +1,55 @@
 import asyncio
 import unittest
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 
 class TestCopyableMarkdown(unittest.TestCase):
 
     def test_copyable_markdown_has_no_on_click(self):
-        """CopyableMarkdown should not define on_click (lets terminal handle clicks)."""
+        """CopyableMarkdown should not override on_click (relies on ChatUI.on_click)."""
         import tui_main
         import inspect
         src = inspect.getsource(tui_main.CopyableMarkdown)
-        self.assertNotIn("on_click", src,
-                         "CopyableMarkdown should not override on_click")
+        self.assertNotIn("on_click", src)
 
-    def test_chatui_has_on_click_for_select_mode(self):
-        """ChatUI.on_click should handle bubble selection in select mode."""
+    def test_copy_single_calls_pbcopy(self):
+        """_copy_single should pipe text to pbcopy."""
         import tui_main
-        import inspect
-        src = inspect.getsource(tui_main.ChatUI.on_click)
-        self.assertIn("select_mode", src)
-
-    def test_copy_selected_empty_does_nothing(self):
-        """_copy_selected with no selections should notify and not run pbcopy."""
-        import tui_main
-        tui_main._selected_bubbles.clear()
-        app = MagicMock()
-        app.notify = MagicMock()
-
         async def run():
-            await tui_main._copy_selected(app)
+            await tui_main._copy_single("Hello world")
+
+        with patch.object(asyncio, "create_subprocess_exec") as mock_pbcopy:
+            asyncio.run(run())
+
+        mock_pbcopy.assert_called_once()
+
+    def test_copy_single_empty_does_nothing(self):
+        """_copy_single with empty string should not call pbcopy."""
+        import tui_main
+        async def run():
+            await tui_main._copy_single("")
 
         with patch.object(asyncio, "create_subprocess_exec") as mock_pbcopy:
             asyncio.run(run())
 
         mock_pbcopy.assert_not_called()
-        app.notify.assert_called_once()
 
-    def test_copy_selected_joins_messages(self):
-        """_copy_selected should join multiple selections with double newlines."""
+    def test_chatui_on_click_walks_widget_tree(self):
+        """ChatUI.on_click should walk up to find CopyableMarkdown ancestor."""
         import tui_main
-        tui_main._selected_bubbles.clear()
+        import inspect
+        src = inspect.getsource(tui_main.ChatUI.on_click)
+        # Should walk parent chain (not just check event.widget directly)
+        self.assertIn("parent", src,
+                      "on_click should walk up widget tree for CopyableMarkdown")
 
-        class FakeBubble:
-            def __init__(self, text):
-                self._markdown = text
-                self._initial_markdown = None
-            def remove_class(self, name):
-                pass
-
-        b1 = FakeBubble("First message")
-        b2 = FakeBubble("Second message")
-        tui_main._selected_bubbles.extend([b1, b2])
-
-        app = MagicMock()
-        app.notify = MagicMock()
-
-        async def fake_pbcopy(*args, **kwargs):
-            class Proc:
-                returncode = 0
-                async def communicate(self, input=b""):
-                    pass
-            return Proc()
-
-        with patch.object(asyncio, "create_subprocess_exec", side_effect=fake_pbcopy) as m:
-            asyncio.run(tui_main._copy_selected(app))
-
-        m.assert_called_once()
-        self.assertEqual(len(tui_main._selected_bubbles), 0)
+    def test_chatui_on_click_notifies(self):
+        """ChatUI.on_click should call notify when copying."""
+        import tui_main
+        import inspect
+        src = inspect.getsource(tui_main.ChatUI.on_click)
+        self.assertIn("notify", src,
+                      "on_click should notify user on copy")
 
 
 if __name__ == "__main__":
