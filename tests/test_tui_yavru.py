@@ -75,20 +75,20 @@ class TestYavru(unittest.IsolatedAsyncioTestCase):
                 "YavrukaplumbaScreen should be popped after second Ctrl+O",
             )
 
-    async def test_escape_closes_yavru_screen(self):
-        """Escape should close the YavrukaplumbaScreen."""
+    async def test_escape_does_nothing_on_yavru(self):
+        """Escape should have no effect on YavrukaplumbaScreen."""
         app = ChatUI(port=StubPort())
         async with app.run_test() as pilot:
             await pilot.press("ctrl+o")
             await pilot.pause()
 
+            from textual_ui.widgets.yavrukaplumba_popup import YavrukaplumbaScreen
             await pilot.press("escape")
             await pilot.pause()
 
-            from textual_ui.widgets.yavrukaplumba_popup import YavrukaplumbaScreen
-            self.assertFalse(
+            self.assertTrue(
                 any(isinstance(s, YavrukaplumbaScreen) for s in app.screen_stack),
-                "YavrukaplumbaScreen should be popped after Escape",
+                "Escape should not close Yavru screen",
             )
 
     async def test_yavru_not_opened_when_busy(self):
@@ -146,7 +146,8 @@ class TestYavru(unittest.IsolatedAsyncioTestCase):
             await pilot.press("enter")
             await pilot.pause()
 
-            await pilot.press("escape")
+            # Close via Ctrl+O (Escape does nothing on yavru)
+            await pilot.press("ctrl+o")
             await pilot.pause()
 
             await pilot.press("ctrl+o")
@@ -158,8 +159,8 @@ class TestYavru(unittest.IsolatedAsyncioTestCase):
             self.assertGreaterEqual(len(children), 2,
                                     "History should be restored on re-open")
 
-    async def test_escape_interrupts_streaming(self):
-        """Escape during streaming should call interrupt on the port."""
+    async def test_escape_does_nothing_during_stream(self):
+        """Escape should not interrupt or close yavru during streaming."""
         app = ChatUI(port=StubPort())
         async with app.run_test() as pilot:
             await pilot.press("ctrl+o")
@@ -167,31 +168,18 @@ class TestYavru(unittest.IsolatedAsyncioTestCase):
 
             from textual_ui.widgets.yavrukaplumba_popup import YavrukaplumbaScreen
             screen = next(s for s in app.screen_stack if isinstance(s, YavrukaplumbaScreen))
-
             screen._streaming = True
             await pilot.press("escape")
             await pilot.pause()
 
             port = app.controller.port
-            self.assertTrue(port._interrupted,
-                            "Port interrupt should be called on Escape during streaming")
-            self.assertFalse(screen._streaming,
-                             "_streaming should be False after Escape")
-
-    async def test_escape_when_idle_does_not_interrupt(self):
-        """Escape when not streaming should pop screen, not interrupt."""
-        app = ChatUI(port=StubPort())
-        async with app.run_test() as pilot:
-            await pilot.press("ctrl+o")
-            await pilot.pause()
-
-            await pilot.press("escape")
-            await pilot.pause()
-
-            from textual_ui.widgets.yavrukaplumba_popup import YavrukaplumbaScreen
-            self.assertFalse(
+            self.assertFalse(port._interrupted,
+                             "Escape should not interrupt during stream")
+            self.assertTrue(screen._streaming,
+                            "_streaming should remain True after Escape")
+            self.assertTrue(
                 any(isinstance(s, YavrukaplumbaScreen) for s in app.screen_stack),
-                "Screen should close on Escape when idle",
+                "Escape should not close yavru during stream",
             )
 
     async def test_send_button_toggles_to_stop_during_stream(self):

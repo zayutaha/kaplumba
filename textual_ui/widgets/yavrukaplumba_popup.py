@@ -140,13 +140,6 @@ class YavrukaplumbaScreen(Screen):
         self._chat.scroll_end(animate=False)
         return bubble
 
-    def key_escape(self) -> None:
-        if self._streaming:
-            self._streaming = False
-            asyncio.create_task(self._interrupt_stream())
-        elif len(self.app.screen_stack) > 1:
-            self.app.pop_screen()
-
     async def _interrupt_stream(self):
         try:
             await self.app.controller.port.interrupt()

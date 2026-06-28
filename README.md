@@ -61,6 +61,7 @@ Speculative decoding that generates 2–3 tokens per forward pass instead of 1. 
 | `/memory` | Show GPU cache / peak memory |
 | `/unload` | Offload model from GPU (preserves KV cache, conversation continues on next prompt) |
 | `/mtp` | Toggle multi-token prediction on/off |
+| `/yavru <message>` | Chat in a separate context (toggle popup with `Ctrl+O`) |
 
 ### Personality System
 Configurable system prompts that persist per-model in `.kaplumba/model_configs.json`. Bundled personalities: default (direct, honest ally), historian (gritty narrative style). Switch mid-session with `/personality` or the menu.
@@ -73,6 +74,9 @@ Detects and strips Qwen `<think>...</think>` and Gemma `<|channel>...<channel|>`
 
 ### LaTeX Rendering
 Model output is processed through a comprehensive LaTeX→Unicode converter covering Greek, math operators, fractions, integrals, matrices, cases, fonts, accents — rendered inline in the terminal.
+
+### Yavrukaplumba (Mini Chat)
+A popup chat sidebar toggled with `Ctrl+O` that maintains a **completely separate conversation context** from the main chat. Ask off-topic questions, test prompts, or explore ideas without polluting your main conversation history. Uses the same loaded model — no reload needed. Has its own KV cache, system prompt (`"You are a helpful assistant"`), and persistent history across the session.
 
 ### Web Search
 `/search` generates 3 search queries from the model, searches DuckDuckGo, scrapes 3 relevant pages, and injects content into context for a concise answer.
@@ -96,6 +100,7 @@ Click any message bubble to select it (orange highlight), then press **`C`** to 
 | `C` | Copy selected messages (formatted) |
 | `D` | Copy selected messages (raw/LaTeX source) |
 | `Ctrl+\` or `/help` | Help overlay |
+| `Ctrl+O` | Yavrukaplumba (mini chat popup) |
 | `Esc` | Close overlay |
 
 ---
@@ -152,7 +157,8 @@ Per-model config at `.kaplumba/model_configs.json`:
 │       ├── chat_selector.py
 │       ├── loading_spinner.py
 │       ├── slash_command_menu.py
-│       └── model_config_editor.py
+│       ├── model_config_editor.py
+│       └── yavrukaplumba_popup.py
 ├── orchestrator.py             # UI ↔ model coordination
 ├── model_lifecycle.py          # Subprocess model runner
 ├── model_interface.py          # Async IPC protocol
