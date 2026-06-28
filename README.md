@@ -87,7 +87,7 @@ A popup chat sidebar toggled with `Ctrl+O` that maintains a **completely separat
 Kaplumba runs the model in an **isolated subprocess** with its own stdin/stdout protocol. If the model crashes (transient OOM, segfault, or cosmic ray), the UI stays up. It auto-retries loading **3 times** before showing a dialog. You can switch models without restarting the app. SIGINT is relayed reliably for clean interruption. Think of it as a bulletproof vest for your inference engine.
 
 ### Message Selection & Copy
-**Ctrl+click** any message bubble to instantly copy its text to the clipboard. A brief gold flash confirms the copy.
+**Ctrl+click** any message bubble to instantly copy its text. **Ctrl+Shift+click** copies the raw unformatted text (LaTeX source). A brief gold flash confirms the copy.
 
 ### Keyboard Shortcuts
 

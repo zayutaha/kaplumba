@@ -205,11 +205,16 @@ class KaplumbebekScreen(Screen):
         while widget is not None:
             if isinstance(widget, Markdown):
                 text = getattr(widget, "_markdown", "") or ""
+                if event.shift:
+                    text = getattr(widget, "_raw_text", "") or text
+                    label = "Raw copied"
+                else:
+                    label = "Copied"
                 if text:
                     await self._copy_text(text)
                     widget.add_class("kb-flash")
                     self.set_timer(0.2, lambda w=widget: w.remove_class("kb-flash"))
-                    self.app.notify("Copied", timeout=2)
+                    self.app.notify(label, timeout=2)
                 event.stop()
                 return
             widget = widget.parent

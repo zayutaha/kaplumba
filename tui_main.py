@@ -50,6 +50,7 @@ HELP_TEXT = """\
 
 [bold]Copy messages[/]
   [bold]Ctrl+click[/] any message bubble to copy it
+  [bold]Ctrl+Shift+click[/] copy raw text (LaTeX source, pre-formatting)
 
 [bold]Copy text[/]
   [bold]Shift+drag[/]  Select text with mouse
@@ -332,12 +333,17 @@ class ChatUI(App):
         widget = event.widget
         while widget is not None:
             if isinstance(widget, CopyableMarkdown):
-                text = getattr(widget, "_raw_text", None) or widget._markdown or widget._initial_markdown or ""
+                if event.shift:
+                    text = getattr(widget, "_raw_text", None) or ""
+                    label = "Raw copied"
+                else:
+                    text = widget._markdown or widget._initial_markdown or ""
+                    label = "Copied"
                 if text:
                     await _copy_single(text)
                     widget.add_class("bubble-flash")
                     self.set_timer(0.2, lambda w=widget: w.remove_class("bubble-flash"))
-                    self.notify("Copied", timeout=2)
+                    self.notify(label, timeout=2)
                 event.stop()
                 return
             widget = widget.parent
