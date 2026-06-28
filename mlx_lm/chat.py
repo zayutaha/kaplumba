@@ -426,7 +426,7 @@ def main():
         rprint("- '/memory' to show current GPU memory usage")
         rprint("- '/unload' to offload model (frees GPU memory, preserves KV cache)")
         rprint("- '/mtp' to toggle multi-token prediction on/off")
-        rprint("- '/yavru <message>' to chat in a separate context (toggle with Cmd+L in TUI)")
+        rprint("- '/kaplumbebek <message>' to chat in a separate context (toggle with Ctrl+O in TUI)")
 
     rprint(f"[INFO] Starting chat session with {args.model}.")
     print_help()
@@ -456,10 +456,10 @@ def main():
     message_history: list = []
     _cache_stale = False
 
-    # Yavru state (separate conversation context, persistent across session)
-    yavru_history: list = []
-    yavru_cache = None
-    YAVRU_SYSTEM_PROMPT = "You are a helpful assistant."
+    # Kaplumbebek state (separate conversation context, persistent across session)
+    kaplumbebek_history: list = []
+    kaplumbebek_cache = None
+    KAPLUMBEBEK_SYSTEM_PROMPT = "You are a helpful assistant."
 
     # KV cache preservation for /unload
     _saved_cache = []
@@ -529,8 +529,8 @@ def main():
                     turbo_fp16_layers=args.turbo_fp16_layers,
                 )
                 message_history.clear()
-                yavru_history.clear()
-                yavru_cache = None
+                kaplumbebek_history.clear()
+                kaplumbebek_cache = None
                 rprint("[INFO] Conversation cleared.")
                 continue
             if query == "h":
@@ -670,33 +670,33 @@ def main():
                     rprint(f"[ERROR] Research failed: {str(e)}")
                     continue
 
-            # Handle /yavru — separate conversation context
-            if query.startswith("/yavru "):
-                yv_query = query[len("/yavru "):].strip()
+            # Handle /kaplumbebek — separate conversation context
+            if query.startswith("/kaplumbebek "):
+                kb_query = query[len("/kaplumbebek "):].strip()
 
-                if yv_query == "/clear":
-                    yavru_history.clear()
-                    yavru_cache = None
-                    rprint("[INFO] Yavru cleared.")
+                if kb_query == "/clear":
+                    kaplumbebek_history.clear()
+                    kaplumbebek_cache = None
+                    rprint("[INFO] Kaplumbebek cleared.")
                     continue
 
-                if not yv_query:
-                    rprint("[ERROR] Usage: /yavru <message>")
+                if not kb_query:
+                    rprint("[ERROR] Usage: /kaplumbebek <message>")
                     continue
 
                 # Determine if this is the first mini-chat turn
-                yv_cache_has_data = False
-                if yavru_cache:
-                    mx.eval(yavru_cache)
-                    for c in yavru_cache:
+                kb_cache_has_data = False
+                if kaplumbebek_cache:
+                    mx.eval(kaplumbebek_cache)
+                    for c in kaplumbebek_cache:
                         if hasattr(c, "offset") and c.offset > 0:
-                            yv_cache_has_data = True
+                            kb_cache_has_data = True
                             break
 
-                yv_is_first = yavru_cache is None or not yv_cache_has_data
+                kb_is_first = kaplumbebek_cache is None or not kb_cache_has_data
 
-                if yv_is_first:
-                    yavru_cache = make_prompt_cache(
+                if kb_is_first:
+                    kaplumbebek_cache = make_prompt_cache(
                         model,
                         args.max_kv_size,
                         turbo_kv_bits=args.turbo_kv_bits,
@@ -706,38 +706,38 @@ def main():
                 # MTP cache sync
                 if args.mtp and hasattr(model, "mtp_forward"):
                     num_backbone = len(model.layers)
-                    if len(yavru_cache) == num_backbone:
-                        yavru_cache.extend(model.make_mtp_cache())
+                    if len(kaplumbebek_cache) == num_backbone:
+                        kaplumbebek_cache.extend(model.make_mtp_cache())
                 elif not args.mtp and hasattr(model, "mtp_forward"):
                     num_backbone = len(model.layers)
-                    if len(yavru_cache) > num_backbone:
-                        yavru_cache = yavru_cache[:num_backbone]
+                    if len(kaplumbebek_cache) > num_backbone:
+                        kaplumbebek_cache = kaplumbebek_cache[:num_backbone]
 
-                if yv_is_first:
-                    yv_messages = [
-                        {"role": "system", "content": YAVRU_SYSTEM_PROMPT},
-                        *yavru_history,
-                        {"role": "user", "content": yv_query},
+                if kb_is_first:
+                    kb_messages = [
+                        {"role": "system", "content": KAPLUMBEBEK_SYSTEM_PROMPT},
+                        *kaplumbebek_history,
+                        {"role": "user", "content": kb_query},
                     ]
                 else:
-                    yv_messages = [{"role": "user", "content": yv_query}]
+                    kb_messages = [{"role": "user", "content": kb_query}]
 
-                yavru_history.append({"role": "user", "content": yv_query})
+                kaplumbebek_history.append({"role": "user", "content": kb_query})
 
-                yv_prompt = tokenizer.apply_chat_template(
-                    yv_messages,
+                kb_prompt = tokenizer.apply_chat_template(
+                    kb_messages,
                     add_generation_prompt=True,
-                    add_special_tokens=yv_is_first,
+                    add_special_tokens=kb_is_first,
                     enable_thinking=False,
                 )
 
                 # Generate mini-chat response
                 _interrupted[0] = False
-                yv_response = ""
+                kb_response = ""
                 for resp in stream_generate(
                     model,
                     tokenizer,
-                    yv_prompt,
+                    kb_prompt,
                     max_tokens=args.max_tokens,
                     sampler=make_sampler(
                         args.temp,
@@ -749,7 +749,7 @@ def main():
                             tokenizer.encode("\n") + list(tokenizer.eos_token_ids)
                         ),
                     ),
-                    prompt_cache=yavru_cache,
+                    prompt_cache=kaplumbebek_cache,
                     turbo_kv_bits=args.turbo_kv_bits,
                     turbo_fp16_layers=args.turbo_fp16_layers,
                     kv_bits=args.kv_bits,
@@ -758,14 +758,14 @@ def main():
                     mtp=args.mtp,
                     prefill_step_size=args.prefill_step_size,
                 ):
-                    yv_response += resp.text
+                    kb_response += resp.text
                     rprint(resp.text, flush=True, end="")
                     if _interrupted[0]:
                         _interrupted[0] = False
                         break
 
-                if yv_response:
-                    yavru_history.append({"role": "assistant", "content": yv_response})
+                if kb_response:
+                    kaplumbebek_history.append({"role": "assistant", "content": kb_response})
 
                 rprint()
                 continue

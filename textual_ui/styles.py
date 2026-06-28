@@ -64,11 +64,6 @@ Screen {
     border: round transparent;
 }
 
-.bubble-flash {
-    background: #3a3a1a !important;
-    border: round #f0a500 !important;
-}
-
 .bubble-welcome {
     margin-bottom: 1;
     padding: 0 2;

@@ -30,7 +30,7 @@ class Orchestrator:
         self.max_crashes = 3
         self.reloading = False
         self._stream_task = None
-        self.yavru_history: list[dict] = []
+        self.kaplumbebek_history: list[dict] = []
 
     @property
     def current_system_prompt(self) -> str:
@@ -63,17 +63,17 @@ class Orchestrator:
             await self.chat.show_personality_selector()
             return
 
-        if user_text.startswith("/yavru"):
-            await self.chat.show_banner("Use Ctrl+O to open Yavrukaplumba", timeout=2)
+        if user_text.startswith("/kaplumbebek"):
+            await self.chat.show_banner("Use Ctrl+O to open Kaplumbebek", timeout=2)
             return
 
         if self.chat.busy or self.chat.loading or not self.port.running:
             return
 
         if user_text == "/clear":
-            self.yavru_history.clear()
+            self.kaplumbebek_history.clear()
             await self.chat.reset_chat()
-            await self.chat.refresh_yavru()
+            await self.chat.refresh_kaplumbebek()
             if self.port.running:
                 try:
                     await self.port.send_command("/clear")
@@ -145,8 +145,8 @@ class Orchestrator:
         except asyncio.CancelledError:
             pass
 
-    async def send_yavru(self, text: str) -> AsyncIterator[str]:
-        async for chunk in self.port.send_yavru_message(f"/yavru {text}"):
+    async def send_kaplumbebek(self, text: str) -> AsyncIterator[str]:
+        async for chunk in self.port.send_kaplumbebek_message(f"/kaplumbebek {text}"):
             yield chunk
 
     async def handle_interrupt(self) -> None:

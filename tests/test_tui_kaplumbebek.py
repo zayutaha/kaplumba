@@ -19,8 +19,8 @@ class StubPort:
         return
         yield
 
-    async def send_yavru_message(self, text: str) -> AsyncIterator[str]:
-        for chunk in ["Hello", " from", " yavru", " chat"]:
+    async def send_kaplumbebek_message(self, text: str) -> AsyncIterator[str]:
+        for chunk in ["Hello", " from", " kaplumbebek", " chat"]:
             if self._interrupted:
                 break
             await asyncio.sleep(0.03)
@@ -36,10 +36,10 @@ class StubPort:
         self.running = False
 
 
-class TestYavru(unittest.IsolatedAsyncioTestCase):
+class TestKaplumbebek(unittest.IsolatedAsyncioTestCase):
 
-    async def test_ctrl_o_opens_yavru_screen(self):
-        """Ctrl+O should push YavrukaplumbaScreen when model is idle."""
+    async def test_ctrl_o_opens_kaplumbebek_screen(self):
+        """Ctrl+O should push KaplumbebekScreen when model is idle."""
         app = ChatUI(port=StubPort())
         async with app.run_test() as pilot:
             self.assertFalse(
@@ -49,49 +49,49 @@ class TestYavru(unittest.IsolatedAsyncioTestCase):
             await pilot.press("ctrl+o")
             await pilot.pause()
 
-            from textual_ui.widgets.yavrukaplumba_popup import YavrukaplumbaScreen
+            from textual_ui.widgets.kaplumbebek_popup import KaplumbebekScreen
             self.assertTrue(
-                any(isinstance(s, YavrukaplumbaScreen) for s in app.screen_stack),
-                "YavrukaplumbaScreen should be pushed after Ctrl+O",
+                any(isinstance(s, KaplumbebekScreen) for s in app.screen_stack),
+                "KaplumbebekScreen should be pushed after Ctrl+O",
             )
 
-    async def test_ctrl_o_closes_yavru_screen(self):
-        """Ctrl+O should pop YavrukaplumbaScreen when already open."""
+    async def test_ctrl_o_closes_kaplumbebek_screen(self):
+        """Ctrl+O should pop KaplumbebekScreen when already open."""
         app = ChatUI(port=StubPort())
         async with app.run_test() as pilot:
             await pilot.press("ctrl+o")
             await pilot.pause()
 
-            from textual_ui.widgets.yavrukaplumba_popup import YavrukaplumbaScreen
+            from textual_ui.widgets.kaplumbebek_popup import KaplumbebekScreen
             self.assertTrue(
-                any(isinstance(s, YavrukaplumbaScreen) for s in app.screen_stack)
+                any(isinstance(s, KaplumbebekScreen) for s in app.screen_stack)
             )
 
             await pilot.press("ctrl+o")
             await pilot.pause()
 
             self.assertFalse(
-                any(isinstance(s, YavrukaplumbaScreen) for s in app.screen_stack),
-                "YavrukaplumbaScreen should be popped after second Ctrl+O",
+                any(isinstance(s, KaplumbebekScreen) for s in app.screen_stack),
+                "KaplumbebekScreen should be popped after second Ctrl+O",
             )
 
-    async def test_escape_does_nothing_on_yavru(self):
-        """Escape should have no effect on YavrukaplumbaScreen."""
+    async def test_escape_does_nothing_on_kaplumbebek(self):
+        """Escape should have no effect on KaplumbebekScreen."""
         app = ChatUI(port=StubPort())
         async with app.run_test() as pilot:
             await pilot.press("ctrl+o")
             await pilot.pause()
 
-            from textual_ui.widgets.yavrukaplumba_popup import YavrukaplumbaScreen
+            from textual_ui.widgets.kaplumbebek_popup import KaplumbebekScreen
             await pilot.press("escape")
             await pilot.pause()
 
             self.assertTrue(
-                any(isinstance(s, YavrukaplumbaScreen) for s in app.screen_stack),
-                "Escape should not close Yavru screen",
+                any(isinstance(s, KaplumbebekScreen) for s in app.screen_stack),
+                "Escape should not close Kaplumbebek screen",
             )
 
-    async def test_yavru_not_opened_when_busy(self):
+    async def test_kaplumbebek_not_opened_when_busy(self):
         """Ctrl+O should do nothing when model is busy generating."""
         app = ChatUI(port=StubPort())
         async with app.run_test() as pilot:
@@ -99,75 +99,75 @@ class TestYavru(unittest.IsolatedAsyncioTestCase):
             await pilot.press("ctrl+o")
             await pilot.pause()
 
-            from textual_ui.widgets.yavrukaplumba_popup import YavrukaplumbaScreen
+            from textual_ui.widgets.kaplumbebek_popup import KaplumbebekScreen
             self.assertFalse(
-                any(isinstance(s, YavrukaplumbaScreen) for s in app.screen_stack),
-                "YavrukaplumbaScreen should not open when busy",
+                any(isinstance(s, KaplumbebekScreen) for s in app.screen_stack),
+                "KaplumbebekScreen should not open when busy",
             )
 
-    async def test_yavru_sends_message_and_shows_bubbles(self):
-        """Sending a message in yavru should show user + assistant bubbles."""
+    async def test_kaplumbebek_sends_message_and_shows_bubbles(self):
+        """Sending a message in kaplumbebek should show user + assistant bubbles."""
         app = ChatUI(port=StubPort())
         async with app.run_test() as pilot:
             await pilot.press("ctrl+o")
             await pilot.pause()
 
-            from textual_ui.widgets.yavrukaplumba_popup import YavrukaplumbaScreen
-            screen = next(s for s in app.screen_stack if isinstance(s, YavrukaplumbaScreen))
+            from textual_ui.widgets.kaplumbebek_popup import KaplumbebekScreen
+            screen = next(s for s in app.screen_stack if isinstance(s, KaplumbebekScreen))
 
-            input_widget = screen.query_one("#yavru-input")
+            input_widget = screen.query_one("#kb-input")
             input_widget.text = "Hello!"
             await pilot.pause()
 
             await pilot.press("enter")
             await pilot.pause()
 
-            chat_area = screen.query_one("#yavru-chat")
+            chat_area = screen.query_one("#kb-chat")
             children = list(chat_area.children)
-            user_bubbles = [c for c in children if "yv-user" in c.classes]
-            assistant_bubbles = [c for c in children if "yv-assistant" in c.classes]
+            user_bubbles = [c for c in children if "kb-user" in c.classes]
+            assistant_bubbles = [c for c in children if "kb-assistant" in c.classes]
             self.assertEqual(len(user_bubbles), 1)
             self.assertGreaterEqual(len(assistant_bubbles), 1)
 
-            self.assertEqual(len(app.controller.yavru_history), 2)
+            self.assertEqual(len(app.controller.kaplumbebek_history), 2)
 
-    async def test_yavru_history_persists_across_close_reopen(self):
-        """Yavru history should survive closing and re-opening the popup."""
+    async def test_kaplumbebek_history_persists_across_close_reopen(self):
+        """Kaplumbebek history should survive closing and re-opening the popup."""
         app = ChatUI(port=StubPort())
         async with app.run_test() as pilot:
             await pilot.press("ctrl+o")
             await pilot.pause()
 
-            from textual_ui.widgets.yavrukaplumba_popup import YavrukaplumbaScreen
-            screen = next(s for s in app.screen_stack if isinstance(s, YavrukaplumbaScreen))
-            input_widget = screen.query_one("#yavru-input")
+            from textual_ui.widgets.kaplumbebek_popup import KaplumbebekScreen
+            screen = next(s for s in app.screen_stack if isinstance(s, KaplumbebekScreen))
+            input_widget = screen.query_one("#kb-input")
             input_widget.text = "Persist me"
             await pilot.pause()
             await pilot.press("enter")
             await pilot.pause()
 
-            # Close via Ctrl+O (Escape does nothing on yavru)
+            # Close via Ctrl+O (Escape does nothing on kaplumbebek)
             await pilot.press("ctrl+o")
             await pilot.pause()
 
             await pilot.press("ctrl+o")
             await pilot.pause()
 
-            screen = next(s for s in app.screen_stack if isinstance(s, YavrukaplumbaScreen))
-            chat_area = screen.query_one("#yavru-chat")
+            screen = next(s for s in app.screen_stack if isinstance(s, KaplumbebekScreen))
+            chat_area = screen.query_one("#kb-chat")
             children = list(chat_area.children)
             self.assertGreaterEqual(len(children), 2,
                                     "History should be restored on re-open")
 
     async def test_escape_does_nothing_during_stream(self):
-        """Escape should not interrupt or close yavru during streaming."""
+        """Escape should not interrupt or close kaplumbebek during streaming."""
         app = ChatUI(port=StubPort())
         async with app.run_test() as pilot:
             await pilot.press("ctrl+o")
             await pilot.pause()
 
-            from textual_ui.widgets.yavrukaplumba_popup import YavrukaplumbaScreen
-            screen = next(s for s in app.screen_stack if isinstance(s, YavrukaplumbaScreen))
+            from textual_ui.widgets.kaplumbebek_popup import KaplumbebekScreen
+            screen = next(s for s in app.screen_stack if isinstance(s, KaplumbebekScreen))
             screen._streaming = True
             await pilot.press("escape")
             await pilot.pause()
@@ -178,8 +178,8 @@ class TestYavru(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(screen._streaming,
                             "_streaming should remain True after Escape")
             self.assertTrue(
-                any(isinstance(s, YavrukaplumbaScreen) for s in app.screen_stack),
-                "Escape should not close yavru during stream",
+                any(isinstance(s, KaplumbebekScreen) for s in app.screen_stack),
+                "Escape should not close kaplumbebek during stream",
             )
 
     async def test_send_button_toggles_to_stop_during_stream(self):
@@ -189,9 +189,9 @@ class TestYavru(unittest.IsolatedAsyncioTestCase):
             await pilot.press("ctrl+o")
             await pilot.pause()
 
-            from textual_ui.widgets.yavrukaplumba_popup import YavrukaplumbaScreen
-            screen = next(s for s in app.screen_stack if isinstance(s, YavrukaplumbaScreen))
-            btn = screen.query_one("#yv-send-btn", Static)
+            from textual_ui.widgets.kaplumbebek_popup import KaplumbebekScreen
+            screen = next(s for s in app.screen_stack if isinstance(s, KaplumbebekScreen))
+            btn = screen.query_one("#kb-send-btn", Static)
             self.assertIn("SEND", str(btn.render()))
 
             screen._streaming = True
@@ -211,27 +211,27 @@ class TestYavru(unittest.IsolatedAsyncioTestCase):
             await pilot.press("ctrl+o")
             await pilot.pause()
 
-            from textual_ui.widgets.yavrukaplumba_popup import YavrukaplumbaScreen
-            screen = next(s for s in app.screen_stack if isinstance(s, YavrukaplumbaScreen))
+            from textual_ui.widgets.kaplumbebek_popup import KaplumbebekScreen
+            screen = next(s for s in app.screen_stack if isinstance(s, KaplumbebekScreen))
             screen._streaming = True
             screen._update_send_btn()
 
-            await pilot.click("#yv-send-btn")
+            await pilot.click("#kb-send-btn")
             await pilot.pause()
 
             port = app.controller.port
             self.assertTrue(port._interrupted,
                             "Clicking STOP should interrupt the port")
 
-    async def test_yavru_blocked_in_main_chat(self):
-        """Orchestrator.handle_submit should reject /yavru before sending to model."""
+    async def test_kaplumbebek_blocked_in_main_chat(self):
+        """Orchestrator.handle_submit should reject /kaplumbebek before sending to model."""
         import inspect
         import orchestrator
         src = inspect.getsource(orchestrator.Orchestrator.handle_submit)
-        self.assertIn("/yavru", src,
-                       "handle_submit should check for /yavru")
+        self.assertIn("/kaplumbebek", src,
+                       "handle_submit should check for /kaplumbebek")
         # It should return early, not fall through to send_message
         send_idx = src.find("send_message")
-        yavru_idx = src.find("/yavru")
-        self.assertLess(yavru_idx, send_idx if send_idx > 0 else len(src),
-                        "/yavru check should come before send_message")
+        kaplumbebek_idx = src.find("/kaplumbebek")
+        self.assertLess(kaplumbebek_idx, send_idx if send_idx > 0 else len(src),
+                        "/kaplumbebek check should come before send_message")

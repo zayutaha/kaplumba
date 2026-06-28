@@ -74,7 +74,7 @@ Detects and strips Qwen `<think>...</think>` and Gemma `<|channel>...<channel|>`
 ### LaTeX Rendering
 Model output is processed through a comprehensive LaTeX→Unicode converter covering Greek, math operators, fractions, integrals, matrices, cases, fonts, accents — rendered inline in the terminal.
 
-### Yavrukaplumba (Mini Chat)
+### Kaplumbebek (Mini Chat)
 A popup chat sidebar toggled with `Ctrl+O` that maintains a **completely separate conversation context** from the main chat. Ask off-topic questions, test prompts, or explore ideas without polluting your main conversation history. Uses the same loaded model — no reload needed. Has its own KV cache, system prompt (`"You are a helpful assistant"`), and persistent history across the session.
 
 ### Web Search
@@ -97,7 +97,7 @@ Kaplumba runs the model in an **isolated subprocess** with its own stdin/stdout 
 | `Ctrl+C` | Quit |
 | `Ctrl+R` | Reload model |
 | `Ctrl+\` or `/help` | Help overlay |
-| `Ctrl+O` | Yavrukaplumba (mini chat popup) |
+| `Ctrl+O` | Kaplumbebek (mini chat popup) |
 | `Esc` | Close overlay |
 
 ---
@@ -155,7 +155,7 @@ Per-model config at `.kaplumba/model_configs.json`:
 │       ├── loading_spinner.py
 │       ├── slash_command_menu.py
 │       ├── model_config_editor.py
-│       └── yavrukaplumba_popup.py
+│       └── kaplumbebek_popup.py
 ├── orchestrator.py             # UI ↔ model coordination
 ├── model_lifecycle.py          # Subprocess model runner
 ├── model_interface.py          # Async IPC protocol

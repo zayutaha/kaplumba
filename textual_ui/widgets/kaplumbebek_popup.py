@@ -8,7 +8,7 @@ from textual.screen import Screen
 from textual.widgets import Markdown, Static, TextArea
 
 
-class _YavruInput(TextArea):
+class _KaplumbebekInput(TextArea):
     def on_mount(self):
         self.show_line_numbers = False
         self.soft_wrap = True
@@ -21,65 +21,65 @@ class _YavruInput(TextArea):
             event.prevent_default()
             event.stop()
             screen = self.app.screen
-            if isinstance(screen, YavrukaplumbaScreen):
+            if isinstance(screen, KaplumbebekScreen):
                 await screen._send_message()
             return
         await super()._on_key(event)
 
 
-class YavrukaplumbaScreen(Screen):
+class KaplumbebekScreen(Screen):
     CSS = """
-    YavrukaplumbaScreen {
+    KaplumbebekScreen {
         align: center middle;
         background: rgba(0, 0, 0, 0.75);
     }
-    #yavru-box {
+    #kb-box {
         width: 66;
         height: 75%;
         background: #1a1a1a;
         border: round #f0a500;
         layout: vertical;
     }
-    #yavru-title {
+    #kb-title {
         height: 3;
         padding: 1 2;
         text-style: bold;
         background: #252525;
         color: #f0a500;
     }
-    #yavru-chat {
+    #kb-chat {
         height: 1fr;
         padding: 1 2;
         overflow-y: auto;
         overflow-x: hidden;
     }
-    #yavru-input-box {
+    #kb-input-box {
         height: auto;
         background: #161616;
         border-top: solid #303030;
         padding: 0 1;
     }
-    #yavru-input {
+    #kb-input {
         width: 1fr;
         margin: 0 1;
         background: #161616;
         color: #e0e0e0;
         border: none;
     }
-    .yv-user {
+    .kb-user {
         margin-top: 1;
         padding: 1 2;
         background: #222;
         border: round #333;
         color: #d8d8d8;
     }
-    .yv-assistant {
+    .kb-assistant {
         margin-bottom: 1;
         padding: 1 2 0 2;
         color: #f0a500;
         border: round transparent;
     }
-    #yv-send-btn {
+    #kb-send-btn {
         width: 8;
         background: #f0a500;
         color: #000;
@@ -88,33 +88,29 @@ class YavrukaplumbaScreen(Screen):
         content-align: center middle;
         height: 100%;
     }
-    #yv-send-btn.stopping {
+    #kb-send-btn.stopping {
         background: #e05a5a;
         color: #fff;
-    }
-    .yv-flash {
-        background: #3a3a1a !important;
-        border: round #f0a500 !important;
     }
     """
 
     def compose(self) -> ComposeResult:
-        with Vertical(id="yavru-box"):
-            yield Static(" Yavru  [dim](Esc to close)[/]", id="yavru-title")
-            yield VerticalScroll(id="yavru-chat")
-            with Horizontal(id="yavru-input-box"):
-                yield _YavruInput("", id="yavru-input")
-                yield Static(" SEND ", id="yv-send-btn")
+        with Vertical(id="kb-box"):
+            yield Static(" Kaplumbebek  [dim](Esc to close)[/]", id="kb-title")
+            yield VerticalScroll(id="kb-chat")
+            with Horizontal(id="kb-input-box"):
+                yield _KaplumbebekInput("", id="kb-input")
+                yield Static(" SEND ", id="kb-send-btn")
 
     async def on_mount(self):
-        self._chat = self.query_one("#yavru-chat", VerticalScroll)
-        self._input = self.query_one("#yavru-input", _YavruInput)
-        self._send_btn = self.query_one("#yv-send-btn", Static)
+        self._chat = self.query_one("#kb-chat", VerticalScroll)
+        self._input = self.query_one("#kb-input", _KaplumbebekInput)
+        self._send_btn = self.query_one("#kb-send-btn", Static)
         self._streaming = False
         await self._reload_history()
         self._input.focus()
 
-    @on(Click, "#yv-send-btn")
+    @on(Click, "#kb-send-btn")
     async def on_send_click(self):
         if self._streaming:
             self._streaming = False
@@ -132,13 +128,13 @@ class YavrukaplumbaScreen(Screen):
 
     async def _reload_history(self):
         self._chat.remove_children()
-        for msg in self.app.controller.yavru_history:
-            cls = "yv-user" if msg["role"] == "user" else "yv-assistant"
+        for msg in self.app.controller.kaplumbebek_history:
+            cls = "kb-user" if msg["role"] == "user" else "kb-assistant"
             await self._chat.mount(Markdown(msg["content"], classes=cls))
         self._chat.scroll_end(animate=False)
 
     async def _add_bubble(self, text: str, role: str):
-        cls = "yv-user" if role == "user" else "yv-assistant"
+        cls = "kb-user" if role == "user" else "kb-assistant"
         bubble = Markdown(text, classes=cls)
         await self._chat.mount(bubble)
         self._chat.scroll_end(animate=False)
@@ -161,14 +157,14 @@ class YavrukaplumbaScreen(Screen):
         self._input.clear()
 
         await self._add_bubble(text, "user")
-        self.app.controller.yavru_history.append({"role": "user", "content": text})
+        self.app.controller.kaplumbebek_history.append({"role": "user", "content": text})
         self._streaming = True
         self._update_send_btn()
 
         assistant = await self._add_bubble("", "assistant")
         full = ""
         try:
-            async for chunk in self.app.controller.send_yavru(text):
+            async for chunk in self.app.controller.send_kaplumbebek(text):
                 full += chunk
                 assistant.update(full + " ▌")
         except Exception:
@@ -183,10 +179,10 @@ class YavrukaplumbaScreen(Screen):
             display = full + suffix if full else suffix
             assistant.update(display)
             if full:
-                self.app.controller.yavru_history.append({"role": "assistant", "content": display})
+                self.app.controller.kaplumbebek_history.append({"role": "assistant", "content": display})
         elif full:
             assistant.update(full)
-            self.app.controller.yavru_history.append({"role": "assistant", "content": full})
+            self.app.controller.kaplumbebek_history.append({"role": "assistant", "content": full})
         else:
             assistant.update("*no response*")
 
@@ -197,30 +193,3 @@ class YavrukaplumbaScreen(Screen):
     async def on_screen_resume(self):
         await self._reload_history()
         self._input.focus()
-
-    async def on_click(self, event: Click):
-        if not event.ctrl:
-            return
-        widget = event.widget
-        while widget is not None:
-            if isinstance(widget, Markdown):
-                text = getattr(widget, "_markdown", "") or ""
-                if text:
-                    await self._copy_text(text)
-                    widget.add_class("yv-flash")
-                    self.set_timer(0.2, lambda w=widget: w.remove_class("yv-flash"))
-                    self.app.notify("Copied", timeout=2)
-                event.stop()
-                return
-            widget = widget.parent
-
-    async def _copy_text(self, text: str):
-        if not text:
-            return
-        try:
-            proc = await asyncio.create_subprocess_exec(
-                "pbcopy", stdin=asyncio.subprocess.PIPE,
-            )
-            await proc.communicate(input=text.encode())
-        except FileNotFoundError:
-            pass
