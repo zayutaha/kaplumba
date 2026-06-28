@@ -92,6 +92,10 @@ class YavrukaplumbaScreen(Screen):
         background: #e05a5a;
         color: #fff;
     }
+    .yv-flash {
+        background: #3a3a1a !important;
+        border: round #f0a500 !important;
+    }
     """
 
     def compose(self) -> ComposeResult:
@@ -193,3 +197,30 @@ class YavrukaplumbaScreen(Screen):
     async def on_screen_resume(self):
         await self._reload_history()
         self._input.focus()
+
+    async def on_click(self, event: Click):
+        if not event.ctrl:
+            return
+        widget = event.widget
+        while widget is not None:
+            if isinstance(widget, Markdown):
+                text = getattr(widget, "_markdown", "") or ""
+                if text:
+                    await self._copy_text(text)
+                    widget.add_class("yv-flash")
+                    self.set_timer(0.2, lambda w=widget: w.remove_class("yv-flash"))
+                    self.app.notify("Copied", timeout=2)
+                event.stop()
+                return
+            widget = widget.parent
+
+    async def _copy_text(self, text: str):
+        if not text:
+            return
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                "pbcopy", stdin=asyncio.subprocess.PIPE,
+            )
+            await proc.communicate(input=text.encode())
+        except FileNotFoundError:
+            pass
