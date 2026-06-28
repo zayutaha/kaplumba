@@ -48,7 +48,7 @@ HELP_TEXT = """\
   [bold]Ctrl+R[/]     Reload model
 
 [bold]Copy messages[/]
-  Click any message bubble to copy it
+  [bold]Ctrl+click[/] any message bubble to copy it
 
 [bold]Copy text[/]
   [bold]Shift+drag[/]  Select text with mouse
@@ -319,6 +319,8 @@ class ChatUI(App):
             help_overlay.display = False
             self.query_one("#chat-center").display = True
             self.query_one("#input-center").display = True
+            return
+        if not event.ctrl:
             return
         widget = event.widget
         while widget is not None:
