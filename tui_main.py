@@ -325,7 +325,7 @@ class ChatUI(App):
         widget = event.widget
         while widget is not None:
             if isinstance(widget, CopyableMarkdown):
-                text = widget._markdown if hasattr(widget, '_markdown') and widget._markdown else widget._initial_markdown or ""
+                text = getattr(widget, "_raw_text", None) or widget._markdown or widget._initial_markdown or ""
                 if text:
                     await _copy_single(text)
                     widget.add_class("bubble-flash")

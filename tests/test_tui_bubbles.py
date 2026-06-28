@@ -51,6 +51,14 @@ class TestCopyableMarkdown(unittest.TestCase):
         self.assertIn("notify", src,
                       "on_click should notify user on copy")
 
+    def test_chatui_on_click_uses_raw_text(self):
+        """ChatUI.on_click should prefer _raw_text over _markdown to avoid cursor/stopped."""
+        import tui_main
+        import inspect
+        src = inspect.getsource(tui_main.ChatUI.on_click)
+        self.assertIn("_raw_text", src,
+                      "on_click should use _raw_text for copy, not _markdown")
+
 
 if __name__ == "__main__":
     unittest.main()
