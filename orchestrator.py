@@ -71,6 +71,7 @@ class Orchestrator:
             return
 
         if user_text == "/clear":
+            self.yavru_history.clear()
             await self.chat.reset_chat()
             if self.port.running:
                 try:

@@ -529,6 +529,8 @@ def main():
                     turbo_fp16_layers=args.turbo_fp16_layers,
                 )
                 message_history.clear()
+                yavru_history.clear()
+                yavru_cache = None
                 rprint("[INFO] Conversation cleared.")
                 continue
             if query == "h":
