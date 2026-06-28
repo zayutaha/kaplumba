@@ -50,7 +50,7 @@ HELP_TEXT = """\
 
 [bold]Copy messages[/]
   [bold]Ctrl+click[/] any message bubble to copy it
-  [bold]Ctrl+Shift+click[/] copy raw text (LaTeX source, pre-formatting)
+  [bold]Ctrl+Alt+click[/] copy raw text (LaTeX source, pre-formatting)
 
 [bold]Copy text[/]
   [bold]Shift+drag[/]  Select text with mouse
@@ -333,7 +333,7 @@ class ChatUI(App):
         widget = event.widget
         while widget is not None:
             if isinstance(widget, CopyableMarkdown):
-                if event.shift:
+                if event.alt:
                     text = getattr(widget, "_raw_text", None) or ""
                     label = "Raw copied"
                 else:

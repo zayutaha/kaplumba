@@ -205,7 +205,7 @@ class KaplumbebekScreen(Screen):
         while widget is not None:
             if isinstance(widget, Markdown):
                 text = getattr(widget, "_markdown", "") or ""
-                if event.shift:
+                if event.alt:
                     text = getattr(widget, "_raw_text", "") or text
                     label = "Raw copied"
                 else:
