@@ -63,6 +63,10 @@ class Orchestrator:
             await self.chat.show_personality_selector()
             return
 
+        if user_text.startswith("/yavru"):
+            await self.chat.show_banner("Use Ctrl+O to open Yavrukaplumba", timeout=2)
+            return
+
         if self.chat.busy or self.chat.loading or not self.port.running:
             return
 

@@ -223,6 +223,15 @@ class TestYavru(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(port._interrupted,
                             "Clicking STOP should interrupt the port")
 
-
-if __name__ == "__main__":
-    unittest.main()
+    async def test_yavru_blocked_in_main_chat(self):
+        """Orchestrator.handle_submit should reject /yavru before sending to model."""
+        import inspect
+        import orchestrator
+        src = inspect.getsource(orchestrator.Orchestrator.handle_submit)
+        self.assertIn("/yavru", src,
+                       "handle_submit should check for /yavru")
+        # It should return early, not fall through to send_message
+        send_idx = src.find("send_message")
+        yavru_idx = src.find("/yavru")
+        self.assertLess(yavru_idx, send_idx if send_idx > 0 else len(src),
+                        "/yavru check should come before send_message")
