@@ -92,25 +92,25 @@ class MiniChatScreen(Screen):
             with Horizontal(id="minichat-input-box"):
                 yield _MiniChatInput("", id="minichat-input")
 
-    def on_mount(self):
+    async def on_mount(self):
         self._chat = self.query_one("#minichat-chat", VerticalScroll)
         self._input = self.query_one("#minichat-input", _MiniChatInput)
         self._status = self.query_one("#minichat-status", Static)
         self._streaming = False
-        self._reload_history()
+        await self._reload_history()
         self._input.focus()
 
-    def _reload_history(self):
+    async def _reload_history(self):
         self._chat.remove_children()
         for msg in self.app.controller.minichat_history:
             cls = "mc-user" if msg["role"] == "user" else "mc-assistant"
-            self._chat.mount(Static(msg["content"], classes=cls))
+            await self._chat.mount(Static(msg["content"], classes=cls))
         self._chat.scroll_end(animate=False)
 
-    def _add_bubble(self, text: str, role: str):
+    async def _add_bubble(self, text: str, role: str):
         cls = "mc-user" if role == "user" else "mc-assistant"
         bubble = Static(text, classes=cls)
-        self._chat.mount(bubble)
+        await self._chat.mount(bubble)
         self._chat.scroll_end(animate=False)
         return bubble
 
@@ -129,34 +129,34 @@ class MiniChatScreen(Screen):
             return
         self._input.clear()
 
-        self._add_bubble(text, "user")
+        await self._add_bubble(text, "user")
         self.app.controller.minichat_history.append({"role": "user", "content": text})
         self._streaming = True
         self._status.update("Thinking...")
 
-        assistant = self._add_bubble("", "assistant")
+        assistant = await self._add_bubble("", "assistant")
         full = ""
         try:
             async for chunk in self.app.controller.send_minichat(text):
                 full += chunk
-                await assistant.update(full + " ▌")
+                assistant.update(full + " ▌")
         except Exception:
-            await assistant.update("*error*")
+            assistant.update("*error*")
             self._streaming = False
             self._status.update("")
             self._input.focus()
             return
 
         if full:
-            await assistant.update(full)
+            assistant.update(full)
             self.app.controller.minichat_history.append({"role": "assistant", "content": full})
         else:
-            await assistant.update("*no response*")
+            assistant.update("*no response*")
 
         self._streaming = False
         self._status.update("")
         self._input.focus()
 
-    def on_screen_resume(self):
-        self._reload_history()
+    async def on_screen_resume(self):
+        await self._reload_history()
         self._input.focus()
