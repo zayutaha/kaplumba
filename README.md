@@ -76,7 +76,7 @@ Detects and strips Qwen `<think>...</think>` and Gemma `<|channel>...<channel|>`
 Model output is processed through a comprehensive LaTeX→Unicode converter covering Greek, math operators, fractions, integrals, matrices, cases, fonts, accents — rendered inline in the terminal.
 
 ### Yavrukaplumba (Mini Chat)
-A popup chat sidebar toggled with `Ctrl+O` that maintains a **completely separate conversation context** from the main chat. Ask off-topic questions, test prompts, or explore ideas without polluting your main conversation history. Uses the same loaded model — no reload needed. Has its own KV cache, system prompt (`"You are a helpful assistant"`), and persistent history across the session.
+Ever have a random question or idea pop up mid-conversation but don't want to derail your main chat? Press `Ctrl+O` to open a popup with a **completely separate context** — ask off-topic questions, test prompts, or quickly look something up without touching your main conversation's history or KV cache. Uses the same loaded model, persistent across the session. No reload needed.
 
 ### Web Search
 `/search` generates 3 search queries from the model, searches DuckDuckGo, scrapes 3 relevant pages, and injects content into context for a concise answer.
