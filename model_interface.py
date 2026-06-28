@@ -19,6 +19,12 @@ class FakeModelPort:
         for chunk in self._chunks:
             yield chunk
 
+    async def send_minichat_message(self, text: str) -> AsyncIterator[str]:
+        self._sent.append(text)
+        # For fake port, just return the same chunks as a normal message
+        for chunk in self._chunks:
+            yield chunk
+
     async def send_command(self, text: str, timeout: int = 60) -> str | None:
         self._sent.append(text)
         return None
@@ -38,6 +44,9 @@ class ModelPort(Protocol):
         ...
 
     async def send_message(self, text: str) -> AsyncIterator[str]:
+        ...
+
+    async def send_minichat_message(self, text: str) -> AsyncIterator[str]:
         ...
 
     async def send_command(self, text: str, timeout: int = 60) -> str | None:
@@ -105,6 +114,34 @@ class MLXSubprocessAdapter:
             remaining = await self._read_until_prompt(timeout=10)
             if remaining:
                 yield remaining
+
+    async def send_minichat_message(self, text: str) -> AsyncIterator[str]:
+        text = " ".join(text.split("\n"))
+
+        if not await self._runner.send(text):
+            return
+
+        marker = self.TUI_PROMPT_MARKER
+        while True:
+            try:
+                chunk = await asyncio.wait_for(
+                    self._runner.proc.stdout.read(256), timeout=0.05
+                )
+            except asyncio.TimeoutError:
+                continue
+            except Exception:
+                break
+
+            if not chunk:
+                break
+
+            decoded = chunk.decode(errors="ignore")
+            marker_pos = decoded.find(marker)
+            if marker_pos >= 0:
+                yield decoded[:marker_pos]
+                return
+
+            yield decoded
 
     async def _drain_stale_stdout(self):
         """Read and discard any data already in stdout up to the prompt marker.
