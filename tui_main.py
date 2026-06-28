@@ -148,7 +148,7 @@ class ChatUI(App):
         ("d", "debug_copy_selected", "Debug Copy"),
         ("ctrl+backslash", "show_help", "Help"),
         ("escape", "close_help", "Close"),
-        ("cmd+l", "toggle_minichat", "Mini Chat"),
+        ("ctrl+o", "toggle_minichat", "Mini Chat"),
     ]
     CSS = CHAT_CSS
 

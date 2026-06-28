@@ -116,6 +116,7 @@ class MLXSubprocessAdapter:
                 yield remaining
 
     async def send_minichat_message(self, text: str) -> AsyncIterator[str]:
+        self._interrupted = False
         text = " ".join(text.split("\n"))
 
         if not await self._runner.send(text):
@@ -128,6 +129,8 @@ class MLXSubprocessAdapter:
                     self._runner.proc.stdout.read(256), timeout=0.05
                 )
             except asyncio.TimeoutError:
+                if self._interrupted:
+                    break
                 continue
             except Exception:
                 break

@@ -1,6 +1,9 @@
+import asyncio
+
+from textual import on
 from textual.app import ComposeResult
 from textual.containers import Horizontal, Vertical, VerticalScroll
-from textual.events import Key
+from textual.events import Click, Key
 from textual.screen import Screen
 from textual.widgets import Static, TextArea
 
@@ -82,23 +85,52 @@ class MiniChatScreen(Screen):
         color: #666;
         text-style: italic;
     }
+    #mc-send-btn {
+        width: 8;
+        background: #f0a500;
+        color: #000;
+        text-style: bold;
+        text-align: center;
+        content-align: center middle;
+        height: 100%;
+    }
+    #mc-send-btn.stopping {
+        background: #e05a5a;
+        color: #fff;
+    }
     """
 
     def compose(self) -> ComposeResult:
         with Vertical(id="minichat-box"):
             yield Static(" Mini Chat  [dim](Esc to close)[/]", id="minichat-title")
             yield VerticalScroll(id="minichat-chat")
-            yield Static("", id="minichat-status")
             with Horizontal(id="minichat-input-box"):
                 yield _MiniChatInput("", id="minichat-input")
+                yield Static(" SEND ", id="mc-send-btn")
 
     async def on_mount(self):
         self._chat = self.query_one("#minichat-chat", VerticalScroll)
         self._input = self.query_one("#minichat-input", _MiniChatInput)
-        self._status = self.query_one("#minichat-status", Static)
+        self._send_btn = self.query_one("#mc-send-btn", Static)
         self._streaming = False
         await self._reload_history()
         self._input.focus()
+
+    @on(Click, "#mc-send-btn")
+    async def on_send_click(self):
+        if self._streaming:
+            self._streaming = False
+            asyncio.create_task(self._interrupt_stream())
+        else:
+            await self._send_message()
+
+    def _update_send_btn(self):
+        if self._streaming:
+            self._send_btn.update(" STOP ")
+            self._send_btn.add_class("stopping")
+        else:
+            self._send_btn.update(" SEND ")
+            self._send_btn.remove_class("stopping")
 
     async def _reload_history(self):
         self._chat.remove_children()
@@ -118,7 +150,18 @@ class MiniChatScreen(Screen):
         if event.key == "escape":
             event.stop()
             event.prevent_default()
-            self.app.pop_screen()
+            if self._streaming:
+                self._streaming = False
+                asyncio.create_task(self._interrupt_stream())
+            elif len(self.app.screen_stack) > 1:
+                self.app.pop_screen()
+
+    async def _interrupt_stream(self):
+        try:
+            await self.app.controller.port.interrupt()
+        except Exception:
+            pass
+        self._update_send_btn()
 
     async def _send_message(self):
         if self._streaming:
@@ -132,7 +175,7 @@ class MiniChatScreen(Screen):
         await self._add_bubble(text, "user")
         self.app.controller.minichat_history.append({"role": "user", "content": text})
         self._streaming = True
-        self._status.update("Thinking...")
+        self._update_send_btn()
 
         assistant = await self._add_bubble("", "assistant")
         full = ""
@@ -143,18 +186,24 @@ class MiniChatScreen(Screen):
         except Exception:
             assistant.update("*error*")
             self._streaming = False
-            self._status.update("")
+            self._update_send_btn()
             self._input.focus()
             return
 
-        if full:
+        if not self._streaming:
+            suffix = "\n\n*stopped*"
+            display = full + suffix if full else suffix
+            assistant.update(display)
+            if full:
+                self.app.controller.minichat_history.append({"role": "assistant", "content": display})
+        elif full:
             assistant.update(full)
             self.app.controller.minichat_history.append({"role": "assistant", "content": full})
         else:
             assistant.update("*no response*")
 
         self._streaming = False
-        self._status.update("")
+        self._update_send_btn()
         self._input.focus()
 
     async def on_screen_resume(self):
