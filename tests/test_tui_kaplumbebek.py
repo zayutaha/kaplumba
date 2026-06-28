@@ -235,3 +235,17 @@ class TestKaplumbebek(unittest.IsolatedAsyncioTestCase):
         kaplumbebek_idx = src.find("/kaplumbebek")
         self.assertLess(kaplumbebek_idx, send_idx if send_idx > 0 else len(src),
                         "/kaplumbebek check should come before send_message")
+
+    async def test_kaplumbebek_on_click_handles_meta(self):
+        """KaplumbebekScreen.on_click should check event.meta for debug copy."""
+        import inspect
+        from textual_ui.widgets.kaplumbebek_popup import KaplumbebekScreen
+        src = inspect.getsource(KaplumbebekScreen.on_click)
+        self.assertIn("event.meta", src,
+                      "on_click should use event.meta for debug copy")
+        self.assertIn("kb-flash", src,
+                      "on_click should add kb-flash on copy")
+
+
+if __name__ == "__main__":
+    unittest.main()

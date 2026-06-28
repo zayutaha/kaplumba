@@ -58,6 +58,16 @@ class TestCopyableMarkdown(unittest.TestCase):
         self.assertIn("_raw_text", src,
                       "on_click should use _raw_text for copy, not _markdown")
 
+    def test_chatui_on_click_handles_meta_modifier(self):
+        """ChatUI.on_click should check event.meta for raw/debug copy."""
+        import tui_main
+        import inspect
+        src = inspect.getsource(tui_main.ChatUI.on_click)
+        self.assertIn("event.meta", src,
+                      "on_click should use event.meta for debug copy")
+        self.assertIn("Raw copied", src,
+                      "on_click should show 'Raw copied' on meta+click")
+
 
 if __name__ == "__main__":
     unittest.main()

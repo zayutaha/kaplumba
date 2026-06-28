@@ -333,7 +333,7 @@ class ChatUI(App):
         widget = event.widget
         while widget is not None:
             if isinstance(widget, CopyableMarkdown):
-                if event.alt:
+                if event.meta:
                     text = getattr(widget, "_raw_text", None) or ""
                     label = "Raw copied"
                 else:
