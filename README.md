@@ -87,7 +87,7 @@ A popup chat sidebar toggled with `Ctrl+O` that maintains a **completely separat
 Kaplumba runs the model in an **isolated subprocess** with its own stdin/stdout protocol. If the model crashes (transient OOM, segfault, or cosmic ray), the UI stays up. It auto-retries loading **3 times** before showing a dialog. You can switch models without restarting the app. SIGINT is relayed reliably for clean interruption. Think of it as a bulletproof vest for your inference engine.
 
 ### Message Selection & Copy
-Click any message bubble to select it (orange highlight), then press **`C`** to copy all selected messages to the clipboard (formatted/rendered text). Press **`D`** to debug-copy the raw unformatted LLM output (including LaTeX source). Click a selected bubble again to deselect. The send button shows the count of selected messages.
+Click any message bubble to instantly copy its text to the clipboard. A brief gold flash confirms the copy. No selection mode, no extra key presses.
 
 ### Keyboard Shortcuts
 
@@ -96,8 +96,6 @@ Click any message bubble to select it (orange highlight), then press **`C`** to 
 | `Enter` | Send message |
 | `Ctrl+C` | Quit |
 | `Ctrl+R` | Reload model |
-| `C` | Copy selected messages (formatted) |
-| `D` | Copy selected messages (raw/LaTeX source) |
 | `Ctrl+\` or `/help` | Help overlay |
 | `Ctrl+O` | Yavrukaplumba (mini chat popup) |
 | `Esc` | Close overlay |
