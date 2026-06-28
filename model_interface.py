@@ -19,7 +19,7 @@ class FakeModelPort:
         for chunk in self._chunks:
             yield chunk
 
-    async def send_minichat_message(self, text: str) -> AsyncIterator[str]:
+    async def send_yavru_message(self, text: str) -> AsyncIterator[str]:
         self._sent.append(text)
         # For fake port, just return the same chunks as a normal message
         for chunk in self._chunks:
@@ -46,7 +46,7 @@ class ModelPort(Protocol):
     async def send_message(self, text: str) -> AsyncIterator[str]:
         ...
 
-    async def send_minichat_message(self, text: str) -> AsyncIterator[str]:
+    async def send_yavru_message(self, text: str) -> AsyncIterator[str]:
         ...
 
     async def send_command(self, text: str, timeout: int = 60) -> str | None:
@@ -115,7 +115,7 @@ class MLXSubprocessAdapter:
             if remaining:
                 yield remaining
 
-    async def send_minichat_message(self, text: str) -> AsyncIterator[str]:
+    async def send_yavru_message(self, text: str) -> AsyncIterator[str]:
         self._interrupted = False
         text = " ".join(text.split("\n"))
 

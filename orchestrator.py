@@ -30,7 +30,7 @@ class Orchestrator:
         self.max_crashes = 3
         self.reloading = False
         self._stream_task = None
-        self.minichat_history: list[dict] = []
+        self.yavru_history: list[dict] = []
 
     @property
     def current_system_prompt(self) -> str:
@@ -139,8 +139,8 @@ class Orchestrator:
         except asyncio.CancelledError:
             pass
 
-    async def send_minichat(self, text: str) -> AsyncIterator[str]:
-        async for chunk in self.port.send_minichat_message(f"/minichat {text}"):
+    async def send_yavru(self, text: str) -> AsyncIterator[str]:
+        async for chunk in self.port.send_yavru_message(f"/yavru {text}"):
             yield chunk
 
     async def handle_interrupt(self) -> None:

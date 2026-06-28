@@ -426,7 +426,7 @@ def main():
         rprint("- '/memory' to show current GPU memory usage")
         rprint("- '/unload' to offload model (frees GPU memory, preserves KV cache)")
         rprint("- '/mtp' to toggle multi-token prediction on/off")
-        rprint("- '/minichat <message>' to chat in a separate context (toggle with Cmd+L in TUI)")
+        rprint("- '/yavru <message>' to chat in a separate context (toggle with Cmd+L in TUI)")
 
     rprint(f"[INFO] Starting chat session with {args.model}.")
     print_help()
@@ -456,10 +456,10 @@ def main():
     message_history: list = []
     _cache_stale = False
 
-    # Mini-chat state (separate conversation context, persistent across session)
-    minichat_history: list = []
-    minichat_cache = None
-    MINICHAT_SYSTEM_PROMPT = "You are a helpful assistant."
+    # Yavru state (separate conversation context, persistent across session)
+    yavru_history: list = []
+    yavru_cache = None
+    YAVRU_SYSTEM_PROMPT = "You are a helpful assistant."
 
     # KV cache preservation for /unload
     _saved_cache = []
@@ -668,33 +668,33 @@ def main():
                     rprint(f"[ERROR] Research failed: {str(e)}")
                     continue
 
-            # Handle /minichat — separate conversation context
-            if query.startswith("/minichat "):
-                mc_query = query[len("/minichat "):].strip()
+            # Handle /yavru — separate conversation context
+            if query.startswith("/yavru "):
+                yv_query = query[len("/yavru "):].strip()
 
-                if mc_query == "/clear":
-                    minichat_history.clear()
-                    minichat_cache = None
-                    rprint("[INFO] Mini-chat cleared.")
+                if yv_query == "/clear":
+                    yavru_history.clear()
+                    yavru_cache = None
+                    rprint("[INFO] Yavru cleared.")
                     continue
 
-                if not mc_query:
-                    rprint("[ERROR] Usage: /minichat <message>")
+                if not yv_query:
+                    rprint("[ERROR] Usage: /yavru <message>")
                     continue
 
                 # Determine if this is the first mini-chat turn
-                mc_cache_has_data = False
-                if minichat_cache:
-                    mx.eval(minichat_cache)
-                    for c in minichat_cache:
+                yv_cache_has_data = False
+                if yavru_cache:
+                    mx.eval(yavru_cache)
+                    for c in yavru_cache:
                         if hasattr(c, "offset") and c.offset > 0:
-                            mc_cache_has_data = True
+                            yv_cache_has_data = True
                             break
 
-                mc_is_first = minichat_cache is None or not mc_cache_has_data
+                yv_is_first = yavru_cache is None or not yv_cache_has_data
 
-                if mc_is_first:
-                    minichat_cache = make_prompt_cache(
+                if yv_is_first:
+                    yavru_cache = make_prompt_cache(
                         model,
                         args.max_kv_size,
                         turbo_kv_bits=args.turbo_kv_bits,
@@ -704,38 +704,38 @@ def main():
                 # MTP cache sync
                 if args.mtp and hasattr(model, "mtp_forward"):
                     num_backbone = len(model.layers)
-                    if len(minichat_cache) == num_backbone:
-                        minichat_cache.extend(model.make_mtp_cache())
+                    if len(yavru_cache) == num_backbone:
+                        yavru_cache.extend(model.make_mtp_cache())
                 elif not args.mtp and hasattr(model, "mtp_forward"):
                     num_backbone = len(model.layers)
-                    if len(minichat_cache) > num_backbone:
-                        minichat_cache = minichat_cache[:num_backbone]
+                    if len(yavru_cache) > num_backbone:
+                        yavru_cache = yavru_cache[:num_backbone]
 
-                if mc_is_first:
-                    mc_messages = [
-                        {"role": "system", "content": MINICHAT_SYSTEM_PROMPT},
-                        *minichat_history,
-                        {"role": "user", "content": mc_query},
+                if yv_is_first:
+                    yv_messages = [
+                        {"role": "system", "content": YAVRU_SYSTEM_PROMPT},
+                        *yavru_history,
+                        {"role": "user", "content": yv_query},
                     ]
                 else:
-                    mc_messages = [{"role": "user", "content": mc_query}]
+                    yv_messages = [{"role": "user", "content": yv_query}]
 
-                minichat_history.append({"role": "user", "content": mc_query})
+                yavru_history.append({"role": "user", "content": yv_query})
 
-                mc_prompt = tokenizer.apply_chat_template(
-                    mc_messages,
+                yv_prompt = tokenizer.apply_chat_template(
+                    yv_messages,
                     add_generation_prompt=True,
-                    add_special_tokens=mc_is_first,
+                    add_special_tokens=yv_is_first,
                     enable_thinking=False,
                 )
 
                 # Generate mini-chat response
                 _interrupted[0] = False
-                mc_response = ""
+                yv_response = ""
                 for resp in stream_generate(
                     model,
                     tokenizer,
-                    mc_prompt,
+                    yv_prompt,
                     max_tokens=args.max_tokens,
                     sampler=make_sampler(
                         args.temp,
@@ -747,7 +747,7 @@ def main():
                             tokenizer.encode("\n") + list(tokenizer.eos_token_ids)
                         ),
                     ),
-                    prompt_cache=minichat_cache,
+                    prompt_cache=yavru_cache,
                     turbo_kv_bits=args.turbo_kv_bits,
                     turbo_fp16_layers=args.turbo_fp16_layers,
                     kv_bits=args.kv_bits,
@@ -756,14 +756,14 @@ def main():
                     mtp=args.mtp,
                     prefill_step_size=args.prefill_step_size,
                 ):
-                    mc_response += resp.text
+                    yv_response += resp.text
                     rprint(resp.text, flush=True, end="")
                     if _interrupted[0]:
                         _interrupted[0] = False
                         break
 
-                if mc_response:
-                    minichat_history.append({"role": "assistant", "content": mc_response})
+                if yv_response:
+                    yavru_history.append({"role": "assistant", "content": yv_response})
 
                 rprint()
                 continue

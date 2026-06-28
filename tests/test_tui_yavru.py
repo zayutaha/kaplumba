@@ -19,8 +19,8 @@ class StubPort:
         return
         yield
 
-    async def send_minichat_message(self, text: str) -> AsyncIterator[str]:
-        for chunk in ["Hello", " from", " mini", " chat"]:
+    async def send_yavru_message(self, text: str) -> AsyncIterator[str]:
+        for chunk in ["Hello", " from", " yavru", " chat"]:
             if self._interrupted:
                 break
             await asyncio.sleep(0.03)
@@ -36,10 +36,10 @@ class StubPort:
         self.running = False
 
 
-class TestMiniChat(unittest.IsolatedAsyncioTestCase):
+class TestYavru(unittest.IsolatedAsyncioTestCase):
 
-    async def test_ctrl_o_opens_minichat_screen(self):
-        """Ctrl+O should push MiniChatScreen when model is idle."""
+    async def test_ctrl_o_opens_yavru_screen(self):
+        """Ctrl+O should push YavrukaplumbaScreen when model is idle."""
         app = ChatUI(port=StubPort())
         async with app.run_test() as pilot:
             self.assertFalse(
@@ -49,34 +49,34 @@ class TestMiniChat(unittest.IsolatedAsyncioTestCase):
             await pilot.press("ctrl+o")
             await pilot.pause()
 
-            from textual_ui.widgets.minichat_popup import MiniChatScreen
+            from textual_ui.widgets.yavrukaplumba_popup import YavrukaplumbaScreen
             self.assertTrue(
-                any(isinstance(s, MiniChatScreen) for s in app.screen_stack),
-                "MiniChatScreen should be pushed after Ctrl+O",
+                any(isinstance(s, YavrukaplumbaScreen) for s in app.screen_stack),
+                "YavrukaplumbaScreen should be pushed after Ctrl+O",
             )
 
-    async def test_ctrl_o_closes_minichat_screen(self):
-        """Ctrl+O should pop MiniChatScreen when already open."""
+    async def test_ctrl_o_closes_yavru_screen(self):
+        """Ctrl+O should pop YavrukaplumbaScreen when already open."""
         app = ChatUI(port=StubPort())
         async with app.run_test() as pilot:
             await pilot.press("ctrl+o")
             await pilot.pause()
 
-            from textual_ui.widgets.minichat_popup import MiniChatScreen
+            from textual_ui.widgets.yavrukaplumba_popup import YavrukaplumbaScreen
             self.assertTrue(
-                any(isinstance(s, MiniChatScreen) for s in app.screen_stack)
+                any(isinstance(s, YavrukaplumbaScreen) for s in app.screen_stack)
             )
 
             await pilot.press("ctrl+o")
             await pilot.pause()
 
             self.assertFalse(
-                any(isinstance(s, MiniChatScreen) for s in app.screen_stack),
-                "MiniChatScreen should be popped after second Ctrl+O",
+                any(isinstance(s, YavrukaplumbaScreen) for s in app.screen_stack),
+                "YavrukaplumbaScreen should be popped after second Ctrl+O",
             )
 
-    async def test_escape_closes_minichat_screen(self):
-        """Escape should close the MiniChatScreen."""
+    async def test_escape_closes_yavru_screen(self):
+        """Escape should close the YavrukaplumbaScreen."""
         app = ChatUI(port=StubPort())
         async with app.run_test() as pilot:
             await pilot.press("ctrl+o")
@@ -85,82 +85,75 @@ class TestMiniChat(unittest.IsolatedAsyncioTestCase):
             await pilot.press("escape")
             await pilot.pause()
 
-            from textual_ui.widgets.minichat_popup import MiniChatScreen
+            from textual_ui.widgets.yavrukaplumba_popup import YavrukaplumbaScreen
             self.assertFalse(
-                any(isinstance(s, MiniChatScreen) for s in app.screen_stack),
-                "MiniChatScreen should be popped after Escape",
+                any(isinstance(s, YavrukaplumbaScreen) for s in app.screen_stack),
+                "YavrukaplumbaScreen should be popped after Escape",
             )
 
-    async def test_minichat_not_opened_when_busy(self):
+    async def test_yavru_not_opened_when_busy(self):
         """Ctrl+O should do nothing when model is busy generating."""
         app = ChatUI(port=StubPort())
         async with app.run_test() as pilot:
-            app.busy = True  # set after on_mount resets it
+            app.busy = True
             await pilot.press("ctrl+o")
             await pilot.pause()
 
-            from textual_ui.widgets.minichat_popup import MiniChatScreen
+            from textual_ui.widgets.yavrukaplumba_popup import YavrukaplumbaScreen
             self.assertFalse(
-                any(isinstance(s, MiniChatScreen) for s in app.screen_stack),
-                "MiniChatScreen should not open when busy",
+                any(isinstance(s, YavrukaplumbaScreen) for s in app.screen_stack),
+                "YavrukaplumbaScreen should not open when busy",
             )
 
-    async def test_minichat_sends_message_and_shows_bubbles(self):
-        """Sending a message in mini-chat should show user + assistant bubbles."""
+    async def test_yavru_sends_message_and_shows_bubbles(self):
+        """Sending a message in yavru should show user + assistant bubbles."""
         app = ChatUI(port=StubPort())
         async with app.run_test() as pilot:
             await pilot.press("ctrl+o")
             await pilot.pause()
 
-            from textual_ui.widgets.minichat_popup import MiniChatScreen
-            screen = next(s for s in app.screen_stack if isinstance(s, MiniChatScreen))
+            from textual_ui.widgets.yavrukaplumba_popup import YavrukaplumbaScreen
+            screen = next(s for s in app.screen_stack if isinstance(s, YavrukaplumbaScreen))
 
-            # Type and send a message
-            input_widget = screen.query_one("#minichat-input")
+            input_widget = screen.query_one("#yavru-input")
             input_widget.text = "Hello!"
             await pilot.pause()
 
-            # Press Enter to send
             await pilot.press("enter")
             await pilot.pause()
 
-            # Check that bubbles appeared
-            chat_area = screen.query_one("#minichat-chat")
+            chat_area = screen.query_one("#yavru-chat")
             children = list(chat_area.children)
-            user_bubbles = [c for c in children if "mc-user" in c.classes]
-            assistant_bubbles = [c for c in children if "mc-assistant" in c.classes]
+            user_bubbles = [c for c in children if "yv-user" in c.classes]
+            assistant_bubbles = [c for c in children if "yv-assistant" in c.classes]
             self.assertEqual(len(user_bubbles), 1)
             self.assertGreaterEqual(len(assistant_bubbles), 1)
 
-            # Check history was updated
-            self.assertEqual(len(app.controller.minichat_history), 2)
+            self.assertEqual(len(app.controller.yavru_history), 2)
 
-    async def test_minichat_history_persists_across_close_reopen(self):
-        """Mini-chat history should survive closing and re-opening the popup."""
+    async def test_yavru_history_persists_across_close_reopen(self):
+        """Yavru history should survive closing and re-opening the popup."""
         app = ChatUI(port=StubPort())
         async with app.run_test() as pilot:
-            # Send a message
             await pilot.press("ctrl+o")
             await pilot.pause()
 
-            from textual_ui.widgets.minichat_popup import MiniChatScreen
-            screen = next(s for s in app.screen_stack if isinstance(s, MiniChatScreen))
-            input_widget = screen.query_one("#minichat-input")
+            from textual_ui.widgets.yavrukaplumba_popup import YavrukaplumbaScreen
+            screen = next(s for s in app.screen_stack if isinstance(s, YavrukaplumbaScreen))
+            input_widget = screen.query_one("#yavru-input")
             input_widget.text = "Persist me"
             await pilot.pause()
             await pilot.press("enter")
             await pilot.pause()
 
-            # Close
             await pilot.press("escape")
             await pilot.pause()
 
-            # Re-open
             await pilot.press("ctrl+o")
             await pilot.pause()
 
-            screen = next(s for s in app.screen_stack if isinstance(s, MiniChatScreen))
-            chat_area = screen.query_one("#minichat-chat")
+            screen = next(s for s in app.screen_stack if isinstance(s, YavrukaplumbaScreen))
+            chat_area = screen.query_one("#yavru-chat")
             children = list(chat_area.children)
             self.assertGreaterEqual(len(children), 2,
                                     "History should be restored on re-open")
@@ -172,15 +165,13 @@ class TestMiniChat(unittest.IsolatedAsyncioTestCase):
             await pilot.press("ctrl+o")
             await pilot.pause()
 
-            from textual_ui.widgets.minichat_popup import MiniChatScreen
-            screen = next(s for s in app.screen_stack if isinstance(s, MiniChatScreen))
+            from textual_ui.widgets.yavrukaplumba_popup import YavrukaplumbaScreen
+            screen = next(s for s in app.screen_stack if isinstance(s, YavrukaplumbaScreen))
 
-            # Simulate streaming state
             screen._streaming = True
             await pilot.press("escape")
             await pilot.pause()
 
-            # Port should have been interrupted
             port = app.controller.port
             self.assertTrue(port._interrupted,
                             "Port interrupt should be called on Escape during streaming")
@@ -197,9 +188,9 @@ class TestMiniChat(unittest.IsolatedAsyncioTestCase):
             await pilot.press("escape")
             await pilot.pause()
 
-            from textual_ui.widgets.minichat_popup import MiniChatScreen
+            from textual_ui.widgets.yavrukaplumba_popup import YavrukaplumbaScreen
             self.assertFalse(
-                any(isinstance(s, MiniChatScreen) for s in app.screen_stack),
+                any(isinstance(s, YavrukaplumbaScreen) for s in app.screen_stack),
                 "Screen should close on Escape when idle",
             )
 
@@ -210,18 +201,16 @@ class TestMiniChat(unittest.IsolatedAsyncioTestCase):
             await pilot.press("ctrl+o")
             await pilot.pause()
 
-            from textual_ui.widgets.minichat_popup import MiniChatScreen
-            screen = next(s for s in app.screen_stack if isinstance(s, MiniChatScreen))
-            btn = screen.query_one("#mc-send-btn", Static)
+            from textual_ui.widgets.yavrukaplumba_popup import YavrukaplumbaScreen
+            screen = next(s for s in app.screen_stack if isinstance(s, YavrukaplumbaScreen))
+            btn = screen.query_one("#yv-send-btn", Static)
             self.assertIn("SEND", str(btn.render()))
 
-            # Simulate streaming
             screen._streaming = True
             screen._update_send_btn()
             self.assertIn("STOP", str(btn.render()))
             self.assertTrue(btn.has_class("stopping"))
 
-            # Back to idle
             screen._streaming = False
             screen._update_send_btn()
             self.assertIn("SEND", str(btn.render()))
@@ -234,12 +223,12 @@ class TestMiniChat(unittest.IsolatedAsyncioTestCase):
             await pilot.press("ctrl+o")
             await pilot.pause()
 
-            from textual_ui.widgets.minichat_popup import MiniChatScreen
-            screen = next(s for s in app.screen_stack if isinstance(s, MiniChatScreen))
+            from textual_ui.widgets.yavrukaplumba_popup import YavrukaplumbaScreen
+            screen = next(s for s in app.screen_stack if isinstance(s, YavrukaplumbaScreen))
             screen._streaming = True
             screen._update_send_btn()
 
-            await pilot.click("#mc-send-btn")
+            await pilot.click("#yv-send-btn")
             await pilot.pause()
 
             port = app.controller.port
