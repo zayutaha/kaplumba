@@ -270,6 +270,7 @@ class Orchestrator:
                 except Exception:
                     pass
 
+        self.chat.query_one("#options-selector-container").display = False
         await self.chat.show_banner("Options updated", timeout=2)
         self.chat.refresh_command_menu()
         self.chat.query_one("#input").focus()
