@@ -316,9 +316,19 @@ class ChatUI(App):
             await self.controller.handle_submit()
 
     async def refresh_kaplumbebek(self):
-        for s in self.screen_stack:
+        try:
+            s = self.screen
             if isinstance(s, KaplumbebekScreen):
                 await s._reload_history()
+                return
+        except Exception:
+            pass
+        for s in self.screen_stack:
+            if isinstance(s, KaplumbebekScreen):
+                try:
+                    await s._reload_history()
+                except Exception:
+                    pass
                 break
 
     async def on_click(self, event: Click):

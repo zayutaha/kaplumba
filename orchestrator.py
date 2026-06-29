@@ -67,13 +67,15 @@ class Orchestrator:
             await self.chat.show_banner("Use Ctrl+O to open Kaplumbebek", timeout=2)
             return
 
+        if user_text == "/clear":
+            self.kaplumbebek_history.clear()
+            await self.chat.refresh_kaplumbebek()
+
         if self.chat.busy or self.chat.loading or not self.port.running:
             return
 
         if user_text == "/clear":
-            self.kaplumbebek_history.clear()
             await self.chat.reset_chat()
-            await self.chat.refresh_kaplumbebek()
             if self.port.running:
                 try:
                     await self.port.send_command("/clear")
