@@ -86,6 +86,9 @@ A popup chat sidebar toggled with `Ctrl+O` that maintains a **completely separat
 ### Phoenix Resilience
 Kaplumba runs the model in an **isolated subprocess** with its own stdin/stdout protocol. If the model crashes (transient OOM, segfault, or cosmic ray), the UI stays up. It auto-retries loading **3 times** before showing a dialog. You can switch models without restarting the app. SIGINT is relayed reliably for clean interruption. Think of it as a bulletproof vest for your inference engine.
 
+### LiveTune Sampling
+Change temperature, top-p, top-k, max tokens, and prefill step size on the fly via `/options` — **no model reload needed**. The new values take effect immediately on the next generation. Cache-affecting options like TurboQuant bits still reload, but your daily knobs are instant.
+
 ### Message Selection & Copy
 **Ctrl+click** any message bubble to instantly copy its text. **Ctrl+Alt+click** copies the raw unformatted text (LaTeX source). A brief gold flash confirms the copy.
 
