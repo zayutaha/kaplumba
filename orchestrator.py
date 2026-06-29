@@ -242,13 +242,37 @@ class Orchestrator:
             return
         personality = get_model_personality(self.selected_model)
         save_model_config(self.selected_model, options, personality)
+        old_options = dict(self.model_options)
         self.model_options = get_model_options(self.selected_model)
-        if self.port.running:
+
+        if not self.port.running:
+            self.chat.show_model_selector()
+            return
+
+        # Options that require a full restart
+        restart_keys = {"turbo_kv_bits", "turbo_fp16_layers", "max_kv_size"}
+        needs_restart = any(
+            old_options.get(k) != self.model_options.get(k)
+            for k in restart_keys
+        )
+
+        if needs_restart:
             self.chat.show_model_loading("Reloading model...")
             await self.port.stop()
             await self._load_model()
             return
-        self.chat.show_model_selector()
+
+        # Apply runtime-changeable options live
+        for key in ("temp", "top_p", "top_k", "max_tokens", "prefill_step_size"):
+            if old_options.get(key) != self.model_options.get(key):
+                try:
+                    await self.port.send_command(f"/set_option {key}={self.model_options[key]}")
+                except Exception:
+                    pass
+
+        await self.chat.show_banner("Options updated", timeout=2)
+        self.chat.refresh_command_menu()
+        self.chat.query_one("#input").focus()
 
     async def handle_model_config_saved(self, model_name: str, config: dict) -> None:
         options = config.get("options", {})

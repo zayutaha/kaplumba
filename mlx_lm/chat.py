@@ -793,6 +793,33 @@ def main():
                 args.mtp = not args.mtp
                 rprint(f"[INFO] MTP {'enabled' if args.mtp else 'disabled'}")
                 continue
+
+            # Handle /set_option — update sampling args at runtime
+            if query.startswith("/set_option "):
+                try:
+                    rest = query[len("/set_option "):]
+                    key, value_str = rest.split("=", 1)
+                    key = key.strip()
+                    value_str = value_str.strip()
+                    if not hasattr(args, key):
+                        rprint(f"[ERROR] Unknown option: {key}")
+                        continue
+                    current = getattr(args, key)
+                    if current is None:
+                        rprint(f"[ERROR] Cannot set None option: {key}")
+                        continue
+                    if isinstance(current, bool):
+                        setattr(args, key, value_str.lower() in ("true", "1", "yes"))
+                    elif isinstance(current, int):
+                        setattr(args, key, int(value_str))
+                    elif isinstance(current, float):
+                        setattr(args, key, float(value_str))
+                    else:
+                        setattr(args, key, type(current)(value_str))
+                    rprint(f"[INFO] Option {key} set to {getattr(args, key)}")
+                except Exception as e:
+                    rprint(f"[ERROR] Failed to set option: {e}")
+                continue
             
             # Check for /think prefix to enable thinking for this message
             thinking_kwargs = dict(chat_template_kwargs)
