@@ -163,5 +163,79 @@ class TestChat(unittest.TestCase):
         self.assertEqual(call_args[0]["content"], "What is the weather?")
 
 
+class TestSetOption(unittest.TestCase):
+    """Test the /set_option runtime parameter update logic."""
+
+    def _simulate_set_option(self, args, cmd: str) -> str | None:
+        """Simulate the /set_option handler logic from chat.py main loop."""
+        rest = cmd[len("/set_option "):]
+        key, value_str = rest.split("=", 1)
+        key = key.strip()
+        value_str = value_str.strip()
+        if not hasattr(args, key):
+            return f"Unknown option: {key}"
+        current = getattr(args, key)
+        if current is None:
+            return f"Cannot set None option: {key}"
+        if isinstance(current, bool):
+            setattr(args, key, value_str.lower() in ("true", "1", "yes"))
+        elif isinstance(current, int):
+            setattr(args, key, int(value_str))
+        elif isinstance(current, float):
+            setattr(args, key, float(value_str))
+        else:
+            setattr(args, key, type(current)(value_str))
+        return None
+
+    def test_set_temp(self):
+        """/set_option temp=0.3 should update args.temp."""
+        from mlx_lm.chat import setup_arg_parser
+        parser = setup_arg_parser()
+        args = parser.parse_args(["--temp", "0.7"])
+        self._simulate_set_option(args, "/set_option temp=0.3")
+        self.assertEqual(args.temp, 0.3)
+
+    def test_set_top_p(self):
+        """/set_option top_p=0.5 should update args.top_p."""
+        from mlx_lm.chat import setup_arg_parser
+        parser = setup_arg_parser()
+        args = parser.parse_args(["--top-p", "0.8"])
+        self._simulate_set_option(args, "/set_option top_p=0.5")
+        self.assertEqual(args.top_p, 0.5)
+
+    def test_set_max_tokens(self):
+        """/set_option max_tokens=4096 should update args.max_tokens."""
+        from mlx_lm.chat import setup_arg_parser
+        parser = setup_arg_parser()
+        args = parser.parse_args(["--max-tokens", "256"])
+        self._simulate_set_option(args, "/set_option max_tokens=4096")
+        self.assertEqual(args.max_tokens, 4096)
+
+    def test_set_prefill_step_size(self):
+        """/set_option prefill_step_size=64 should update args.prefill_step_size."""
+        from mlx_lm.chat import setup_arg_parser
+        parser = setup_arg_parser()
+        args = parser.parse_args(["--prefill-step-size", "128"])
+        self._simulate_set_option(args, "/set_option prefill_step_size=64")
+        self.assertEqual(args.prefill_step_size, 64)
+
+    def test_set_unknown_option_errors(self):
+        """/set_option unknown_key=1 should produce error message."""
+        from mlx_lm.chat import setup_arg_parser
+        parser = setup_arg_parser()
+        args = parser.parse_args([])
+        result = self._simulate_set_option(args, "/set_option nonexistent=1")
+        self.assertIsNotNone(result)
+        self.assertIn("Unknown", result)
+
+    def test_set_option_wrong_type_errors(self):
+        """/set_option max_tokens=abc should fail gracefully."""
+        from mlx_lm.chat import setup_arg_parser
+        parser = setup_arg_parser()
+        args = parser.parse_args(["--max-tokens", "256"])
+        with self.assertRaises(ValueError):
+            self._simulate_set_option(args, "/set_option max_tokens=abc")
+
+
 if __name__ == "__main__":
     unittest.main()

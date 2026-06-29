@@ -820,6 +820,12 @@ def main():
                 except Exception as e:
                     rprint(f"[ERROR] Failed to set option: {e}")
                 continue
+
+            # Handle /params — show current sampling parameters
+            if query == "/params":
+                rprint(f"[INFO] temp={args.temp} top_p={args.top_p} top_k={args.top_k} "
+                       f"max_tokens={args.max_tokens} prefill_step_size={args.prefill_step_size}")
+                continue
             
             # Check for /think prefix to enable thinking for this message
             thinking_kwargs = dict(chat_template_kwargs)
