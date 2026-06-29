@@ -270,10 +270,8 @@ class Orchestrator:
                 except Exception:
                     pass
 
-        self.chat.query_one("#options-selector-container").display = False
+        self.chat.show_chat_ui()
         await self.chat.show_banner("Options updated", timeout=2)
-        self.chat.refresh_command_menu()
-        self.chat.query_one("#input").focus()
 
     async def handle_model_config_saved(self, model_name: str, config: dict) -> None:
         options = config.get("options", {})

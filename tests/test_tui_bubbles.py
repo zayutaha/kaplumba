@@ -71,13 +71,13 @@ class TestCopyableMarkdown(unittest.TestCase):
 
 class TestOptionsLiveUpdate(unittest.IsolatedAsyncioTestCase):
 
-    def test_handle_options_hides_container(self):
-        """handle_options_selected should hide #options-selector-container."""
+    def test_handle_options_shows_chat_ui(self):
+        """handle_options_selected should call show_chat_ui after applying."""
         import orchestrator
         import inspect
         src = inspect.getsource(orchestrator.Orchestrator.handle_options_selected)
-        self.assertIn("options-selector-container", src,
-                      "should hide options container after applying")
+        self.assertIn("show_chat_ui", src,
+                      "should restore chat UI after applying options")
 
     def test_handle_options_sends_set_option_for_runtime_keys(self):
         """handle_options_selected should send /set_option for temp/top_p/etc."""
