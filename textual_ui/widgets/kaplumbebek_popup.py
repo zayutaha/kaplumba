@@ -160,6 +160,17 @@ class KaplumbebekScreen(Screen):
             return
         self._input.clear()
 
+        # Handle /clear inside the popup
+        if text == "/clear":
+            self.app.controller.kaplumbebek_history.clear()
+            self._chat.remove_children()
+            try:
+                await self.app.controller.port.send_command("/kaplumbebek /clear")
+            except Exception:
+                pass
+            self._input.focus()
+            return
+
         await self._add_bubble(text, "user")
         self.app.controller.kaplumbebek_history.append({"role": "user", "content": text})
         self._streaming = True
