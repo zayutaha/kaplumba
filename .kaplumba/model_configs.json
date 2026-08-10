@@ -1,0 +1,70 @@
+{
+  "Qwen3.8-27B-AWQ-4.85bpw": {
+    "options": {
+      "enable_thinking": false,
+      "max_kv_size": null,
+      "max_tokens": 16384,
+      "min_p": 0.0,
+      "mtp": true,
+      "prefill_step_size": 128,
+      "repetition_penalty": 1.0,
+      "temp": 0.7,
+      "top_k": 0,
+      "top_p": 0.8,
+      "turbo_fp16_layers": 8,
+      "turbo_kv_bits": 4
+    },
+    "personality": "default"
+  },
+  "Qwen3.8-27B-mxfp4": {
+    "options": {
+      "enable_thinking": false,
+      "max_kv_size": null,
+      "max_tokens": 16384,
+      "min_p": 0.0,
+      "mtp": true,
+      "prefill_step_size": 128,
+      "repetition_penalty": 1.0,
+      "temp": 0.7,
+      "top_k": 0,
+      "top_p": 0.8,
+      "turbo_fp16_layers": 2,
+      "turbo_kv_bits": null
+    },
+    "personality": "default"
+  },
+  "demo-model": {
+    "options": {
+      "enable_thinking": false,
+      "max_kv_size": null,
+      "max_tokens": 16384,
+      "min_p": 0.0,
+      "mtp": true,
+      "prefill_step_size": 128,
+      "repetition_penalty": 1.0,
+      "temp": 0.5,
+      "top_k": 0,
+      "top_p": 0.8,
+      "turbo_fp16_layers": 2,
+      "turbo_kv_bits": 3
+    },
+    "personality": "default"
+  },
+  "test-model": {
+    "options": {
+      "enable_thinking": false,
+      "max_kv_size": null,
+      "max_tokens": 16384,
+      "min_p": 0.0,
+      "mtp": true,
+      "prefill_step_size": 128,
+      "repetition_penalty": 1.0,
+      "temp": 0.8,
+      "top_k": 0,
+      "top_p": 0.8,
+      "turbo_fp16_layers": 2,
+      "turbo_kv_bits": 3
+    },
+    "personality": "default"
+  }
+}
