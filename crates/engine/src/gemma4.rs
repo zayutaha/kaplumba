@@ -2425,4 +2425,102 @@ mod tests {
             }
         }
     }
+
+    /// T4.0 decode baseline (rows=1, device KV, T4.2 pipeline): forward-only
+    /// and end-to-end tg/s plus the implied weight-stream rate. `eos=[]` so
+    /// the run always reaches `KAPLUMBA_DECODE_STEPS` (default 64).
+    /// Ignored by default: `KAPLUMBA_RUN_SLOW=1 cargo test -p kaplumba-engine
+    /// --release --lib -- --ignored --nocapture decode_throughput_slow`.
+    #[test]
+    #[ignore]
+    fn decode_throughput_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1 to run the real-model test");
+            return;
+        }
+        let Some(dir) = crate::testutil::artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let steps: usize = std::env::var("KAPLUMBA_DECODE_STEPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64);
+        let prompt: Vec<u32> = std::env::var("KAPLUMBA_SLOW_PROMPT")
+            .unwrap_or_else(|_| "2".into())
+            .split(',')
+            .map(|s| s.trim().parse().expect("token id"))
+            .collect();
+
+        let ctx = crate::metal_ctx::MetalContext::new().expect("metal context");
+        let model = crate::load::load_exl3(&ctx, &dir).expect("load artifact");
+        let gpu = crate::metal_linear::MetalLinear::new(&ctx).expect("metal linear");
+        let g = Gemma4Model::from_model(&model)
+            .expect("gemma cfg")
+            .with_gpu(&gpu);
+        assert!(g.gpu_enabled(), "decode baseline must run the GPU path");
+        let tk = crate::tokenizer::GemmaTokenizer::from_dir(&dir).ok();
+        let show = |ids: &[u32]| -> String {
+            tk.as_ref()
+                .and_then(|t| t.decode(ids).ok())
+                .unwrap_or_default()
+        };
+
+        let params = crate::generate::GenParams {
+            max_new: steps,
+            sample: crate::sampler::SampleParams::greedy(),
+            seed: 0,
+            eos: vec![],
+            layers: None,
+            use_kv: true,
+        };
+        let t0 = std::time::Instant::now();
+        let stats = crate::generate::generate(&g, &prompt, &params, |_| true).expect("decode run");
+        let wall = t0.elapsed().as_secs_f64();
+
+        assert!(stats.kv_cache, "device KV path required");
+        assert!(stats.cache_bytes > 0, "cache actually resident");
+        assert_eq!(stats.gen_tokens, steps, "eos=[] → full length");
+        assert!(stats.decode_steps > 0, "need decode steps");
+        assert!(
+            stats.tokens.iter().all(|t| (*t as usize) < g.cfg.vocab),
+            "sampled id outside vocab"
+        );
+
+        let fwd_ms = stats.decode_s / stats.decode_steps as f64 * 1e3;
+        let host_s = (wall - stats.prefill_s - stats.decode_s).max(0.0);
+        let host_ms = host_s / stats.decode_steps as f64 * 1e3;
+        let e2e = stats.decode_steps as f64 / (stats.decode_s + host_s);
+        // Resident weights per full forward: artifact shards measured 16.028 GB
+        // (trellis + had/svh tables + embed + lm_head); every token streams them.
+        let bytes_per_tok = 16.028e9;
+        let gbs = bytes_per_tok / (fwd_ms / 1e3) / 1e9;
+
+        eprintln!(
+            "[T4.0] prefill {:.1} ms ({:.1} t/s) | prompt {:?}",
+            stats.prefill_s * 1e3,
+            stats.pp_tps(),
+            show(&prompt)
+        );
+        eprintln!(
+            "[T4.0] decode forward-only {fwd_ms:.1} ms/token → {:.2} t/s",
+            stats.tg_tps()
+        );
+        eprintln!("[T4.0] host between tokens {host_ms:.2} ms/token (sample+convert+submit)");
+        eprintln!("[T4.0] end-to-end decode {e2e:.2} t/s");
+        eprintln!(
+            "[T4.0] implied weight stream {gbs:.1} GB/s ({:.3} GB/token)",
+            bytes_per_tok / 1e9
+        );
+        eprintln!(
+            "[T4.0] decoded[0..8] {:?} | text {:?}",
+            &stats.tokens[..stats.tokens.len().min(8)],
+            show(&stats.tokens[..stats.tokens.len().min(32)])
+        );
+        assert!(
+            stats.tg_tps() > 0.5,
+            "decode below 0.5 t/s — pipeline broken ({:.2})",
+            stats.tg_tps()
+        );
+    }
 }

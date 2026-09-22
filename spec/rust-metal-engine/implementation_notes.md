@@ -532,7 +532,26 @@ Cross-checks:
 
 **Budget detail (confirms small-N starvation — next lever):** L0 q (512 out) 4.46 ms, k 2.57, v 2.41, o 4.50; L5 q (1024 out) 8.52, k (128 out) **1.43**, o (K=8192) 8.72; gate/up/down ≈ 11.8 each. k at 0.97 TF (64 TGs) vs gate 5.5 TF (1344 TGs) — K-split across grid.z + partial-sum reduce targets exactly this (~600 ms/chunk → ~110 t/s).
 
-**Order of next levers:** (1) small-N K-split (T3.10, ~600 ms) → (2) glue/fusion audit (114 ms + attn 71) → (3) stop, re-report the 200 pp/s conflict with end-to-end numbers (best-case ~116 t/s at the measured 6.3 TF MMA wall) → (4) decode track toward 18 t/s → MTP only after 18 + 100% coherency.
+**Order of next levers:** (1) small-N K-split (T3.10, ~600 ms) → (2) glue/fusion audit (114 ms + attn 71) → (3) stop, re-report the 200 pp/s conflict with end-to-end numbers (best-case ~116 t/s at the measured 6.3 TF MMA wall) → (4) decode track toward 18 t/s → MTP only after 18 + 100% coherency. *(K-split estimate STALE after T3.9: budget shows k/v/o already at 4.0–5.3 TF, not 0.97 — gains there ≈ 50–150 ms, not 600. Prefill levers now: residual funnel ~12%, structure-to-ceiling ~14%, glue 114 ms.)*
+
+## T4.0 — decode baseline (2026-09-23)
+
+**Test:** `decode_throughput_slow` (`gemma4.rs`, gated + `#[ignore]`): real artifact, `MetalLinear::new` + `.with_gpu`, device KV, greedy, `eos=[]`, `KAPLUMBA_DECODE_STEPS` default 64.
+
+**Baseline (release, M4 Pro):**
+- decode forward-only **155.6 ms/token → 6.42 t/s**
+- host between tokens **0.26 ms/token** (sample + f16→f32 + softcap + submit — negligible; T4.2 single-cb + shared-mode logits confirmed working)
+- end-to-end decode **6.41 t/s** (host adds nothing measurable)
+- implied weight stream **103.0 GB/s** at 16.028 GB/token ≈ **38% of the 273 GB/s rating**
+- first forward 3822 ms = one-time Metal residency + shader warm-up (T2.1's known ~0.8–1.5 s/buffer cost, inside TTFT — move to load-time warm-up under T2.2)
+- decoded ids start `236773` (fixture ✓); bare `[2]` prompt → expected gibberish text
+
+**Gotcha (cost 10 min):** first run timed out with no output — test forgot `.with_gpu()`, so `forward_cached_layers` silently fell back to the **CPU host path** (~0.18 t/s → 64 steps ≈ 6 min). Always `assert!(g.gpu_enabled())` in GPU perf tests.
+
+**Walls (for the 18 t/s conflict report):**
+- bandwidth: 15.5–16.0 GB ÷ 273 GB/s ≈ **17.6 t/s at 100% efficiency** → the 18 target is above rated bandwidth *before any ALU* (plan's own roofline was 17.6)
+- T2.3 ops ceiling: 350–450 Gw/s for the current gemv algorithm ≈ **9–12 t/s**
+- today 6.42 → plausible plain-decode ceiling **~9–12 t/s** after gemv ops-count work; **18 requires MTP/verify-batch** (Phase 4 T4.4/T4.6: rows=k amortize decode ops/weight below 5) — but the user gate sequences MTP *after* 18 via plain decode → circular; surface alongside the 200 pp/s conflict
 
 ## T4.2 — one command buffer per decode token (2026-09-22)
 

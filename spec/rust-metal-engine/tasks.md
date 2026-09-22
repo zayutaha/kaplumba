@@ -194,6 +194,15 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 
 ## Phase 4 — Decode amplification
 
+### T4.0 — Decode baseline (end-to-end tg/s + bandwidth)
+- [x] Gated test `decode_throughput_slow` (`gemma4.rs`): real artifact + `MetalLinear::new` + `.with_gpu` (first attempt forgot `with_gpu` → silently ran the ~0.18 t/s CPU path and timed out — always `assert!(g.gpu_enabled())`), device KV (T4.2 path), greedy, `eos=[]`, 64 steps
+- [x] **Baseline (release, M4 Pro):** decode forward-only **155.6 ms/token → 6.42 t/s**; host between tokens **0.26 ms** (sample+convert+submit — negligible, T4.2 single-cb + shared logits confirmed); end-to-end **6.41 t/s**; implied weight stream **103.0 GB/s** (16.028 GB/token vs ~273 rated); first forward 3822 ms = one-time Metal residency/shader warm-up (T2.1 open item inside TTFT); decoded starts `236773` (fixture ✓), text from bare `[2]` prompt is expected gibberish
+- [x] **Walls:** bandwidth roofline 15.5–16.0 GB ÷ 273 GB/s ≈ **17.6 t/s** (18 target is above rated bandwidth before any ALU); T2.3 ops ceiling 350–450 Gw/s ≈ **9–12 t/s** for the current gemv algorithm; today 6.42 → headroom to T2.3 ceiling via gemv/ops-count work, then 18 needs MTP/verify-batch (Phase 4) or a lifted gate — surface with the 200 pp/s conflict in the end-of-track report
+- Files: `crates/engine/src/gemma4.rs` (tests), `spec/rust-metal-engine/tasks.md`
+- Test: `KAPLUMBA_RUN_SLOW=1 cargo test -p kaplumba-engine --release --lib -- --ignored --nocapture decode_throughput_slow`
+- Target: profile-before-machinery (spec §8); input to the 18 t/s conflict report
+- Commit: `spec/rust-metal-engine: T4.0 decode baseline`
+
 ### T4.1 — Sibling fusion (qkv, gated gate+up)
 - [ ] Topology-guarded fusion; thresholds measured on M4 Pro
 - Test: tg/s up or neutral; wrong-fusion guard unit test; golden outputs
