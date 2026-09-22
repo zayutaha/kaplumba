@@ -8,7 +8,10 @@ Append as work proceeds (AGENTS.md §5). Dense, factual, takeover-oriented. Cont
 - Open questions **all closed** (interviews 2026-09-22) — see spec.md table (OQ1–OQ11).
 - Companion spec: `spec/paged-kv-cache` (being rewritten for Rust) — coordinate at Phase 5 hooks only.
 - Superseded: `spec/omlx-exl3-engine/` (stub).
-- **T1.0 done** (2026-09-22): workspace + `metal` 0.33.0 + GPU fill smoke. Next: T0.2 baseline (reference-only) or T1.1 loader.
+- **T1.0 done** (2026-09-22): workspace + `metal` 0.33.0 + GPU fill smoke.
+- **T1.1 done** (2026-09-22): EXL3 loader — per-shard Metal buffers, stream via 8 MiB stage. Real artifact: **2422 tensors / 2 shards / 16.028 GB / ~4s**, 7/7 tests. Next: T1.2 tokenizer (or T0.2 baseline).
+- DE25 (T1.1): Single ~16 GiB `new_buffer` failed (null contents → SIGABRT on drop). Fix = one shared buffer per safetensors shard (~8.5 + ~7.5 GB). Null-check after alloc; `LoadError::Alloc`.
+- DE26 (T1.1): Load layout = original safetensors data offsets within each shard buffer (seek `8+header_len+data_offset`, copy to same offset) — no repack.
 
 ## Decisions (carried + new)
 
@@ -99,6 +102,7 @@ Append as work proceeds (AGENTS.md §5). Dense, factual, takeover-oriented. Cont
 ## Commands
 
 - Rust build/test/smoke (T1.0+): `cargo build` · `cargo test -p kaplumba-engine` · `cargo run -p kaplumba-cli -- metal-smoke`
+- Load real artifact test: `cargo test -p kaplumba-engine load_real_artifact -- --nocapture` (skips if `~/.kaplumba/models/Gxma/Gxma` absent; override with `KAPLUMBA_MODEL_DIR`)
 - Reference baseline (Python, temporary): `.venv-baseline/bin/python scripts/bench.py ~/.kaplumba/models/Gxma/Gxma --backend ponyexl3 --json /tmp/bench.json`
 - Reference CLI: `.venv-baseline/bin/ponyexl3-generate-bench --prefill-sizes 1024,8192 --gen-tokens 64 --warmup --raw --json`
 - Rust generate (from T1.4): `cargo run -p kaplumba-cli -- generate ...`

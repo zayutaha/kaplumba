@@ -35,9 +35,9 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - Commit: `spec/rust-metal-engine: T1.0 workspace + metal bindings`
 
 ### T1.1 — EXL3 artifact loader
-- [ ] Stream `~/.kaplumba/models/Gxma/Gxma` shards into device memory; no duplicate host copies at steady state; quant_config parsed; resident size report
-- Files: `crates/engine/src/load/*`
-- Test: load succeeds; footprint ≈ 15.5–16.5 GB class; corrupt/missing shard errors cleanly
+- [x] Stream `~/.kaplumba/models/Gxma/Gxma` shards into Metal buffers (per-shard shared allocs; single ~16 GiB buffer rejected by Metal → **2 shard buffers**); no duplicate host copy at steady state; quant_config parsed; resident size report
+- Files: `crates/engine/src/load.rs`
+- Test: `cargo test -p kaplumba-engine` 7/7; real artifact: **2422 tensors / 2 shards / 16.028 GB / ~4s**; corrupt/missing shard/config errors unit-tested
 - Commit: `spec/rust-metal-engine: T1.1 exl3 loader`
 
 ### T1.2 — Tokenizer wire-up
