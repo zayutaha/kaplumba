@@ -1,0 +1,10 @@
+[package]
+name = "kaplumba-engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Pure-Rust + raw-Metal single-user Gemma 4 31B inference engine (EXL3)"
+
+[dependencies]
+metal.workspace = true
+thiserror.workspace = true

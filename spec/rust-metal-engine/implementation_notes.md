@@ -8,6 +8,7 @@ Append as work proceeds (AGENTS.md §5). Dense, factual, takeover-oriented. Cont
 - Open questions **all closed** (interviews 2026-09-22) — see spec.md table (OQ1–OQ11).
 - Companion spec: `spec/paged-kv-cache` (being rewritten for Rust) — coordinate at Phase 5 hooks only.
 - Superseded: `spec/omlx-exl3-engine/` (stub).
+- **T1.0 done** (2026-09-22): workspace + `metal` 0.33.0 + GPU fill smoke. Next: T0.2 baseline (reference-only) or T1.1 loader.
 
 ## Decisions (carried + new)
 
@@ -32,6 +33,9 @@ Append as work proceeds (AGENTS.md §5). Dense, factual, takeover-oriented. Cont
 - DE19: PonyExl3 Python converter CLI remains as **offline build-time** tool only.
 - DE20: `scripts/bench.py` (Python) is a **temporary** T0 harness — retire at T0.2/R7.4; baseline numbers **reference-only** (measure PonyExl3, not us).
 - DE21: New spec folder `rust-metal-engine`; `omlx-exl3-engine` superseded; `paged-kv-cache` fully rewritten for Rust.
+- DE22 (T1.0): Workspace = `crates/engine` (lib) + `crates/cli` (bin `kaplumba-engine`); root package `kaplumba` removed (hello-world `src/` deleted). Edition **2024** (rustc 1.95.0-nightly).
+- DE23 (T1.0): Metal binding = **`metal` 0.33.0** (workspace dep). Chosen for mature compute API (`dispatch_threads`, `new_library_with_source`, shared buffers). Caveat: crate docs mark it deprecated in favor of `objc2-metal` (0.3.2) — still “basic PRs maintained” while wgpu migrates; **revisit only if blocked**, do not churn mid-kernel-work. `objc2`/`objc2-metal` remain the long-term fallback (DE23 risk).
+- DE24 (T1.0): Shader path = **runtime MSL compile** (`Device::new_library_with_source`) for T1 smoke; switch to offline `xcrun metal -o *.metallib` in `build.rs` once kernels stabilize (T2+) to avoid first-token compile latency (R2.6).
 
 ## Environment (T0.3 — verified, carried)
 
@@ -94,9 +98,10 @@ Append as work proceeds (AGENTS.md §5). Dense, factual, takeover-oriented. Cont
 
 ## Commands
 
+- Rust build/test/smoke (T1.0+): `cargo build` · `cargo test -p kaplumba-engine` · `cargo run -p kaplumba-cli -- metal-smoke`
 - Reference baseline (Python, temporary): `.venv-baseline/bin/python scripts/bench.py ~/.kaplumba/models/Gxma/Gxma --backend ponyexl3 --json /tmp/bench.json`
 - Reference CLI: `.venv-baseline/bin/ponyexl3-generate-bench --prefill-sizes 1024,8192 --gen-tokens 64 --warmup --raw --json`
-- Rust (from T1.0): `cargo build`, `cargo test`, `cargo run -p kaplumba-cli -- generate ...` (exact names TBD in T1.0/T1.4)
+- Rust generate (from T1.4): `cargo run -p kaplumba-cli -- generate ...`
 
 ## Handover checklist
 

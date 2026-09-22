@@ -1,0 +1,13 @@
+[package]
+name = "kaplumba-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI for the kaplumba Rust/Metal engine"
+
+[[bin]]
+name = "kaplumba-engine"
+path = "src/main.rs"
+
+[dependencies]
+kaplumba-engine = { path = "../engine" }

@@ -29,9 +29,9 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 ## Phase 1 — Rust skeleton
 
 ### T1.0 — Workspace + Metal binding choice
-- [ ] Cargo workspace layout; choose + pin Metal binding crate(s) and shader build path; document in notes
-- Files: `Cargo.toml`, `crates/*` skeleton, build script for `.metal`
-- Test: `cargo build`; triangle/clear-buffer smoke on M4 Pro
+- [x] Cargo workspace layout; Metal binding crate pinned: **`metal` 0.33.0** (gfx-rs; API checked against registry sources); shader path T1.0 = runtime `new_library_with_source` (offline `.metal`→`.metallib` via `xcrun metal` deferred to T2 when kernels stabilize); documented in notes
+- Files: root `Cargo.toml` (workspace), `crates/engine`, `crates/cli`, `crates/engine/src/metal_ctx.rs`
+- Test: `cargo build` OK; `cargo test -p kaplumba-engine` (2 pass); `cargo run -p kaplumba-cli -- metal-smoke` → OK on M4 Pro
 - Commit: `spec/rust-metal-engine: T1.0 workspace + metal bindings`
 
 ### T1.1 — EXL3 artifact loader
