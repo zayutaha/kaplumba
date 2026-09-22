@@ -175,6 +175,16 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - Target: R2.1 (pp/s), profile-before-machinery (spec §8)
 - Commit: `spec/rust-metal-engine: T3.8 sg ceiling/decode-tax probe`
 
+### T3.9 — sg funnel register-pressure fix (20.1% gem tax)
+- [x] **C-spill hypothesis REFUTED:** implemented the planned threadgroup `csave` spill (16 KB, per-sgid slots, same 2-barrier structure, lossless f32) — gate-shape real sg got **worse: 11.786 → 18.333 ms, tax 20.1% → 48.7%** (the `simdgroup_store/load` round-trip + pushing TG footprint 5.5 → 21.6 KB cost more than the presumed stack spills, or evicted wblk from fast TG memory). Reverted via `git checkout`
+- [x] **What worked — phase-split funnel fill:** issue **all 32 global loads** of the stage first (independent addresses → memory-level parallelism, 32 `uint` temps `la0/lb0/la1/lb1`), then shift/decode/`wblk`-write as pure ALU. Same loads, same wblk entries → bit-identical. Result: real sg 11.786 → **10.740 ms = 5.51 TFLOP/s; funnel tax 20.1% → 12.0%** (ceiling stable ~9.44). j-outer variant (16 temps, 12.4%) = noise-equal; kept the 32-temp deeper-MLP form
+- [x] **Verify:** kernels 18; fast engine 113; full gated **113 passed / 0 failed / 3 ignored** (fixture 236773, span 0.55, batched-vs-gemv unchanged → bit-identity confirmed); budget linears **3249 → 2900 ms** (chunk 3092 = 2900+114+71+6); prefill bench **86.8 / 79.5 / 71.0 t/s @ 512 / 2048 / 8192** (was 77.8 / 72.3 / 65.0 → +12% / +10% / +9%)
+- Residual 12.0% tax ≈ funnel address/shift ALU vs ceiling's simple loads — marginal levers only; stop here. Remaining levers ranked: small-N K-split (~600 ms → ~110 t/s) > glue fusion (114 ms) > residual funnel (~190 ms)
+- Files: `crates/kernels/src/exl3.metal` (fill loop of `exl3_gemm_sg` only)
+- Test: gate-shape probe + CPU-ref + both engine suites + bench
+- Target: R2.1 (pp/s), no quality loss (bit-identical gate)
+- Commit: `spec/rust-metal-engine: T3.9 sg fill register-pressure fix`
+
 ### T3.7 — Bounded prefill scratch + peak-RSS gate (user directive 2026-09-22)
 - [~] Kernel half **done**: attention is online-softmax over KV tiles with an O(1) working set — running max/denominator/output accumulators and one 16-entry score tile all live in **registers**, the slice reduction is `simd_shuffle_xor`, and the kernel allocates **no** threadgroup memory and uses **no** barriers. There is no `[heads, L, L]` score matrix, no `[heads, q, kv]` bias tensor, and no growable scratch anywhere in the attention path
 - [ ] Remaining (blocked on the batched prefill path T3.2/T5.1): the CLI-side proof — measured peak RSS / Metal footprint at **1024 / 2048 / 8192** prefill tokens, ≥3 repeats each, asserted to grow by ≤ (KV bytes for that length + fixed constant), recorded here and in the `kaplumba-bench/1` report

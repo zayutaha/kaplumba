@@ -481,17 +481,37 @@ kernel void exl3_gemm_sg(device const half *xh [[buffer(0)]],
     for (uint ks = 0u; ks < stages; ks++) {
         // Previous stage's B fragment loads must finish before overwrite.
         threadgroup_barrier(mem_flags::mem_threadgroup);
+        // T3.9 phase-split funnel: issue all 32 global loads for the stage
+        // back-to-back (independent addresses → memory-level parallelism),
+        // then run the shift/decode/write phase as pure ALU. The old
+        // load-decode-load-decode chain exposed the ~300-cycle word-load
+        // latency serially while C's 32 f32/lane constrained scheduling —
+        // the 20.1% tax T3.8 measured (real 11.79 vs ceiling 9.42, isolated
+        // fill only 0.21 ms). Same loads, same order → bit-identical.
+        uint la0[8]; // it2 * 4 + lt, bit index 0
+        uint lb0[8];
+        uint la1[8]; // it2 * 4 + lt, bit index 1
+        uint lb1[8];
         for (uint it2 = 0u; it2 < 2u; it2++) {
             uint tk = ks * 2u + it2;
             for (uint lt = 0u; lt < 4u; lt++) {
-                device const uint *words =
-                    (device const uint *)trellis +
+                device const uint *words = (device const uint *)trellis +
                     ((ulong)tk * nout + ot0 + lt) * p.twords;
-                for (uint j = 0u; j < 2u; j++) {
-                    uint a = ld_word((device const ushort *)words, i0_[j], aligned);
-                    uint b = ld_word((device const ushort *)words, i1_[j], aligned);
-                    uint cw =
-                        (uint)((((ulong)a) << 32 | (ulong)b) >> sh_[j]) & 0xFFFFu;
+                uint g = it2 * 4u + lt;
+                la0[g] = ld_word((device const ushort *)words, i0_[0], aligned);
+                lb0[g] = ld_word((device const ushort *)words, i1_[0], aligned);
+                la1[g] = ld_word((device const ushort *)words, i0_[1], aligned);
+                lb1[g] = ld_word((device const ushort *)words, i1_[1], aligned);
+            }
+        }
+        for (uint j = 0u; j < 2u; j++) {
+            for (uint it2 = 0u; it2 < 2u; it2++) {
+                for (uint lt = 0u; lt < 4u; lt++) {
+                    uint g = it2 * 4u + lt;
+                    uint wa = j == 0u ? la0[g] : la1[g];
+                    uint wb = j == 0u ? lb0[g] : lb1[g];
+                    uint cw = (uint)((((ulong)wa) << 32 | (ulong)wb) >>
+                                     sh_[j]) & 0xFFFFu;
                     wblk[(it2 * 16u + 2u * rp + j) * SG_WS + lt * 16u + dcol] =
                         exl3_decode(cw, p.mode);
                 }

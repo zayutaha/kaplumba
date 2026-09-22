@@ -518,7 +518,21 @@ Cross-checks:
 - `plan.md` roofline "200 t/s ≈ 12.4 TFLOP/s" implicitly assumed ~16 TFLOP/s fp16 peak at ~78% eff; measured f16→f32 simdgroup rate is ~6.3. **Open conflict to surface to the user with this table — do not keep grinding GEMM micro-opts toward 200.**
 - Small-N TG starvation (part of why avg = 3.7 < gate's 5.0): k/v out_tiles give only 64/64 TGs (k runs 0.97 TF), q/o 256 TGs (2.1 TF), gate/up/down 1344 TGs (4.9–5.0). K-split across grid.z with a partial-sum reduce would lift these (~600 ms/chunk) — second lever after the tax fix.
 
-**Next steps (ordered):** (1) C-spill funnel-tax fix → expect linears −648 ms → **~86 t/s**; verify with gate-shape probe (real sg ≈ ceiling) + full gated suite + prefill bench; (2) small-N K-split → ~110; (3) glue/fusion audit → maybe ~115; (4) stop, re-report the 200 conflict with end-to-end numbers; (5) switch to decode track (18 t/s target — plan roofline 17.6 from weight bandwidth; MTP gate stays closed until 18 + coherency).
+**Next steps (ordered):** (1) C-spill funnel-tax fix → expect linears −648 ms → **~86 t/s**; verify with gate-shape probe (real sg ≈ ceiling) + full gated suite + prefill bench; (2) small-N K-split → ~110; (3) glue/fusion audit → maybe ~115; (4) stop, re-report the 200 conflict with end-to-end numbers; (5) switch to decode track (18 t/s target — plan roofline 17.6 from weight bandwidth; MTP gate stays closed until 18 + coherency). *(Step 1 executed as T3.9 — spill refuted, phase-split fill won; see below.)*
+
+## T3.9 — funnel phase-split fill (2026-09-23)
+
+**Experiment A — C-spill to threadgroup memory: REFUTED (dead end, do not retry).** Implemented exactly the T3.8-hypothesized fix: `threadgroup float csave[4*16*64]` (16 KB, each simdgroup owning slots `sgid*16..+16`, C stored after init and after each non-final stage's MMA, reloaded after the fill barrier; same 2-barrier structure; C live in registers for the final-stage store → bit-identical). Gate-shape result: real sg **11.786 → 18.333 ms (tax 20.1% → 48.7%)** — *worse than before*. Cause: the per-stage `simdgroup_store/load` round-trip plus pushing total TG footprint from 5.5 KB (wblk+csc) to 21.6 KB is costlier than any stack spills the original incurred (or it evicted wblk from a fast TG region). Reverted with `git checkout crates/kernels/src/exl3.metal`. **Invariant learned:** keep `exl3_gemm_sg`'s threadgroup footprint ≤ ~6 KB; do not add per-stage TG round-trips.
+
+**Experiment B — phase-split fill: KEPT.** Restructure of the fill loop only: issue **all 32 global trellis loads** of the stage back-to-back into `uint la0[8], lb0[8], la1[8], lb1[8]` (independent addresses → memory-level parallelism; the old interleaved load-decode chain exposed the ~300-cycle load latency serially under C's register pressure), then the shift/decode/`wblk`-write phase runs as pure ALU. Same loads, same wblk entries → bit-identical outputs. j-outer variant (only 16 temps live) measured 12.4% tax vs 32-temp's 12.0% — noise-equal, kept the deeper-MLP 32-temp form.
+
+**Measured after (release, gate shape):** real sg **10.740 ms = 5.51 TFLOP/s**, ceiling 9.455 ms = 6.26 TF, **funnel tax 20.1% → 12.0%** (1.29 ms residual ≈ funnel address/shift ALU vs ceiling's simple loads — marginal levers only, stop here).
+
+**Verification:** kernels 18 passed; fast engine suite 113; full gated suite **113 passed / 0 failed / 3 ignored** (fixture argmax 236773, span bound 0.55, batched-vs-gemv unchanged → bit-identity confirmed empirically); budget profile **linears 3249 → 2900 ms** (chunk = 2900 + glue 114 + attn 71 + head 6 = **3092 ms**); prefill bench → `/tmp/prefill_bench.log`: **86.8 / 79.5 / 71.0 t/s @ 512 / 2048 / 8192** (T3.6 was 77.8 / 72.3 / 65.0 → +12% / +10% / +9%).
+
+**Budget detail (confirms small-N starvation — next lever):** L0 q (512 out) 4.46 ms, k 2.57, v 2.41, o 4.50; L5 q (1024 out) 8.52, k (128 out) **1.43**, o (K=8192) 8.72; gate/up/down ≈ 11.8 each. k at 0.97 TF (64 TGs) vs gate 5.5 TF (1344 TGs) — K-split across grid.z + partial-sum reduce targets exactly this (~600 ms/chunk → ~110 t/s).
+
+**Order of next levers:** (1) small-N K-split (T3.10, ~600 ms) → (2) glue/fusion audit (114 ms + attn 71) → (3) stop, re-report the 200 pp/s conflict with end-to-end numbers (best-case ~116 t/s at the measured 6.3 TF MMA wall) → (4) decode track toward 18 t/s → MTP only after 18 + 100% coherency.
 
 ## T4.2 — one command buffer per decode token (2026-09-22)
 
