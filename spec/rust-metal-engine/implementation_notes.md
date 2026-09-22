@@ -340,6 +340,51 @@ Also fixed while landing this: `generate()`'s cached path honours `--layers`, an
 `KvCache::new` allocates per-layer capacity (sliding layers reserve only the
 window, so a 16k-context allocation does not reserve 8 GB for sliding layers).
 
+## Where the engine stands (2026-09-22, after T5.1)
+
+Commands that produced every number below (one 16 GB process at a time, I1):
+
+```bash
+cargo test                                                        # 131 tests, all green
+# real artifact, cached + GPU, greedy (release):
+cargo run --release -p kaplumba-cli -- generate --prompt "The meaning of life is" \
+  --max-tokens 4 --temp 0 --metal --kv-cache --json -
+# fixture re-validation (naive path, ~205 s):
+KAPLUMBA_RUN_SLOW=1 KAPLUMBA_SLOW_MODE=forward KAPLUMBA_SLOW_PROMPT=2 \
+  KAPLUMBA_SLOW_EXPECT=236773 cargo test --release -p kaplumba-engine \
+  --lib -- --nocapture --test-threads=1 real_artifact_greedy_slow
+```
+
+| metric | naive CPU | + Metal linears | + KV cache (now) | target |
+|---|---|---|---|---|
+| decode | ~0.18 t/s (5.58 s/token) | unusable (DE29: `rows > 1` ⇒ CPU) | **3.64 t/s**, flat in context | 18 t/s (roofline 17.6) |
+| prefill | ~0.18 t/s | — | 1.53 t/s (one row per token) | 200 t/s |
+| GPU linears / token | 0 | 0 or 1 | **3699 across 9 row-steps, i.e. all** | all |
+| KV resident | n/a | n/a | 9.0 MB at 9 tokens (~1 MB/token) | ≤1 GB |
+| fixture | 236773 / 29.9782 | — | **236773 / 29.9782 (exact)** | unchanged |
+
+Blocking work, in the order the measurements justify it:
+
+1. **One command buffer per token** (T4.2/T3.6). 471 command buffers per token ⇒
+   ~180 ms of the 275 ms steady-state token is submit/wait. This needs
+   device-resident activations plus kernels for the elementwise glue
+   (rms_norm, rope, gelu·up, residual, layer_scalar) rather than host loops,
+   i.e. the real "fixed-shape decode step". Expected: ~93 ms kernel + one sync
+   ⇒ ~8-10 t/s, and it speeds prefill identically.
+2. **Batched multi-row linear (T3.2).** Prefill is still one row per token; a
+   GEMM that amortises the trellis decode across columns is what converts the
+   measured 167 Gw/s single-row rate into hundreds of t/s of prompt throughput.
+   This is also the prerequisite for the T3.7 peak-RSS measurement
+   (1024/2048/8192), since 8k prefill cannot be expressed with one-row steps.
+3. **Kernel ops/weight** (T2.3 residue). At 18 t/s the model needs 15.5 GB in
+   55 ms = 280 GB/s > 273 GB/s peak, so 18 t/s is *at* the roofline: the honest
+   framing is "~15-16 t/s is the realistic ceiling for a single-pass decode",
+   and the spec's own answer for the rest is speculation (Phase 4, and this
+   artifact has **no MTP head** — checked the weight map — so it would have to be
+   n-gram/verify-gated drafting, T4.7).
+4. One-time Metal shard residency (~1 s) is still inside TTFT; load-time warm-up
+   is a small, honest fix for the TTFT number (T2.2).
+
 ## Invariants
 
 - I1: Single resident model; single-user; one agent session editing at a time.
