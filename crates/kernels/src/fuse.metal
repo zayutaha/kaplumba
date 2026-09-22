@@ -21,7 +21,9 @@ struct RmsParams {
 
 struct RopeParams {
     uint head_dim;
-    uint pos;
+    uint pos; // absolute position of row 0 (rows use pos + row)
+    uint rows;
+    uint row_stride; // elements per row (n_heads * head_dim)
 };
 
 // ---------------------------------------------------------------------------
@@ -80,7 +82,8 @@ kernel void kr_rms(device const half *x [[buffer(0)]],
 //
 // `o` may be a *KV cache row* (the caller passes a span already offset to the
 // target row), which is how a cached k is roped straight into the cache.
-// grid = n_heads * head_dim threads.
+// `rows` > 1 covers prefill: row r is roped at absolute position `pos + r`.
+// grid = rows * n_heads * head_dim threads.
 // ---------------------------------------------------------------------------
 kernel void kr_rope(device const half *x [[buffer(0)]],
                     device const float *ctab [[buffer(1)]],
@@ -90,13 +93,17 @@ kernel void kr_rope(device const half *x [[buffer(0)]],
                     uint i [[thread_position_in_grid]]) {
     const uint hd = p.head_dim;
     const uint hh = hd >> 1u;
-    const uint j = i % hd;
-    const uint lo = (i / hd) * hd;
+    const uint within = i % p.row_stride;
+    const uint row = i / p.row_stride;
+    const uint j = within % hd;
+    const uint lo = (within / hd) * hd;
     const uint kk = (j < hh) ? j : (j - hh);
-    const float c = ctab[(ulong)p.pos * hh + kk];
-    const float s = stab[(ulong)p.pos * hh + kk];
-    const float x1 = float(x[lo + kk]);
-    const float x2 = float(x[lo + kk + hh]);
+    const uint pos = p.pos + row;
+    const float c = ctab[(ulong)pos * hh + kk];
+    const float s = stab[(ulong)pos * hh + kk];
+    const ulong xr = (ulong)row * p.row_stride;
+    const float x1 = float(x[xr + lo + kk]);
+    const float x2 = float(x[xr + lo + kk + hh]);
     o[i] = (j < hh) ? (half)(x1 * c - x2 * s) : (half)(x1 * s + x2 * c);
 }
 

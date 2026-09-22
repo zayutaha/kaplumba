@@ -23,5 +23,5 @@ pub mod exl3;
 pub mod fuse;
 
 pub use attn::{ATTN_ROWS, AttnParams, Exl3Attention};
-pub use fuse::Fuse;
 pub use exl3::{DeviceSpan, Exl3Gemv, Exl3Shape, KernelError};
+pub use fuse::Fuse;

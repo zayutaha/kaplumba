@@ -334,6 +334,74 @@ impl KvCache {
         self.finish_token();
     }
 
+    /// Advance the shared token counter by `n` (batched prefill, T3.2).
+    pub(crate) fn end_tokens(&mut self, n: usize) {
+        self.len += n;
+    }
+
+    /// Reserve `n` rows at once (T3.2 batched prefill), rotating a full
+    /// sliding window down by the overflow in one memmove, and return
+    /// `(kv_pos0, kv_rows)` — the layer's key state **after** the whole batch
+    /// is accounted for. The new rows are the last `n` rows
+    /// (`kv_rows - n .. kv_rows`), which the K/V write passes then fill.
+    ///
+    /// `n` must be ≤ the sliding window limit: a batch bigger than the window
+    /// would need multiple rotations with undefined intermediate states.
+    pub fn reserve_rows(
+        &mut self,
+        cfg: &GemmaCfg,
+        i: usize,
+        pos0: usize,
+        n: usize,
+    ) -> Result<(usize, usize), GemmaError> {
+        self.check(cfg)?;
+        if n == 0 {
+            return Err(GemmaError::Config("reserve_rows(n=0)".into()));
+        }
+        let window = match cfg.layers[i].kind {
+            LayerKind::Sliding => cfg.sliding_window,
+            LayerKind::Full => 0,
+        };
+        let l = &mut self.layers[i];
+        if window == 0 {
+            if l.len + n > l.cap {
+                return Err(GemmaError::Config(format!(
+                    "layer {i}: kv cache full at {} rows (allocate a larger context)",
+                    l.cap
+                )));
+            }
+            l.len += n;
+        } else {
+            let limit = LayerKv::limit(window, l.cap);
+            if n > limit {
+                return Err(GemmaError::Config(format!(
+                    "layer {i}: batch of {n} rows exceeds the sliding window {limit}"
+                )));
+            }
+            if l.len + n > limit {
+                let d = l.len + n - limit;
+                let row = l.row;
+                let keep = (l.len - d) * row;
+                l.k.slice_mut(l.len * row)
+                    .copy_within(d * row..d * row + keep, 0);
+                l.v.slice_mut(l.len * row)
+                    .copy_within(d * row..d * row + keep, 0);
+                l.start += d;
+                l.len -= d;
+            }
+            l.len += n;
+        }
+        let (start, rows) = (l.start, l.len);
+        if start + rows != pos0 + n {
+            return Err(GemmaError::Config(format!(
+                "layer {i}: reserve_rows(pos0={pos0}, n={n}) but window covers {}..{}",
+                start,
+                start + rows - 1
+            )));
+        }
+        Ok((start, rows))
+    }
+
     /// Reserve the row for `pos` **without writing it**, for the GPU path where
     /// the row contents are produced by kernels (RoPE straight into the cache for
     /// k, a device copy for v).
@@ -509,6 +577,71 @@ mod tests {
         let err = kv
             .append_layer(&cfg, 0, &bad, &row(n, 0.0))
             .expect_err("row width mismatch must be rejected, not corrupt");
+        assert!(matches!(err, GemmaError::Config(_)), "got {err}");
+    }
+
+    /// Batched reserve: sliding layers rotate by the whole overflow at once and
+    /// report the same final `(start, rows)` a row-at-a-time append would; full
+    /// layers grow by `n`. An oversized batch (n > window) is rejected.
+    #[test]
+    fn reserve_rows_batches_match_row_at_a_time() {
+        let (_src, cfg) = cfg();
+        assert_eq!(cfg.sliding_window, 4);
+
+        // `one`: 7 rows one at a time, then +3 (overflow rotates by 3).
+        let mut one = KvCache::new(&cfg, 64);
+        for pos in 0..7 {
+            for i in 0..cfg.layers.len() {
+                one.reserve_rows(&cfg, i, pos, 1).expect("row reserve");
+            }
+            one.end_tokens(1);
+        }
+        for i in 0..cfg.layers.len() {
+            one.reserve_rows(&cfg, i, 7, 3).expect("one +3");
+        }
+        one.end_tokens(3);
+        assert_eq!(one.len(), 10);
+
+        // `batch`: the same 10 rows in chunks of 4, 3, 3 (4 fits the window,
+        // 4+3 overflows it and forces a multi-row rotation).
+        let mut batch = KvCache::new(&cfg, 64);
+        let mut bpos = 0usize;
+        for c in [4usize, 3, 3] {
+            for i in 0..cfg.layers.len() {
+                batch.reserve_rows(&cfg, i, bpos, c).expect("batch reserve");
+            }
+            batch.end_tokens(c);
+            bpos += c;
+        }
+        assert_eq!(bpos, 10);
+        assert_eq!(batch.len(), 10);
+
+        for i in 0..cfg.layers.len() {
+            let lc = &cfg.layers[i];
+            let ol = one.layer(i);
+            let bl = batch.layer(i);
+            assert_eq!(
+                (bl.start(), bl.len()),
+                (ol.start(), ol.len()),
+                "layer {i} batch vs row-at-a-time diverged"
+            );
+            match lc.kind {
+                LayerKind::Sliding => {
+                    assert_eq!(bl.len(), 4, "sliding window stays full");
+                    assert_eq!(bl.start(), 6, "positions 6..=9 retained");
+                }
+                LayerKind::Full => {
+                    assert_eq!(bl.len(), 10, "full layer keeps all rows");
+                    assert_eq!(bl.start(), 0);
+                }
+            }
+        }
+
+        // n > window must be rejected, not silently wrapped.
+        let mut kv = KvCache::new(&cfg, 64);
+        let err = kv
+            .reserve_rows(&cfg, 0, 0, 5)
+            .expect_err("batch larger than window");
         assert!(matches!(err, GemmaError::Config(_)), "got {err}");
     }
 }

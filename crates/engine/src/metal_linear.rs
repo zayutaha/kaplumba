@@ -384,13 +384,16 @@ impl MetalLinear {
         )
     }
 
-    /// One EXL3 linear, encoded into `enc` (`x`/`out` are whole device buffers).
+    /// One EXL3 linear, encoded into `enc` (`x`/`out` are whole device buffers
+    /// covering `[rows, in/out_features]`; `rows == 1` is the decode GEMV,
+    /// `rows >= 2` the batched prefill GEMM).
     pub fn encode_linear(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
         lin: &LinearHandles,
         x: &Buffer,
         out: &Buffer,
+        rows: usize,
     ) -> Result<(), MetalLinearError> {
         self.gemv.encode_linear(
             enc,
@@ -401,6 +404,7 @@ impl MetalLinear {
             out,
             lin.shape,
             lin.mode,
+            rows,
         )?;
         self.calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -434,9 +438,10 @@ impl MetalLinear {
         n_heads: usize,
         head_dim: usize,
         pos: usize,
+        rows: usize,
     ) -> Result<(), MetalLinearError> {
         self.fuse
-            .encode_rope(enc, x, cos, sin, out, n_heads, head_dim, pos)?;
+            .encode_rope(enc, x, cos, sin, out, n_heads, head_dim, pos, rows)?;
         Ok(())
     }
 
@@ -1115,6 +1120,89 @@ mod tests {
             .try_linear(&src, "l", &x)
             .unwrap();
         assert!(got.is_none(), "multi-row input must use the CPU path");
+    }
+
+    /// T3.2: the batched GEMM (`encode_linear`, rows ≥ 2) must match both the
+    /// CPU reference and M single-row GEMV dispatches on the same weights —
+    /// same per-row accumulation order, so the batched row and the GEMV row are
+    /// expected **bit-identical** (the strong version of "numerical closeness").
+    /// rows=17 > RGT(8) exercises the partial third row-chunk.
+    #[test]
+    fn gpu_gemm_rows_match_per_row_gemv_and_cpu() {
+        let Some(c) = ctx() else { return };
+        for (k, in_f, out_f, rows) in [
+            (3u32, 128usize, 128usize, 5usize),
+            (6, 256, 128, 3),
+            (3, 128, 256, 17),
+        ] {
+            let src = SynthGpuSource::build(c.device(), k, in_f, out_f);
+            let handles = linear_handles(&src, "l").expect("eligible");
+            let layer = src.linear();
+            let mut rng = Rng(0x6E_2026);
+            let x: Vec<f16> = (0..rows * in_f)
+                .map(|_| f16::from_f32(((rng.next() % 2001) as f32 / 1000.0) - 1.0))
+                .collect();
+            let ml = MetalLinear::new(&c).unwrap();
+            let f16_bytes = |v: &[f16]| unsafe {
+                std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2)
+            };
+            let new_buf = |bytes: &[u8]| {
+                c.device().new_buffer_with_data(
+                    bytes.as_ptr() as *const _,
+                    bytes.len().max(1) as u64,
+                    metal::MTLResourceOptions::StorageModeShared,
+                )
+            };
+
+            // One batched dispatch over all rows.
+            let xb = new_buf(f16_bytes(&x));
+            let yb = c.device().new_buffer(
+                (rows * out_f * 2) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let cb = ml.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            ml.encode_linear(enc, &handles, &xb, &yb, rows)
+                .expect("batched encode_linear");
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            let batched: Vec<f16> =
+                unsafe { std::slice::from_raw_parts(yb.contents() as *const f16, rows * out_f) }
+                    .to_vec();
+
+            for r in 0..rows {
+                let row_x = &x[r * in_f..(r + 1) * in_f];
+                let want_cpu = linear_forward_reconstruct(&layer, row_x);
+                let got = &batched[r * out_f..(r + 1) * out_f];
+                let err = max_rel_err(&want_cpu, got);
+                assert!(
+                    err < 5e-3,
+                    "k={k} {rows}x{in_f}x{out_f} row {r} vs CPU rel err {err}"
+                );
+
+                // Same row through the single-row GEMV (rows=1).
+                let xb1 = new_buf(f16_bytes(row_x));
+                let yb1 = c.device().new_buffer(
+                    (out_f * 2) as u64,
+                    metal::MTLResourceOptions::StorageModeShared,
+                );
+                let cb1 = ml.new_command_buffer();
+                let enc1 = cb1.new_compute_command_encoder();
+                ml.encode_linear(enc1, &handles, &xb1, &yb1, 1)
+                    .expect("row encode_linear");
+                enc1.end_encoding();
+                cb1.commit();
+                cb1.wait_until_completed();
+                let gemv: Vec<f16> =
+                    unsafe { std::slice::from_raw_parts(yb1.contents() as *const f16, out_f) }
+                        .to_vec();
+                assert_eq!(
+                    got, gemv,
+                    "k={k} {rows}x{in_f}x{out_f} row {r}: batched GEMM vs GEMV bits"
+                );
+            }
+        }
     }
 
     #[test]

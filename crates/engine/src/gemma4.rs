@@ -616,17 +616,29 @@ impl<'a> Gemma4Model<'a> {
     }
 
     /// Build the device decode pipeline on first use (`Ok(false)` = this model or
-    /// runner cannot use it, so the host path applies).
+    /// runner cannot use it, so the host path applies). Rebuilt when a later
+    /// cache is **larger** than the one the pipeline was built for — the RoPE
+    /// tables (and batch arena) are sized from the first `cache_cap`, so keeping
+    /// a small decoder would fail the table check on a longer prompt.
     fn ensure_decoder(
         &self,
         gpu: &crate::metal_linear::MetalLinear,
         cache_cap: usize,
     ) -> Result<bool, GemmaError> {
-        if self.decoder.borrow().is_some() {
-            return Ok(true);
-        }
         if self.decoder_unavailable.get() {
             return Ok(false);
+        }
+        {
+            let d = self.decoder.borrow();
+            if let Some(dec) = d.as_ref() {
+                if dec.built_cap >= cache_cap {
+                    return Ok(true);
+                }
+            }
+        }
+        if self.decoder.borrow().is_some() {
+            // Growing capacity: drop the too-small pipeline, rebuild below.
+            *self.decoder.borrow_mut() = None;
         }
         match crate::gpu_decode::GpuDecoder::new(self, gpu, cache_cap)? {
             Some(d) => {
@@ -1118,8 +1130,9 @@ impl<'a> Gemma4Model<'a> {
     ///
     /// Each token is one pass of `rows == 1` projections plus attention over the
     /// cached keys, so the per-token cost stops growing with the prefix (the
-    /// naive [`Self::forward_seq`] recomputes it). Prefill is still one token at
-    /// a time — batching it is the GEMM task (T3.2).
+    /// naive [`Self::forward_seq`] recomputes it). Prefill of `tokens.len() >= 2`
+    /// goes through the batched GEMM span (T3.2); a single token uses the tuned
+    /// per-token pipeline (T4.2).
     pub fn forward_cached(
         &self,
         cache: &mut KvCache,
@@ -1144,17 +1157,19 @@ impl<'a> Gemma4Model<'a> {
         // below (same maths, slower submission).
         if let Some(gpu) = self.gpu {
             if cache.is_device_backed() && self.ensure_decoder(gpu, cache.capacity())? {
-                let mut logits = Vec::new();
-                for &t in tokens {
+                let d = self.decoder.borrow();
+                let d = d.as_ref().expect("ensure_decoder built it");
+                let logits = if tokens.len() == 1 {
                     let cb = gpu.new_command_buffer();
-                    let d = self.decoder.borrow();
-                    let d = d.as_ref().expect("ensure_decoder built it");
-                    logits = d.encode_token(self, gpu, &cb, cache, t, upto)?;
+                    let l = d.encode_token(self, gpu, &cb, cache, tokens[0], upto)?;
                     // Mirror the host path: `reserve_row` advanced the per-layer
                     // row counts, this advances the shared token counter so the
                     // next token sees the right position.
                     cache.end_token();
-                }
+                    l
+                } else {
+                    d.encode_span(self, gpu, cache, tokens, upto)?
+                };
                 return Ok(logits);
             }
         }
@@ -2095,6 +2110,171 @@ mod tests {
         let mut kv2 = g.new_kv_cache(8);
         let again = g.forward_cached(&mut kv2, &[2]).expect("repeat forward");
         assert_eq!(logits, again, "T4.2 single-cb forward not deterministic");
+    }
+
+    /// T3.2: batched prefill (`encode_span`) must be **bit-identical** to the
+    /// token loop (`encode_token` × n) on the real artifact — 300 tokens with
+    /// `cache_cap = 308` forces `batch_rows = 256` → two chunks (256 + 44), so
+    /// the multi-chunk command-buffer boundary is covered too. Every pass is
+    /// row-independent (GEMM vs GEMV accumulate in the same per-row order), so
+    /// any divergence is a bug, not tolerance noise.
+    ///
+    /// Also covers the decoder rebuild: a second model builds its pipeline on a
+    /// cap-8 cache first, then prefills 32 tokens with a cap-64 cache (rope
+    /// tables are sized at build; `ensure_decoder` must rebuild on growth).
+    #[test]
+    fn real_artifact_span_matches_token_loop_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let ctx = crate::metal_ctx::MetalContext::new().expect("metal context");
+        let model = crate::load::load_exl3(&ctx, &dir).expect("load artifact");
+        let gpu = crate::metal_linear::MetalLinear::new(&ctx).expect("metal linear");
+        let g = Gemma4Model::from_model(&model)
+            .expect("gemma cfg")
+            .with_gpu(&gpu);
+
+        // --- decoder rebuild on growing cache capacity ---
+        let g2 = Gemma4Model::from_model(&model)
+            .expect("gemma cfg")
+            .with_gpu(&gpu);
+        let mut kv_small = g2.new_kv_cache(8);
+        g2.forward_cached(&mut kv_small, &[2])
+            .expect("cap-8 forward");
+        assert_eq!(kv_small.len(), 1);
+        let grow: Vec<u32> = (0..32u32).map(|i| i + 2).collect();
+        let mut kv_big = g2.new_kv_cache(64);
+        let big_logits = g2
+            .forward_cached(&mut kv_big, &grow)
+            .expect("decoder must rebuild for a larger cache");
+        assert_eq!(kv_big.len(), 32);
+        assert!(big_logits.iter().all(|v| v.is_finite()));
+
+        // --- span (2 chunks) vs token loop: bit-identical last-token logits ---
+        let tokens: Vec<u32> = (0..300u32).map(|i| (i % 997) + 2).collect();
+        let mut kv_span = g.new_kv_cache(308);
+        let t0 = std::time::Instant::now();
+        let span_logits = g.forward_cached(&mut kv_span, &tokens).expect("span");
+        let span_dt = t0.elapsed().as_secs_f64();
+        assert_eq!(kv_span.len(), 300);
+        assert!(span_logits.iter().all(|v| v.is_finite()));
+
+        let mut kv_loop = g.new_kv_cache(308);
+        let t1 = std::time::Instant::now();
+        let mut loop_logits: Vec<f32> = Vec::new();
+        for &t in &tokens {
+            loop_logits = g.forward_cached(&mut kv_loop, &[t]).expect("loop step");
+        }
+        let loop_dt = t1.elapsed().as_secs_f64();
+        assert_eq!(kv_loop.len(), 300);
+        eprintln!(
+            "span 300 tok: {span_dt:.2}s ({:.1} t/s) vs token loop {loop_dt:.2}s ({:.1} t/s), {} GPU linears",
+            300.0 / span_dt,
+            300.0 / loop_dt,
+            gpu.calls()
+        );
+        assert!(
+            gpu.calls() >= 800,
+            "span must drive the GPU linears ({} dispatches)",
+            gpu.calls()
+        );
+        let n_diff = span_logits
+            .iter()
+            .zip(&loop_logits)
+            .filter(|(a, b)| a.to_bits() != b.to_bits())
+            .count();
+        let max_abs = span_logits
+            .iter()
+            .zip(&loop_logits)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        let argmax_span = span_logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i);
+        let argmax_loop = loop_logits
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.total_cmp(b.1))
+            .map(|(i, _)| i);
+        eprintln!(
+            "span vs loop: {n_diff}/{} logits differ, max_abs={max_abs:e}, argmax span={argmax_span:?} loop={argmax_loop:?}",
+            span_logits.len()
+        );
+        assert_eq!(
+            span_logits, loop_logits,
+            "batched prefill must be bit-identical to the token loop (n_diff={n_diff}, max_abs={max_abs:e})"
+        );
+
+        // Fresh-cache replay determinism (chunked cbs, host KV rotations).
+        let mut kv2 = g.new_kv_cache(308);
+        let again = g.forward_cached(&mut kv2, &tokens).expect("replay");
+        assert_eq!(span_logits, again, "span replay not deterministic");
+    }
+
+    /// T3.2 acceptance: pp/s before (token loop) and after (batched span).
+    /// Before is measured at 512 (a token-loop 8k run would take ~an hour at
+    /// the recorded 1.5 t/s — its rate also falls with context, so 512 is the
+    /// honest small-prompt baseline); span runs at 512 / 2048 / 8192.
+    /// Gate: `KAPLUMBA_RUN_SLOW=1`, `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn prefill_throughput_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let ctx = crate::metal_ctx::MetalContext::new().expect("metal context");
+        let model = crate::load::load_exl3(&ctx, &dir).expect("load artifact");
+        let gpu = crate::metal_linear::MetalLinear::new(&ctx).expect("metal linear");
+        let g = Gemma4Model::from_model(&model)
+            .expect("gemma cfg")
+            .with_gpu(&gpu);
+
+        let run = |n: usize, span: bool| -> f64 {
+            let tokens: Vec<u32> = (0..n as u32).map(|i| (i % 997) + 2).collect();
+            let mut kv = g.new_kv_cache(n + 8);
+            let t0 = std::time::Instant::now();
+            if span {
+                g.forward_cached(&mut kv, &tokens).expect("span prefill");
+            } else {
+                for &t in &tokens {
+                    g.forward_cached(&mut kv, &[t]).expect("token loop");
+                }
+            }
+            let dt = t0.elapsed().as_secs_f64();
+            assert_eq!(kv.len(), n, "token accounting");
+            dt
+        };
+
+        // Warm-up: shader compile + first scratch growth (also sizes the
+        // decoder's rope tables/arena at the largest cap we will use).
+        run(32, true);
+        run(4, false);
+
+        let before = run(512, false);
+        eprintln!(
+            "BEFORE @512 token-loop: {before:.1}s → {:.2} t/s (recorded baseline ~1.5)",
+            512.0 / before
+        );
+        for n in [512usize, 2048, 8192] {
+            let dt = run(n, true);
+            eprintln!(
+                "AFTER  @{n:5} span: {dt:.1}s → {:.1} t/s ({}x vs token-loop rate)",
+                n as f64 / dt,
+                (n as f64 / dt) / (512.0 / before)
+            );
+        }
     }
 
     /// Top-`n` (logit, token) pairs, descending.

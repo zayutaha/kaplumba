@@ -39,6 +39,24 @@ struct Exl3Params {
     uint aligned; // trellis base is 4-byte aligned -> single u32 loads
 };
 
+// Same, plus the row count for the batched prefill GEMM (T3.2).
+struct Exl3GemmParams {
+    uint in_tiles;
+    uint out_tiles;
+    uint k;
+    uint twords;
+    uint mode;
+    uint aligned;
+    uint rows;
+};
+
+// Row geometry for the Hadamard passes: rows of `row_len` elements, so the
+// 2-D threadgroup grid is (row_len/128, rows) and row 0 with rows=1 reduces to
+// the original 1-D dispatch.
+struct HadParams {
+    uint row_len;
+};
+
 // EXL3 procedural codebook, matching the CPU `decode_3inst`:
 //   Mcg:     x *= 0xCBAC1FED, then x = 0x3B603B60 ^ (x & 0x8FFF8FFF), then one
 //            exact IEEE binary16 add of the two packed halves.
@@ -96,14 +114,20 @@ inline CodePair funnel_pair(
 // ---------------------------------------------------------------------------
 // xh = had_r(x * suh)   (one 128-block per threadgroup, 128 threads)
 // ---------------------------------------------------------------------------
+// grid = (row_len/128, rows): threadgroup (tx, ty) transforms block tx of row
+// ty. With rows=1 this is exactly the old 1-D dispatch.
 kernel void exl3_had_in(device const half *x [[buffer(0)]],
                         device const half *suh [[buffer(1)]],
                         device half *xh [[buffer(2)]],
-                        uint blk [[threadgroup_position_in_grid]],
-                        uint t [[thread_position_in_threadgroup]]) {
+                        constant HadParams &hp [[buffer(3)]],
+                        uint2 tg [[threadgroup_position_in_grid]],
+                        uint2 thr [[thread_position_in_threadgroup]]) {
     threadgroup float sh[HAD];
-    uint base = blk * HAD;
-    sh[t] = float(x[base + t]) * float(suh[base + t]);
+    uint t = thr.x;
+    uint base = tg.y * hp.row_len + tg.x * HAD;
+    // suh is ONE row of scales shared by every batch row: index it within the
+    // row (tg.x*HAD + t), while x/xh are the full [rows, row_len] buffers.
+    sh[t] = float(x[base + t]) * float(suh[tg.x * HAD + t]);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // Sylvester FWT, 7 stages; H is symmetric so `H · block` needs no transpose.
@@ -215,14 +239,19 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
 // ---------------------------------------------------------------------------
 // out = had_r(y) * svh    (one 128-block per threadgroup; y is the f32 GEMV out)
 // ---------------------------------------------------------------------------
+// grid = (row_len/128, rows), same layout as exl3_had_in: y is [rows, row_len]
+// f32 (the batched GEMM's intermediate), out is [rows, row_len] f16.
 kernel void exl3_had_out(device const float *y [[buffer(0)]],
                          device const half *svh [[buffer(1)]],
                          device half *out [[buffer(2)]],
-                         uint blk [[threadgroup_position_in_grid]],
-                         uint t [[thread_position_in_threadgroup]]) {
+                         constant HadParams &hp [[buffer(3)]],
+                         uint2 tg [[threadgroup_position_in_grid]],
+                         uint2 thr [[thread_position_in_threadgroup]]) {
     threadgroup float sh[HAD];
-    uint base = blk * HAD;
+    uint t = thr.x;
+    uint base = tg.y * hp.row_len + tg.x * HAD;
     // The reference rounds the GEMV slab to f16 before the final Hadamard.
+    // svh is ONE row of scales shared by every batch row (see exl3_had_in).
     sh[t] = float((half)y[base + t]);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -235,5 +264,112 @@ kernel void exl3_had_out(device const float *y [[buffer(0)]],
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    out[base + t] = (half)(sh[t] * as_type<float>(0x3DB504F3u) * float(svh[base + t]));
+    out[base + t] = (half)(sh[t] * as_type<float>(0x3DB504F3u) * float(svh[tg.x * HAD + t]));
+}
+
+// ---------------------------------------------------------------------------
+// y = xh @ decode(trellis) for `rows` rows (T3.2 prefill GEMM).
+//
+// One threadgroup = one out-tile × a chunk of RGT rows. The trellis decode
+// depends only on the weight tile and the lane's pair descriptors, so each
+// lane decodes its 8 halves **once per in-tile** and reuses them for all RGT
+// rows — that reuse is the whole point of the batched path (decode cost / RGT).
+// Accumulators live in registers (accA/B[RGT]); the 4-lane column reduction
+// collapses through threadgroup memory in one barrier at the end, writing
+// y[row * out_features + col]. Rows beyond `rows` are skipped warp-uniformly.
+// ---------------------------------------------------------------------------
+constant uint RGT = 8u;
+
+kernel void exl3_gemm(device const half *xh [[buffer(0)]],
+                      device const ushort *trellis [[buffer(1)]],
+                      device const uint *pair_tab [[buffer(2)]],
+                      device float *y [[buffer(3)]],
+                      constant Exl3GemmParams &p [[buffer(4)]],
+                      uint2 tg [[threadgroup_position_in_grid]],
+                      uint2 thr [[thread_position_in_threadgroup]]) {
+    threadgroup float shA[RGT * 32];
+    threadgroup float shB[RGT * 32];
+
+    uint tid = thr.x;
+    uint g = tid & 31u;
+    uint ot = tg.x;
+    uint row0 = tg.y * RGT;
+    bool live = ot < p.out_tiles && row0 < p.rows;
+    uint n_here = 0u;
+    if (row0 < p.rows) {
+        n_here = min(RGT, p.rows - row0);
+    }
+
+    uint nin = p.in_tiles;
+    uint nout = p.out_tiles;
+    uint K = nin * TILE;
+    uint N = nout * TILE;
+
+    uint cA = g >> 2;
+    uint cB = cA + 8u;
+    uint r0 = (g & 3u) * 2u;
+
+    bool aligned = p.aligned != 0u;
+    uint pk0 = pair_tab[4u * g];
+    uint pk1 = pair_tab[4u * g + 1u];
+    uint pk2 = pair_tab[4u * g + 2u];
+    uint pk3 = pair_tab[4u * g + 3u];
+
+    float accA[RGT];
+    float accB[RGT];
+    for (uint r = 0; r < RGT; r++) {
+        accA[r] = 0.0f;
+        accB[r] = 0.0f;
+    }
+
+    for (uint it = 0; live && it < nin; it++) {
+        device const ushort *tile =
+            trellis + (ulong)(it * nout + ot) * p.twords * 2u;
+        CodePair p0 = funnel_pair(
+            tile, pk0 & 0xFFu, (pk0 >> 8) & 0xFFu, (pk0 >> 16) & 0xFFu, p.k, p.mode, aligned
+        );
+        CodePair p1 = funnel_pair(
+            tile, pk1 & 0xFFu, (pk1 >> 8) & 0xFFu, (pk1 >> 16) & 0xFFu, p.k, p.mode, aligned
+        );
+        CodePair p2 = funnel_pair(
+            tile, pk2 & 0xFFu, (pk2 >> 8) & 0xFFu, (pk2 >> 16) & 0xFFu, p.k, p.mode, aligned
+        );
+        CodePair p3 = funnel_pair(
+            tile, pk3 & 0xFFu, (pk3 >> 8) & 0xFFu, (pk3 >> 16) & 0xFFu, p.k, p.mode, aligned
+        );
+
+        for (uint r = 0; r < n_here; r++) {
+            uint xrow = (row0 + r) * K + it * TILE + r0;
+            float x00 = float(xh[xrow]);
+            float x01 = float(xh[xrow + 1u]);
+            float x02 = float(xh[xrow + 8u]);
+            float x03 = float(xh[xrow + 9u]);
+            accA[r] += x00 * float(p0.lo) + x01 * float(p0.hi);
+            accA[r] += x02 * float(p1.lo) + x03 * float(p1.hi);
+            accB[r] += x00 * float(p2.lo) + x01 * float(p2.hi);
+            accB[r] += x02 * float(p3.lo) + x03 * float(p3.hi);
+        }
+    }
+
+    for (uint r = 0; r < n_here; r++) {
+        shA[r * 32u + tid] = accA[r];
+        shB[r * 32u + tid] = accB[r];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (live && g < 16u) {
+        for (uint r = 0; r < n_here; r++) {
+            uint base = r * 32u;
+            float s = 0.0f;
+            if (g < 8u) {
+                for (uint q = 0; q < 4u; q++) {
+                    s += shA[base + (g << 2) + q];
+                }
+            } else {
+                for (uint q = 0; q < 4u; q++) {
+                    s += shB[base + ((g - 8u) << 2) + q];
+                }
+            }
+            y[(ulong)(row0 + r) * N + ot * TILE + g] = s;
+        }
+    }
 }

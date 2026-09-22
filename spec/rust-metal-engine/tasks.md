@@ -116,12 +116,14 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - [x] Artifact already exists — verify load + resident size + manifest/versions in notes (done under omlx-exl3 T0.3/T3.1 research)
 - Commit: (historical notes)
 
-### T3.2 — Dual-path matmul + int8 staging
-- [ ] seq==1 GEMV vs seq≥T staged GEMM path; amortize dequant across columns
-- Files: linear layer dispatch
-- Test: numerical closeness vs naive path; pp/s before/after @512/2k/8k
+### T3.2 — Dual-path matmul + batched prefill GEMM
+- [x] Done — `rows==1` GEMV vs `rows≥2` `exl3_gemm` (RGT=8 row-chunks; trellis decode once per out-tile×chunk, reused across 8 rows); multi-row Hadamard/rope; `encode_span` packs a prefill chunk into one command buffer; `reserve_rows`/`end_tokens`
+- **Bug found + fixed:** in-place q-RoPE (`q → q`) races `kr_rope` (reads `x[xr+lo+kk]`/`x[xr+lo+kk+hh]` while writing `o[i]`). Comment always said in/out must be distinct; tests used distinct buffers, production did not. Symptom: span vs token-loop `n_diff=258588/262144`, `max_abs=2.95e-1` (argmax accidentally agreed). Fix: rope `q → q_raw`, attention reads `q_raw` (both `encode_token` and `encode_span`). After fix: **0/262144 differ, bit-identical**.
+- Measured pp/s (`prefill_throughput_slow`, debug build, M4 Pro): token-loop @512 **5.20 t/s** → span @512 **15.0 t/s (2.88×)**, @2048 **14.8 t/s (2.85×)**, @8192 **14.4 t/s (2.78×)**. Far from 200 t/s: GEMM re-streams weights `rows/RGT=32`× per chunk (RGT=8) — next lever is larger reuse / fused siblings / kernel time, not correctness.
+- Tests: `gpu_gemm_rows_match_per_row_gemv_and_cpu`, `rope_multi_row_matches_cpu_reference`, `reserve_rows_batches_match_row_at_a_time` pass; gated `real_artifact_span_matches_token_loop_slow` bit-identical; fixture still argmax 236773 / logit 29.9782; full suite 109 engine + 14 kernels green
+- Files: `crates/engine/src/{gemma4,gpu_decode,kv_cache,metal_linear}.rs`, `crates/kernels/src/{exl3,fuse}.{rs,metal}`, `crates/kernels/src/lib.rs`
 - Target: AC2, R2.1
-- Commit: `spec/rust-metal-engine: T3.2 dual-path matmul`
+- Commit: `spec/rust-metal-engine: T3.2 batched prefill GEMM`
 
 ### T3.3 — Multi-row packed weights at load
 - [ ] Interleaved packing applied on load; metadata layout rules documented

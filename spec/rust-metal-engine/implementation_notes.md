@@ -410,6 +410,25 @@ Blocking work, in the order the measurements justify it:
   - `KAPLUMBA_RUN_SLOW=1 KAPLUMBA_SLOW_MODE=greedy KAPLUMBA_SLOW_MAX_NEW=1 ...` (~3×210s: two forward passes per generated token)
   - T4.2 device-cache fixture: `KAPLUMBA_RUN_SLOW=1 cargo test --release -p kaplumba-engine real_artifact_cached_fixture_and_gpu_slow -- --nocapture --test-threads=1` (~6s after load; asserts device_kv, 411 GPU linears, argmax 236773, fresh-cache bit-identical replay)
 
+## T3.2 — batched prefill GEMM + span path (2026-09-22)
+
+**Done.** `rows==1` keeps the tuned GEMV; `rows≥2` takes `exl3_gemm` (one threadgroup = one out-tile × `RGT=8` row-chunk; funnel decode once per in-tile, reused across 8 rows; y written `[row, out_features]` f32). Multi-row `exl3_had_in`/`had_out` (grid `(row_len/128, rows)`), multi-row `kr_rope`, `KvCache::reserve_rows`/`end_tokens`, `GpuDecoder::encode_span` (host embed → one CB per chunk → all passes `rows=m` → final norm+lm on last row only). `ensure_decoder` rebuilds when a later `cache_cap > built_cap`.
+
+**Correctness bug (span ≠ token loop):** production did **in-place q-RoPE** (`encode_rope(q, …, q)`), but `kr_rope` reads `x[xr+lo+kk]` and `x[xr+lo+kk+hh]` while writing `o[i]` — racy when `x==o`. The comment at the call site already said in/out must be distinct; every unit test used distinct buffers, so only the real span path failed: `n_diff=258588/262144`, `max_abs=2.95e-1`, argmax accidentally both 207. **Fix:** rope `q → q_raw` (q_raw is free after the per-head rms has read it); attention consumes `q_raw`. Same fix in `encode_token` (decode was "working" because rows=1 scheduling happened to serialize the race on this GPU — do not trust it). After fix: span vs loop **0/262144 bit-identical**; fixture still 236773 / 29.9782.
+
+**Measured pp/s** (`KAPLUMBA_RUN_SLOW=1 … prefill_throughput_slow -- --ignored --nocapture`, debug build):
+
+| case | time | t/s | vs token-loop |
+|---|---|---|---|
+| token-loop @512 | 98.5s | **5.20** | 1× |
+| span @512 | 34.2s | **15.0** | 2.88× |
+| span @2048 | 138.4s | **14.8** | 2.85× |
+| span @8192 | 567.6s | **14.4** | 2.78× |
+
+**Why only ~2.8× and not RGT=8's promise:** each threadgroup-row-chunk re-streams the **entire** trellis (`grid.y = rows/8` independent weight streams). Weight traffic ≈ `(rows/RGT)×` one GEMV's weights; decode ALU likewise. Rate is flat in context (15.0→14.4), so we are decode/re-stream bound, not attention-bound. Levers for 200 t/s: (a) larger effective reuse (raise RGT / multi-out-tile threadgroups so one decode serves more columns+rows), (b) T4.1 sibling fusion (qkv, gate+up share one had_in), (c) profile whether had_in/had_out/glue are now a meaningful slice. Correctness is done; remaining T3.2 work is performance only.
+
+**Tests green:** `gpu_gemm_rows_match_per_row_gemv_and_cpu`, `rope_multi_row_matches_cpu_reference`, `reserve_rows_batches_match_row_at_a_time`, bit-identical `real_artifact_span_matches_token_loop_slow`, fixture, full suite 109+14.
+
 ## T4.2 — one command buffer per decode token (2026-09-22)
 
 **Problem:** the cached/GPU decode path encoded each of the ~471 dispatches per token (411 linears + 60 attentions + glue) into its own command buffer with `commit`+`wait_until_completed` — ~0.4 ms of CPU submit/wait each ⇒ **~180 ms of a ~275 ms token was pure overhead** (kernel time only ~93 ms).

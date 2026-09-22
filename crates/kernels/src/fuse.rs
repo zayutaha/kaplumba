@@ -14,7 +14,7 @@ use metal::{
     MTLCommandBufferStatus, MTLResourceOptions, MTLSize,
 };
 
-use crate::exl3::{check_span_fits, DeviceSpan, KernelError};
+use crate::exl3::{DeviceSpan, KernelError, check_span_fits};
 
 const MSL: &str = include_str!("fuse.metal");
 
@@ -33,6 +33,8 @@ struct MslRms {
 struct MslRope {
     head_dim: u32,
     pos: u32,
+    rows: u32,
+    row_stride: u32,
 }
 
 #[repr(C)]
@@ -118,14 +120,13 @@ impl Fuse {
             std::mem::size_of::<MslRms>() as u64,
             &p as *const MslRms as *const _,
         );
-        enc.dispatch_thread_groups(
-            MTLSize::new(rows as u64, 1, 1),
-            MTLSize::new(128, 1, 1),
-        );
+        enc.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(128, 1, 1));
         Ok(())
     }
 
-    /// Neox RoPE for `n_heads` heads of `head_dim` at position `pos`.
+    /// Neox RoPE for `rows` rows of `n_heads` heads of `head_dim`. Row `r` is
+    /// roped at absolute position `pos + r` (prefill batches pass the position
+    /// of row 0); `rows = 1` is the single-row decode case.
     pub fn encode_rope(
         &self,
         enc: &ComputeCommandEncoderRef,
@@ -136,17 +137,22 @@ impl Fuse {
         n_heads: usize,
         head_dim: usize,
         pos: usize,
+        rows: usize,
     ) -> Result<(), KernelError> {
-        let n = n_heads * head_dim;
+        assert!(rows >= 1, "rope needs rows >= 1");
+        let row_stride = n_heads * head_dim;
+        let n = row_stride * rows;
         check_span_fits(&x, n * 2, "rope x", 2)?;
         check_span_fits(&out, n * 2, "rope out", 2)?;
         let half = head_dim / 2;
         if cos.byte_offset % 4 != 0 || sin.byte_offset % 4 != 0 {
-            return Err(KernelError::Unsupported("rope tables must be 4-byte aligned".into()));
+            return Err(KernelError::Unsupported(
+                "rope tables must be 4-byte aligned".into(),
+            ));
         }
-        // The table span must cover head_dim/2 floats at `pos`.
+        // The table span must cover head_dim/2 floats at the last row's position.
         for (s, what) in [(cos, "cos"), (sin, "sin")] {
-            let need = (pos + 1) * half * 4;
+            let need = (pos + rows) * half * 4;
             if (s.buffer.length() as usize) < s.byte_offset + need {
                 return Err(KernelError::Unsupported(format!(
                     "rope {what}: needs {need} bytes at offset {}, buffer is {}",
@@ -158,6 +164,8 @@ impl Fuse {
         let p = MslRope {
             head_dim: head_dim as u32,
             pos: pos as u32,
+            rows: rows as u32,
+            row_stride: row_stride as u32,
         };
         enc.set_compute_pipeline_state(&self.rope);
         enc.set_buffer(0, Some(x.buffer), x.byte_offset as u64);
@@ -380,11 +388,7 @@ mod tests {
             worst = worst.max((x.to_f32() - y.to_f32()).abs());
             scale = scale.max(x.to_f32().abs());
         }
-        if scale > 0.0 {
-            worst / scale
-        } else {
-            worst
-        }
+        if scale > 0.0 { worst / scale } else { worst }
     }
 
     /// `kr_rms` against the CPU reference, for both norm shapes (hidden row and
@@ -452,7 +456,12 @@ mod tests {
         let fuse = Fuse::new(&device, &queue).expect("pipelines");
         let mut rng = Rng(0x9999);
         let max_pos = 16usize;
-        for (n_heads, hd, pos) in [(32usize, 256usize, 0usize), (32, 256, 7), (32, 512, 3), (4, 256, 15)] {
+        for (n_heads, hd, pos) in [
+            (32usize, 256usize, 0usize),
+            (32, 256, 7),
+            (32, 512, 3),
+            (4, 256, 15),
+        ] {
             let hh = hd / 2;
             // Tables exactly as `rope_cos_sin` builds them: [max_pos, hd/2].
             let mut cos = vec![0f32; max_pos * hh];
@@ -479,6 +488,7 @@ mod tests {
                     n_heads,
                     hd,
                     pos,
+                    1,
                 )
                 .expect("encode rope");
             })
@@ -498,6 +508,92 @@ mod tests {
             eprintln!("rope heads={n_heads} hd={hd} pos={pos}: rel {err:.2e}");
             assert!(err < 1e-3, "rope rel err {err}");
         }
+    }
+
+    /// T3.2: multi-row rope (rows ≥ 2, row r at absolute `pos0 + r`) must match
+    /// the CPU neox rotate per row — the same reference the single-row test
+    /// uses, so batched prefill ropes exactly what the token loop would.
+    /// Also: a table that only covers `pos0 + rows - 1` must be **rejected**
+    /// when the batch would run past its end.
+    #[test]
+    fn rope_multi_row_matches_cpu_reference() {
+        let Some((device, queue)) = ctx() else {
+            eprintln!("skip: no Metal device");
+            return;
+        };
+        let fuse = Fuse::new(&device, &queue).expect("pipelines");
+        let mut rng = Rng(0xBEEF);
+        let (n_heads, hd, rows, pos0, max_pos) = (32usize, 256usize, 3usize, 4usize, 16usize);
+        let hh = hd / 2;
+        let mut cos = vec![0f32; max_pos * hh];
+        let mut sin = vec![0f32; max_pos * hh];
+        for p in 0..max_pos {
+            for k in 0..hh {
+                let f = p as f32 * (1e4f32.powf(-2.0 * k as f32 / hd as f32));
+                cos[p * hh + k] = f.cos();
+                sin[p * hh + k] = f.sin();
+            }
+        }
+        let x: Vec<f16> = (0..rows * n_heads * hd).map(|_| rng.half()).collect();
+        let xb = fuse.half_buffer(&x);
+        let cb = fuse.f32_buffer(&cos);
+        let sb = fuse.f32_buffer(&sin);
+        let ob = fuse.buffer(x.len() * 2);
+        fuse.submit(|enc| {
+            fuse.encode_rope(
+                enc,
+                Fuse::span(&xb),
+                Fuse::span(&cb),
+                Fuse::span(&sb),
+                Fuse::span(&ob),
+                n_heads,
+                hd,
+                pos0,
+                rows,
+            )
+            .expect("encode multi-row rope");
+        })
+        .expect("submit");
+        let got = Fuse::read_half(&ob, x.len());
+
+        let mut want = vec![f16::ZERO; x.len()];
+        for r in 0..rows {
+            let pos = pos0 + r;
+            for h in 0..n_heads {
+                for j in 0..hh {
+                    let (c, s) = (cos[pos * hh + j], sin[pos * hh + j]);
+                    let base = (r * n_heads + h) * hd;
+                    let (x1, x2) = (x[base + j].to_f32(), x[base + j + hh].to_f32());
+                    want[base + j] = f16::from_f32(x1 * c - x2 * s);
+                    want[base + j + hh] = f16::from_f32(x1 * s + x2 * c);
+                }
+            }
+        }
+        let err = max_rel(&want, &got);
+        eprintln!("rope rows={rows} pos0={pos0} heads={n_heads} hd={hd}: rel {err:.2e}");
+        assert!(err < 1e-3, "multi-row rope rel err {err}");
+
+        // pos0 + rows must fit the table: 14 + 3 = 17 > max_pos 16 → reject.
+        let err = std::cell::Cell::new(None);
+        fuse.submit(|enc| {
+            let r = fuse.encode_rope(
+                enc,
+                Fuse::span(&xb),
+                Fuse::span(&cb),
+                Fuse::span(&sb),
+                Fuse::span(&ob),
+                n_heads,
+                hd,
+                14,
+                rows,
+            );
+            err.set(r.err());
+        })
+        .expect("submit");
+        assert!(
+            err.take().is_some(),
+            "multi-row rope past table end must be rejected"
+        );
     }
 
     /// `kr_gelu_mul` / `kr_add` / `kr_add_scale` / `kr_copy` vs the CPU helpers.
@@ -529,7 +625,9 @@ mod tests {
             .map(|i| {
                 let x = g[i].to_f32();
                 let k = 0.797_884_56f32;
-                f16::from_f32(0.5 * x * (1.0 + (k * (x + 0.044_715 * x * x * x)).tanh()) * u[i].to_f32())
+                f16::from_f32(
+                    0.5 * x * (1.0 + (k * (x + 0.044_715 * x * x * x)).tanh()) * u[i].to_f32(),
+                )
             })
             .collect();
         let err = max_rel(&want, &got);
@@ -556,8 +654,15 @@ mod tests {
 
         let ob3 = fuse.buffer(n * 2);
         fuse.submit(|enc| {
-            fuse.encode_add_scale(enc, Fuse::span(&rb), Fuse::span(&gb), Fuse::span(&ob3), n, scalar)
-                .unwrap();
+            fuse.encode_add_scale(
+                enc,
+                Fuse::span(&rb),
+                Fuse::span(&gb),
+                Fuse::span(&ob3),
+                n,
+                scalar,
+            )
+            .unwrap();
         })
         .unwrap();
         let got3 = Fuse::read_half(&ob3, n);
@@ -569,7 +674,8 @@ mod tests {
         assert!(err < 2e-3, "add_scale rel err {err}");
 
         fuse.submit(|enc| {
-            fuse.encode_copy(enc, Fuse::span(&gb), Fuse::span(&ob), n).unwrap();
+            fuse.encode_copy(enc, Fuse::span(&gb), Fuse::span(&ob), n)
+                .unwrap();
         })
         .unwrap();
         assert_eq!(Fuse::read_half(&ob, n), g, "copy must be exact");
@@ -589,8 +695,16 @@ mod tests {
         let xb = fuse.half_buffer(&x);
         let ob = fuse.buffer(x.len() * 2);
         fuse.submit(|enc| {
-            fuse.encode_rms(enc, Fuse::span(&xb), None, Fuse::span(&ob), rows, row_len, 1e-6)
-                .expect("weightless rms");
+            fuse.encode_rms(
+                enc,
+                Fuse::span(&xb),
+                None,
+                Fuse::span(&ob),
+                rows,
+                row_len,
+                1e-6,
+            )
+            .expect("weightless rms");
         })
         .expect("submit");
         let got = Fuse::read_half(&ob, x.len());
@@ -626,6 +740,7 @@ mod tests {
                 1,
                 256,
                 0,
+                1,
             );
             err.set(r.err());
         })
@@ -644,6 +759,7 @@ mod tests {
                 1,
                 256,
                 4096,
+                1,
             );
             err2.set(r.err());
         })
