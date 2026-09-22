@@ -1,3 +1,5 @@
 /target
 /reference
 .venv-*/
+
+scripts/__pycache__/
