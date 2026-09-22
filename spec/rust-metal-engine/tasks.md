@@ -51,9 +51,12 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
   - [x] **T1.3a** EXL3 decode primitives: trellis pack/unpack, codebook (MCG/Default/Mul1), perm, signs, Hadamard, `decode_packed_tile` — 26/26 unit tests vs reference goldens (q00 tile, MCG codewords, pack fixtures k=3/6)
   - [x] **T1.3b** reconstruct (inner/slab/public weights) + streaming `linear_forward_reconstruct` — 44/44 tests; stream ≡ stepwise rel err < 1e-3; dense public-weight loose parity
   - [ ] **T1.3b** reconstruct (inner trellis → had+scales) + `linear_forward_reconstruct`
-  - [ ] **T1.3c** Gemma4 model forward (embed, hybrid SWA/full attn, MLP, layer_scalar, softcap)
+  - [~] **T1.3c** Gemma4 model forward (embed·√h, hybrid SWA/full attn, MLP, layer_scalar, softcap) — facts+goldens done (see notes "T1.3c handover"); code NOT written
+    - [ ] expand `TextConfig` (load.rs): n_heads, n_kv, n_global_kv, n_layers, vocab, eps, sliding_window, hidden_activation, max_pos, rope_parameters; synthesize per-layer head_dim/n_kv (full=512/4, k_eq_v)
+    - [ ] `crates/engine/src/gemma4.rs` + lib.rs: RMSNorm(f32), dual RoPE tables, k_eq_v attention (K=rope@k_norm, V=weightless v_norm on raw k; scale 1.0; masks full kv≤q / sliding kv∈[q-1023,q]), gelu_tanh MLP, decoder order + layer_scalar (DE28 f64 add), streaming lm_head w/ softcap 30 → f32 logits
+    - [ ] unit tests: inv_freq/rope/rms/gelu/mask goldens (consts in notes), embed[2]+layer_scalar real-artifact reads, layer-0 smoke (slow-gated)
   - [ ] **T1.3d** greedy generate + golden fixture; deterministic across runs
-- Files: `crates/engine/src/exl3/*` (a); model forward, attention, lm_head, sampler stub (b–d)
+- Files: `crates/engine/src/exl3/*` (a); `crates/engine/src/gemma4.rs`, model forward, attention, lm_head, sampler stub (c–d)
 - Test: golden greedy output on fixed prompt matches known-good text (record fixture); deterministic across runs
 - Commit: `spec/rust-metal-engine: T1.3 naive forward` (a committed as `...: T1.3a decode primitives`)
 
