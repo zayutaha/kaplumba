@@ -1,47 +1,45 @@
-# Plan: Paged KV cache, prompt cache, and delta prefill
+# Plan: Paged KV cache, prompt cache, and delta prefill (Rust engine)
+
+Rewritten 2026-09-22 for `spec/rust-metal-engine/` (pure Rust + raw Metal). No omlx modules; persistence is a Rust crate/module alongside the engine.
 
 ## Architecture
 
 ```
-Request (chat turn)
+Request (chat turn) — via engine CLI/library
   → assemble S = system ‖ history ‖ new_user_msg  (token ids)
-  → ChainValidator
+  → ChainValidator (Rust)
        ├─ active prompt_hash? model_id? quant_fp? template_ver?
        ├─ chat.json token log prefix of S?
        └─ pass → Restore | fail → Recompute
   → Restore
-       ├─ prompt_cache: load shared system-prompt blocks (RAM paged pool ← SSD)
+       ├─ prompt_cache: load shared system-prompt blocks (RAM paged pool ← disk)
        ├─ chat tail: load blocks to L (block-aligned v1)
-       └─ Prefill(S[L:]) only
+       └─ Engine prefill(S[L:]) only   // rust-metal-engine R6.2 / T5.3
   → Decode turn
   → on turn complete:
        ├─ append assistant ids to chat.json token log
-       └─ async PersistChatKV (checksummed blocks → ./chat/<id>/)  // never gates next admission
+       └─ async PersistChatKV (checksummed blocks → ./chat/<id>/)  // never gates next turn
 ```
 
-Single-tenant engine path bypasses omlx multi-tenant admission gates (store-cache backpressure, cache-freshness deferral) so persistence is fully decoupled (spec R5).
+Single-tenant by construction: no multi-tenant admission gates to bypass (old R5.3 reduced to "no sync persist wait on turn advance").
 
-## File / module touchpoints (omlx reference)
+## File / module touchpoints (Rust — greenfield)
 
-| Area | Path (under `reference/omlx/omlx/`) | Current behavior | Intended change |
-|------|--------------------------------------|------------------|-----------------|
-| Prefix API | `cache/prefix_cache.py` (`BlockAwarePrefixCache`, `fetch_cache` `:622`, `store_cache` `:750`, `store_exact_prefix` `:1460`) | Opportunistic block-hash prefix reuse | Add prompt_hash/chat chain validation layer; exact or block-aligned restore entry points |
-| Paged RAM | `cache/paged_cache.py` (`PagedCacheManager`, block size 256) | Block pool + optional SSD manager hook | Refcount/CoW for shared prompt blocks; free-on-cut; chat-private tail |
-| SSD tier | `cache/paged_ssd_cache.py` (`PagedSSDCacheManager`) | Hot bytes tier + disk, default dir `/tmp/cache` | Repoint dirs; support two namespaces (`prompt_cache` vs `chat/<id>`); checksums |
-| Factory | `cache/factory.py` | `paged_ssd_cache_dir`, 100GB default cap | Config for data root, quotas, enable single-tenant persistence mode |
-| Boundary snapshots | `cache/boundary_snapshot_store.py` | Every 256 tokens during prefill/decode | Persist point for block-aligned checkpoints; keep for MTP arming |
-| Admission gates | `scheduler.py` `_schedule_waiting` ~`:10714`, `_should_defer_for_cache_freshness` ~`:8564` | New turn can wait on prior async store | Single-tenant: skip both gates (R5.3) |
-| Prefill loop | `scheduler.py` `_do_external_prefill` ~`:3517`, chunk loop ~`:3686` | Chunks full prompt (minus skip_lm_head) | Start at restored L; chunk only suffix |
-| Engine core | `engine_core.py` `add_request` ~`:670`, wake ~`:791` | Executor hop | Unchanged except: never wait on persist future |
-| Settings | `settings.py` | multi-tenant defaults | Flags: data root, single_tenant_persistence, block_aligned_restore |
-| Gemma hybrid | `cache/prefix_cache.py` ~`:1697` (gemma3 KVCache+Rotating mix), model paths for gemma4 | Hybrid supported for gemma3; gemma4 audit needed | Save/load SWA rings + global full; K=V global round-trip |
-| Server config | `server.py` / `cli.py` | — | Expose `--data-root`, `--prompt-cache-dir`, `--chat-dir` |
+| Area | Intended location (T0 decides exact crate split) | Responsibility |
+|------|--------------------------------------------------|----------------|
+| Schemas | `crates/persist/src/schema.rs` | `meta.json`, `chat.json` v1 serde types |
+| Chain validator | `crates/persist/src/validate.rs` | Pure, unit-testable, no GPU |
+| Atomic IO | `crates/persist/src/io.rs` | temp + fsync + rename; per-block sha256 |
+| Paged RAM pool | `crates/engine/src/kv/paged.rs` (or persist crate if shared) | 256-token blocks, block table, refcount/CoW |
+| Prompt cache | `crates/persist/src/prompt_cache.rs` | compute-once load/store |
+| Chat store | `crates/persist/src/chat_store.rs` | per-turn persist worker, dirty status |
+| Restore API | engine prefill entry (`crates/engine`) | `prefill_from(L)` |
+| Persist hook | engine turn-complete | enqueue only |
+| Hybrid Gemma4 | `crates/engine/src/kv/hybrid.rs` | SWA ring + global full round-trip |
+| Config | engine CLI/config | `--data-root`, prompt/chat dirs, quotas, enable flag |
+| Observability | bench/stats JSON fields | prefix tokens, delta tokens, restore source, fail reason |
 
-New code (owned by kaplumba or a thin omlx patch layer — decided in tasks):
-
-- `spec` implementation may live as patches against vendored omlx or a sibling package; exact location is T0 in tasks.md (see open risk below).
-- Chain validator + `chat.json` / `prompt_cache/meta.json` schema (small, new).
-- Persist worker: single background thread/queue, atomic writes.
+New code is owned by kaplumba; `reference/omlx` cache Python is inspiration-only (block size, boundary every 256, hybrid gemma ideas) — do not port.
 
 ## Data flow: validation
 
@@ -53,9 +51,9 @@ New code (owned by kaplumba or a thin omlx patch layer — decided in tasks):
 
 ## Data flow: save
 
-1. After turn complete: enqueue PersistJob(chat_id, block_table snapshot, token_log tail, meta).
-2. Worker: write new blocks to temp files → checksum → rename → update `chat.json` (atomic).
-3. Completion does not feed back into scheduler admission (R5.2/R5.3).
+1. After turn complete: enqueue PersistJob(chat_id, block table snapshot, token_log tail, meta).
+2. Worker thread: write new blocks to temp files → checksum → rename → update `chat.json` (atomic).
+3. Completion does not feed back into turn-advance (R5.2/R5.3).
 4. Dirty generations counted for shutdown flush (R5.5).
 
 ## Interfaces / formats
@@ -98,43 +96,49 @@ New code (owned by kaplumba or a thin omlx patch layer — decided in tasks):
 - `token_log` may be stored as binary int32 sidecar if JSON size is a concern (task-level detail).
 - `status=dirty` means persist incomplete → R5.4 on load.
 
-### Restore API (conceptual)
+### Restore API (conceptual — Rust)
 
 ```text
 restore(chat_id, S) -> RestoreOk(L, sources) | Recompute(reason)
-persist_async(chat_id) -> None   # enqueue only
-invalidate(chat_id | prompt_hash) -> None
+persist_async(chat_id) -> ()   // enqueue only
+invalidate(chat_id | prompt_hash) -> ()
+```
+
+Engine side (rust-metal-engine R6.2 / T5.3–T5.4):
+
+```text
+prefill_from(L, S[L:]) -> ()
+on_turn_complete(token_log_tail, block_table) -> ()  // enqueue persist
 ```
 
 ## Sequencing (tasks live in tasks.md)
 
-T0: Decide patch location + config surface (data root flags).
+T0: Decide crate layout + config surface (data root flags).
 T1: Schema + chain validator (pure, unit-testable, no GPU).
-T2: Directory wiring (factory → `./prompt_cache`, `./chat`), atomic write helpers.
+T2: Directory wiring + atomic write helpers.
 T3: Prompt cache compute-once path (miss → prefill → store → hit).
-T4: Single-tenant admission bypass for store-cache/freshness gates.
-T5: Delta prefill entry (block-aligned L restore → prefill suffix only).
+T4: Assert no sync persist on turn-advance (replaces omlx admission-bypass task).
+T5: Delta prefill entry (block-aligned L restore → prefill suffix only) — depends on engine T5.3.
 T6: Per-turn async persist worker + chat.json updates.
 T7: Crash/torn-write handling + status=dirty.
 T8: Edit-truncate / free-above-cut.
-T9: Gemma 4 SWA + global KV save/load round-trip tests.
+T9: Gemma 4 SWA + global KV save/load round-trip tests — depends on engine hybrid KV (T5.1).
 T10: Eviction/quotas.
 T11: Observability counters + bench harness assertions (AC1–AC11).
 T12: Docs + implementation_notes freeze for handover.
 
-Dependencies: T1–T2 before anything touches disk; T4 before T6 in production path; T5 after T3; T9 parallelizable after T5 once restore works for full-attn-only fixtures.
+Dependencies: T1–T2 before anything touches disk; T4 before relying on T6 in production path; T5 after T3 + engine restore hook; T9 after T5 once restore works for full-attn-only fixtures.
 
 ## Risks and fallbacks
 
 | Risk | Mitigation |
 |------|------------|
 | Warm vs cold greedy not token-identical (R9.2/AC10) | OQ1; force deterministic order or allow tolerance gate; fallback: golden tests compare distributions / allowlisted diffs |
-| omlx store-cache path deeply entangled with multi-tenant code | Feature-flag single-tenant mode; keep old path behind flag (AC11) |
 | Gemma4 hybrid restore bugs → silent quality loss | T9 bit-level fixture tests per layer type; mismatch → recompute (fail closed) |
-| SSD write bandwidth / latency spikes on turn boundary | Async only; write block-at-a-time; never on request critical path |
+| Disk write bandwidth / latency spikes on turn boundary | Async only; write block-at-a-time; never on request critical path |
 | Token log too large as JSON | Binary sidecar (format in T1) |
-| Patching vendored omlx vs forking | T0 decision; prefer small patch series + notes in implementation_notes.md |
-| Reference checkouts drift | Pin commits in implementation_notes when patching |
+| Crate split churn | T0 decision recorded in notes before T1 code lands |
+| Reference checkouts drift | Pin commits (already frozen in rust-metal-engine notes) |
 
 ## Requirement → task mapping
 
