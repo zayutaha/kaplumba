@@ -16,8 +16,8 @@
 //! * a single row of activations (`rows == 1`, the decode shape).
 
 use half::f16;
-use kaplumba_kernels::{DeviceSpan, Exl3Gemv, Exl3Shape, KernelError};
-use metal::Buffer;
+use kaplumba_kernels::{AttnParams, DeviceSpan, Exl3Attention, Exl3Gemv, Exl3Shape, KernelError};
+use metal::{Buffer, MTLResourceOptions};
 
 use crate::exl3::codebook::CodebookMode;
 use crate::gemma4::TensorSource;
@@ -32,13 +32,29 @@ pub enum MetalLinearError {
 
 /// Owns the compiled pipelines + scratch for the GPU decode path.
 pub struct MetalLinear {
+    device: metal::Device,
     gemv: Exl3Gemv,
+    attn: Exl3Attention,
+    /// Attention staging buffers, grown on demand (T3.5). The engine still hands
+    /// attention host slices, so q/k/v are copied in and `out` copied back; the
+    /// KV cache (T5.1) will keep K/V device-resident and drop the copies.
+    attn_scratch: std::cell::RefCell<Option<AttnScratch>>,
+    attn_ns: std::sync::atomic::AtomicU64,
     /// Linears actually dispatched to the GPU (proof that eligibility held for
     /// a real run — a silent fallback would otherwise look like a slow GPU).
     calls: std::sync::atomic::AtomicU64,
     /// Wall time spent inside the GPU dispatches (R7.2: separates kernel cost
     /// from whatever else the forward pass is doing).
     gpu_ns: std::sync::atomic::AtomicU64,
+}
+
+struct AttnScratch {
+    q: Buffer,
+    k: Buffer,
+    v: Buffer,
+    out: Buffer,
+    q_elems: usize,
+    kv_elems: usize,
 }
 
 struct GpuLinear<'a> {
@@ -52,10 +68,19 @@ struct GpuLinear<'a> {
 impl MetalLinear {
     pub fn new(ctx: &MetalContext) -> Result<Self, MetalLinearError> {
         Ok(Self {
+            device: ctx.device().clone(),
             gemv: Exl3Gemv::new(ctx.device(), ctx.queue())?,
+            attn: Exl3Attention::new(ctx.device(), ctx.queue())?,
+            attn_scratch: std::cell::RefCell::new(None),
             calls: std::sync::atomic::AtomicU64::new(0),
             gpu_ns: std::sync::atomic::AtomicU64::new(0),
+            attn_ns: std::sync::atomic::AtomicU64::new(0),
         })
+    }
+
+    /// Wall time inside GPU attention dispatches, in milliseconds.
+    pub fn attn_ms(&self) -> f64 {
+        self.attn_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6
     }
 
     /// Number of linears dispatched to the GPU since construction.
@@ -112,6 +137,109 @@ impl MetalLinear {
         self.calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Some(out))
+    }
+}
+
+impl MetalLinear {
+    /// `out = attn(q, k, v)` on the GPU when the shape is supported.
+    ///
+    /// * `Ok(Some(out))` — computed on the GPU, `out.len() == q.len()`.
+    /// * `Ok(None)` — shape not covered by the kernels; caller uses the CPU path.
+    /// * `Err(_)` — dispatch/allocation failure (never silently wrong).
+    ///
+    /// `q` is `[s, n_heads, head_dim]`, `k`/`v` are `[kv_len, n_kv, head_dim]`,
+    /// all f16. Query row `r` sits at absolute position `kv_len - s + r`, which
+    /// is what lets one kernel serve both prefill (`s == kv_len`) and a cached
+    /// decode step (`s == 1`).
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_attention(
+        &self,
+        q: &[f16],
+        k: &[f16],
+        v: &[f16],
+        s: usize,
+        kv_len: usize,
+        n_heads: usize,
+        n_kv: usize,
+        head_dim: usize,
+        window: usize,
+    ) -> Result<Option<Vec<f16>>, MetalLinearError> {
+        let p = AttnParams {
+            s,
+            kv_len,
+            n_heads,
+            n_kv,
+            head_dim,
+            window,
+        };
+        if p.part().is_none()
+            || q.len() != s * n_heads * head_dim
+            || k.len() != kv_len * n_kv * head_dim
+            || v.len() != k.len()
+        {
+            return Ok(None);
+        }
+
+        let q_elems = q.len();
+        let kv_elems = k.len();
+        let mut slot = self.attn_scratch.borrow_mut();
+        let needs_grow = match slot.as_ref() {
+            Some(sc) => sc.q_elems < q_elems || sc.kv_elems < kv_elems,
+            None => true,
+        };
+        if needs_grow {
+            let q_cap = slot.as_ref().map(|s| s.q_elems).unwrap_or(0).max(q_elems);
+            let kv_cap = slot.as_ref().map(|s| s.kv_elems).unwrap_or(0).max(kv_elems);
+            let alloc = |n: usize| {
+                self.device
+                    .new_buffer((n * 2).max(2) as u64, MTLResourceOptions::StorageModeShared)
+            };
+            *slot = Some(AttnScratch {
+                q: alloc(q_cap),
+                k: alloc(kv_cap),
+                v: alloc(kv_cap),
+                out: alloc(q_cap),
+                q_elems: q_cap,
+                kv_elems: kv_cap,
+            });
+        }
+        let sc = slot.as_ref().expect("just allocated");
+        copy_in(&sc.q, q);
+        copy_in(&sc.k, k);
+        copy_in(&sc.v, v);
+
+        fn span(b: &Buffer) -> DeviceSpan<'_> {
+            DeviceSpan {
+                buffer: b,
+                byte_offset: 0,
+            }
+        }
+        let t0 = std::time::Instant::now();
+        self.attn
+            .run(span(&sc.q), span(&sc.k), span(&sc.v), span(&sc.out), p)?;
+        self.attn_ns.fetch_add(
+            t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        let mut out = vec![f16::ZERO; q_elems];
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                sc.out.contents() as *const u8,
+                out.as_mut_ptr() as *mut u8,
+                q_elems * 2,
+            );
+        }
+        Ok(Some(out))
+    }
+}
+
+fn copy_in(dst: &Buffer, src: &[f16]) {
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            src.as_ptr() as *const u8,
+            dst.contents() as *mut u8,
+            src.len() * 2,
+        );
     }
 }
 
@@ -673,7 +801,7 @@ mod tests {
                 .collect();
             const REPS: usize = 20;
             let verbose = std::env::var("KAPLUMBA_BENCH_VERBOSE").is_ok();
-            let mut time = |tag: &str, f: &mut dyn FnMut()| -> (f64, f64) {
+            let time = |tag: &str, f: &mut dyn FnMut()| -> (f64, f64) {
                 let mut v = Vec::with_capacity(REPS);
                 for _ in 0..REPS {
                     let t = std::time::Instant::now();
@@ -873,6 +1001,56 @@ mod tests {
             "{name}: {}x{} cpu vs gpu max rel err {err:.2e}",
             shape.0, shape.1
         );
+    }
+
+    /// GPU attention vs the engine's CPU reference on the real layer shapes
+    /// (sliding: 32q/16kv × 256; full: 32q/4kv × 512) with the config's window.
+    #[test]
+    fn real_artifact_attention_matches_cpu_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = crate::testutil::artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let Some(c) = ctx() else { return };
+        let model = crate::load::load_exl3(&c, &dir).expect("load artifact");
+        let g = MetalLinear::new(&c).expect("metal linear");
+        let cfg = crate::gemma4::GemmaCfg::from_text_config(&model.config.text_config)
+            .expect("gemma cfg");
+        let gm = crate::gemma4::Gemma4Model::from_model(&model).expect("model");
+
+        let mut rng = Rng(0xA77E);
+        let mut half = || f16::from_f32(((rng.next() % 2001) as f32 / 1000.0) - 1.0);
+
+        for (i, kind) in [(0usize, "sliding"), (5, "full")] {
+            let lc = cfg.layers[i];
+            let hd = lc.head_dim;
+            let s = 12usize;
+            let q: Vec<f16> = (0..s * cfg.n_heads * hd).map(|_| half()).collect();
+            let k: Vec<f16> = (0..s * lc.n_kv * hd).map(|_| half()).collect();
+            let v: Vec<f16> = (0..s * lc.n_kv * hd).map(|_| half()).collect();
+            let want = gm.attention_cpu(&lc, &q, &k, &v, s);
+            let got = g
+                .try_attention(
+                    &q,
+                    &k,
+                    &v,
+                    s,
+                    s,
+                    cfg.n_heads,
+                    lc.n_kv,
+                    hd,
+                    cfg.sliding_window,
+                )
+                .expect("dispatch")
+                .expect("gpu eligible");
+            let err = max_rel_err(&want, &got);
+            eprintln!("layer {i} ({kind}) attention: hd={hd} max rel err {err:.2e}");
+            assert!(err < 4e-3, "layer {i}: rel err {err}");
+        }
     }
 
     /// Every decoder linear in the real artifact must be GPU-eligible.

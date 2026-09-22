@@ -717,7 +717,45 @@ impl<'a> Gemma4Model<'a> {
     /// Causal (optionally windowed) GQA attention, scale 1.0.
     ///
     /// `q`: `s × n_heads·hd`, `k`/`v`: `s × n_kv·hd`. Output `s × n_heads·hd`.
-    pub fn attention(&self, lc: &LayerCfg, q: &[f16], k: &[f16], v: &[f16], s: usize) -> Vec<f16> {
+    ///
+    /// Dispatches to the Metal kernel when the GPU path is enabled and the shape
+    /// is covered (T3.5); the CPU path here is the reference the kernel is
+    /// checked against, and stays the fallback for unsupported shapes.
+    pub fn attention(
+        &self,
+        lc: &LayerCfg,
+        q: &[f16],
+        k: &[f16],
+        v: &[f16],
+        s: usize,
+    ) -> Result<Vec<f16>, GemmaError> {
+        if let Some(gpu) = self.gpu {
+            if let Some(out) = gpu.try_attention(
+                q,
+                k,
+                v,
+                s,
+                s,
+                self.cfg.n_heads,
+                lc.n_kv,
+                lc.head_dim,
+                self.cfg.sliding_window,
+            )? {
+                return Ok(out);
+            }
+        }
+        Ok(self.attention_cpu(lc, q, k, v, s))
+    }
+
+    /// CPU reference attention (the naive path and the kernel's ground truth).
+    pub fn attention_cpu(
+        &self,
+        lc: &LayerCfg,
+        q: &[f16],
+        k: &[f16],
+        v: &[f16],
+        s: usize,
+    ) -> Vec<f16> {
         let hd = lc.head_dim;
         let nh = self.cfg.n_heads;
         let nkv = lc.n_kv;
@@ -812,7 +850,7 @@ impl<'a> Gemma4Model<'a> {
             self.linear(&format!("{p}.self_attn.v_proj"), &xn)?
         };
 
-        let attn = self.attention(&lc, &q, &k, &v, s);
+        let attn = self.attention(&lc, &q, &k, &v, s)?;
         let o = self.linear(&format!("{p}.self_attn.o_proj"), &attn)?;
         let post_ln = self.f32_tensor(&format!("{p}.post_attention_layernorm.weight"))?;
         let o = rms_norm_rows(&o, s, hidden, Some(&post_ln), cfg.eps);

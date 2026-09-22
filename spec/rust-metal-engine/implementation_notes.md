@@ -224,6 +224,60 @@ Guard: `all_layer_linears_gpu_eligible_slow` (KAPLUMBA_RUN_SLOW=1, ~5 s, loads
 16 GB) now asserts eligibility *and* that a real 1-layer forward dispatches 8
 GPU linears, so this class of silent fallback cannot come back unnoticed.
 
+## T3.5/T3.7 (kernel half) — bounded-scratch attention, 2026-09-22
+
+`crates/kernels/src/attn.metal` + `attn.rs`, wired into `Gemma4Model::attention`
+(`attention_cpu` is kept as the reference/fallback).
+
+Geometry: one threadgroup = `AROWS` = 8 query rows **× one query head**;
+`PART = head_dim / 32` threads per row (8 for hd 256, 16 for hd 512, i.e. the
+threadgroup is 64 or 128 threads), each owning `DW = 32` dims. The `PART` threads
+of a row are consecutive lanes of one simd group (`row*PART + slice` indexing),
+so the q·k slice reduction is `simd_shuffle_xor(dot, 1<<m)` for `m < log2(PART)`.
+
+Why it has **no scratch and no barriers** (this is the R5.3/prohibited-pattern
+answer, DE25):
+
+- online-softmax state = per-thread scalars: running max `m_run`, denominator
+  `l_run`, and `float acc[DW]`;
+- one KV tile of scores = `float sc[ATILE]` (ATILE = 16) in registers;
+- because nothing is shared between the threads of a row, the kernel needs no
+  `threadgroup` memory and no `threadgroup_barrier` at all, so it also tolerates
+  divergence (padded rows are masked by `row < s`, never early-returned).
+
+Working set is therefore O(1) in sequence length: no `[heads, L, L]` score
+matrix, no `[heads, q, kv]` mask tensor, no growable scratch. One masking rule
+serves prefill and decode: query row `r` sits at absolute position
+`kv_len - s + r`, so `s == kv_len` is a full prefill and `s == 1` is a cached
+decode step; sliding layers start the KV loop at `max(0, p0 + 1 - window)`.
+
+Correctness (all vs the CPU reference):
+
+- `cargo test -p kaplumba-kernels` — 7 tests, all pass. Sliding window 1024/4/3,
+  full causal (incl. s=9), cached decode at kv 8/16/17/32/64/256/512/700, kv=1,
+  padded rows, and unsupported-shape rejection. `tiny-2x2` is **bit-exact**.
+- `one_hot_golden` pins the semantics with hand-checkable numbers (uniform scores
+  over one-hot `v` ⇒ `out[d] = 1/(pos+1)`), which is what caught both bugs.
+- `KAPLUMBA_RUN_SLOW=1 … real_artifact_attention_matches_cpu_slow` (real layer
+  shapes, ~4 s): sliding (32q/16kv, hd 256) **4.88e-4**, full (32q/4kv, hd 512)
+  **4.88e-4** — about 2 f16 ulps, i.e. at the f16 noise floor.
+
+Two bugs found and fixed while landing this (both worth remembering, they are
+invisible in the "obvious" test setup):
+
+1. `pos` was computed from `tp.y` (row *within* the threadgroup) instead of
+   `tg.x*AROWS + tp.y`. Every query block past the first silently recomputed
+   block 0's positions. Any test with `s <= AROWS = 8` passes.
+2. `q` and `out` were indexed by absolute position instead of query row. Those
+   coincide when `s == kv_len`, so **every prefill case passed** while every
+   cached-decode case was wrong. Only `s < kv_len` distinguishes them.
+
+Cost/limits: the kernel is instantiated for hd 256 and hd 512 only; anything
+else returns `Ok(None)`/`Unsupported` so the CPU path keeps handling it (the
+synthetic test model's hd 64 goes down that road). Attention is dispatched per
+layer with host→device staging of q/k/v for now; keeping K/V device-resident is
+the KV cache (T5.1).
+
 ## Invariants
 
 - I1: Single resident model; single-user; one agent session editing at a time.

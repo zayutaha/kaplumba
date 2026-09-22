@@ -90,6 +90,35 @@ pub struct DeviceSpan<'a> {
     pub byte_offset: usize,
 }
 
+/// Check that `span` is aligned and large enough for how a kernel will read it.
+///
+/// `align` is 2 for f16 data and for the trellis (read as u16 pairs): real
+/// artifacts place some tensors at offsets that are 2- but not 4-byte aligned,
+/// so a blanket 4-byte rule would push the largest single linear back onto the
+/// CPU. Shared by the GEMV and attention wrappers.
+pub(crate) fn check_span_fits(
+    span: &DeviceSpan<'_>,
+    bytes_needed: usize,
+    what: &str,
+    align: usize,
+) -> Result<(), KernelError> {
+    if span.byte_offset % align != 0 {
+        return Err(KernelError::Unsupported(format!(
+            "{what}: byte offset {} is not {align}-byte aligned",
+            span.byte_offset
+        )));
+    }
+    if (span.buffer.length() as usize) < span.byte_offset + bytes_needed {
+        return Err(KernelError::Unsupported(format!(
+            "{what}: needs {} bytes at offset {}, buffer is {}",
+            bytes_needed,
+            span.byte_offset,
+            span.buffer.length()
+        )));
+    }
+    Ok(())
+}
+
 /// Per-pair funnel-shift descriptor for one `k`, as consumed by the kernel:
 /// bits 0..8 = `i0`, 8..16 = `i1`, 16..24 = `s1`.
 ///
@@ -333,21 +362,7 @@ impl Exl3Gemv {
         what: &str,
         align: usize,
     ) -> Result<(), KernelError> {
-        if span.byte_offset % align != 0 {
-            return Err(KernelError::Unsupported(format!(
-                "{what}: byte offset {} is not {align}-byte aligned",
-                span.byte_offset
-            )));
-        }
-        if (span.buffer.length() as usize) < span.byte_offset + bytes_needed {
-            return Err(KernelError::Unsupported(format!(
-                "{what}: needs {} bytes at offset {}, buffer is {}",
-                bytes_needed,
-                span.byte_offset,
-                span.buffer.length()
-            )));
-        }
-        Ok(())
+        check_span_fits(span, bytes_needed, what, align)
     }
 
     /// Isolated `had_in` pass: `xh = had_r_128(x * suh)` for one row.

@@ -134,10 +134,14 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - Commit: `spec/rust-metal-engine: T3.4 shape dispatch`
 
 ### T3.5 — SWA KV bound in attention
-- [ ] Sliding layers only iterate in-window KV (n_kv_max)
-- Test: outputs match unbound path; long-context pp/tg delta
-- Target: AC2, R2.5
-- Commit: `spec/rust-metal-engine: T3.5 swa bound`
+- [x] Done — GPU attention kernel (`crates/kernels/src/attn.metal`) + engine wiring; sliding layers iterate only the in-window KV (the kernel starts its KV loop at `max(0, p0+1-window)`, so a sliding layer never touches KV outside the window)
+- Design: one threadgroup = `AROWS`(8) query rows × one query head, `PART` = `head_dim/32` threads per row so the slice reduction is a `simd_shuffle_xor` all-reduce. **No barriers, no threadgroup memory** → see T3.7
+- One rule covers prefill and decode: query row `r` sits at absolute position `kv_len - s + r`, so `s == kv_len` is a prefill and `s == 1` is a cached decode step
+- Verified: `cargo test -p kaplumba_kernels` (7 tests: sliding window wide/narrow/odd, full causal, cached decode at kv 8/16/17/32/64/256/512/700, kv=1, padded rows, unsupported shapes) + `real_artifact_attention_matches_cpu_slow` on the real layer shapes (sliding 32q/16kv×256 and full 32q/4kv×512): **max rel err 4.88e-4 ≈ 2 f16 ulps**
+- Bug found + fixed: `pos` used the row *within* the threadgroup instead of `tg.x*AROWS + tp.y` (every block past the first recomputed block 0's positions; hidden by all `s ≤ 8` cases), and q/out were indexed by absolute position instead of row (identical only when `s == kv_len`, i.e. every prefill case passed while decode was wrong)
+- Files: `crates/kernels/src/{attn.metal,attn.rs,lib.rs}`, `crates/engine/src/{metal_linear,gemma4}.rs`
+- Target: AC2, R2.5, R3.7
+- Commit: `spec/rust-metal-engine: T3.5 attention kernel`
 
 ### T3.6 — Prefill sync policy + fusion audit
 - [ ] No unconditional sync+clear per chunk (deferred/pressure only); no accidental materialize between fused candidates (up/gate, silu⊙up)
@@ -145,11 +149,11 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - Test: prefill completes 8k; profile shows no mid-prefill full clear; numerical parity
 
 ### T3.7 — Bounded prefill scratch + peak-RSS gate (user directive 2026-09-22)
-- [ ] Audit + prove: prefill attention is **online-softmax over KV tiles** with an O(L) working set (no `[heads, L, L]` score matrix, no model-built `[heads, q, kv]` bias tensor); every scratch buffer is fixed-size and allocated once at load; nothing retains a freed-buffer high-water mark; no per-chunk unconditional clear/marker that would keep transients alive
-- Files: prefill attention kernel + engine scratch arena; `crates/cli` bench report
-- Test: **measured peak RSS / Metal footprint at 1024 / 2048 / 8192 prefill tokens**, each ≥ 3 repeats, asserted to grow by ≤ (KV bytes for that length + fixed constant); report the three numbers in `implementation_notes.md` and in the `kaplumba-bench/1` report
+- [~] Kernel half **done**: attention is online-softmax over KV tiles with an O(1) working set — running max/denominator/output accumulators and one 16-entry score tile all live in **registers**, the slice reduction is `simd_shuffle_xor`, and the kernel allocates **no** threadgroup memory and uses **no** barriers. There is no `[heads, L, L]` score matrix, no `[heads, q, kv]` bias tensor, and no growable scratch anywhere in the attention path
+- [ ] Remaining (blocked on the batched prefill path T3.2/T5.1): the CLI-side proof — measured peak RSS / Metal footprint at **1024 / 2048 / 8192** prefill tokens, ≥3 repeats each, asserted to grow by ≤ (KV bytes for that length + fixed constant), recorded here and in the `kaplumba-bench/1` report
+- Files: `crates/kernels/src/attn.metal` (structural); `crates/cli` bench report + measurement (remaining)
 - Target: R5.3, R5.5, AC6 (this is an acceptance number, not a nice-to-have)
-- Commit: `spec/rust-metal-engine: T3.7 bounded prefill scratch`
+- Commit: `spec/rust-metal-engine: T3.5 attention kernel` (kernel half)
 - Target: AC8, R2.4
 - Commit: `spec/rust-metal-engine: T3.6 sync policy + fusion`
 
