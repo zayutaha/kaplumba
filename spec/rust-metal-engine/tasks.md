@@ -61,10 +61,17 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - Commit: `spec/rust-metal-engine: T1.3c gemma4 forward + greedy`
 
 ### T1.4 — CLI generate + bench entry
-- [ ] `kaplumba-engine generate --prompt ... --max-tokens N --temp ...` streaming; JSON stats (ttft_ms, pp_tps, tg_tps, mem) schema `kaplumba-bench/1`
-- Files: `crates/cli`
-- Test: CLI runs; JSON schema matches harness during transition; diffable
-- Commit: `spec/rust-metal-engine: T1.4 cli generate`
+- [x] `kaplumba-engine generate --prompt ... --max-tokens N --temp ...` streaming; JSON stats (ttft_ms, pp_tps, tg_tps, mem) schema `kaplumba-bench/1`
+  - `crates/engine/src/generate.rs`: `generate(model, prompt, GenParams, on_token) -> GenStats` (prefill/decode/ttft/finish_reason/computed_tokens), EOS-aware, seed-reproducible; `Gemma4Model::greedy_generate` now delegates to it
+  - `crates/engine/src/sampler.rs`: PCG32 + top-k/top-p/temp (OQ4 defaults 1.0/64/0.95; temp 0 → greedy); T4.3 replaces the host path
+  - `crates/cli`: `generate` command (hand-rolled arg parsing, streaming delta detokenizer, `--layers` depth limit, `--json PATH|-`), `kaplumba-bench/1` report mirroring `scripts/bench.py` keys + `sampling`/`tokens`/`text`; host+mem metrics via libc (`sysctl`, `getrusage`), Metal alloc/working-set from the device
+- Files: `crates/cli/{main,args,report}.rs`, `crates/cli/tests/cli_generate.rs`, `crates/engine/src/{generate,sampler,testutil}.rs`
+- Test: `cargo test` 101 pass (85 engine + 11 CLI unit + 5 CLI integration); report schema key set pinned and asserted in `build_report`; e2e `generate --layers 2 --json -` gated behind `KAPLUMBA_RUN_SLOW=1` (~22s, verified)
+- Measured (release, real artifact): load 3.7s · 2-layer/2-token prefill 16.5s (ttft 16.5s) · full 60-layer 1-token forward + lm_head 205s · `peak_rss` 8.08 GB vs `metal_alloc` 16.03 GB (UMA buffers are not in `getrusage`)
+- Commit: `spec/rust-metal-engine: T1.4 cli generate + bench report`
+
+### T0.2 — Baseline capture (still open, next)
+- [ ] Reference-only PonyExl3 numbers + cross-check of the T1.3d fixture (`[2]` → 236773); then retire `scripts/bench.py` (R7.4) now that the Rust bench exists
 
 ## Phase 2 — EXL3 decode path
 

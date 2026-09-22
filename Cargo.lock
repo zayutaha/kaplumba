@@ -392,6 +392,8 @@ name = "kaplumba-cli"
 version = "0.1.0"
 dependencies = [
  "kaplumba-engine",
+ "libc",
+ "serde_json",
 ]
 
 [[package]]
