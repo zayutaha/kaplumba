@@ -14,6 +14,7 @@ Supersedes `spec/omlx-exl3-engine/` (Python/omlx plan abandoned per user directi
 - **No KV cache quantization** (unless a future spec amends this).
 - **No quality loss** — speculative decoding verify-gated (greedy token-identical at temp 0; distribution-exact sampling at temp > 0). EXL3 3.0 bpw must pass the sampled golden review.
 - **No overhead margin** — profile before adding machinery; no scheduler/sync/serialization on the steady-state path.
+- **No graph/tree-shaped prefill scratch** (user directive 2026-09-22, see AGENTS.md §8). Explicitly banned, all of which the MLX reference does: a lazy op graph whose intermediates are all live at once; a retained Metal buffer pool that keeps the prefill high-water mark (MLX's `mx.clear_cache()` path, `omlx/memory_monitor.py`); and a materialized **O(L²) `[heads, L, L]` attention score matrix** (`estimate_prefill_transient_bytes`, `PrefillMemoryExceededError`, `cluster/memory_guard.py` — measured ~33 GiB for one 160k-token, head_dim-256 prefill). Prefill attention must be **online-softmax over KV tiles with an O(L) working set**; every scratch buffer we own is **fixed-size and context-independent**; peak RSS across 1k/2k/8k prefill is a **measured acceptance criterion** (R5.3).
 - Do not treat `reference/` as a runtime dependency tree; port ideas deliberately as fresh code (same stance as old DE13: inspiration OK, no vendored engine code).
 - No multi-model pool; single resident model. Model weights only from `~/.kaplumba/models`.
 - `reference/` is read-only.
@@ -67,7 +68,7 @@ Supersedes `spec/omlx-exl3-engine/` (Python/omlx plan abandoned per user directi
 
 - R5.1 Resident budget: ~16.5 GB class (weights + SWA/KV) + documented headroom for activations, MTP state, runtime; stretch goal **14.6 GB** footprint as user-stated target (report delta; may require tighter packing or different accounting — open).
 - R5.2 Gemma hybrid KV layout: SWA rings (window 1024) for local layers; full context only for global layers; honor unified global K=V — **layout, not quantization**.
-- R5.3 Budgeted activation/attention scratch (no unbounded score tensors); FA/SDPA avoids materializing full score matrices; OOM-retry loops are failures, not steady state.
+- R5.3 **Budgeted, context-independent scratch** — flash/online-softmax attention that never materializes a `[heads, L, L]` score matrix; every scratch buffer we own has a fixed size decided at load time; no retained buffer pool that keeps a high-water mark. **Measured** acceptance: peak RSS / Metal footprint for prefill of 1024/2048/8192 tokens must be within the budget of R5.1 and must grow **only** by the KV cache itself (≤ KV bytes + a fixed constant), reported per length in the bench JSON (R5.5/R7.1). OOM-retry loops are failures, not steady state. See the named bans in the restrictions.
 - R5.4 Load hygiene: streaming/per-layer release, no duplicate host copies of trellis when device owns weights; Metal working-set cap pattern (PonyExl3 92% cap as reference).
 - R5.5 Memory metrics: peak RSS / footprint / Metal peak captured in bench runs.
 

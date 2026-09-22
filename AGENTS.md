@@ -178,6 +178,7 @@ These are global restrictions; any spec that conflicts with them must call the c
 - **No KV cache quantization** (unless a future spec explicitly lifts this).
 - **No quality loss** — speculative decoding must be verify-gated (greedy-identical or distribution-exact).
 - **No overhead margin** — avoid scheduler/sync/serialization costs on the hot path; profile before adding machinery.
+- **No graph/tree-shaped prefill scratch** (user directive 2026-09-22). The MLX reference (`reference/omlx`) lets prefill peak memory balloon far past the KV window: (a) its lazy op graph keeps every intermediate and model-built additive mask alive at once, (b) MLX's Metal **buffer pool** keeps freed transients resident (only `mx.clear_cache()` returns them), and (c) unsupported SDPA shapes materialize an **O(L²) `[heads, L, L]` score matrix in fp32** even for fp16/bf16 models (documented `PrefillMemoryExceededError` path; `omlx/memory_monitor.py`, `omlx/cluster/memory_guard.py`). Our engine must not: prefill attention is **online-softmax (flash-style), O(L) working set**, never a materialized score matrix; scratch buffers are **explicitly owned, fixed-size, and independent of context length**; no retained-pool semantics; peak RSS is a **measured acceptance number** across 1k/2k/8k prefill, not a prediction.
 - Optimize for: **TTFT, tg/s, pp/s, memory**, in that awareness; always state which metric a change targets.
 
 ---

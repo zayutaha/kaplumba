@@ -79,8 +79,8 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 ## Phase 2 — EXL3 decode path
 
 ### T2.1 — Fresh trellis GEMV + dequant kernels
-- [ ] EXL3 trellis decode GEMV in Metal from reference logic (fresh code); out_scales/codebook path correct
-- Files: `crates/kernels/src/exl3/*`
+- [~] In progress. EXL3 trellis decode GEMV + both 128-point Hadamard passes in fresh Metal (`crates/kernels`), wired into the engine decode path with CPU fallback
+- Files: `crates/kernels/src/{lib,exl3}.rs`, `crates/kernels/src/exl3.metal`
 - Test: numerical closeness vs loader reference path; tg/s before/after; pageins=0 in steady decode
 - Target: AC4, R3.5, R4.3
 - Commit: `spec/rust-metal-engine: T2.1 trellis gemv`
@@ -137,6 +137,13 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - [ ] No unconditional sync+clear per chunk (deferred/pressure only); no accidental materialize between fused candidates (up/gate, silu⊙up)
 - Files: prefill loop, elementwise
 - Test: prefill completes 8k; profile shows no mid-prefill full clear; numerical parity
+
+### T3.7 — Bounded prefill scratch + peak-RSS gate (user directive 2026-09-22)
+- [ ] Audit + prove: prefill attention is **online-softmax over KV tiles** with an O(L) working set (no `[heads, L, L]` score matrix, no model-built `[heads, q, kv]` bias tensor); every scratch buffer is fixed-size and allocated once at load; nothing retains a freed-buffer high-water mark; no per-chunk unconditional clear/marker that would keep transients alive
+- Files: prefill attention kernel + engine scratch arena; `crates/cli` bench report
+- Test: **measured peak RSS / Metal footprint at 1024 / 2048 / 8192 prefill tokens**, each ≥ 3 repeats, asserted to grow by ≤ (KV bytes for that length + fixed constant); report the three numbers in `implementation_notes.md` and in the `kaplumba-bench/1` report
+- Target: R5.3, R5.5, AC6 (this is an acceptance number, not a nice-to-have)
+- Commit: `spec/rust-metal-engine: T3.7 bounded prefill scratch`
 - Target: AC8, R2.4
 - Commit: `spec/rust-metal-engine: T3.6 sync policy + fusion`
 

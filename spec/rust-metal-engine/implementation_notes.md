@@ -60,6 +60,7 @@ Append as work proceeds (AGENTS.md §5). Dense, factual, takeover-oriented. Cont
 - DE21: New spec folder `rust-metal-engine`; `omlx-exl3-engine` superseded; `paged-kv-cache` fully rewritten for Rust.
 - DE22 (T1.0): Workspace = `crates/engine` (lib) + `crates/cli` (bin `kaplumba-engine`); root package `kaplumba` removed (hello-world `src/` deleted). Edition **2024** (rustc 1.95.0-nightly).
 - DE23 (T1.0): Metal binding = **`metal` 0.33.0** (workspace dep). Chosen for mature compute API (`dispatch_threads`, `new_library_with_source`, shared buffers). Caveat: crate docs mark it deprecated in favor of `objc2-metal` (0.3.2) — still “basic PRs maintained” while wgpu migrates; **revisit only if blocked**, do not churn mid-kernel-work. `objc2`/`objc2-metal` remain the long-term fallback (DE23 risk).
+- DE25 (2026-09-22, user directive): **No prefill scratch that scales with context or keeps a high-water mark.** The MLX reference's lazy-graph intermediates + buffer pool + unfused O(L²) SDPA score matrix are banned by name (AGENTS.md §8, spec.md restrictions). Consequences for T3/T4: attention is online-softmax over KV tiles; a prefill step may only allocate scratch we own at a fixed size; peak RSS at 1k/2k/8k is measured and is an acceptance number (R5.3), not a best-effort.
 - DE24 (T1.0): Shader path = **runtime MSL compile** (`Device::new_library_with_source`) for T1 smoke; switch to offline `xcrun metal -o *.metallib` in `build.rs` once kernels stabilize (T2+) to avoid first-token compile latency (R2.6).
 
 ## Environment (T0.3 — verified, carried)
@@ -129,6 +130,7 @@ then `ponyexl3.mlx.generate.generate_text(..., use_chat_template=False, temp=0.0
 
 ## Dead ends (do not repeat)
 
+- **Prefill scratch that grows past the KV window (banned by user 2026-09-22).** What the MLX reference actually does, for the record, so nobody re-imports it: (1) MLX evaluates a whole lazy op **graph/DAG** per prefill step, so every intermediate and every model-built additive attention bias `[n_q_heads, q_tokens, kv_len]` is alive simultaneously (`memory_monitor.py` prices it as `estimate_prefill_transient_bytes`, on top of resident KV); (2) freed transients go back into MLX's **Metal buffer pool**, not to the OS, so RSS keeps the prefill high-water mark until `mx.clear_cache()` — the notes in `speculative/vlm_mtp.py` ("on large targets like Gemma 4 31B the buffer pool balloons", upstream issue #1416) are about exactly this; (3) when a prefill shape is not covered by fused SDPA, MLX materializes an **unfused O(L²) score matrix** in fp32 even for bf16 models (`SDPA256_UNFUSED_SCORE_DTYPE_SIZE = 4`; measured ~33 GiB spike on a 160k-token head_dim-256 prefill), which is what `PrefillMemoryExceededError` / `cluster/memory_guard.py` exist to catch. **Our rule: online-softmax attention over KV tiles, O(L) working set, fixed-size owned scratch, and a measured peak-RSS criterion (R5.3) at 1k/2k/8k.**
 - EXL3 LUT decode (measured slower than procedural).
 - Lowering global fuse min size (2× decode regressions on small groups).
 - KV quant / Hadamard-KV (out of scope).
