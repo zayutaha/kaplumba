@@ -12,6 +12,7 @@ Append as work proceeds (AGENTS.md §5). Dense, factual, takeover-oriented. Cont
 - **T1.1 done** (2026-09-22): EXL3 loader — per-shard Metal buffers, stream via 8 MiB stage. Real artifact: **2422 tensors / 2 shards / 16.028 GB / ~4s**, 7/7 tests.
 - **T1.2 done** (2026-09-22): tokenizer — `tokenizers` **0.21.4** (classic API; 1.0.0-rc.2 reorganized and was rejected). 9/9 tests. Specials verified: pad=0 eos=1 bos=2 unk=3 open=105 close=106. Next: T1.3 naive forward (or T0.2 baseline).
 - **T1.3a done** (2026-09-22): EXL3 CPU decode primitives under `crates/engine/src/exl3/` — `trellis`, `codebook`, `perm`, `signs`, `hadamard`, `decode`. 26 new unit tests (35 total engine tests pass) pinned to reference goldens: MCG/Default/Mul1 codewords, q00 artifact tile k=3 MCG row-major, pack fixtures k=3/6, sign bitfield, perm heads, Hadamard large-magnitude lanes. Deps added: `half` 2.7.1, `rayon` 1 (rayon not yet used — reserved for T1.3b reconstruct). Next: T1.3b reconstruct + linear forward.
+- **T1.3b done** (2026-09-22): `reconstruct.rs` (`TrellisView`, `reconstruct_inner`, `reconstruct_inner_slab` 16-col tiles, `reconstruct_public_weights` with outer Hadamard+suh/svh) + `forward.rs` (`Exl3Linear`, streaming `linear_forward_reconstruct` — output in 128-col slabs so lm_head never materializes ~2.8 GB). 44/44 tests. Stream vs full stepwise: max rel err < 1e-3; stream vs dense public-weight: < 0.15 (inherent f16 intermediate-rounding gap when Hadamard is folded into W). Outer Hadamard asserts `in/out % 128 == 0` (all Gemma4 dims qualify: 5376, 8192, 21504, 262144).
 - DE25 (T1.1): Single ~16 GiB `new_buffer` failed (null contents → SIGABRT on drop). Fix = one shared buffer per safetensors shard (~8.5 + ~7.5 GB). Null-check after alloc; `LoadError::Alloc`.
 - DE26 (T1.1): Load layout = original safetensors data offsets within each shard buffer (seek `8+header_len+data_offset`, copy to same offset) — no repack.
 - DE27 (T1.2): Prefer **stable `tokenizers` 0.21.4** over 1.0.0-rc.2 (rc moved Tokenizer into tk-convert; API churn).
@@ -19,6 +20,7 @@ Append as work proceeds (AGENTS.md §5). Dense, factual, takeover-oriented. Cont
 - DE29 (T1.3a): `HAD_SCALE` must be the exact f32 of `1/sqrt(128)` = `f32::from_bits(0x3DB504F3)`; a hand-written `0.08838835` is 1 ULP off and skews Hadamard goldens.
 - DE30 (T1.3a): Hadamard golden vs Python BLAS — only 8/128 lanes have \|y\|>0.01; near-zero lanes are pure cancellation and differ by accumulation order. Tests pin bit-exact on those 8, absolute bound \|y\|<1 elsewhere.
 - DE31 (T1.3a): `unpack_trellis_tile` returns **full 16-bit sliding-window codewords**, not low-K bits; `pack_trellis_tile(cw)` reproduces the packed tile because pack only emits low K bits. Roundtrip property: `unpack(pack(x)) & mask == x & mask`.
+- DE32 (T1.3b): Streaming forward casts the f32 matmul slab to **f16 before** the right Hadamard (matches reference `linear_forward_reconstruct`). Folding Hadamard into W (`reconstruct_public_weights`) is only a loose-parity path (rel err ≲0.15 on synth) — golden path is stream/stepwise.
 
 ## Decisions (carried + new)
 

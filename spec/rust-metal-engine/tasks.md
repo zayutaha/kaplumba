@@ -49,6 +49,7 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 ### T1.3 — Naive eager prefill + decode (correctness first)
 - [~] In progress — sub-steps:
   - [x] **T1.3a** EXL3 decode primitives: trellis pack/unpack, codebook (MCG/Default/Mul1), perm, signs, Hadamard, `decode_packed_tile` — 26/26 unit tests vs reference goldens (q00 tile, MCG codewords, pack fixtures k=3/6)
+  - [x] **T1.3b** reconstruct (inner/slab/public weights) + streaming `linear_forward_reconstruct` — 44/44 tests; stream ≡ stepwise rel err < 1e-3; dense public-weight loose parity
   - [ ] **T1.3b** reconstruct (inner trellis → had+scales) + `linear_forward_reconstruct`
   - [ ] **T1.3c** Gemma4 model forward (embed, hybrid SWA/full attn, MLP, layer_scalar, softcap)
   - [ ] **T1.3d** greedy generate + golden fixture; deterministic across runs
