@@ -148,6 +148,37 @@ pub fn pair_table(k: u32) -> Vec<u32> {
     out
 }
 
+/// Inverse of the tensor-core 16×16 tile permutation: for each row-major
+/// tile position, the kernel-order codeword index stored there. Consumed by
+/// `exl3_gemm_sg`'s decode precompute (`inv_perm[(2*rp+j)*16 + dcol]`).
+///
+/// Duplicate of the engine's `exl3::perm::tensor_core_perm_inverse` (the
+/// kernels crate must not depend on the engine); same construction as the
+/// reference `_inv_perm_u32` / `tensor_core_perm_inverse`
+/// (reference/PonyExl3/ponyexl3/ref/perm.py). Unit-tested against the
+/// engine's recorded head values below.
+fn tensor_core_perm_inverse() -> [u32; 256] {
+    let mut perm = [0usize; 256];
+    for t in 0..32 {
+        let r0 = (t % 4) * 2;
+        let c0 = t / 4;
+        let base = t * 8;
+        perm[base] = r0 * 16 + c0;
+        perm[base + 1] = (r0 + 1) * 16 + c0;
+        perm[base + 2] = (r0 + 8) * 16 + c0;
+        perm[base + 3] = (r0 + 9) * 16 + c0;
+        perm[base + 4] = r0 * 16 + c0 + 8;
+        perm[base + 5] = (r0 + 1) * 16 + c0 + 8;
+        perm[base + 6] = (r0 + 8) * 16 + c0 + 8;
+        perm[base + 7] = (r0 + 9) * 16 + c0 + 8;
+    }
+    let mut inv = [0u32; 256];
+    for (i, &p) in perm.iter().enumerate() {
+        inv[p] = i as u32;
+    }
+    inv
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct MslHad {
@@ -170,8 +201,13 @@ pub struct Exl3Gemv {
     had_in: ComputePipelineState,
     gemv: ComputePipelineState,
     gemm: ComputePipelineState,
+    /// Simdgroup tensor-core GEMM (v19c port; `rows ≥ 2`, see `sg_eligible`).
+    gemm_sg: ComputePipelineState,
     had_out: ComputePipelineState,
     pair_tables: RefCell<HashMap<u32, Buffer>>,
+    /// Constant 256×u32 inverse tile permutation, shared by every linear
+    /// (the decode geometry is per tile-position, not per layer).
+    inv_perm: Buffer,
     scratch: RefCell<Option<Scratch>>,
 }
 
@@ -193,14 +229,22 @@ impl Exl3Gemv {
                 .new_compute_pipeline_state_with_function(&f)
                 .map_err(|e| KernelError::Pipeline(name.to_string(), e.to_string()))
         };
+        let inv = tensor_core_perm_inverse();
+        let inv_perm = device.new_buffer_with_data(
+            inv.as_ptr() as *const _,
+            (inv.len() * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
         Ok(Self {
             device: device.clone(),
             queue: queue.clone(),
             had_in: build("exl3_had_in")?,
             gemv: build("exl3_gemv")?,
             gemm: build("exl3_gemm")?,
+            gemm_sg: build("exl3_gemm_sg")?,
             had_out: build("exl3_had_out")?,
             pair_tables: RefCell::new(HashMap::new()),
+            inv_perm,
             scratch: RefCell::new(None),
         })
     }
@@ -370,6 +414,101 @@ impl Exl3Gemv {
             MTLSize::new(shape.out_tiles as u64, rows.div_ceil(RGT) as u64, 1),
             MTLSize::new(32, 1, 1),
         );
+    }
+
+    /// Simdgroup tensor-core GEMM (v19c port): one threadgroup per 64×64
+    /// output tile (4 out-tiles × 64 token rows), f16 MMA with f32
+    /// accumulate. Caller must gate via [`Self::sg_eligible`] and have padded
+    /// the `xh` scratch to `rows.div_ceil(64) * 64` rows (the kernel loads A
+    /// fragments device-direct up to a 64-row boundary and masks the store).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_gemm_sg(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        xh: &Buffer,
+        trellis: DeviceSpan<'_>,
+        shape: Exl3Shape,
+        mode: u32,
+        y: &Buffer,
+        rows: usize,
+    ) {
+        debug_assert!(rows >= 2);
+        debug_assert!(Self::sg_eligible(shape, trellis));
+        debug_assert_eq!(shape.words_per_tile() % 2, 0);
+        let params: [u32; 7] = [
+            shape.in_tiles as u32,
+            shape.out_tiles as u32,
+            shape.k,
+            (shape.words_per_tile() / 2) as u32,
+            mode,
+            u32::from(trellis.byte_offset % 4 == 0),
+            rows as u32,
+        ];
+        enc.set_compute_pipeline_state(&self.gemm_sg);
+        enc.set_buffer(0, Some(xh), 0);
+        enc.set_buffer(1, Some(trellis.buffer), trellis.byte_offset as u64);
+        enc.set_buffer(2, Some(&self.inv_perm), 0);
+        enc.set_buffer(3, Some(y), 0);
+        enc.set_bytes(4, 28, params.as_ptr() as *const _);
+        // MUST match SG_BM/SG_THREADS in exl3.metal: grid over 64-row ×
+        // 4-out-tile blocks, 128 threads (4 simdgroups) per block.
+        const SG_BM: usize = 64;
+        const SG_OUT_TILES: usize = 4;
+        debug_assert_eq!(shape.out_tiles % SG_OUT_TILES, 0);
+        enc.dispatch_thread_groups(
+            MTLSize::new(
+                (shape.out_tiles / SG_OUT_TILES) as u64,
+                rows.div_ceil(SG_BM) as u64,
+                1,
+            ),
+            MTLSize::new(128, 1, 1),
+        );
+    }
+
+    /// Simdgroup-GEMM eligibility (see `exl3_gemm_sg`): even `in_tiles` (the
+    /// k-loop stages over 2 in-tiles), `out_tiles % 4 == 0` (64-wide out
+    /// blocks), and a 4-byte-aligned trellis (funnel words read as u32 pairs,
+    /// same contract as the v19c reference). lm_head is 2-mod-4 but always
+    /// takes the rows=1 GEMV path, so it never needs this gate to fire.
+    fn sg_eligible(shape: Exl3Shape, trellis: DeviceSpan<'_>) -> bool {
+        shape.in_tiles % 2 == 0 && shape.out_tiles % 4 == 0 && trellis.byte_offset % 4 == 0
+    }
+
+    /// The one gem-dispatch decision point: rows=1 → tuned single-row GEMV;
+    /// sg-eligible multi-row → simdgroup tensor-core GEMM; otherwise the
+    /// scalar RGT=8 fallback. Shared by production (`encode_linear`) and the
+    /// phase bench so measurements reflect what production runs.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_gem(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        xh: &Buffer,
+        trellis: DeviceSpan<'_>,
+        pair: &Buffer,
+        shape: Exl3Shape,
+        mode: u32,
+        y: &Buffer,
+        rows: usize,
+    ) {
+        if rows == 1 {
+            self.encode_gemv(enc, xh, trellis, pair, shape, mode, y);
+        } else if Self::sg_eligible(shape, trellis) {
+            self.encode_gemm_sg(enc, xh, trellis, shape, mode, y, rows);
+        } else {
+            self.encode_gemm(enc, xh, trellis, pair, shape, mode, y, rows);
+        }
+    }
+
+    /// `xh` rows to reserve: the sg kernel's device-direct A loads read up to
+    /// the next 64-row boundary above `rows`; pad rows are multiplied into
+    /// outputs the store masks away (`gr < blk_len`). Non-sg paths need no
+    /// padding (they only ever address rows < `rows`).
+    fn xh_rows(rows: usize, shape: Exl3Shape, trellis: DeviceSpan<'_>) -> usize {
+        if rows >= 2 && Self::sg_eligible(shape, trellis) {
+            rows.div_ceil(64) * 64
+        } else {
+            rows
+        }
     }
 
     fn encode_had_out(
@@ -686,15 +825,135 @@ impl Exl3Gemv {
         check_span_fits(&suh, inn * 2, "suh", 2)?;
         check_span_fits(&svh, outp * 2, "svh", 2)?;
         let pair_buf = self.pair_buffer(shape.k);
-        self.with_scratch(rows * inn, rows * outp, |sc| {
+        let x_rows = Self::xh_rows(rows, shape, trellis);
+        self.with_scratch(x_rows * inn, rows * outp, |sc| {
             self.encode_had_in(enc, x, suh, &sc.xh, rows, inn);
-            if rows == 1 {
-                self.encode_gemv(enc, &sc.xh, trellis, &pair_buf, shape, mode, &sc.y);
-            } else {
-                self.encode_gemm(enc, &sc.xh, trellis, &pair_buf, shape, mode, &sc.y, rows);
-            }
+            self.encode_gem(enc, &sc.xh, trellis, &pair_buf, shape, mode, &sc.y, rows);
             self.encode_had_out(enc, &sc.y, svh, out, rows, outp);
         });
         Ok(())
+    }
+
+    /// Microbench: time `had_in`, `gemm`/`gemv`, `had_out` separately for one
+    /// linear. Each phase gets its own command buffer + wait (wall-clock per
+    /// phase, not overlapped). Returns `(had_in_ms, gem_ms, had_out_ms)`.
+    ///
+    /// Test/bench hook only — production uses [`Self::encode_linear`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn bench_linear_phases(
+        &self,
+        x: &Buffer,
+        trellis: DeviceSpan<'_>,
+        suh: DeviceSpan<'_>,
+        svh: DeviceSpan<'_>,
+        out: &Buffer,
+        shape: Exl3Shape,
+        mode: u32,
+        rows: usize,
+        reps: usize,
+    ) -> Result<(f64, f64, f64), KernelError> {
+        let inn = shape.in_features();
+        let outp = shape.out_features();
+        check_span_fits(
+            &trellis,
+            shape.in_tiles * shape.out_tiles * shape.words_per_tile() * 2,
+            "trellis",
+            2,
+        )?;
+        check_span_fits(&suh, inn * 2, "suh", 2)?;
+        check_span_fits(&svh, outp * 2, "svh", 2)?;
+        let pair_buf = self.pair_buffer(shape.k);
+        let x_rows = Self::xh_rows(rows, shape, trellis);
+
+        let mut result = (0.0f64, 0.0f64, 0.0f64);
+        self.with_scratch(x_rows * inn, rows * outp, |sc| {
+            // Warm-up (shader specialization / scratch residency).
+            for _ in 0..2 {
+                self.submit(|enc| {
+                    self.encode_had_in(enc, x, suh, &sc.xh, rows, inn);
+                    self.encode_gem(enc, &sc.xh, trellis, &pair_buf, shape, mode, &sc.y, rows);
+                    self.encode_had_out(enc, &sc.y, svh, out, rows, outp);
+                })
+                .expect("warmup submit");
+            }
+
+            let time_in = |gemv: &Exl3Gemv, sc: &Scratch| -> f64 {
+                let _ = gemv;
+                let t0 = std::time::Instant::now();
+                for _ in 0..reps {
+                    gemv.submit(|enc| {
+                        gemv.encode_had_in(enc, x, suh, &sc.xh, rows, inn);
+                    })
+                    .expect("had_in submit");
+                }
+                t0.elapsed().as_secs_f64() * 1e3 / reps as f64
+            };
+            let time_gem = |gemv: &Exl3Gemv, sc: &Scratch| -> f64 {
+                let t0 = std::time::Instant::now();
+                for _ in 0..reps {
+                    gemv.submit(|enc| {
+                        gemv.encode_gem(enc, &sc.xh, trellis, &pair_buf, shape, mode, &sc.y, rows);
+                    })
+                    .expect("gem submit");
+                }
+                t0.elapsed().as_secs_f64() * 1e3 / reps as f64
+            };
+            let time_out = |gemv: &Exl3Gemv, sc: &Scratch| -> f64 {
+                let t0 = std::time::Instant::now();
+                for _ in 0..reps {
+                    gemv.submit(|enc| {
+                        gemv.encode_had_out(enc, &sc.y, svh, out, rows, outp);
+                    })
+                    .expect("had_out submit");
+                }
+                t0.elapsed().as_secs_f64() * 1e3 / reps as f64
+            };
+
+            let had_in_ms = time_in(self, sc);
+            let gem_ms = time_gem(self, sc);
+            let had_out_ms = time_out(self, sc);
+
+            let t0 = std::time::Instant::now();
+            for _ in 0..reps {
+                self.submit(|enc| {
+                    self.encode_had_in(enc, x, suh, &sc.xh, rows, inn);
+                    self.encode_gem(enc, &sc.xh, trellis, &pair_buf, shape, mode, &sc.y, rows);
+                    self.encode_had_out(enc, &sc.y, svh, out, rows, outp);
+                })
+                .expect("full submit");
+            }
+            let full = t0.elapsed().as_secs_f64() * 1e3 / reps as f64;
+            eprintln!(
+                "  phases: had_in={had_in_ms:.3} gem={gem_ms:.3} had_out={had_out_ms:.3} full={full:.3} ms \
+                 (sum={:.3})",
+                had_in_ms + gem_ms + had_out_ms
+            );
+            result = (had_in_ms, gem_ms, had_out_ms);
+        });
+        Ok(result)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The duplicated inverse permutation must match the engine's recorded
+    /// head (crates/engine/src/exl3/perm.rs `perm_inv_head_matches_reference`)
+    /// and be a bijection — a wrong inv silently decodes every weight into
+    /// the wrong row-major position, which still "looks like" numbers.
+    #[test]
+    fn inv_perm_head_matches_engine_reference() {
+        let inv = tensor_core_perm_inverse();
+        let want = [
+            0u32, 32, 64, 96, 128, 160, 192, 224, 4, 36, 68, 100, 132, 164, 196, 228,
+        ];
+        assert_eq!(&inv[..16], &want);
+        let mut seen = [false; 256];
+        for &v in &inv {
+            assert!((v as usize) < 256, "out of range {v}");
+            assert!(!seen[v as usize], "duplicate {v}");
+            seen[v as usize] = true;
+        }
     }
 }

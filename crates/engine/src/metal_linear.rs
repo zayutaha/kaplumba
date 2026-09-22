@@ -1123,10 +1123,20 @@ mod tests {
     }
 
     /// T3.2: the batched GEMM (`encode_linear`, rows ≥ 2) must match both the
-    /// CPU reference and M single-row GEMV dispatches on the same weights —
-    /// same per-row accumulation order, so the batched row and the GEMV row are
-    /// expected **bit-identical** (the strong version of "numerical closeness").
-    /// rows=17 > RGT(8) exercises the partial third row-chunk.
+    /// CPU reference and M single-row GEMV dispatches on the same weights.
+    /// rows=17 > RGT(8) exercises the partial third row-chunk (scalar path);
+    /// all three shapes are sg-eligible, so this also covers the simdgroup
+    /// tensor-core kernel end to end.
+    ///
+    /// The batched-vs-GEMV comparison used to assert bit-identity (the scalar
+    /// RGT GEMM accumulates each row in exactly the GEMV order). The
+    /// simdgroup kernel multiplies in f16 8×8 tiles across k-blocks, so the
+    /// f32 sums differ by reassociation noise (~1e-6…1e-5) and the f16
+    /// rounding in `had_out` may flip values that sit within that of a
+    /// rounding boundary. Products themselves are exact (f16×f16 fits f32),
+    /// so the two paths must agree to within an f16 ulp: `max_rel_err < 2e-3`
+    /// (divisor ≥ 1, so this is ≤ ~2 ulp for |v| ≤ 1) — tight enough that a
+    /// wrong decode/offset (error ~1e-1) still fails loudly.
     #[test]
     fn gpu_gemm_rows_match_per_row_gemv_and_cpu() {
         let Some(c) = ctx() else { return };
@@ -1197,11 +1207,70 @@ mod tests {
                 let gemv: Vec<f16> =
                     unsafe { std::slice::from_raw_parts(yb1.contents() as *const f16, out_f) }
                         .to_vec();
-                assert_eq!(
-                    got, gemv,
-                    "k={k} {rows}x{in_f}x{out_f} row {r}: batched GEMM vs GEMV bits"
+                let err = max_rel_err(got, &gemv);
+                assert!(
+                    err < 2e-3,
+                    "k={k} {rows}x{in_f}x{out_f} row {r}: batched GEMM vs GEMV rel err {err}"
                 );
             }
+        }
+    }
+
+    /// T3.2 follow-up: where does span prefill time actually go for one linear?
+    /// Synthetic weights, real shapes (hidden→q/k/v/o, gate/up, down). Prints
+    /// `had_in` / `gem` / `had_out` milliseconds so the next kernel change
+    /// targets the dominant phase. Not a correctness test.
+    #[test]
+    fn phase_profile_prefill_shapes() {
+        let Some(c) = ctx() else { return };
+        // (name, k, in, out, rows) — Gemma 4 31B linears at batch_rows=256.
+        let shapes = [
+            ("q_proj", 3u32, 5376usize, 8192usize, 256usize),
+            ("k_proj", 3, 5376, 4096, 256),
+            ("o_proj", 3, 8192, 5376, 256),
+            ("gate", 3, 5376, 21504, 256),
+            ("down", 3, 21504, 5376, 256),
+            ("gate@512", 3, 5376, 21504, 512),
+        ];
+        eprintln!("=== phase profile (ms per linear, release-friendly synthetic) ===");
+        for (name, k, in_f, out_f, rows) in shapes {
+            eprintln!("-- {name}: {rows}x{in_f}x{out_f} k={k}");
+            let src = SynthGpuSource::build(c.device(), k, in_f, out_f);
+            let handles = linear_handles(&src, "l").expect("eligible");
+            let ml = MetalLinear::new(&c).unwrap();
+            let mut rng = Rng(0x6E_2026);
+            let x: Vec<f16> = (0..rows * in_f)
+                .map(|_| f16::from_f32(((rng.next() % 2001) as f32 / 1000.0) - 1.0))
+                .collect();
+            let xb = c.device().new_buffer_with_data(
+                x.as_ptr() as *const _,
+                (rows * in_f * 2) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let yb = c.device().new_buffer(
+                (rows * out_f * 2) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let (hi, g, ho) = ml
+                .raw()
+                .bench_linear_phases(
+                    &xb,
+                    handles.trellis(),
+                    handles.suh(),
+                    handles.svh(),
+                    &yb,
+                    handles.shape,
+                    handles.mode,
+                    rows,
+                    5,
+                )
+                .expect("phase bench");
+            // Per-token cost if this linear runs once per 256-row chunk.
+            let chunk_ms = hi + g + ho;
+            let tokens_per_s_if_only_this = rows as f64 / (chunk_ms / 1e3);
+            eprintln!(
+                "  => {chunk_ms:.2} ms/chunk ≈ {tokens_per_s_if_only_this:.1} t/s if this were the whole model"
+            );
         }
     }
 
@@ -1376,5 +1445,97 @@ mod tests {
             dispatched, 8,
             "expected 7 layer linears + lm_head on the GPU"
         );
+    }
+
+    /// T3.x: batched (`rows ≥ 2` → simdgroup GEMM) vs single-row GEMV on the
+    /// REAL artifact trellises — the synthetic `gpu_gemm_rows_...` proves the
+    /// math, this proves the real byte offsets / `k` / codebook / shapes.
+    /// Isolates kernel correctness from model-level error compounding: a bad
+    /// decode or index shows up here as ~1e-1, while summation-order noise
+    /// stays within an f16 ulp (2e-3 with the `max_rel_err` divisor ≥ 1).
+    /// `rows = 65` covers an exact 64-row block plus a ragged tail (xh pad +
+    /// `gr < blk_len` store mask).
+    #[test]
+    fn real_artifact_batched_linear_matches_gemv_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = crate::testutil::artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let Some(c) = ctx() else { return };
+        let model = crate::load::load_exl3(&c, &dir).expect("load artifact");
+        let ml = MetalLinear::new(&c).expect("metal linear");
+        let src: &dyn TensorSource = &model;
+        let f16_bytes =
+            |v: &[f16]| unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, v.len() * 2) };
+        let new_buf = |bytes: &[u8]| {
+            c.device().new_buffer_with_data(
+                bytes.as_ptr() as *const _,
+                bytes.len().max(1) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let run = |handles: &LinearHandles, xb: &metal::Buffer, yb: &metal::Buffer, rows: usize| {
+            let cb = ml.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            ml.encode_linear(enc, handles, xb, yb, rows)
+                .expect("encode_linear");
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            assert_eq!(
+                cb.status(),
+                metal::MTLCommandBufferStatus::Completed,
+                "command buffer failed"
+            );
+        };
+
+        let rows = 65usize;
+        for name in [
+            "model.language_model.layers.0.self_attn.q_proj", // 5376×8192
+            "model.language_model.layers.0.mlp.gate_proj",    // 5376×21504
+            "model.language_model.layers.0.mlp.down_proj",    // 21504×5376
+        ] {
+            let handles = linear_handles(src, name).expect("eligible");
+            let inn = handles.shape.in_features();
+            let out_f = handles.shape.out_features();
+            let mut rng = Rng(0x5EED);
+            let x: Vec<f16> = (0..rows * inn)
+                .map(|_| f16::from_f32(((rng.next() % 2001) as f32 / 1000.0) - 1.0))
+                .collect();
+
+            let xb = new_buf(f16_bytes(&x));
+            let yb = c.device().new_buffer(
+                (rows * out_f * 2) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            run(&handles, &xb, &yb, rows);
+            let batched: Vec<f16> =
+                unsafe { std::slice::from_raw_parts(yb.contents() as *const f16, rows * out_f) }
+                    .to_vec();
+
+            let mut worst = 0.0f32;
+            for r in 0..rows {
+                let xb1 = new_buf(f16_bytes(&x[r * inn..(r + 1) * inn]));
+                let yb1 = c.device().new_buffer(
+                    (out_f * 2) as u64,
+                    metal::MTLResourceOptions::StorageModeShared,
+                );
+                run(&handles, &xb1, &yb1, 1);
+                let gemv: Vec<f16> =
+                    unsafe { std::slice::from_raw_parts(yb1.contents() as *const f16, out_f) }
+                        .to_vec();
+                let err = max_rel_err(&batched[r * out_f..(r + 1) * out_f], &gemv);
+                worst = worst.max(err);
+                assert!(
+                    err < 2e-3,
+                    "{name} row {r} (of {rows}): batched sg vs gemv rel err {err}"
+                );
+            }
+            eprintln!("{name}: {rows} rows vs per-row gemv worst rel err {worst:.2e}");
+        }
     }
 }

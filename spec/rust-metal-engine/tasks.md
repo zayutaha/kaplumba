@@ -131,9 +131,15 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - Commit: `spec/rust-metal-engine: T3.3 row packing`
 
 ### T3.4 — Shape dispatch
-- [ ] Dispatch table by (M,N,K); pathological shapes off generic kernel
-- Test: per-shape microbench grid; no correctness regress
-- Commit: `spec/rust-metal-engine: T3.4 shape dispatch`
+- [x] Done — `encode_gem` (`crates/kernels/src/exl3.rs`) is the single dispatch point: `rows == 1` → GEMV, `sg_eligible` (rows ≥ 2, in_tiles even, out_tiles % 4 == 0, byte_offset % 4 == 0) → new **simdgroup GEMM** `exl3_gemm_sg` (v19c port: 64 token rows × 64 out cols per TG, 32-deep in-feature stages, `wblk[32×72]` staging, `simdgroup_half8x8 × simdgroup_half8x8 → simdgroup_float8x8` MMA), else RGT=8 fallback. All real prefill shapes take sg; lm_head is `rows == 1` (gemv) or ineligible → never affected. Decode path (rows==1) untouched
+- xh scratch pads to `rows.div_ceil(64)*64` rows (`xh_rows()`); store masks `gr < blk_len`; TG-uniform early return before barriers
+- Phase profile (release, rows=256, real shapes): q 5.92 / k 2.87 / o 5.04 / **gate 66→12.03 (5.5×)** / down 13.16 ms; gate@512 23.54 ms
+- Correctness: synthetic `gpu_gemm_rows_match_per_row_gemv_and_cpu` (5/3/17-row tails) < 2e-3; **new** `real_artifact_batched_linear_matches_gemv_slow` — q/gate/down ×65 rows vs per-row GEMV on real trellises worst rel err **9.76e-4**; gated span test argmax identical (207=207), max_abs 2.374e-1 (300-token f16 compounding — kernel gated separately at ~1e-3, threshold 0.35), replay bit-deterministic; fixture/attention/CPU-linear/greedy all green; full gated suite 111 passed / 3 ignored; kernels 15 passed
+- Two assertions relaxed (documented in code): bit-identical span==loop → argmax + 0.35 bound (tensor-core k-block order ≠ scalar, mathematically cannot match); batched==gemv → `max_rel_err < 2e-3` (~1 f16 ulp)
+- Measured pp/s (`prefill_throughput_slow`, release): token-loop @512 **5.25 t/s** → span **25.7 / 25.2 / 24.1 t/s @ 512 / 2048 / 8192** (4.9× / 4.8× / 4.6×). Flat in context; ~75% of chunk time is now **outside** the linears (linear ceiling ≈ 79 t/s @256) → next lever is T3.6 sync/fusion + attention/glue profile, not more GEMM
+- Files: `crates/kernels/src/{exl3.metal,exl3.rs}`, `crates/engine/src/{metal_linear,gemma4}.rs`
+- Target: AC2, R2.1
+- Commit: `spec/rust-metal-engine: T3.4 simdgroup GEMM shape dispatch`
 
 ### T3.5 — SWA KV bound in attention
 - [x] Done — GPU attention kernel (`crates/kernels/src/attn.metal`) + engine wiring; sliding layers iterate only the in-window KV (the kernel starts its KV loop at `max(0, p0+1-window)`, so a sliding layer never touches KV outside the window)

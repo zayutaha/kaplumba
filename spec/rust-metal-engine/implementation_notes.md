@@ -429,6 +429,32 @@ Blocking work, in the order the measurements justify it:
 
 **Tests green:** `gpu_gemm_rows_match_per_row_gemv_and_cpu`, `rope_multi_row_matches_cpu_reference`, `reserve_rows_batches_match_row_at_a_time`, bit-identical `real_artifact_span_matches_token_loop_slow`, fixture, full suite 109+14.
 
+## T3.4 — simdgroup GEMM shape dispatch (2026-09-23)
+
+**What landed:** `exl3_gemm_sg` (`crates/kernels/src/exl3.metal`) — a faithful port of PonyExl3 v19c `_mm_seg_source` — plus the host dispatch `encode_gem` in `crates/kernels/src/exl3.rs`. Decision: `rows == 1` → `exl3_gemv` (unchanged, all decode traffic), `sg_eligible()` → sg GEMM, else RGT=8 `exl3_gemm`. Eligibility: `rows ≥ 2 && in_tiles % 2 == 0 && out_tiles % 4 == 0 && byte_offset % 4 == 0` — every real prefill shape qualifies; lm_head never runs multi-row (span does lm_head `rows=1` per token, `gemma4.rs`), so the ineligible/RGT path is currently dead in production but kept as fallback.
+
+**Kernel facts:** `_MM_BM=64` token rows/TG, `_MM_BN=64` out cols/TG, `_MM_WS=72` wblk stride; one TG = 4 sgids × 32 threads = 2×2 sgid grid × 4 out-tiles; stages = in_tiles/2, each stage is 32 in-features × 64 out; weights staged through `wblk[32×72]` after `exl3_decode` (MCG/default, `ld_word` 4-aligned — the reference's `ld_word` with `aligned` flag); A loaded device-direct `simdgroup_load(a, xrow + r*8*K + ks*32 + k2*8, K)`; MMA is mixed `half8x8 × half8x8 → float8x8` accumulate (reference-proven); store scatters via `csc[4×64]` with `gr < blk_len` mask. xh scratch pads to `rows.div_ceil(64)*64` (`xh_rows()` in `encode_linear`); sg path returns early on a TG-uniform condition **before** any barrier so ragged grids stay legal.
+
+**Decisions the plan didn't predict:**
+- **Two test assertions had to be relaxed.** Bit-identical span==loop and batched==gemv were invariants of the *scalar* RGT GEMM sharing GEMV's accumulation order; tensor-core k-block summation mathematically cannot reproduce scalar order. New gates: batched vs gemv → `max_rel_err < 2e-3` (~1 f16 ulp, `max_rel_err` divisor ≥1); span vs loop → argmax equal + `max_abs < 0.35` (measured 2.3743033e-1 over 300 tokens / 262144 logits, n_diff 254424, argmax 207=207). Rationale documented in both code comments.
+- **A new decisive test was added**: `real_artifact_batched_linear_matches_gemv_slow` (`metal_linear.rs`) — real trellises, rows=65 (exact block + ragged tail), batched vs per-row GEMV → worst **9.76e-4** on q/gate/down. This is the bug-detector for decode/index errors (~1e-1 if broken); model-level compounding is *measured*, not asserted away. Discriminators that ruled out a kernel bug: this test + synthetic `gpu_gemm_rows_*` (5/3/17 rows) + replay bit-determinism (a race would fail it; sg has no atomics) + argmax identity.
+- **`phase_profile_prefill_shapes` + `bench_linear_phases`** (profiler added under this task): per-shape encode+wait timings at rows=256/512, real shapes.
+
+**Measured (release, M4 Pro, real artifact):**
+- Phase profile rows=256: q 5.92, k 2.87, o 5.04, **gate 12.03 (was ~66 → 5.5×)**, down 13.16 ms; gate@512 23.54 ms. gate ≈ 5.0 TFLOP/s ≈ 31% of 16 TFLOP/s fp16 (62% if f32-accum runs at 8T).
+- Linear ceiling ≈ **79 t/s** @ rows=256 if linears were the whole model.
+- `prefill_throughput_slow` (release): token-loop @512 **5.25 t/s** → span **25.7 / 25.2 / 24.1 t/s @ 512 / 2048 / 8192** (4.9× / 4.8× / 4.6×). Span 300 tok: 11.93 s (25.1 t/s) vs loop 55.83 s (5.4 t/s), 124943 GPU linears (counts *dispatches*, not row-linears).
+- **Key finding: ~75% of chunk wall time is outside the linears** (25 t/s total vs 79 t/s linear ceiling ⇒ non-linear ≈ 7.6 s of a 10.2 s / 256-token chunk). Attention, norms/RoPE/HAD glue, host encode/commit sync, and residual glue now dominate. Flat rate in context (25.7→24.1) says glue/linears bound, attention growth is secondary — but the split between *attention GPU time* and *sync/submit* is **unmeasured**; that is the next profile.
+
+**Tests green at commit:** gated suite 111 passed / 3 ignored (`--test-threads=1`, `KAPLUMBA_RUN_SLOW=1`), kernels 15 passed, `cargo fmt` clean. Span, fixture (argmax 236773 / 29.9782), attention, CPU-linear, greedy, chunk-invariance, replay-determinism all pass. `cached_prefill_is_chunk_invariant` is CPU-only (`Gemma4Model::new` without `.with_gpu`) → unaffected.
+
+**Gotchas for the next session:**
+- `try_linear` / `real_artifact_linear_matches_cpu_slow` are **rows=1 only** — do not treat them as multi-row coverage; use `real_artifact_batched_linear_matches_gemv_slow`.
+- `g.calls()` counts *dispatches*; a 300-token span mixes ~416 rows=1 lm_head dispatches with ~840 rows≥2 sg dispatches.
+- The bench's "recorded baseline ~1.5" eprintln annotation is stale (token-loop now measures 5.20–5.25 t/s since RGT=8); the *before* number it prints is live.
+- Next performance work = **T3.6** (sync policy + fusion audit): instrument chunk path for attention vs glue vs wait time; remove any per-phase commit/wait; fuse gate+up / qkv. Levers beyond that: T3.3 load-time packing, sibling fusion (T4.1) for prefill too, larger sg BM. Do **not** chase more GEMM micro-opts before the non-linear split is measured — linears cap at 79 t/s anyway, far under 200.
+- Roofline reminder: 200 t/s @ rows=256 ≈ 12.4 TFLOP/s dense ⇒ needs *both* ~2× better linears *and* near-zero glue/sync, or a different tiling strategy; re-plan after the T3.6 profile numbers exist.
+
 ## T4.2 — one command buffer per decode token (2026-09-22)
 
 **Problem:** the cached/GPU decode path encoded each of the ~471 dispatches per token (411 linears + 60 attentions + glue) into its own command buffer with `commit`+`wait_until_completed` — ~0.4 ms of CPU submit/wait each ⇒ **~180 ms of a ~275 ms token was pure overhead** (kernel time only ~93 ms).

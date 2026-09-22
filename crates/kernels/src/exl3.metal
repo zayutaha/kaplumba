@@ -21,6 +21,7 @@
 // as one 16-byte vector.
 
 #include <metal_stdlib>
+#include <metal_simdgroup_matrix>
 using namespace metal;
 
 constant uint HAD = 128u;
@@ -375,6 +376,174 @@ kernel void exl3_gemm(device const half *xh [[buffer(0)]],
                 }
             }
             y[(ulong)(row0 + r) * N + ot * TILE + g] = s;
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// simdgroup tensor-core trellis GEMM — dense port of PonyExl3 v19c
+// `_mm_seg_source` (reference/PonyExl3/ponyexl3/mlx/gemv_metal.py:1544).
+//
+// One threadgroup = one 64×64 output tile = 4 out-tiles × 64 token rows
+// (_MM_BM/_MM_BN = 64). 128 threads = 4 simdgroups in a 2×2 grid
+// (sgid = tid>>5, sgr = sgid>>1, sgc = sgid&1); each owns a 32×32 subtile of
+// C[4][4] simdgroup_float8x8 accumulators (f32). Per 32-deep k-stage (2
+// in-tiles) the 128 threads decode 2 in-tiles × 4 out-tiles ONCE into
+// `wblk` (32 in-rows × 64 out-cols, stride 72 — _MM_WS), then 4×
+// simdgroup_half8x8 B fragments × device-direct A fragments from `xh` run
+// f16 MMA → f32 accumulate. That decode-reuse + tensor MMA replaces the
+// scalar FMA+RMW of exl3_gemm (RGT=8 measured 15 t/s prefill; target ≥200).
+//
+// Decode precompute matches `_decode_full_t_source` (v13t) / v19c verbatim:
+//   src = inv_perm[(2*rp+j)*16 + dcol]; t = src>>1;
+//   sh  = ((b2-1)/32+1)*32 - b2 + ((src&1) ? 0 : K_BITS);
+//   cw  = (merge(i0,i1) >> sh) & 0xFFFF;
+// (even src = lo codeword gets the +K_BITS; odd = hi as-is — the funnel
+// pairing of exl3_gemv, expressed as one per-codeword shift.)
+//
+// wblk row = it2*16 + 2*rp + j = row-major in-feature within the stage;
+// col = lt*16 + dcol = row-major out-feature within the 64-wide block. So
+// `simdgroup_load(bf, wrow, 72)` yields B[k, n] directly — the same
+// row-major (in, out) convention xh columns and y use; no transpose.
+//
+// Early `return` on a dead threadgroup is safe (row0 is threadgroup-uniform,
+// so all 128 threads exit together — no barrier is left waiting). The A
+// fragment loads are device-direct up to a 64-row boundary: the host pads
+// the `xh` scratch to `rows.div_ceil(64)*64` rows, and the store masks
+// `gr < blk_len`, so pad rows multiply into discarded outputs only.
+//
+// Host gate (`sg_eligible` in exl3.rs): rows ≥ 2, in_tiles even,
+// out_tiles % 4 == 0, trellis byte_offset % 4 == 0 (funnel words are read as
+// u32 pairs — same contract as the reference). lm_head is 2-mod-4 but always
+// rows == 1, so it stays on the GEMV path.
+constant uint SG_BM = 64u;    // token rows per threadgroup   (_MM_BM)
+constant uint SG_BN = 64u;    // out cols per threadgroup     (_MM_BN)
+constant uint SG_WS = 72u;    // wblk row stride in halfs     (_MM_WS)
+constant uint SG_THREADS = 128u;
+
+kernel void exl3_gemm_sg(device const half *xh [[buffer(0)]],
+                         device const ushort *trellis [[buffer(1)]],
+                         device const uint *inv_perm [[buffer(2)]],
+                         device float *y [[buffer(3)]],
+                         constant Exl3GemmParams &p [[buffer(4)]],
+                         uint2 tg [[threadgroup_position_in_grid]],
+                         uint2 thr [[thread_position_in_threadgroup]]) {
+    threadgroup half wblk[32u * SG_WS]; // 32 in × 64 out, stride 72 (4.5 KB)
+    threadgroup float csc[4u * 64u];    // per-simdgroup 8×8 store scratch (1 KB)
+
+    uint tid = thr.x;
+    uint lane = tid & 31u;
+    uint sgid = tid >> 5u;
+    uint sgr = sgid >> 1u; // 0..1 → token rows  0..31 / 32..63
+    uint sgc = sgid & 1u;  // 0..1 → out cols    0..31 / 32..31
+
+    uint ot0 = tg.x * 4u;
+    uint row0 = tg.y * SG_BM;
+    if (row0 >= p.rows) {
+        return; // threadgroup-uniform: safe before any barrier
+    }
+
+    uint nin = p.in_tiles;
+    uint nout = p.out_tiles;
+    uint K = nin * TILE;
+    uint N = nout * TILE;
+    uint stages = nin >> 1u; // host gates in_tiles even (≥ 2)
+    uint blk_len = p.rows - row0; // live token rows in this TG (1..=64)
+
+    // Decode-position precompute (fixed per thread; `_decode_full_t` mapping).
+    uint dcol = tid >> 3u; // out col within tile (0..15)
+    uint rp = tid & 7u;    // in row-pair within tile (0..7)
+    uint i0_[2];
+    uint i1_[2];
+    uint sh_[2];
+    for (uint j = 0u; j < 2u; j++) {
+        uint src = inv_perm[(2u * rp + j) * 16u + dcol];
+        uint t = src >> 1u;
+        int b0 = int(t) * 2 * int(p.k) + int(p.k) - 16 + 256 * int(p.k);
+        int b2 = b0 + int(p.k) + 16;
+        i0_[j] = uint(b0 / 32) % p.twords;
+        i1_[j] = uint((b2 - 1) / 32) % p.twords;
+        sh_[j] =
+            uint(((b2 - 1) / 32 + 1) * 32 - b2) + ((src & 1u) ? 0u : p.k);
+    }
+
+    simdgroup_float8x8 C[4][4];
+    for (uint r = 0u; r < 4u; r++) {
+        for (uint c = 0u; c < 4u; c++) {
+            C[r][c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+
+    const device half *xrow =
+        xh + (ulong)(row0 + sgr * 32u) * K;
+    bool aligned = p.aligned != 0u; // host gates byte_offset % 4 == 0
+
+    for (uint ks = 0u; ks < stages; ks++) {
+        // Previous stage's B fragment loads must finish before overwrite.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint it2 = 0u; it2 < 2u; it2++) {
+            uint tk = ks * 2u + it2;
+            for (uint lt = 0u; lt < 4u; lt++) {
+                device const uint *words =
+                    (device const uint *)trellis +
+                    ((ulong)tk * nout + ot0 + lt) * p.twords;
+                for (uint j = 0u; j < 2u; j++) {
+                    uint a = ld_word((device const ushort *)words, i0_[j], aligned);
+                    uint b = ld_word((device const ushort *)words, i1_[j], aligned);
+                    uint cw =
+                        (uint)((((ulong)a) << 32 | (ulong)b) >> sh_[j]) & 0xFFFFu;
+                    wblk[(it2 * 16u + 2u * rp + j) * SG_WS + lt * 16u + dcol] =
+                        exl3_decode(cw, p.mode);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k2 = 0u; k2 < 4u; k2++) {
+            simdgroup_half8x8 bf0;
+            simdgroup_half8x8 bf1;
+            simdgroup_half8x8 bf2;
+            simdgroup_half8x8 bf3;
+            const threadgroup half *wrow = &wblk[k2 * 8u * SG_WS + sgc * 32u];
+            simdgroup_load(bf0, wrow, SG_WS);
+            simdgroup_load(bf1, wrow + 8u, SG_WS);
+            simdgroup_load(bf2, wrow + 16u, SG_WS);
+            simdgroup_load(bf3, wrow + 24u, SG_WS);
+            for (uint r = 0u; r < 4u; r++) {
+                simdgroup_half8x8 a;
+                simdgroup_load(a, xrow + (ulong)(r * 8u) * K + ks * 32u + k2 * 8u,
+                               K);
+                simdgroup_multiply_accumulate(C[r][0], a, bf0, C[r][0]);
+                simdgroup_multiply_accumulate(C[r][1], a, bf1, C[r][1]);
+                simdgroup_multiply_accumulate(C[r][2], a, bf2, C[r][2]);
+                simdgroup_multiply_accumulate(C[r][3], a, bf3, C[r][3]);
+            }
+        }
+    }
+
+    // Store: f32 fragments → tg scratch → y, masked to the live rows. The
+    // reference round-trips through scratch to cast f16; y is f32 here
+    // (exl3_had_out rounds), so the scatter writes straight through. Only
+    // simdgroup_barriers: the ragged-tail `break` is sgr-uniform within a
+    // simdgroup, so the 4 simdgroups may exit the loop at different r.
+    uint cb0 = ot0 * TILE + sgc * 32u;
+    uint rbase = sgr * 32u;
+    for (uint r = 0u; r < 4u; r++) {
+        if (rbase + r * 8u >= blk_len) {
+            break;
+        }
+        for (uint cf = 0u; cf < 4u; cf++) {
+            simdgroup_store(C[r][cf], &csc[sgid * 64u], 8u);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint i = lane; i < 64u; i += 32u) {
+                uint rr = i >> 3u;
+                uint cc = i & 7u;
+                uint gr = rbase + r * 8u + rr;
+                if (gr < blk_len) {
+                    y[(ulong)(row0 + gr) * N + cb0 + cf * 8u + cc] =
+                        csc[sgid * 64u + i];
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
 }
