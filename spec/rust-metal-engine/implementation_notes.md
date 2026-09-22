@@ -12,6 +12,7 @@ Append as work proceeds (AGENTS.md §5). Dense, factual, takeover-oriented. Cont
 - **T1.1 done** (2026-09-22): EXL3 loader — per-shard Metal buffers, stream via 8 MiB stage. Real artifact: **2422 tensors / 2 shards / 16.028 GB / ~4s**, 7/7 tests.
 - **T1.2 done** (2026-09-22): tokenizer — `tokenizers` **0.21.4** (classic API; 1.0.0-rc.2 reorganized and was rejected). 9/9 tests. Specials verified: pad=0 eos=1 bos=2 unk=3 open=105 close=106. Next: T1.3 naive forward (or T0.2 baseline).
 - **T1.3a done** (2026-09-22): EXL3 CPU decode primitives under `crates/engine/src/exl3/` — `trellis`, `codebook`, `perm`, `signs`, `hadamard`, `decode`. 26 new unit tests (35 total engine tests pass) pinned to reference goldens: MCG/Default/Mul1 codewords, q00 artifact tile k=3 MCG row-major, pack fixtures k=3/6, sign bitfield, perm heads, Hadamard large-magnitude lanes. Deps added: `half` 2.7.1, `rayon` 1 (rayon not yet used — reserved for T1.3b reconstruct). Next: T1.3b reconstruct + linear forward.
+- **T0.2 partial** (2026-09-22): reference-only baselines + **correctness cross-check**: PonyExl3 greedy from `[2]` returns `"S"`, matching our argmax 236773 at position 0. Full 1k/2k/8k matrix still open; `scripts/bench.py` is now retirable because the Rust CLI emits the same schema (R7.4).
 - **T1.4 done** (2026-09-22): streaming generation + bench entry. Engine: `generate.rs` (`generate()` with `on_token` callback, `GenStats` = prefill_s/decode_s/decode_steps/ttft_ms/finish_reason/tokens/computed_tokens, EOS-aware, seed-reproducible) and `sampler.rs` (PCG32 + temp/top-k/top-p, OQ4 defaults). CLI: `kaplumba-engine generate` (hand-rolled args, delta detokenizer, `--layers` depth limit, `--json PATH|-`) emitting `kaplumba-bench/1` reports mirroring `scripts/bench.py`'s keys. 101 tests pass. Measured release runs: `--prompt The --layers 2 --max-tokens 1` → load 3.7s, prefill 16.5s, ttft 16.5s, `text=" a"`, token 496; full-depth single-token forward 205s (lm_head ≈ 13s/row of that). `peak_rss_bytes` 8.08 GB vs `metal_alloc_bytes` 16.03 GB — UMA Metal buffers are not in `getrusage` maxrss, so weight/Metal figures are the authoritative memory evidence (R5.5 will add `phys_footprint`).
 - **T1.3c done** (2026-09-22): `crates/engine/src/gemma4.rs` — naive CPU Gemma 4 forward + streaming lm_head + `greedy_generate`, driven by a `TensorSource`/`RawTensor` view over the artifact. 21 new tests (67 total). Real artifact (release): full 60-layer forward + lm_head **205s/row**, repeat **bit-identical** (hidden + logits), partial depth (layer 0 sliding + layer 5 full/k_eq_v) bit-identical in 3.1s/layer/row. Fixture: prompt `[2]` (BOS) → argmax **236773 ("S")**, logit 29.9782; top-5 all saturate the softcap (raw logits ≫ 30) — expected for Gemma at BOS, but **not yet cross-checked against the PonyExl3 reference** (T0.2/T2.4, OQ1). Config synthesis verified against the real `config.json`: 60 layers, full at 5,11,…,59, sliding (head_dim 256, n_kv 16), full (512, 4), window 1024, softcap 30; lm_head is a **6-bit** head (`[336,16384,96]` → k=6).
 - **T1.3b done** (2026-09-22): `reconstruct.rs` (`TrellisView`, `reconstruct_inner`, `reconstruct_inner_slab` 16-col tiles, `reconstruct_public_weights` with outer Hadamard+suh/svh) + `forward.rs` (`Exl3Linear`, streaming `linear_forward_reconstruct` — output in 128-col slabs so lm_head never materializes ~2.8 GB). 44/44 tests. Stream vs full stepwise: max rel err < 1e-3; stream vs dense public-weight: < 0.15 (inherent f16 intermediate-rounding gap when Hadamard is folded into W). Outer Hadamard asserts `in/out % 128 == 0` (all Gemma4 dims qualify: 5376, 8192, 21504, 262144).
@@ -93,7 +94,31 @@ Append as work proceeds (AGENTS.md §5). Dense, factual, takeover-oriented. Cont
 
 ## Baseline numbers
 
-- (fill T0.2: reference PonyExl3 numbers — **label reference-only**, not our engine's)
+**All of these measure PonyExl3/MLX 0.32.2 (ponyexl3 0.3.0, mlx-lm 0.31.3), NOT this engine** (DE20).
+Captured 2026-09-22 via `.venv-baseline/bin/python` calling
+`load_generate_stack(argparse.Namespace(model=…, engine="exl3", no_warm=False, quiet=True, dflash=None, dflash_quant="w8", eagle3=None, mtp="off", draft=3, draft_w4=False))`
+then `ponyexl3.mlx.generate.generate_text(..., use_chat_template=False, temp=0.0)`.
+
+| Probe | prompt tok | prefill | decode | wall |
+|-------|-----------|---------|--------|------|
+| load  | — | 15.1s (Python + MLX) | — | — |
+| BOS-only greedy-1 (`[2]`) | 1 | 5.39s (0.2 t/s, first-call warmup) | 4.7 t/s | 5.73s |
+| `The quick brown fox` greedy-4 (`[818,3823,8864,37423]`) | 4 | 0.51s (7.9 t/s) | 5.9 t/s | 1.31s |
+| repeated text, greedy-16 | 64 | 3.54s (18.1 t/s) | 5.7 t/s | 6.50s |
+
+- Outputs: `[2]` → `"S"`; `The quick brown fox` → `" fox fox fox fox"` (degenerate greedy loop, expected for temp 0); repeated text → echoes the prompt.
+- Decode ≈ 5.7 t/s ≈ 91 GB/s effective vs 273 GB/s peak → reference kernel-efficiency gap (matches the earlier micro measurement), **not** pageins.
+- Still missing for a complete T0.2: the 1k/2k/8k prefill matrix and 32/128-token decode runs, plus `phys_footprint`/Metal peak in the reference report.
+
+### Our engine vs reference (correctness evidence so far)
+
+| Check | Reference | This engine |
+|-------|-----------|-------------|
+| greedy argmax from `[2]`, temp 0 | text `"S"` | token **236773** = `"S"` (logit 29.9782) |
+| determinism on repeat | (not measured) | full 60-layer forward + logits **bit-identical** |
+
+- A 262144-way argmax matching by chance is ~4e-6, so position 0 is verified. Positions ≥ 1 (rope/mask beyond the first position, incrementing context) are **not yet** cross-checked against the reference — that needs a 2-row forward (~7 min on the naive path) and is the natural first check inside the T2.4/OQ1 quality gate.
+- Reference tokenizer ids for `The quick brown fox` = `[818, 3823, 8864, 37423]` (no BOS); our CLI reproduces these with `--no-bos`.
 
 ## Research digests (where to look)
 
@@ -128,6 +153,7 @@ Append as work proceeds (AGENTS.md §5). Dense, factual, takeover-oriented. Cont
 - Reference CLI: `.venv-baseline/bin/ponyexl3-generate-bench --prefill-sizes 1024,8192 --gen-tokens 64 --warmup --raw --json`
 - Rust generate (T1.4): `cargo run --release -p kaplumba-cli -- generate --prompt "The" --max-tokens 8` · add `--layers N` for a fast/debug depth limit · `--json -` prints the `kaplumba-bench/1` report to stdout (text then streams to stderr) · `--temp 0` greedy.
 - CLI e2e (real artifact, ~22s): `KAPLUMBA_RUN_SLOW=1 cargo test --release -p kaplumba-cli --test cli_generate -- --test-threads=1`
+- Reference baseline / cross-check (Python, transition only): `.venv-baseline/bin/python scripts/bench.py ~/.kaplumba/models/Gxma/Gxma --backend ponyexl3 --json /tmp/bench_ref.json`; the one-off cross-check used an inline heredoc that builds the `load_generate_stack(...)` namespace shown in "Baseline numbers" and calls `generate_text(prompt_ids=[2], max_tokens=1, temp=0.0)` — run one reference process at a time (16 GB residency, I1).
 - Real-model slow tests (opt-in; **one at a time**, each loads 16 GB; use `--test-threads=1`):
   - `KAPLUMBA_RUN_SLOW=1 cargo test --release -p kaplumba-engine real_artifact_partial_depth_deterministic_slow -- --nocapture --test-threads=1` (~50s; sliding+full layers, bit-identical)
   - `KAPLUMBA_RUN_SLOW=1 KAPLUMBA_SLOW_MODE=forward KAPLUMBA_SLOW_PROMPT=2 KAPLUMBA_SLOW_EXPECT=236773 cargo test --release -p kaplumba-engine real_artifact_greedy_slow -- --nocapture --test-threads=1` (~210s; add `KAPLUMBA_SLOW_REPEAT=1` for ~420s determinism proof)

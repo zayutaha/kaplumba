@@ -15,11 +15,14 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - Commit: `spec/rust-metal-engine: T0.1 bench harness` (was drafted under omlx-exl3-engine name; re-tagged)
 
 ### T0.2 — Baseline capture (reference-only)
-- [ ] Record **PonyExl3 runtime** numbers + profile of per-step work; label all numbers **reference-only** (measures PonyExl3, not our engine)
-- Files: implementation_notes.md only (+ raw logs under /tmp or notes)
+- [~] In progress — all numbers below measure **PonyExl3/MLX, not this engine** (DE20):
+  - [x] **Correctness cross-check of the T1.3d fixture**: reference greedy from prompt `[2]` (BOS) returns text **`"S"`** — identical to our argmax token 236773. Independent confirmation that the 60-layer EXL3 forward, hybrid attention, lm_head and softcap agree with the reference quant at position 0
+  - [x] Reference-only spot numbers (`.venv-baseline`, MLX 0.32.2 / ponyexl3 0.3.0): load **15.1s**; 64-token prompt → prefill **18.1 t/s**, decode **5.7 t/s**; 4-token prompt → prefill 7.9 t/s (0.51s incl. warmup), decode 5.9 t/s; 1-token prompt → 4.7 t/s decode. Decode ~5.7 t/s ≈ 91 GB/s effective vs 273 peak (the known reference kernel-efficiency gap, not pageins)
+  - [x] Rust CLI bench lands `kaplumba-bench/1` (T1.4), so the Python harness is now retirable per R7.4
+  - [ ] Full reference matrix at **1k/2k/8k** prefill + 32/128 gen tokens; multi-token (position ≥ 1) identity check vs our engine; then retire `scripts/bench.py` (R7.4)
+- Files: implementation_notes.md only (+ raw logs under /tmp)
 - Test: notes contain numbers, commands, hardware context
-- Commit: `spec/rust-metal-engine: T0.2 baselines`
-- Follow-up in same task or T0.2b: implement/land Rust CLI bench emitting `kaplumba-bench/1`; retire Python harness (R7.4)
+- Commit: `spec/rust-metal-engine: T0.2 reference cross-check + baselines`
 
 ### T0.3 — Confirm environment
 - [x] Memory size (24 GB), model files in `~/.kaplumba/models` (EXL3 artifact present), reference pin SHAs frozen — carried from omlx-exl3-engine T0.3
