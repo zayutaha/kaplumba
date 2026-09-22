@@ -164,6 +164,17 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - Target: AC8, R2.4 (sync), R2.1 (pp/s 3×)
 - Commit: `spec/rust-metal-engine: T3.6 chunk profile + loader 64B repack`
 
+### T3.8 — sg GEMM ceiling / decode-tax profile (path to 200 pp/s)
+- [x] Probe kernels: `exl3_gemm_sg_ceiling` (funnel decode → direct f16 device loads, identical grid/wblk/barriers/MMA/store), `exl3_gemm_sg_decode_only` (funnel + barriers, no MMA/store), `exl3_gemm_sg_mma_peak` (wblk filled once, PEAK_REPS=32 hot passes) — test-only pipelines built locally in `exl3.rs` tests (production `Exl3Gemv` unchanged); CPU-ref correctness for ceiling on small shape (K=64/N=128/rows=64, max_rel < 1e-3); perf under `KAPLUMBA_RUN_SLOW`
+- [x] **Measured (release, gate shape rows=256/K=5376/N=21504, gem-only vs gem-only):** real sg **11.786 ms = 5.02 TFLOP/s**; ceiling **9.418 ms = 6.28 TFLOP/s**; **funnel tax = 20.1% of gem time (2.37 ms)**; decode_only 0.211 ms (cheap in isolation → the tax is a live-C-registers×funnel interaction, not raw funnel cost); mma_peak (hot fragments) **5.84–6.19 TFLOP/s ≈ ceiling** → weight streaming costs ~0
+- [x] **Physics finding (blocks 200 as specified):** sustained f16→f32 simdgroup MMA on M4 Pro = **~6.3 TFLOP/s measured hot**. 200 pp/s needs linears ≤1065 ms/chunk = **~11.6 TFLOP/s sustained** (chunk budget: 12.35 TFLOP linears + 215 ms non-linear → 1280 ms) — **1.85× beyond the hardware's MMA ceiling**, before any decode/glue/attention cost. Best-possible chunk at the wall (tax=0, every linear at gate-ceiling, non-linear minimal) ≈ **2200 ms → ~116 t/s**; realistic path (tax fix + small-N K-split + glue) **~100–110 t/s**. plan.md's roofline (12.4 TFLOP/s ≈ 78% of an assumed ~16 fp16 peak) overstates the f32-accum MMA rate available on this device — surface to user with these numbers; do not burn more GEMM micro-opts chasing 200
+- [x] Engine-budget cross-check: `linear_ms` 11.98 ≈ gem-only 11.79 → **had_in/had_out ≈ 0.19 ms total at rows=256** (had is a decode-path concern at rows=1 per-linear overhead, not a prefill cost)
+- Next under this task: funnel-tax fix (spill C[4][4] to threadgroup memory around the fill loop so the funnel runs with lean registers) → expect linears −648 ms/chunk → **~86 t/s**; then small-N K-split (k/v run at 0.97–2.1 TF vs 5.0 due to TG starvation: k=64 TGs, q=256 TGs) for the next ~600 ms
+- Files: `crates/kernels/src/{exl3.metal,exl3.rs}`
+- Test: CPU-ref match on small shape; printed TFLOP/s + ms for real/ceiling/decode/peak on gate shape
+- Target: R2.1 (pp/s), profile-before-machinery (spec §8)
+- Commit: `spec/rust-metal-engine: T3.8 sg ceiling/decode-tax probe`
+
 ### T3.7 — Bounded prefill scratch + peak-RSS gate (user directive 2026-09-22)
 - [~] Kernel half **done**: attention is online-softmax over KV tiles with an O(1) working set — running max/denominator/output accumulators and one 16-entry score tile all live in **registers**, the slice reduction is `simd_shuffle_xor`, and the kernel allocates **no** threadgroup memory and uses **no** barriers. There is no `[heads, L, L]` score matrix, no `[heads, q, kv]` bias tensor, and no growable scratch anywhere in the attention path
 - [ ] Remaining (blocked on the batched prefill path T3.2/T5.1): the CLI-side proof — measured peak RSS / Metal footprint at **1024 / 2048 / 8192** prefill tokens, ≥3 repeats each, asserted to grow by ≤ (KV bytes for that length + fixed constant), recorded here and in the `kaplumba-bench/1` report

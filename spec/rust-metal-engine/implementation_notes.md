@@ -487,6 +487,39 @@ Blocking work, in the order the measurements justify it:
 - Decode **unaffected** by the repack (rows=1 → gemv; gemv never needed 4-byte offsets) — still ~5.6–6.2 t/s baseline; T4.1 + T2.3 remain the decode path to ≥18.
 - MTP drafter (`gemma-4-31B-it-qat-assistant-4bit`) still gated: only after ≥18 t/s **and** 100% coherency, temp 1.0 / top_k 64, target 28 t/s.
 
+## T3.8 — sg ceiling / decode-tax / MMA-peak probes (2026-09-23)
+
+**Question:** after T3.6 linears = 94% of the chunk at only ~3.7 TFLOP/s avg — is the funnel decode the tax, or is the simdgroup MMA itself the wall? Three test-only probe kernels in `exl3.metal` (pipelines built locally in `exl3.rs` tests; production `Exl3Gemv` untouched):
+
+- `exl3_gemm_sg_ceiling` — production sg with the funnel fill replaced by direct `device half` loads of a pre-decoded `w[N,K]`. Everything else (grid 128 thr, wblk, both per-stage barriers, MMA k-loop, store) byte-for-byte identical. CPU-ref checked on K=64/N=128/rows=64 (max_rel < 1e-3).
+- `exl3_gemm_sg_decode_only` — funnel fill + per-stage barriers only; no MMA, no store (writes nothing; its value = timing).
+- `exl3_gemm_sg_mma_peak` — wblk filled once (stage-0 geometry), then `PEAK_REPS=32` identical passes over hot fragments (B in TG mem, A L2-resident); keep-alive store at the end. Absolute sustained rate for this tile config.
+- Gate-shape timing test `sg_ceiling_decode_tax_gate_shape` also dispatches the **real** `exl3_gemm_sg` on the same synthetic buffers (zero trellis = cw=0, safe) so all numbers are gem-only vs gem-only.
+
+**Measured (release, M4 Pro, gate shape rows=256 / K=5376 / N=21504, flops 59.19 GF):**
+
+| probe | time | rate |
+|---|---|---|
+| real `exl3_gemm_sg` (funnel) | 11.786 ms | **5.02 TFLOP/s** |
+| ceiling (direct loads) | 9.418 ms | **6.28 TFLOP/s** |
+| funnel tax = 1 − ceil/real | 2.37 ms | **20.1% of gem time** |
+| decode_only (isolated funnel) | 0.211 ms | — |
+| mma_peak (hot fragments) | 1.83–1.93 ms | **5.84–6.19 TFLOP/s** |
+
+Cross-checks:
+- Engine budget `linear_ms` 11.98 ≈ gem-only 11.79 → **had_in+had_out ≈ 0.19 ms at rows=256** (had is negligible in batched prefill; its T2.3 cost is the rows=1 per-linear path in decode).
+- `mma_peak ≈ ceiling` → **weight streaming from device adds ~0 ms** at these rates (L1/TG covers the wblk fill); the wall is the MMA+structure loop itself.
+- **decode_only = 0.21 ms but in-context funnel tax = 2.37 ms** → the funnel is NOT raw-cost-limited. Best hypothesis: register pressure — production fill runs with `C[4][4]` (32 f32/lane) live **plus** funnel address state (i0/i1/sh/words/shift temps ≈ +15–20 regs) and crosses a spill threshold; ceiling fill is lean (col/k0/wcol) and decode_only has no C. Fix to try: spill C to threadgroup memory around the fill loop (C = 32 f32/lane × 128 lanes = 16 KB TG; wblk 4.5 + csc 1 + C 16 ≈ 21.5 KB, fits), keep the same 2-barrier structure.
+
+**The physics finding (200 pp/s conflict):**
+- Chunk budget (from T3.6 measured times + shape flops): linears carry **12.35 TFLOP / 256-token chunk** (mlp 10.65 + attn 1.70) + non-linear ≈ 215 ms (glue 142 + attn 66 + head 7). 200 t/s ⇒ 1280 ms/chunk ⇒ linears ≤ 1065 ms ⇒ **11.59 TFLOP/s sustained on linears**.
+- Hardware delivers **~6.3 TFLOP/s** even with hot fragments (measured, not a spec-sheet guess). Production today: 5.02 on gate, 3.7 avg.
+- ⇒ 200 t/s needs **1.85× the measured MMA ceiling of the device** — unreachable by staging/tax/occupancy fixes (those only close the 5.02→6.28 gap). Best-possible chunk (tax=0, every linear at 6.28, non-linear squeezed) ≈ 1959+24+142+66+7 ≈ **2200 ms → ~116 t/s**; realistic after tax fix + small-N K-split + glue fusion ≈ **100–110 t/s**.
+- `plan.md` roofline "200 t/s ≈ 12.4 TFLOP/s" implicitly assumed ~16 TFLOP/s fp16 peak at ~78% eff; measured f16→f32 simdgroup rate is ~6.3. **Open conflict to surface to the user with this table — do not keep grinding GEMM micro-opts toward 200.**
+- Small-N TG starvation (part of why avg = 3.7 < gate's 5.0): k/v out_tiles give only 64/64 TGs (k runs 0.97 TF), q/o 256 TGs (2.1 TF), gate/up/down 1344 TGs (4.9–5.0). K-split across grid.z with a partial-sum reduce would lift these (~600 ms/chunk) — second lever after the tax fix.
+
+**Next steps (ordered):** (1) C-spill funnel-tax fix → expect linears −648 ms → **~86 t/s**; verify with gate-shape probe (real sg ≈ ceiling) + full gated suite + prefill bench; (2) small-N K-split → ~110; (3) glue/fusion audit → maybe ~115; (4) stop, re-report the 200 conflict with end-to-end numbers; (5) switch to decode track (18 t/s target — plan roofline 17.6 from weight bandwidth; MTP gate stays closed until 18 + coherency).
+
 ## T4.2 — one command buffer per decode token (2026-09-22)
 
 **Problem:** the cached/GPU decode path encoded each of the ~471 dispatches per token (411 linears + 60 attentions + glue) into its own command buffer with `commit`+`wait_until_completed` — ~0.4 ms of CPU submit/wait each ⇒ **~180 ms of a ~275 ms token was pure overhead** (kernel time only ~93 ms).

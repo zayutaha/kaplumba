@@ -956,4 +956,417 @@ mod tests {
             seen[v as usize] = true;
         }
     }
+
+    // -- T3.8 probes: exl3_gemm_sg_ceiling / exl3_gemm_sg_decode_only ------------
+    //
+    // Test-only pipelines (production Exl3Gemv never binds these). Ceiling =
+    // the sg kernel with funnel decode replaced by direct half loads from a
+    // pre-decoded w[N, K]; decode_only = the funnel decode + wblk staging +
+    // per-stage barriers with the MMA/store skipped. tax = 1 - t(real
+    // sg)/t(ceiling) isolates the decode+staging cost of the production path.
+
+    fn probe_ctx() -> Option<(Device, CommandQueue)> {
+        let d = Device::system_default()?;
+        let q = d.new_command_queue();
+        Some((d, q))
+    }
+
+    fn build_probe(device: &Device, name: &str) -> ComputePipelineState {
+        let opts = CompileOptions::new();
+        opts.set_fast_math_enabled(false);
+        let lib = device
+            .new_library_with_source(MSL, &opts)
+            .unwrap_or_else(|e| panic!("probe MSL compile ({name}): {e}"));
+        let f = lib
+            .get_function(name, None)
+            .unwrap_or_else(|e| panic!("probe function {name}: {e}"));
+        device
+            .new_compute_pipeline_state_with_function(&f)
+            .unwrap_or_else(|e| panic!("probe pipeline {name}: {e}"))
+    }
+
+    fn probe_submit(
+        queue: &CommandQueue,
+        f: impl FnOnce(&ComputeCommandEncoderRef),
+    ) -> Result<(), KernelError> {
+        let cb = queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        f(enc);
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        let status = cb.status();
+        if status != MTLCommandBufferStatus::Completed {
+            return Err(KernelError::CommandFailed(status));
+        }
+        Ok(())
+    }
+
+    fn dispatch_sg(enc: &ComputeCommandEncoderRef, out_tiles: usize, rows: usize) {
+        enc.dispatch_thread_groups(
+            MTLSize::new((out_tiles / 4) as u64, rows.div_ceil(64) as u64, 1),
+            MTLSize::new(128, 1, 1),
+        );
+    }
+
+    /// Ceiling kernel vs a CPU f32 matmul on a small sg-eligible shape:
+    /// y[row, col] = sum_k xh[row, k] * w[col, k]. Inputs are f16 on both
+    /// sides (products exact in f32); only the summation order differs
+    /// (MMA k-tiles vs sequential k), so the gate is a tight relative bound.
+    #[test]
+    fn sg_ceiling_matches_cpu_small() {
+        let Some((device, queue)) = probe_ctx() else {
+            eprintln!("skip: no Metal device");
+            return;
+        };
+        const K: usize = 64; // in_tiles = 4 (even), stages = 2
+        const N: usize = 128; // out_tiles = 8 (% 4 == 0)
+        const ROWS: usize = 64; // one full 64-row block, no ragged tail
+
+        let mut rng = 0x9E37_79B9u32;
+        let mut next = move || {
+            rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (rng >> 16) as u16
+        };
+        let rand_f16 = |n: &mut dyn FnMut() -> u16| -> f16 {
+            // [1, 2) minus 1.5 → [-0.5, 0.5): valid normal f16 throughout.
+            f16::from_bits((n() & 0x3BFF) | 0x3800) - f16::from_f32(1.5)
+        };
+
+        let mut xh_v = Vec::with_capacity(ROWS * K);
+        for _ in 0..ROWS * K {
+            xh_v.push(rand_f16(&mut next));
+        }
+        let mut w_v = Vec::with_capacity(N * K);
+        for _ in 0..N * K {
+            w_v.push(rand_f16(&mut next));
+        }
+
+        let xh = device.new_buffer_with_data(
+            xh_v.as_ptr() as *const _,
+            (ROWS * K * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let w = device.new_buffer_with_data(
+            w_v.as_ptr() as *const _,
+            (N * K * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let y = device.new_buffer((ROWS * N * 4) as u64, MTLResourceOptions::StorageModeShared);
+
+        let pipe = build_probe(&device, "exl3_gemm_sg_ceiling");
+        let in_tiles = K / TILE;
+        let out_tiles = N / TILE;
+        let params: [u32; 7] = [in_tiles as u32, out_tiles as u32, 6, 0, 0, 1, ROWS as u32];
+        probe_submit(&queue, |enc| {
+            enc.set_compute_pipeline_state(&pipe);
+            enc.set_buffer(0, Some(&xh), 0);
+            enc.set_buffer(1, Some(&w), 0);
+            enc.set_buffer(2, Some(&y), 0);
+            enc.set_bytes(3, 28, params.as_ptr() as *const _);
+            dispatch_sg(enc, out_tiles, ROWS);
+        })
+        .expect("ceiling dispatch");
+
+        let got = unsafe { std::slice::from_raw_parts(y.contents() as *const f32, ROWS * N) };
+        let mut worst = 0f32;
+        let mut scale = 0f32;
+        for r in 0..ROWS {
+            for c in 0..N {
+                let mut acc = 0f32;
+                for k in 0..K {
+                    acc += xh_v[r * K + k].to_f32() * w_v[c * K + k].to_f32();
+                }
+                let d = (got[r * N + c] - acc).abs();
+                worst = worst.max(d);
+                scale = scale.max(acc.abs());
+            }
+        }
+        let rel = if scale > 0.0 { worst / scale } else { worst };
+        assert!(
+            rel < 1e-3,
+            "ceiling vs CPU max_rel={rel:e} (worst_abs={worst:e})"
+        );
+    }
+
+    /// Gate-shape timing probe (env-gated so the fast kernels suite stays
+    /// fast): ceiling TFLOP/s and decode-only ms on rows=256, K=5376,
+    /// N=21504 — the real `mlp.gate_proj` shape. For context the engine's
+    /// `phase_profile_chunk_budget_slow` measures the production sg kernel
+    /// (with funnel decode) at 11.98 ms ≈ 4.91 TFLOP/s on this shape.
+    #[test]
+    fn sg_ceiling_decode_tax_gate_shape() {
+        if std::env::var_os("KAPLUMBA_RUN_SLOW").is_none() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1 for the T3.8 timing probe");
+            return;
+        }
+        let Some((device, queue)) = probe_ctx() else {
+            eprintln!("skip: no Metal device");
+            return;
+        };
+        const K: usize = 5376; // in_tiles 336, even
+        const N: usize = 21504; // out_tiles 1344, %4==0
+        const ROWS: usize = 256; // production chunk rows
+        const FLOPS: f64 = 2.0 * ROWS as f64 * K as f64 * N as f64; // 59.19 GF
+        let in_tiles = K / TILE;
+        let out_tiles = N / TILE;
+
+        let mut rng = 0x1234_5678u32;
+        let mut next = move || {
+            rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (rng >> 16) as u16
+        };
+
+        // w: non-zero normal f16 in [1, 2) — timing-neutral, no denormals.
+        let w = {
+            let n = N * K;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                v.push((next() & 0x3BFF) | 0x3800);
+            }
+            device.new_buffer_with_data(
+                v.as_ptr() as *const _,
+                (n * 2) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let xh = {
+            let n = ROWS * K;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                v.push((next() & 0x3BFF) | 0x3800);
+            }
+            device.new_buffer_with_data(
+                v.as_ptr() as *const _,
+                (n * 2) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let y = device.new_buffer((ROWS * N * 4) as u64, MTLResourceOptions::StorageModeShared);
+
+        // decode_only: zero trellis (cw=0 is a safe exl3_decode input) at the
+        // production twords layout; real inv_perm so the address math matches.
+        let twords = 8 * 6; // stream_words for k=6, as production sets it
+        let trellis = device.new_buffer(
+            (in_tiles * out_tiles * twords * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        ); // zero-filled (new_buffer is uninitialized — clear it)
+        unsafe {
+            std::ptr::write_bytes(trellis.contents() as *mut u8, 0, trellis.length() as usize);
+        }
+        let inv = tensor_core_perm_inverse();
+        let inv_perm = device.new_buffer_with_data(
+            inv.as_ptr() as *const _,
+            (inv.len() * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let params_ceiling: [u32; 7] = [in_tiles as u32, out_tiles as u32, 6, 0, 0, 1, ROWS as u32];
+        let params_dec: [u32; 7] = [
+            in_tiles as u32,
+            out_tiles as u32,
+            6,
+            twords as u32,
+            0,
+            1,
+            ROWS as u32,
+        ];
+
+        let ceil_pipe = build_probe(&device, "exl3_gemm_sg_ceiling");
+        let dec_pipe = build_probe(&device, "exl3_gemm_sg_decode_only");
+        // Real production kernel on the same synthetic buffers (zero trellis =
+        // cw=0, safe decode) so the tax compares gem-only against gem-only —
+        // the engine budget's 11.98 ms includes had_in/had_out around the gem.
+        let real_pipe = build_probe(&device, "exl3_gemm_sg");
+
+        let run_ceiling = || {
+            probe_submit(&queue, |enc| {
+                enc.set_compute_pipeline_state(&ceil_pipe);
+                enc.set_buffer(0, Some(&xh), 0);
+                enc.set_buffer(1, Some(&w), 0);
+                enc.set_buffer(2, Some(&y), 0);
+                enc.set_bytes(3, 28, params_ceiling.as_ptr() as *const _);
+                dispatch_sg(enc, out_tiles, ROWS);
+            })
+            .expect("ceiling dispatch");
+        };
+        let run_real = || {
+            probe_submit(&queue, |enc| {
+                enc.set_compute_pipeline_state(&real_pipe);
+                enc.set_buffer(0, Some(&xh), 0);
+                enc.set_buffer(1, Some(&trellis), 0);
+                enc.set_buffer(2, Some(&inv_perm), 0);
+                enc.set_buffer(3, Some(&y), 0);
+                enc.set_bytes(4, 28, params_dec.as_ptr() as *const _);
+                dispatch_sg(enc, out_tiles, ROWS);
+            })
+            .expect("real sg dispatch");
+        };
+        let run_decode = || {
+            probe_submit(&queue, |enc| {
+                enc.set_compute_pipeline_state(&dec_pipe);
+                enc.set_buffer(0, Some(&trellis), 0);
+                enc.set_buffer(1, Some(&inv_perm), 0);
+                enc.set_bytes(2, 28, params_dec.as_ptr() as *const _);
+                enc.dispatch_thread_groups(
+                    MTLSize::new((out_tiles / 4) as u64, ROWS.div_ceil(64) as u64, 1),
+                    MTLSize::new(128, 1, 1),
+                );
+            })
+            .expect("decode_only dispatch");
+        };
+
+        // Warmup (shader compile lands here), then min of 5 runs each.
+        run_ceiling();
+        run_real();
+        run_decode();
+        let mut ceil_best = f64::MAX;
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            run_ceiling();
+            ceil_best = ceil_best.min(t.elapsed().as_secs_f64());
+        }
+        let mut real_best = f64::MAX;
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            run_real();
+            real_best = real_best.min(t.elapsed().as_secs_f64());
+        }
+        let mut dec_best = f64::MAX;
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            run_decode();
+            dec_best = dec_best.min(t.elapsed().as_secs_f64());
+        }
+
+        let ceil_tf = FLOPS / ceil_best / 1e12;
+        let real_tf = FLOPS / real_best / 1e12;
+        // Fraction of production gem time that is funnel+staging overhead
+        // (ceiling is the same kernel with the funnel replaced by direct loads).
+        let tax = 1.0 - ceil_best / real_best;
+        eprintln!(
+            "[T3.8] real sg (gem-only): {:.3} ms = {:.2} TFLOP/s | ceiling: {:.3} ms = {:.2} \
+             TFLOP/s | decode_only: {:.3} ms | funnel tax = {:.1}% of gem time",
+            real_best * 1e3,
+            real_tf,
+            ceil_best * 1e3,
+            ceil_tf,
+            dec_best * 1e3,
+            tax * 100.0
+        );
+        eprintln!(
+            "[T3.8] context: engine budget linear_ms (gem + had_in/out) = 11.98 ms on this \
+             shape; 200 pp/s needs ≈11.4 TFLOP/s sustained on linears"
+        );
+        // Sanity floors: a silent kernel failure shows up as absurd times, not
+        // wrong numbers (decode_only writes nothing). 1 TFLOP/s is ~5x below
+        // production, so these only trip on a broken dispatch.
+        assert!(
+            ceil_tf > 1.0,
+            "ceiling implausibly slow: {ceil_tf:.3} TFLOP/s — dispatch broken?"
+        );
+        assert!(
+            real_tf > 1.0,
+            "real sg implausibly slow: {real_tf:.3} TFLOP/s — dispatch broken?"
+        );
+        assert!(
+            dec_best < ceil_best,
+            "decode_only ({:.3} ms) should not exceed ceiling ({:.3} ms)",
+            dec_best * 1e3,
+            ceil_best * 1e3
+        );
+    }
+
+    /// Sustained-MMA peak probe (env-gated): wblk filled once, then
+    /// PEAK_REPS identical passes over hot fragments — the absolute simdgroup
+    /// f16→f32 rate of this GPU for the production tile config, with no
+    /// weight streaming or decode. 200 pp/s needs linears ≈ 1065 ms/chunk
+    /// ≈ 11.4 TFLOP/s sustained; this number says whether any staging/order
+    /// tweak could ever get there.
+    #[test]
+    fn sg_mma_peak_probe() {
+        if std::env::var_os("KAPLUMBA_RUN_SLOW").is_none() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1 for the T3.8 peak probe");
+            return;
+        }
+        let Some((device, queue)) = probe_ctx() else {
+            eprintln!("skip: no Metal device");
+            return;
+        };
+        const K: usize = 5376;
+        const N: usize = 21504;
+        const ROWS: usize = 256;
+        const PEAK_REPS: u64 = 32; // MUST match PEAK_REPS in exl3.metal
+        let in_tiles = K / TILE;
+        let out_tiles = N / TILE;
+        let tgs = (out_tiles / 4) as u64 * ROWS.div_ceil(64) as u64;
+        // One rep = one 64×64 tile over k2×8 = 32 deep.
+        let flops = 2.0 * (64.0 * 64.0 * 32.0) * PEAK_REPS as f64 * tgs as f64;
+
+        let mut rng = 0x8765_4321u32;
+        let mut next = move || {
+            rng = rng.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            (rng >> 16) as u16
+        };
+        let w = {
+            let n = N * K;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                v.push((next() & 0x3BFF) | 0x3800);
+            }
+            device.new_buffer_with_data(
+                v.as_ptr() as *const _,
+                (n * 2) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let xh = {
+            let n = ROWS * K;
+            let mut v = Vec::with_capacity(n);
+            for _ in 0..n {
+                v.push((next() & 0x3BFF) | 0x3800);
+            }
+            device.new_buffer_with_data(
+                v.as_ptr() as *const _,
+                (n * 2) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let y = device.new_buffer((ROWS * N * 4) as u64, MTLResourceOptions::StorageModeShared);
+
+        let pipe = build_probe(&device, "exl3_gemm_sg_mma_peak");
+        let params: [u32; 7] = [in_tiles as u32, out_tiles as u32, 6, 0, 0, 1, ROWS as u32];
+        let run = || {
+            probe_submit(&queue, |enc| {
+                enc.set_compute_pipeline_state(&pipe);
+                enc.set_buffer(0, Some(&xh), 0);
+                enc.set_buffer(1, Some(&w), 0);
+                enc.set_buffer(2, Some(&y), 0);
+                enc.set_bytes(3, 28, params.as_ptr() as *const _);
+                dispatch_sg(enc, out_tiles, ROWS);
+            })
+            .expect("peak dispatch");
+        };
+
+        run(); // warmup / shader compile
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let t = std::time::Instant::now();
+            run();
+            best = best.min(t.elapsed().as_secs_f64());
+        }
+        let tf = flops / best / 1e12;
+        eprintln!(
+            "[T3.8] mma_peak: {:.3} ms = {:.2} TFLOP/s (hot fragments, {} reps) | \
+             ceiling(streaming) 6.27 TF | production 4.91 TF | 200 pp/s needs ≈11.4 TF \
+             sustained on linears",
+            best * 1e3,
+            tf,
+            PEAK_REPS
+        );
+        assert!(
+            tf > 5.0 && tf < 50.0,
+            "mma peak implausible: {tf:.3} TFLOP/s — probe broken?"
+        );
+    }
 }

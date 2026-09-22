@@ -547,3 +547,289 @@ kernel void exl3_gemm_sg(device const half *xh [[buffer(0)]],
         }
     }
 }
+
+// ---------------------------------------------------------------------------
+// T3.8 probe — ceiling: exl3_gemm_sg with the funnel decode replaced by a
+// direct device load of a pre-decoded half matrix `w[N, K]` (row-major,
+// w[col*K + k]). Grid, thread mapping, wblk fill layout, both barriers, the
+// MMA k-loop and the store are IDENTICAL to exl3_gemm_sg — only the source
+// of the wblk halves differs. tax = 1 − t(real sg) / t(this kernel) isolates
+// the decode+staging cost. Test-only: pipelines are built locally in
+// exl3.rs tests; production never binds this kernel.
+//   buffer(0) xh [rows, K] f16 | buffer(1) w [N, K] f16
+//   buffer(2) y  [rows, N] f32 | buffer(3) Exl3GemmParams
+// ---------------------------------------------------------------------------
+kernel void exl3_gemm_sg_ceiling(device const half *xh [[buffer(0)]],
+                                 device const half *w [[buffer(1)]],
+                                 device float *y [[buffer(2)]],
+                                 constant Exl3GemmParams &p [[buffer(3)]],
+                                 uint2 tg [[threadgroup_position_in_grid]],
+                                 uint2 thr [[thread_position_in_threadgroup]]) {
+    threadgroup half wblk[32u * SG_WS];
+    threadgroup float csc[4u * 64u];
+
+    uint tid = thr.x;
+    uint lane = tid & 31u;
+    uint sgid = tid >> 5u;
+    uint sgr = sgid >> 1u;
+    uint sgc = sgid & 1u;
+
+    uint ot0 = tg.x * 4u;
+    uint row0 = tg.y * SG_BM;
+    if (row0 >= p.rows) {
+        return;
+    }
+
+    uint nin = p.in_tiles;
+    uint nout = p.out_tiles;
+    uint K = nin * TILE;
+    uint N = nout * TILE;
+    uint stages = nin >> 1u;
+    uint blk_len = p.rows - row0;
+
+    uint dcol = tid >> 3u;
+    uint rp = tid & 7u;
+
+    simdgroup_float8x8 C[4][4];
+    for (uint r = 0u; r < 4u; r++) {
+        for (uint c = 0u; c < 4u; c++) {
+            C[r][c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+
+    const device half *xrow = xh + (ulong)(row0 + sgr * 32u) * K;
+
+    for (uint ks = 0u; ks < stages; ks++) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint it2 = 0u; it2 < 2u; it2++) {
+            uint tk = ks * 2u + it2;
+            uint k0 = ks * 32u + it2 * 16u + 2u * rp;
+            uint base = (it2 * 16u + 2u * rp) * SG_WS;
+            for (uint lt = 0u; lt < 4u; lt++) {
+                uint col = ot0 * TILE + lt * 16u + dcol;
+                device const half *wcol = w + (ulong)col * K + k0;
+                wblk[base + lt * 16u + dcol] = wcol[0];
+                wblk[base + SG_WS + lt * 16u + dcol] = wcol[1];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k2 = 0u; k2 < 4u; k2++) {
+            simdgroup_half8x8 bf0;
+            simdgroup_half8x8 bf1;
+            simdgroup_half8x8 bf2;
+            simdgroup_half8x8 bf3;
+            const threadgroup half *wrow = &wblk[k2 * 8u * SG_WS + sgc * 32u];
+            simdgroup_load(bf0, wrow, SG_WS);
+            simdgroup_load(bf1, wrow + 8u, SG_WS);
+            simdgroup_load(bf2, wrow + 16u, SG_WS);
+            simdgroup_load(bf3, wrow + 24u, SG_WS);
+            for (uint r = 0u; r < 4u; r++) {
+                simdgroup_half8x8 a;
+                simdgroup_load(a, xrow + (ulong)(r * 8u) * K + ks * 32u + k2 * 8u,
+                               K);
+                simdgroup_multiply_accumulate(C[r][0], a, bf0, C[r][0]);
+                simdgroup_multiply_accumulate(C[r][1], a, bf1, C[r][1]);
+                simdgroup_multiply_accumulate(C[r][2], a, bf2, C[r][2]);
+                simdgroup_multiply_accumulate(C[r][3], a, bf3, C[r][3]);
+            }
+        }
+    }
+
+    uint cb0 = ot0 * TILE + sgc * 32u;
+    uint rbase = sgr * 32u;
+    for (uint r = 0u; r < 4u; r++) {
+        if (rbase + r * 8u >= blk_len) {
+            break;
+        }
+        for (uint cf = 0u; cf < 4u; cf++) {
+            simdgroup_store(C[r][cf], &csc[sgid * 64u], 8u);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint i = lane; i < 64u; i += 32u) {
+                uint rr = i >> 3u;
+                uint cc = i & 7u;
+                uint gr = rbase + r * 8u + rr;
+                if (gr < blk_len) {
+                    y[(ulong)(row0 + gr) * N + cb0 + cf * 8u + cc] =
+                        csc[sgid * 64u + i];
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T3.8 probe — decode-only: the funnel-decode + wblk staging + per-stage
+// barriers of exl3_gemm_sg, with the MMA k-loop and store skipped. Times the
+// decode/staging half of the pipeline in isolation (barrier structure per
+// stage preserved so the staging-vs-MMA overlap behavior matches). Writes
+// nothing; safe to exit after the stage loop (all threads leave together).
+// Test-only. buffer(0) trellis | buffer(1) inv_perm | buffer(2) params
+// ---------------------------------------------------------------------------
+kernel void exl3_gemm_sg_decode_only(device const ushort *trellis [[buffer(0)]],
+                                     device const uint *inv_perm [[buffer(1)]],
+                                     constant Exl3GemmParams &p [[buffer(2)]],
+                                     uint2 tg [[threadgroup_position_in_grid]],
+                                     uint2 thr [[thread_position_in_threadgroup]]) {
+    threadgroup half wblk[32u * SG_WS];
+
+    uint tid = thr.x;
+    uint ot0 = tg.x * 4u;
+    uint row0 = tg.y * SG_BM;
+    if (row0 >= p.rows) {
+        return;
+    }
+
+    uint nin = p.in_tiles;
+    uint nout = p.out_tiles;
+    uint stages = nin >> 1u;
+
+    uint dcol = tid >> 3u;
+    uint rp = tid & 7u;
+    uint i0_[2];
+    uint i1_[2];
+    uint sh_[2];
+    for (uint j = 0u; j < 2u; j++) {
+        uint src = inv_perm[(2u * rp + j) * 16u + dcol];
+        uint t = src >> 1u;
+        int b0 = int(t) * 2 * int(p.k) + int(p.k) - 16 + 256 * int(p.k);
+        int b2 = b0 + int(p.k) + 16;
+        i0_[j] = uint(b0 / 32) % p.twords;
+        i1_[j] = uint((b2 - 1) / 32) % p.twords;
+        sh_[j] =
+            uint(((b2 - 1) / 32 + 1) * 32 - b2) + ((src & 1u) ? 0u : p.k);
+    }
+    bool aligned = p.aligned != 0u;
+
+    for (uint ks = 0u; ks < stages; ks++) {
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint it2 = 0u; it2 < 2u; it2++) {
+            uint tk = ks * 2u + it2;
+            for (uint lt = 0u; lt < 4u; lt++) {
+                device const uint *words =
+                    (device const uint *)trellis +
+                    ((ulong)tk * nout + ot0 + lt) * p.twords;
+                for (uint j = 0u; j < 2u; j++) {
+                    uint a = ld_word((device const ushort *)words, i0_[j], aligned);
+                    uint b = ld_word((device const ushort *)words, i1_[j], aligned);
+                    uint cw =
+                        (uint)((((ulong)a) << 32 | (ulong)b) >> sh_[j]) & 0xFFFFu;
+                    wblk[(it2 * 16u + 2u * rp + j) * SG_WS + lt * 16u + dcol] =
+                        exl3_decode(cw, p.mode);
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// T3.8 probe — MMA peak: fill wblk ONCE (stage-0 geometry, direct half loads
+// like the ceiling kernel), then run R identical MMA passes over the SAME
+// hot fragments (B in threadgroup memory, A re-read from L2-resident xh).
+// No weight streaming, no decode, no per-stage barriers inside the rep loop —
+// this is the sustained simdgroup f16→f32 MMA rate of the GPU for the
+// production tile configuration. If ≪ what 200 t/s needs (~9.45 TFLOP/s
+// average), the sg structure cannot reach the target by staging tweaks.
+// p.rows sets the grid (rows/64 × out_tiles/4); R is fixed below.
+// Test-only. buffer(0) xh | buffer(1) w | buffer(2) params (y unused)
+// ---------------------------------------------------------------------------
+constant uint PEAK_REPS = 32u;
+
+kernel void exl3_gemm_sg_mma_peak(device const half *xh [[buffer(0)]],
+                                  device const half *w [[buffer(1)]],
+                                  device float *y [[buffer(2)]],
+                                  constant Exl3GemmParams &p [[buffer(3)]],
+                                  uint2 tg [[threadgroup_position_in_grid]],
+                                  uint2 thr [[thread_position_in_threadgroup]]) {
+    threadgroup half wblk[32u * SG_WS];
+    threadgroup float csc[4u * 64u];
+
+    uint tid = thr.x;
+    uint lane = tid & 31u;
+    uint sgid = tid >> 5u;
+    uint sgr = sgid >> 1u;
+    uint sgc = sgid & 1u;
+
+    uint ot0 = tg.x * 4u;
+    uint row0 = tg.y * SG_BM;
+    if (row0 >= p.rows) {
+        return;
+    }
+
+    uint nin = p.in_tiles;
+    uint nout = p.out_tiles;
+    uint K = nin * TILE;
+    uint N = nout * TILE;
+    uint blk_len = p.rows - row0;
+
+    uint dcol = tid >> 3u;
+    uint rp = tid & 7u;
+
+    // Fill wblk with stage 0 (k = 0..31) from the pre-decoded w.
+    for (uint it2 = 0u; it2 < 2u; it2++) {
+        uint k0 = it2 * 16u + 2u * rp;
+        uint base = (it2 * 16u + 2u * rp) * SG_WS;
+        for (uint lt = 0u; lt < 4u; lt++) {
+            uint col = ot0 * TILE + lt * 16u + dcol;
+            device const half *wcol = w + (ulong)col * K + k0;
+            wblk[base + lt * 16u + dcol] = wcol[0];
+            wblk[base + SG_WS + lt * 16u + dcol] = wcol[1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    simdgroup_float8x8 C[4][4];
+    for (uint r = 0u; r < 4u; r++) {
+        for (uint c = 0u; c < 4u; c++) {
+            C[r][c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
+    }
+    const device half *xrow = xh + (ulong)(row0 + sgr * 32u) * K;
+
+    for (uint rep = 0u; rep < PEAK_REPS; rep++) {
+        for (uint k2 = 0u; k2 < 4u; k2++) {
+            simdgroup_half8x8 bf0;
+            simdgroup_half8x8 bf1;
+            simdgroup_half8x8 bf2;
+            simdgroup_half8x8 bf3;
+            const threadgroup half *wrow = &wblk[k2 * 8u * SG_WS + sgc * 32u];
+            simdgroup_load(bf0, wrow, SG_WS);
+            simdgroup_load(bf1, wrow + 8u, SG_WS);
+            simdgroup_load(bf2, wrow + 16u, SG_WS);
+            simdgroup_load(bf3, wrow + 24u, SG_WS);
+            for (uint r = 0u; r < 4u; r++) {
+                simdgroup_half8x8 a;
+                simdgroup_load(a, xrow + (ulong)(r * 8u) * K + k2 * 8u, K);
+                simdgroup_multiply_accumulate(C[r][0], a, bf0, C[r][0]);
+                simdgroup_multiply_accumulate(C[r][1], a, bf1, C[r][1]);
+                simdgroup_multiply_accumulate(C[r][2], a, bf2, C[r][2]);
+                simdgroup_multiply_accumulate(C[r][3], a, bf3, C[r][3]);
+            }
+        }
+    }
+
+    // Keep-alive store (same scatter as the ceiling kernel); fixed cost,
+    // amortized away by PEAK_REPS in the host-side FLOP count.
+    uint cb0 = ot0 * TILE + sgc * 32u;
+    uint rbase = sgr * 32u;
+    for (uint r = 0u; r < 4u; r++) {
+        if (rbase + r * 8u >= blk_len) {
+            break;
+        }
+        for (uint cf = 0u; cf < 4u; cf++) {
+            simdgroup_store(C[r][cf], &csc[sgid * 64u], 8u);
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+            for (uint i = lane; i < 64u; i += 32u) {
+                uint rr = i >> 3u;
+                uint cc = i & 7u;
+                uint gr = rbase + r * 8u + rr;
+                if (gr < blk_len) {
+                    y[(ulong)(row0 + gr) * N + cb0 + cf * 8u + cc] =
+                        csc[sgid * 64u + i];
+                }
+            }
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
