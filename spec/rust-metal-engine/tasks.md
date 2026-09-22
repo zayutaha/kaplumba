@@ -47,10 +47,14 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - Commit: `spec/rust-metal-engine: T1.2 tokenizer`
 
 ### T1.3 — Naive eager prefill + decode (correctness first)
-- [ ] Unfused, unfused-threshold, obviously-correct kernels (even naive Metal or CPU-fallback for tiny paths) end-to-end generate greedy tokens
-- Files: model forward, attention, lm_head, sampler stub
+- [~] In progress — sub-steps:
+  - [x] **T1.3a** EXL3 decode primitives: trellis pack/unpack, codebook (MCG/Default/Mul1), perm, signs, Hadamard, `decode_packed_tile` — 26/26 unit tests vs reference goldens (q00 tile, MCG codewords, pack fixtures k=3/6)
+  - [ ] **T1.3b** reconstruct (inner trellis → had+scales) + `linear_forward_reconstruct`
+  - [ ] **T1.3c** Gemma4 model forward (embed, hybrid SWA/full attn, MLP, layer_scalar, softcap)
+  - [ ] **T1.3d** greedy generate + golden fixture; deterministic across runs
+- Files: `crates/engine/src/exl3/*` (a); model forward, attention, lm_head, sampler stub (b–d)
 - Test: golden greedy output on fixed prompt matches known-good text (record fixture); deterministic across runs
-- Commit: `spec/rust-metal-engine: T1.3 naive forward`
+- Commit: `spec/rust-metal-engine: T1.3 naive forward` (a committed as `...: T1.3a decode primitives`)
 
 ### T1.4 — CLI generate + bench entry
 - [ ] `kaplumba-engine generate --prompt ... --max-tokens N --temp ...` streaming; JSON stats (ttft_ms, pp_tps, tg_tps, mem) schema `kaplumba-bench/1`

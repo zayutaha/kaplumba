@@ -59,10 +59,7 @@ impl MetalContext {
         enc.set_buffer(1, Some(&src), 0);
         let elems = (buf.length() / 4).min(1 << 20).max(1);
         let width = pipeline.thread_execution_width().min(elems);
-        enc.dispatch_threads(
-            MTLSize::new(elems, 1, 1),
-            MTLSize::new(width, 1, 1),
-        );
+        enc.dispatch_threads(MTLSize::new(elems, 1, 1), MTLSize::new(width, 1, 1));
         enc.end_encoding();
         cb.commit();
         cb.wait_until_completed();
@@ -139,7 +136,9 @@ mod tests {
     fn metal_context_creates() {
         match MetalContext::new() {
             Ok(_) => {}
-            Err(MetalError::NoDevice) => eprintln!("no device; context test is environment-dependent"),
+            Err(MetalError::NoDevice) => {
+                eprintln!("no device; context test is environment-dependent")
+            }
             Err(e) => panic!("unexpected metal error: {e}"),
         }
     }

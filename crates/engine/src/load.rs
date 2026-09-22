@@ -256,11 +256,10 @@ fn parse_safetensors_header(path: &Path) -> Result<HashMap<String, TensorInfo>, 
         });
     }
     let mut header = vec![0u8; header_len];
-    f.read_exact(&mut header)
-        .map_err(|source| LoadError::Io {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    f.read_exact(&mut header).map_err(|source| LoadError::Io {
+        path: path.to_path_buf(),
+        source,
+    })?;
     let header: SafetensorHeader =
         serde_json::from_slice(&header).map_err(|e| LoadError::BadHeader {
             path: path.to_path_buf(),
@@ -467,10 +466,8 @@ pub fn load_exl3(ctx: &MetalContext, dir: impl AsRef<Path>) -> Result<Exl3Model,
         let header_len = read_shard_header_len(&path)?;
         let data_start = 8 + header_len;
 
-        let mut entries: Vec<(&String, &TensorInfo)> = shard_headers[shard]
-            .iter()
-            .map(|(n, i)| (n, i))
-            .collect();
+        let mut entries: Vec<(&String, &TensorInfo)> =
+            shard_headers[shard].iter().map(|(n, i)| (n, i)).collect();
         entries.sort_by_key(|(n, _)| n.as_str());
 
         let mut f = File::open(&path).map_err(|source| LoadError::Io {
@@ -489,10 +486,11 @@ pub fn load_exl3(ctx: &MetalContext, dir: impl AsRef<Path>) -> Result<Exl3Model,
             let mut off = info.data_offset;
             while remaining > 0 {
                 let chunk = remaining.min(STAGE as u64) as usize;
-                f.read_exact(&mut stage[..chunk]).map_err(|source| LoadError::Io {
-                    path: path.clone(),
-                    source,
-                })?;
+                f.read_exact(&mut stage[..chunk])
+                    .map_err(|source| LoadError::Io {
+                        path: path.clone(),
+                        source,
+                    })?;
                 unsafe {
                     std::ptr::copy_nonoverlapping(stage.as_ptr(), ptr.add(off as usize), chunk);
                 }
@@ -556,7 +554,10 @@ mod tests {
     fn header_parse_ok() {
         let dir = std::env::temp_dir().join("kaplumba_st_ok");
         std::fs::create_dir_all(&dir).unwrap();
-        write_safetensors(&dir.join("a.safetensors"), &[("t1", b"abcd"), ("t2", b"ef")]);
+        write_safetensors(
+            &dir.join("a.safetensors"),
+            &[("t1", b"abcd"), ("t2", b"ef")],
+        );
         let got = parse_safetensors_header(&dir.join("a.safetensors")).unwrap();
         assert_eq!(got.len(), 2);
         assert_eq!(got["t1"].nbytes, 4);
@@ -626,7 +627,11 @@ mod tests {
             "too small: {}",
             model.resident_bytes()
         );
-        assert!(model.tensor("model.language_model.embed_tokens.weight").is_some());
+        assert!(
+            model
+                .tensor("model.language_model.embed_tokens.weight")
+                .is_some()
+        );
         assert!(model.tensor("lm_head.trellis").is_some());
         let (bytes, info) = model
             .tensor_bytes("model.language_model.embed_tokens.weight")
