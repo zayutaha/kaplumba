@@ -71,51 +71,11 @@ pub fn linear_forward_reconstruct(layer: &Exl3Linear<'_>, x: &[f16]) -> Vec<f16>
     assert!(inn > 0 && out > 0 && inn % 16 == 0 && out % 16 == 0);
     assert_eq!(x.len() % inn, 0, "x rows must be multiple of in_features");
     let rows = x.len() / inn;
-
-    let suh = expand_scales(layer.suh, inn, layer.suh_is_f16);
-    let svh = expand_scales(layer.svh, out, layer.svh_is_f16);
-
-    // Input Hadamard + suh → xh (rows, in)
-    let xh = had_r_128(x, rows, inn, suh.as_deref(), None);
+    assert_eq!(out % 128, 0, "out_features must be multiple of 128");
 
     let mut y = vec![f16::ZERO; rows * out];
-
-    // Stream output in 128-col slabs (one right-Hadamard block).
-    assert_eq!(out % 128, 0, "out_features must be multiple of 128");
     for n0 in (0..out).step_by(128) {
-        let n_count = 128;
-        let w = reconstruct_inner_slab(&layer.trellis, layer.mode, n0, n_count)
-            .expect("slab reconstruct");
-
-        // slab[r, c] = sum_k xh[r, k] * w[k, c]  (f32 accumulate)
-        let mut slab = vec![0f32; rows * n_count];
-        for tk in 0..layer.trellis.in_tiles {
-            let k_off = tk * 16;
-            let xh_row_off = |r: usize| -> &[f16] { &xh[r * inn + k_off..r * inn + k_off + 16] };
-            for tn_local in 0..8 {
-                let col_local = tn_local * 16;
-                // w tile rows for this tk: slab of w is (in, 128), tile columns
-                // are already placed at col_local within the slab.
-                for r in 0..rows {
-                    let xr = xh_row_off(r);
-                    let dst = r * n_count + col_local;
-                    for oc in 0..16 {
-                        let mut acc = 0f32;
-                        for ic in 0..16 {
-                            // w is (inn, 128) row-major; row = k_off+ic, col = col_local+oc
-                            acc += xr[ic].to_f32()
-                                * w[(k_off + ic) * n_count + col_local + oc].to_f32();
-                        }
-                        slab[dst + oc] += acc;
-                    }
-                }
-            }
-        }
-
-        // Output Hadamard (right) + svh on this slab.
-        let slab_f16: Vec<f16> = slab.iter().map(|&v| f16::from_f32(v)).collect();
-        let svh_block: Option<&[f16]> = svh.as_ref().map(|s| &s[n0..n0 + 128]);
-        let y_block = had_r_128(&slab_f16, rows, 128, None, svh_block);
+        let y_block = linear_forward_slab(layer, x, n0, 128);
         for r in 0..rows {
             let dst = r * out + n0;
             y[dst..dst + 128].copy_from_slice(&y_block[r * 128..(r + 1) * 128]);
@@ -128,6 +88,71 @@ pub fn linear_forward_reconstruct(layer: &Exl3Linear<'_>, x: &[f16]) -> Vec<f16>
                 let v = y[r * out + c].to_f32() + bias[c].to_f32();
                 y[r * out + c] = f16::from_f32(v);
             }
+        }
+    }
+    y
+}
+
+/// One 128-column output block: `y[.., n0..n0 + n_count]` where `n_count` is a
+/// multiple of 128. Used to stream huge heads (lm_head, 2.8 GB f16) without ever
+/// materializing the full output width. Bias is **not** added here.
+pub fn linear_forward_slab(
+    layer: &Exl3Linear<'_>,
+    x: &[f16],
+    n0: usize,
+    n_count: usize,
+) -> Vec<f16> {
+    let inn = layer.in_features();
+    let out = layer.out_features();
+    assert!(inn > 0 && out > 0 && inn % 16 == 0 && out % 16 == 0);
+    assert_eq!(x.len() % inn, 0, "x rows must be multiple of in_features");
+    let rows = x.len() / inn;
+    assert!(n_count % 128 == 0, "slab width must be multiple of 128");
+    assert!(n0 % 128 == 0 && n0 + n_count <= out, "slab out of range");
+
+    let suh = expand_scales(layer.suh, inn, layer.suh_is_f16);
+    let svh = expand_scales(layer.svh, out, layer.svh_is_f16);
+
+    // Input Hadamard + suh → xh (rows, in)
+    let xh = had_r_128(x, rows, inn, suh.as_deref(), None);
+
+    // Stream output in 128-col slabs (one right-Hadamard block).
+    let mut y = vec![f16::ZERO; rows * n_count];
+    for n_local in (0..n_count).step_by(128) {
+        let n_off = n0 + n_local;
+        let w = reconstruct_inner_slab(&layer.trellis, layer.mode, n_off, 128)
+            .expect("slab reconstruct");
+
+        // slab[r, c] = sum_k xh[r, k] * w[k, c]  (f32 accumulate)
+        let mut slab = vec![0f32; rows * 128];
+        for tk in 0..layer.trellis.in_tiles {
+            let k_off = tk * 16;
+            let xh_row_off = |r: usize| -> &[f16] { &xh[r * inn + k_off..r * inn + k_off + 16] };
+            for tn_local in 0..8 {
+                let col_local = tn_local * 16;
+                // w slab is (in, 128) row-major; tile columns land at col_local.
+                for r in 0..rows {
+                    let xr = xh_row_off(r);
+                    let dst = r * 128 + col_local;
+                    for oc in 0..16 {
+                        let mut acc = 0f32;
+                        for ic in 0..16 {
+                            acc +=
+                                xr[ic].to_f32() * w[(k_off + ic) * 128 + col_local + oc].to_f32();
+                        }
+                        slab[dst + oc] += acc;
+                    }
+                }
+            }
+        }
+
+        // Output Hadamard (right) + svh on this slab.
+        let slab_f16: Vec<f16> = slab.iter().map(|&v| f16::from_f32(v)).collect();
+        let svh_block: Option<&[f16]> = svh.as_ref().map(|s| &s[n_off..n_off + 128]);
+        let y_block = had_r_128(&slab_f16, rows, 128, None, svh_block);
+        for r in 0..rows {
+            let dst = r * n_count + n_local;
+            y[dst..dst + 128].copy_from_slice(&y_block[r * 128..(r + 1) * 128]);
         }
     }
     y
@@ -351,6 +376,46 @@ mod tests {
         for v in &y1 {
             assert!(v.to_f32().is_finite());
         }
+    }
+
+    #[test]
+    fn slab_matches_full_forward_columns() {
+        // out = 256 → two 128-col slabs; multi-slab widths must stitch exactly.
+        let k = 3;
+        let (_td, suh, svh, view) = synth_layer(k, 8, 16, 31);
+        let out = view.out_features();
+        assert_eq!(out, 256);
+        let layer = Exl3Linear {
+            trellis: view,
+            suh: Some(&suh),
+            svh: Some(&svh),
+            suh_is_f16: true,
+            svh_is_f16: true,
+            mode: CodebookMode::Mcg,
+            bias: None,
+        };
+        let x = f16_le(view.in_features() * 2, 17);
+        let full = linear_forward_reconstruct(&layer, &x);
+        let rows = 2;
+        for n0 in (0..out).step_by(128) {
+            let slab = linear_forward_slab(&layer, &x, n0, 128);
+            assert_eq!(slab.len(), rows * 128);
+            for r in 0..rows {
+                for c in 0..128 {
+                    assert_eq!(slab[r * 128 + c], full[r * out + n0 + c], "r={r} c={c}");
+                }
+            }
+        }
+        // Wider-than-128 slab is allowed and equals the stitched 128 blocks.
+        let wide = linear_forward_slab(&layer, &x, 0, 256);
+        for r in 0..rows {
+            for c in 0..256 {
+                assert_eq!(wide[r * 256 + c], full[r * out + c], "r={r} c={c}");
+            }
+        }
+        // Out-of-range slab is rejected.
+        let r = std::panic::catch_unwind(|| linear_forward_slab(&layer, &x, 256, 128));
+        assert!(r.is_err());
     }
 
     #[test]

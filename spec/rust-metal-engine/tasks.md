@@ -47,18 +47,18 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - Commit: `spec/rust-metal-engine: T1.2 tokenizer`
 
 ### T1.3 — Naive eager prefill + decode (correctness first)
-- [~] In progress — sub-steps:
+- [x] Done — sub-steps:
   - [x] **T1.3a** EXL3 decode primitives: trellis pack/unpack, codebook (MCG/Default/Mul1), perm, signs, Hadamard, `decode_packed_tile` — 26/26 unit tests vs reference goldens (q00 tile, MCG codewords, pack fixtures k=3/6)
   - [x] **T1.3b** reconstruct (inner/slab/public weights) + streaming `linear_forward_reconstruct` — 44/44 tests; stream ≡ stepwise rel err < 1e-3; dense public-weight loose parity
-  - [ ] **T1.3b** reconstruct (inner trellis → had+scales) + `linear_forward_reconstruct`
-  - [~] **T1.3c** Gemma4 model forward (embed·√h, hybrid SWA/full attn, MLP, layer_scalar, softcap) — facts+goldens done (see notes "T1.3c handover"); code NOT written
-    - [ ] expand `TextConfig` (load.rs): n_heads, n_kv, n_global_kv, n_layers, vocab, eps, sliding_window, hidden_activation, max_pos, rope_parameters; synthesize per-layer head_dim/n_kv (full=512/4, k_eq_v)
-    - [ ] `crates/engine/src/gemma4.rs` + lib.rs: RMSNorm(f32), dual RoPE tables, k_eq_v attention (K=rope@k_norm, V=weightless v_norm on raw k; scale 1.0; masks full kv≤q / sliding kv∈[q-1023,q]), gelu_tanh MLP, decoder order + layer_scalar (DE28 f64 add), streaming lm_head w/ softcap 30 → f32 logits
-    - [ ] unit tests: inv_freq/rope/rms/gelu/mask goldens (consts in notes), embed[2]+layer_scalar real-artifact reads, layer-0 smoke (slow-gated)
-  - [ ] **T1.3d** greedy generate + golden fixture; deterministic across runs
-- Files: `crates/engine/src/exl3/*` (a); `crates/engine/src/gemma4.rs`, model forward, attention, lm_head, sampler stub (c–d)
-- Test: golden greedy output on fixed prompt matches known-good text (record fixture); deterministic across runs
-- Commit: `spec/rust-metal-engine: T1.3 naive forward` (a committed as `...: T1.3a decode primitives`)
+  - [x] **T1.3c** Gemma4 model forward (embed·√h, hybrid SWA/full attn, MLP, layer_scalar, softcap) — `crates/engine/src/gemma4.rs` (~1000 lines incl. tests), 21 new tests; **real 60-layer forward + lm_head 205s**, argmax matches fixture
+    - [x] expand `TextConfig` (load.rs): n_heads, n_kv, n_global_kv, n_layers, vocab, eps, sliding_window, hidden_activation, max_pos, `rope_parameters`→`RopeParams`; per-layer head_dim/n_kv synthesized from `layer_types`+k_eq_v (full=512/4, sliding=256/16)
+    - [x] `crates/engine/src/gemma4.rs` + lib.rs: `TensorSource`/`RawTensor` view of the artifact, RMSNorm(f32), dual RoPE tables (proportional full), k_eq_v attention (K=rope∘k_norm, V=weightless v_norm on raw k; scale 1.0; masks full kv≤q / sliding kv∈[q-1023,q]), gelu_tanh MLP, decoder order + layer_scalar (DE28 f64 exact), streaming lm_head slabs w/ softcap 30 → f32 logits
+    - [x] unit tests: inv_freq/rope/rms/gelu/mask goldens (consts from notes), embed[2]+layer_scalar real-artifact reads, synthetic 2-layer end-to-end (forward/logits/greedy/cfg errors)
+  - [x] **T1.3d** greedy generate (`greedy_generate`, EOS-aware) + recorded fixture; deterministic across runs
+- Files: `crates/engine/src/exl3/*` (a/b); `crates/engine/src/gemma4.rs`, `load.rs`, `lib.rs` (c/d)
+- Test: `cargo test` 67 pass; real-weight slow tests (gated `KAPLUMBA_RUN_SLOW=1`): full forward + lm_head bit-identical on repeat, partial depth (sliding+full) bit-identical, fixture prompt `[2]` → argmax **236773 ("S")** logit 29.9782
+- Note: fixture is *recorded*, not yet *validated* against the PonyExl3 reference — that comparison is T0.2/T2.4 (OQ1 gate)
+- Commit: `spec/rust-metal-engine: T1.3c gemma4 forward + greedy`
 
 ### T1.4 — CLI generate + bench entry
 - [ ] `kaplumba-engine generate --prompt ... --max-tokens N --temp ...` streaming; JSON stats (ttft_ms, pp_tps, tg_tps, mem) schema `kaplumba-bench/1`

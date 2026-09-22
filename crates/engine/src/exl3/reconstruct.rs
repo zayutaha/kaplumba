@@ -265,6 +265,25 @@ pub fn trellis_bytes_as_u16(bytes: &[u8]) -> Vec<u16> {
         .collect()
 }
 
+/// Zero-copy view of trellis bytes as u16 words (little-endian hosts only).
+///
+/// Safetensors offsets are 64-byte aligned, so the 2-byte alignment holds for
+/// artifact-backed slices. Copies nothing — the forward path relies on this to
+/// avoid duplicating 15.5 GB of trellis per token.
+pub fn trellis_u16_view(bytes: &[u8]) -> &[u16] {
+    assert_eq!(bytes.len() % 2, 0, "trellis byte length must be even");
+    assert_eq!(
+        bytes.as_ptr() as usize % 2,
+        0,
+        "trellis byte slice must be 2-byte aligned"
+    );
+    debug_assert!(
+        cfg!(target_endian = "little"),
+        "u16 view assumes a little-endian host"
+    );
+    unsafe { std::slice::from_raw_parts(bytes.as_ptr() as *const u16, bytes.len() / 2) }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum ReconstructError {
     #[error("trellis shape overflow")]
@@ -305,6 +324,20 @@ mod tests {
         let leaked: &'static [u16] = Box::leak(data.into_boxed_slice());
         let view = TrellisView::new(leaked, in_tiles, out_tiles, packed_size).unwrap();
         (leaked.to_vec(), view)
+    }
+
+    #[test]
+    fn u16_view_is_bit_identical_to_copy() {
+        let words: Vec<u16> = (0..64u16).map(|i| i.wrapping_mul(0x1234)).collect();
+        let mut bytes = Vec::with_capacity(words.len() * 2);
+        for w in &words {
+            bytes.extend_from_slice(&w.to_le_bytes());
+        }
+        assert_eq!(trellis_u16_view(&bytes), &words[..]);
+        assert_eq!(trellis_bytes_as_u16(&bytes), words);
+        // Odd length rejected rather than silently truncated.
+        let r = std::panic::catch_unwind(|| trellis_u16_view(&bytes[..7]));
+        assert!(r.is_err());
     }
 
     #[test]

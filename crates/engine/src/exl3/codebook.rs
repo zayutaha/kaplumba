@@ -19,6 +19,27 @@ pub enum CodebookMode {
     Mul1 = 2,
 }
 
+impl CodebookMode {
+    /// The I32 multiplier stored in an artifact's `*.mcg` tensor.
+    pub fn mcg_mult(self) -> u32 {
+        match self {
+            CodebookMode::Default => DEFAULT_MULT,
+            CodebookMode::Mcg => MCG_MULT,
+            CodebookMode::Mul1 => MUL1_MULT,
+        }
+    }
+
+    /// Identify the codebook from a `*.mcg` tensor value (LE u32).
+    pub fn from_mcg_mult(v: u32) -> Option<Self> {
+        match v {
+            MCG_MULT => Some(CodebookMode::Mcg),
+            MUL1_MULT => Some(CodebookMode::Mul1),
+            DEFAULT_MULT => Some(CodebookMode::Default),
+            _ => None,
+        }
+    }
+}
+
 /// LOP3.b32 with PTX truth-table immediate; `0x6A` = `c ^ (a & b)`.
 fn lop3_b32(a: u32, b: u32, c: u32, imm: u32) -> u32 {
     let mut out = 0u32;
@@ -163,6 +184,19 @@ mod tests {
         assert_eq!(vabsdiff4_add(0x01, 0x00, 0), 1);
         // All four lanes differ by 1.
         assert_eq!(vabsdiff4_add(0x0101_0101, 0, 0), 4);
+    }
+
+    #[test]
+    fn codebook_roundtrips_through_mcg_mult() {
+        for m in [CodebookMode::Default, CodebookMode::Mcg, CodebookMode::Mul1] {
+            assert_eq!(CodebookMode::from_mcg_mult(m.mcg_mult()), Some(m));
+        }
+        assert_eq!(CodebookMode::from_mcg_mult(0), None);
+        // Artifact-pinned: L0 q_proj.mcg == 0xCBAC1FED → MCG.
+        assert_eq!(
+            CodebookMode::from_mcg_mult(0xCBAC_1FED),
+            Some(CodebookMode::Mcg)
+        );
     }
 
     #[test]

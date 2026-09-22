@@ -13,12 +13,12 @@ pub mod trellis;
 
 pub use codebook::{CodebookMode, decode_3inst};
 pub use decode::{decode_codewords, decode_packed_tile};
-pub use forward::{Exl3Linear, linear_forward_reconstruct};
+pub use forward::{Exl3Linear, linear_forward_reconstruct, linear_forward_slab};
 pub use hadamard::{HAD_DIM, HAD_SCALE, had_r_128, hadamard_128};
 pub use perm::{kernel_order_to_row_major, tensor_core_perm, tensor_core_perm_inverse};
 pub use reconstruct::{
     TrellisView, reconstruct_inner, reconstruct_inner_slab, reconstruct_public_weights,
-    trellis_bytes_as_u16,
+    trellis_bytes_as_u16, trellis_u16_view,
 };
 pub use signs::{unpack_sign_bitfield, unpack_signs_or_pass};
 pub use trellis::{pack_trellis_tile, unpack_trellis_tile};

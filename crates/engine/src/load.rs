@@ -68,7 +68,7 @@ pub enum DType {
 }
 
 impl DType {
-    fn from_safetensors(s: &str) -> Self {
+    pub fn from_safetensors(s: &str) -> Self {
         match s {
             "BF16" => DType::BF16,
             "F16" => DType::F16,
@@ -106,18 +106,42 @@ impl DType {
     }
 }
 
+/// RoPE variant for one attention flavor (`sliding_attention` / `full_attention`).
+#[derive(Debug, Clone, serde::Deserialize)]
+pub struct RopeParams {
+    pub rope_type: String,
+    pub rope_theta: f64,
+    #[serde(default)]
+    pub partial_rotary_factor: Option<f64>,
+}
+
 #[derive(Debug, Clone, serde::Deserialize)]
 pub struct TextConfig {
     pub hidden_size: usize,
     pub intermediate_size: usize,
     pub head_dim: usize,
     pub global_head_dim: usize,
+    pub num_attention_heads: usize,
+    pub num_key_value_heads: usize,
+    #[serde(default)]
+    pub num_global_key_value_heads: Option<usize>,
+    pub num_hidden_layers: usize,
+    pub vocab_size: usize,
+    pub rms_norm_eps: f64,
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
+    #[serde(default)]
+    pub hidden_activation: Option<String>,
+    #[serde(default)]
+    pub max_position_embeddings: Option<usize>,
     #[serde(default)]
     pub layer_types: Vec<String>,
     #[serde(rename = "attention_k_eq_v", default)]
     pub attention_k_eq_v: bool,
     #[serde(rename = "final_logit_softcapping", default)]
     pub final_logit_softcapping: Option<f64>,
+    #[serde(default)]
+    pub rope_parameters: HashMap<String, RopeParams>,
 }
 
 #[derive(Debug, Clone, serde::Deserialize)]
