@@ -260,7 +260,8 @@ impl Exl3Gemv {
         y: &Buffer,
     ) {
         // The kernel reads the trellis as u32 words (two packed u16s each), so
-        // the per-tile stride is half the u16 tile length.
+        // the per-tile stride is half the u16 tile length. `aligned` selects the
+        // single-u32 load path (real artifacts: most tensors yes, lm_head no).
         debug_assert_eq!(shape.words_per_tile() % 2, 0);
         let params: [u32; 6] = [
             shape.in_tiles as u32,
@@ -268,7 +269,7 @@ impl Exl3Gemv {
             shape.k,
             (shape.words_per_tile() / 2) as u32,
             mode,
-            0,
+            u32::from(trellis.byte_offset % 4 == 0),
         ];
         enc.set_compute_pipeline_state(&self.gemv);
         enc.set_buffer(0, Some(xh), 0);
@@ -276,9 +277,14 @@ impl Exl3Gemv {
         enc.set_buffer(2, Some(pair), 0);
         enc.set_buffer(3, Some(y), 0);
         enc.set_bytes(4, 24, params.as_ptr() as *const _);
+        // MUST match `WARPS` in exl3.metal (one out-tile per warp). These two
+        // constants drifted once and the mismatch looked like a math bug: the
+        // kernel indexed shA[] out of bounds and the tests went red.
+        const WARPS: usize = 1;
+        let groups = shape.out_tiles.div_ceil(WARPS) as u64;
         enc.dispatch_thread_groups(
-            MTLSize::new(shape.out_tiles as u64, 1, 1),
-            MTLSize::new(32, 1, 1),
+            MTLSize::new(groups, 1, 1),
+            MTLSize::new((32 * WARPS) as u64, 1, 1),
         );
     }
 

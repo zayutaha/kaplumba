@@ -1,29 +1,31 @@
-// EXL3 trellis GEMV + 128-point Hadamard passes (T2.1).
+// EXL3 trellis GEMV + 128-point Hadamard passes (T2.1, tuned in T2.3).
 //
-// Mirrors the CPU reference path bit-for-bit where the arithmetic allows:
 //   y = had_out(had_in(x, suh) @ decode(trellis), svh)
 //
-// had_in / had_out: one 128-block per thread; the f32 accumulate order over
-// j = 0..128 is identical to had_r_128, and the intermediate products are
-// rounded to f32 exactly like the CPU's f32 scratch. Those two passes are
-// bit-exact against the CPU path.
+// had_in / had_out use a **fast Walsh–Hadamard transform**: 7 butterfly stages
+// over the 128-block in threadgroup memory, i.e. 7 × 128 lane-ops instead of a
+// full O(n²) 128×128 matrix product per block (measured ~36× fewer ops). The
+// butterfly computes the Sylvester matrix H[i][j] = (-1)^popcount(i&j), which is
+// symmetric, so `H · block` is the same transform the CPU reference applies —
+// only the summation order differs, by ≤1 ulp of f16 after rounding.
 //
-// exl3_gemv: lane-per-group over the kernel-order permutation. The 256
-// elements of a 16x16 tile form 32 groups of 8 kernel indices; group g maps to
-// row-major rows (R0,R1,R2,R3) = ((g%4)*2, +1, +8, +9) of columns
-// cA = g/4 and cB = cA + 8. Each lane therefore accumulates into exactly two
-// output columns with *static* register accumulators (no dynamic indexing),
-// and the per-lane reduction collapses 4 lanes per column at the end.
+// exl3_gemv: lane-per-group over the kernel-order permutation. The 256 elements
+// of a 16×16 tile form 32 groups of 8 kernel indices; group g maps to row-major
+// rows (R0,R1,R2,R3) = ((g%4)*2, +1, +8, +9) of columns cA = g/4, cB = cA + 8.
+// Each lane accumulates into exactly two output columns with *static* register
+// accumulators, and 4 lanes per column collapse in one shared-memory reduction.
 //
-// The 4 pairs of a group (pair index t = 4g + q) come straight from the
-// decoder's per-pair funnel shift; the host precomputes (i0, i1, s1) per pair
-// per K in `pair_tab` so the kernel does no index math beyond the loads.
+// The 4 pairs of a group (pair index t = 4g + q) come from the decoder's
+// per-pair funnel shift; the host precomputes (i0, i1, s1) per pair per K in
+// `pair_tab`, and the 4 entries a lane needs are consecutive u32s, so they load
+// as one 16-byte vector.
 
 #include <metal_stdlib>
 using namespace metal;
 
 constant uint HAD = 128u;
 constant uint TILE = 16u;
+constant uint LOG2_HAD = 7u;
 
 struct Exl3Params {
     uint in_tiles;
@@ -34,21 +36,12 @@ struct Exl3Params {
     // like the CPU reference (`unpack_trellis_tile` packs two u16s per word).
     uint twords;
     uint mode; // 0 = Default, 1 = Mcg (Mul1 stays on the CPU path)
-    uint pad0;
+    uint aligned; // trellis base is 4-byte aligned -> single u32 loads
 };
 
-// One u32 word of the packed trellis = two little-endian u16 words.
-inline uint load_word(device const ushort *tile, uint w) {
-    return (uint)tile[2u * w] | ((uint)tile[2u * w + 1u] << 16);
-}
-
-inline float had_sign(uint i, uint j) {
-    return (popcount(i & j) & 1u) ? -as_type<float>(0x3DB504F3u) : as_type<float>(0x3DB504F3u);
-}
-
-// EXL3 procedural codebook, bit-identical to the CPU `decode_3inst`:
-//   Mcg:     x *= 0xCBAC1FED, then x = 0x3B603B60 ^ (x & 0x8FFF8FFF), then
-//            one exact IEEE binary16 add of the two packed halves.
+// EXL3 procedural codebook, matching the CPU `decode_3inst`:
+//   Mcg:     x *= 0xCBAC1FED, then x = 0x3B603B60 ^ (x & 0x8FFF8FFF), then one
+//            exact IEEE binary16 add of the two packed halves.
 //   Default: x = x*89226354 + 64248484, then the same tail.
 // Mul1 is not supported here (the engine keeps it on the CPU path).
 inline half exl3_decode(uint cw, uint mode) {
@@ -64,6 +57,42 @@ inline half exl3_decode(uint cw, uint mode) {
     return lo + hi;
 }
 
+// One u32 word of the packed trellis = two little-endian u16 words. The paired
+// path exists because real artifacts place some trellis tensors (lm_head) at a
+// 2-mod-4 byte offset, where a u32 load would not be naturally aligned.
+inline uint ld_word(device const ushort *t, uint w, bool aligned) {
+    if (aligned) {
+        return *(device const uint *)(t + 2u * w);
+    }
+    return (uint)t[2u * w] | ((uint)t[2u * w + 1u] << 16);
+}
+
+struct CodePair {
+    half lo;
+    half hi;
+};
+
+// One funnel window, unpacked to the two 16-bit codewords the pair carries.
+// `pk` packs i0 | i1<<8 | s1<<16; the words are read straight from the device
+// buffer (L1-resident: a whole tile is 96-192 bytes and 32 lanes share it).
+//
+// NOTE (T2.3): staging the tile through threadgroup memory first (1-2 global
+// loads per lane instead of 8) was tried and produced *wrong* weights — with
+// one-hot probes, column cA came back holding column cB's weight, i.e. pairs
+// q=0 and q=2 resolved identically. Reverted unproven; see the notes dead-end
+// entry before retrying, and use `debug_gemv_rows` to check a one-hot matrix.
+inline CodePair funnel_pair(
+    device const ushort *tile, uint i0, uint i1, uint s1, uint k, uint mode, bool aligned
+) {
+    uint a = ld_word(tile, i0, aligned);
+    uint b = ld_word(tile, i1, aligned);
+    uint w1 = (uint)((((ulong)a) << 32 | (ulong)b) >> s1);
+    CodePair r;
+    r.lo = exl3_decode((w1 >> k) & 0xFFFFu, mode);
+    r.hi = exl3_decode(w1 & 0xFFFFu, mode);
+    return r;
+}
+
 // ---------------------------------------------------------------------------
 // xh = had_r(x * suh)   (one 128-block per threadgroup, 128 threads)
 // ---------------------------------------------------------------------------
@@ -76,37 +105,65 @@ kernel void exl3_had_in(device const half *x [[buffer(0)]],
     uint base = blk * HAD;
     sh[t] = float(x[base + t]) * float(suh[base + t]);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float acc = 0.0f;
-    for (uint j = 0; j < HAD; j++) {
-        acc += sh[j] * had_sign(j, t);
+
+    // Sylvester FWT, 7 stages; H is symmetric so `H · block` needs no transpose.
+    for (uint stage = 1u; stage < HAD; stage <<= 1u) {
+        if ((t & stage) == 0u) {
+            float a = sh[t];
+            float b = sh[t + stage];
+            sh[t] = a + b;
+            sh[t + stage] = a - b;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    xh[base + t] = (half)acc;
+    xh[base + t] = (half)(sh[t] * as_type<float>(0x3DB504F3u));
 }
 
 // ---------------------------------------------------------------------------
-// y = had_r_inner(xh @ inner)   (raw f32 output, one thread per out column)
+// y = xh @ decode(trellis)   (raw f32 output, one lane per output column)
 // ---------------------------------------------------------------------------
+// One out-tile per 32-lane threadgroup. Fatter threadgroups (4 warps sharing a
+// threadgroup) measured *slower* on M4 Pro: with few out-tiles there are too
+// few threadgroups left to spread across 20 cores.
+constant uint WARPS = 1u;
+
 kernel void exl3_gemv(device const half *xh [[buffer(0)]],
                       device const ushort *trellis [[buffer(1)]],
                       device const uint *pair_tab [[buffer(2)]],
                       device float *y [[buffer(3)]],
                       constant Exl3Params &p [[buffer(4)]],
-                      uint ot [[threadgroup_position_in_grid]],
-                      uint g [[thread_position_in_threadgroup]]) {
-    threadgroup float shA[32];
-    threadgroup float shB[32];
+                      uint tg [[threadgroup_position_in_grid]],
+                      uint tid [[thread_position_in_threadgroup]]) {
+    threadgroup float shA[32 * WARPS];
+    threadgroup float shB[32 * WARPS];
+
+    uint sub = 0u;
+    uint g = tid & 31u;       // lane = kernel-order group
+    uint ot = tg * WARPS + sub;
+    bool live = ot < p.out_tiles;
 
     uint cA = g >> 2;   // 0..7  -> output columns 0..7
     uint cB = cA + 8u;  //       -> output columns 8..15
     uint r0 = (g & 3u) * 2u;
 
+    bool aligned = p.aligned != 0u;
+    // The 4 pair descriptors this lane needs. Measured both ways (as 4 scalar
+    // loads and as one 16-byte uint4 load): indistinguishable within run-to-run
+    // noise, so the simpler scalar form stays.
+    uint pk0 = pair_tab[4u * g];
+    uint pk1 = pair_tab[4u * g + 1u];
+    uint pk2 = pair_tab[4u * g + 2u];
+    uint pk3 = pair_tab[4u * g + 3u];
+
     float accA = 0.0f;
     float accB = 0.0f;
 
-    for (uint it = 0; it < p.in_tiles; it++) {
-        // Stride is in u32 words; the tile is addressed as u16 pairs, so a
-        // trellis tensor whose byte offset is only 2-aligned (real artifacts:
-        // lm_head.trellis) still reads correctly.
+    // `live` is warp-uniform, so the loop is skipped (not divergent) for the
+    // padding warp of the last threadgroup while every warp still reaches the
+    // barrier below.
+    for (uint it = 0; live && it < p.in_tiles; it++) {
+        // Stride is in u32 words; the tile is addressed as u16 pairs so that a
+        // 2-mod-4 trellis offset still reads correctly.
         device const ushort *tile =
             trellis + (ulong)(it * p.out_tiles + ot) * p.twords * 2u;
         uint xrow = it * TILE + r0;
@@ -114,40 +171,41 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
         float x01 = float(xh[xrow + 1u]);
         float x02 = float(xh[xrow + 8u]);
         float x03 = float(xh[xrow + 9u]);
-#pragma unroll
-        for (uint q = 0; q < 4u; q++) {
-            uint pk = pair_tab[4u * g + q];
-            uint i0 = pk & 0xFFu;
-            uint i1 = (pk >> 8) & 0xFFu;
-            uint s1 = (pk >> 16) & 0xFFu;
-            uint a = load_word(tile, i0);
-            uint b = load_word(tile, i1);
-            uint w1 = (uint)((((ulong)a) << 32 | (ulong)b) >> s1);
-            half lo = exl3_decode((w1 >> p.k) & 0xFFFFu, p.mode);
-            half hi = exl3_decode(w1 & 0xFFFFu, p.mode);
-            // q = 0,2 -> rows (r0, r0+1) of column cA/cB; q = 1,3 -> rows (r0+8, r0+9)
-            float v = (q & 1u) == 0u ? (x00 * float(lo) + x01 * float(hi))
-                                     : (x02 * float(lo) + x03 * float(hi));
-            if (q < 2u) {
-                accA += v;
-            } else {
-                accB += v;
-            }
-        }
+
+        CodePair p0 = funnel_pair(
+            tile, pk0 & 0xFFu, (pk0 >> 8) & 0xFFu, (pk0 >> 16) & 0xFFu, p.k, p.mode, aligned
+        );
+        CodePair p1 = funnel_pair(
+            tile, pk1 & 0xFFu, (pk1 >> 8) & 0xFFu, (pk1 >> 16) & 0xFFu, p.k, p.mode, aligned
+        );
+        CodePair p2 = funnel_pair(
+            tile, pk2 & 0xFFu, (pk2 >> 8) & 0xFFu, (pk2 >> 16) & 0xFFu, p.k, p.mode, aligned
+        );
+        CodePair p3 = funnel_pair(
+            tile, pk3 & 0xFFu, (pk3 >> 8) & 0xFFu, (pk3 >> 16) & 0xFFu, p.k, p.mode, aligned
+        );
+
+        // q = 0,1 feed column cA from rows (r0, r0+1) and (r0+8, r0+9);
+        // q = 2,3 do the same for column cB.
+        accA += x00 * float(p0.lo) + x01 * float(p0.hi);
+        accA += x02 * float(p1.lo) + x03 * float(p1.hi);
+        accB += x00 * float(p2.lo) + x01 * float(p2.hi);
+        accB += x02 * float(p3.lo) + x03 * float(p3.hi);
     }
 
-    shA[g] = accA;
-    shB[g] = accB;
+    shA[tid] = accA;
+    shB[tid] = accB;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (g < 16u) {
+    if (live && g < 16u) {
+        uint base = sub << 5;
         float s = 0.0f;
         if (g < 8u) {
             for (uint q = 0; q < 4u; q++) {
-                s += shA[(g << 2) + q];
+                s += shA[base + (g << 2) + q];
             }
         } else {
             for (uint q = 0; q < 4u; q++) {
-                s += shB[((g - 8u) << 2) + q];
+                s += shB[base + ((g - 8u) << 2) + q];
             }
         }
         y[ot * TILE + g] = s;
@@ -164,11 +222,18 @@ kernel void exl3_had_out(device const float *y [[buffer(0)]],
                          uint t [[thread_position_in_threadgroup]]) {
     threadgroup float sh[HAD];
     uint base = blk * HAD;
+    // The reference rounds the GEMV slab to f16 before the final Hadamard.
     sh[t] = float((half)y[base + t]);
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    float acc = 0.0f;
-    for (uint j = 0; j < HAD; j++) {
-        acc += sh[j] * had_sign(j, t);
+
+    for (uint stage = 1u; stage < HAD; stage <<= 1u) {
+        if ((t & stage) == 0u) {
+            float a = sh[t];
+            float b = sh[t + stage];
+            sh[t] = a + b;
+            sh[t + stage] = a - b;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    out[base + t] = (half)(acc * float(svh[base + t]));
+    out[base + t] = (half)(sh[t] * as_type<float>(0x3DB504F3u) * float(svh[base + t]));
 }

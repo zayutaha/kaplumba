@@ -368,10 +368,13 @@ mod tests {
         assert!(gather(&src, "l").is_none());
     }
 
-    /// `had_in` is bit-exact against the CPU reference (same f32 products, same
-    /// accumulate order over the 128-block).
+    /// `had_in` matches the CPU reference within 1 f16 ulp. The transform is
+    /// mathematically identical (the butterfly computes the same symmetric
+    /// Sylvester matrix the CPU builds explicitly); only the f32 summation order
+    /// differs, so a value that lands exactly on an f16 rounding boundary may
+    /// round the other way.
     #[test]
-    fn gpu_had_in_is_bit_exact() {
+    fn gpu_had_in_matches_cpu_reference() {
         let Some(c) = ctx() else { return };
         let src = SynthGpuSource::build(c.device(), 3, 256, 128);
         let Some((buf, off)) = src.device_span("l.suh") else {
@@ -402,19 +405,19 @@ mod tests {
             .expect("had_in");
         assert_eq!(want.len(), got.len());
         for (i, (w, g)) in want.iter().zip(got.iter()).enumerate() {
-            assert_eq!(
-                w.to_bits(),
-                g.to_bits(),
-                "had_in[{i}] want {:#06x} got {:#06x}",
+            let d = (w.to_bits() as i32 - g.to_bits() as i32).abs();
+            assert!(
+                d <= 1,
+                "had_in[{i}] want {:#06x} got {:#06x} (delta {d} ulp)",
                 w.to_bits(),
                 g.to_bits()
             );
         }
     }
 
-    /// `had_out` is bit-exact against the CPU reference too.
+    /// `had_out` matches the CPU reference within 1 f16 ulp (same reason).
     #[test]
-    fn gpu_had_out_is_bit_exact() {
+    fn gpu_had_out_matches_cpu_reference() {
         let Some(c) = ctx() else { return };
         let src = SynthGpuSource::build(c.device(), 3, 128, 256);
         let Some((buf, off)) = src.device_span("l.svh") else {

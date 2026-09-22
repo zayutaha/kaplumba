@@ -96,9 +96,12 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - Commit: `spec/rust-metal-engine: T2.2 working set cap`
 
 ### T2.3 — M4 Pro kernel sweep
-- [ ] Split-K threadgroup targets, GEMV dispatch thresholds measured on this GPU; recorded in notes (not copied from M5 Max)
-- Files: kernel constants / dispatch table
-- Test: tg/s not worse than unswept defaults; numbers in notes
+- [x] Done — swept on this GPU, recorded in notes (not copied from M5 Max). See the "T2.3 kernel sweep" section of `implementation_notes.md`
+- Results: fast Walsh–Hadamard kept (7 butterfly stages vs an O(n²) per-block matrix product, ≤1 f16 ulp vs CPU); **4 warps/threadgroup rejected** (small shapes 25–40% worse — too few threadgroups for 20 cores); **threadgroup tile staging rejected** (wrong weights, reverted unproven); scalar pair loads kept (uint4 within noise)
+- Reliable metric: `lm_head` gemv **8.46 ms / 1.41e9 weights = 167 Gw/s** (±1.4%); short kernels have ±25% run-to-run clock noise, so compare only long loops
+- Ceiling analysis (notes): ~9–12 ops/weight vs ~4.1 Tops/s issue ⇒ ~350–450 Gw/s ⇒ **~9–12 t/s** decode for this decode algorithm; bandwidth roofline 24 t/s; **18 t/s needs ≤5 ops/weight, i.e. a different decode algorithm, not tuning**
+- Files: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`
+- Test: `cargo test -p kaplumba-engine --lib metal_linear` (10; had_in/had_out ≤1 ulp, gemv ≤5e-3), `KAPLUMBA_RUN_SLOW=1 … bench_passes_slow -- --ignored --nocapture`
 - Commit: `spec/rust-metal-engine: T2.3 m4 sweeps`
 
 ### T2.4 — Quality gate (OQ1)

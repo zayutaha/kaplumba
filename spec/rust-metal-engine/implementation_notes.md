@@ -118,6 +118,29 @@ Facts that matter:
 - Two bugs found by testing, both worth remembering: (a) the pair table must use **256 samples per tile**, not the 16-wide tile edge (wrong constant ⇒ plausible-looking garbage); (b) `s1` must be derived from the **unwrapped** word index while the two words are loaded at **wrapped** ones — wrapping first gives a negative shift.
 - Accuracy vs the CPU reference: `had_in` **bit-exact**; `had_out` ≤ **1 f16 ulp** (GPU contracts `acc += sh*sign` into an FMA); GEMV ≤ 5e-3 relative over random activations for K=1..8.
 
+## T2.3 kernel sweep — findings (2026-09-22)
+
+**Measurement noise (important, read first).** The same binary measured twice back-to-back gives down_proj `gemv` **1.018 ms** then **0.764 ms** (±25%) and o_proj 0.489 then 0.387. Short kernels (0.4–1.2 ms) are dominated by GPU clock ramping between bursts, so *single* before/after numbers on them are meaningless. `lm_head` (8.4 ms, 1.41e9 weights) reproduces to ±1.4% and is the only shape here worth trusting; for anything smaller, loop it ≥1000× inside one timing region instead of comparing min/median of 20.
+
+Variants tried, with the reliable (lm_head) verdict:
+
+| variant | lm_head gemv | verdict |
+|---|---|---|
+| scalar pair loads, per-block O(n²) Hadamard (T2.1 as merged) | 8.58 ms | baseline |
+| **fast Walsh–Hadamard (7 butterfly stages)** + uint4 pair load | 8.46 ms | kept (≤1.4% ≈ noise, but ~36× fewer ops in the Hadamards and much less code) |
+| fast WHT + 4 warps per threadgroup (4 out-tiles/group) | 8.35 ms | reverted (small shapes 25–40% worse: too few threadgroups left to fill 20 cores) |
+| fast WHT + tile staged through threadgroup memory (1–2 global loads/lane instead of 8) | — | **reverted, produced wrong weights** |
+| scalar pair loads (current) | 8.47 ms | landing state |
+
+Steady state as committed: **167 Gw/s** (lm_head 8.46–8.47 ms for 1.41e9 weights). Hadamards are ≤1 f16 ulp vs the CPU reference after the WHT (the butterfly re-associates the f32 sum, so bit-exactness is gone by design).
+
+**Dead ends (do not repeat without a new idea):**
+- *Threadgroup staging of the packed tile.* Stage the tile's u32 words into `threadgroup uint[MAX_TWORDS]` once per in-tile and read the funnel windows from shared memory. Symptom: one-hot probes (`debug_gemv_rows`) showed column cA returning column cB's weight for every row, i.e. pairs q=0 and q=2 resolving identically; and after reverting, the failure persisted because the *other* half of the change (see next bullet) was still in place. Not diagnosed further — the load-count saving was unproven, so it was reverted rather than debugged.
+- *Two copies of a kernel constant.* `WARPS` existed in `exl3.metal` and in `exl3.rs`; changing one without the other made the host dispatch 128-thread threadgroups into a kernel that indexes `shA[g]` with `g = tid & 31` (out of bounds) — wrong results that look like a math bug. Both copies now carry a MUST-match comment.
+- *Measuring with min/median of 20 short reps.* See noise above; it manufactured a phantom 25% regression.
+
+**Where the decode ceiling actually is.** lm_head = 167 Gw/s ⇒ ~180 ms/token for the 30.1e9 weights/token ⇒ **~5.5 t/s decode** for this kernel. Roofline is 41 ms (24 t/s) and the kernel is not bandwidth-bound: the trellis streams at ~50–63 GB/s vs 273 GB/s peak. At ~9–12 ops per decoded weight (2 trellis loads + funnel shift + 2 masks + 2 procedural decodes + FMA, per 2 weights) against ~4.1 Tops/s of FP32/INT32 issue on 20 cores, the arithmetic ceiling is **~350–450 Gw/s**, i.e. **~9–12 t/s**. Reaching the user's 18 t/s needs ≤5 ops/weight, which is a different decode algorithm (not a tuning change); at 3 bpw the bytes themselves cap any design at 24 t/s.
+
 ## Baseline numbers
 
 **All of these measure PonyExl3/MLX 0.32.2 (ponyexl3 0.3.0, mlx-lm 0.31.3), NOT this engine** (DE20).
