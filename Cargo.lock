@@ -401,12 +401,22 @@ name = "kaplumba-engine"
 version = "0.1.0"
 dependencies = [
  "half",
+ "kaplumba-kernels",
  "metal",
  "rayon",
  "serde",
  "serde_json",
  "thiserror",
  "tokenizers",
+]
+
+[[package]]
+name = "kaplumba-kernels"
+version = "0.1.0"
+dependencies = [
+ "half",
+ "metal",
+ "thiserror",
 ]
 
 [[package]]

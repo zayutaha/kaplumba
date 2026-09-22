@@ -42,6 +42,8 @@ pub enum GemmaError {
     #[error("config: {0}")]
     Config(String),
     #[error(transparent)]
+    MetalLinear(#[from] crate::metal_linear::MetalLinearError),
+    #[error(transparent)]
     Trellis(#[from] crate::exl3::trellis::TrellisError),
     #[error(transparent)]
     Reconstruct(#[from] crate::exl3::reconstruct::ReconstructError),
@@ -125,6 +127,13 @@ impl<'a> RawTensor<'a> {
 /// fixtures). `None` for absent tensors (e.g. `v_proj` on `k_eq_v` layers).
 pub trait TensorSource {
     fn get(&self, name: &str) -> Option<RawTensor<'_>>;
+
+    /// Device buffer + byte offset of a tensor, when this source owns device
+    /// storage (T2.1 GPU path). `None` (the default) keeps callers on the CPU
+    /// reference path.
+    fn device_span(&self, _name: &str) -> Option<(&metal::Buffer, usize)> {
+        None
+    }
 }
 
 impl TensorSource for Exl3Model {
@@ -135,6 +144,10 @@ impl TensorSource for Exl3Model {
             dtype: info.dtype,
             shape: &info.shape,
         })
+    }
+
+    fn device_span(&self, name: &str) -> Option<(&metal::Buffer, usize)> {
+        self.tensor_device_span(name)
     }
 }
 
@@ -546,11 +559,28 @@ pub fn argmax(values: &[f32]) -> usize {
 pub struct Gemma4Model<'a> {
     pub cfg: GemmaCfg,
     src: &'a dyn TensorSource,
+    gpu: Option<&'a crate::metal_linear::MetalLinear>,
 }
 
 impl<'a> Gemma4Model<'a> {
     pub fn new(cfg: GemmaCfg, src: &'a dyn TensorSource) -> Self {
-        Self { cfg, src }
+        Self {
+            cfg,
+            src,
+            gpu: None,
+        }
+    }
+
+    /// Route eligible single-row linears through the Metal kernels (T2.1).
+    /// Any ineligible tensor silently stays on the CPU reference path.
+    pub fn with_gpu(mut self, gpu: &'a crate::metal_linear::MetalLinear) -> Self {
+        self.gpu = Some(gpu);
+        self
+    }
+
+    /// True when the model will attempt the GPU linear path.
+    pub fn gpu_enabled(&self) -> bool {
+        self.gpu.is_some()
     }
 
     /// Build from a loaded artifact (`config.json` drives the scheme).
@@ -623,9 +653,22 @@ impl<'a> Gemma4Model<'a> {
         })
     }
 
-    fn linear(&self, name: &str, x: &[f16]) -> Result<Vec<f16>, GemmaError> {
+    /// Explicit CPU reference linear (`linear_forward_reconstruct`).
+    pub fn linear_via_cpu(&self, name: &str, x: &[f16]) -> Result<Vec<f16>, GemmaError> {
         let layer = self.exl3_linear(name)?;
         Ok(linear_forward_reconstruct(&layer, x))
+    }
+
+    /// Linear dispatch: GPU when eligible (decode-shaped, device-resident),
+    /// CPU reference otherwise. Both paths are the *same math*; the GPU path is
+    /// verified against this one in `metal_linear`'s tests.
+    fn linear(&self, name: &str, x: &[f16]) -> Result<Vec<f16>, GemmaError> {
+        if let Some(gpu) = self.gpu {
+            if let Some(y) = gpu.try_linear(self.src, name, x)? {
+                return Ok(y);
+            }
+        }
+        self.linear_via_cpu(name, x)
     }
 
     fn layer_scalar(&self, i: usize) -> Result<f64, GemmaError> {
@@ -842,6 +885,17 @@ impl<'a> Gemma4Model<'a> {
                 ),
             });
         }
+        // GPU path: the whole head in one dispatch (decode shape only).
+        if let Some(gpu) = self.gpu {
+            if let Some(y) = gpu.try_linear(self.src, "lm_head", x)? {
+                let mut out: Vec<f32> = y.iter().map(|v| v.to_f32()).collect();
+                if let Some(cap) = self.cfg.softcap {
+                    apply_softcap(&mut out, cap);
+                }
+                return Ok(out);
+            }
+        }
+
         let mut out = vec![0f32; rows * vocab];
         for n0 in (0..vocab).step_by(LM_SLAB) {
             let n = (vocab - n0).min(LM_SLAB);

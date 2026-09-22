@@ -7,6 +7,7 @@ description = "Pure-Rust + raw-Metal single-user Gemma 4 31B inference engine (E
 
 [dependencies]
 metal.workspace = true
+kaplumba-kernels = { path = "../kernels" }
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true

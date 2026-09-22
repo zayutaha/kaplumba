@@ -236,6 +236,18 @@ impl Exl3Model {
         Some((slice, info))
     }
 
+    /// Device buffer + byte offset of a tensor inside its shard allocation
+    /// (T2.1 GPU path). `None` when the name is unknown or out of range.
+    pub fn tensor_device_span(&self, name: &str) -> Option<(&Buffer, usize)> {
+        let info = self.tensors.get(name)?;
+        let shard = self.shards.get(&info.shard)?;
+        let start = info.data_offset as usize;
+        if start + info.nbytes as usize > shard.buffer.length() as usize {
+            return None;
+        }
+        Some((&shard.buffer, start))
+    }
+
     pub fn resident_bytes(&self) -> u64 {
         self.weights_nbytes
     }

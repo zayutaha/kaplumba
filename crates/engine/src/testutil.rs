@@ -111,6 +111,18 @@ impl TensorSource for SynthSource {
     }
 }
 
+/// Real EXL3 artifact directory, when present (`KAPLUMBA_MODEL_DIR` override).
+pub(crate) fn artifact_dir() -> Option<std::path::PathBuf> {
+    let dir = match std::env::var("KAPLUMBA_MODEL_DIR") {
+        Ok(d) => std::path::PathBuf::from(d),
+        Err(_) => {
+            let h = std::env::var("HOME").ok()?;
+            std::path::PathBuf::from(format!("{h}/.kaplumba/models/Gxma/Gxma"))
+        }
+    };
+    dir.join("config.json").is_file().then_some(dir)
+}
+
 pub(crate) fn norm_vals(n: usize, i: usize) -> Vec<f32> {
     (0..n)
         .map(|j| 1.0 + ((j * 7 + i) % 5) as f32 * 0.05)

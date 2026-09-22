@@ -5,12 +5,15 @@
 //! T1.3b: reconstruct + streaming linear forward.
 //! T1.3c: Gemma 4 text forward (naive CPU golden path) + greedy decode.
 //! T1.4: streaming generation loop + host sampler (bench/CLI plumbing).
+//! T2.1: raw-Metal EXL3 decode GEMV + Hadamard passes (`metal_linear`), with the
+//! CPU reference path as the fallback for anything ineligible.
 
 pub mod exl3;
 pub mod gemma4;
 pub mod generate;
 pub mod load;
 pub mod metal_ctx;
+pub mod metal_linear;
 pub mod sampler;
 #[cfg(test)]
 pub(crate) mod testutil;
@@ -24,5 +27,6 @@ pub use load::{
     DType, Exl3Model, LoadError, ModelConfig, RopeParams, TensorInfo, inspect_dir, load_exl3,
 };
 pub use metal_ctx::{MetalContext, MetalError, clear_buffer_u32};
+pub use metal_linear::{MetalLinear, MetalLinearError};
 pub use sampler::{Pcg32, SampleParams, sample};
 pub use tokenizer::{GemmaSpecialIds, GemmaTokenizer, TokenizerError};
