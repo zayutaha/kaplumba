@@ -563,4 +563,67 @@ impl Exl3Gemv {
             Ok(())
         })
     }
+
+    /// `had_in` → `gemv` → `had_out` encoded into **this** command buffer, for
+    /// callers that already own device-resident activations (the T4.2 decode
+    /// pipeline encodes a whole token this way, so there is one sync per token
+    /// instead of one per linear).
+    ///
+    /// `x` is f16 of `in_features`, `out` is f16 of `out_features`; both are
+    /// whole buffers (offset 0). The internal `xh`/`y` scratch is shared between
+    /// calls, which is safe because dispatches inside one compute encoder run in
+    /// submission order.
+    pub fn encode_linear(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: &Buffer,
+        trellis: DeviceSpan<'_>,
+        suh: DeviceSpan<'_>,
+        svh: DeviceSpan<'_>,
+        out: &Buffer,
+        shape: Exl3Shape,
+        mode: u32,
+    ) -> Result<(), KernelError> {
+        let inn = shape.in_features();
+        let outp = shape.out_features();
+        if mode > 1 {
+            return Err(KernelError::Unsupported(format!(
+                "codebook mode {mode} is CPU-only"
+            )));
+        }
+        if inn % HAD != 0 || outp % HAD != 0 {
+            return Err(KernelError::Unsupported(format!(
+                "hadamard needs multiples of {HAD}, got in={inn} out={outp}"
+            )));
+        }
+        if (x.length() as usize) < inn * 2 {
+            return Err(KernelError::Unsupported(format!(
+                "x buffer too small: {} < {}",
+                x.length(),
+                inn * 2
+            )));
+        }
+        if (out.length() as usize) < outp * 2 {
+            return Err(KernelError::Unsupported(format!(
+                "out buffer too small: {} < {}",
+                out.length(),
+                outp * 2
+            )));
+        }
+        check_span_fits(
+            &trellis,
+            shape.in_tiles * shape.out_tiles * shape.words_per_tile() * 2,
+            "trellis",
+            2,
+        )?;
+        check_span_fits(&suh, inn * 2, "suh", 2)?;
+        check_span_fits(&svh, outp * 2, "svh", 2)?;
+        let pair_buf = self.pair_buffer(shape.k);
+        self.with_scratch(inn, outp, |sc| {
+            self.encode_had_in(enc, x, suh, &sc.xh, inn);
+            self.encode_gemv(enc, &sc.xh, trellis, &pair_buf, shape, mode, &sc.y);
+            self.encode_had_out(enc, &sc.y, svh, out, outp);
+        });
+        Ok(())
+    }
 }

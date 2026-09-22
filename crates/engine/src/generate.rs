@@ -144,7 +144,7 @@ pub fn generate(
     // Cached path: one pass over the prompt, then one row per step.
     let mut cache = params
         .use_kv
-        .then(|| crate::kv_cache::KvCache::new(&model.cfg, prompt.len() + params.max_new));
+        .then(|| model.new_kv_cache(prompt.len() + params.max_new));
     let cached_len = cache.as_ref().map(|c| c.bytes()).unwrap_or(0);
 
     for step in 0..params.max_new {

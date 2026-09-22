@@ -24,13 +24,71 @@
 //! trade for the same bandwidth, so it is deliberately not done yet.
 
 use half::f16;
+use kaplumba_kernels::DeviceSpan;
+use metal::{Buffer, Device, MTLResourceOptions};
 
 use crate::gemma4::{GemmaCfg, GemmaError, LayerKind};
 
+/// Backing store for one key/value matrix.
+///
+/// `Host` is the CPU path (and every unit test). `Device` is a `StorageModeShared`
+/// Metal buffer: on Apple silicon that is the *same* memory the GPU reads, so the
+/// host can append or rotate a row with a plain `copy_within` and the attention
+/// kernel then reads the cache in place — no staging copy, and therefore no
+/// command-buffer round trip per layer (which is what T4.2 needs).
+enum Store {
+    Host(Vec<f16>),
+    Device(Buffer),
+}
+
+impl Store {
+    fn new_host(n: usize) -> Self {
+        Store::Host(vec![f16::ZERO; n])
+    }
+
+    fn new_device(device: &Device, n: usize) -> Self {
+        Store::Device(
+            device.new_buffer((n * 2).max(2) as u64, MTLResourceOptions::StorageModeShared),
+        )
+    }
+
+    fn slice(&self, n: usize) -> &[f16] {
+        match self {
+            Store::Host(v) => &v[..n],
+            Store::Device(b) => unsafe {
+                std::slice::from_raw_parts(b.contents() as *const f16, n)
+            },
+        }
+    }
+
+    fn slice_mut(&mut self, n: usize) -> &mut [f16] {
+        match self {
+            Store::Host(v) => &mut v[..n],
+            Store::Device(b) => unsafe {
+                std::slice::from_raw_parts_mut(b.contents() as *mut f16, n)
+            },
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        match self {
+            Store::Host(v) => v.len(),
+            Store::Device(b) => b.length() as usize / 2,
+        }
+    }
+
+    fn buffer(&self) -> Option<&Buffer> {
+        match self {
+            Store::Host(_) => None,
+            Store::Device(b) => Some(b),
+        }
+    }
+}
+
 /// Keys (and values) for one decoder layer.
 pub struct LayerKv {
-    k: Vec<f16>,
-    v: Vec<f16>,
+    k: Store,
+    v: Store,
     row: usize,
     cap: usize,
     /// Rows currently stored (≤ `cap`).
@@ -42,8 +100,19 @@ pub struct LayerKv {
 impl LayerKv {
     fn new(row: usize, cap: usize) -> Self {
         Self {
-            k: vec![f16::ZERO; row * cap],
-            v: vec![f16::ZERO; row * cap],
+            k: Store::new_host(row * cap),
+            v: Store::new_host(row * cap),
+            row,
+            cap,
+            len: 0,
+            start: 0,
+        }
+    }
+
+    fn new_device(device: &Device, row: usize, cap: usize) -> Self {
+        Self {
+            k: Store::new_device(device, row * cap),
+            v: Store::new_device(device, row * cap),
             row,
             cap,
             len: 0,
@@ -71,11 +140,26 @@ impl LayerKv {
     }
 
     fn keys(&self) -> &[f16] {
-        &self.k[..self.len * self.row]
+        self.k.slice(self.len * self.row)
     }
 
     fn values(&self) -> &[f16] {
-        &self.v[..self.len * self.row]
+        self.v.slice(self.len * self.row)
+    }
+
+    /// Device span covering the whole key matrix (starts at stored row 0).
+    pub fn keys_span(&self) -> Option<DeviceSpan<'_>> {
+        self.k.buffer().map(|buffer| DeviceSpan {
+            buffer,
+            byte_offset: 0,
+        })
+    }
+
+    pub fn values_span(&self) -> Option<DeviceSpan<'_>> {
+        self.v.buffer().map(|buffer| DeviceSpan {
+            buffer,
+            byte_offset: 0,
+        })
     }
 
     /// Append one row, dropping the oldest when a window is full.
@@ -85,14 +169,18 @@ impl LayerKv {
         let limit = Self::limit(window, self.cap);
         if self.len == limit {
             let keep = (limit - 1) * self.row;
-            self.k.copy_within(self.row..self.row + keep, 0);
-            self.v.copy_within(self.row..self.row + keep, 0);
+            let (ks, vs) = (self.k.slice_mut(limit * self.row), limit * self.row);
+            ks.copy_within(self.row..self.row + keep, 0);
+            self.v
+                .slice_mut(vs)
+                .copy_within(self.row..self.row + keep, 0);
             self.start += 1;
             self.len = limit - 1;
         }
-        let at = self.len * self.row;
-        self.k[at..at + self.row].copy_from_slice(k_row);
-        self.v[at..at + self.row].copy_from_slice(v_row);
+        let row = self.row;
+        let at = self.len * row;
+        self.k.slice_mut(at + row)[at..at + row].copy_from_slice(k_row);
+        self.v.slice_mut(at + row)[at..at + row].copy_from_slice(v_row);
         self.len += 1;
     }
 }
@@ -108,6 +196,21 @@ impl KvCache {
     /// Allocate for a context of `cap` tokens (capacity is per token, not per
     /// layer: sliding layers self-limit to the sliding window).
     pub fn new(cfg: &GemmaCfg, cap: usize) -> Self {
+        Self::build(cfg, cap, None)
+    }
+
+    /// Same, but backed by `StorageModeShared` Metal buffers so the GPU path can
+    /// read K/V in place (and kernels can write rows straight into the cache).
+    pub fn new_device(cfg: &GemmaCfg, cap: usize, device: &Device) -> Self {
+        Self::build(cfg, cap, Some(device))
+    }
+
+    /// True when the cache is GPU-readable (device-backed).
+    pub fn is_device_backed(&self) -> bool {
+        self.layers.first().is_some_and(|l| l.k.buffer().is_some())
+    }
+
+    fn build(cfg: &GemmaCfg, cap: usize, device: Option<&Device>) -> Self {
         let cap = cap.max(1);
         let layers = cfg
             .layers
@@ -117,7 +220,12 @@ impl KvCache {
                     LayerKind::Sliding => cfg.sliding_window,
                     LayerKind::Full => 0,
                 };
-                LayerKv::new(lc.n_kv * lc.head_dim, LayerKv::limit(window, cap).max(1))
+                let row = lc.n_kv * lc.head_dim;
+                let rows = LayerKv::limit(window, cap).max(1);
+                match device {
+                    Some(d) => LayerKv::new_device(d, row, rows),
+                    None => LayerKv::new(row, rows),
+                }
             })
             .collect();
         Self { layers, len: 0 }
@@ -136,7 +244,7 @@ impl KvCache {
     pub fn bytes(&self) -> usize {
         self.layers
             .iter()
-            .map(|l| (l.k.len() + l.v.len()) * std::mem::size_of::<f16>())
+            .map(|l| (l.k.capacity() + l.v.capacity()) * std::mem::size_of::<f16>())
             .sum()
     }
 
@@ -224,6 +332,79 @@ impl KvCache {
 
     pub(crate) fn end_token(&mut self) {
         self.finish_token();
+    }
+
+    /// Reserve the row for `pos` **without writing it**, for the GPU path where
+    /// the row contents are produced by kernels (RoPE straight into the cache for
+    /// k, a device copy for v).
+    ///
+    /// Rotation is host-side on shared memory, which is safe because the previous
+    /// token's command buffer has already completed (one sync per token).
+    pub fn reserve_row(
+        &mut self,
+        cfg: &GemmaCfg,
+        i: usize,
+        pos: usize,
+    ) -> Result<(usize, usize), GemmaError> {
+        self.check(cfg)?;
+        let window = match cfg.layers[i].kind {
+            LayerKind::Sliding => cfg.sliding_window,
+            LayerKind::Full => 0,
+        };
+        let l = &mut self.layers[i];
+        if window == 0 && l.len == l.cap {
+            return Err(GemmaError::Config(format!(
+                "layer {i}: kv cache full at {} rows (allocate a larger context)",
+                l.cap
+            )));
+        }
+        if l.len == LayerKv::limit(window, l.cap) {
+            let row = l.row;
+            let limit = LayerKv::limit(window, l.cap);
+            let keep = (limit - 1) * row;
+            l.k.slice_mut(limit * row).copy_within(row..row + keep, 0);
+            l.v.slice_mut(limit * row).copy_within(row..row + keep, 0);
+            l.start += 1;
+            l.len = limit - 1;
+        }
+        l.len += 1;
+        let (start, rows) = (l.start, l.len);
+        if start + rows - 1 != pos {
+            return Err(GemmaError::Config(format!(
+                "layer {i}: reserve_row for pos {pos} but window covers {}..{}",
+                start,
+                start + rows - 1
+            )));
+        }
+        Ok((start, rows))
+    }
+
+    /// Device span for one stored row (K when `is_value == false`).
+    pub fn row_span(&self, i: usize, is_value: bool, row: usize) -> Option<DeviceSpan<'_>> {
+        let l = &self.layers[i];
+        if row >= l.len {
+            return None;
+        }
+        let store = if is_value { &l.v } else { &l.k };
+        let buffer = store.buffer()?;
+        Some(DeviceSpan {
+            buffer,
+            byte_offset: row * l.row * 2,
+        })
+    }
+
+    /// Device span over the whole key matrix of layer `i`.
+    pub fn layer_keys_span(&self, i: usize) -> Option<DeviceSpan<'_>> {
+        self.layers[i].keys_span()
+    }
+
+    pub fn layer_values_span(&self, i: usize) -> Option<DeviceSpan<'_>> {
+        self.layers[i].values_span()
+    }
+
+    /// Largest per-layer row capacity in this cache.
+    pub fn capacity(&self) -> usize {
+        self.layers.iter().map(|l| l.cap).max().unwrap_or(0)
     }
 }
 

@@ -147,6 +147,8 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - [ ] No unconditional sync+clear per chunk (deferred/pressure only); no accidental materialize between fused candidates (up/gate, silu⊙up)
 - Files: prefill loop, elementwise
 - Test: prefill completes 8k; profile shows no mid-prefill full clear; numerical parity
+- Target: AC8, R2.4
+- Commit: `spec/rust-metal-engine: T3.6 sync policy + fusion`
 
 ### T3.7 — Bounded prefill scratch + peak-RSS gate (user directive 2026-09-22)
 - [~] Kernel half **done**: attention is online-softmax over KV tiles with an O(1) working set — running max/denominator/output accumulators and one 16-entry score tile all live in **registers**, the slice reduction is `simd_shuffle_xor`, and the kernel allocates **no** threadgroup memory and uses **no** barriers. There is no `[heads, L, L]` score matrix, no `[heads, q, kv]` bias tensor, and no growable scratch anywhere in the attention path
@@ -154,8 +156,6 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - Files: `crates/kernels/src/attn.metal` (structural); `crates/cli` bench report + measurement (remaining)
 - Target: R5.3, R5.5, AC6 (this is an acceptance number, not a nice-to-have)
 - Commit: `spec/rust-metal-engine: T3.5 attention kernel` (kernel half)
-- Target: AC8, R2.4
-- Commit: `spec/rust-metal-engine: T3.6 sync policy + fusion`
 
 ## Phase 4 — Decode amplification
 
@@ -165,12 +165,19 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - Target: AC4, R3.1
 - Commit: `spec/rust-metal-engine: T4.1 sibling fusion`
 
-### T4.2 — Compiled/fixed-shape decode step
-- [ ] Stable command-buffer / pipeline reuse; KV length classes (align 256); warmup; no per-token rebuild
-- Files: decode path
-- Test: shape stability across tokens; tg/s before/after; correctness vs eager on golden prompt
-- Target: AC4 groundwork, R1.3
-- Commit: `spec/rust-metal-engine: T4.2 fixed-shape decode`
+### T4.2 — One command buffer per decode token
+- [x] Done — every dispatch of one decode token (411 linears + 60 attentions + glue) is encoded into a **single command buffer** and submitted once, replacing the per-linear `commit`+`wait_until_completed` storm (471 cb/token ≈ 0.4 ms each ≈ 180 ms of a 275 ms token)
+  - `crates/engine/src/gpu_decode.rs`: `GpuDecoder::encode_token` — device-resident arena with a 3-slot hidden ring (layer i reads `2i%3`, writes `(2i+2)%3`); K/V written straight into the shared-mode device cache (RoPE applied in-place on the k write); only 2 host round trips per token (embed row in, logits out)
+  - `crates/kernels/src/fuse.{metal,rs}`: `kr_rms` / rope / copy / gelu_mul / add / add_scale glue kernels (norms, RoPE, residuals all GPU-side; only `layer_scalar` f64-vs-f32 handoff remains ≤1 ulp DE28)
+  - `crates/engine/src/kv_cache.rs`: `Store::{Host,Device}` — device cache in `StorageModeShared` (shader-writable, same heap as weights), `reserve_row`/`row_span`/`layer_{keys,values}_span`; host store unchanged as the CPU fallback
+  - `gemma4.rs`: `new_kv_cache` / `ensure_decoder` (lazy build, unavailable models fall back) / T4.2 branch in `forward_cached_layers` gated on `cache.is_device_backed()`
+  - `attn.rs`: `AttnParams` carries `kv_rows,q_pos0,kv_pos0` (was `kv_len`); `exl3::encode_linear` + `MetalLinear::encode_*` let an external encoder drive the linears; `Exl3Attention::run_in`
+- Measured (release, real artifact, `generate --metal --kv-cache --temp 0`, 6-token prompt, 8 gen): **decode 5.68 t/s** (was 3.64 with per-cb submission → +56%; naive 0.18), prefill 1.45 t/s, 5343 GPU linears/8 steps, `kv_bytes` 12.6 MB
+- Verified: gated fixture `real_artifact_cached_fixture_and_gpu_slow` on the **device** cache (`new_kv_cache`) → argmax **236773**, logit 29.9782, 411 GPU linears, `device_kv=true`, fresh-cache **bit-identical** second run (in-cb dispatch ordering holds); cross-process determinism (two CLI runs → identical tokens `[711,506,1852×6]`); full suite green (136)
+- Files: `crates/engine/src/{gpu_decode,gemma4,generate,kv_cache,metal_linear,lib}.rs`, `crates/kernels/src/{fuse,attn,exl3,lib}.{rs,metal}`
+- Test: above; plus `fuse::*` unit tests vs CPU reference
+- Target: AC4, R1.3
+- Commit: `spec/rust-metal-engine: T4.2 one command buffer per token`
 
 ### T4.3 — Fast sampler without clear tax
 - [ ] Single-pass CDF sampling; reused buffers; RNG residency without mid-decode clears
@@ -216,12 +223,6 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - Files: `crates/engine/src/{kv_cache,gemma4,generate,lib}.rs`, `crates/cli/src/{args,main,report}.rs`, `crates/kernels/src/attn.{metal,rs}` (position bases)
 - Target: AC6 memory, R5.2
 - Commit: `spec/rust-metal-engine: T5.1 hybrid kv + cached decode`
-
-### T4.2 — Compiled/fixed-shape decode step
-- [~] Shape stability exists now (every step is `rows == 1`, fixed shapes, cache-allocated scratch reused: the attention scratch and the GEMV scratch grow once and are then reused).  Remaining: the measured per-dispatch overhead — 471 command buffers per token (411 linears + 60 attentions), each `commit`+`wait_until_completed`
-- Measured: steady-state **~275 ms/token**, of which ~93 ms is the decode kernel time at the measured 167 Gw/s ⇒ **~180 ms/token is submit/wait overhead (≈0.4 ms per linear)**, plus ~1 s of one-time Metal residency currently inside TTFT (move to load-time warm-up)
-- Next: one command buffer for the whole token (encode all 471 dispatches, one sync) — the measured numbers put this at the top of the decode lever list, ahead of further kernel tuning
-- Target: AC4, R1.3
 
 ### T5.2 — Activation budget + no OOM-retry steady state
 - [ ] Scratch caps; long prefill without allocator thrash

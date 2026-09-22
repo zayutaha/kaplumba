@@ -34,6 +34,8 @@ Append as work proceeds (AGENTS.md §5). Dense, factual, takeover-oriented. Cont
 - DE40 (T1.4): Sampler rules, locked by tests: non-finite logits (NaN/±inf) behave as `-inf` (never selected; all-dead → id 0, no panic); candidates are ordered weight-desc then **id-asc** so ties are deterministic; top-k then top-p over the sorted prefix (`top_p` cuts at the smallest prefix whose cumulative mass ≥ top_p); `temp <= 0` or `top_k == 1` → argmax and the RNG is untouched. PCG32 (seed → `(seed<<1)|1` stream) makes any run reproducible. Host cost is a full-vocab sort per token (~262k entries) — acceptable on the naive path, replaced in T4.3.
 - DE41 (T1.4): `kaplumba-bench/1` report = the harness's keys + `sampling` + `tokens`/`text`; the required set is `report::REPORT_KEYS` and `build_report` `debug_assert!`s it is present, so schema drift fails tests rather than silently breaking diffs. f32 CLI args are rounded to 3 decimals (`0.95` must not print as `0.949999988079071`). Keys the naive path cannot measure yet (`phys_footprint_bytes`, `lifetime_max_phys_footprint_bytes`, `metal_peak_bytes`) are `null` with `mem_note` naming R5.5/T2.2 — never fabricated. `mem.weights_bytes`/`metal_alloc_bytes` come from the loader/device; `peak_rss_bytes` is `getrusage(RUSAGE_SELF).ru_maxrss` and **under-reports Metal** on UMA (8.08 GB vs 16.03 GB observed).
 - DE42 (T1.4): CLI end-to-end tests are gated on `KAPLUMBA_RUN_SLOW=1` even at `--layers 2`, because the naive path in a **debug** build is far slower than release (lm_head alone is ~14s/row in release). Default `cargo test` therefore never loads 16 GB; run e2e with `KAPLUMBA_RUN_SLOW=1 cargo test --release -p kaplumba-cli --test cli_generate`.
+- **T4.2 done** (2026-09-22): one command buffer per decode token — see the T4.2 section below. Decode **3.64 → 5.68 t/s** (+56%), device-resident KV + activations, 2 host round trips/token. Fixture on the device path reproduces argmax 236773 bit-identically on replay; full suite 136 green.
+- DE43 (T4.2): Metal compute dispatches encoded into **one** `MTLCommandBuffer` (one compute encoder, sequential dispatches, no barriers) execute in encode order — verified empirically: the T4.2 single-cb forward replays to **bit-identical logits** on a fresh cache, twice per test run and across processes. The in-place q-RoPE (q read/written by the same kernel) and cross-pass hazards (had_in→gemv→had_out sharing scratch, rms→rope→attn over shared vectors) all hold. Do not add `memory_barrier` calls without a failing case; re-check if a kernel ever writes a buffer a later dispatch in the same encoder reads **from a different threadgroup with relaxed visibility assumptions**.
 
 ## Decisions (carried + new)
 
@@ -406,6 +408,37 @@ Blocking work, in the order the measurements justify it:
   - `KAPLUMBA_RUN_SLOW=1 cargo test --release -p kaplumba-engine real_artifact_partial_depth_deterministic_slow -- --nocapture --test-threads=1` (~50s; sliding+full layers, bit-identical)
   - `KAPLUMBA_RUN_SLOW=1 KAPLUMBA_SLOW_MODE=forward KAPLUMBA_SLOW_PROMPT=2 KAPLUMBA_SLOW_EXPECT=236773 cargo test --release -p kaplumba-engine real_artifact_greedy_slow -- --nocapture --test-threads=1` (~210s; add `KAPLUMBA_SLOW_REPEAT=1` for ~420s determinism proof)
   - `KAPLUMBA_RUN_SLOW=1 KAPLUMBA_SLOW_MODE=greedy KAPLUMBA_SLOW_MAX_NEW=1 ...` (~3×210s: two forward passes per generated token)
+  - T4.2 device-cache fixture: `KAPLUMBA_RUN_SLOW=1 cargo test --release -p kaplumba-engine real_artifact_cached_fixture_and_gpu_slow -- --nocapture --test-threads=1` (~6s after load; asserts device_kv, 411 GPU linears, argmax 236773, fresh-cache bit-identical replay)
+
+## T4.2 — one command buffer per decode token (2026-09-22)
+
+**Problem:** the cached/GPU decode path encoded each of the ~471 dispatches per token (411 linears + 60 attentions + glue) into its own command buffer with `commit`+`wait_until_completed` — ~0.4 ms of CPU submit/wait each ⇒ **~180 ms of a ~275 ms token was pure overhead** (kernel time only ~93 ms).
+
+**Design:** `GpuDecoder::encode_token` (`crates/engine/src/gpu_decode.rs`) builds one command buffer per token:
+- Hidden states live in a device **arena** with a 3-slot ring: layer *i* reads slot `2i%3`, writes `(2i+2)%3` — two buffers in flight, never materialized to host.
+- K/V write straight into the shared-mode device KV cache (`KvCache::new_device`): RoPE is applied to k **in the kernel that writes the cache row**, so attention reads cache memory directly (2 host round trips/token total: embed row in, final logits out).
+- All elementwise/norm/RoPE glue runs as `fuse.*` kernels (`crates/kernels/src/fuse.metal`): `kr_rms`, rope, copy, gelu_mul, add, add_scale. `layer_scalar` stays f64 on the CPU (DE28 ≤1 ulp).
+- Linears/attention join an **external encoder** via `MetalLinear::encode_*` / `Exl3Attention::run_in` / `exl3::encode_linear`; `AttnParams` now carries `kv_rows, q_pos0, kv_pos0` (was `kv_len`).
+- Fallback: no GPU, decoder build failure, or a **host** cache ⇒ old per-linear path (same maths). `ensure_decoder()` records permanently-unavailable models so we don't retry a failing build.
+
+**Measured** (release, M4 Pro, real artifact, `generate --metal --kv-cache --temp 0`, 6-token prompt, 8 gen tokens):
+
+| | before (per-cb) | after (one cb) |
+|---|---|---|
+| decode | 3.64 t/s | **5.68 t/s** (+56%) |
+| command buffers/token | 471 | **1** |
+| GPU linears | 5343/8 steps | same (all dispatched) |
+| prefill (still per-row; T3.2) | 1.53 t/s | 1.45 t/s (unchanged, expected) |
+
+Naive path remains 0.18 t/s. Roofline 17.6 t/s ⇒ decode now at **32%** of ceiling; next decode levers are T4.1 sibling fusion and kernel-side (T2.3 says 9–12 t/s for this decode algorithm).
+
+**Verification:** gated `real_artifact_cached_fixture_and_gpu_slow` switched from `KvCache::new` (host — silently tested the old path!) to `g.new_kv_cache(8)` (device) and now asserts `is_device_backed()`, argmax **236773**, logit 29.9782, ≥400 GPU linears, and **bit-identical logits on a fresh-cache replay** (DE43). Cross-process: two CLI runs → identical tokens `[711, 506, 1852×6]`. Full suite: **136 green** (108 engine incl. new determinism assert, 13 kernels incl. `fuse::*`, 12+5 CLI).
+
+**Gotchas for the next model:**
+- The old fixture used a **host** cache, so T4.2 could have shipped untested — always check `is_device_backed()` when testing this path.
+- `gpu_ms()` reports 0 in this path (encode_* doesn't time individual dispatches; the whole token is timed by the caller).
+- Prefill (`step == 0` in `generate`) pushes the whole prompt through `encode_token` **one token at a time** in a loop of command buffers — correct, but that's why prefill didn't move; T3.2 batches it.
+- `.freebuff/` in the repo root is an untracked scratch dir; leave it.
 
 ## T1.3c handover (2026-09-22 — **implemented**, kept for the locked facts)
 

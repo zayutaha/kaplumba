@@ -33,8 +33,10 @@ pub enum MetalLinearError {
 /// Owns the compiled pipelines + scratch for the GPU decode path.
 pub struct MetalLinear {
     device: metal::Device,
+    queue: metal::CommandQueue,
     gemv: Exl3Gemv,
     attn: Exl3Attention,
+    fuse: kaplumba_kernels::Fuse,
     /// Attention staging buffers, grown on demand (T3.5). The engine still hands
     /// attention host slices, so q/k/v are copied in and `out` copied back; the
     /// KV cache (T5.1) will keep K/V device-resident and drop the copies.
@@ -57,20 +59,52 @@ struct AttnScratch {
     kv_elems: usize,
 }
 
-struct GpuLinear<'a> {
-    shape: Exl3Shape,
-    mode: u32,
-    trellis: DeviceSpan<'a>,
-    suh: DeviceSpan<'a>,
-    svh: DeviceSpan<'a>,
+/// Owned device handles for one EXL3 linear.
+///
+/// Owned (`Buffer` clones + byte offsets) rather than borrowed spans so the
+/// decode pipeline can resolve all 411 linear weights **once** at construction
+/// and keep them, instead of re-validating metadata on every token.
+#[derive(Clone)]
+pub struct LinearHandles {
+    pub name: String,
+    pub shape: Exl3Shape,
+    pub mode: u32,
+    trellis: (Buffer, usize),
+    suh: (Buffer, usize),
+    svh: (Buffer, usize),
+}
+
+impl LinearHandles {
+    pub fn trellis(&self) -> DeviceSpan<'_> {
+        DeviceSpan {
+            buffer: &self.trellis.0,
+            byte_offset: self.trellis.1,
+        }
+    }
+
+    pub fn suh(&self) -> DeviceSpan<'_> {
+        DeviceSpan {
+            buffer: &self.suh.0,
+            byte_offset: self.suh.1,
+        }
+    }
+
+    pub fn svh(&self) -> DeviceSpan<'_> {
+        DeviceSpan {
+            buffer: &self.svh.0,
+            byte_offset: self.svh.1,
+        }
+    }
 }
 
 impl MetalLinear {
     pub fn new(ctx: &MetalContext) -> Result<Self, MetalLinearError> {
         Ok(Self {
             device: ctx.device().clone(),
+            queue: ctx.queue().clone(),
             gemv: Exl3Gemv::new(ctx.device(), ctx.queue())?,
             attn: Exl3Attention::new(ctx.device(), ctx.queue())?,
+            fuse: kaplumba_kernels::Fuse::new(ctx.device(), ctx.queue())?,
             attn_scratch: std::cell::RefCell::new(None),
             calls: std::sync::atomic::AtomicU64::new(0),
             gpu_ns: std::sync::atomic::AtomicU64::new(0),
@@ -120,7 +154,7 @@ impl MetalLinear {
         name: &str,
         x: &[f16],
     ) -> Result<Option<Vec<f16>>, MetalLinearError> {
-        let Some(g) = gather(src, name) else {
+        let Some(g) = linear_handles(src, name).ok() else {
             return Ok(None);
         };
         if x.len() != g.shape.in_features() {
@@ -129,7 +163,7 @@ impl MetalLinear {
         let mut out = Vec::new();
         let t0 = std::time::Instant::now();
         self.gemv
-            .linear_row(x, g.trellis, g.suh, g.svh, g.shape, g.mode, &mut out)?;
+            .linear_row(x, g.trellis(), g.suh(), g.svh(), g.shape, g.mode, &mut out)?;
         self.gpu_ns.fetch_add(
             t0.elapsed().as_nanos() as u64,
             std::sync::atomic::Ordering::Relaxed,
@@ -228,15 +262,17 @@ fn copy_in(dst: &Buffer, src: &[f16]) {
     }
 }
 
-/// Collect everything the kernels need, or `None` when not eligible.
-fn gather<'a>(src: &'a dyn TensorSource, name: &str) -> Option<GpuLinear<'a>> {
-    gather_checked(src, name).ok()
+/// Device handles for `name`, or the reason it cannot go on the GPU.
+///
+/// Public (and returning a reason rather than `None`) because a silent CPU
+/// fallback is indistinguishable from a slow GPU in a bench report: see
+/// `MetalLinear::skip_reason` and the `all_layer_linears_gpu_eligible_slow`
+/// guard test.
+pub fn linear_handles(src: &dyn TensorSource, name: &str) -> Result<LinearHandles, String> {
+    gather_checked(src, name)
 }
 
-/// `gather` with the reason it declined, so a silent CPU fallback is
-/// diagnosable (see `skip_reason` and the `all_layer_linears_gpu_eligible_slow`
-/// test).
-fn gather_checked<'a>(src: &'a dyn TensorSource, name: &str) -> Result<GpuLinear<'a>, String> {
+fn gather_checked(src: &dyn TensorSource, name: &str) -> Result<LinearHandles, String> {
     let trellis_name = format!("{name}.trellis");
     let t = src
         .get(&trellis_name)
@@ -305,24 +341,166 @@ fn gather_checked<'a>(src: &'a dyn TensorSource, name: &str) -> Result<GpuLinear
         CodebookMode::Mul1 => return Err("codebook Mul1 (CPU-only)".to_string()),
     };
 
-    Ok(GpuLinear {
+    Ok(LinearHandles {
+        name: name.to_string(),
         shape,
         mode,
-        trellis: device_span(src, &trellis_name)
+        trellis: owned_span(src, &trellis_name)
             .ok_or_else(|| format!("{trellis_name}: no device span"))?,
-        suh: device_span(src, &format!("{name}.suh"))
+        suh: owned_span(src, &format!("{name}.suh"))
             .ok_or_else(|| format!("{name}.suh: no device span"))?,
-        svh: device_span(src, &format!("{name}.svh"))
+        svh: owned_span(src, &format!("{name}.svh"))
             .ok_or_else(|| format!("{name}.svh: no device span"))?,
     })
 }
 
-fn device_span<'a>(src: &'a dyn TensorSource, name: &str) -> Option<DeviceSpan<'a>> {
-    let (buffer, byte_offset): (&Buffer, usize) = src.device_span(name)?;
-    Some(DeviceSpan {
-        buffer,
-        byte_offset,
-    })
+/// `(buffer, byte offset)` for a tensor, owned so it can outlive the borrow.
+fn owned_span(src: &dyn TensorSource, name: &str) -> Option<(Buffer, usize)> {
+    let (buffer, byte_offset) = src.device_span(name)?;
+    Some((buffer.clone(), byte_offset))
+}
+
+// ---------------------------------------------------------------------------
+// Encoder-level passthroughs (T4.2): these do not submit anything, they add
+// passes to a caller-owned command buffer so a whole token is one submission.
+// ---------------------------------------------------------------------------
+
+impl MetalLinear {
+    pub fn device(&self) -> &metal::Device {
+        &self.device
+    }
+
+    /// A fresh command buffer from the shared queue (caller commits/waits).
+    pub fn new_command_buffer(&self) -> metal::CommandBuffer {
+        self.queue.new_command_buffer().to_owned()
+    }
+
+    /// Upload a small host f32 vector as a shared device buffer.
+    pub fn upload_f32(&self, data: &[f32]) -> Buffer {
+        self.device.new_buffer_with_data(
+            data.as_ptr() as *const _,
+            (data.len() * 4).max(4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+
+    /// One EXL3 linear, encoded into `enc` (`x`/`out` are whole device buffers).
+    pub fn encode_linear(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        lin: &LinearHandles,
+        x: &Buffer,
+        out: &Buffer,
+    ) -> Result<(), MetalLinearError> {
+        self.gemv.encode_linear(
+            enc,
+            x,
+            lin.trellis(),
+            lin.suh(),
+            lin.svh(),
+            out,
+            lin.shape,
+            lin.mode,
+        )?;
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_rms(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        x: DeviceSpan<'_>,
+        weight: Option<DeviceSpan<'_>>,
+        out: DeviceSpan<'_>,
+        rows: usize,
+        row_len: usize,
+        eps: f32,
+    ) -> Result<(), MetalLinearError> {
+        self.fuse
+            .encode_rms(enc, x, weight, out, rows, row_len, eps)?;
+        Ok(())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_rope(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        x: DeviceSpan<'_>,
+        cos: DeviceSpan<'_>,
+        sin: DeviceSpan<'_>,
+        out: DeviceSpan<'_>,
+        n_heads: usize,
+        head_dim: usize,
+        pos: usize,
+    ) -> Result<(), MetalLinearError> {
+        self.fuse
+            .encode_rope(enc, x, cos, sin, out, n_heads, head_dim, pos)?;
+        Ok(())
+    }
+
+    pub fn encode_copy(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        src: DeviceSpan<'_>,
+        dst: DeviceSpan<'_>,
+        n: usize,
+    ) -> Result<(), MetalLinearError> {
+        self.fuse.encode_copy(enc, src, dst, n)?;
+        Ok(())
+    }
+
+    pub fn encode_gelu_mul(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        gate: DeviceSpan<'_>,
+        up: DeviceSpan<'_>,
+        out: DeviceSpan<'_>,
+        n: usize,
+    ) -> Result<(), MetalLinearError> {
+        self.fuse.encode_gelu_mul(enc, gate, up, out, n)?;
+        Ok(())
+    }
+
+    pub fn encode_add(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        a: DeviceSpan<'_>,
+        b: DeviceSpan<'_>,
+        out: DeviceSpan<'_>,
+        n: usize,
+    ) -> Result<(), MetalLinearError> {
+        self.fuse.encode_add(enc, a, b, out, n)?;
+        Ok(())
+    }
+
+    pub fn encode_add_scale(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        a: DeviceSpan<'_>,
+        b: DeviceSpan<'_>,
+        out: DeviceSpan<'_>,
+        n: usize,
+        scalar: f32,
+    ) -> Result<(), MetalLinearError> {
+        self.fuse.encode_add_scale(enc, a, b, out, n, scalar)?;
+        Ok(())
+    }
+
+    /// Attention into an existing encoder (the T4.2 pipeline).
+    pub fn encode_attention(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        q: DeviceSpan<'_>,
+        k: DeviceSpan<'_>,
+        v: DeviceSpan<'_>,
+        out: DeviceSpan<'_>,
+        p: AttnParams,
+    ) -> Result<(), MetalLinearError> {
+        self.attn.run_in(enc, q, k, v, out, p)?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -481,7 +659,7 @@ mod tests {
     fn gather_accepts_eligible_synthetic_linear() {
         let Some(c) = ctx() else { return };
         let src = SynthGpuSource::build(c.device(), 3, 128, 128);
-        let g = gather(&src, "l").expect("eligible");
+        let g = linear_handles(&src, "l").ok().expect("eligible");
         assert_eq!(g.shape.in_features(), 128);
         assert_eq!(g.shape.out_features(), 128);
         assert_eq!(g.mode, 1, "Mcg");
@@ -493,17 +671,17 @@ mod tests {
         // packed words not 16*k
         let mut src = SynthGpuSource::build(c.device(), 3, 128, 128);
         src.meta.get_mut("l.trellis").unwrap().1[2] = 47;
-        assert!(gather(&src, "l").is_none());
+        assert!(linear_handles(&src, "l").ok().is_none());
 
         // out_features not a multiple of 128
         let mut src = SynthGpuSource::build(c.device(), 3, 128, 128);
         src.meta.get_mut("l.trellis").unwrap().1[1] = 7;
-        assert!(gather(&src, "l").is_none());
+        assert!(linear_handles(&src, "l").ok().is_none());
 
         // packed sign bitfield scales stay on the CPU
         let mut src = SynthGpuSource::build(c.device(), 3, 128, 128);
         src.meta.get_mut("l.suh").unwrap().0 = DType::I16;
-        assert!(gather(&src, "l").is_none());
+        assert!(linear_handles(&src, "l").ok().is_none());
 
         // bias is unsupported on the GPU path
         let mut src = SynthGpuSource::build(c.device(), 3, 128, 128);
@@ -518,18 +696,18 @@ mod tests {
         );
         src.host.insert("l.bias".into(), bias);
         src.meta.insert("l.bias".into(), (DType::F16, vec![128]));
-        assert!(gather(&src, "l").is_none());
+        assert!(linear_handles(&src, "l").ok().is_none());
 
         // unknown codebook multiplier
         let mut src = SynthGpuSource::build(c.device(), 3, 128, 128);
         src.host
             .insert("l.mcg".into(), 0xDEAD_BEEFu32.to_le_bytes().to_vec());
-        assert!(gather(&src, "l").is_none());
+        assert!(linear_handles(&src, "l").ok().is_none());
 
         // missing device storage
         let mut src = SynthGpuSource::build(c.device(), 3, 128, 128);
         src.buffers.remove("l.svh");
-        assert!(gather(&src, "l").is_none());
+        assert!(linear_handles(&src, "l").ok().is_none());
     }
 
     /// `had_in` matches the CPU reference within 1 f16 ulp. The transform is
@@ -779,7 +957,7 @@ mod tests {
             ("lm_head", "lm_head"),
         ];
         for (label, name) in names {
-            let g = gather(src, name).unwrap_or_else(|| panic!("{name} eligible"));
+            let g = linear_handles(src, name).unwrap_or_else(|e| panic!("{name} eligible: {e}"));
             let (inn, outp) = (g.shape.in_features(), g.shape.out_features());
             let x: Vec<f16> = (0..inn)
                 .map(|i| f16::from_f32(((i % 17) as f32 - 8.0) / 64.0))
@@ -807,18 +985,18 @@ mod tests {
 
             let (hi_min, hi_med) = time("had_in", &mut || {
                 let mut o = Vec::new();
-                ml.raw().had_in_pass(&x, g.suh, &mut o).unwrap();
+                ml.raw().had_in_pass(&x, g.suh(), &mut o).unwrap();
             });
             let y: Vec<f32> = (0..outp).map(|i| (i % 13) as f32 * 0.01).collect();
             let (ho_min, ho_med) = time("had_out", &mut || {
                 let mut o = Vec::new();
-                ml.raw().had_out_pass(&y, g.svh, &mut o).unwrap();
+                ml.raw().had_out_pass(&y, g.svh(), &mut o).unwrap();
             });
             let mut xh = vec![f16::ZERO; inn];
             let (gv_min, gv_med) = time("gemv", &mut || {
                 let mut o = Vec::new();
                 ml.raw()
-                    .gemv_pass(&xh, g.trellis, g.shape, g.mode, &mut o)
+                    .gemv_pass(&xh, g.trellis(), g.shape, g.mode, &mut o)
                     .unwrap();
             });
             xh.clear();
@@ -830,9 +1008,9 @@ mod tests {
             eprintln!(
                 "{label:8} {inn}x{outp} k={} off(t{}/s{}/{}) · full {fu_min:7.3}/{fu_med:7.3} · gemv {gv_min:6.3}/{gv_med:6.3} · had_in {hi_min:6.3}/{hi_med:6.3} · had_out {ho_min:6.3}/{ho_med:6.3} ms · {:.0} Gw/s",
                 g.shape.k,
-                g.trellis.byte_offset % 4,
-                g.suh.byte_offset % 4,
-                g.svh.byte_offset % 4,
+                g.trellis().byte_offset % 4,
+                g.suh().byte_offset % 4,
+                g.svh().byte_offset % 4,
                 weights as f64 / (fu_min / 1000.0) / 1e9,
             );
         }

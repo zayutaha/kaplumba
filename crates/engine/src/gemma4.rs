@@ -586,6 +586,11 @@ pub struct Gemma4Model<'a> {
     pub cfg: GemmaCfg,
     src: &'a dyn TensorSource,
     gpu: Option<&'a crate::metal_linear::MetalLinear>,
+    /// Lazily built device decode pipeline (T4.2). Built on the first cached
+    /// forward and reused; `decoder_unavailable` records a model the kernels
+    /// cannot cover so the host path is used without retrying every token.
+    decoder: std::cell::RefCell<Option<crate::gpu_decode::GpuDecoder>>,
+    decoder_unavailable: std::cell::Cell<bool>,
 }
 
 impl<'a> Gemma4Model<'a> {
@@ -594,6 +599,44 @@ impl<'a> Gemma4Model<'a> {
             cfg,
             src,
             gpu: None,
+            decoder: std::cell::RefCell::new(None),
+            decoder_unavailable: std::cell::Cell::new(false),
+        }
+    }
+
+    /// A KV cache matching this model's path: device-backed when the GPU decode
+    /// pipeline is available (so kernels can read K/V in place), host otherwise.
+    pub fn new_kv_cache(&self, cap: usize) -> crate::kv_cache::KvCache {
+        match self.gpu {
+            Some(g) if !self.decoder_unavailable.get() => {
+                crate::kv_cache::KvCache::new_device(&self.cfg, cap, g.device())
+            }
+            _ => crate::kv_cache::KvCache::new(&self.cfg, cap),
+        }
+    }
+
+    /// Build the device decode pipeline on first use (`Ok(false)` = this model or
+    /// runner cannot use it, so the host path applies).
+    fn ensure_decoder(
+        &self,
+        gpu: &crate::metal_linear::MetalLinear,
+        cache_cap: usize,
+    ) -> Result<bool, GemmaError> {
+        if self.decoder.borrow().is_some() {
+            return Ok(true);
+        }
+        if self.decoder_unavailable.get() {
+            return Ok(false);
+        }
+        match crate::gpu_decode::GpuDecoder::new(self, gpu, cache_cap)? {
+            Some(d) => {
+                *self.decoder.borrow_mut() = Some(d);
+                Ok(true)
+            }
+            None => {
+                self.decoder_unavailable.set(true);
+                Ok(false)
+            }
         }
     }
 
@@ -621,7 +664,7 @@ impl<'a> Gemma4Model<'a> {
             .ok_or_else(|| GemmaError::Missing(name.to_string()))
     }
 
-    fn f32_tensor(&self, name: &str) -> Result<Vec<f32>, GemmaError> {
+    pub fn f32_tensor(&self, name: &str) -> Result<Vec<f32>, GemmaError> {
         self.tensor(name)?.to_f32(name)
     }
 
@@ -679,6 +722,36 @@ impl<'a> Gemma4Model<'a> {
         })
     }
 
+    /// The artifact source, for callers that need device handles (T4.2).
+    pub fn source(&self) -> &'a dyn TensorSource {
+        self.src
+    }
+
+    /// One embedding row as f16 **×√hidden**, without materializing the table.
+    ///
+    /// The decode pipeline needs this on the host (10 KB per token) because it is
+    /// the one input that cannot be produced by a kernel from device weights
+    /// without another pass.
+    pub fn embed_row(&self, token: u32) -> Result<Vec<f16>, GemmaError> {
+        let name = "model.language_model.embed_tokens.weight";
+        let t = self.tensor(name)?;
+        let hidden = self.cfg.hidden;
+        let vocab = t.shape.first().copied().unwrap_or(0);
+        if token as usize >= vocab {
+            return Err(GemmaError::Config(format!(
+                "token id {token} out of range (vocab {vocab})"
+            )));
+        }
+        let scale = (hidden as f32).sqrt();
+        let row = &t.bytes[token as usize * hidden * 2..(token as usize + 1) * hidden * 2];
+        let mut out = vec![f16::ZERO; hidden];
+        for (j, o) in out.iter_mut().enumerate() {
+            let b = bf16_bits_to_f32(u16::from_le_bytes([row[2 * j], row[2 * j + 1]]));
+            *o = f16::from_f32(b * scale);
+        }
+        Ok(out)
+    }
+
     /// Explicit CPU reference linear (`linear_forward_reconstruct`).
     pub fn linear_via_cpu(&self, name: &str, x: &[f16]) -> Result<Vec<f16>, GemmaError> {
         let layer = self.exl3_linear(name)?;
@@ -697,7 +770,7 @@ impl<'a> Gemma4Model<'a> {
         self.linear_via_cpu(name, x)
     }
 
-    fn layer_scalar(&self, i: usize) -> Result<f64, GemmaError> {
+    pub fn layer_scalar(&self, i: usize) -> Result<f64, GemmaError> {
         let name = format!("model.language_model.layers.{i}.layer_scalar");
         let t = self.tensor(&name)?;
         let v = t.to_f32(&name)?;
@@ -1065,6 +1138,25 @@ impl<'a> Gemma4Model<'a> {
     ) -> Result<Vec<f32>, GemmaError> {
         if tokens.is_empty() {
             return Err(GemmaError::Config("empty token sequence".into()));
+        }
+        // T4.2: device-resident pipeline, one command buffer per token. It needs
+        // a device-backed cache; anything unsupported falls back to the host path
+        // below (same maths, slower submission).
+        if let Some(gpu) = self.gpu {
+            if cache.is_device_backed() && self.ensure_decoder(gpu, cache.capacity())? {
+                let mut logits = Vec::new();
+                for &t in tokens {
+                    let cb = gpu.new_command_buffer();
+                    let d = self.decoder.borrow();
+                    let d = d.as_ref().expect("ensure_decoder built it");
+                    logits = d.encode_token(self, gpu, &cb, cache, t, upto)?;
+                    // Mirror the host path: `reserve_row` advanced the per-layer
+                    // row counts, this advances the shared token counter so the
+                    // next token sees the right position.
+                    cache.end_token();
+                }
+                return Ok(logits);
+            }
         }
         let hidden = self.cfg.hidden;
         let upto = upto.min(self.cfg.n_layers);
@@ -1973,17 +2065,22 @@ mod tests {
             .expect("gemma cfg")
             .with_gpu(&gpu);
 
-        let mut kv = KvCache::new(&g.cfg, 8);
+        // `new_kv_cache` is device-backed when the GPU is on, which is what
+        // routes this into the T4.2 single-command-buffer decoder (a host cache
+        // would silently fall back to the older per-linear submission path).
+        let mut kv = g.new_kv_cache(8);
         let t0 = std::time::Instant::now();
         let logits = g.forward_cached(&mut kv, &[2]).expect("cached forward");
         let dt = t0.elapsed().as_secs_f64();
         let got = argmax(&logits);
         eprintln!(
-            "cached 1-token prefill: argmax {got} logit {:.4} in {dt:.1}s, {} GPU linears, {:.0}ms GPU",
+            "cached 1-token prefill: argmax {got} logit {:.4} in {dt:.1}s, {} GPU linears, {:.0}ms GPU, device_kv={}",
             logits[got],
             gpu.calls(),
-            gpu.gpu_ms()
+            gpu.gpu_ms(),
+            kv.is_device_backed()
         );
+        assert!(kv.is_device_backed(), "fixture must exercise the T4.2 path");
         assert_eq!(got, 236773, "recorded naive-path fixture for prompt [2]");
         assert_eq!(kv.len(), 1);
         assert!(kv.bytes() > 0);
@@ -1992,6 +2089,12 @@ mod tests {
             "cached path must run the GPU linears ({} dispatches)",
             gpu.calls()
         );
+        // T4.2 packs every dispatch of one token into a single command buffer:
+        // a fresh cache must replay to the exact same logits (catches missing
+        // barriers or in-place races between dependent passes).
+        let mut kv2 = g.new_kv_cache(8);
+        let again = g.forward_cached(&mut kv2, &[2]).expect("repeat forward");
+        assert_eq!(logits, again, "T4.2 single-cb forward not deterministic");
     }
 
     /// Top-`n` (logit, token) pairs, descending.

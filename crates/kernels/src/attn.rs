@@ -143,6 +143,54 @@ impl Exl3Attention {
         })
     }
 
+    /// Encode the attention pass into a caller-owned encoder (T4.2: a whole
+    /// token shares one command buffer, so nothing here submits or waits).
+    pub fn run_in(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        q: DeviceSpan<'_>,
+        k: DeviceSpan<'_>,
+        v: DeviceSpan<'_>,
+        out: DeviceSpan<'_>,
+        p: AttnParams,
+    ) -> Result<(), KernelError> {
+        p.validate()?;
+        let hd = p.head_dim;
+        check_span_fits(&q, p.s * p.n_heads * hd * 2, "attn q", 2)?;
+        check_span_fits(&k, p.kv_rows * p.n_kv * hd * 2, "attn k", 2)?;
+        check_span_fits(&v, p.kv_rows * p.n_kv * hd * 2, "attn v", 2)?;
+        check_span_fits(&out, p.s * p.n_heads * hd * 2, "attn out", 2)?;
+
+        let part = p.part().expect("validated");
+        let pipeline = if hd == 256 { &self.hd256 } else { &self.hd512 };
+        let params = MslAttnParams {
+            s: p.s as u32,
+            kv_rows: p.kv_rows as u32,
+            q_pos0: p.q_pos0 as u32,
+            kv_pos0: p.kv_pos0 as u32,
+            n_heads: p.n_heads as u32,
+            n_kv: p.n_kv as u32,
+            head_dim: hd as u32,
+            window: p.window as u32,
+        };
+        enc.set_compute_pipeline_state(pipeline);
+        enc.set_buffer(0, Some(q.buffer), q.byte_offset as u64);
+        enc.set_buffer(1, Some(k.buffer), k.byte_offset as u64);
+        enc.set_buffer(2, Some(v.buffer), v.byte_offset as u64);
+        enc.set_buffer(3, Some(out.buffer), out.byte_offset as u64);
+        enc.set_bytes(
+            4,
+            std::mem::size_of::<MslAttnParams>() as u64,
+            &params as *const MslAttnParams as *const _,
+        );
+        let groups = p.s.div_ceil(ATTN_ROWS) as u64;
+        enc.dispatch_thread_groups(
+            MTLSize::new(groups, p.n_heads as u64, 1),
+            MTLSize::new(part as u64, ATTN_ROWS as u64, 1),
+        );
+        Ok(())
+    }
+
     /// `out = attn(q, k, v)` for one dispatch, submitting and waiting.
     ///
     /// All four spans are f16 tensors: `q`/`out` are `[s, n_heads, head_dim]`,
