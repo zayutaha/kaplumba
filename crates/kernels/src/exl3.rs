@@ -315,15 +315,21 @@ impl Exl3Gemv {
         Ok(())
     }
 
+    /// Check a device span is big enough and aligned for how the kernel reads it.
+    ///
+    /// `align` is 2 for both the trellis (read as u16 pairs) and the f16 scales.
+    /// The distinction matters: real artifacts place `lm_head.suh` at an offset
+    /// that is 2- but not 4-byte aligned, so a blanket 4-byte rule would push
+    /// the largest single linear in the model back onto the CPU.
     fn ensure_span_fits(
         span: &DeviceSpan<'_>,
         bytes_needed: usize,
         what: &str,
+        align: usize,
     ) -> Result<(), KernelError> {
-        // The trellis is read as u32 words, so every span is 4-byte aligned.
-        if span.byte_offset % 4 != 0 {
+        if span.byte_offset % align != 0 {
             return Err(KernelError::Unsupported(format!(
-                "{what}: byte offset {} is not 4-byte aligned",
+                "{what}: byte offset {} is not {align}-byte aligned",
                 span.byte_offset
             )));
         }
@@ -352,7 +358,7 @@ impl Exl3Gemv {
                 "had_in needs a multiple of {HAD}, got {n}"
             )));
         }
-        Self::ensure_span_fits(&suh, n * 2, "suh")?;
+        Self::ensure_span_fits(&suh, n * 2, "suh", 2)?;
         out.resize(n, f16::ZERO);
         self.with_scratch(n, 0, |sc| {
             unsafe {
@@ -398,6 +404,7 @@ impl Exl3Gemv {
             &trellis,
             shape.in_tiles * shape.out_tiles * shape.words_per_tile() * 2,
             "trellis",
+            2,
         )?;
         let pair = self.pair_buffer(shape.k);
         out.resize(shape.out_features(), 0.0);
@@ -443,7 +450,7 @@ impl Exl3Gemv {
                 "had_out needs a multiple of {HAD}, got {n}"
             )));
         }
-        Self::ensure_span_fits(&svh, n * 2, "svh")?;
+        Self::ensure_span_fits(&svh, n * 2, "svh", 2)?;
         out.resize(n, f16::ZERO);
         self.with_scratch(0, n, |sc| {
             unsafe {
@@ -498,28 +505,16 @@ impl Exl3Gemv {
                 "hadamard needs multiples of {HAD}, got in={inn} out={outp}"
             )));
         }
-        if trellis.byte_offset % 2 != 0 || suh.byte_offset % 2 != 0 || svh.byte_offset % 2 != 0 {
-            return Err(KernelError::Unsupported(
-                "odd device byte offset for a f16/u16 tensor".into(),
-            ));
-        }
-        let tile_bytes = shape.words_per_tile() * 2;
-        let need = shape.in_tiles * shape.out_tiles * tile_bytes + trellis.byte_offset;
-        if (trellis.buffer.length() as usize) < need {
-            return Err(KernelError::Unsupported(format!(
-                "trellis span {} bytes past buffer end {}",
-                need,
-                trellis.buffer.length()
-            )));
-        }
-        let need = outp * 2 + svh.byte_offset;
-        if (svh.buffer.length() as usize) < need {
-            return Err(KernelError::Unsupported("svh span past buffer end".into()));
-        }
-        let need = inn * 2 + suh.byte_offset;
-        if (suh.buffer.length() as usize) < need {
-            return Err(KernelError::Unsupported("suh span past buffer end".into()));
-        }
+        // The trellis is addressed as u16 pairs, so 2-byte alignment suffices
+        // (real artifacts place lm_head.trellis at a 2-mod-4 offset).
+        Self::ensure_span_fits(
+            &trellis,
+            shape.in_tiles * shape.out_tiles * shape.words_per_tile() * 2,
+            "trellis",
+            2,
+        )?;
+        Self::ensure_span_fits(&suh, inn * 2, "suh", 2)?;
+        Self::ensure_span_fits(&svh, outp * 2, "svh", 2)?;
 
         let pair_buf = self.pair_buffer(shape.k);
         out.resize(outp, f16::ZERO);

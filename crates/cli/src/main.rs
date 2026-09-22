@@ -10,7 +10,8 @@ use std::io::Write;
 use std::time::Instant;
 
 use kaplumba_engine::{
-    Gemma4Model, GemmaTokenizer, GenParams, MetalContext, SampleParams, generate, load_exl3,
+    Gemma4Model, GemmaTokenizer, GenParams, MetalContext, MetalLinear, SampleParams, generate,
+    load_exl3,
 };
 
 fn main() {
@@ -206,12 +207,33 @@ fn generate_cmd(a: &args::GenerateArgs) -> i32 {
         return 2;
     }
 
+    // T2.1: raw-Metal EXL3 kernels (opt-in). Ineligible tensors stay on the CPU
+    // reference path, so this is a pure speed lever, never a correctness mode.
+    let gpu = if a.metal {
+        match MetalLinear::new(&ctx) {
+            Ok(g) => {
+                progress("metal kernels: EXL3 decode GEMV + Hadamard enabled".into());
+                Some(g)
+            }
+            Err(e) => {
+                eprintln!("error: metal kernels: {e}");
+                return 1;
+            }
+        }
+    } else {
+        None
+    };
+
     let gemma = match Gemma4Model::from_model(&model) {
         Ok(g) => g,
         Err(e) => {
             eprintln!("error: model config: {e}");
             return 1;
         }
+    };
+    let gemma = match gpu.as_ref() {
+        Some(g) => gemma.with_gpu(g),
+        None => gemma,
     };
 
     let params = GenParams {
@@ -271,7 +293,13 @@ fn generate_cmd(a: &args::GenerateArgs) -> i32 {
         wall_ms,
         stats: &stats,
         text: &text,
-        backend: "rust-naive-cpu",
+        backend: if gpu.is_some() {
+            "rust-metal-gemv"
+        } else {
+            "rust-naive-cpu"
+        },
+        gpu_linears: gpu.as_ref().map(|g| g.calls()).unwrap_or(0),
+        gpu_ms: gpu.as_ref().map(|g| g.gpu_ms()).unwrap_or(0.0),
         n_layers: gemma.cfg.n_layers,
         weights_bytes: model.resident_bytes(),
         peak_rss_bytes: report::peak_rss_bytes(),

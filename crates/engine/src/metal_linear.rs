@@ -36,6 +36,9 @@ pub struct MetalLinear {
     /// Linears actually dispatched to the GPU (proof that eligibility held for
     /// a real run — a silent fallback would otherwise look like a slow GPU).
     calls: std::sync::atomic::AtomicU64,
+    /// Wall time spent inside the GPU dispatches (R7.2: separates kernel cost
+    /// from whatever else the forward pass is doing).
+    gpu_ns: std::sync::atomic::AtomicU64,
 }
 
 struct GpuLinear<'a> {
@@ -51,12 +54,18 @@ impl MetalLinear {
         Ok(Self {
             gemv: Exl3Gemv::new(ctx.device(), ctx.queue())?,
             calls: std::sync::atomic::AtomicU64::new(0),
+            gpu_ns: std::sync::atomic::AtomicU64::new(0),
         })
     }
 
     /// Number of linears dispatched to the GPU since construction.
     pub fn calls(&self) -> u64 {
         self.calls.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Total wall time inside GPU dispatches, in milliseconds.
+    pub fn gpu_ms(&self) -> f64 {
+        self.gpu_ns.load(std::sync::atomic::Ordering::Relaxed) as f64 / 1e6
     }
 
     /// Low-level kernel access (per-pass tests and T2.3 microbenchmarks).
@@ -82,8 +91,13 @@ impl MetalLinear {
             return Ok(None);
         }
         let mut out = Vec::new();
+        let t0 = std::time::Instant::now();
         self.gemv
             .linear_row(x, g.trellis, g.suh, g.svh, g.shape, g.mode, &mut out)?;
+        self.gpu_ns.fetch_add(
+            t0.elapsed().as_nanos() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
         self.calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(Some(out))
@@ -570,6 +584,90 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// Per-pass timings on the **real artifact shapes** (T2.3 groundwork).
+    /// Gate: `KAPLUMBA_RUN_SLOW=1`; run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_passes_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = crate::testutil::artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let Some(c) = ctx() else { return };
+        let model = crate::load::load_exl3(&c, &dir).expect("load artifact");
+        let ml = MetalLinear::new(&c).expect("metal linear");
+        let src: &dyn TensorSource = &model;
+
+        let names = [
+            ("gate", "model.language_model.layers.0.mlp.gate_proj"),
+            ("down", "model.language_model.layers.0.mlp.down_proj"),
+            ("o", "model.language_model.layers.0.self_attn.o_proj"),
+            ("lm_head", "lm_head"),
+        ];
+        for (label, name) in names {
+            let g = gather(src, name).unwrap_or_else(|| panic!("{name} eligible"));
+            let (inn, outp) = (g.shape.in_features(), g.shape.out_features());
+            let x: Vec<f16> = (0..inn)
+                .map(|i| f16::from_f32(((i % 17) as f32 - 8.0) / 64.0))
+                .collect();
+            const REPS: usize = 20;
+            let verbose = std::env::var("KAPLUMBA_BENCH_VERBOSE").is_ok();
+            let mut time = |tag: &str, f: &mut dyn FnMut()| -> (f64, f64) {
+                let mut v = Vec::with_capacity(REPS);
+                for _ in 0..REPS {
+                    let t = std::time::Instant::now();
+                    f();
+                    v.push(t.elapsed().as_secs_f64() * 1000.0);
+                }
+                if verbose {
+                    eprintln!(
+                        "    {tag:8} reps ms: {:?}",
+                        v.iter()
+                            .map(|x| (x * 100.0).round() / 100.0)
+                            .collect::<Vec<_>>()
+                    );
+                }
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                (v[0], v[REPS / 2])
+            };
+
+            let (hi_min, hi_med) = time("had_in", &mut || {
+                let mut o = Vec::new();
+                ml.raw().had_in_pass(&x, g.suh, &mut o).unwrap();
+            });
+            let y: Vec<f32> = (0..outp).map(|i| (i % 13) as f32 * 0.01).collect();
+            let (ho_min, ho_med) = time("had_out", &mut || {
+                let mut o = Vec::new();
+                ml.raw().had_out_pass(&y, g.svh, &mut o).unwrap();
+            });
+            let mut xh = vec![f16::ZERO; inn];
+            let (gv_min, gv_med) = time("gemv", &mut || {
+                let mut o = Vec::new();
+                ml.raw()
+                    .gemv_pass(&xh, g.trellis, g.shape, g.mode, &mut o)
+                    .unwrap();
+            });
+            xh.clear();
+            let (fu_min, fu_med) = time("full", &mut || {
+                let _ = ml.try_linear(src, name, &x).unwrap().unwrap();
+            });
+
+            let weights = inn * outp;
+            eprintln!(
+                "{label:8} {inn}x{outp} k={} off(t{}/s{}/{}) · full {fu_min:7.3}/{fu_med:7.3} · gemv {gv_min:6.3}/{gv_med:6.3} · had_in {hi_min:6.3}/{hi_med:6.3} · had_out {ho_min:6.3}/{ho_med:6.3} ms · {:.0} Gw/s",
+                g.shape.k,
+                g.trellis.byte_offset % 4,
+                g.suh.byte_offset % 4,
+                g.svh.byte_offset % 4,
+                weights as f64 / (fu_min / 1000.0) / 1e9,
+            );
         }
     }
 

@@ -32,6 +32,8 @@ pub struct GenerateArgs {
     pub seed: u64,
     /// Debug/bench depth limit (decoder layers actually run).
     pub layers: Option<usize>,
+    /// Use the raw-Metal EXL3 kernels for eligible single-row linears (T2.1).
+    pub metal: bool,
     pub eos: Vec<u32>,
     /// Prepend the tokenizer's BOS id.
     pub bos: bool,
@@ -58,6 +60,7 @@ impl Default for GenerateArgs {
             top_p: 0.95,
             seed: 0,
             layers: None,
+            metal: false,
             eos: vec![1, 106],
             bos: true,
             json: None,
@@ -95,6 +98,7 @@ pub fn usage() -> &'static str {
      \x20 --top-p F              nucleus cutoff, 1.0 = off (default 0.95)\n\
      \x20 --seed N               sampler seed (default 0)\n\
      \x20 --layers N             only run the first N decoder layers (debug/bench)\n\
+     \x20 --metal               raw-Metal EXL3 kernels for eligible linears (T2.1)\n\
      \x20 --eos ID,ID            stop ids (default 1,106)\n\
      \x20 --no-bos               do not prepend the BOS token\n\
      \x20 --json PATH            write the kaplumba-bench/1 report ('-' = stdout)\n\
@@ -135,6 +139,7 @@ pub fn parse_generate(args: &[String]) -> Result<GenerateArgs, String> {
             "--top-p" => out.top_p = parse_num("--top-p", &take_value("--top-p")?)?,
             "--seed" => out.seed = parse_num("--seed", &take_value("--seed")?)?,
             "--layers" => out.layers = Some(parse_num("--layers", &take_value("--layers")?)?),
+            "--metal" => out.metal = true,
             "--eos" => {
                 let v = take_value("--eos")?;
                 out.eos = v

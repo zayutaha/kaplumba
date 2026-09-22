@@ -79,11 +79,14 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 ## Phase 2 — EXL3 decode path
 
 ### T2.1 — Fresh trellis GEMV + dequant kernels
-- [~] In progress. EXL3 trellis decode GEMV + both 128-point Hadamard passes in fresh Metal (`crates/kernels`), wired into the engine decode path with CPU fallback
-- Files: `crates/kernels/src/{lib,exl3}.rs`, `crates/kernels/src/exl3.metal`
-- Test: numerical closeness vs loader reference path; tg/s before/after; pageins=0 in steady decode
+- [x] Done — `crates/kernels` (MSL + Rust host wrapper) carrying the decode-shaped EXL3 path: `exl3_had_in` → `exl3_gemv` → `exl3_had_out`, wired into the engine with the CPU reference as fallback. Commits `b93c007` (kernels + wiring) and this one (measurement + alignment fix)
+- Accuracy vs CPU reference: `had_in` **bit-exact**; `had_out` **≤1 f16 ulp** (FMA contraction in the 128-term sum); GEMV **≤5e-3** relative for K=1..8 on single tiles and on 3 real layer shapes. Host-only model of the pair table reproduces `unpack_trellis_tile`/`tensor_core_perm` for every K (guards the whole class of index bugs)
+- Measured (release, real artifact, per-pass table in notes): **~165–180 Gw/s** decoded weights steady state; gate_proj 5376×21504 K=3 **0.72 ms**, lm_head 5376×262144 **K=6 8.58 ms**; ⇒ **~177 ms/token ≈ 5.6 t/s** decode for this kernel = 4.3× off the 41 ms/24 t/s bandwidth roofline (ALU/latency-bound)
+- Found and fixed: pair table used the 16-wide tile edge instead of 256 samples/tile; `s1` computed from a wrapped index; `lm_head` spans are only 2-byte aligned (trellis now read as u16 pairs)
+- Open (T2.3): Hadamard is O(n²) per 128-block (fast Walsh–Hadamard = 7 butterfly stages is ~36× fewer ops) and each linear uses its own command buffer + sync (~0.15 ms × 420 = 63 ms/token). Also: ~0.8–1.5 s **one-time** Metal residency cost per shard buffer, currently inside TTFT — move to load-time warm-up
+- Files: `crates/kernels/src/{lib,exl3}.rs`, `crates/kernels/src/exl3.metal`, `crates/engine/src/metal_linear.rs`, `crates/engine/src/{gemma4,load}.rs`, `crates/cli/src/{args,main,report}.rs`
+- Test: `cargo test -p kaplumba-engine --lib` (96) + gated real-artifact tests; `--metal` flag on `generate` with `engine.gpu_linears`/`engine.gpu_ms` in the bench report
 - Target: AC4, R3.5, R4.3
-- Commit: `spec/rust-metal-engine: T2.1 trellis gemv`
 
 ### T2.2 — Working-set cap + load hygiene
 - [ ] Metal allocation cap pattern (~92% recommended working set); streaming load; no trellis host/device duplication

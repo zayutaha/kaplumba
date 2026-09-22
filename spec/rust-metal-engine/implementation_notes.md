@@ -93,6 +93,31 @@ Append as work proceeds (AGENTS.md §5). Dense, factual, takeover-oriented. Cont
 - DV3: Two venvs existed due to Python version split — moot for engine once Python retired after T0.2; keep `.venv-baseline` only for reference benches.
 - DV4 (pivot): Entire omlx-based plan abandoned per user no-Python directive; pure Rust + raw Metal (DE15). `scripts/bench.py` Python exception time-boxed (DE20).
 
+## T2.1 measured numbers (2026-09-22, release, M4 Pro)
+
+Commands:
+- Correctness: `cargo test -p kaplumba-engine --lib metal_linear` (fast, synthetic + eligibility) · `KAPLUMBA_RUN_SLOW=1 cargo test --release -p kaplumba-engine --lib real_artifact_linear_matches_cpu_slow -- --nocapture --test-threads=1`
+- Per-pass table: `KAPLUMBA_RUN_SLOW=1 [KAPLUMBA_BENCH_VERBOSE=1] cargo test --release -p kaplumba-engine --lib bench_passes_slow -- --ignored --nocapture --test-threads=1`
+- End to end: `cargo run --release -q -p kaplumba-cli -- generate --prompt "The" --no-bos --max-tokens 1 --temp 0 --metal --json -` (`--layers N` to depth-limit)
+
+GPU kernels (min/median ms over 20 reps, real artifact tensors; `full` = had_in+gemv+had_out in one command buffer):
+
+| tensor | shape (in×out) | K | gemv | had_in | had_out | full | Gw/s |
+|---|---|---|---|---|---|---|---|
+| gate_proj | 5376×21504 | 3 | 0.65/0.72 | 0.15 | 0.25 | 0.65/**0.72** | 177 |
+| down_proj | 21504×5376 | 3 | 0.79/0.82 | 0.15 | 0.14 | 0.81/**0.84** | 144 |
+| o_proj | 8192×5376 | 3 | 0.37/0.38 | 0.17 | 0.14 | 0.38/**0.39** | 118 |
+| lm_head | 5376×262144 | **6** | 8.58/8.71 | 0.17 | 0.28 | **8.58** | 164 |
+
+Facts that matter:
+- Steady-state throughput is **~165–180 Gw/s** of decoded weights (gemv-limited). 30.1e9 weights/token → **~177 ms/token ⇒ ~5.6 t/s decode** for this kernel as-is, vs the 41 ms (24 t/s) bandwidth roofline and 273 GB/s of DRAM. So the decode path is **ALU/latency-bound, ~4.3× off roofline**, not bandwidth-bound.
+- Per-`linear_row` fixed cost ≈ **0.15 ms** (one command buffer + one sync); the had_in/had_out numbers above are almost entirely that overhead (their real work is ~0.15 ms per 20k features). A token issues ~420 linears → ~63 ms/token of pure call overhead. **T2.3: batch a whole token into one command buffer.**
+- **One-time Metal cost per shard buffer: ~0.8–1.5 s.** Evidence: `--layers 0` (lm_head only, shard 2) → 780 ms `gpu_ms`; `--layers 1` → 2288 ms (layer 1's 7 *new* shapes ≈ 215 ms each); `--layers 2..60` → only +0.26 s for 58 more layers (same shapes, buffers already mapped). It is page/residency mapping of the 8.5 GB shard allocations on first touch, charged to whichever call runs first. Do not mistake it for kernel cost; the fix is a load-time warm-up dispatch, not a kernel change.
+- `lm_head` has **K=6** (its trellis is 96 u16 words/tile) while decoder layers are **K=3**; both are handled by the same kernel via the per-K pair table.
+- **Alignment lesson:** `lm_head.trellis` and `lm_head.{suh,svh}` sit at **2-mod-4 byte offsets**, so the trellis is read as u16 pairs (`load_word` in the MSL) and every span only needs 2-byte alignment. A 4-byte rule silently rejected the largest linear in the model.
+- Two bugs found by testing, both worth remembering: (a) the pair table must use **256 samples per tile**, not the 16-wide tile edge (wrong constant ⇒ plausible-looking garbage); (b) `s1` must be derived from the **unwrapped** word index while the two words are loaded at **wrapped** ones — wrapping first gives a negative shift.
+- Accuracy vs the CPU reference: `had_in` **bit-exact**; `had_out` ≤ **1 f16 ulp** (GPU contracts `acc += sh*sign` into an FMA); GEMV ≤ 5e-3 relative over random activations for K=1..8.
+
 ## Baseline numbers
 
 **All of these measure PonyExl3/MLX 0.32.2 (ponyexl3 0.3.0, mlx-lm 0.31.3), NOT this engine** (DE20).

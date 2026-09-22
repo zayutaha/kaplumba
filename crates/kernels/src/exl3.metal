@@ -37,6 +37,11 @@ struct Exl3Params {
     uint pad0;
 };
 
+// One u32 word of the packed trellis = two little-endian u16 words.
+inline uint load_word(device const ushort *tile, uint w) {
+    return (uint)tile[2u * w] | ((uint)tile[2u * w + 1u] << 16);
+}
+
 inline float had_sign(uint i, uint j) {
     return (popcount(i & j) & 1u) ? -as_type<float>(0x3DB504F3u) : as_type<float>(0x3DB504F3u);
 }
@@ -82,7 +87,7 @@ kernel void exl3_had_in(device const half *x [[buffer(0)]],
 // y = had_r_inner(xh @ inner)   (raw f32 output, one thread per out column)
 // ---------------------------------------------------------------------------
 kernel void exl3_gemv(device const half *xh [[buffer(0)]],
-                      device const uint *trellis [[buffer(1)]],
+                      device const ushort *trellis [[buffer(1)]],
                       device const uint *pair_tab [[buffer(2)]],
                       device float *y [[buffer(3)]],
                       constant Exl3Params &p [[buffer(4)]],
@@ -99,7 +104,11 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
     float accB = 0.0f;
 
     for (uint it = 0; it < p.in_tiles; it++) {
-        device const uint *tile = trellis + (ulong)(it * p.out_tiles + ot) * p.twords;
+        // Stride is in u32 words; the tile is addressed as u16 pairs, so a
+        // trellis tensor whose byte offset is only 2-aligned (real artifacts:
+        // lm_head.trellis) still reads correctly.
+        device const ushort *tile =
+            trellis + (ulong)(it * p.out_tiles + ot) * p.twords * 2u;
         uint xrow = it * TILE + r0;
         float x00 = float(xh[xrow]);
         float x01 = float(xh[xrow + 1u]);
@@ -111,8 +120,8 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
             uint i0 = pk & 0xFFu;
             uint i1 = (pk >> 8) & 0xFFu;
             uint s1 = (pk >> 16) & 0xFFu;
-            uint a = tile[i0];
-            uint b = tile[i1];
+            uint a = load_word(tile, i0);
+            uint b = load_word(tile, i1);
             uint w1 = (uint)((((ulong)a) << 32 | (ulong)b) >> s1);
             half lo = exl3_decode((w1 >> p.k) & 0xFFFFu, p.mode);
             half hi = exl3_decode(w1 & 0xFFFFu, p.mode);

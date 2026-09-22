@@ -174,6 +174,10 @@ pub struct RunOutcome<'a> {
     pub stats: &'a GenStats,
     pub text: &'a str,
     pub backend: &'a str,
+    /// Linears actually dispatched to the Metal kernels (0 on the CPU path).
+    pub gpu_linears: u64,
+    /// Wall time inside those dispatches (ms).
+    pub gpu_ms: f64,
     pub n_layers: usize,
     pub weights_bytes: u64,
     pub peak_rss_bytes: u64,
@@ -264,6 +268,8 @@ fn build_report_inner(args: &GenerateArgs, run: &RunOutcome<'_>) -> Value {
         },
         "engine": {
             "name": run.backend,
+            "gpu_linears": run.gpu_linears,
+            "gpu_ms": round3(run.gpu_ms),
             "layers": run.n_layers,
             "layers_run": args.layers.map(|n| n.min(run.n_layers)).unwrap_or(run.n_layers),
             "kv_cache": false,
@@ -304,6 +310,8 @@ mod tests {
             stats,
             text: "hello",
             backend: "rust-naive-cpu",
+            gpu_linears: 0,
+            gpu_ms: 0.0,
             n_layers: 60,
             weights_bytes: 16_028_000_000,
             peak_rss_bytes: 17_000_000_000,
