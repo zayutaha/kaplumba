@@ -547,11 +547,17 @@ impl GpuDecoder {
         let upto = upto_layers.min(self.layers.len());
         let base_pos = cache.len();
         let mut offset = 0usize;
+        let prof = std::env::var_os("KAPLUMBA_SPAN_PROFILE").is_some();
+        let mut prof_encode = 0.0f64;
+        let mut prof_wait = 0.0f64;
+        let mut prof_layers: Vec<(usize, f64)> = Vec::new();
+        let prof_t0 = std::time::Instant::now();
 
         while offset < tokens.len() {
             let m = (tokens.len() - offset).min(self.batch_rows);
             let pos0 = base_pos + offset;
             let is_last = offset + m == tokens.len();
+            let t_enc = std::time::Instant::now();
 
             // Host: the chunk's embeddings (bf16 → f16 ×√hidden) into ring slot 0.
             {
@@ -565,8 +571,8 @@ impl GpuDecoder {
                 }
             }
 
-            let cb = gpu.new_command_buffer();
-            let enc = cb.new_compute_command_encoder();
+            let mut cb = gpu.new_command_buffer();
+            let mut enc = cb.new_compute_command_encoder();
             for i in 0..upto {
                 let lw = &self.layers[i];
                 let x_in = &self.x[(2 * i) % 3];
@@ -732,6 +738,17 @@ impl GpuDecoder {
                     hidden * m,
                     lw.scalar,
                 )?;
+                if prof {
+                    // One command buffer per layer so each layer's GPU time is
+                    // measurable in isolation (queue order still serializes).
+                    let t = std::time::Instant::now();
+                    enc.end_encoding();
+                    cb.commit();
+                    cb.wait_until_completed();
+                    prof_layers.push((i, t.elapsed().as_secs_f64() * 1e3));
+                    cb = gpu.new_command_buffer();
+                    enc = cb.new_compute_command_encoder();
+                }
             }
 
             // Final norm + lm_head only on the last chunk, on the last row.
@@ -752,11 +769,44 @@ impl GpuDecoder {
                 )?;
                 gpu.encode_linear(enc, &self.lm, &self.xn_final, &self.logits_h, 1)?;
             }
+            if prof {
+                prof_encode += t_enc.elapsed().as_secs_f64() * 1e3;
+            }
             enc.end_encoding();
+            let t_w = std::time::Instant::now();
             cb.commit();
             cb.wait_until_completed();
+            if prof {
+                prof_wait += t_w.elapsed().as_secs_f64() * 1e3;
+            }
 
             offset += m;
+        }
+        if prof {
+            let sum: f64 = prof_layers.iter().map(|(_, t)| t).sum();
+            eprintln!(
+                "[span profile] chunks encode={prof_encode:.1}ms wait={prof_wait:.1}ms total={:.1}ms",
+                prof_t0.elapsed().as_secs_f64() * 1e3
+            );
+            if !prof_layers.is_empty() {
+                let first: Vec<String> = prof_layers
+                    .iter()
+                    .take(6)
+                    .map(|(i, t)| format!("L{i}:{t:.1}"))
+                    .collect();
+                let last: Vec<String> = prof_layers
+                    .iter()
+                    .rev()
+                    .take(6)
+                    .rev()
+                    .map(|(i, t)| format!("L{i}:{t:.1}"))
+                    .collect();
+                eprintln!(
+                    "[span profile] per-layer GPU ms sum={sum:.0} first {} last {}",
+                    first.join(" "),
+                    last.join(" "),
+                );
+            }
         }
 
         // Mirror the host path: reserve_rows advanced per-layer counts; advance

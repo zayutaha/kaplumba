@@ -1274,6 +1274,345 @@ mod tests {
         }
     }
 
+    /// T3.6: attribute one 256-row prefill chunk's wall time to linears /
+    /// attention / glue on the real artifact (both layer kinds), then compare
+    /// the projected budget against a measured real 256-token span forward.
+    /// Every sample is encode + commit + wait on an idle queue, so it is real
+    /// GPU time. Not a correctness test.
+    #[test]
+    fn phase_profile_chunk_budget_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = crate::testutil::artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let Some(c) = ctx() else { return };
+        let model = crate::load::load_exl3(&c, &dir).expect("load artifact");
+        let ml = MetalLinear::new(&c).expect("metal linear");
+        let src: &dyn TensorSource = &model;
+        let rows = 256usize;
+        let dev = c.device();
+        let mk = |elems: usize| {
+            dev.new_buffer(
+                (elems * 2) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let mkf32 = |elems: usize| {
+            dev.new_buffer(
+                (elems * 4) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+        };
+        fn sp(b: &metal::Buffer) -> DeviceSpan<'_> {
+            DeviceSpan {
+                buffer: b,
+                byte_offset: 0,
+            }
+        }
+        let time_ms = |f: &dyn Fn(&metal::ComputeCommandEncoderRef)| -> f64 {
+            let mut best = f64::MAX;
+            for _ in 0..3 {
+                let t0 = std::time::Instant::now();
+                let cb = ml.new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                f(enc);
+                enc.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                let dt = t0.elapsed().as_secs_f64() * 1e3;
+                if dt < best {
+                    best = dt;
+                }
+            }
+            best
+        };
+
+        // ---- linears (real weights, sg path, encode_linear = had+gem+had) ----
+        let linear_ms = |name: &str| -> f64 {
+            let handles = linear_handles(src, name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let inn = handles.shape.in_features();
+            let out_f = handles.shape.out_features();
+            let elig = handles.shape.in_tiles % 2 == 0
+                && handles.shape.out_tiles % 4 == 0
+                && handles.trellis().byte_offset % 4 == 0;
+            eprintln!(
+                "    {name}: in_tiles={} out_tiles={} k={} off%4={} sg_eligible={elig}",
+                handles.shape.in_tiles,
+                handles.shape.out_tiles,
+                handles.shape.k,
+                handles.trellis().byte_offset % 4,
+            );
+            let xb = mk(rows * inn);
+            let yb = mk(rows * out_f);
+            time_ms(&|enc: &metal::ComputeCommandEncoderRef| {
+                ml.encode_linear(enc, &handles, &xb, &yb, rows)
+                    .expect("encode_linear")
+            })
+        };
+        let prefix = |i: usize, m: &str| format!("model.language_model.layers.{i}.{m}");
+        let l0_names = [
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.v_proj",
+            "self_attn.o_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        ];
+        let l5_names = [
+            "self_attn.q_proj",
+            "self_attn.k_proj",
+            "self_attn.o_proj",
+            "mlp.gate_proj",
+            "mlp.up_proj",
+            "mlp.down_proj",
+        ];
+        eprintln!("=== chunk budget profile (rows={rows}, real artifact) ===");
+        eprintln!("-- linears (ms, one call each, includes had_in/out)");
+        let mut l0_sum = 0.0;
+        for m in l0_names {
+            let ms = linear_ms(&prefix(0, m));
+            l0_sum += ms;
+            eprintln!("  L0 sliding {m:24} {ms:8.2}");
+        }
+        let mut l5_sum = 0.0;
+        for m in l5_names {
+            let ms = linear_ms(&prefix(5, m));
+            l5_sum += ms;
+            eprintln!("  L5 full    {m:24} {ms:8.2}");
+        }
+        eprintln!("  sliding layer sum {l0_sum:.2} ms | full layer sum {l5_sum:.2} ms");
+
+        // lm_head once per prompt (rows=1 gemv).
+        let lm_handles = linear_handles(src, "lm_head").expect("lm_head");
+        let lm_x = mk(lm_handles.shape.in_features());
+        let lm_y = mk(lm_handles.shape.out_features());
+        let lm_head_ms = time_ms(&|enc: &metal::ComputeCommandEncoderRef| {
+            ml.encode_linear(enc, &lm_handles, &lm_x, &lm_y, 1)
+                .expect("lm_head")
+        });
+
+        // ---- attention ----
+        let attn_ms = |s: usize,
+                       kv_rows: usize,
+                       q_pos0: usize,
+                       kv_pos0: usize,
+                       n_heads: usize,
+                       n_kv: usize,
+                       hd: usize,
+                       window: usize|
+         -> f64 {
+            let q = mk(s * n_heads * hd);
+            let kv = mk(kv_rows * n_kv * hd);
+            let o = mk(s * n_heads * hd);
+            time_ms(&|enc: &metal::ComputeCommandEncoderRef| {
+                ml.encode_attention(
+                    enc,
+                    sp(&q),
+                    sp(&kv),
+                    sp(&kv),
+                    sp(&o),
+                    AttnParams {
+                        s,
+                        kv_rows,
+                        q_pos0,
+                        kv_pos0,
+                        n_heads,
+                        n_kv,
+                        head_dim: hd,
+                        window,
+                    },
+                )
+                .expect("encode_attention")
+            })
+        };
+        eprintln!("-- attention (ms per dispatch)");
+        let sl0 = attn_ms(256, 256, 0, 0, 32, 16, 256, 1024);
+        let sl1 = attn_ms(256, 512, 256, 0, 32, 16, 256, 1024);
+        let sl2 = attn_ms(256, 1024, 7936, 6913, 32, 16, 256, 1024);
+        let fl0 = attn_ms(256, 256, 0, 0, 32, 4, 512, 0);
+        let fl1 = attn_ms(256, 512, 256, 0, 32, 4, 512, 0);
+        let fl4 = attn_ms(256, 4096, 3840, 0, 32, 4, 512, 0);
+        let fl8 = attn_ms(256, 8192, 7936, 0, 32, 4, 512, 0);
+        eprintln!("  sliding kv=256/512/1024: {sl0:.2} / {sl1:.2} / {sl2:.2}");
+        eprintln!("  full    kv=256/512/4096/8192: {fl0:.2} / {fl1:.2} / {fl4:.2} / {fl8:.2}");
+
+        // ---- glue (norms/rope/copy/add/gelu) ----
+        let gm = crate::gemma4::Gemma4Model::from_model(&model)
+            .expect("cfg")
+            .with_gpu(&ml);
+        let eps = gm.cfg.eps as f32;
+        let xh = [mk(rows * 5376), mk(rows * 5376), mk(rows * 5376)];
+        let xn = mk(rows * 5376);
+        let o_norm = mk(rows * 5376);
+        let gu_gate = mk(rows * 21504);
+        let gu_up = mk(rows * 21504);
+        let gu = mk(rows * 21504);
+        let w_hidden = mkf32(5376);
+        let w256 = mkf32(256);
+        let w512 = mkf32(512);
+        eprintln!("-- glue (ms per dispatch)");
+
+        let rope_glue = |hd: usize, n_heads_q: usize, n_kv: usize, has_v: bool| -> (f64, f64) {
+            // returns (hidden-glue ms for this layer kind, head-glue ms)
+            let hh = hd / 2;
+            let ctab = mkf32((8192 + 512) * hh);
+            let stab = mkf32((8192 + 512) * hh);
+            let q_raw = mk(rows * n_heads_q * hd);
+            let q = mk(rows * n_heads_q * hd);
+            let k_raw = mk(rows * n_kv * hd);
+            let k_norm = mk(rows * n_kv * hd);
+            let v_raw = mk(rows * n_kv * hd);
+            let vcache = mk(rows * n_kv * hd);
+            let w_qk: &metal::Buffer = if hd == 256 { &w256 } else { &w512 };
+
+            let mut hidden = 0.0;
+            // 4 hidden-sized rms per layer.
+            for (xin, w) in [
+                (&xh[0], Some(&w_hidden)),
+                (&o_norm, Some(&w_hidden)),
+                (&xh[1], Some(&w_hidden)),
+                (&xh[2], Some(&w_hidden)),
+            ] {
+                hidden += time_ms(&|enc: &metal::ComputeCommandEncoderRef| {
+                    ml.encode_rms(enc, sp(xin), w.map(|b| sp(b)), sp(&xn), rows, 5376, eps)
+                        .expect("rms hidden")
+                });
+            }
+            // residual add + gelu_mul + add_scale.
+            hidden += time_ms(&|enc: &metal::ComputeCommandEncoderRef| {
+                ml.encode_add(enc, sp(&xh[0]), sp(&o_norm), sp(&xh[2]), rows * 5376)
+                    .expect("add")
+            });
+            hidden += time_ms(&|enc: &metal::ComputeCommandEncoderRef| {
+                ml.encode_gelu_mul(enc, sp(&gu_gate), sp(&gu_up), sp(&gu), rows * 21504)
+                    .expect("gelu_mul")
+            });
+            hidden += time_ms(&|enc: &metal::ComputeCommandEncoderRef| {
+                ml.encode_add_scale(enc, sp(&xh[1]), sp(&xn), sp(&xh[0]), rows * 5376, 0.5)
+                    .expect("add_scale")
+            });
+
+            let mut head = 0.0;
+            head += time_ms(&|enc: &metal::ComputeCommandEncoderRef| {
+                ml.encode_rms(
+                    enc,
+                    sp(&q_raw),
+                    Some(sp(w_qk)),
+                    sp(&q),
+                    rows * n_heads_q,
+                    hd,
+                    eps,
+                )
+                .expect("rms q_norm")
+            });
+            head += time_ms(&|enc: &metal::ComputeCommandEncoderRef| {
+                ml.encode_rms(
+                    enc,
+                    sp(&k_raw),
+                    Some(sp(w_qk)),
+                    sp(&k_norm),
+                    rows * n_kv,
+                    hd,
+                    eps,
+                )
+                .expect("rms k_norm")
+            });
+            head += time_ms(&|enc: &metal::ComputeCommandEncoderRef| {
+                ml.encode_rope(
+                    enc,
+                    sp(&q),
+                    sp(&ctab),
+                    sp(&stab),
+                    sp(&q_raw),
+                    n_heads_q,
+                    hd,
+                    7936,
+                    rows,
+                )
+                .expect("rope q")
+            });
+            head += time_ms(&|enc: &metal::ComputeCommandEncoderRef| {
+                ml.encode_rope(
+                    enc,
+                    sp(&k_norm),
+                    sp(&ctab),
+                    sp(&stab),
+                    sp(&vcache),
+                    n_kv,
+                    hd,
+                    7936,
+                    rows,
+                )
+                .expect("rope k")
+            });
+            if has_v {
+                head += time_ms(&|enc: &metal::ComputeCommandEncoderRef| {
+                    ml.encode_copy(enc, sp(&v_raw), sp(&vcache), rows * n_kv * hd)
+                        .expect("copy v")
+                });
+            } else {
+                head += time_ms(&|enc: &metal::ComputeCommandEncoderRef| {
+                    ml.encode_rms(enc, sp(&k_raw), None, sp(&v_raw), rows * n_kv, hd, eps)
+                        .expect("weightless rms v")
+                });
+            }
+            (hidden, head)
+        };
+        let (sl_hid, sl_head) = rope_glue(256, 32, 16, true);
+        let (fl_hid, fl_head) = rope_glue(512, 32, 4, false);
+        let sl_glue = sl_hid + sl_head;
+        let fl_glue = fl_hid + fl_head;
+        eprintln!(
+            "  sliding layer: hidden {sl_hid:.2} + head {sl_head:.2} = {sl_glue:.2} ms | \
+             full layer: hidden {fl_hid:.2} + head {fl_head:.2} = {fl_glue:.2} ms"
+        );
+
+        // ---- real 256-span wall ----
+        let mut kv_w = gm.new_kv_cache(264);
+        gm.forward_cached(&mut kv_w, &[2, 3, 4, 5, 6, 7, 8, 9])
+            .expect("warmup forward");
+        let tokens: Vec<u32> = (0..256u32).map(|i| (i % 997) + 2).collect();
+        let mut kv = gm.new_kv_cache(264);
+        let t0 = std::time::Instant::now();
+        let logits = gm.forward_cached(&mut kv, &tokens).expect("256 span");
+        let wall_ms = t0.elapsed().as_secs_f64() * 1e3;
+        assert_eq!(logits.len(), gm.cfg.vocab);
+
+        let proj = |sl_attn: f64, fl_attn: f64| -> (f64, f64, f64, f64, f64) {
+            let lin = 50.0 * l0_sum + 10.0 * l5_sum;
+            let glue = 50.0 * sl_glue + 10.0 * fl_glue;
+            let attn = 50.0 * sl_attn + 10.0 * fl_attn;
+            (lin, glue, attn, lin + glue + attn + lm_head_ms, lm_head_ms)
+        };
+        // First chunk of any prompt: both kinds see causal kv=256.
+        let (p1l, p1g, p1a, p1t, _) = proj(sl0, fl0);
+        // 512-prompt average chunk: kv 256 then 512 -> mean of those cases.
+        let (p2l, p2g, p2a, p2t, _) = proj((sl0 + sl1) / 2.0, (fl0 + fl1) / 2.0);
+        // 8k mid chunk: sliding at window cap, full at kv≈4096 (prompt average).
+        let (p3l, p3g, p3a, p3t, lmt) = proj(sl2, fl4);
+        eprintln!("-- projections (ms per 256-row chunk, 50 sliding + 10 full)");
+        eprintln!(
+            "  first chunk:  linears {p1l:.0} + glue {p1g:.0} + attn {p1a:.0} + head {lmt:.1} = {p1t:.0}"
+        );
+        eprintln!(
+            "  512-avg:      linears {p2l:.0} + glue {p2g:.0} + attn {p2a:.0} + head {lmt:.1} = {p2t:.0}"
+        );
+        eprintln!(
+            "  8k mid:       linears {p3l:.0} + glue {p3g:.0} + attn {p3a:.0} + head {lmt:.1} = {p3t:.0}"
+        );
+        eprintln!(
+            "MEASURED real 256-span wall: {wall_ms:.0} ms ({:.1} t/s) | \
+             budget first-chunk {p1t:.0} ms | unaccounted {:+.0} ms",
+            256000.0 / wall_ms,
+            wall_ms - p1t,
+        );
+    }
+
     #[test]
     fn shape_derivation_matches_artifact_convention() {
         let shape = Exl3Shape::new(3840, 3072, 3).unwrap();

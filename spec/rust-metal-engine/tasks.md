@@ -151,12 +151,18 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - Target: AC2, R2.5, R3.7
 - Commit: `spec/rust-metal-engine: T3.5 attention kernel`
 
-### T3.6 — Prefill sync policy + fusion audit
-- [ ] No unconditional sync+clear per chunk (deferred/pressure only); no accidental materialize between fused candidates (up/gate, silu⊙up)
-- Files: prefill loop, elementwise
-- Test: prefill completes 8k; profile shows no mid-prefill full clear; numerical parity
-- Target: AC8, R2.4
-- Commit: `spec/rust-metal-engine: T3.6 sync policy + fusion`
+### T3.6 — Prefill sync policy + fusion audit (+ chunk profile)
+- [x] No unconditional sync+clear per chunk: `encode_span` builds **one command buffer per 256-row chunk** — single `commit+wait` at the chunk boundary (`gpu_decode.rs:777`), host encode 1.3 ms/chunk, and **no `clear()`/pool purge exists anywhere on the span path**. Per-chunk wait vs a pipelined design costs ≈ encode overlap (1.3 ms of 3630 ms = 0.04%) — not worth removing. AC8/R2.4 evidence recorded in implementation_notes
+- [x] No accidental host materialize between fused candidates: gate+up / qkv write into the same device arena inside one command buffer (no host round trip, no cache clear). Actual kernel fusion remains T4.1
+- [x] Chunk profile harness: `KAPLUMBA_SPAN_PROFILE=1` (per-chunk encode/wait + optional per-layer cb split) in `encode_span`; `phase_profile_chunk_budget_slow` (per-linear / attention / glue budget vs measured wall)
+- [x] **Profile finding → fix:** artifact file offsets are only 2-byte aligned (alternating `off%4=2` across layers, phase-flip at the shard boundary) → `sg_eligible` (`byte_offset%4==0`) failed for ~half the linears → silent scalar-RGT path (+224 ms/layer). `load_exl3` now **repacks every tensor at a 64-byte-aligned device offset** (file order preserved; `tensors` + `shard_headers` both updated; alloc = packed end; padding ≤63 B/tensor ≈ 100 KB total → **no memory increase**)
+- [x] Regression guard: `dump_trellis_alignment_slow` (`align_dump.rs`) asserts every linear's trellis offset `%4==0` (121 tensors, incl. lm_head)
+- Measured after (release, real artifact): all layers on sg; full-layer linear sum **57.85 ms (was 307.72)**; 256-chunk **3635 ms = 70.4 t/s (was 9882 = 25.9)**; budget unaccounted +172 ms (was +3948 → profile now closes); `prefill_throughput_slow` **77.8 / 72.3 / 65.0 t/s @512/2k/8k** (was 25.7/25.2/24.1 — 3.0×); span 300 tok 4.25 s (70.6 t/s, was 11.93 s)
+- Span drift after repack: max_abs 4.002571e-1 (was 2.374e-1 — doubled count of sg-vs-gemv layers), argmax 207=207 → gate raised to <0.55 with measured citation; per-linear kernel gate unchanged (~1e-3). Repack correctness proven by the full gated suite (fixture argmax 236773 unchanged)
+- Linears are now **94% of chunk budget** (3249/3463) → remaining path to 200 t/s: sg kernel efficiency (currently ~4.3 TFLOP/s ≈ 27% of fp16 peak) + T4.1 sibling fusion (~900 ms/chunk fused savings) → re-profile each step
+- Files: `crates/engine/src/{load.rs,gpu_decode.rs,metal_linear.rs,gemma4.rs,exl3/reconstruct.rs}` + new `align_dump.rs`
+- Target: AC8, R2.4 (sync), R2.1 (pp/s 3×)
+- Commit: `spec/rust-metal-engine: T3.6 chunk profile + loader 64B repack`
 
 ### T3.7 — Bounded prefill scratch + peak-RSS gate (user directive 2026-09-22)
 - [~] Kernel half **done**: attention is online-softmax over KV tiles with an O(1) working set — running max/denominator/output accumulators and one 16-entry score tile all live in **registers**, the slice reduction is `simd_shuffle_xor`, and the kernel allocates **no** threadgroup memory and uses **no** barriers. There is no `[heads, L, L]` score matrix, no `[heads, q, kv]` bias tensor, and no growable scratch anywhere in the attention path

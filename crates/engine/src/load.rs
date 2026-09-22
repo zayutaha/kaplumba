@@ -436,7 +436,6 @@ pub fn load_exl3(ctx: &MetalContext, dir: impl AsRef<Path>) -> Result<Exl3Model,
 
     // Parse headers first (fail fast before any large alloc).
     let mut shard_headers: HashMap<String, HashMap<String, TensorInfo>> = HashMap::new();
-    let mut shard_sizes: HashMap<String, u64> = HashMap::new();
     let mut tensors: HashMap<String, TensorInfo> = HashMap::new();
     let mut total: u64 = 0;
 
@@ -460,17 +459,14 @@ pub fn load_exl3(ctx: &MetalContext, dir: impl AsRef<Path>) -> Result<Exl3Model,
                 )));
             }
         }
-        let mut size = 0u64;
         for (name, info) in &indexed {
             if tensors.contains_key(name) {
                 return Err(LoadError::Duplicate(name.clone()));
             }
-            size += info.nbytes;
             total += info.nbytes;
             tensors.insert(name.clone(), info.clone());
         }
         shard_headers.insert(shard.clone(), indexed);
-        shard_sizes.insert(shard.clone(), size);
     }
 
     for name in weight_map.keys() {
@@ -485,26 +481,45 @@ pub fn load_exl3(ctx: &MetalContext, dir: impl AsRef<Path>) -> Result<Exl3Model,
     }
 
     // Allocate + stream each shard.
+    //
+    // Device layout: tensors are repacked at **64-byte-aligned** offsets (file
+    // order preserved). The artifact's file offsets are only 2-byte aligned
+    // (alternating `off % 4 == 2` across layers), which would fail
+    // `sg_eligible`'s `trellis.byte_offset % 4 == 0` for ~half the linears and
+    // silently drop them onto the scalar RGT path (~5x slower prefill — see
+    // spec/rust-metal-engine implementation_notes T3.6). Padding cost is
+    // ≤63 B per tensor (~100 KB total).
     const STAGE: usize = 8 * 1024 * 1024;
     let mut stage = vec![0u8; STAGE];
     let mut shards: HashMap<String, Shard> = HashMap::new();
 
     for shard in &shard_names {
         let path = dir.join(shard);
-        let size = shard_sizes[shard];
-        let buf = ctx.new_shared_buffer(size as usize);
-        if buf.contents().is_null() || buf.length() < size {
-            return Err(LoadError::Alloc {
-                what: shard.clone(),
-                nbytes: size,
-            });
-        }
         let header_len = read_shard_header_len(&path)?;
         let data_start = 8 + header_len;
 
-        let mut entries: Vec<(&String, &TensorInfo)> =
-            shard_headers[shard].iter().map(|(n, i)| (n, i)).collect();
-        entries.sort_by_key(|(n, _)| n.as_str());
+        // (name, file_offset, nbytes) sorted by file offset -> packed device offsets.
+        let mut by_file: Vec<(String, u64, u64)> = shard_headers[shard]
+            .iter()
+            .map(|(n, i)| (n.clone(), i.data_offset, i.nbytes))
+            .collect();
+        by_file.sort_by_key(|(_, off, _)| *off);
+        let mut dev = 0u64;
+        let mut layout: Vec<(String, u64, u64, u64)> = Vec::with_capacity(by_file.len());
+        for (name, file_off, nbytes) in by_file {
+            dev = dev.div_ceil(64) * 64;
+            layout.push((name, file_off, dev, nbytes));
+            dev += nbytes;
+        }
+        let packed = dev;
+
+        let buf = ctx.new_shared_buffer(packed as usize);
+        if buf.contents().is_null() || buf.length() < packed {
+            return Err(LoadError::Alloc {
+                what: shard.clone(),
+                nbytes: packed,
+            });
+        }
 
         let mut f = File::open(&path).map_err(|source| LoadError::Io {
             path: path.clone(),
@@ -512,14 +527,15 @@ pub fn load_exl3(ctx: &MetalContext, dir: impl AsRef<Path>) -> Result<Exl3Model,
         })?;
         let ptr = buf.contents() as *mut u8;
 
-        for (_name, info) in entries {
-            f.seek(SeekFrom::Start(data_start + info.data_offset))
+        let mut updates: Vec<(String, u64)> = Vec::with_capacity(layout.len());
+        for (name, file_off, dev_off, nbytes) in layout {
+            f.seek(SeekFrom::Start(data_start + file_off))
                 .map_err(|source| LoadError::Io {
                     path: path.clone(),
                     source,
                 })?;
-            let mut remaining = info.nbytes;
-            let mut off = info.data_offset;
+            let mut remaining = nbytes;
+            let mut off = dev_off;
             while remaining > 0 {
                 let chunk = remaining.min(STAGE as u64) as usize;
                 f.read_exact(&mut stage[..chunk])
@@ -533,13 +549,22 @@ pub fn load_exl3(ctx: &MetalContext, dir: impl AsRef<Path>) -> Result<Exl3Model,
                 off += chunk as u64;
                 remaining -= chunk as u64;
             }
+            updates.push((name, dev_off));
+        }
+
+        // Point every consumer at the device offset (both maps hold clones).
+        for (name, dev_off) in updates {
+            if let Some(info) = shard_headers.get_mut(shard).and_then(|m| m.get_mut(&name)) {
+                info.data_offset = dev_off;
+            }
+            if let Some(info) = tensors.get_mut(&name) {
+                info.data_offset = dev_off;
+            }
         }
 
         shards.insert(shard.clone(), Shard { buffer: buf });
     }
 
-    // Fix tensor.shard-relative data_offset already equals file data offset
-    // which matches buffer layout (packed = original safetensors layout).
     Ok(Exl3Model {
         dir,
         config,

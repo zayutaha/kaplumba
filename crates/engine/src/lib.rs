@@ -17,6 +17,9 @@ pub mod load;
 pub mod metal_ctx;
 pub mod metal_linear;
 pub mod sampler;
+
+#[cfg(test)]
+mod align_dump;
 #[cfg(test)]
 pub(crate) mod testutil;
 pub mod tokenizer;

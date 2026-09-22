@@ -267,9 +267,11 @@ pub fn trellis_bytes_as_u16(bytes: &[u8]) -> Vec<u16> {
 
 /// Zero-copy view of trellis bytes as u16 words (little-endian hosts only).
 ///
-/// Safetensors offsets are 64-byte aligned, so the 2-byte alignment holds for
-/// artifact-backed slices. Copies nothing — the forward path relies on this to
-/// avoid duplicating 15.5 GB of trellis per token.
+/// The loader repacks every tensor at a 64-byte-aligned device offset
+/// (`load_exl3`), which implies 2-byte alignment — note the *file* offsets are
+/// only 2-byte aligned (alternating `off % 4`), so this relies on the repack,
+/// not on the safetensors header. Copies nothing — the forward path relies on
+/// this to avoid duplicating 15.5 GB of trellis per token.
 pub fn trellis_u16_view(bytes: &[u8]) -> &[u16] {
     assert_eq!(bytes.len() % 2, 0, "trellis byte length must be even");
     assert_eq!(

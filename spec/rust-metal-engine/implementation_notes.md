@@ -455,6 +455,38 @@ Blocking work, in the order the measurements justify it:
 - Next performance work = **T3.6** (sync policy + fusion audit): instrument chunk path for attention vs glue vs wait time; remove any per-phase commit/wait; fuse gate+up / qkv. Levers beyond that: T3.3 load-time packing, sibling fusion (T4.1) for prefill too, larger sg BM. Do **not** chase more GEMM micro-opts before the non-linear split is measured — linears cap at 79 t/s anyway, far under 200.
 - Roofline reminder: 200 t/s @ rows=256 ≈ 12.4 TFLOP/s dense ⇒ needs *both* ~2× better linears *and* near-zero glue/sync, or a different tiling strategy; re-plan after the T3.6 profile numbers exist.
 
+## T3.6 — chunk profile + loader 64B repack (2026-09-23)
+
+**Why:** after T3.4 the measured pp/s was still 25.x while the linear-only budget predicted ~6.0 s/chunk — needed a per-layer/per-linear split of a real 256-row chunk to find where the ~4 s went.
+
+**Profile tooling (keep — this is the re-profile harness):**
+- `KAPLUMBA_SPAN_PROFILE=1` in `encode_span` (`gpu_decode.rs:529`): per-chunk host encode/wait ms + optional per-layer command-buffer split (`prof_layers`, one cb+commit+wait per layer for isolation; queue order still serializes). Non-prof = one cb per chunk, single commit+wait at `:777`.
+- `phase_profile_chunk_budget_slow` (`metal_linear.rs`): per-kind linears on real shapes (rows=256), 6 attention cases (sliding kv 256/512/1024; full kv 256/512/4096/8192), glue per layer kind, real 256-span wall + first-chunk / 512-avg / 8k-mid projections.
+- `metal-rs 0.33.0` has **no** `gpu_start_time`/`gpu_end_time` — cb-split or encode/wait split are the only GPU timing options.
+
+**Sync audit (T3.6 checkbox evidence):** non-prof host encode = 1.3 ms/chunk; the wait is the drain of that chunk's single cb. **No `clear()`/pool purge exists on the span path** (`xh.clear()` is tests, `scores.clear()` is CPU). Pipelining encode of chunk n+1 against GPU of chunk n would save ≈ 1.3 ms of 3630 ms = 0.04% — not worth the complexity. AC8/R2.4 satisfied as-is. No host materialize between fused candidates: gate+up/qkv write the device arena inside one cb (actual kernel fusion = T4.1).
+
+**The finding — loader alignment (the entire 3× win):**
+- `dump_trellis_alignment_slow` (`align_dump.rs`, gated) prints/asserts every linear's `trellis().byte_offset % 4` across 60 layers + lm_head. Before fix: **alternating — even layers 0, odd layers 2**, phase-flip at the shard boundary (L30/L31 both 0), lm_head 2. The `reconstruct.rs` header comment "Safetensors offsets are 64-byte aligned" was **wrong for this artifact**: file offsets are only 2-byte aligned (net bytes per layer ≡ 2 mod 4 — e.g. `layer_scalar` is 2 bytes — flips parity each layer).
+- Consequence: `sg_eligible` requires `byte_offset % 4 == 0` (`exl3.rs:473`) → **~half the linears silently took the scalar RGT=8 path**. This explained: L5 full-layer sum 307.72 vs L0 sliding 53.61 ms on identical shapes (L5 gate 66.48 vs L0 gate 12.03); per-layer GPU times alternating ~53 / ~277 ms; budget projection 6024 ms vs measured wall 9884 ms — gap arithmetic: ~19 sliding layers × +224 ms ≈ 4256 ≈ 3948 measured unaccounted (closes).
+- Fix in `load_exl3` (`load.rs`): per shard, sort tensors by file offset, assign packed `dev = align_up_64(dev)` offsets, stream file→device at those offsets, then update `TensorInfo.data_offset` in **both** `shard_headers` and `tensors` (both hold clones of the original). Alloc = packed end; `shard_sizes` map deleted (dead). `tensor_bytes` / `tensor_device_span` read the same mutated offsets → zero-copy view invariant unchanged. Memory: ≤63 B padding × ~1500 tensors ≈ 100 KB — **no memory increase** (user directive holds).
+- Guard: `dump_trellis_alignment_slow` now **asserts** all `%4==0` (121 tensors incl. lm_head). Post-fix lm_head also 0 (still rows=1 → gemv regardless).
+- Doc fix: `reconstruct.rs:270` comment now says alignment comes from the loader repack, not from safetensors.
+
+**Measured after (release, M4 Pro, real artifact):**
+- L5 full layer: **57.85 ms (was 307.72)**; per-layer GPU uniform ~53 ms sliding / ~59 ms full, no alternation; warmup L0 18.2 ms (first-call shader compile).
+- 256-chunk: **3635 ms = 70.4 t/s (was 9882 = 25.9)**; budget 3463 → unaccounted **+172 ms** (was +3948) — profile closes.
+- Budget split: linears 3249 ms (**94%**), glue 142 (3.9%), attn 66 (kv256) … 684 (8k-mid), head 7.
+- `prefill_throughput_slow` → `/tmp/prefill_bench.log`: **77.8 / 72.3 / 65.0 t/s @ 512 / 2048 / 8192** (was 25.7/25.2/24.1 — ×3.02/2.87/2.70; 13.0×/12.1×/10.9× vs live token-loop 5.99 t/s). Span 300 tok: **4.25 s (70.6 t/s)**, was 11.93 s.
+- Attention unchanged/cheap (not the bottleneck): sliding kv256/512/1024 = 1.08/2.48/5.24 ms; full kv256/512/4096/8192 = 1.45/4.03/40.65/90.81 ms; glue 2.15–2.31 ms/layer.
+- Span drift: max_abs **4.002571e-1** (was 2.3743033e-1 — the count of sg-vs-gemv layers doubled), n_diff 258499, argmax 207=207 → bound 0.35 → **0.55** with the new measured citation; kernel gate unchanged (batched-vs-gemv worst 9.76e-4). Repack correctness proven by the whole gated suite (fixture argmax 236773 unchanged).
+- **Tests at this commit:** gated suite **113 passed / 3 ignored / 0 failed** (`--test-threads=1`, `KAPLUMBA_RUN_SLOW=1`), kernels 15 passed, fast suite 113 passed, `cargo fmt` clean. Attention-CPU, greedy, replay-determinism, chunk-invariance, alignment assert all green.
+
+**Next (linears = 94% of the budget now — the 75%-outside-linears finding from T3.4 is obsolete):**
+- Path to 200 t/s: chunk ≤ ~1280 ms ⇒ linears ≈ ≤1000 ms ≈ 13.8 TFLOP/s ≈ 86% of 16 fp16 peak. Realistic combo: (a) sg kernel efficiency — current ~4.3 TFLOP/s ≈ 27% of peak (occupancy / BM / BN / wblk staging), (b) T4.1 sibling fusion — gate+up 24→12 ms and qkv 11→8 ms per layer ⇒ ~900 ms/chunk ≈ +16%, (c) glue/attention remain secondary. Re-profile after each lever with the harness above before adding more machinery.
+- Decode **unaffected** by the repack (rows=1 → gemv; gemv never needed 4-byte offsets) — still ~5.6–6.2 t/s baseline; T4.1 + T2.3 remain the decode path to ≥18.
+- MTP drafter (`gemma-4-31B-it-qat-assistant-4bit`) still gated: only after ≥18 t/s **and** 100% coherency, temp 1.0 / top_k 64, target 28 t/s.
+
 ## T4.2 — one command buffer per decode token (2026-09-22)
 
 **Problem:** the cached/GPU decode path encoded each of the ~471 dispatches per token (411 linears + 60 attentions + glue) into its own command buffer with `commit`+`wait_until_completed` — ~0.4 ms of CPU submit/wait each ⇒ **~180 ms of a ~275 ms token was pure overhead** (kernel time only ~93 ms).

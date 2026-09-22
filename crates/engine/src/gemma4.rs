@@ -2126,12 +2126,15 @@ mod tests {
     /// all but boundary cases. Over 60 layers that is expected to perturb
     /// some logits slightly while leaving the token identity intact — which
     /// is what the spec actually gates (R8.1 greedy token-identity, OQ1,
-    /// fixture 236773). Measured with the simdgroup GEMM path: max_abs =
-    /// 2.3743033e-1 over 262144 logits, n_diff = 254424, argmax identical
-    /// (207 = 207); the per-linear bound comes from
+    /// fixture 236773). Measured with the simdgroup GEMM path on every
+    /// linear (post loader-repack, T3.6): max_abs = 4.002571e-1 over 262144
+    /// logits, n_diff = 258499, argmax identical (207 = 207); before the
+    /// repack (half the layers still scalar-RGT) it was 2.3743033e-1 — the
+    /// drift tracks how many layers use a non-GEMV summation order, and is
+    /// now at its ceiling. The per-linear bound comes from
     /// `real_artifact_batched_linear_matches_gemv_slow` (worst ~1e-3 vs
     /// per-row GEMV on real trellises — kernel proven, this is compounding).
-    /// Gate: argmax must match AND max drift < 0.35 (~1.5x the measured
+    /// Gate: argmax must match AND max drift < 0.55 (~1.37x the measured
     /// value). Systematic row-dependence / decode bugs are caught tighter and
     /// earlier by the per-linear test above and by the replay-determinism
     /// check below; the q-RoPE race this test originally caught
@@ -2230,9 +2233,9 @@ mod tests {
             "span and token loop must predict the same token (n_diff={n_diff}, max_abs={max_abs:e})"
         );
         assert!(
-            max_abs < 0.35,
+            max_abs < 0.55,
             "span vs loop logits drifted by {max_abs:e} (n_diff={n_diff}) — beyond the \
-             measured sg-path compounding (2.374e-1); kernel itself is gated at ~1e-3 \
+             measured sg-path compounding (4.003e-1); kernel itself is gated at ~1e-3 \
              per linear by real_artifact_batched_linear_matches_gemv_slow"
         );
 
