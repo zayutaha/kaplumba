@@ -9,9 +9,11 @@ Append as work proceeds (AGENTS.md §5). Dense, factual, takeover-oriented. Cont
 - Companion spec: `spec/paged-kv-cache` (being rewritten for Rust) — coordinate at Phase 5 hooks only.
 - Superseded: `spec/omlx-exl3-engine/` (stub).
 - **T1.0 done** (2026-09-22): workspace + `metal` 0.33.0 + GPU fill smoke.
-- **T1.1 done** (2026-09-22): EXL3 loader — per-shard Metal buffers, stream via 8 MiB stage. Real artifact: **2422 tensors / 2 shards / 16.028 GB / ~4s**, 7/7 tests. Next: T1.2 tokenizer (or T0.2 baseline).
+- **T1.1 done** (2026-09-22): EXL3 loader — per-shard Metal buffers, stream via 8 MiB stage. Real artifact: **2422 tensors / 2 shards / 16.028 GB / ~4s**, 7/7 tests.
+- **T1.2 done** (2026-09-22): tokenizer — `tokenizers` **0.21.4** (classic API; 1.0.0-rc.2 reorganized and was rejected). 9/9 tests. Specials verified: pad=0 eos=1 bos=2 unk=3 open=105 close=106. Next: T1.3 naive forward (or T0.2 baseline).
 - DE25 (T1.1): Single ~16 GiB `new_buffer` failed (null contents → SIGABRT on drop). Fix = one shared buffer per safetensors shard (~8.5 + ~7.5 GB). Null-check after alloc; `LoadError::Alloc`.
 - DE26 (T1.1): Load layout = original safetensors data offsets within each shard buffer (seek `8+header_len+data_offset`, copy to same offset) — no repack.
+- DE27 (T1.2): Prefer **stable `tokenizers` 0.21.4** over 1.0.0-rc.2 (rc moved Tokenizer into tk-convert; API churn).
 
 ## Decisions (carried + new)
 

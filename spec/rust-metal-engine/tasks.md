@@ -41,9 +41,9 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - Commit: `spec/rust-metal-engine: T1.1 exl3 loader`
 
 ### T1.2 — Tokenizer wire-up
-- [ ] In-engine Rust tokenizer loads Gemma 4 vocab from artifact dir (or HF tokenizer files alongside); encode/decode round-trip
-- Files: tokenizer module
-- Test: unit round-trip; special tokens (`<turn|>`) correct
+- [x] In-engine Rust tokenizer loads Gemma 4 vocab from artifact `tokenizer.json`; encode/decode round-trip
+- Files: `crates/engine/src/tokenizer.rs` (`GemmaTokenizer`, `tokenizers` 0.21.4)
+- Test: `cargo test -p kaplumba-engine` 9/9; round-trip stable; specials pad=0 eos=1 bos=2 unk=3 `<|turn>`=105 `<turn|>`=106
 - Commit: `spec/rust-metal-engine: T1.2 tokenizer`
 
 ### T1.3 — Naive eager prefill + decode (correctness first)
