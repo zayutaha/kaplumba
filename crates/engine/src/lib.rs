@@ -11,6 +11,7 @@
 pub mod exl3;
 pub mod gemma4;
 pub mod generate;
+pub mod kv_cache;
 pub mod load;
 pub mod metal_ctx;
 pub mod metal_linear;

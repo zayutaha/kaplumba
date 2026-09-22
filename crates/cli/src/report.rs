@@ -272,8 +272,9 @@ fn build_report_inner(args: &GenerateArgs, run: &RunOutcome<'_>) -> Value {
             "gpu_ms": round3(run.gpu_ms),
             "layers": run.n_layers,
             "layers_run": args.layers.map(|n| n.min(run.n_layers)).unwrap_or(run.n_layers),
-            "kv_cache": false,
-            "naive_recompute": true,
+            "kv_cache": s.kv_cache,
+            "naive_recompute": !s.kv_cache,
+            "kv_bytes": s.cache_bytes,
             "computed_tokens": s.computed_tokens,
             "redone_fraction": round3(s.redone_fraction()),
             "eos_ids": args.eos,
@@ -300,6 +301,8 @@ mod tests {
             finish_reason: FinishReason::Length,
             tokens: vec![10, 11, 12],
             computed_tokens: 4 + 5 + 6,
+            kv_cache: false,
+            cache_bytes: 0,
         }
     }
 
@@ -411,6 +414,33 @@ mod tests {
         let r2 = build_report(&args, &fake_outcome(&no_decode));
         assert_eq!(r2["decode"]["tg_tps"], 0.0);
         assert_eq!(r2["tg_pct_of_roofline"], 0.0);
+    }
+
+    /// A cached run must be labelled honestly: `redone_fraction` stops being
+    /// quadratic, and the resident KV bytes are reported rather than implied.
+    #[test]
+    fn cached_run_is_reported_as_such() {
+        let stats = GenStats {
+            kv_cache: true,
+            cache_bytes: 9_011_200,
+            computed_tokens: 7, // prompt 4 + generated 3, each token once
+            ..fake_stats()
+        };
+        let args = GenerateArgs {
+            kv_cache: true,
+            ..GenerateArgs::default()
+        };
+        let report = build_report(&args, &fake_outcome(&stats));
+        assert_eq!(report["engine"]["kv_cache"], true);
+        assert_eq!(report["engine"]["naive_recompute"], false);
+        assert_eq!(report["engine"]["kv_bytes"], 9_011_200);
+        assert_eq!(report["engine"]["redone_fraction"], 1.0);
+
+        // The default (naive) run still reports itself as quadratic.
+        let naive = build_report(&GenerateArgs::default(), &fake_outcome(&fake_stats()));
+        assert_eq!(naive["engine"]["kv_cache"], false);
+        assert_eq!(naive["engine"]["naive_recompute"], true);
+        assert_eq!(naive["engine"]["kv_bytes"], 0);
     }
 
     #[test]

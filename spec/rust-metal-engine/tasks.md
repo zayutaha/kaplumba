@@ -209,10 +209,19 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 ## Phase 5 — Memory + persistence hooks
 
 ### T5.1 — Hybrid KV layout (gemma4)
-- [ ] SWA rings + global full; K=V honor; aligned with paged-kv T9
-- Test: save/load/cold equivalence; footprint numbers
+- [x] Done — `crates/engine/src/kv_cache.rs`: sliding layers keep a **rotated contiguous window** (a full window drops the oldest row and shifts; 8 KB memmove per layer per token), full layers keep everything, K=V honoured through the existing `k_eq_v` branch in the new single-row `layer_step`. Full layers error instead of silently dropping context when the allocation runs out
+- Why it was on the critical path: the GPU linear path is `rows == 1`, and without a cache every prefill/decode call was multi-row, so **nothing** used the GPU (DE29). With the cache, prefill pushes the prompt once and every decode step is one row
+- Measured (release, real artifact, `--metal --kv-cache --temp 0`, 6-token prompt, 4 generated): **decode 3.64 t/s** (was ~0.18 t/s naive) with **3699/3699 linears dispatched to the GPU** and `redone_fraction 0.9` instead of quadratic; resident KV **9.0 MB at 9 tokens** (≈ 1.0 MB/token: 84 KB/token sliding capped at the 1024 window + 41 KB/token full)
+- Verified: `cargo test` (14 new tests) — cache rotation/window/reset/footprint/row-width, `cached_forward_matches_naive` (same argmax, logits within 0.05 after softcap), `cached_prefill_is_chunk_invariant` (bit-identical), `cached_decode_step_matches_naive_prefix`, `cached_step_uses_absolute_position`; and on the real artifact `real_artifact_cached_fixture_and_gpu_slow` reproduces the recorded naive fixture exactly — argmax **236773**, logit **29.9782** — with 411 GPU linears (the bug's signature was `gpu_linears: 1`)
+- Files: `crates/engine/src/{kv_cache,gemma4,generate,lib}.rs`, `crates/cli/src/{args,main,report}.rs`, `crates/kernels/src/attn.{metal,rs}` (position bases)
 - Target: AC6 memory, R5.2
-- Commit: `spec/rust-metal-engine: T5.1 hybrid kv`
+- Commit: `spec/rust-metal-engine: T5.1 hybrid kv + cached decode`
+
+### T4.2 — Compiled/fixed-shape decode step
+- [~] Shape stability exists now (every step is `rows == 1`, fixed shapes, cache-allocated scratch reused: the attention scratch and the GEMV scratch grow once and are then reused).  Remaining: the measured per-dispatch overhead — 471 command buffers per token (411 linears + 60 attentions), each `commit`+`wait_until_completed`
+- Measured: steady-state **~275 ms/token**, of which ~93 ms is the decode kernel time at the measured 167 Gw/s ⇒ **~180 ms/token is submit/wait overhead (≈0.4 ms per linear)**, plus ~1 s of one-time Metal residency currently inside TTFT (move to load-time warm-up)
+- Next: one command buffer for the whole token (encode all 471 dispatches, one sync) — the measured numbers put this at the top of the decode lever list, ahead of further kernel tuning
+- Target: AC4, R1.3
 
 ### T5.2 — Activation budget + no OOM-retry steady state
 - [ ] Scratch caps; long prefill without allocator thrash

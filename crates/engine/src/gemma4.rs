@@ -24,7 +24,9 @@ use half::f16;
 use crate::exl3::codebook::CodebookMode;
 use crate::exl3::forward::{Exl3Linear, linear_forward_reconstruct, linear_forward_slab};
 use crate::exl3::reconstruct::{TrellisView, trellis_u16_view};
+use crate::kv_cache::KvCache;
 use crate::load::{DType, Exl3Model, TextConfig};
+use kaplumba_kernels::AttnParams;
 
 /// Output columns per streamed `lm_head` slab (one right-Hadamard block).
 pub const LM_SLAB: usize = 128;
@@ -505,11 +507,27 @@ pub fn rope_heads(
     head_dim: usize,
     rope: &RopeCfg,
 ) -> Vec<f16> {
+    rope_heads_at(x, rows, n_heads, head_dim, rope, 0)
+}
+
+/// RoPE over all heads starting at absolute position `pos0`.
+///
+/// The cached decode path needs the offset: a single row is at position `pos`,
+/// not 0, and Gemma 4's tables are per-position (proportional RoPE on the full
+/// layers makes this load-bearing rather than a phase shift).
+pub fn rope_heads_at(
+    x: &[f16],
+    rows: usize,
+    n_heads: usize,
+    head_dim: usize,
+    rope: &RopeCfg,
+    pos0: usize,
+) -> Vec<f16> {
     assert_eq!(x.len(), rows * n_heads * head_dim, "rope_heads shape");
     let inv = inv_freq(head_dim, rope);
     let mut out = vec![f16::ZERO; x.len()];
     for r in 0..rows {
-        let (cos, sin) = rope_cos_sin(&inv, r);
+        let (cos, sin) = rope_cos_sin(&inv, pos0 + r);
         for h in 0..n_heads {
             let off = (r * n_heads + h) * head_dim;
             rope_apply_row(
@@ -528,6 +546,14 @@ pub fn attention_lo(kind: LayerKind, q: usize, window: usize) -> usize {
     match kind {
         LayerKind::Full => 0,
         LayerKind::Sliding => q.saturating_sub(window.saturating_sub(1)),
+    }
+}
+
+/// Effective attention window for a layer (`0` = full causal).
+pub fn layer_window(kind: LayerKind, window: usize) -> usize {
+    match kind {
+        LayerKind::Full => 0,
+        LayerKind::Sliding => window,
     }
 }
 
@@ -729,25 +755,52 @@ impl<'a> Gemma4Model<'a> {
         v: &[f16],
         s: usize,
     ) -> Result<Vec<f16>, GemmaError> {
+        self.attention_bases(lc, q, k, v, s, 0, 0, s)
+    }
+
+    /// Attention with explicit position bases (T5.1/T3.5).
+    ///
+    /// Query row `r` is at absolute position `q_pos0 + r`; key row `j` is at
+    /// `kv_pos0 + j`. A prefill uses `(q_pos0=0, kv_pos0=0, kv_rows=s)`; a cached
+    /// decode step uses `s=1, q_pos0=pos` with however many key rows the cache
+    /// still holds — for a sliding layer that window no longer starts at 0, which
+    /// is the whole point of passing `kv_pos0` instead of assuming it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_bases(
+        &self,
+        lc: &LayerCfg,
+        q: &[f16],
+        k: &[f16],
+        v: &[f16],
+        s: usize,
+        q_pos0: usize,
+        kv_pos0: usize,
+        kv_rows: usize,
+    ) -> Result<Vec<f16>, GemmaError> {
         if let Some(gpu) = self.gpu {
             if let Some(out) = gpu.try_attention(
                 q,
                 k,
                 v,
-                s,
-                s,
-                self.cfg.n_heads,
-                lc.n_kv,
-                lc.head_dim,
-                self.cfg.sliding_window,
+                AttnParams {
+                    s,
+                    kv_rows,
+                    q_pos0,
+                    kv_pos0,
+                    n_heads: self.cfg.n_heads,
+                    n_kv: lc.n_kv,
+                    head_dim: lc.head_dim,
+                    window: layer_window(lc.kind, self.cfg.sliding_window),
+                },
             )? {
                 return Ok(out);
             }
         }
-        Ok(self.attention_cpu(lc, q, k, v, s))
+        Ok(self.attention_cpu(lc, q, k, v, s, q_pos0, kv_pos0, kv_rows))
     }
 
     /// CPU reference attention (the naive path and the kernel's ground truth).
+    #[allow(clippy::too_many_arguments)]
     pub fn attention_cpu(
         &self,
         lc: &LayerCfg,
@@ -755,40 +808,55 @@ impl<'a> Gemma4Model<'a> {
         k: &[f16],
         v: &[f16],
         s: usize,
+        q_pos0: usize,
+        kv_pos0: usize,
+        kv_rows: usize,
     ) -> Vec<f16> {
         let hd = lc.head_dim;
         let nh = self.cfg.n_heads;
         let nkv = lc.n_kv;
         assert!(nkv > 0 && nh % nkv == 0, "GQA head ratio");
         assert_eq!(q.len(), s * nh * hd, "q shape");
-        assert_eq!(k.len(), s * nkv * hd, "k shape");
-        assert_eq!(v.len(), s * nkv * hd, "v shape");
+        assert_eq!(k.len(), kv_rows * nkv * hd, "k shape");
+        assert_eq!(v.len(), kv_rows * nkv * hd, "v shape");
+        assert!(kv_pos0 <= q_pos0, "keys cannot start after the queries");
         let gsize = nh / nkv;
-        let window = self.cfg.sliding_window;
+        let window = layer_window(lc.kind, self.cfg.sliding_window);
 
         let mut out = vec![f16::ZERO; s * nh * hd];
-        let mut scores = vec![0f32; s];
+        let mut scores: Vec<(usize, f32)> = Vec::new();
         for h in 0..nh {
             let kvh = h / gsize;
             for qi in 0..s {
-                let lo = attention_lo(lc.kind, qi, window);
+                let pos = q_pos0 + qi;
+                let lo_abs = if window == 0 {
+                    kv_pos0
+                } else {
+                    kv_pos0.max((pos + 1).saturating_sub(window))
+                };
+                let hi_abs = pos.min(kv_pos0 + kv_rows - 1);
                 let q_off = qi * nh * hd + h * hd;
                 let qrow = &q[q_off..q_off + hd];
+                if lo_abs > hi_abs {
+                    continue; // nothing visible: stays zero, matching the kernel
+                }
+                scores.clear();
                 let mut max_s = f32::NEG_INFINITY;
-                for kv in lo..=qi {
+                for a in lo_abs..=hi_abs {
+                    let kv = a - kv_pos0;
                     let kv_off = kv * nkv * hd + kvh * hd;
                     let krow = &k[kv_off..kv_off + hd];
                     let mut acc = 0f32;
                     for d in 0..hd {
                         acc += qrow[d].to_f32() * krow[d].to_f32();
                     }
-                    scores[kv] = acc;
+                    scores.push((a, acc));
                     if acc > max_s {
                         max_s = acc;
                     }
                 }
                 let mut sum = 0f32;
-                for sc in scores[lo..=qi].iter_mut() {
+                for (_, sc) in scores.iter_mut() {
                     let e = (*sc - max_s).exp();
                     *sc = e;
                     sum += e;
@@ -796,11 +864,12 @@ impl<'a> Gemma4Model<'a> {
                 let inv = 1.0 / sum;
                 for d in 0..hd {
                     let mut acc = 0f32;
-                    for kv in lo..=qi {
-                        let p = scores[kv] * inv;
+                    for &(a, e) in scores.iter() {
+                        let p = e * inv;
                         if p == 0.0 {
                             continue;
                         }
+                        let kv = a - kv_pos0;
                         acc += p * v[kv * nkv * hd + kvh * hd + d].to_f32();
                     }
                     out[q_off + d] = f16::from_f32(acc);
@@ -879,6 +948,141 @@ impl<'a> Gemma4Model<'a> {
         Ok(())
     }
 
+    /// One decoder layer for a **single token row**, reading/writing the KV cache
+    /// (T5.1/T4.2). This is the decode shape the GPU kernels target: every
+    /// projection here is `rows == 1`.
+    pub fn layer_step(
+        &self,
+        i: usize,
+        x: &mut [f16],
+        cache: &mut KvCache,
+        pos: usize,
+    ) -> Result<(), GemmaError> {
+        let cfg = &self.cfg;
+        let hidden = cfg.hidden;
+        let lc = cfg.layers[i];
+        if x.len() != hidden {
+            return Err(GemmaError::Config(format!(
+                "layer_step needs one row of {hidden}, got {}",
+                x.len()
+            )));
+        }
+        let p = format!("model.language_model.layers.{i}");
+        let hd = lc.head_dim;
+
+        // --- self-attention ---
+        let res: Vec<f16> = x.to_vec();
+        let ln = self.f32_tensor(&format!("{p}.input_layernorm.weight"))?;
+        let xn = rms_norm_rows(x, 1, hidden, Some(&ln), cfg.eps);
+
+        let q = self.linear(&format!("{p}.self_attn.q_proj"), &xn)?;
+        let k_raw = self.linear(&format!("{p}.self_attn.k_proj"), &xn)?;
+        let qnorm = self.f32_tensor(&format!("{p}.self_attn.q_norm.weight"))?;
+        let knorm = self.f32_tensor(&format!("{p}.self_attn.k_norm.weight"))?;
+
+        let q = rope_heads_at(
+            &norm_heads(&q, 1, cfg.n_heads, hd, Some(&qnorm), cfg.eps),
+            1,
+            cfg.n_heads,
+            hd,
+            &lc.rope,
+            pos,
+        );
+        let k = rope_heads_at(
+            &norm_heads(&k_raw, 1, lc.n_kv, hd, Some(&knorm), cfg.eps),
+            1,
+            lc.n_kv,
+            hd,
+            &lc.rope,
+            pos,
+        );
+        let v = if lc.kind == LayerKind::Full && cfg.k_eq_v {
+            norm_heads(&k_raw, 1, lc.n_kv, hd, None, cfg.eps)
+        } else {
+            self.linear(&format!("{p}.self_attn.v_proj"), &xn)?
+        };
+
+        let (kv_pos0, kv_rows) = cache.append_layer(cfg, i, &k, &v)?;
+        let attn = self.attention_bases(
+            &lc,
+            &q,
+            cache.layer_keys(i),
+            cache.layer_values(i),
+            1,
+            pos,
+            kv_pos0,
+            kv_rows,
+        )?;
+        let o = self.linear(&format!("{p}.self_attn.o_proj"), &attn)?;
+        let post_ln = self.f32_tensor(&format!("{p}.post_attention_layernorm.weight"))?;
+        let o = rms_norm_rows(&o, 1, hidden, Some(&post_ln), cfg.eps);
+        for j in 0..hidden {
+            x[j] = add_f16(res[j], o[j]);
+        }
+
+        // --- MLP ---
+        let res: Vec<f16> = x.to_vec();
+        let pre_ln = self.f32_tensor(&format!("{p}.pre_feedforward_layernorm.weight"))?;
+        let xn = rms_norm_rows(x, 1, hidden, Some(&pre_ln), cfg.eps);
+        let g = self.linear(&format!("{p}.mlp.gate_proj"), &xn)?;
+        let u = self.linear(&format!("{p}.mlp.up_proj"), &xn)?;
+        let mut gu = vec![f16::ZERO; g.len()];
+        for j in 0..g.len() {
+            gu[j] = f16::from_f32(gelu_tanh(g[j].to_f32()) * u[j].to_f32());
+        }
+        let d = self.linear(&format!("{p}.mlp.down_proj"), &gu)?;
+        let post_ff = self.f32_tensor(&format!("{p}.post_feedforward_layernorm.weight"))?;
+        let d = rms_norm_rows(&d, 1, hidden, Some(&post_ff), cfg.eps);
+        let scalar = self.layer_scalar(i)?;
+        for j in 0..hidden {
+            x[j] = mul_f16(add_f16(res[j], d[j]), scalar);
+        }
+        Ok(())
+    }
+
+    /// Push `tokens` through the model with a KV cache, returning the **last**
+    /// token's logits.
+    ///
+    /// Each token is one pass of `rows == 1` projections plus attention over the
+    /// cached keys, so the per-token cost stops growing with the prefix (the
+    /// naive [`Self::forward_seq`] recomputes it). Prefill is still one token at
+    /// a time — batching it is the GEMM task (T3.2).
+    pub fn forward_cached(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+    ) -> Result<Vec<f32>, GemmaError> {
+        self.forward_cached_layers(cache, tokens, self.cfg.n_layers)
+    }
+
+    /// [`Self::forward_cached`] through the first `upto` decoder layers (depth
+    /// limit for debugging/benching).
+    pub fn forward_cached_layers(
+        &self,
+        cache: &mut KvCache,
+        tokens: &[u32],
+        upto: usize,
+    ) -> Result<Vec<f32>, GemmaError> {
+        if tokens.is_empty() {
+            return Err(GemmaError::Config("empty token sequence".into()));
+        }
+        let hidden = self.cfg.hidden;
+        let upto = upto.min(self.cfg.n_layers);
+        let norm_w = self.f32_tensor("model.language_model.norm.weight")?;
+        let mut logits = Vec::new();
+        for &t in tokens {
+            let pos = cache.len();
+            let mut x = self.embed(&[t])?;
+            for i in 0..upto {
+                self.layer_step(i, &mut x, cache, pos)?;
+            }
+            cache.end_token();
+            let xn = rms_norm_rows(&x, 1, hidden, Some(&norm_w), self.cfg.eps);
+            logits = self.logits(&xn)?;
+        }
+        Ok(logits)
+    }
+
     /// Full prompt forward → final hidden states (`s × hidden` f16).
     pub fn forward_seq(&self, tokens: &[u32]) -> Result<Vec<f16>, GemmaError> {
         self.forward_seq_layers(tokens, self.cfg.n_layers)
@@ -952,7 +1156,8 @@ impl<'a> Gemma4Model<'a> {
     }
 
     /// Greedy (temp 0) decode. Recomputes the whole prefix each step — the naive
-    /// path; KV-cached decode lands in T4/T5. EOS is included in the output.
+    /// path; [`crate::generate`] uses the KV cache when asked (T5.1). EOS is
+    /// included in the output.
     pub fn greedy_generate(
         &self,
         prompt: &[u32],
@@ -965,6 +1170,7 @@ impl<'a> Gemma4Model<'a> {
             seed: 0,
             eos: eos.to_vec(),
             layers: None,
+            use_kv: false,
         };
         Ok(crate::generate::generate(self, prompt, &params, |_| true)?.tokens)
     }
@@ -973,6 +1179,112 @@ impl<'a> Gemma4Model<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // -- KV cache path (T5.1) ----------------------------------------------
+
+    /// The cached path must reproduce the naive whole-prefix forward.
+    ///
+    /// This is the equivalence that makes the cache trustworthy: the naive path
+    /// computes attention over the prompt in one block, the cached path appends
+    /// one row per token and reads it back, and for a sliding layer the older
+    /// rows have been rotated out. Same visible keys, different accumulation
+    /// order, so the check is "same argmax + tiny f32 noise", not bit-exact.
+    #[test]
+    fn cached_forward_matches_naive() {
+        use crate::testutil::synth_model;
+        let (src, cfg) = synth_model(Some(30.0));
+        let hidden = cfg.hidden;
+        let model = Gemma4Model::new(cfg.clone(), &src);
+        // Longer than the window (4) so the sliding layers rotate.
+        let prompt: Vec<u32> = vec![2, 17, 5, 300, 42, 7, 19, 3, 88];
+
+        let h = model.forward_seq(&prompt).expect("naive");
+        let last = &h[(prompt.len() - 1) * hidden..];
+        let want = model.logits(last).expect("logits");
+
+        let mut kv = KvCache::new(&cfg, 64);
+        let got = model.forward_cached(&mut kv, &prompt).expect("cached");
+        assert_eq!(kv.len(), prompt.len(), "one cached row per token");
+        assert_eq!(want.len(), got.len());
+
+        let worst = want
+            .iter()
+            .zip(&got)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        eprintln!("cached vs naive logits: max abs {worst:.4}");
+        assert_eq!(
+            argmax(&want),
+            argmax(&got),
+            "cached path must predict the same token"
+        );
+        assert!(worst < 0.05, "cached logits drifted by {worst}");
+    }
+
+    /// Prefill in chunks must equal prefill in one shot, bit for bit: a token's
+    /// forward depends only on the keys already cached.
+    #[test]
+    fn cached_prefill_is_chunk_invariant() {
+        use crate::testutil::synth_model;
+        let (src, cfg) = synth_model(None);
+        let model = Gemma4Model::new(cfg.clone(), &src);
+        let all: Vec<u32> = (0..9).map(|i| 3 + i).collect();
+
+        let mut one = KvCache::new(&cfg, 32);
+        let full = model.forward_cached(&mut one, &all).expect("one shot");
+
+        let mut two = KvCache::new(&cfg, 32);
+        model.forward_cached(&mut two, &all[..4]).expect("head");
+        let split = model.forward_cached(&mut two, &all[4..]).expect("tail");
+
+        assert_eq!(one.len(), two.len());
+        assert_eq!(full, split, "chunked prefill must be bit-identical");
+    }
+
+    /// A cached step at position `pos` must match the same token pushed through
+    /// the naive path with a `pos`-token prefix.
+    #[test]
+    fn cached_decode_step_matches_naive_prefix() {
+        use crate::testutil::synth_model;
+        let (src, cfg) = synth_model(Some(30.0));
+        let hidden = cfg.hidden;
+        let model = Gemma4Model::new(cfg.clone(), &src);
+        let prefix: Vec<u32> = vec![2, 11, 13, 17, 19];
+        let next = 23u32;
+
+        let h = model
+            .forward_seq(&[prefix.clone(), vec![next]].concat())
+            .expect("naive");
+        let want = model.logits(&h[5 * hidden..6 * hidden]).expect("logits");
+
+        let mut kv = KvCache::new(&cfg, 32);
+        model.forward_cached(&mut kv, &prefix).expect("prefill");
+        let got = model.forward_cached(&mut kv, &[next]).expect("step");
+        assert_eq!(kv.len(), 6);
+        assert_eq!(argmax(&want), argmax(&got));
+    }
+
+    /// Position-dependent RoPE: the same token at a different position must
+    /// produce different keys (guards a forgotten `pos0` offset).
+    #[test]
+    fn cached_step_uses_absolute_position() {
+        use crate::testutil::synth_model;
+        let (src, cfg) = synth_model(None);
+        assert!(cfg.sliding_window > 0);
+        let model = Gemma4Model::new(cfg.clone(), &src);
+        let mut a = KvCache::new(&cfg, 16);
+        let mut b = KvCache::new(&cfg, 16);
+        model.forward_cached(&mut a, &[2, 5, 7]).expect("a");
+        model
+            .forward_cached(&mut b, &[2, 5, 7, 11, 13, 17])
+            .expect("b");
+        // Keys for the *first* token are not reused across positions: the caches
+        // differ in the number of rows, and the newest row encodes position 2 vs 5.
+        let la = a.layer(0);
+        let lb = b.layer(0);
+        assert!(la.len() <= cfg.sliding_window && lb.len() <= cfg.sliding_window);
+        assert_ne!(la.start(), lb.start());
+    }
 
     // -- pure golden constants (from the locked notes) ----------------------
 
@@ -1636,6 +1948,50 @@ mod tests {
                 t1.elapsed().as_secs_f64()
             );
         }
+    }
+
+    /// Real artifact, cached + GPU path, against the recorded fixture.
+    ///
+    /// The naive path's fixture is prompt `[2]` → argmax **236773** ("S"). The
+    /// cached path must reproduce it while (a) stepping one row at a time and
+    /// (b) actually dispatching to the GPU — `gpu_linears == 1` was exactly the
+    /// silent-CPU-fallback bug, so the count is asserted, not just logged.
+    #[test]
+    fn real_artifact_cached_fixture_and_gpu_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let ctx = crate::metal_ctx::MetalContext::new().expect("metal context");
+        let model = crate::load::load_exl3(&ctx, &dir).expect("load artifact");
+        let gpu = crate::metal_linear::MetalLinear::new(&ctx).expect("metal linear");
+        let g = Gemma4Model::from_model(&model)
+            .expect("gemma cfg")
+            .with_gpu(&gpu);
+
+        let mut kv = KvCache::new(&g.cfg, 8);
+        let t0 = std::time::Instant::now();
+        let logits = g.forward_cached(&mut kv, &[2]).expect("cached forward");
+        let dt = t0.elapsed().as_secs_f64();
+        let got = argmax(&logits);
+        eprintln!(
+            "cached 1-token prefill: argmax {got} logit {:.4} in {dt:.1}s, {} GPU linears, {:.0}ms GPU",
+            logits[got],
+            gpu.calls(),
+            gpu.gpu_ms()
+        );
+        assert_eq!(got, 236773, "recorded naive-path fixture for prompt [2]");
+        assert_eq!(kv.len(), 1);
+        assert!(kv.bytes() > 0);
+        assert!(
+            gpu.calls() >= 400,
+            "cached path must run the GPU linears ({} dispatches)",
+            gpu.calls()
+        );
     }
 
     /// Top-`n` (logit, token) pairs, descending.

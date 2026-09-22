@@ -34,6 +34,9 @@ pub struct GenerateArgs {
     pub layers: Option<usize>,
     /// Use the raw-Metal EXL3 kernels for eligible single-row linears (T2.1).
     pub metal: bool,
+    /// Use the hybrid KV cache instead of recomputing the prefix (T5.1). This is
+    /// also what makes the Metal path apply to decode at all (`rows == 1`).
+    pub kv_cache: bool,
     pub eos: Vec<u32>,
     /// Prepend the tokenizer's BOS id.
     pub bos: bool,
@@ -61,6 +64,7 @@ impl Default for GenerateArgs {
             seed: 0,
             layers: None,
             metal: false,
+            kv_cache: false,
             eos: vec![1, 106],
             bos: true,
             json: None,
@@ -99,6 +103,7 @@ pub fn usage() -> &'static str {
      \x20 --seed N               sampler seed (default 0)\n\
      \x20 --layers N             only run the first N decoder layers (debug/bench)\n\
      \x20 --metal               raw-Metal EXL3 kernels for eligible linears (T2.1)\n\
+     \x20 --kv-cache            hybrid KV cache instead of recomputing the prefix (T5.1)\n\
      \x20 --eos ID,ID            stop ids (default 1,106)\n\
      \x20 --no-bos               do not prepend the BOS token\n\
      \x20 --json PATH            write the kaplumba-bench/1 report ('-' = stdout)\n\
@@ -140,6 +145,7 @@ pub fn parse_generate(args: &[String]) -> Result<GenerateArgs, String> {
             "--seed" => out.seed = parse_num("--seed", &take_value("--seed")?)?,
             "--layers" => out.layers = Some(parse_num("--layers", &take_value("--layers")?)?),
             "--metal" => out.metal = true,
+            "--kv-cache" => out.kv_cache = true,
             "--eos" => {
                 let v = take_value("--eos")?;
                 out.eos = v
@@ -233,6 +239,8 @@ mod tests {
             "2",
             "--eos",
             "1, 5,106",
+            "--metal",
+            "--kv-cache",
             "--no-bos",
             "--no-stream",
             "--quiet",
@@ -252,6 +260,7 @@ mod tests {
         assert_eq!(a.seed, 42);
         assert_eq!(a.layers, Some(2));
         assert_eq!(a.eos, vec![1, 5, 106]);
+        assert!(a.metal && a.kv_cache, "GPU + KV cache flags");
         assert!(!a.bos && !a.stream && a.quiet);
         assert_eq!(a.weights_gb, 16.5);
         assert_eq!(a.bandwidth_gbps, 300.0);

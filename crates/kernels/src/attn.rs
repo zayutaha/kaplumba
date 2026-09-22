@@ -1,9 +1,18 @@
 //! Host side of the bounded-scratch attention kernels (`attn.metal`, T3.5/T3.7).
 //!
 //! One `run` call = one dispatch: `out = softmax(q·kᵀ) · v` with causal +
-//! optional sliding-window masking, GQA head sharing, and the query rows placed
-//! at `kv_len - s .. kv_len` so the same kernel serves a fresh prefill
-//! (`s == kv_len`) and a cached decode step (`s == 1`).
+//! optional sliding-window masking, GQA head sharing, and **explicit position
+//! bases** for keys and queries. The bases are what let one kernel serve every
+//! shape the engine has:
+//!
+//! | case | `s` | `kv_rows` | `q_pos0` | `kv_pos0` |
+//! |---|---|---|---|---|
+//! | prefill | prompt length | prompt length | 0 | 0 |
+//! | cached decode | 1 | `pos + 1` | `pos` | 0 |
+//! | windowed SWA cache | 1 | `<= window` | `pos` | `pos + 1 - kv_rows` |
+//!
+//! The last row is the important one for memory: a sliding layer keeps only its
+//! last `window` keys, so key row 0 is *not* absolute position 0.
 //!
 //! The kernel is a compile-time specialization per head dim (`256` → 8 slices,
 //! `512` → 16 slices). Anything else is rejected up front rather than reduced
@@ -21,14 +30,20 @@ use crate::exl3::{DeviceSpan, KernelError, check_span_fits};
 
 const MSL: &str = include_str!("attn.metal");
 
-/// Rows per threadgroup in `attn.metal` (`AROWS`).
+/// Query rows per threadgroup in `attn.metal` (`AROWS`).
 pub const ATTN_ROWS: usize = 8;
 
 /// Shape of one attention pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AttnParams {
+    /// Query rows in this dispatch.
     pub s: usize,
-    pub kv_len: usize,
+    /// Key rows available (`kv_pos0 + kv_rows - 1` is the newest).
+    pub kv_rows: usize,
+    /// Absolute position of query row 0.
+    pub q_pos0: usize,
+    /// Absolute position of key row 0 (`<= q_pos0`).
+    pub kv_pos0: usize,
     pub n_heads: usize,
     pub n_kv: usize,
     pub head_dim: usize,
@@ -47,10 +62,23 @@ impl AttnParams {
     }
 
     fn validate(&self) -> Result<(), KernelError> {
-        if self.s == 0 || self.kv_len < self.s {
+        if self.s == 0 || self.kv_rows == 0 {
             return Err(KernelError::Unsupported(format!(
-                "attention needs 0 < s <= kv_len, got s={} kv_len={}",
-                self.s, self.kv_len
+                "attention needs s >= 1 and kv_rows >= 1, got s={} kv_rows={}",
+                self.s, self.kv_rows
+            )));
+        }
+        if self.kv_pos0 > self.q_pos0 {
+            return Err(KernelError::Unsupported(format!(
+                "keys cannot start after the first query: kv_pos0={} q_pos0={}",
+                self.kv_pos0, self.q_pos0
+            )));
+        }
+        if self.kv_pos0 + self.kv_rows > self.q_pos0 + self.s {
+            return Err(KernelError::Unsupported(format!(
+                "keys must not run past the last query: {} > {}",
+                self.kv_pos0 + self.kv_rows,
+                self.q_pos0 + self.s
             )));
         }
         if self.n_kv == 0 || self.n_heads % self.n_kv != 0 {
@@ -74,7 +102,9 @@ impl AttnParams {
 #[derive(Clone, Copy)]
 struct MslAttnParams {
     s: u32,
-    kv_len: u32,
+    kv_rows: u32,
+    q_pos0: u32,
+    kv_pos0: u32,
     n_heads: u32,
     n_kv: u32,
     head_dim: u32,
@@ -115,9 +145,8 @@ impl Exl3Attention {
 
     /// `out = attn(q, k, v)` for one dispatch, submitting and waiting.
     ///
-    /// All four spans are f16 tensors in the layout the engine already uses:
-    /// `q`/`out` are `[s, n_heads, head_dim]`, `k`/`v` are
-    /// `[kv_len, n_kv, head_dim]`.
+    /// All four spans are f16 tensors: `q`/`out` are `[s, n_heads, head_dim]`,
+    /// `k`/`v` are `[kv_rows, n_kv, head_dim]`.
     pub fn run(
         &self,
         q: DeviceSpan<'_>,
@@ -129,15 +158,17 @@ impl Exl3Attention {
         p.validate()?;
         let hd = p.head_dim;
         check_span_fits(&q, p.s * p.n_heads * hd * 2, "attn q", 2)?;
-        check_span_fits(&k, p.kv_len * p.n_kv * hd * 2, "attn k", 2)?;
-        check_span_fits(&v, p.kv_len * p.n_kv * hd * 2, "attn v", 2)?;
+        check_span_fits(&k, p.kv_rows * p.n_kv * hd * 2, "attn k", 2)?;
+        check_span_fits(&v, p.kv_rows * p.n_kv * hd * 2, "attn v", 2)?;
         check_span_fits(&out, p.s * p.n_heads * hd * 2, "attn out", 2)?;
 
         let part = p.part().expect("validated");
         let pipeline = if hd == 256 { &self.hd256 } else { &self.hd512 };
         let params = MslAttnParams {
             s: p.s as u32,
-            kv_len: p.kv_len as u32,
+            kv_rows: p.kv_rows as u32,
+            q_pos0: p.q_pos0 as u32,
+            kv_pos0: p.kv_pos0 as u32,
             n_heads: p.n_heads as u32,
             n_kv: p.n_kv as u32,
             head_dim: hd as u32,
@@ -178,43 +209,47 @@ mod tests {
     use half::f16;
 
     /// CPU reference: the semantics the kernel must reproduce (max-subtracted
-    /// f32 softmax over the visible window, f16 output).
+    /// f32 softmax over the visible keys, f16 output, absolute-position mask).
     fn cpu_attn(q: &[f16], k: &[f16], v: &[f16], p: AttnParams) -> Vec<f16> {
         let hd = p.head_dim;
         let gsize = p.n_heads / p.n_kv;
         let mut out = vec![f16::ZERO; p.s * p.n_heads * hd];
         for r in 0..p.s {
-            let pos = p.kv_len - p.s + r;
+            let pos = p.q_pos0 + r;
             for h in 0..p.n_heads {
                 let kvh = h / gsize;
                 let qoff = (r * p.n_heads + h) * hd;
-                let lo = if p.window == 0 {
-                    0
+                let lo_abs = if p.window == 0 {
+                    p.kv_pos0
                 } else {
-                    pos.saturating_sub(p.window - 1)
+                    // saturating: the window may be wider than the history so far
+                    p.kv_pos0.max((pos + 1).saturating_sub(p.window))
                 };
-                let mut sc = Vec::with_capacity(pos + 1 - lo);
-                for kv in lo..=pos {
-                    let koff = (kv * p.n_kv + kvh) * hd;
+                let hi_abs = pos.min(p.kv_pos0 + p.kv_rows - 1);
+                let mut sc = Vec::new();
+                for a in lo_abs..=hi_abs {
+                    let koff = ((a - p.kv_pos0) * p.n_kv + kvh) * hd;
                     let mut acc = 0f32;
                     for d in 0..hd {
                         acc += q[qoff + d].to_f32() * k[koff + d].to_f32();
                     }
-                    sc.push(acc);
+                    sc.push((a, acc));
                 }
-                let m = sc.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum = 0f32;
-                for s in sc.iter_mut() {
-                    *s = (*s - m).exp();
-                    sum += *s;
-                }
-                let inv = 1.0 / sum;
-                for d in 0..hd {
-                    let mut acc = 0f32;
-                    for (i, &e) in sc.iter().enumerate() {
-                        acc += e * inv * v[((lo + i) * p.n_kv + kvh) * hd + d].to_f32();
+                if !sc.is_empty() {
+                    let m = sc.iter().map(|(_, s)| *s).fold(f32::NEG_INFINITY, f32::max);
+                    let mut sum = 0f32;
+                    for (_, s) in sc.iter_mut() {
+                        *s = (*s - m).exp();
+                        sum += *s;
                     }
-                    out[qoff + d] = f16::from_f32(acc);
+                    let inv = 1.0 / sum;
+                    for d in 0..hd {
+                        let mut acc = 0f32;
+                        for &(a, e) in sc.iter() {
+                            acc += e * inv * v[((a - p.kv_pos0) * p.n_kv + kvh) * hd + d].to_f32();
+                        }
+                        out[qoff + d] = f16::from_f32(acc);
+                    }
                 }
             }
         }
@@ -257,20 +292,20 @@ mod tests {
     }
 
     /// Run one case on the GPU and compare with the CPU reference.
-    fn check_case(name: &str, p: AttnParams, tol: f32) {
+    fn check_case(name: &str, p: AttnParams, tol: f32) -> Vec<f16> {
         let Some((device, queue)) = ctx() else {
             eprintln!("skip: no Metal device");
-            return;
+            return Vec::new();
         };
         let gpu = Exl3Attention::new(&device, &queue).expect("pipelines");
         let mut rng = Rng(0xA77E_2026);
         let q: Vec<f16> = (0..p.s * p.n_heads * p.head_dim)
             .map(|_| rng.half())
             .collect();
-        let k: Vec<f16> = (0..p.kv_len * p.n_kv * p.head_dim)
+        let k: Vec<f16> = (0..p.kv_rows * p.n_kv * p.head_dim)
             .map(|_| rng.half())
             .collect();
-        let v: Vec<f16> = (0..p.kv_len * p.n_kv * p.head_dim)
+        let v: Vec<f16> = (0..p.kv_rows * p.n_kv * p.head_dim)
             .map(|_| rng.half())
             .collect();
         let want = cpu_attn(&q, &k, &v, p);
@@ -295,15 +330,18 @@ mod tests {
         }
         let rel = if scale > 0.0 { worst / scale } else { worst };
         eprintln!(
-            "{name}: s={} kv={} hd={} nh={} nkv={} win={} max abs {worst:.3e} rel {rel:.3e}",
-            p.s, p.kv_len, p.head_dim, p.n_heads, p.n_kv, p.window
+            "{name}: s={} kv={} pos0={}/{} hd={} nh={} nkv={} win={} max abs {worst:.3e} rel {rel:.3e}",
+            p.s, p.kv_rows, p.q_pos0, p.kv_pos0, p.head_dim, p.n_heads, p.n_kv, p.window
         );
         assert!(rel <= tol, "{name}: rel err {rel} > {tol}");
+        got
     }
 
+    /// Prefill / plain-cache shape: keys start at 0 and the queries end the KV
+    /// vector (`q_pos0 = kv_rows - s`).
     fn p(
         s: usize,
-        kv_len: usize,
+        kv_rows: usize,
         hd: usize,
         n_heads: usize,
         n_kv: usize,
@@ -311,7 +349,9 @@ mod tests {
     ) -> AttnParams {
         AttnParams {
             s,
-            kv_len,
+            kv_rows,
+            q_pos0: kv_rows - s,
+            kv_pos0: 0,
             n_heads,
             n_kv,
             head_dim: hd,
@@ -337,8 +377,6 @@ mod tests {
 
     #[test]
     fn matches_cpu_reference_cached_decode() {
-        // Decode shape: one query row against a long cache, with and without a
-        // window, both head dims.
         check_case("decode-kv8", p(1, 8, 256, 2, 1, 0), 4e-3);
         check_case("decode-kv16", p(1, 16, 256, 2, 1, 0), 4e-3);
         check_case("decode-kv17", p(1, 17, 256, 2, 1, 0), 4e-3);
@@ -358,6 +396,20 @@ mod tests {
         check_case("padded-rows", p(10, 10, 256, 32, 16, 0), 4e-3);
     }
 
+    /// Minimal non-degenerate case: 2 rows, 2 keys, one head, random q/k/v.
+    /// Separates "dot product / slice reduction is wrong" from "multi-head or
+    /// masking is wrong".
+    #[test]
+    fn tiny_random() {
+        check_case("tiny-2x2", p(2, 2, 256, 1, 1, 0), 4e-3);
+        check_case("tiny-2x2-window1", p(2, 2, 256, 1, 1, 1), 4e-3);
+        check_case("2heads", p(2, 2, 256, 2, 1, 0), 4e-3);
+        check_case("32heads16kv", p(2, 2, 256, 32, 16, 0), 4e-3);
+        check_case("8rows-1head", p(8, 8, 256, 1, 1, 0), 4e-3);
+        check_case("16rows-1head", p(16, 16, 256, 1, 1, 0), 4e-3);
+        check_case("16rows-2heads", p(16, 16, 256, 2, 1, 0), 4e-3);
+    }
+
     /// Exact, hand-checkable case: uniform scores (q = k = 0) over one-hot `v`.
     ///
     /// Row `r` (position `r`) must return `v[kv] / (r + 1)` summed, i.e. dim `d`
@@ -371,17 +423,17 @@ mod tests {
             return;
         };
         let gpu = Exl3Attention::new(&device, &queue).expect("pipelines");
-        let (p, hd) = (
-            AttnParams {
-                s: 2,
-                kv_len: 2,
-                n_heads: 1,
-                n_kv: 1,
-                head_dim: 256,
-                window: 0,
-            },
-            hd256(),
-        );
+        let hd = 256usize;
+        let p = AttnParams {
+            s: 2,
+            kv_rows: 2,
+            q_pos0: 0,
+            kv_pos0: 0,
+            n_heads: 1,
+            n_kv: 1,
+            head_dim: hd,
+            window: 0,
+        };
         let zeros = vec![f16::ZERO; 2 * hd];
         let mut v = vec![f16::ZERO; 2 * hd];
         v[0] = f16::ONE; // v[0] is one-hot on dim 0
@@ -410,22 +462,82 @@ mod tests {
         assert_eq!(got_dims[1], [0.5, 0.5, 0.0, 0.0], "row 1");
     }
 
-    fn hd256() -> usize {
-        256
-    }
-
-    /// Minimal non-degenerate case: 2 rows, 2 keys, one head, random q/k/v.
-    /// Separates "dot product / slice reduction is wrong" from "multi-head or
-    /// masking is wrong".
+    /// Windowed SWA cache: key row 0 is *not* absolute position 0.
+    ///
+    /// A decode step whose cache holds only the last `window` keys must return
+    /// exactly what a full-history attention with the same window returns,
+    /// because the extra keys are invisible either way. This is the check that
+    /// the `q_pos0`/`kv_pos0` bases are honoured: with the earlier
+    /// "kv row j is at q_pos0 - s + j" shortcut this case is silently wrong.
     #[test]
-    fn tiny_random() {
-        check_case("tiny-2x2", p(2, 2, 256, 1, 1, 0), 4e-3);
-        check_case("tiny-2x2-window1", p(2, 2, 256, 1, 1, 1), 4e-3);
-        check_case("2heads", p(2, 2, 256, 2, 1, 0), 4e-3);
-        check_case("32heads16kv", p(2, 2, 256, 32, 16, 0), 4e-3);
-        check_case("8rows-1head", p(8, 8, 256, 1, 1, 0), 4e-3);
-        check_case("16rows-1head", p(16, 16, 256, 1, 1, 0), 4e-3);
-        check_case("16rows-2heads", p(16, 16, 256, 2, 1, 0), 4e-3);
+    fn windowed_cache_matches_full_history() {
+        let Some((device, queue)) = ctx() else {
+            eprintln!("skip: no Metal device");
+            return;
+        };
+        let gpu = Exl3Attention::new(&device, &queue).expect("pipelines");
+        let (hd, nh, nkv, window) = (256usize, 32usize, 16usize, 4usize);
+        let total = 12usize;
+        let mut rng = Rng(0xC0DE_1234);
+        let q_all: Vec<f16> = (0..total * nh * hd).map(|_| rng.half()).collect();
+        let k_all: Vec<f16> = (0..total * nkv * hd).map(|_| rng.half()).collect();
+        let v_all: Vec<f16> = (0..total * nkv * hd).map(|_| rng.half()).collect();
+
+        let mut worst = 0f32;
+        for pos in 7..total {
+            // Full-history reference: all keys 0..=pos, window applied by mask.
+            let full = AttnParams {
+                s: 1,
+                kv_rows: pos + 1,
+                q_pos0: pos,
+                kv_pos0: 0,
+                n_heads: nh,
+                n_kv: nkv,
+                head_dim: hd,
+                window,
+            };
+            let want = cpu_attn(
+                &q_all[pos * nh * hd..(pos + 1) * nh * hd],
+                &k_all,
+                &v_all,
+                full,
+            );
+
+            // Windowed cache: only the last `window` keys, at their true positions.
+            let kv_rows = window.min(pos + 1);
+            let kv_pos0 = pos + 1 - kv_rows;
+            let cached = AttnParams {
+                s: 1,
+                kv_rows,
+                q_pos0: pos,
+                kv_pos0,
+                n_heads: nh,
+                n_kv: nkv,
+                head_dim: hd,
+                window,
+            };
+            let k_win = &k_all[kv_pos0 * nkv * hd..(pos + 1) * nkv * hd];
+            let v_win = &v_all[kv_pos0 * nkv * hd..(pos + 1) * nkv * hd];
+            let q = &q_all[pos * nh * hd..(pos + 1) * nh * hd];
+            let qb = upload(&device, q);
+            let kb = upload(&device, k_win);
+            let vb = upload(&device, v_win);
+            let ob = device.new_buffer(
+                (hd * nh * 2) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            gpu.run(span(&qb), span(&kb), span(&vb), span(&ob), cached)
+                .expect("attn dispatch");
+            let got: Vec<f16> = unsafe {
+                std::slice::from_raw_parts(ob.contents() as *const f16, hd * nh).to_vec()
+            };
+
+            for (a, b) in want.iter().zip(&got) {
+                worst = worst.max((a.to_f32() - b.to_f32()).abs());
+            }
+        }
+        eprintln!("windowed cache vs full history: max abs {worst:.3e}");
+        assert!(worst < 4e-3, "windowed cache mismatch: {worst}");
     }
 
     #[test]
@@ -435,37 +547,39 @@ mod tests {
             return;
         };
         let gpu = Exl3Attention::new(&device, &queue).expect("pipelines");
-        let hd = 384;
         let qb = device.new_buffer(4, metal::MTLResourceOptions::StorageModeShared);
         let bad = AttnParams {
             s: 1,
-            kv_len: 1,
+            kv_rows: 1,
+            q_pos0: 0,
+            kv_pos0: 0,
             n_heads: 4,
             n_kv: 4,
-            head_dim: hd,
+            head_dim: 384,
             window: 0,
         };
         let err = gpu.run(span(&qb), span(&qb), span(&qb), span(&qb), bad);
         assert!(matches!(err, Err(KernelError::Unsupported(_))), "{err:?}");
 
-        // kv_len < s is a caller bug, not a kernel case.
+        // GQA ratio must divide.
         let bad = AttnParams {
-            s: 4,
-            kv_len: 2,
+            n_heads: 6,
+            n_kv: 4,
+            head_dim: 256,
             ..bad
         };
         assert!(matches!(
             gpu.run(span(&qb), span(&qb), span(&qb), span(&qb), bad),
             Err(KernelError::Unsupported(_))
         ));
-        // GQA ratio must divide.
+        // Keys must not start after the queries, nor run past them.
         let bad = AttnParams {
-            s: 2,
-            kv_len: 2,
-            n_heads: 6,
+            n_heads: 4,
             n_kv: 4,
             head_dim: 256,
-            window: 0,
+            q_pos0: 2,
+            kv_pos0: 5,
+            ..bad
         };
         assert!(matches!(
             gpu.run(span(&qb), span(&qb), span(&qb), span(&qb), bad),

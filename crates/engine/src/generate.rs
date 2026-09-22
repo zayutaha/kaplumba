@@ -1,9 +1,18 @@
 //! Streaming generation loop (T1.4): prefill → sample → emit, with the stats the
 //! bench report needs (R7.1/R7.4).
 //!
-//! The naive path has **no KV cache**: every step recomputes the whole prefix, so
-//! `computed_tokens` grows quadratically and `tg_tps` is not comparable with a
-//! KV-cached engine. Reported honestly rather than hidden; T4.2/T5.1 fix it.
+//! Two paths, selected by `GenParams::use_kv`:
+//!
+//! * **cached** (T5.1, `use_kv`) — the prompt is pushed once into a [`KvCache`]
+//!   and every decode step forwards a single token, so `computed_tokens` equals
+//!   `prompt + generated` and the per-step cost stops growing with the prefix.
+//!   This is also the only path where the GPU kernels can run at all: their
+//!   eligibility is `rows == 1` (see the DE29 note in the spec notes).
+//! * **naive** (default) — recomputes the whole prefix every step, so
+//!   `computed_tokens` grows quadratically. Kept as the reference path and for
+//!   fixtures recorded before the cache existed.
+//!
+//! The stats record which path ran rather than quietly normalising them.
 
 use std::time::Instant;
 
@@ -40,6 +49,8 @@ pub struct GenParams {
     pub eos: Vec<u32>,
     /// Depth limit for debugging/benching (only the first N decoder layers).
     pub layers: Option<usize>,
+    /// Use the hybrid KV cache (T5.1) instead of recomputing the prefix.
+    pub use_kv: bool,
 }
 
 impl Default for GenParams {
@@ -51,6 +62,7 @@ impl Default for GenParams {
             // Gemma 4: <eos> = 1, <turn|> = 106 (turn boundary).
             eos: vec![1, 106],
             layers: None,
+            use_kv: false,
         }
     }
 }
@@ -71,6 +83,11 @@ pub struct GenStats {
     /// Prompt tokens actually pushed through the model (naive path recomputes the
     /// prefix each step, so this is much larger than `prompt_tokens`).
     pub computed_tokens: usize,
+    /// Whether the KV cache was used (and therefore whether the GPU path could
+    /// run: it needs single-row steps).
+    pub kv_cache: bool,
+    /// Resident KV bytes (0 without a cache).
+    pub cache_bytes: usize,
 }
 
 impl GenStats {
@@ -124,15 +141,42 @@ pub fn generate(
     let mut finish = FinishReason::Length;
     let t_start = Instant::now();
 
+    // Cached path: one pass over the prompt, then one row per step.
+    let mut cache = params
+        .use_kv
+        .then(|| crate::kv_cache::KvCache::new(&model.cfg, prompt.len() + params.max_new));
+    let cached_len = cache.as_ref().map(|c| c.bytes()).unwrap_or(0);
+
     for step in 0..params.max_new {
-        computed_tokens += toks.len();
         let t0 = Instant::now();
-        let h = match params.layers {
-            Some(n) => model.forward_seq_layers(&toks, n)?,
-            None => model.forward_seq(&toks)?,
+        let logits = if let Some(kv) = cache.as_mut() {
+            let next = if step == 0 {
+                // Prefill (and the first sampled token) in one pass.
+                computed_tokens += toks.len();
+                model.forward_cached_layers(
+                    kv,
+                    &toks,
+                    params.layers.unwrap_or(model.cfg.n_layers),
+                )?
+            } else {
+                let tokens = [toks[toks.len() - 1]];
+                computed_tokens += 1;
+                model.forward_cached_layers(
+                    kv,
+                    &tokens,
+                    params.layers.unwrap_or(model.cfg.n_layers),
+                )?
+            };
+            next
+        } else {
+            computed_tokens += toks.len();
+            let h = match params.layers {
+                Some(n) => model.forward_seq_layers(&toks, n)?,
+                None => model.forward_seq(&toks)?,
+            };
+            let last = &h[(toks.len() - 1) * hidden..toks.len() * hidden];
+            model.logits(last)?
         };
-        let last = &h[(toks.len() - 1) * hidden..toks.len() * hidden];
-        let logits = model.logits(last)?;
         let dt = t0.elapsed().as_secs_f64();
         if step == 0 {
             prefill_s = dt;
@@ -170,6 +214,8 @@ pub fn generate(
         finish_reason: finish,
         tokens,
         computed_tokens,
+        kv_cache: cache.is_some(),
+        cache_bytes: cached_len,
     })
 }
 
@@ -186,6 +232,7 @@ mod tests {
             seed: 0,
             eos: vec![1],
             layers: None,
+            use_kv: false,
         }
     }
 
@@ -231,6 +278,7 @@ mod tests {
             seed: 0,
             eos: vec![first],
             layers: None,
+            use_kv: false,
         };
         let stats = generate(&model, &prompt, &params, |_| true).expect("generate");
         assert_eq!(stats.tokens, vec![first], "EOS token is emitted then stops");
@@ -283,6 +331,7 @@ mod tests {
             seed: 0,
             eos: vec![],
             layers: None,
+            use_kv: false,
         };
         let stats = generate(&model, &[2u32, 4], &params, |_| true).expect("generate");
         assert_eq!(stats.tokens.len(), 3);
@@ -300,6 +349,7 @@ mod tests {
             seed: 7,
             eos: vec![],
             layers: None,
+            use_kv: false,
         };
         let a = generate(&model, &prompt, &base, |_| true).expect("a");
         let b = generate(&model, &prompt, &base, |_| true).expect("b");

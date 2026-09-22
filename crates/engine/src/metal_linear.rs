@@ -147,34 +147,19 @@ impl MetalLinear {
     /// * `Ok(None)` — shape not covered by the kernels; caller uses the CPU path.
     /// * `Err(_)` — dispatch/allocation failure (never silently wrong).
     ///
-    /// `q` is `[s, n_heads, head_dim]`, `k`/`v` are `[kv_len, n_kv, head_dim]`,
-    /// all f16. Query row `r` sits at absolute position `kv_len - s + r`, which
-    /// is what lets one kernel serve both prefill (`s == kv_len`) and a cached
-    /// decode step (`s == 1`).
-    #[allow(clippy::too_many_arguments)]
+    /// `q` is `[s, n_heads, head_dim]`, `k`/`v` are `[kv_rows, n_kv, head_dim]`,
+    /// all f16, with the position bases carried in `p` (`ATTN_ROWS`-batched query
+    /// rows per threadgroup, one dispatch over all heads).
     pub fn try_attention(
         &self,
         q: &[f16],
         k: &[f16],
         v: &[f16],
-        s: usize,
-        kv_len: usize,
-        n_heads: usize,
-        n_kv: usize,
-        head_dim: usize,
-        window: usize,
+        p: AttnParams,
     ) -> Result<Option<Vec<f16>>, MetalLinearError> {
-        let p = AttnParams {
-            s,
-            kv_len,
-            n_heads,
-            n_kv,
-            head_dim,
-            window,
-        };
         if p.part().is_none()
-            || q.len() != s * n_heads * head_dim
-            || k.len() != kv_len * n_kv * head_dim
+            || q.len() != p.s * p.n_heads * p.head_dim
+            || k.len() != p.kv_rows * p.n_kv * p.head_dim
             || v.len() != k.len()
         {
             return Ok(None);
@@ -1032,18 +1017,22 @@ mod tests {
             let q: Vec<f16> = (0..s * cfg.n_heads * hd).map(|_| half()).collect();
             let k: Vec<f16> = (0..s * lc.n_kv * hd).map(|_| half()).collect();
             let v: Vec<f16> = (0..s * lc.n_kv * hd).map(|_| half()).collect();
-            let want = gm.attention_cpu(&lc, &q, &k, &v, s);
+            let want = gm.attention_cpu(&lc, &q, &k, &v, s, 0, 0, s);
             let got = g
                 .try_attention(
                     &q,
                     &k,
                     &v,
-                    s,
-                    s,
-                    cfg.n_heads,
-                    lc.n_kv,
-                    hd,
-                    cfg.sliding_window,
+                    AttnParams {
+                        s,
+                        kv_rows: s,
+                        q_pos0: 0,
+                        kv_pos0: 0,
+                        n_heads: cfg.n_heads,
+                        n_kv: lc.n_kv,
+                        head_dim: hd,
+                        window: crate::gemma4::layer_window(lc.kind, cfg.sliding_window),
+                    },
                 )
                 .expect("dispatch")
                 .expect("gpu eligible");

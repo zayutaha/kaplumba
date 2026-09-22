@@ -2,10 +2,20 @@
 //
 //   out[pos, h, :] = softmax_{kv in window(pos)} ( q[pos, h, :] · k[kv, kvh, :] ) · v[kv, kvh, :]
 //
-// Query row `r` of a dispatch sits at absolute position `kv_len - s + r`, and
-// attends to `kv <= pos` (causal) plus, when `window != 0`, `kv >= pos - window + 1`.
-// That single rule covers both shapes the engine needs: a prefill (`s == kv_len`)
-// and a cached decode step (`s == 1`, `kv_len == pos + 1`).
+// Query row `r` sits at absolute position `q_pos0 + r` and attends to absolute
+// key position `kv_pos0 + j <= pos` (causal) plus, when `window != 0`,
+// `kv_pos0 + j >= pos - window + 1`. That single rule covers every shape the
+// engine needs, because the two position bases decouple "where the keys start"
+// from "where the queries are":
+//
+//   * prefill:            `s == kv_rows`, `kv_pos0 == q_pos0`
+//   * plain cached step:  `s == 1`, `kv_pos0 == 0`, `kv_rows == pos + 1`
+//   * windowed SWA cache: `s == 1`, `kv_rows <= window`,
+//                         `kv_pos0 == pos + 1 - kv_rows`
+//
+// The last one is why the bases are explicit: a sliding layer only keeps the
+// last `window` keys (a rotated window, not a growing vector), so key row 0 no
+// longer corresponds to absolute position 0.
 //
 // Memory discipline (user directive 2026-09-22, spec T3.7). This kernel keeps
 // **the entire attention working set in registers**:
@@ -36,7 +46,9 @@ using namespace metal;
 
 struct AttnParams {
     uint s;        // query rows in this dispatch
-    uint kv_len;   // keys available (>= s); query row r sits at kv_len - s + r
+    uint kv_rows;  // key rows available (kv_pos0 + kv_rows - 1 is the newest)
+    uint q_pos0;   // absolute position of query row 0
+    uint kv_pos0;  // absolute position of key row 0 (<= q_pos0)
     uint n_heads;  // query heads
     uint n_kv;     // key/value heads (GQA); n_heads % n_kv == 0
     uint head_dim; // 256 (sliding) or 512 (full) for Gemma 4
@@ -63,7 +75,7 @@ inline void attn_body(device const half *q [[buffer(0)]],
     // threadgroup index must be folded in (a missing `tg.x` term silently makes
     // every block past the first recompute block 0's positions).
     const uint row = tg.x * AROWS + tp.y;
-    const uint pos = p.kv_len - p.s + row;
+    const uint pos = p.q_pos0 + row;
     const bool live = row < p.s;
 
     // Query slice for this row (registers). Padded rows never store, but they
@@ -90,13 +102,16 @@ inline void attn_body(device const half *q [[buffer(0)]],
     float m_run = -3.0e38f;
     float l_run = 0.0f;
 
-    // KV range covered by this threadgroup's row block. Rows in the block share
-    // the range so the loads stay coalesced; out-of-range entries are masked per
-    // row inside the tile.
-    const uint p0 = p.kv_len - p.s + tg.x * AROWS;
-    const uint p1 = min(p0 + AROWS - 1u, p.kv_len - 1u);
-    const uint lo = (p.window > 0u && p0 + 1u > p.window) ? (p0 + 1u - p.window) : 0u;
-    const uint hi = p1;
+    // KV row range covered by this threadgroup's block of query rows: rows share
+    // it so the loads stay coalesced, and anything still invisible is masked per
+    // row inside the tile. Bounds are in *key row* space, hence the `- kv_pos0`.
+    const uint p_last = pos + min((uint)AROWS, p.s - tg.x * AROWS) - 1u;
+    const uint hi = min(p.kv_rows - 1u, p_last - p.kv_pos0);
+    const uint lo_abs = (p.window > 0u) ? ((p.q_pos0 + tg.x * AROWS + 1u > p.window)
+                                               ? (p.q_pos0 + tg.x * AROWS + 1u - p.window)
+                                               : 0u)
+                                         : 0u;
+    const uint lo = (lo_abs > p.kv_pos0) ? (lo_abs - p.kv_pos0) : 0u;
 
     for (uint kb = lo; kb <= hi; kb += ATILE) {
         const uint jn = min(ATILE, hi - kb + 1u);
@@ -122,7 +137,7 @@ inline void attn_body(device const half *q [[buffer(0)]],
         float tmax = -3.0e38f;
         for (uint j = 0; j < ATILE; ++j) {
             if (j < jn) {
-                const uint a = kb + j;
+                const uint a = p.kv_pos0 + kb + j;
                 const bool visible = (a <= pos) && (p.window == 0u || a + p.window > pos);
                 if (!visible) {
                     sc[j] = -3.0e38f;

@@ -278,6 +278,68 @@ synthetic test model's hd 64 goes down that road). Attention is dispatched per
 layer with host→device staging of q/k/v for now; keeping K/V device-resident is
 the KV cache (T5.1).
 
+## T5.1 hybrid KV cache + cached decode (2026-09-22)
+
+Files: `crates/engine/src/kv_cache.rs` (new), `gemma4.rs` (`layer_step`,
+`forward_cached`, `forward_cached_layers`, `rope_heads_at`, `attention_bases`,
+`attention_cpu` with position bases), `generate.rs` (`GenParams::use_kv`),
+`crates/cli` (`--kv-cache`, report fields), `crates/kernels` (attention position
+bases `q_pos0`/`kv_pos0`/`kv_rows`).
+
+Why this came before the prefill GEMM: the GPU linear path is `rows == 1`
+(DE29), so *without* a cache, prefill and every decode step are multi-row and
+100% CPU. The cache is what makes decode GPU-eligible at all.
+
+Layout: one `LayerKv` per layer, `n_kv * head_dim` f16 per row.
+* sliding layers: contiguous **rotated window** of `min(window, cap)` rows — when
+  full, drop the oldest row and shift (8 KB memmove per layer per token).
+  Deliberately not a modular ring: a ring would force modular indexing into the
+  attention kernel for the same bandwidth, so the rotation stays in the host.
+* full layers: every row; running out of capacity is an error, never a silent
+  drop of context.
+
+Memory at 1024 tokens: 50 × 8 MB (sliding, capped by the 1024 window) +
+10 × 4 MB (full) ≈ **450 MB**, matching the spec's "~1 GB SWA/KV" line.
+Measured `kv_bytes` 9,011,200 at 9 tokens ≈ 1.0 MB/token before the window fills.
+
+Measured (release, real artifact, `cargo run --release -p kaplumba-cli --
+generate --prompt "The meaning of life is" --max-tokens 4 --temp 0 --metal
+--kv-cache --json -`):
+
+| metric | value |
+|---|---|
+| prefill (6 tokens) | 3.933 s → **1.53 t/s** (still one row per token; needs T3.2) |
+| decode | 0.824 s / 3 steps → **3.64 t/s** |
+| GPU linears | **3699 = 9 row-steps × 411** (was 1 per *run* before) |
+| `gpu_ms` | 4496 ms total (first row-step pays residency; steady state ≈ 275 ms/token) |
+| `computed_tokens` / `redone_fraction` | 9 / 0.9 (was quadratic) |
+| KV resident | 9.0 MB at 9 tokens |
+
+The recorded fixture is reproduced **exactly** by the new path:
+`real_artifact_cached_fixture_and_gpu_slow` → prompt `[2]`, argmax **236773**,
+logit **29.9782**, 411 GPU linears (the naive fixture recorded in T1.3d has the
+same argmax and logit, so the cache + GPU path is not merely close).
+
+Where the remaining decode time goes (this is the T4.2 target):
+* 15.5 GB of weights at the measured 167 Gw/s ≈ **93 ms/token** of kernel time;
+* 471 command buffers per token (411 linears + 60 attentions), each
+  `commit` + `wait_until_completed`; steady state 275 ms/token minus kernel time
+  puts **~180 ms/token in submit/wait (~0.4 ms per linear)**;
+* ~1 s of one-time Metal shard residency is still charged to TTFT.
+So the next decode lever is "encode the whole token into one command buffer",
+not more kernel tuning, and the bandwidth roofline (17.6 t/s) is still the limit
+that matters after that.
+
+Attention kernel API change (needed for a windowed cache): `AttnParams` now
+carries `kv_rows`, `q_pos0`, `kv_pos0` instead of `kv_len`, because a sliding
+cache's key row 0 is *not* absolute position 0. `windowed_cache_matches_full_history`
+pins that: a rotated cache and a full-history attention with the same window must
+agree.
+
+Also fixed while landing this: `generate()`'s cached path honours `--layers`, and
+`KvCache::new` allocates per-layer capacity (sliding layers reserve only the
+window, so a 16k-context allocation does not reserve 8 GB for sliding layers).
+
 ## Invariants
 
 - I1: Single resident model; single-user; one agent session editing at a time.

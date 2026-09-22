@@ -246,6 +246,7 @@ fn generate_cmd(a: &args::GenerateArgs) -> i32 {
         seed: a.seed,
         eos: a.eos.clone(),
         layers: a.layers,
+        use_kv: a.kv_cache,
     };
 
     let sink = if !a.stream {
