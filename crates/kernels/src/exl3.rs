@@ -363,7 +363,8 @@ impl Exl3Gemv {
         enc.set_buffer(2, Some(pair), 0);
         enc.set_buffer(3, Some(y), 0);
         enc.set_bytes(4, 28, params.as_ptr() as *const _);
-        // MUST match `RGT` in exl3.metal (rows per threadgroup).
+        // MUST match `RGT` in exl3.metal (rows per threadgroup). 8 is the
+        // measured M4 Pro sweet spot; 32 spilled registers (see exl3.metal).
         const RGT: usize = 8;
         enc.dispatch_thread_groups(
             MTLSize::new(shape.out_tiles as u64, rows.div_ceil(RGT) as u64, 1),

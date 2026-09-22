@@ -277,7 +277,12 @@ kernel void exl3_had_out(device const float *y [[buffer(0)]],
 // Accumulators live in registers (accA/B[RGT]); the 4-lane column reduction
 // collapses through threadgroup memory in one barrier at the end, writing
 // y[row * out_features + col]. Rows beyond `rows` are skipped warp-uniformly.
-// ---------------------------------------------------------------------------
+//
+// RGT trades register pressure against redundant weight streams: grid.y =
+// ceil(rows/RGT), and every row-chunk re-reads the same trellis for its
+// out-tile. RGT=8 is the measured sweet spot on M4 Pro — RGT=32 spilled
+// registers and collapsed span prefill from 15 t/s to 5.5 t/s (2026-09-22).
+// MUST match `RGT` in exl3.rs.
 constant uint RGT = 8u;
 
 kernel void exl3_gemm(device const half *xh [[buffer(0)]],
