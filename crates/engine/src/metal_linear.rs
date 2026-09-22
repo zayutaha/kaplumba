@@ -73,6 +73,17 @@ impl MetalLinear {
         &self.gemv
     }
 
+    /// Why `try_linear(src, name)` would fall back to the CPU reference, or
+    /// `None` when the linear is GPU-eligible. Cheap (metadata only) — call it
+    /// to prove a real run is not silently CPU-bound (`gpu_linears` in the
+    /// bench report only counts dispatches, not the reason).
+    pub fn skip_reason(&self, src: &dyn TensorSource, name: &str) -> Option<String> {
+        match gather_checked(src, name) {
+            Ok(_) => None,
+            Err(e) => Some(e),
+        }
+    }
+
     /// Single-row `y = had(had(x·suh) @ W)·svh` on the GPU.
     ///
     /// * `Ok(Some(y))` — computed on the GPU, `y.len() == out_features`.
@@ -106,50 +117,90 @@ impl MetalLinear {
 
 /// Collect everything the kernels need, or `None` when not eligible.
 fn gather<'a>(src: &'a dyn TensorSource, name: &str) -> Option<GpuLinear<'a>> {
+    gather_checked(src, name).ok()
+}
+
+/// `gather` with the reason it declined, so a silent CPU fallback is
+/// diagnosable (see `skip_reason` and the `all_layer_linears_gpu_eligible_slow`
+/// test).
+fn gather_checked<'a>(src: &'a dyn TensorSource, name: &str) -> Result<GpuLinear<'a>, String> {
     let trellis_name = format!("{name}.trellis");
-    let t = src.get(&trellis_name)?;
+    let t = src
+        .get(&trellis_name)
+        .ok_or_else(|| format!("missing {trellis_name}"))?;
     if t.shape.len() != 3 {
-        return None;
+        return Err(format!("{trellis_name}: shape {:?} is not 3-D", t.shape));
     }
     let (in_tiles, out_tiles, packed) = (t.shape[0], t.shape[1], t.shape[2]);
-    if packed % 16 != 0 {
-        return None;
+    if packed == 0 || packed % 16 != 0 {
+        return Err(format!(
+            "trellis packed size {packed} is not a multiple of 16"
+        ));
     }
     let k = (packed / 16) as u32;
-    let shape = Exl3Shape::new(in_tiles * 16, out_tiles * 16, k)?;
+    let shape = Exl3Shape::new(in_tiles * 16, out_tiles * 16, k)
+        .ok_or_else(|| format!("k={k} unsupported for {in_tiles}×{out_tiles} tiles"))?;
     if t.bytes.len() != in_tiles * out_tiles * packed * 2 {
-        return None;
+        return Err(format!(
+            "trellis byte length {} != {}×{}×{}×2",
+            t.bytes.len(),
+            in_tiles,
+            out_tiles,
+            packed
+        ));
     }
 
-    let suh_t = src.get(&format!("{name}.suh"))?;
-    let svh_t = src.get(&format!("{name}.svh"))?;
+    let suh_t = src
+        .get(&format!("{name}.suh"))
+        .ok_or_else(|| format!("missing {name}.suh"))?;
+    let svh_t = src
+        .get(&format!("{name}.svh"))
+        .ok_or_else(|| format!("missing {name}.svh"))?;
     // Packed sign bitfields (I16) and missing scales stay on the CPU.
     if suh_t.dtype != DType::F16 || svh_t.dtype != DType::F16 {
-        return None;
+        return Err(format!(
+            "sign fields must be F16, got {:?}/{:?} (packed bitfield = CPU-only)",
+            suh_t.dtype, svh_t.dtype
+        ));
     }
     if suh_t.bytes.len() != shape.in_features() * 2 || svh_t.bytes.len() != shape.out_features() * 2
     {
-        return None;
+        return Err(format!(
+            "sign field lengths {}/{} != {}/{} halves",
+            suh_t.bytes.len() / 2,
+            svh_t.bytes.len() / 2,
+            shape.in_features(),
+            shape.out_features()
+        ));
     }
     if src.get(&format!("{name}.bias")).is_some() {
-        return None;
+        return Err("has a bias (CPU-only)".to_string());
     }
 
     let mcg_name = format!("{name}.mcg");
-    let mcg = src.get(&mcg_name)?;
-    let mode = CodebookMode::from_mcg_mult(mcg.first_u32(&mcg_name).ok()?)?;
+    let mcg = src
+        .get(&mcg_name)
+        .ok_or_else(|| format!("missing {mcg_name}"))?;
+    let mult = mcg
+        .first_u32(&mcg_name)
+        .map_err(|e| format!("{mcg_name}: {e}"))?;
+    let mode = CodebookMode::from_mcg_mult(mult)
+        .ok_or_else(|| format!("{mcg_name}: mcg_mult {mult:#x} is not a known codebook"))?;
     let mode = match mode {
         CodebookMode::Default => 0u32,
         CodebookMode::Mcg => 1u32,
-        CodebookMode::Mul1 => return None,
+        CodebookMode::Mul1 => return Err("codebook Mul1 (CPU-only)".to_string()),
     };
 
-    Some(GpuLinear {
+    Ok(GpuLinear {
         shape,
         mode,
-        trellis: device_span(src, &trellis_name)?,
-        suh: device_span(src, &format!("{name}.suh"))?,
-        svh: device_span(src, &format!("{name}.svh"))?,
+        trellis: device_span(src, &trellis_name)
+            .ok_or_else(|| format!("{trellis_name}: no device span"))?,
+        suh: device_span(src, &format!("{name}.suh"))
+            .ok_or_else(|| format!("{name}.suh: no device span"))?,
+        svh: device_span(src, &format!("{name}.svh"))
+            .ok_or_else(|| format!("{name}.svh: no device span"))?,
     })
 }
 
@@ -821,6 +872,76 @@ mod tests {
         eprintln!(
             "{name}: {}x{} cpu vs gpu max rel err {err:.2e}",
             shape.0, shape.1
+        );
+    }
+
+    /// Every decoder linear in the real artifact must be GPU-eligible.
+    ///
+    /// A single silent CPU fallback costs ~0.5 s/token, and `gpu_linears`
+    /// alone cannot tell you *why* a linear was skipped. Gate on
+    /// `KAPLUMBA_RUN_SLOW=1` (loads 16 GB, ~5 s — no forward passes).
+    #[test]
+    fn all_layer_linears_gpu_eligible_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = crate::testutil::artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let Some(c) = ctx() else { return };
+        let model = crate::load::load_exl3(&c, &dir).expect("load artifact");
+        let g = MetalLinear::new(&c).expect("metal linear");
+        let src: &dyn TensorSource = &model;
+        let cfg = crate::gemma4::GemmaCfg::from_text_config(&model.config.text_config)
+            .expect("gemma cfg");
+
+        let mut names: Vec<String> = Vec::new();
+        for i in 0..cfg.n_layers {
+            let p = format!("model.language_model.layers.{i}");
+            for m in ["self_attn.q_proj", "self_attn.k_proj", "self_attn.o_proj"] {
+                names.push(format!("{p}.{m}"));
+            }
+            if cfg.layers[i].kind == crate::gemma4::LayerKind::Sliding {
+                names.push(format!("{p}.self_attn.v_proj"));
+            }
+            for m in ["mlp.gate_proj", "mlp.up_proj", "mlp.down_proj"] {
+                names.push(format!("{p}.{m}"));
+            }
+        }
+        names.push("lm_head".to_string());
+
+        let mut skipped = Vec::new();
+        for name in &names {
+            if let Some(reason) = g.skip_reason(src, name) {
+                skipped.push(format!("{name}: {reason}"));
+            }
+        }
+        for s in &skipped {
+            eprintln!("CPU fallback -> {s}");
+        }
+        eprintln!(
+            "{} of {} linears GPU-eligible",
+            names.len() - skipped.len(),
+            names.len()
+        );
+        assert!(skipped.is_empty(), "{} skipped linears", skipped.len());
+
+        // Eligibility is necessary but not sufficient: the runtime dispatch
+        // must actually take the GPU branch. A one-layer forward makes that
+        // observable (7 linears + lm_head for a sliding layer).
+        let gm = crate::gemma4::Gemma4Model::from_model(&model)
+            .expect("cfg")
+            .with_gpu(&g);
+        let before = g.calls();
+        let x = gm.forward_seq_layers(&[2], 1).expect("1-layer forward");
+        let _ = gm.logits(&x).expect("logits");
+        let dispatched = g.calls() - before;
+        eprintln!("1-layer forward + lm_head dispatched {dispatched} GPU linears");
+        assert_eq!(
+            dispatched, 8,
+            "expected 7 layer linears + lm_head on the GPU"
         );
     }
 }

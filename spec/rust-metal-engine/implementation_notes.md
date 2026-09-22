@@ -187,6 +187,43 @@ then `ponyexl3.mlx.generate.generate_text(..., use_chat_template=False, temp=0.0
 - Timing TTFT via first detokenizer segment (late) — time first token emit instead.
 - Per-row decode degradation in reference bench = memory accumulation without `mx.clear_cache` between rows (Python harness fix needed for fair reference capture; our Rust bench must clear/track peaks per row).
 
+## DE29 — the GPU linear path only ever ran the lm_head (found 2026-09-22, T2.1 residue)
+
+Symptom: `generate --metal --json -` on the real artifact reported **`gpu_linears: 1`**
+for a 60-layer token that took 5.58 s. One 16 GB load, one `MetalLinear`, 411
+decoder linears — and exactly one dispatch.
+
+Diagnosis (via the new `MetalLinear::skip_reason`, which replaces `gather`'s
+bare `None` with a reason string, plus `all_layer_linears_gpu_eligible_slow`):
+
+- `gather` **is** happy with every linear in the artifact: `411 of 411 linears
+  GPU-eligible`. All `mcg` are `0xCBAC1FED` (Mcg), all `suh`/`svh` are F16, all
+  trellis `[in_tiles, out_tiles, 48]`. Nothing is mode/format-gated.
+- The blocker is the **runtime** row check in `try_linear`:
+  `if x.len() != shape.in_features() { return Ok(None) }` — i.e. `rows == 1`.
+- The naive engine recomputes the **whole prefix** every step, so the only
+  genuinely single-row call in a whole run is the last-row `lm_head` in
+  `logits()`. Prefill (`s = prompt`) and every decode step (`s = prefix + 1`)
+  are multi-row → **100% CPU fallback**, at ~0.5 s per linear.
+- A one-layer forward test proves the wiring is otherwise fine: 7 layer linears
+  + lm_head dispatch, and `assert_eq!(dispatched, 8)`.
+
+Consequences for the plan (both user targets depend on this):
+
+1. **Decode** cannot use the GPU until the engine stops recomputing the prefix:
+   a KV cache makes decode `s == 1` (T5.1/T4.2) — that alone is the difference
+   between ~0.18 t/s and ~5.6 t/s, before any kernel tuning.
+2. **Prefill** needs a multi-row (batched) linear: `s > 1` must go to a GEMM that
+   amortizes the trellis decode across columns (T3.2).
+3. **Attention** is CPU-only today (`Gemma4Model::attention`), and at L=1024 it
+   is ~587 MMAC/token across the 60 layers — comparable to the whole GEMV cost.
+   So a Metal attention kernel (T3.5/T3.7, online softmax, fixed scratch) is on
+   the critical path for *both* targets, not just a prefill nicety.
+
+Guard: `all_layer_linears_gpu_eligible_slow` (KAPLUMBA_RUN_SLOW=1, ~5 s, loads
+16 GB) now asserts eligibility *and* that a real 1-layer forward dispatches 8
+GPU linears, so this class of silent fallback cannot come back unnoticed.
+
 ## Invariants
 
 - I1: Single resident model; single-user; one agent session editing at a time.
