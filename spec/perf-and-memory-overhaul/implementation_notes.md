@@ -46,6 +46,22 @@ This document records technical decisions, benchmark measurements, register allo
 - Historical "103–134 GB/s achieved" figures are similarly understated in % terms (they divided the wrong numerator... actually they used 16 GB numerator so % was overstated-as-low: true stream 11.2 GB at the same ms/token yields LOWER achieved GB/s but the same t/s — the % of bus now reads ~37% at 8.39 t/s, i.e. **63% of the bus idle** — that's the real work).
 - Awaiting `decode_throughput_slow` re-run to record the corrected baseline line.
 
+### T5.1r — PF=4 register prefetch ring REVERTED (2026-09-23)
+- **Attempt** (commit `a4e15e2`): in the T4 32-thread kernel, split each tile's funnel-window load into `exl3_load_win` and its decode/multiply into `exl3_acc_win`, then replaced the 2-way unrolled loop with a 4-slot register ring. Each iteration decodes slot `I&3`, then refills that slot with iteration `I+4`'s words, so 3 future iterations (24 word-loads) sit in flight behind the current decode. Prologue fills all 4 slots. Logic per tile (window shifts, FMA order) was byte-identical to the old loop; tail loop unchanged.
+- **A/B measurement (same session, `bench_passes_slow`, swap stable 9449/10240 MB used before+after)**:
+  | linear | T4 (7197888) | PF=4 ring | Δ |
+  |---|---|---|---|
+  | gate | 165 Gw/s | 107 | −35% |
+  | down | 168 | 108 | −36% |
+  | o | 109 | 80 | −27% |
+  | q | 111 | 81 | −27% |
+  | k | 70 | 63 | −10% |
+  | v | 76 | 57 | −25% |
+  | lm_head | 243 | 135 | −44% |
+- **Root causes** (hypothesis, not proven): (a) `ulong pf_m0[4][2]` indexed by dynamic `cur = I&3` is *not* guaranteed register-resident in MSL — dynamic indexing most likely demotes the arrays to stack/local memory, turning the "ring" into extra per-iteration memory traffic; (b) +32 regs/thread would cut concurrent threadgroups/core, killing the cross-TG latency hiding that already exists at 336–1344 TGs spread over 20 cores.
+- **Learned**: the "load-then-decode serial → issue-bound" theory is **not** confirmed on M4 Pro. With 2-way unroll already issuing 8 loads per iteration and ~hundreds of live threadgroups, the ~60% bus utilization is probably a genuine memory-system/coalescing ceiling, not latency. A non-array `simd_shuffle`/scalar double-buffer might dodge the spill issue, but the ExllamaV3 PF trick does not obviously transfer. Do not retry without a register-spill check (e.g. `xcrun metal -frameworks Metal -c ... -gline-tables-only` / compile with `-zeitgeist` or inspect SASS-like disassembly).
+- Correctness was NOT the problem: kernels 21/21, one-hot GPU==CPU, decoded-tile parity, `gpu_linear_matches_cpu_reference`, 116 fast engine tests — all green while perf regressed. Reverted in `fb26c21`.
+
 ### T1: Filter vision tower tensors during model load
 - Implemented `is_vision_tensor` in `crates/engine/src/load.rs`.
 - Safetensors loader skips 356 tensors matching `model.vision_tower.*` and `model.embed_vision.*`.

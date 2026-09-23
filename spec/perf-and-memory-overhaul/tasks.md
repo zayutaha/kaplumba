@@ -31,10 +31,11 @@
   - **Intent**: True per-token stream = 11.2 GB (vision removed T1, embed mmap T2) → roofline 11.2÷273 ≈ 41 ms ≈ **24.4 t/s** (user-confirmed 11.2 GB). The old 16.028e9 figure overstated stream ~43% and produced the wrong 17.6 t/s "hard ceiling" used to declare 18/20 unreachable. Print roofline in `decode_throughput_slow`.
   - **Testing**: `decode_throughput_slow` prints corrected GB/s + roofline; fast suite green.
 
-- [ ] **T5.1r: Prefetch ring in the T4 32-thread gemv (ExllamaV3's actual trick)**
+- [x] **T5.1r: Prefetch ring in the T4 32-thread gemv (ExllamaV3's actual trick)** — ATTEMPTED, REVERTED `fb26c21` (impl `a4e15e2`)
   - **Files**: `crates/kernels/src/exl3.metal`
   - **Intent**: PF depth 2–4 register prefetch: load tile i+PF words while decoding tile i (currently load-then-decode serial → latency never hidden → issue-bound ~50%, 60% BW). Keep T4 structure (32 threads, 2-way unroll, no fat TGs).
-  - **Testing**: kernels 21/21, parity tests, one-hot; **bench gate/down ≥ 200 Gw/s or revert**.
+  - **Result**: PF=4 ring (4-slot, dynamic `I&3` indexing, consume-then-refill I+4) regressed EVERY shape: gate 165→107, down 168→108, o 109→80, q 111→81, k 70→63, v 76→57, lm 243→135 Gw/s. Correctness fine (21/21, one-hot, parity, 116 fast). Likely cause: MSL arrays with dynamic indexing demoted to stack memory (spill) + occupancy cut. See implementation_notes §T5.1r.
+  - **Testing**: kernels 21/21, parity tests, one-hot; **bench gate/down ≥ 200 Gw/s or revert** → reverted.
 
 - [ ] **T5.2r: Split-policy empirical sweep**
   - **Files**: `crates/kernels/src/exl3.rs`
