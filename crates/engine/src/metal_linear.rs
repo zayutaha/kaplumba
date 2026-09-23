@@ -1081,6 +1081,68 @@ mod tests {
         }
     }
 
+    /// T5.2r: nsplit sweep on the real artifact shapes. Pure measurement —
+    /// prints min-ms per nsplit ∈ {1,2,4,8,16} for gemv only (no had).
+    /// Gate: `KAPLUMBA_RUN_SLOW=1`; run with `--ignored --nocapture`.
+    #[test]
+    #[ignore]
+    fn bench_gemv_split_sweep_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = crate::testutil::artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let Some(c) = ctx() else { return };
+        let model = crate::load::load_exl3(&c, &dir).expect("load artifact");
+        let ml = MetalLinear::new(&c).expect("metal linear");
+        let src: &dyn TensorSource = &model;
+
+        let names = [
+            ("gate", "model.language_model.layers.0.mlp.gate_proj"),
+            ("down", "model.language_model.layers.0.mlp.down_proj"),
+            ("o", "model.language_model.layers.0.self_attn.o_proj"),
+            ("q", "model.language_model.layers.0.self_attn.q_proj"),
+            ("k", "model.language_model.layers.0.self_attn.k_proj"),
+            ("v", "model.language_model.layers.0.self_attn.v_proj"),
+            ("lm_head", "lm_head"),
+        ];
+        for (label, name) in names {
+            let g = linear_handles(src, name).unwrap_or_else(|e| panic!("{name} eligible: {e}"));
+            let (inn, outp) = (g.shape.in_features(), g.shape.out_features());
+            let nsplit_policy = 4096usize.div_ceil(g.shape.out_tiles).clamp(1, 16);
+            let xh: Vec<f16> = (0..inn)
+                .map(|i| f16::from_f32(((i % 17) as f32 - 8.0) / 64.0))
+                .collect();
+            let mut row = format!("{label:8} {inn}x{outp} k={} pol_ns={nsplit_policy}", g.shape.k);
+            for nsplit in [1usize, 2, 4, 8, 16, 32] {
+                if nsplit > inn / 16 {
+                    row.push_str("  -");
+                    continue;
+                }
+                const REPS: usize = 12;
+                let mut best = f64::INFINITY;
+                for _ in 0..REPS {
+                    let mut o = Vec::new();
+                    let t = std::time::Instant::now();
+                    ml.raw()
+                        .gemv_pass_nsplit(&xh, g.trellis(), g.shape, g.mode, Some(nsplit), &mut o)
+                        .unwrap();
+                    best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+                }
+                let gb = (inn * outp) as f64;
+                row.push_str(&format!(
+                    "  n{nsplit}={:.3}/{}",
+                    best,
+                    (gb / (best / 1000.0) / 1e9) as u32
+                ));
+            }
+            eprintln!("{row}");
+        }
+    }
+
     /// Diagnostic dump of the matrix the GPU sees, one-hot activation per row.
     /// Ignored by default; `cargo test -- --ignored --nocapture debug_gemv_rows`.
     #[test]

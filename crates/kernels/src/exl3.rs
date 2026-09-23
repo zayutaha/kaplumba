@@ -281,10 +281,21 @@ impl Exl3Gemv {
     /// split the in-tile range across `grid.y` until the dispatch reaches
     /// ~4096 threadgroups (T2.9 pivot: 1024 left k/v at 94/106 Gw/s with
     /// nsplit=4), capped at 16 splits (partial ≤ ~344 KB).
+    ///
+    /// T5.2r: isolated nsplit sweep on the real artifact shapes
+    /// (`bench_gemv_split_sweep_slow`) showed the 4096-TG target over-splits
+    /// the mid shapes. Measured argmax (Gw/s): lm 1 (241), gate 4 (167),
+    /// q 4 (119 vs 111 @8), down/o ≈ 13 band (167/114 straddled 8–16),
+    /// k/v 8 (89/78 vs 78/78 @16). Only the two measured outliers need
+    /// overrides; the rest stay on the formula.
     fn gemv_splits(out_tiles: usize) -> usize {
         const TARGET_TGS: usize = 4096;
         const MAX_SPLIT: usize = 16;
-        TARGET_TGS.div_ceil(out_tiles.max(1)).clamp(1, MAX_SPLIT)
+        match out_tiles {
+            512 => 4, // q (8 → 4): 8192-out shape, 119 Gw/s
+            256 => 8, // k/v (16 → 8): 4096-out shape, 89/78 Gw/s
+            _ => TARGET_TGS.div_ceil(out_tiles.max(1)).clamp(1, MAX_SPLIT),
+        }
     }
 
     fn pair_buffer(&self, k: u32) -> Buffer {
@@ -519,12 +530,13 @@ impl Exl3Gemv {
         mode: u32,
         y: &Buffer,
         ext_partial: Option<&Buffer>,
+        nsplit_override: Option<usize>,
     ) {
         // The kernel reads the trellis as u32 words (two packed u16s each), so
         // the per-tile stride is half the u16 tile length. `aligned` selects the
         // single-u32 load path (real artifacts: most tensors yes, lm_head no).
         debug_assert_eq!(shape.words_per_tile() % 2, 0);
-        let nsplit = Self::gemv_splits(shape.out_tiles);
+        let nsplit = nsplit_override.unwrap_or_else(|| Self::gemv_splits(shape.out_tiles));
         let params: [u32; 7] = [
             shape.in_tiles as u32,
             shape.out_tiles as u32,
@@ -797,7 +809,7 @@ impl Exl3Gemv {
         rows: usize,
     ) {
         if rows == 1 {
-            self.encode_gemv(enc, xh, trellis, pair, shape, mode, y, ext_partial);
+            self.encode_gemv(enc, xh, trellis, pair, shape, mode, y, ext_partial, None);
         } else if Self::sg_eligible(shape, trellis) {
             self.encode_gemm_sg(enc, xh, trellis, shape, mode, y, ext_partial, rows);
         } else {
@@ -917,6 +929,20 @@ impl Exl3Gemv {
         mode: u32,
         out: &mut Vec<f32>,
     ) -> Result<(), KernelError> {
+        self.gemv_pass_nsplit(xh, trellis, shape, mode, None, out)
+    }
+
+    /// `gemv_pass` with an explicit `nsplit` (None → `gemv_splits` policy).
+    /// T5.2r sweep hook.
+    pub fn gemv_pass_nsplit(
+        &self,
+        xh: &[f16],
+        trellis: DeviceSpan<'_>,
+        shape: Exl3Shape,
+        mode: u32,
+        nsplit: Option<usize>,
+        out: &mut Vec<f32>,
+    ) -> Result<(), KernelError> {
         if xh.len() != shape.in_features() {
             return Err(KernelError::Unsupported(format!(
                 "gemv needs {} activations, got {}",
@@ -945,7 +971,7 @@ impl Exl3Gemv {
             }
             let cb = self.queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
-            self.encode_gemv(enc, &sc.xh, trellis, &pair, shape, mode, &sc.y, None);
+            self.encode_gemv(enc, &sc.xh, trellis, &pair, shape, mode, &sc.y, None, nsplit);
             enc.end_encoding();
             cb.commit();
             cb.wait_until_completed();
@@ -1056,7 +1082,7 @@ impl Exl3Gemv {
             }
             self.submit(|enc| {
                 self.encode_had_in(enc, &sc.x_stage, suh, &sc.xh, 1, inn);
-                self.encode_gemv(enc, &sc.xh, trellis, &pair_buf, shape, mode, &sc.y, None);
+                self.encode_gemv(enc, &sc.xh, trellis, &pair_buf, shape, mode, &sc.y, None, None);
                 self.encode_had_out(enc, &sc.y, svh, &sc.yh, 1, outp);
             })?;
             unsafe {
@@ -1279,17 +1305,18 @@ mod tests {
         Some((d, q))
     }
 
-    /// T2.5 policy (T2.9 deepened): TARGET 4096 TGs — lm_head (16384 tiles)
-    /// stays 1, gate → 4, q → 8, down/o → 13, k/v → 16 (was 4 at 94/106
-    /// Gw/s); tiny shapes clamp to 16. Partial scratch ≤ ~344 KB transient.
+    /// T2.5 policy (T2.9 deepened, T5.2r re-tuned): TARGET 4096 TGs — lm_head
+    /// (16384 tiles) stays 1, gate → 4, q → 4 (T5.2r: 8→4, 119 Gw/s), down/o
+    /// → 13 (band-straddled 8–16), k/v → 8 (T5.2r: 16→8, 89/78 Gw/s); tiny
+    /// shapes clamp to 16. Partial scratch ≤ ~344 KB transient.
     #[test]
     fn gemv_splits_policy_covers_shapes() {
         assert_eq!(Exl3Gemv::gemv_splits(16384), 1); // lm_head (already 16k TGs)
         assert_eq!(Exl3Gemv::gemv_splits(4096), 1); // exactly target
         assert_eq!(Exl3Gemv::gemv_splits(1344), 4); // gate (21504 out), was 1
-        assert_eq!(Exl3Gemv::gemv_splits(512), 8); // q (8192 out), was 2
-        assert_eq!(Exl3Gemv::gemv_splits(336), 13); // down/o (5376 out), was 4
-        assert_eq!(Exl3Gemv::gemv_splits(256), 16); // k/v (4096 out), was 4
+        assert_eq!(Exl3Gemv::gemv_splits(512), 4); // q (8192 out), T5.2r 8→4
+        assert_eq!(Exl3Gemv::gemv_splits(336), 13); // down/o (5376 out)
+        assert_eq!(Exl3Gemv::gemv_splits(256), 8); // k/v (4096 out), T5.2r 16→8
         assert_eq!(Exl3Gemv::gemv_splits(64), 16); // clamped (want 64)
         assert_eq!(Exl3Gemv::gemv_splits(1), 16);
     }
