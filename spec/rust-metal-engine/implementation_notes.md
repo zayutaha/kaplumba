@@ -553,6 +553,16 @@ Cross-checks:
 - T2.3 ops ceiling: 350–450 Gw/s for the current gemv algorithm ≈ **9–12 t/s**
 - today 6.42 → plausible plain-decode ceiling **~9–12 t/s** after gemv ops-count work; **18 requires MTP/verify-batch** (Phase 4 T4.4/T4.6: rows=k amortize decode ops/weight below 5) — but the user gate sequences MTP *after* 18 via plain decode → circular; surface alongside the 200 pp/s conflict
 
+## T2.6 — gemv funnel micro (2026-09-23)
+
+**A — pk mask hoist:** the four `pk&0xFF`/`>>8`/`>>16` field extractions (20 ops/iter) were written inside the `it` loop; hoisted to locals before it. Bench: **gate 177 → 187 Gw/s** (+5.6%), lm/down/o flat — LLVM already hoisted on the long lm_head loop (in_tiles=16384), but evidently not on gate's shorter one (in_tiles=1344? gate in_tiles=21504/16=1344). Keep.
+
+**B — 2-way unroll:** loop body duplicated (8 `funnel_pair`s / 16 loads per scheduling region) + odd-tail remainder loop. Accumulation order preserved exactly: body(it) then body(it+1) in program order, each body's four `accA`/`accB` `+=` statements verbatim → bit-identical to rolled form (confirmed: gated gemv suite + fixture tokens unchanged). Bench vs A: gate 189, **down 183 → 192 (+4.9%)** (split shapes: fewer iters/TG → deeper relative tail), o 138, **lm 239 flat** — lm_head was already latency-hiding via 51 resident waves; its bound is issue/ALU not load latency (239 Gw/s × 10 ops = 2.4 Tops vs T2.3's ~4.1 Tops issue bound = ~59%).
+
+**End-to-end:** decode **7.15 → 7.52 t/s** (139.8 → 132.9 ms/token, 120.6 GB/s), tokens identical `[236773, …]`. T2.5+T2.6 total: **6.42 → 7.52 (+17%)**.
+
+**Where decode stands (7.52 t/s):** remaining walls — lm_head/gate issue-bound (funnel ALU ~10 ops/weight; T2.3 ceiling 350–450 Gw/s ⇒ ~9–12 t/s same-algorithm max), bandwidth roofline ~17.6 t/s at 100% (currently 120.6/273 = 44%). Next decode lever: capture a one-token host-side phase profile (T4.2 span-profile tooling) at 7.52 t/s to split linears vs had vs attn/rope/rms vs sampler before choosing — do NOT guess from bench sub-timers (bench `full`/`gemv`/`had_*` columns are separate runs and do not sum reliably). Then either attack the identified share or declare the same-algorithm plateau (~9–12 t/s ops ceiling) and write the conflict report (18 needs MTP — gate circular).
+
 ## T2.5 — gemv K-split + reduce (2026-09-23)
 
 **Finding (profile-first):** gemv Gw/s tracks **wave depth** almost perfectly — lm_head 16384 TGs = 51 waves → 241 Gw/s, gate 1344 = 4 waves → 172, down/o 336 = 1 wave → 149/119, k/v ≲0.5 waves worst. 1-wave shapes have no tail-latency hiding across the ~320 concurrent simdgroups (20 cores), so the funnel's load latency sits exposed. attn/glue/head ≈ 0 of the 155.6 ms token at short ctx — linears are the whole decode.

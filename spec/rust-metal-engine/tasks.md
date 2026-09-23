@@ -119,6 +119,15 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - Target: R2.1 (tg/s), profile-before-machinery
 - Commit: `spec/rust-metal-engine: T2.5 gemv k-split`
 
+### T2.6 — gemv funnel micro: mask hoist + 2-way unroll (issue/MLP)
+- [x] Experiment A: hoist `pk0..3` field extraction (`i0/i1/s1` × 4 pairs = 20 loop-invariant ops/iter) out of the `it` loop — bench: **gate 177 → 187 Gw/s (+5.6%)**, lm 240 flat (long loop already hoisted by LLVM), down/o flat
+- [x] Experiment B: 2-way unroll of the `it` loop → 8 `funnel_pair`s (16 word loads) visible per scheduling region, odd tail via second loop; each body's statement order and the accA/accB `+=` sequence preserved exactly (bit-identical accumulation). Bench vs A: gate 189 (+1.1%), down 183 → 192 (+4.9%), o 138, lm 239 (flat — already latency-hiding via 51 resident waves)
+- [x] **Verified:** kernels 19, fast engine 113, full gated **113 passed / 0 failed / 4 ignored** (fixture 236773, span 0.55, batched-vs-gemv unchanged); `decode_throughput_slow`: **7.15 → 7.52 t/s** (139.8 → 132.9 ms/token, 120.6 GB/s), decoded ids identical `[236773, …]`; total T2.5+T2.6: **6.42 → 7.52 t/s (+17%)**
+- Files: `crates/kernels/src/exl3.metal` (`exl3_gemv` only)
+- Test: above
+- Target: R2.1 (tg/s), toward T2.3's 350–450 Gw/s ops ceiling
+- Commit: `spec/rust-metal-engine: T2.6 gemv funnel micro`
+
 ## Phase 3 — Prefill kernels
 
 ### T3.1 — Verify EXL3 artifact (T3.1 from old plan, renamed)

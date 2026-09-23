@@ -191,16 +191,71 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
     uint pk1 = pair_tab[4u * g + 1u];
     uint pk2 = pair_tab[4u * g + 2u];
     uint pk3 = pair_tab[4u * g + 3u];
+    // T2.6 A: field extraction hoisted out of the it loop (was 20
+    // loop-invariant ops re-derived per iteration before funnel_pair).
+    uint i0_0 = pk0 & 0xFFu;
+    uint i1_0 = (pk0 >> 8) & 0xFFu;
+    uint s1_0 = (pk0 >> 16) & 0xFFu;
+    uint i0_1 = pk1 & 0xFFu;
+    uint i1_1 = (pk1 >> 8) & 0xFFu;
+    uint s1_1 = (pk1 >> 16) & 0xFFu;
+    uint i0_2 = pk2 & 0xFFu;
+    uint i1_2 = (pk2 >> 8) & 0xFFu;
+    uint s1_2 = (pk2 >> 16) & 0xFFu;
+    uint i0_3 = pk3 & 0xFFu;
+    uint i1_3 = (pk3 >> 8) & 0xFFu;
+    uint s1_3 = (pk3 >> 16) & 0xFFu;
 
     float accA = 0.0f;
     float accB = 0.0f;
 
     // `live` is warp-uniform, so the loop is skipped (not divergent) for the
     // padding warp of the last threadgroup while every warp still reaches the
-    // barrier below.
-    for (uint it = it0; live && it < it1; it++) {
-        // Stride is in u32 words; the tile is addressed as u16 pairs so that a
-        // 2-mod-4 trellis offset still reads correctly.
+    // barrier below. T2.6 B: 2-way unroll — 8 funnel_pair calls (16 word
+    // loads) become visible to the scheduler in one region for memory-level
+    // parallelism; each body keeps its statement order and the accA/accB
+    // `+=` sequence stays strictly sequential across iterations (bit-identical
+    // accumulation order to the rolled form). Odd tail handled by the second
+    // loop.
+    for (uint it = it0; live && it + 1u < it1; it += 2u) {
+        {
+            device const ushort *tile =
+                trellis + (ulong)(it * p.out_tiles + ot) * p.twords * 2u;
+            uint xrow = it * TILE + r0;
+            float x00 = float(xh[xrow]);
+            float x01 = float(xh[xrow + 1u]);
+            float x02 = float(xh[xrow + 8u]);
+            float x03 = float(xh[xrow + 9u]);
+            CodePair p0 = funnel_pair(tile, i0_0, i1_0, s1_0, p.k, p.mode, aligned);
+            CodePair p1 = funnel_pair(tile, i0_1, i1_1, s1_1, p.k, p.mode, aligned);
+            CodePair p2 = funnel_pair(tile, i0_2, i1_2, s1_2, p.k, p.mode, aligned);
+            CodePair p3 = funnel_pair(tile, i0_3, i1_3, s1_3, p.k, p.mode, aligned);
+            accA += x00 * float(p0.lo) + x01 * float(p0.hi);
+            accA += x02 * float(p1.lo) + x03 * float(p1.hi);
+            accB += x00 * float(p2.lo) + x01 * float(p2.hi);
+            accB += x02 * float(p3.lo) + x03 * float(p3.hi);
+        }
+        {
+            uint it1_ = it + 1u;
+            device const ushort *tile =
+                trellis + (ulong)(it1_ * p.out_tiles + ot) * p.twords * 2u;
+            uint xrow = it1_ * TILE + r0;
+            float x00 = float(xh[xrow]);
+            float x01 = float(xh[xrow + 1u]);
+            float x02 = float(xh[xrow + 8u]);
+            float x03 = float(xh[xrow + 9u]);
+            CodePair p0 = funnel_pair(tile, i0_0, i1_0, s1_0, p.k, p.mode, aligned);
+            CodePair p1 = funnel_pair(tile, i0_1, i1_1, s1_1, p.k, p.mode, aligned);
+            CodePair p2 = funnel_pair(tile, i0_2, i1_2, s1_2, p.k, p.mode, aligned);
+            CodePair p3 = funnel_pair(tile, i0_3, i1_3, s1_3, p.k, p.mode, aligned);
+            accA += x00 * float(p0.lo) + x01 * float(p0.hi);
+            accA += x02 * float(p1.lo) + x03 * float(p1.hi);
+            accB += x00 * float(p2.lo) + x01 * float(p2.hi);
+            accB += x02 * float(p3.lo) + x03 * float(p3.hi);
+        }
+    }
+    for (uint it = (it1 > it0 && (it1 - it0) % 2u == 1u) ? it1 - 1u : it1;
+         live && it < it1; it++) {
         device const ushort *tile =
             trellis + (ulong)(it * p.out_tiles + ot) * p.twords * 2u;
         uint xrow = it * TILE + r0;
@@ -208,22 +263,10 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
         float x01 = float(xh[xrow + 1u]);
         float x02 = float(xh[xrow + 8u]);
         float x03 = float(xh[xrow + 9u]);
-
-        CodePair p0 = funnel_pair(
-            tile, pk0 & 0xFFu, (pk0 >> 8) & 0xFFu, (pk0 >> 16) & 0xFFu, p.k, p.mode, aligned
-        );
-        CodePair p1 = funnel_pair(
-            tile, pk1 & 0xFFu, (pk1 >> 8) & 0xFFu, (pk1 >> 16) & 0xFFu, p.k, p.mode, aligned
-        );
-        CodePair p2 = funnel_pair(
-            tile, pk2 & 0xFFu, (pk2 >> 8) & 0xFFu, (pk2 >> 16) & 0xFFu, p.k, p.mode, aligned
-        );
-        CodePair p3 = funnel_pair(
-            tile, pk3 & 0xFFu, (pk3 >> 8) & 0xFFu, (pk3 >> 16) & 0xFFu, p.k, p.mode, aligned
-        );
-
-        // q = 0,1 feed column cA from rows (r0, r0+1) and (r0+8, r0+9);
-        // q = 2,3 do the same for column cB.
+        CodePair p0 = funnel_pair(tile, i0_0, i1_0, s1_0, p.k, p.mode, aligned);
+        CodePair p1 = funnel_pair(tile, i0_1, i1_1, s1_1, p.k, p.mode, aligned);
+        CodePair p2 = funnel_pair(tile, i0_2, i1_2, s1_2, p.k, p.mode, aligned);
+        CodePair p3 = funnel_pair(tile, i0_3, i1_3, s1_3, p.k, p.mode, aligned);
         accA += x00 * float(p0.lo) + x01 * float(p0.hi);
         accA += x02 * float(p1.lo) + x03 * float(p1.hi);
         accB += x00 * float(p2.lo) + x01 * float(p2.hi);
