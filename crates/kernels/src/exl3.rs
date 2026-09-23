@@ -396,7 +396,7 @@ impl Exl3Gemv {
         trellis_offset: usize,
         rows: usize,
     ) -> (usize, usize, usize) {
-        let eligible = rows >= 2 && Self::sg_eligible_at(shape, trellis_offset);
+        let eligible = rows >= 32 && Self::sg_eligible_at(shape, trellis_offset);
         let xh_rows = if eligible {
             rows.div_ceil(64) * 64
         } else {
@@ -410,7 +410,7 @@ impl Exl3Gemv {
     /// Bytes of sg K-split partial a rows>1 call may write
     /// (`nsplit * rows_pad * N * 4`), or 0 when the shape binds `y` directly.
     pub fn sg_partial_bytes(shape: Exl3Shape, trellis_offset: usize, rows: usize) -> usize {
-        if rows < 2 || !Self::sg_eligible_at(shape, trellis_offset) {
+        if rows < 32 || !Self::sg_eligible_at(shape, trellis_offset) {
             return 0;
         }
         let nsplit = Self::sg_splits(shape, rows);
@@ -892,7 +892,7 @@ impl Exl3Gemv {
     ) {
         if rows == 1 {
             self.encode_gemv(enc, xh, trellis, pair, shape, mode, y, ext_partial, None);
-        } else if Self::sg_eligible(shape, trellis) {
+        } else if rows >= 32 && Self::sg_eligible(shape, trellis) {
             self.encode_gemm_sg(enc, xh, trellis, shape, mode, y, ext_partial, rows);
         } else {
             self.encode_gemm(enc, xh, trellis, pair, shape, mode, y, rows);
@@ -904,7 +904,7 @@ impl Exl3Gemv {
     /// outputs the store masks away (`gr < blk_len`). Non-sg paths need no
     /// padding (they only ever address rows < `rows`).
     fn xh_rows(rows: usize, shape: Exl3Shape, trellis: DeviceSpan<'_>) -> usize {
-        if rows >= 2 && Self::sg_eligible(shape, trellis) {
+        if rows >= 32 && Self::sg_eligible(shape, trellis) {
             rows.div_ceil(64) * 64
         } else {
             rows

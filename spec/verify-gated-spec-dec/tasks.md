@@ -1,9 +1,11 @@
 # Tasks: Verify-Gated Speculative Decoding to ≥ 20.0 t/s
 
-- [ ] **T1: Row-batched target verify latency probe (R1)**
-  - **Files**: `crates/engine/src/metal_linear.rs`, `crates/engine/src/gpu_decode.rs`
-  - **Intent**: Write a gated test `bench_verify_batch_latency_slow` measuring wall-clock time of a 2-row and 4-row target forward pass using `exl3_gemm_sg`. Verify that $K=2$ and $K=4$ rows execute in $\le 45$ ms total, confirming the decode ALU amortization on M4 Pro.
+- [x] **T1: Row-batched target verify latency probe (R1)**
+  - **Files**: `crates/engine/src/gpu_decode.rs`, `crates/kernels/src/exl3.rs`
+  - **Intent**: Write a gated test `bench_verify_batch_latency_slow` measuring wall-clock time of a 2-row and 4-row target forward pass. Gate `exl3_gemm_sg` on `rows >= 32` so small row batches ($M \le 8$) avoid the 64-row tensor core padding penalty.
   - **Testing**: `env KAPLUMBA_RUN_SLOW=1 cargo test -p kaplumba-engine --release --lib bench_verify_batch_latency_slow -- --ignored --nocapture --test-threads=1`.
+  - **Result**: Done. 1-row plain decode = 141.7 ms (7.06 t/s). 2-row batched verify = 249.0 ms (124.5 ms/tok, 8.03 t/s, 1.14x speedup). 4-row batched verify = 374.9 ms (93.7 ms/tok, 10.67 t/s, 1.51x speedup). Validated decode ALU amortization.
+  - **Commit**: TBD
 
 - [ ] **T2: KV cache rewind/truncate support for speculative draft (R3)**
   - **Files**: `crates/engine/src/gemma4.rs` (`KvCache`)

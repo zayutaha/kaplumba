@@ -963,3 +963,101 @@ fn build_rope_tables(
 
 #[allow(dead_code)]
 fn unused(_: &ComputeCommandEncoderRef, _: Exl3Shape) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gemma4::Gemma4Model;
+    use crate::load::load_exl3;
+    use crate::metal_ctx::MetalContext;
+    use crate::testutil::artifact_dir;
+
+    #[test]
+    #[ignore]
+    fn bench_verify_batch_latency_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let ctx = MetalContext::new().expect("metal context");
+        let model = load_exl3(&ctx, &dir).expect("load artifact");
+        let gpu = MetalLinear::new(&ctx).expect("metal linear");
+        let gm = Gemma4Model::from_model(&model)
+            .expect("gemma cfg")
+            .with_gpu(&gpu);
+        let decoder = GpuDecoder::new(&gm, &gpu, 1024)
+            .expect("decoder build")
+            .expect("eligible");
+
+        eprintln!("=== Speculative Batched Target Verify Latency Probe ===");
+
+        // Warm up / prime KV cache with token 2 (BOS)
+        let mut cache = gm.new_kv_cache(1024);
+        let cb0 = gpu.new_command_buffer();
+        let _ = decoder.encode_token(&gm, &gpu, &cb0, &mut cache, 2, 60).expect("warmup token");
+
+        // Measure single-token plain decode (1 row)
+        const REPS: usize = 5;
+        let mut t1_samples = Vec::new();
+        for _ in 0..REPS {
+            let mut c = gm.new_kv_cache(1024);
+            let cb0 = gpu.new_command_buffer();
+            let _ = decoder.encode_token(&gm, &gpu, &cb0, &mut c, 2, 60).expect("warmup");
+            c.end_token();
+            let cb = gpu.new_command_buffer();
+            let t0 = std::time::Instant::now();
+            let _ = decoder.encode_token(&gm, &gpu, &cb, &mut c, 818, 60).expect("1 tok");
+            c.end_token();
+            t1_samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        t1_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let t1_med = t1_samples[REPS / 2];
+        eprintln!("1-row target forward (plain decode): {t1_med:.2} ms ({:.2} t/s)", 1000.0 / t1_med);
+
+        // Measure 2-row batched target forward (m = 2)
+        let tokens_2 = [818u32, 236773];
+        let mut t2_samples = Vec::new();
+        for _ in 0..REPS {
+            let mut c = gm.new_kv_cache(1024);
+            let cb0 = gpu.new_command_buffer();
+            let _ = decoder.encode_token(&gm, &gpu, &cb0, &mut c, 2, 60).expect("warmup");
+            c.end_token();
+            let t0 = std::time::Instant::now();
+            let _ = decoder.encode_span(&gm, &gpu, &mut c, &tokens_2, 60).expect("2 tok span");
+            t2_samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        t2_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let t2_med = t2_samples[REPS / 2];
+        let per_tok_2 = t2_med / 2.0;
+        eprintln!(
+            "2-row target forward (batched verify): {t2_med:.2} ms total ({per_tok_2:.2} ms/token, {:.2} t/s, speedup {:.2}x)",
+            1000.0 / per_tok_2,
+            (2.0 * t1_med) / t2_med
+        );
+
+        // Measure 4-row batched target forward (m = 4)
+        let tokens_4 = [818u32, 236773, 24996, 1852];
+        let mut t4_samples = Vec::new();
+        for _ in 0..REPS {
+            let mut c = gm.new_kv_cache(1024);
+            let cb0 = gpu.new_command_buffer();
+            let _ = decoder.encode_token(&gm, &gpu, &cb0, &mut c, 2, 60).expect("warmup");
+            c.end_token();
+            let t0 = std::time::Instant::now();
+            let _ = decoder.encode_span(&gm, &gpu, &mut c, &tokens_4, 60).expect("4 tok span");
+            t4_samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+        }
+        t4_samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let t4_med = t4_samples[REPS / 2];
+        let per_tok_4 = t4_med / 4.0;
+        eprintln!(
+            "4-row target forward (batched verify): {t4_med:.2} ms total ({per_tok_4:.2} ms/token, {:.2} t/s, speedup {:.2}x)",
+            1000.0 / per_tok_4,
+            (4.0 * t1_med) / t4_med
+        );
+    }
+}
