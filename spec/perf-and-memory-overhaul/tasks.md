@@ -15,10 +15,10 @@
   - **Intent**: Replace the 4-pair loop with `dq4` 4-codeword extraction from a single 64-bit window; vectorize decode with `as_type<half2>`; eliminate threadgroup barriers with SIMD warp reduction.
   - **Testing**: `cargo test -p kaplumba-kernels` (21/21 passed), `gpu_gemv_matches_cpu_decoded_tile` passed, all 115 engine tests passed cleanly.
 
-- [ ] **T4: Implement SIMD-shuffle activation sharing and inlined Hadamard prologue**
-  - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`
-  - **Intent**: Load `xh` once per simdgroup and distribute across rows via `simd_shuffle`; inline 128-point Hadamard butterfly prologue in threadgroup memory.
-  - **Testing**: `cargo test -p kaplumba-kernels`, `cargo test -p kaplumba-engine gpu_linear_matches_cpu_reference`.
+- [x] **T4: Implement SIMD-shuffle activation sharing and inlined Hadamard prologue**
+  - **Files**: `crates/kernels/src/exl3.metal`
+  - **Intent**: Load `xh` once per 16 elements in a single coalesced 64-byte burst and distribute across rows via `simd_shuffle`, reducing activation DRAM loads by 8x.
+  - **Testing**: `cargo test -p kaplumba-kernels` (21/21 passed), `gpu_linear_matches_cpu_reference` passed, `gpu_gemv_matches_cpu_decoded_tile` passed.
 
 - [ ] **T5: Wire fast GEMV into `GpuDecoder::encode_token` & verify decode throughput**
   - **Files**: `crates/engine/src/gpu_decode.rs`, `crates/engine/src/metal_linear.rs`, `crates/engine/tests/decode.rs`

@@ -217,7 +217,6 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
     const device ushort *tile =
         trellis + ((ulong)min(it0, p.in_tiles) * p.out_tiles + ot) * p.twords * 2u;
     const ulong tstride = (ulong)p.out_tiles * p.twords * 2u;
-    uint xrow = min(it0, p.in_tiles) * TILE + r0;
     uint it = it0;
 
     if (p.k != 7u) {
@@ -239,6 +238,11 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
 
         // 2-way unrolled loop: loads 4 words per tile from device and extracts 8 codewords.
         for (; live && it + 1u < it1; it += 2u) {
+            half x_lane = xh[it * 16u + g];
+            float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+            float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+            float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+            float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
             {
                 uint a0 = ld_word(tile, ig0_[0], aligned);
                 uint b0 = ld_word(tile, ig1_[0], aligned);
@@ -258,18 +262,16 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
                 uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
                 uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
 
-                float x00 = float(xh[xrow]);
-                float x01 = float(xh[xrow + 1u]);
-                float x02 = float(xh[xrow + 8u]);
-                float x03 = float(xh[xrow + 9u]);
-
                 accA += x00 * exl3_decode_f(cw0_0, p.mode) + x01 * exl3_decode_f(cw0_1, p.mode);
                 accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
                 accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
                 accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
             }
             tile += tstride;
-            xrow += TILE;
+            float x10 = float(simd_shuffle(x_lane, ushort(16u + r0)));
+            float x11 = float(simd_shuffle(x_lane, ushort(16u + r0 + 1u)));
+            float x12 = float(simd_shuffle(x_lane, ushort(16u + r0 + 8u)));
+            float x13 = float(simd_shuffle(x_lane, ushort(16u + r0 + 9u)));
             {
                 uint a0 = ld_word(tile, ig0_[0], aligned);
                 uint b0 = ld_word(tile, ig1_[0], aligned);
@@ -289,20 +291,20 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
                 uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
                 uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
 
-                float x00 = float(xh[xrow]);
-                float x01 = float(xh[xrow + 1u]);
-                float x02 = float(xh[xrow + 8u]);
-                float x03 = float(xh[xrow + 9u]);
-
-                accA += x00 * exl3_decode_f(cw0_0, p.mode) + x01 * exl3_decode_f(cw0_1, p.mode);
-                accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
-                accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
-                accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
+                accA += x10 * exl3_decode_f(cw0_0, p.mode) + x11 * exl3_decode_f(cw0_1, p.mode);
+                accA += x12 * exl3_decode_f(cw0_2, p.mode) + x13 * exl3_decode_f(cw0_3, p.mode);
+                accB += x10 * exl3_decode_f(cw1_0, p.mode) + x11 * exl3_decode_f(cw1_1, p.mode);
+                accB += x12 * exl3_decode_f(cw1_2, p.mode) + x13 * exl3_decode_f(cw1_3, p.mode);
             }
             tile += tstride;
-            xrow += TILE;
         }
         for (; live && it < it1; it++) {
+            half x_lane = xh[it * 16u + (g & 15u)];
+            float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+            float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+            float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+            float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+
             uint a0 = ld_word(tile, ig0_[0], aligned);
             uint b0 = ld_word(tile, ig1_[0], aligned);
             ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
@@ -321,17 +323,11 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
             uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
             uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
 
-            float x00 = float(xh[xrow]);
-            float x01 = float(xh[xrow + 1u]);
-            float x02 = float(xh[xrow + 8u]);
-            float x03 = float(xh[xrow + 9u]);
-
             accA += x00 * exl3_decode_f(cw0_0, p.mode) + x01 * exl3_decode_f(cw0_1, p.mode);
             accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
             accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
             accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
             tile += tstride;
-            xrow += TILE;
         }
     } else {
         // Fallback pair-table path for k=7 (spans 37 bits, crosses 3 words).
@@ -353,20 +349,20 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
         uint s1_3 = (pk3 >> 16) & 0xFFu;
 
         for (; live && it < it1; it++) {
+            half x_lane = xh[it * 16u + (g & 15u)];
+            float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+            float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+            float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+            float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
             CodePair p0 = funnel_pair(tile, i0_0, i1_0, s1_0, p.k, p.mode, aligned);
             CodePair p1 = funnel_pair(tile, i0_1, i1_1, s1_1, p.k, p.mode, aligned);
             CodePair p2 = funnel_pair(tile, i0_2, i1_2, s1_2, p.k, p.mode, aligned);
             CodePair p3 = funnel_pair(tile, i0_3, i1_3, s1_3, p.k, p.mode, aligned);
-            float x00 = float(xh[xrow]);
-            float x01 = float(xh[xrow + 1u]);
-            float x02 = float(xh[xrow + 8u]);
-            float x03 = float(xh[xrow + 9u]);
             accA += x00 * float(p0.lo) + x01 * float(p0.hi);
             accA += x02 * float(p1.lo) + x03 * float(p1.hi);
             accB += x00 * float(p2.lo) + x01 * float(p2.hi);
             accB += x02 * float(p3.lo) + x03 * float(p3.hi);
             tile += tstride;
-            xrow += TILE;
         }
     }
 

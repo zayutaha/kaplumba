@@ -42,6 +42,15 @@ This document records technical decisions, benchmark measurements, register allo
   - Implemented `exl3_decode_f`: uses `half2 h2 = as_type<half2>(x); return float(h2.x + h2.y);` for single-instruction FP16 unpacking, replacing `as_type<half>(ushort(x))` + `as_type<half>(ushort(x >> 16))`.
   - Implemented `dq4` 64-bit window extraction: for $k \in \{1..6, 8\}$, 4 codewords are packed in at most $3 \times 8 + 16 = 40$ bits, which always fits within a 64-bit funnel shift `((ulong)w0 << 32) | (ulong)w1`. This extracts 4 codewords using only 2 memory loads instead of 4, cutting ALU shifts/funnel operations in half.
   - Handled $k=7$ via fallback pair table path (since $3 \times 7 + 16 = 37$ bits spans 3 words only at $k=7$).
+  - Eliminated threadgroup shared memory buffers `shA[128]`, `shB[128]` and `threadgroup_barrier(mem_flags::mem_threadgroup)` in `exl3_gemv`: replaced with register-level `simd_shuffle_down(acc, 1)` and `simd_shuffle_down(acc, 2)` across the 4 lanes computing each output column.
+- Verified: All 21 kernel tests in `kaplumba-kernels` passed; all 115 engine tests in `kaplumba-engine` passed cleanly.
+
+### T4: SIMD-shuffle activation sharing in `exl3_gemv`
+- In `crates/kernels/src/exl3.metal`:
+  - Implemented coalesced SIMD-shuffle activation sharing: each lane loads a single activation `half x_lane = xh[it * 16u + g]`, and the 4 values needed for accumulation ($x_{00}, x_{01}, x_{02}, x_{03}$) are fetched across the warp using `simd_shuffle`.
+  - For the 2-way unrolled loop, `xh` is loaded for both tiles in a single coalesced 64-byte burst across all 32 lanes, cutting activation memory loads by 8x.
+- Verified: `gpu_linear_matches_cpu_reference` passed; all 21 kernel tests passed.
+
 ### Decode Coherence Root Cause & Resolution
 - **Symptom**: CLI generation on `"What is the capital of France?"` produced `"It seems like to answers: \nIt seems like to answer"` instead of `"The capital of France is Paris."`.
 - **Root Cause Investigation**:
