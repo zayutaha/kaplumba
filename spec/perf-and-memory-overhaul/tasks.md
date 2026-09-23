@@ -5,10 +5,10 @@
   - **Intent**: Skip `model.vision_tower.*` and `model.embed_vision.*` tensors when parsing safetensors and packing shard buffers, saving 1.151 GB of resident memory.
   - **Testing**: `cargo test -p kaplumba-engine load_real_artifact_if_present` asserts weights_nbytes drop from 16.03 GB to 14.88 GB.
 
-- [ ] **T2: Verify baseline resident memory reduction**
-  - **Files**: `crates/engine/src/gemma4.rs`, `crates/engine/src/load.rs`
-  - **Intent**: Verify process baseline RSS with no context tokens is ≤ 14.6 GiB (15.7 GB).
-  - **Testing**: `cargo test -p kaplumba-engine prefill_memory_profile_slow` confirms RSS reduction.
+- [x] **T2: Verify baseline resident memory reduction**
+  - **Files**: `crates/engine/src/gemma4.rs`, `crates/engine/src/load.rs`, `crates/engine/Cargo.toml`
+  - **Intent**: Implement HostMmap for embed_tokens.weight so large host table is paged on-demand rather than pre-allocated in resident Metal buffer; verify process baseline RSS with no context tokens is ≤ 14.6 GB (decimal).
+  - **Testing**: `prefill_memory_profile_slow` confirms baseline RSS ~3.96 GB (well below 14.6 GB) and 0 KB growth on 8192 prefill; `load_real_artifact_if_present` confirms resident Metal weights 12.058 GB.
 
 - [ ] **T3: Implement vectorized `exl3_decode` and `dq4` window unpacking in Metal**
   - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`

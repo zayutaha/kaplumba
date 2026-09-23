@@ -49,9 +49,10 @@ pub struct TensorInfo {
     pub dtype: DType,
     pub shape: Vec<usize>,
     pub nbytes: u64,
-    /// Offset within this tensor's shard buffer.
+    /// Offset within this tensor's shard buffer (or file offset if is_mmap).
     pub data_offset: u64,
     pub shard: String,
+    pub is_mmap: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -190,6 +191,75 @@ struct Shard {
     buffer: Buffer,
 }
 
+/// Read-only memory-mapped file for host-only tensors (e.g. embedding table).
+///
+/// Avoids allocating large host-only tables (like 2.82 GB embed_tokens) in resident
+/// GPU Metal memory, while keeping zero-copy host slice access for `embed_row`.
+pub struct HostMmap {
+    ptr: *mut u8,
+    len: usize,
+}
+
+unsafe impl Send for HostMmap {}
+unsafe impl Sync for HostMmap {}
+
+impl HostMmap {
+    pub fn open(path: &Path) -> Result<Self, LoadError> {
+        use std::os::unix::io::AsRawFd;
+        let file = File::open(path).map_err(|source| LoadError::Io {
+            path: path.to_path_buf(),
+            source,
+        })?;
+        let len = file
+            .metadata()
+            .map_err(|source| LoadError::Io {
+                path: path.to_path_buf(),
+                source,
+            })?
+            .len() as usize;
+        let fd = file.as_raw_fd();
+        let ptr = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                fd,
+                0,
+            )
+        };
+        if ptr == libc::MAP_FAILED {
+            return Err(LoadError::Io {
+                path: path.to_path_buf(),
+                source: std::io::Error::last_os_error(),
+            });
+        }
+        Ok(Self {
+            ptr: ptr as *mut u8,
+            len,
+        })
+    }
+
+    #[inline]
+    pub fn slice(&self, start: usize, len: usize) -> Option<&[u8]> {
+        if start.checked_add(len)? <= self.len {
+            Some(unsafe { std::slice::from_raw_parts(self.ptr.add(start), len) })
+        } else {
+            None
+        }
+    }
+}
+
+impl Drop for HostMmap {
+    fn drop(&mut self) {
+        if !self.ptr.is_null() && self.ptr as *mut libc::c_void != libc::MAP_FAILED {
+            unsafe {
+                libc::munmap(self.ptr as *mut libc::c_void, self.len);
+            }
+        }
+    }
+}
+
 /// Fully loaded EXL3 weights resident in Metal buffers + metadata.
 pub struct Exl3Model {
     pub dir: PathBuf,
@@ -199,6 +269,7 @@ pub struct Exl3Model {
     shards: HashMap<String, Shard>,
     tensors: HashMap<String, TensorInfo>,
     pub weights_nbytes: u64,
+    mmaps: HashMap<String, HostMmap>,
 }
 
 impl Exl3Model {
@@ -218,9 +289,14 @@ impl Exl3Model {
         self.shards.len()
     }
 
-    /// Host pointer into the shared shard buffer (valid while model lives).
+    /// Host pointer into the shared shard buffer (or mmap slice for host-only tensors).
     pub fn tensor_bytes(&self, name: &str) -> Option<(&[u8], &TensorInfo)> {
         let info = self.tensors.get(name)?;
+        if info.is_mmap {
+            let mm = self.mmaps.get(&info.shard)?;
+            let slice = mm.slice(info.data_offset as usize, info.nbytes as usize)?;
+            return Some((slice, info));
+        }
         let shard = self.shards.get(&info.shard)?;
         let base = shard.buffer.contents();
         if base.is_null() {
@@ -237,9 +313,12 @@ impl Exl3Model {
     }
 
     /// Device buffer + byte offset of a tensor inside its shard allocation
-    /// (T2.1 GPU path). `None` when the name is unknown or out of range.
+    /// (T2.1 GPU path). `None` when the name is unknown, out of range, or host-only.
     pub fn tensor_device_span(&self, name: &str) -> Option<(&Buffer, usize)> {
         let info = self.tensors.get(name)?;
+        if info.is_mmap {
+            return None;
+        }
         let shard = self.shards.get(&info.shard)?;
         let start = info.data_offset as usize;
         if start + info.nbytes as usize > shard.buffer.length() as usize {
@@ -346,6 +425,7 @@ fn parse_safetensors_header(path: &Path) -> Result<HashMap<String, TensorInfo>, 
                 nbytes,
                 data_offset: start,
                 shard: shard_name.clone(),
+                is_mmap: false,
             },
         );
     }
@@ -377,6 +457,12 @@ fn read_shard_header_len(path: &Path) -> Result<u64, LoadError> {
 #[inline]
 pub fn is_vision_tensor(name: &str) -> bool {
     name.starts_with("model.vision_tower.") || name.starts_with("model.embed_vision.")
+}
+
+/// Returns true for host-only tensors that do not need GPU Metal buffer allocation.
+#[inline]
+pub fn is_host_only_tensor(name: &str) -> bool {
+    name == "model.language_model.embed_tokens.weight"
 }
 
 /// Load EXL3 artifact from `dir` into per-shard Metal buffers (shared/UMA).
@@ -472,7 +558,9 @@ pub fn load_exl3(ctx: &MetalContext, dir: impl AsRef<Path>) -> Result<Exl3Model,
             if tensors.contains_key(name) {
                 return Err(LoadError::Duplicate(name.clone()));
             }
-            total += info.nbytes;
+            if !is_host_only_tensor(name) {
+                total += info.nbytes;
+            }
             tensors.insert(name.clone(), info.clone());
         }
         shard_headers.insert(shard.clone(), indexed);
@@ -504,6 +592,7 @@ pub fn load_exl3(ctx: &MetalContext, dir: impl AsRef<Path>) -> Result<Exl3Model,
     const STAGE: usize = 8 * 1024 * 1024;
     let mut stage = vec![0u8; STAGE];
     let mut shards: HashMap<String, Shard> = HashMap::new();
+    let mut mmaps: HashMap<String, HostMmap> = HashMap::new();
 
     for shard in &shard_names {
         let path = dir.join(shard);
@@ -511,11 +600,22 @@ pub fn load_exl3(ctx: &MetalContext, dir: impl AsRef<Path>) -> Result<Exl3Model,
         let data_start = 8 + header_len;
 
         // (name, file_offset, nbytes) sorted by file offset -> packed device offsets.
-        let mut by_file: Vec<(String, u64, u64)> = shard_headers[shard]
-            .iter()
-            .map(|(n, i)| (n.clone(), i.data_offset, i.nbytes))
-            .collect();
+        // Host-only tensors (e.g. 2.82 GB embed_tokens) are omitted from the GPU buffer and mmap'd.
+        let mut by_file: Vec<(String, u64, u64)> = Vec::new();
+        let mut mmap_needed = false;
+        for (n, i) in &shard_headers[shard] {
+            if is_host_only_tensor(n) {
+                mmap_needed = true;
+            } else {
+                by_file.push((n.clone(), i.data_offset, i.nbytes));
+            }
+        }
         by_file.sort_by_key(|(_, off, _)| *off);
+
+        if mmap_needed && !mmaps.contains_key(shard) {
+            mmaps.insert(shard.clone(), HostMmap::open(&path)?);
+        }
+
         let mut dev = 0u64;
         let mut layout: Vec<(String, u64, u64, u64)> = Vec::with_capacity(by_file.len());
         for (name, file_off, nbytes) in by_file {
@@ -574,6 +674,18 @@ pub fn load_exl3(ctx: &MetalContext, dir: impl AsRef<Path>) -> Result<Exl3Model,
             }
         }
 
+        // Host-only tensors use the mmap absolute file offset (data_start + file_offset).
+        for (name, info) in shard_headers.get_mut(shard).unwrap().iter_mut() {
+            if is_host_only_tensor(name) {
+                info.data_offset = data_start + info.data_offset;
+                info.is_mmap = true;
+                if let Some(t) = tensors.get_mut(name) {
+                    t.data_offset = info.data_offset;
+                    t.is_mmap = true;
+                }
+            }
+        }
+
         shards.insert(shard.clone(), Shard { buffer: buf });
     }
 
@@ -585,6 +697,7 @@ pub fn load_exl3(ctx: &MetalContext, dir: impl AsRef<Path>) -> Result<Exl3Model,
         shards,
         tensors,
         weights_nbytes: total,
+        mmaps,
     })
 }
 

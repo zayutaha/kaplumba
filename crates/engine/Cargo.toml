@@ -14,3 +14,4 @@ serde_json.workspace = true
 tokenizers.workspace = true
 half = "2"
 rayon = "1"
+libc = { workspace = true }
