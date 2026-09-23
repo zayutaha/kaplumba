@@ -137,6 +137,52 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - Target: R2.1 (tg/s) — decides remaining decode work
 - Commit: `spec/rust-metal-engine: T2.7 decode phase profile`
 
+### T2.8 — gemv ALU trim: hoisted tile-address increments (decode)
+- [ ] Replace the per-iteration `(ulong)(it * p.out_tiles + ot) * p.twords * 2u` recompute (64-bit mul chain) in `exl3_gemv` with a `device const ushort *tile` pointer advanced by a hoisted `stride` const (and `xrow` by `TILE`); same for the unroll bodies and remainder loop. Addressing-only change → bit-identical outputs
+- [ ] Verify: kernels suite, engine fast + gated suites, `bench_passes_slow` (gate/lm/down/o Gw/s up or neutral), `decode_throughput_slow` ≥ 7.52 t/s; if neutral/regress, revert (profile-before-machinery)
+- Files: `crates/kernels/src/exl3.metal` (`exl3_gemv` only)
+- Test: above
+- Target: R2.1 (tg/s), toward T2.3's 350–450 Gw/s ops ceiling
+- Commit: `spec/rust-metal-engine: T2.8 gemv address hoist`
+
+### T2.9 — decode sibling fusion: qkv + gate+up (T4.1 semantics)
+- [ ] On the `encode_token` path: fuse q/k/v into one dispatch per layer (one `x`/`xn` read, three trellis streams, one barrier trailer) and gate+up into one dispatch (shared `xn` read, two outputs `gu_gate`/`gu_up`) — only where output buffers stay disjoint (topology guard: never write the same output from both siblings); f32 add order per output unchanged → token gates hold. Small-N tail shapes (n_kv 4096/16 heads) must keep the same split policy
+- [ ] Verify: synthetic wrong-fusion guard test, `gpu_gemm_rows_match_per_row_gemv_and_cpu`-style per-sibling CPU-ref match, full gated suite (fixture 236773, span 0.55, batched-vs-gemv), `decode_throughput_slow` ≥ prior, `prefill_throughput_slow` ≥ prior (fusion touches span path too — keep or guard by rows)
+- Files: `crates/engine/src/{gpu_decode,metal_linear}.rs`, `crates/kernels/src/{exl3,fuse}.{rs,metal}`
+- Test: above
+- Target: AC4, R3.1 (tg + pp — fewer dispatches/barriers per layer)
+- Commit: `spec/rust-metal-engine: T2.9 decode sibling fusion`
+
+### T3.10 — small-N K-split for sg GEMM (prefill, T3.9 ranked #1)
+- [ ] Mirror the T2.5 pattern on `exl3_gemm_sg`: k/v/q run at 0.97–2.1 TFLOP/s (64–256 TGs) vs gate ~5 TF — split the `ks` stage range across a new grid dimension, each split-TG partial-accumulates its own `C[4][4]` segment, new reduce kernel sums partials to `y` (or stores per-split slices if csc already tiles). Policy: `sg_splits(shape) = clamp(div_ceil(1024, out_tiles), 1, 8)`; `nsplit==1` keeps the current grid exactly (byte-identical path for gate/down)
+- [ ] f32 reassociation on split shapes only → span/batched token gates must hold (argmax + max_abs < 0.55, batched-vs-gemv < 2e-3)
+- [ ] Verify: CPU-ref ceiling test extended to split path, `real_artifact_batched_linear_matches_gemv_slow`, full gated suite, `prefill_throughput_slow` ≥ +8% at 512 (expect ~600 ms/chunk → ~95–100 t/s); target best case ~110
+- Files: `crates/kernels/src/{exl3.metal,exl3.rs}`
+- Test: above
+- Target: R2.1 (pp/s)
+- Commit: `spec/rust-metal-engine: T3.10 sg small-N K-split`
+
+### T2.2 — Working-set cap + load hygiene (TTFT warm-up relocation)
+- [ ] Move the one-time Metal residency + first-forward shader compile cost (3822 ms measured in T4.0's first forward) out of first-token latency: warm pipelines at end of `load_exl3` (build every production pipeline + dispatch a tiny probe) so `decode_throughput_slow`'s first forward ≈ steady-state token; record cold load vs warm load split
+- [ ] Metal allocation cap pattern (~92% working set); streaming load; no trellis host/device duplication (already largely true — document + assert)
+- [ ] Verify: resident footprint report (16.028 GB weights + KV + scratch), first-forward ms in `decode_throughput_slow` down from 3822 toward < 500, no OOM on 24 GB during load+decode, full suite green
+- Files: `crates/engine/src/{load,metal_ctx,metal_linear,gemma4}.rs`
+- Test: above
+- Target: R5.4, R2.6 (TTFT), AC6
+- Commit: `spec/rust-metal-engine: T2.2 working set cap`
+
+### T2.4 — Quality gate (OQ1)
+- [ ] Golden prompts at **temp=1.0, topk=64, top_p=0.95** (multi-seed optional); review sampled outputs vs reference quant; pass/fail recorded
+- Test: the gate script/CLI itself
+- Target: AC6
+- Commit: `spec/rust-metal-engine: T2.4 quality gate`
+
+### T4.8 — Spec quality suite (coherence + goldens)
+- [ ] Golden suite temp 0 + sampling distribution tests (R8): fixture 236773 identity, greedy token-identity vs recorded loops, sampling smoke at temp>0; record coherence review (user: "tokens 100% coherent")
+- Test: the suite
+- Target: R8, AC1
+- Commit: `spec/rust-metal-engine: T4.8 spec quality`
+
 ## Phase 3 — Prefill kernels
 
 ### T3.1 — Verify EXL3 artifact (T3.1 from old plan, renamed)
@@ -231,7 +277,7 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - Commit: `spec/rust-metal-engine: T4.0 decode baseline`
 
 ### T4.1 — Sibling fusion (qkv, gated gate+up)
-- [ ] Topology-guarded fusion; thresholds measured on M4 Pro
+- [~] Superseded in scope by **T2.9** (same semantics, implemented on the decode `encode_token` path first); span-path fusion rides along inside T2.9's guard
 - Test: tg/s up or neutral; wrong-fusion guard unit test; golden outputs
 - Target: AC4, R3.1
 - Commit: `spec/rust-metal-engine: T4.1 sibling fusion`
@@ -258,7 +304,7 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - Commit: `spec/rust-metal-engine: T4.3 sampler`
 
 ### T4.4 — MTP shared-KV integration
-- [ ] Drafter on shared target KV; batched verify; depth flag; disable path
+- [!] **BLOCKED by user gate (2026-09-23): strict hold — no MTP until plain decode reaches 18 t/s + 100% coherence.** Measured walls (T2.7/T3.8): ops ceiling ~9–12 t/s, bandwidth floor ~17 t/s → plain 18 unreachable; gate held anyway per user decision. Same status for T4.5, T4.6, T4.7 (n-gram also refused: "No drafter — same-algorithm only")
 - Files: mtp module, verify step
 - Test: R8.1 golden token-identity; accept rate logged; tg/s × factor
 - Target: AC5, R3.2

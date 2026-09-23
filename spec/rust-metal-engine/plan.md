@@ -123,3 +123,17 @@ HTTP server, admin, multi-tenant anything: not in this diagram (out of scope v1)
 - P3–P4 depend on P2 GEMV existing (prefill reuses dequant; decode fusion reuses linear abstractions).
 - P5 persistence hooks depend on paged-kv-cache T1–T5 (other spec).
 - P6 last.
+
+## Final track (user decisions 2026-09-23)
+
+After T2.5–T2.7 measured the same-algorithm ceilings, the user chose: **hold the MTP gate strictly** (no MTP / no n-gram / no speculative machinery of any kind until plain decode reaches 18 t/s + 100% coherence — and separately recorded that 200 pp/s and 18 t/s plain are beyond the measured hardware walls: MMA 6.3 TFLOP/s vs 11.59 needed; gemv ops ceiling ~9–12 t/s; bandwidth floor ~17 t/s). Approved plan: **finish every remaining same-algorithm lever, prove quality/memory/TTFT, close the spec honestly** with end-of-track wall tables. Scope added (tasks.md is the live checklist):
+
+- **T2.8** — gemv ALU trim: hoist the per-iteration 64-bit tile-address recomputation to pointer increments (decode tg/s).
+- **T2.9** — decode sibling fusion (T4.1 semantics on the encode_token path): qkv one-dispatch and gate+up one-dispatch where topology allows (tg/s).
+- **T3.10** — small-N K-split for `exl3_gemm_sg` (k/v starve at 60–256 TGs): split `in_tiles` across a grid dimension + partial-sum, same policy shape as T2.5 (pp/s; T3.9's ranked #1 lever, ~600 ms/chunk).
+- **T2.2** — TTFT: move the one-time Metal residency/shader warm-up (3822 ms) out of first forward into load time (TTFT).
+- **T2.4 + T4.8** — sampled quality gate (temp 1.0 / topk 64 / top_p 0.95) + coherence/golden suite (quality, R8).
+- **T3.7 remainder** — measured peak RSS / Metal footprint at 1k/2k/8k prefill, ≤ KV bytes + constant growth (mem, R5.3 acceptance).
+- **T6.1 / T6.2** — full acceptance run + final walls report + handover notes.
+
+Out of scope forever under this track: MTP (T4.4–T4.6), n-gram drafter (T4.7), any verify-batch machinery — all blocked by the strict gate.
