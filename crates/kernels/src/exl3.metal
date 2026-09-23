@@ -122,40 +122,6 @@ inline uint ld_word(device const ushort *t, uint w, bool aligned) {
     return (uint)t[2u * w] | ((uint)t[2u * w + 1u] << 16);
 }
 
-// T5.1r: issue one tile's 4 funnel-window words (group 0 then group 1) into a
-// prefetch slot, split out of the decode body so loads for iteration I+PF can
-// sit in registers while iteration I decodes.
-inline void exl3_load_win(device const ushort *tile, uint ig00, uint ig10,
-                          uint ig01, uint ig11, bool aligned,
-                          thread ulong &m0, thread ulong &m1) {
-    uint a0 = ld_word(tile, ig00, aligned);
-    uint b0 = ld_word(tile, ig10, aligned);
-    m0 = ((ulong)a0 << 32) | (ulong)b0;
-    uint a1 = ld_word(tile, ig01, aligned);
-    uint b1 = ld_word(tile, ig11, aligned);
-    m1 = ((ulong)a1 << 32) | (ulong)b1;
-}
-
-// One prefetched tile: extract the 8 codewords from its two 64-bit windows
-// and FMA them into accA/accB. Body of the old unrolled loop, unchanged math.
-inline void exl3_acc_win(ulong m0, ulong m1, uint s0, uint s1, uint k, uint mode,
-                         float x00, float x01, float x02, float x03,
-                         thread float &accA, thread float &accB) {
-    uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
-    uint cw0_2 = uint(m0 >> (s0 + k)) & 0xFFFFu;
-    uint cw0_1 = uint(m0 >> (s0 + 2u * k)) & 0xFFFFu;
-    uint cw0_0 = uint(m0 >> (s0 + 3u * k)) & 0xFFFFu;
-    uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
-    uint cw1_2 = uint(m1 >> (s1 + k)) & 0xFFFFu;
-    uint cw1_1 = uint(m1 >> (s1 + 2u * k)) & 0xFFFFu;
-    uint cw1_0 = uint(m1 >> (s1 + 3u * k)) & 0xFFFFu;
-
-    accA += x00 * exl3_decode_f(cw0_0, mode) + x01 * exl3_decode_f(cw0_1, mode);
-    accA += x02 * exl3_decode_f(cw0_2, mode) + x03 * exl3_decode_f(cw0_3, mode);
-    accB += x00 * exl3_decode_f(cw1_0, mode) + x01 * exl3_decode_f(cw1_1, mode);
-    accB += x02 * exl3_decode_f(cw1_2, mode) + x03 * exl3_decode_f(cw1_3, mode);
-}
-
 struct CodePair {
     half lo;
     half hi;
@@ -270,50 +236,68 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
             s3_[gg] = uint((i_end + 1) * 32 - e_last);
         }
 
-        // T5.1r prefetch ring (ExllamaV3's portable trick, PF=4): the old body
-        // did load→shift→FMA serially per tile, so the 64KB-strided weight
-        // loads never hid behind decode and the kernel ran issue-bound (~50%
-        // util, ~60% bus). Ring of 4 unrolled iterations (8 tiles): each
-        // iteration decodes its slot, then refills that slot with iteration
-        // I+4, leaving 3 future iterations (24 word-loads) in flight.
-        // math/order per tile identical to the old unrolled loop.
-        ulong pf_m0[4][2];
-        ulong pf_m1[4][2];
-        for (uint d = 0u; d < 4u; d++) {
-            if (!(live && it0 + 2u * d + 1u < it1)) break;
-            const device ushort *b = tile + (ulong)(2u * d) * tstride;
-            exl3_load_win(b, ig0_[0], ig1_[0], ig0_[1], ig1_[1], aligned,
-                          pf_m0[d][0], pf_m1[d][0]);
-            exl3_load_win(b + tstride, ig0_[0], ig1_[0], ig0_[1], ig1_[1],
-                          aligned, pf_m0[d][1], pf_m1[d][1]);
-        }
-        uint I = 0u;
-        for (; live && it0 + 2u * I + 1u < it1; I++) {
-            uint cur = I & 3u;
-            half x_lane = xh[(it0 + 2u * I) * 16u + g];
+        // 2-way unrolled loop: loads 4 words per tile from device and extracts 8 codewords.
+        for (; live && it + 1u < it1; it += 2u) {
+            half x_lane = xh[it * 16u + g];
             float x00 = float(simd_shuffle(x_lane, ushort(r0)));
             float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
             float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
             float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
-            exl3_acc_win(pf_m0[cur][0], pf_m1[cur][0], s3_[0], s3_[1], p.k,
-                         p.mode, x00, x01, x02, x03, accA, accB);
+            {
+                uint a0 = ld_word(tile, ig0_[0], aligned);
+                uint b0 = ld_word(tile, ig1_[0], aligned);
+                ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                uint s0 = s3_[0];
+                uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+                uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
+                uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
+                uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
+
+                uint a1 = ld_word(tile, ig0_[1], aligned);
+                uint b1 = ld_word(tile, ig1_[1], aligned);
+                ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                uint s1 = s3_[1];
+                uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+                uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
+                uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
+                uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
+
+                accA += x00 * exl3_decode_f(cw0_0, p.mode) + x01 * exl3_decode_f(cw0_1, p.mode);
+                accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
+                accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
+                accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
+            }
+            tile += tstride;
             float x10 = float(simd_shuffle(x_lane, ushort(16u + r0)));
             float x11 = float(simd_shuffle(x_lane, ushort(16u + r0 + 1u)));
             float x12 = float(simd_shuffle(x_lane, ushort(16u + r0 + 8u)));
             float x13 = float(simd_shuffle(x_lane, ushort(16u + r0 + 9u)));
-            exl3_acc_win(pf_m0[cur][1], pf_m1[cur][1], s3_[0], s3_[1], p.k,
-                         p.mode, x10, x11, x12, x13, accA, accB);
-            uint ni = I + 4u;
-            if (live && it0 + 2u * ni + 1u < it1) {
-                const device ushort *b = tile + (ulong)(2u * ni) * tstride;
-                exl3_load_win(b, ig0_[0], ig1_[0], ig0_[1], ig1_[1], aligned,
-                              pf_m0[cur][0], pf_m1[cur][0]);
-                exl3_load_win(b + tstride, ig0_[0], ig1_[0], ig0_[1], ig1_[1],
-                              aligned, pf_m0[cur][1], pf_m1[cur][1]);
+            {
+                uint a0 = ld_word(tile, ig0_[0], aligned);
+                uint b0 = ld_word(tile, ig1_[0], aligned);
+                ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                uint s0 = s3_[0];
+                uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+                uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
+                uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
+                uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
+
+                uint a1 = ld_word(tile, ig0_[1], aligned);
+                uint b1 = ld_word(tile, ig1_[1], aligned);
+                ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                uint s1 = s3_[1];
+                uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+                uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
+                uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
+                uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
+
+                accA += x10 * exl3_decode_f(cw0_0, p.mode) + x11 * exl3_decode_f(cw0_1, p.mode);
+                accA += x12 * exl3_decode_f(cw0_2, p.mode) + x13 * exl3_decode_f(cw0_3, p.mode);
+                accB += x10 * exl3_decode_f(cw1_0, p.mode) + x11 * exl3_decode_f(cw1_1, p.mode);
+                accB += x12 * exl3_decode_f(cw1_2, p.mode) + x13 * exl3_decode_f(cw1_3, p.mode);
             }
+            tile += tstride;
         }
-        it += 2u * I;
-        tile += (ulong)(2u * I) * tstride;
         for (; live && it < it1; it++) {
             half x_lane = xh[it * 16u + (g & 15u)];
             float x00 = float(simd_shuffle(x_lane, ushort(r0)));
