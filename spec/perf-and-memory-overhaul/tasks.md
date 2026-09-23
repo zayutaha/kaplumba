@@ -1,6 +1,6 @@
 # Tasks: Performance and Memory Overhaul
 
-- [ ] **T1: Filter vision tower tensors during model load**
+- [x] **T1: Filter vision tower tensors during model load**
   - **Files**: `crates/engine/src/load.rs`
   - **Intent**: Skip `model.vision_tower.*` and `model.embed_vision.*` tensors when parsing safetensors and packing shard buffers, saving 1.151 GB of resident memory.
   - **Testing**: `cargo test -p kaplumba-engine load_real_artifact_if_present` asserts weights_nbytes drop from 16.03 GB to 14.88 GB.

@@ -19,4 +19,10 @@ This document records technical decisions, benchmark measurements, register allo
 
 ## Log of Steps and Learnings
 
-*(Entries will be appended here as each task is executed and tested).*
+### T1: Filter vision tower tensors during model load
+- Implemented `is_vision_tensor` in `crates/engine/src/load.rs`.
+- Safetensors loader skips 356 tensors matching `model.vision_tower.*` and `model.embed_vision.*`.
+- Retained language model tensors: 2066 tensors (all 60 layers, norms, trellis, embed_tokens, lm_head).
+- Resident Metal allocation dropped from 16.028 GB to **14.877 GB (13.855 GiB)**, saving **1.151 GB**.
+- Load time: 3.3 seconds.
+- Verified: `load_real_artifact_if_present` and `is_vision_tensor_filters_prefixes` passed; all 115 engine unit tests passed.

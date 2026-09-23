@@ -373,6 +373,12 @@ fn read_shard_header_len(path: &Path) -> Result<u64, LoadError> {
     Ok(u64::from_le_bytes(len_buf))
 }
 
+/// Returns true if `name` belongs to multimodal vision layers not used in text chat.
+#[inline]
+pub fn is_vision_tensor(name: &str) -> bool {
+    name.starts_with("model.vision_tower.") || name.starts_with("model.embed_vision.")
+}
+
 /// Load EXL3 artifact from `dir` into per-shard Metal buffers (shared/UMA).
 ///
 /// Streaming: each shard is read through an 8 MiB staging buffer into its
@@ -421,6 +427,9 @@ pub fn load_exl3(ctx: &MetalContext, dir: impl AsRef<Path>) -> Result<Exl3Model,
 
     let mut by_shard: HashMap<String, Vec<String>> = HashMap::new();
     for (name, shard) in weight_map {
+        if is_vision_tensor(name) {
+            continue;
+        }
         let shard = shard.as_str().ok_or_else(|| LoadError::BadHeader {
             path: index_path.clone(),
             msg: format!("weight_map[{name}] not a string"),
@@ -470,6 +479,9 @@ pub fn load_exl3(ctx: &MetalContext, dir: impl AsRef<Path>) -> Result<Exl3Model,
     }
 
     for name in weight_map.keys() {
+        if is_vision_tensor(name) {
+            continue;
+        }
         if !tensors.contains_key(name) {
             return Err(LoadError::MissingShard(format!(
                 "tensor {name} not in any shard header"
@@ -701,6 +713,10 @@ mod tests {
         assert_eq!(info.dtype, DType::BF16);
         // Non-zero check: embed first row shouldn't be all zero after load.
         assert!(bytes.iter().any(|&b| b != 0), "embed is all zeros");
+        // Verify vision tensors are omitted while language tensors remain.
+        assert!(model.tensor("model.vision_tower.encoder.layers.1.mlp.down_proj.linear.weight").is_none());
+        assert!(model.tensor("model.embed_vision.embedding_projection.weight").is_none());
+        assert!(model.resident_gb() < 14.95, "resident gb was {}", model.resident_gb());
         println!(
             "loaded {} tensors / {} shards, {:.3} GB, in {:.1}s",
             model.n_tensors(),
@@ -708,5 +724,14 @@ mod tests {
             model.resident_gb(),
             dt.as_secs_f64()
         );
+    }
+
+    #[test]
+    fn is_vision_tensor_filters_prefixes() {
+        assert!(is_vision_tensor("model.vision_tower.encoder.layers.1.mlp.down_proj.linear.weight"));
+        assert!(is_vision_tensor("model.embed_vision.embedding_projection.weight"));
+        assert!(!is_vision_tensor("model.language_model.embed_tokens.weight"));
+        assert!(!is_vision_tensor("model.language_model.layers.0.self_attn.q_proj.trellis"));
+        assert!(!is_vision_tensor("lm_head.trellis"));
     }
 }
