@@ -98,6 +98,20 @@ inline half exl3_decode(uint cw, uint mode) {
     return lo + hi;
 }
 
+// Vectorized exl3_decode returning float (T3):
+// Evaluates both halves as half2 and does one binary16 addition in registers.
+inline float exl3_decode_f(uint cw, uint mode) {
+    uint x = cw & 0xFFFFu;
+    if (mode == 1u) {
+        x = x * 0xCBAC1FEDu;
+    } else {
+        x = x * 89226354u + 64248484u;
+    }
+    x = 0x3B603B60u ^ (x & 0x8FFF8FFFu);
+    half2 h2 = as_type<half2>(x);
+    return float(h2.x + h2.y);
+}
+
 // One u32 word of the packed trellis = two little-endian u16 words. The paired
 // path exists because real artifacts place some trellis tensors (lm_head) at a
 // 2-mod-4 byte offset, where a u32 load would not be naturally aligned.
@@ -181,9 +195,6 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
                       constant Exl3Params &p [[buffer(4)]],
                       uint2 tg [[threadgroup_position_in_grid]],
                       uint2 thr [[thread_position_in_threadgroup]]) {
-    threadgroup float shA[32 * WARPS];
-    threadgroup float shB[32 * WARPS];
-
     uint sub = 0u;
     uint tid = thr.x;
     uint g = tid & 31u;       // lane = kernel-order group
@@ -196,57 +207,152 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
     uint it1 = min(p.in_tiles, it0 + chunk);
     bool live = ot < p.out_tiles;
 
-    uint cA = g >> 2;   // 0..7  -> output columns 0..7
-    uint cB = cA + 8u;  //       -> output columns 8..15
     uint r0 = (g & 3u) * 2u;
-
     bool aligned = p.aligned != 0u;
-    // The 4 pair descriptors this lane needs. Measured both ways (as 4 scalar
-    // loads and as one 16-byte uint4 load): indistinguishable within run-to-run
-    // noise, so the simpler scalar form stays.
-    uint pk0 = pair_tab[4u * g];
-    uint pk1 = pair_tab[4u * g + 1u];
-    uint pk2 = pair_tab[4u * g + 2u];
-    uint pk3 = pair_tab[4u * g + 3u];
-    // T2.6 A: field extraction hoisted out of the it loop (was 20
-    // loop-invariant ops re-derived per iteration before funnel_pair).
-    uint i0_0 = pk0 & 0xFFu;
-    uint i1_0 = (pk0 >> 8) & 0xFFu;
-    uint s1_0 = (pk0 >> 16) & 0xFFu;
-    uint i0_1 = pk1 & 0xFFu;
-    uint i1_1 = (pk1 >> 8) & 0xFFu;
-    uint s1_1 = (pk1 >> 16) & 0xFFu;
-    uint i0_2 = pk2 & 0xFFu;
-    uint i1_2 = (pk2 >> 8) & 0xFFu;
-    uint s1_2 = (pk2 >> 16) & 0xFFu;
-    uint i0_3 = pk3 & 0xFFu;
-    uint i1_3 = (pk3 >> 8) & 0xFFu;
-    uint s1_3 = (pk3 >> 16) & 0xFFu;
 
     float accA = 0.0f;
     float accB = 0.0f;
 
-    // T2.8: strength-reduce the tile address. Was recomputed per body as
-    // (ulong)(it * p.out_tiles + ot) * p.twords * 2u (64-bit mul chain);
-    // now one base + one hoisted stride, advanced by pointer add. `it0` is
-    // clamped so a pathological nsplit > in_tiles (tiny synthetics) never
-    // forms an address past the column (loops do not run when it0 >= it1).
+    // Strength-reduced tile address.
     const device ushort *tile =
         trellis + ((ulong)min(it0, p.in_tiles) * p.out_tiles + ot) * p.twords * 2u;
     const ulong tstride = (ulong)p.out_tiles * p.twords * 2u;
     uint xrow = min(it0, p.in_tiles) * TILE + r0;
     uint it = it0;
 
-    // `live` is warp-uniform, so the loop is skipped (not divergent) for the
-    // padding warp of the last threadgroup while every warp still reaches the
-    // barrier below. T2.6 B: 2-way unroll — 8 funnel_pair calls (16 word
-    // loads) become visible to the scheduler in one region for memory-level
-    // parallelism; each body keeps its statement order and the accA/accB
-    // `+=` sequence stays strictly sequential across iterations (bit-identical
-    // accumulation order to the rolled form). Odd tail handled by the second
-    // loop; after this loop `tile`/`xrow`/`it` already point at the tail.
-    for (; live && it + 1u < it1; it += 2u) {
-        {
+    if (p.k != 7u) {
+        // T3: dq4 64-bit window path for k in {1..6, 8}.
+        // A 4-aligned group of 4 codewords spans 3K+16 bits, which always fits
+        // into a single 64-bit window of two words.
+        uint ig0_[2];
+        uint ig1_[2];
+        uint s3_[2];
+        int tw = int(p.twords);
+        for (uint gg = 0u; gg < 2u; gg++) {
+            uint c0 = g * 8u + gg * 4u;
+            int e_last = int(c0 + 4u) * int(p.k) + 256 * int(p.k);
+            int i_end = (e_last - 1) / 32;
+            ig1_[gg] = uint(((i_end % tw) + tw) % tw);
+            ig0_[gg] = uint((((i_end - 1) % tw) + tw) % tw);
+            s3_[gg] = uint((i_end + 1) * 32 - e_last);
+        }
+
+        // 2-way unrolled loop: loads 4 words per tile from device and extracts 8 codewords.
+        for (; live && it + 1u < it1; it += 2u) {
+            {
+                uint a0 = ld_word(tile, ig0_[0], aligned);
+                uint b0 = ld_word(tile, ig1_[0], aligned);
+                ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                uint s0 = s3_[0];
+                uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+                uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
+                uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
+                uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
+
+                uint a1 = ld_word(tile, ig0_[1], aligned);
+                uint b1 = ld_word(tile, ig1_[1], aligned);
+                ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                uint s1 = s3_[1];
+                uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+                uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
+                uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
+                uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
+
+                float x00 = float(xh[xrow]);
+                float x01 = float(xh[xrow + 1u]);
+                float x02 = float(xh[xrow + 8u]);
+                float x03 = float(xh[xrow + 9u]);
+
+                accA += x00 * exl3_decode_f(cw0_0, p.mode) + x01 * exl3_decode_f(cw0_1, p.mode);
+                accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
+                accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
+                accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
+            }
+            tile += tstride;
+            xrow += TILE;
+            {
+                uint a0 = ld_word(tile, ig0_[0], aligned);
+                uint b0 = ld_word(tile, ig1_[0], aligned);
+                ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                uint s0 = s3_[0];
+                uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+                uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
+                uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
+                uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
+
+                uint a1 = ld_word(tile, ig0_[1], aligned);
+                uint b1 = ld_word(tile, ig1_[1], aligned);
+                ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                uint s1 = s3_[1];
+                uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+                uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
+                uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
+                uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
+
+                float x00 = float(xh[xrow]);
+                float x01 = float(xh[xrow + 1u]);
+                float x02 = float(xh[xrow + 8u]);
+                float x03 = float(xh[xrow + 9u]);
+
+                accA += x00 * exl3_decode_f(cw0_0, p.mode) + x01 * exl3_decode_f(cw0_1, p.mode);
+                accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
+                accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
+                accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
+            }
+            tile += tstride;
+            xrow += TILE;
+        }
+        for (; live && it < it1; it++) {
+            uint a0 = ld_word(tile, ig0_[0], aligned);
+            uint b0 = ld_word(tile, ig1_[0], aligned);
+            ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+            uint s0 = s3_[0];
+            uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+            uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
+            uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
+            uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
+
+            uint a1 = ld_word(tile, ig0_[1], aligned);
+            uint b1 = ld_word(tile, ig1_[1], aligned);
+            ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+            uint s1 = s3_[1];
+            uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+            uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
+            uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
+            uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
+
+            float x00 = float(xh[xrow]);
+            float x01 = float(xh[xrow + 1u]);
+            float x02 = float(xh[xrow + 8u]);
+            float x03 = float(xh[xrow + 9u]);
+
+            accA += x00 * exl3_decode_f(cw0_0, p.mode) + x01 * exl3_decode_f(cw0_1, p.mode);
+            accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
+            accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
+            accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
+            tile += tstride;
+            xrow += TILE;
+        }
+    } else {
+        // Fallback pair-table path for k=7 (spans 37 bits, crosses 3 words).
+        uint pk0 = pair_tab[4u * g];
+        uint pk1 = pair_tab[4u * g + 1u];
+        uint pk2 = pair_tab[4u * g + 2u];
+        uint pk3 = pair_tab[4u * g + 3u];
+        uint i0_0 = pk0 & 0xFFu;
+        uint i1_0 = (pk0 >> 8) & 0xFFu;
+        uint s1_0 = (pk0 >> 16) & 0xFFu;
+        uint i0_1 = pk1 & 0xFFu;
+        uint i1_1 = (pk1 >> 8) & 0xFFu;
+        uint s1_1 = (pk1 >> 16) & 0xFFu;
+        uint i0_2 = pk2 & 0xFFu;
+        uint i1_2 = (pk2 >> 8) & 0xFFu;
+        uint s1_2 = (pk2 >> 16) & 0xFFu;
+        uint i0_3 = pk3 & 0xFFu;
+        uint i1_3 = (pk3 >> 8) & 0xFFu;
+        uint s1_3 = (pk3 >> 16) & 0xFFu;
+
+        for (; live && it < it1; it++) {
             CodePair p0 = funnel_pair(tile, i0_0, i1_0, s1_0, p.k, p.mode, aligned);
             CodePair p1 = funnel_pair(tile, i0_1, i1_1, s1_1, p.k, p.mode, aligned);
             CodePair p2 = funnel_pair(tile, i0_2, i1_2, s1_2, p.k, p.mode, aligned);
@@ -259,60 +365,20 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
             accA += x02 * float(p1.lo) + x03 * float(p1.hi);
             accB += x00 * float(p2.lo) + x01 * float(p2.hi);
             accB += x02 * float(p3.lo) + x03 * float(p3.hi);
+            tile += tstride;
+            xrow += TILE;
         }
-        tile += tstride;
-        xrow += TILE;
-        {
-            CodePair p0 = funnel_pair(tile, i0_0, i1_0, s1_0, p.k, p.mode, aligned);
-            CodePair p1 = funnel_pair(tile, i0_1, i1_1, s1_1, p.k, p.mode, aligned);
-            CodePair p2 = funnel_pair(tile, i0_2, i1_2, s1_2, p.k, p.mode, aligned);
-            CodePair p3 = funnel_pair(tile, i0_3, i1_3, s1_3, p.k, p.mode, aligned);
-            float x00 = float(xh[xrow]);
-            float x01 = float(xh[xrow + 1u]);
-            float x02 = float(xh[xrow + 8u]);
-            float x03 = float(xh[xrow + 9u]);
-            accA += x00 * float(p0.lo) + x01 * float(p0.hi);
-            accA += x02 * float(p1.lo) + x03 * float(p1.hi);
-            accB += x00 * float(p2.lo) + x01 * float(p2.hi);
-            accB += x02 * float(p3.lo) + x03 * float(p3.hi);
-        }
-        tile += tstride;
-        xrow += TILE;
-    }
-    for (; live && it < it1; it++) {
-        CodePair p0 = funnel_pair(tile, i0_0, i1_0, s1_0, p.k, p.mode, aligned);
-        CodePair p1 = funnel_pair(tile, i0_1, i1_1, s1_1, p.k, p.mode, aligned);
-        CodePair p2 = funnel_pair(tile, i0_2, i1_2, s1_2, p.k, p.mode, aligned);
-        CodePair p3 = funnel_pair(tile, i0_3, i1_3, s1_3, p.k, p.mode, aligned);
-        float x00 = float(xh[xrow]);
-        float x01 = float(xh[xrow + 1u]);
-        float x02 = float(xh[xrow + 8u]);
-        float x03 = float(xh[xrow + 9u]);
-        accA += x00 * float(p0.lo) + x01 * float(p0.hi);
-        accA += x02 * float(p1.lo) + x03 * float(p1.hi);
-        accB += x00 * float(p2.lo) + x01 * float(p2.hi);
-        accB += x02 * float(p3.lo) + x03 * float(p3.hi);
-        tile += tstride;
-        xrow += TILE;
     }
 
-    shA[tid] = accA;
-    shB[tid] = accB;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (live && g < 16u) {
-        uint base = sub << 5;
-        float s = 0.0f;
-        if (g < 8u) {
-            for (uint q = 0; q < 4u; q++) {
-                s += shA[base + (g << 2) + q];
-            }
-        } else {
-            for (uint q = 0; q < 4u; q++) {
-                s += shB[base + ((g - 8u) << 2) + q];
-            }
-        }
-        // Split-slice store (T2.5): split == 0 keeps the old address exactly.
-        y[(tg.y * p.out_tiles + ot) * TILE + g] = s;
+    // SIMD warp reduction (T3): 4 lanes per output column collapse in registers.
+    accA += simd_shuffle_down(accA, 1);
+    accA += simd_shuffle_down(accA, 2);
+    accB += simd_shuffle_down(accB, 1);
+    accB += simd_shuffle_down(accB, 2);
+    if (live && (g & 3u) == 0u) {
+        uint c0 = g >> 2;
+        y[(tg.y * p.out_tiles + ot) * TILE + c0] = accA;
+        y[(tg.y * p.out_tiles + ot) * TILE + c0 + 8u] = accB;
     }
 }
 

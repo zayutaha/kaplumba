@@ -37,3 +37,11 @@ This document records technical decisions, benchmark measurements, register allo
   - `RSS growth: 0 KB (limit 49152)`
   - Confirmed 100% numerical accuracy and complete adherence to ≤ 14.6 GB (decimal) limit.
 
+### T3: Vectorized `exl3_decode_f`, `dq4` window unpacking, and SIMD warp reduction
+- In `crates/kernels/src/exl3.metal`:
+  - Implemented `exl3_decode_f`: uses `half2 h2 = as_type<half2>(x); return float(h2.x + h2.y);` for single-instruction FP16 unpacking, replacing `as_type<half>(ushort(x))` + `as_type<half>(ushort(x >> 16))`.
+  - Implemented `dq4` 64-bit window extraction: for $k \in \{1..6, 8\}$, 4 codewords are packed in at most $3 \times 8 + 16 = 40$ bits, which always fits within a 64-bit funnel shift `((ulong)w0 << 32) | (ulong)w1`. This extracts 4 codewords using only 2 memory loads instead of 4, cutting ALU shifts/funnel operations in half.
+  - Handled $k=7$ via fallback pair table path (since $3 \times 7 + 16 = 37$ bits spans 3 words only at $k=7$).
+  - Eliminated threadgroup shared memory buffers `shA[128]`, `shB[128]` and `threadgroup_barrier(mem_flags::mem_threadgroup)` in `exl3_gemv`: replaced with register-level `simd_shuffle_down(acc, 1)` and `simd_shuffle_down(acc, 2)` across the 4 lanes computing each output column.
+- Verified: All 21 kernel tests in `kaplumba-kernels` passed; all 115 engine tests in `kaplumba-engine` passed cleanly.
+

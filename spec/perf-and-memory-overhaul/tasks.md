@@ -10,10 +10,10 @@
   - **Intent**: Implement HostMmap for embed_tokens.weight so large host table is paged on-demand rather than pre-allocated in resident Metal buffer; verify process baseline RSS with no context tokens is ≤ 14.6 GB (decimal).
   - **Testing**: `prefill_memory_profile_slow` confirms baseline RSS ~3.96 GB (well below 14.6 GB) and 0 KB growth on 8192 prefill; `load_real_artifact_if_present` confirms resident Metal weights 12.058 GB.
 
-- [ ] **T3: Implement vectorized `exl3_decode` and `dq4` window unpacking in Metal**
+- [x] **T3: Implement vectorized `exl3_decode` and `dq4` window unpacking in Metal**
   - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`
-  - **Intent**: Replace the 4-pair loop with `dq4` 4-codeword extraction from a single 64-bit window; vectorize decode with `as_type<half2>`.
-  - **Testing**: `cargo test -p kaplumba-kernels gpu_gemv_matches_cpu_decoded_tile`.
+  - **Intent**: Replace the 4-pair loop with `dq4` 4-codeword extraction from a single 64-bit window; vectorize decode with `as_type<half2>`; eliminate threadgroup barriers with SIMD warp reduction.
+  - **Testing**: `cargo test -p kaplumba-kernels` (21/21 passed), `gpu_gemv_matches_cpu_decoded_tile` passed, all 115 engine tests passed cleanly.
 
 - [ ] **T4: Implement SIMD-shuffle activation sharing and inlined Hadamard prologue**
   - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`
