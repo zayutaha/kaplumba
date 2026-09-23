@@ -3,17 +3,20 @@
 ## Goal
 
 End-to-end Gemma 4 31B EXL3 decode on the M4 Pro (273 GB/s, 20 GPU cores) at
-**≥ 20.0 t/s** (`decode_throughput_slow` gate ≥ 19.5), with:
-1. Measured plain-decode parity with the reference (PonyExl3) kernel structure
-   (P0–P2), then
-2. Verify-gated speculative decoding (P3) as the only physically-sound route
-   that crosses the bus ceiling.
+**≥ 20.0 t/s** (`decode_throughput_slow` gate ≥ 19.5), by:
+1. Landing the cheap plain-decode baseline wins available without quality loss
+   (P1-T2 split chooser, P1-T3 fused had_in, P2 end-to-end re-verify), then
+2. **Verify-gated speculative decoding (P3) as the primary route** — plain
+   decode is ALU-roofed at ~7–10 t/s, so speculation with row-batched
+   target-verify (the only mechanism that amortizes the decode ALU without
+   quality loss) is required to cross to 20 t/s.
 
 This re-bases `spec/perf-and-memory-overhaul` T5.5r: same-algorithm decode
-physically caps near ~40–45% of bus (~105–120 GB/s → ~9.5–11 t/s at 3 bpw for
-our 11.2 GB/token stream; see plan §Evidence). 20 t/s = 224 GB/s = 82% of bus,
-which no M-series EXL3 decode reaches; speculative decode multiplies against
-the bus by emitting several tokens per weight-stream read.
+reaches an **ALU roof, not a bus ceiling** — ~6–7 int/fp32 ops per decoded
+weight × ~31G weights ≈ 200G ops/token vs ~1.4–2.0T ops/s on the M4 Pro GPU.
+Measured 142 ms/token (7.03 t/s) sits on that roof. Speculative decode with
+8-row `exl3_gemm_sg` verify amortizes the decode ALU across rows and multiplies
+accepted tokens per step.
 
 ## Non-goals / restrictions
 
@@ -38,13 +41,16 @@ the bus by emitting several tokens per weight-stream read.
 1. R1 (P0, evidence): A stream-sum Metal probe reporting both (a) contiguous
    DRAM read bandwidth and (b) decode-geometry read bandwidth (strided as the
    gemv grid reads trellis) on this exact device. Printed in a gated bench.
-2. R2 (P1-T1): `exl3_gemv` rewritten to the PonyExl3 v12 MT=1 production
-   geometry — 128-thread TG (4 simdgroups, `NSG = 4`), 8 static register
-   accumulators per lane, static funnel windows, direct (non-coalesced) word
-   loads, x fetch via `simd_shuffle`, in-kernel cross-simdgroup reduction, no
-   dynamic indexing. Keeps the T5.2r `nsplit_override` hook **and** in-tile
-   split-K. Gate: all kernel/parity/one-hot tests green AND `bench_passes_slow`
-   gate+down ≥ current (168 Gw/s) or revert.
+2. R2 (P1-T1): `exl3_gemv4`, a PonyExl3 v12 MT=1-geometry kernel built
+   **alongside** `exl3_gemv` for A/B — 128-thread TG (4 simdgroups, `NSG = 4`),
+   8 static register accumulators per lane, static funnel windows, direct
+   (non-coalesced) word loads, x fetch via `simd_shuffle`, in-kernel
+   cross-simdgroup reduction, no dynamic indexing. Keeps the T5.2r
+   `nsplit_override` hook and in-tile split-K. **Outcome 2026-09-23: A/B
+   negative at every nsplit — v1 stays; `exl3_gemv4` + `gemv_pass_v4` + parity
+   test kept as regression bench (spec/decode-20tps/implementation_notes).**
+   Gate: all kernel/parity/one-hot tests green AND `bench_passes_slow` + sweep
+   never regress the v1 baseline (168 Gw/s gate).
 3. R3 (P1-T2): nsplit re-sweep on the new geometry using the reference chooser
    (double splits while `out_tiles * n_splits < 8192` and `in_tiles //
    (splits*2) >= 128`; post-divisor of 8); bake argmax per shape.
@@ -83,3 +89,11 @@ the bus by emitting several tokens per weight-stream read.
 
 Plan reviewed with user 2026-09-23. Decisions: (1) do all P0–P3, do not stop
 until 20 t/s; (2) 8-acc/128-thread register-pressure tradeoff acceptable.
+
+Plan re-reviewed 2026-09-23 after P1-T1 (v12-parity A/B negative + ALU-roof
+analysis): (3) **P3 verify-gated speculation is the primary path** to 20 t/s —
+plain decode is ALU-roofed ~7–10 t/s and 20 t/s plain would need f16x2 packed
+accumulate, blocked by no-quality-loss; (4) do the cheap plain-decode wins
+(P1-T2 chooser, P1-T3 fused had_in, P2 re-verify) first, then P3;
+(5) P3 draft architecture = **shallow-layer target draft** (target's own first
+few layers + reduced head; zero extra weights; acceptance profiled on artifact).

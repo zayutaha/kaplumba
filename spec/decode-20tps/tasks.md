@@ -38,14 +38,15 @@
     untouched.
   - **Commit**: TBD
 
-- [ ] **P1-T2: nsplit chooser → reference formula, re-sweep**
+- [ ] **P1-T2: nsplit chooser → sweep argmax (v1 geometry)**
   - **Files**: `crates/kernels/src/exl3.rs` (`gemv_splits`), policy tests
-  - **Intent**: Double splits while `out_tiles*n < 8192` and `in_tiles//
-    (n*2) >= 128`, enforce `tiles_per_split % 8 == 0`; validate with
-    `bench_gemv_split_sweep_slow` on the new geometry; bake per-shape argmax
-    only where it beats the chooser.
-  - **Testing**: `bench_gemv_split_sweep_slow` per shape ≥ P1-T1 baseline;
-    policy test updated; kernels + fast + parity.
+  - **Intent**: Bake the measured argmax override table from
+    `bench_gemv_split_sweep_slow` (gate n2, down n8, o n8, q n2, k/v n8, lm n1;
+    formula fallback for unlisted shapes, clamped 1..16). The reference float
+    (128 in-tiles/split) contradicts the measured k/v argmax (n8), so argmax
+    wins per T5.2r philosophy. Expected ~1–2 ms/token.
+  - **Testing**: `bench_gemv_split_sweep_slow` re-run shows engine policy ≥
+    best-of-sweep per shape; kernels + fast + parity green.
 
 - [ ] **P1-T3: Fuse had_in (and v18 post) into M=1 gemv**
   - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`,
@@ -66,17 +67,21 @@
     unflipped, document. Never land red.
   - **Testing**: two consecutive stable gated runs, no swap-file growth.
 
-- [ ] **P3: spec/verify-gated-spec-dec — interview**
+- [ ] **P3 (PRIMARY): spec/verify-gated-spec-dec — interview**
   - **Files**: new `spec/verify-gated-spec-dec/{spec,plan,tasks}.md`
-  - **Intent**: AGENTS.md §2 interview: draft architecture/weights, verify
-    mechanism (greedy-identical), acceptance measurement plan (1-token-ahead
-    profiler), memory budget within 14.6 GB, integration into `gpu_decode.rs`.
+  - **Intent**: AGENTS.md §2 interview on the CONFIRMED shallow-layer target
+    draft (target's own first 2–4 layers + reduced head, zero extra weights),
+    row-batched target-verify on `exl3_gemm_sg` (decode ALU amortized across
+    ≤8 rows), acceptance measurement plan, memory budget within 14.6 GB,
+    integration into `gpu_decode.rs`. Plain decode is ALU-roofed at ~7–10 t/s
+    (R2/R6 evidence), so this spec is the PRIMARY delivery of the 20 t/s gate.
   - **Testing**: user confirmation before implementation.
 
-- [ ] **P3: verify-gated speculative decode → 20 t/s**
+- [ ] **P3 (PRIMARY): verify-gated speculative decode → 20 t/s**
   - **Files**: per P3 spec
-  - **Intent**: Draft model gen + verify batch against target, greedy-identical
-    only; accept run-length measured on artifact; flip `decode_throughput_slow`
-    gate ≥ 19.5 only on measured proof.
+  - **Intent**: (a) 2-row E2E probe that batched target-verify actually
+    amortizes decode ALU on M4 Pro; (b) shallow-draft gen + verify batch,
+    greedy-identical only; accept run-length measured on artifact; flip
+    `decode_throughput_slow` gate ≥ 19.5 only on measured proof.
   - **Testing**: full coherence (fixture, France prompt, margin > 8) + two
     stable gated runs ≥ 19.5 t/s.
