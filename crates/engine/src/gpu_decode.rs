@@ -420,14 +420,25 @@ impl GpuDecoder {
             // which is why it is computed before the roped k overwrites nothing
             // and never reads a roped buffer.
             match &lw.v {
-                Some(lin) => gpu.encode_linear_with_scratch(
-                    enc,
-                    lin,
-                    &self.xn,
-                    &self.v_raw,
-                    1,
-                    &self.lin_temps,
-                )?,
+                Some(lin) => {
+                    gpu.encode_linear_with_scratch(
+                        enc,
+                        lin,
+                        &self.xn,
+                        &self.v_raw,
+                        1,
+                        &self.lin_temps,
+                    )?;
+                    gpu.encode_rms(
+                        enc,
+                        span(&self.v_raw),
+                        None,
+                        span(&self.v_raw),
+                        lw.n_kv,
+                        hd,
+                        eps,
+                    )?;
+                }
                 None => gpu.encode_rms(
                     enc,
                     span(&self.k_raw),
@@ -706,7 +717,16 @@ impl GpuDecoder {
                 )?;
                 match &lw.v {
                     Some(lin) => {
-                        gpu.encode_linear_with_scratch(enc, lin, &self.xn, &self.v_raw, m, sc)?
+                        gpu.encode_linear_with_scratch(enc, lin, &self.xn, &self.v_raw, m, sc)?;
+                        gpu.encode_rms(
+                            enc,
+                            span(&self.v_raw),
+                            None,
+                            span(&self.v_raw),
+                            m * lw.n_kv,
+                            hd,
+                            eps,
+                        )?;
                     }
                     None => gpu.encode_rms(
                         enc,

@@ -42,6 +42,26 @@ This document records technical decisions, benchmark measurements, register allo
   - Implemented `exl3_decode_f`: uses `half2 h2 = as_type<half2>(x); return float(h2.x + h2.y);` for single-instruction FP16 unpacking, replacing `as_type<half>(ushort(x))` + `as_type<half>(ushort(x >> 16))`.
   - Implemented `dq4` 64-bit window extraction: for $k \in \{1..6, 8\}$, 4 codewords are packed in at most $3 \times 8 + 16 = 40$ bits, which always fits within a 64-bit funnel shift `((ulong)w0 << 32) | (ulong)w1`. This extracts 4 codewords using only 2 memory loads instead of 4, cutting ALU shifts/funnel operations in half.
   - Handled $k=7$ via fallback pair table path (since $3 \times 7 + 16 = 37$ bits spans 3 words only at $k=7$).
-  - Eliminated threadgroup shared memory buffers `shA[128]`, `shB[128]` and `threadgroup_barrier(mem_flags::mem_threadgroup)` in `exl3_gemv`: replaced with register-level `simd_shuffle_down(acc, 1)` and `simd_shuffle_down(acc, 2)` across the 4 lanes computing each output column.
-- Verified: All 21 kernel tests in `kaplumba-kernels` passed; all 115 engine tests in `kaplumba-engine` passed cleanly.
-
+### Decode Coherence Root Cause & Resolution
+- **Symptom**: CLI generation on `"What is the capital of France?"` produced `"It seems like to answers: \nIt seems like to answer"` instead of `"The capital of France is Paris."`.
+- **Root Cause Investigation**:
+  - Step-by-step intermediate tracing against the reference Python oracle (`ponyexl3` in `.venv-baseline`) revealed exact mathematical divergence starting at token 1:
+    - Step 0 (<bos>): Both predicted token 236773 with identical logit `29.9782` (bit-exact match to 4 decimal places).
+    - Step 1 (<|turn>): Diverged in layer 0 hidden state (`h_mid[1]` was `0.6660` in Python vs `1.0547` in Rust).
+  - Traced layer 0 attention sublayer internals:
+    - In Python `mlx_lm.models.gemma4_text.Attention`: every attention layer normalizes values with `v = self.v_norm(values)` using `RMSNormNoScale` (weightless per-head RMSNorm).
+    - In Kaplumba: `gemma4.rs` and `gpu_decode.rs` applied head normalization only to full-attention layers when `k_eq_v == true`. On all sliding-attention layers (e.g. layers 0, 1, 2, 4, ...), `v` was taken directly from the raw linear projection `v_proj` without RMSNorm!
+    - This caused attention values on all sliding layers to enter with unnormalized magnitudes, distorting the attention output vector and compounding across all 60 layers.
+- **Resolution**:
+  - In `crates/engine/src/gemma4.rs`: applied `norm_heads` (weightless RMSNorm) to `v_proj` in `forward_seq_layers` and `layer_step`.
+  - In `crates/engine/src/gpu_decode.rs`: added `gpu.encode_rms` (weightless RMSNorm) to normalize `self.v_raw` after the linear projection in both `encode_token` and `encode_span`.
+  - Cleaned up `trace_chat_prompt_steps_slow` as a regression test asserting token 818 argmax on step 19.
+- **Verification**:
+  - Every single token from step 0 to step 19 matched the reference oracle with 100% bit-exact argmax identity!
+  - Step 19 argmax: Token 818 ("The") with logit 21.5117 (an 8.8-logit margin over rank 2). Token 1509 ("It") dropped to logit 5.0036.
+  - Live CLI generate test:
+    ```
+    The capital of France is Paris.
+    prefill 1379.1ms (14.5 tok/s) · ttft 1379.7ms · 8 tokens · eos · 7.157 tok/s decode (7 steps, 1.0x recompute)
+    ```
+    Generated the exact answer and terminated cleanly on `eos`!

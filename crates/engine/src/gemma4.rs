@@ -1001,7 +1001,8 @@ impl<'a> Gemma4Model<'a> {
             // k_eq_v: V is a weightless RMSNorm of the RAW k projection.
             norm_heads(&k_raw, s, lc.n_kv, hd, None, cfg.eps)
         } else {
-            self.linear(&format!("{p}.self_attn.v_proj"), &xn)?
+            let v_proj = self.linear(&format!("{p}.self_attn.v_proj"), &xn)?;
+            norm_heads(&v_proj, s, lc.n_kv, hd, None, cfg.eps)
         };
 
         let attn = self.attention(&lc, &q, &k, &v, s)?;
@@ -1084,7 +1085,8 @@ impl<'a> Gemma4Model<'a> {
         let v = if lc.kind == LayerKind::Full && cfg.k_eq_v {
             norm_heads(&k_raw, 1, lc.n_kv, hd, None, cfg.eps)
         } else {
-            self.linear(&format!("{p}.self_attn.v_proj"), &xn)?
+            let v_proj = self.linear(&format!("{p}.self_attn.v_proj"), &xn)?;
+            norm_heads(&v_proj, 1, lc.n_kv, hd, None, cfg.eps)
         };
 
         let (kv_pos0, kv_rows) = cache.append_layer(cfg, i, &k, &v)?;
@@ -2110,6 +2112,35 @@ mod tests {
         let mut kv2 = g.new_kv_cache(8);
         let again = g.forward_cached(&mut kv2, &[2]).expect("repeat forward");
         assert_eq!(logits, again, "T4.2 single-cb forward not deterministic");
+    }
+
+    #[test]
+    fn trace_chat_prompt_steps_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let ctx = crate::metal_ctx::MetalContext::new().expect("metal context");
+        let model = crate::load::load_exl3(&ctx, &dir).expect("load artifact");
+        let gpu = crate::metal_linear::MetalLinear::new(&ctx).expect("metal linear");
+        let g = Gemma4Model::from_model(&model)
+            .expect("gemma cfg")
+            .with_gpu(&gpu);
+
+        let prompt_ids: [u32; 20] = [
+            2, 105, 2364, 107, 3689, 563, 506, 5279, 529, 7001, 236881, 106, 107, 105, 4368, 107, 100, 45518, 107, 101,
+        ];
+        let mut kv = g.new_kv_cache(64);
+        let mut last_got = 0;
+        for &t in &prompt_ids {
+            let logits = g.forward_cached(&mut kv, &[t]).expect("step forward");
+            last_got = argmax(&logits);
+        }
+        assert_eq!(last_got, 818, "chat prompt must predict 'The' (token 818) after closing thought tag");
     }
 
     /// T3.2: batched prefill (`encode_span`) must agree with the token loop
