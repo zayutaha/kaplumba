@@ -2523,4 +2523,83 @@ mod tests {
             stats.tg_tps()
         );
     }
+
+    /// T2.7 decode phase profile via layer-scaling: forward-only ms/token at
+    /// `layers = 60 / 10 / 0`. `fwd(n) = a + b·n` where `a` = embed + final
+    /// norm + lm_head + device waits (non-layer) and `b` = average per-layer
+    /// cost (linears + attn + rope/rms glue). `a − lm_head` isolates the
+    /// fixed overhead; comparing `60b` against the `bench_passes` linear sums
+    /// shows how much of a layer is NOT trellis gemv.
+    /// `KAPLUMBA_RUN_SLOW=1 cargo test -p kaplumba-engine --release --lib --
+    /// --ignored --nocapture decode_layer_scaling_slow`.
+    #[test]
+    #[ignore]
+    fn decode_layer_scaling_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1 to run the real-model test");
+            return;
+        }
+        let Some(dir) = crate::testutil::artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let steps: usize = std::env::var("KAPLUMBA_DECODE_STEPS")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(64);
+        let ctx = crate::metal_ctx::MetalContext::new().expect("metal context");
+        let model = crate::load::load_exl3(&ctx, &dir).expect("load artifact");
+        let gpu = crate::metal_linear::MetalLinear::new(&ctx).expect("metal linear");
+        let g = Gemma4Model::from_model(&model)
+            .expect("gemma cfg")
+            .with_gpu(&gpu);
+        assert!(g.gpu_enabled(), "layer scaling must run the GPU path");
+
+        let mut rows: Vec<(String, Option<usize>, f64, f64)> = Vec::new();
+        for (label, layers) in [
+            ("full", None),
+            ("L=10", Some(10usize)),
+            ("L=0", Some(0usize)),
+        ] {
+            let params = crate::generate::GenParams {
+                max_new: steps,
+                sample: crate::sampler::SampleParams::greedy(),
+                seed: 0,
+                eos: vec![],
+                layers,
+                use_kv: true,
+            };
+            let stats =
+                crate::generate::generate(&g, &[2u32], &params, |_| true).expect("decode run");
+            assert_eq!(stats.gen_tokens, steps, "eos=[] → full length");
+            let fwd_ms = stats.decode_s / stats.decode_steps as f64 * 1e3;
+            eprintln!(
+                "[T2.7] {label:<6} fwd {fwd_ms:>7.2} ms/token → {:>5.2} t/s",
+                stats.tg_tps()
+            );
+            rows.push((
+                label.to_string(),
+                layers,
+                fwd_ms,
+                stats.decode_s / stats.decode_steps as f64 * 1e3,
+            ));
+            assert!(fwd_ms > 0.0 && fwd_ms < 10_000.0, "implausible timing");
+        }
+        let (t60, t10, t0) = (rows[0].2, rows[1].2, rows[2].2);
+        let b = (t60 - t10) / 50.0;
+        let a = t10 - 10.0 * b;
+        eprintln!(
+            "[T2.7] model fwd(n) = {a:.2} + {b:.3}·n ms | \
+             a includes lm_head (~5.9 ms bench) + embed + waits | \
+             60 layers = {:.1} ms | non-layer a = {:.1} ms ({:.0}%)",
+            60.0 * b,
+            a,
+            100.0 * a / t60
+        );
+        assert!(
+            b > 0.0,
+            "per-layer cost must be positive (t60 {t60} vs t10 {t10})"
+        );
+        assert!(a >= 0.0, "non-layer intercept negative? t0 {t0} t10 {t10}");
+    }
 }

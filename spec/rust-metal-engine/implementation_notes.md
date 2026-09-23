@@ -553,6 +553,23 @@ Cross-checks:
 - T2.3 ops ceiling: 350–450 Gw/s for the current gemv algorithm ≈ **9–12 t/s**
 - today 6.42 → plausible plain-decode ceiling **~9–12 t/s** after gemv ops-count work; **18 requires MTP/verify-batch** (Phase 4 T4.4/T4.6: rows=k amortize decode ops/weight below 5) — but the user gate sequences MTP *after* 18 via plain decode → circular; surface alongside the 200 pp/s conflict
 
+## T2.7 — decode phase profile (2026-09-23)
+
+**Method:** `decode_layer_scaling_slow` runs the same 64-step greedy decode at `GenParams.layers = 60 / 10 / 0` (GPU kv path honors `upto` — `layers=0` = embed + final norm + lm_head only; outputs meaningless, timing-only).
+
+**Numbers (M4 Pro, release):**
+- fwd ms/token: **132.86 / 28.72 / 6.99** → fit `fwd(n) = 7.89 + 2.083·n`; per-layer **2.083 ms = 95%**, non-layer **~7.9 ms = 6%** (direct t0 6.99 → ~0.9 ms sub-linearity at shallow depth)
+- non-layer breakdown: lm_head isolated 5.90–5.98 ms + embed copy/norm/convert/waits ~1–2 ms
+- bench_passes now includes q/k/v (were missing): **gate 0.628, down 0.601, o 0.330, q 0.330, k 0.235, v 0.233** ms (isolated `full`, min of 20) → linear sum **2.357 ms/layer** vs in-model 2.083 ⇒ ~0.07–0.1 ms/call isolation submit overhead; residual for attn + rope/rms + encoder loop **≈ 0.14 ms/layer ≈ 7%**
+- Gw/s (isolated full): lm 239, down 192, gate 184, o/q 134, k/v 94/95 — k/v weakest but tiny (22M weights each vs gate 116M); already nsplit=4 (out_tiles=256 → 1024/256)
+
+**Decision (b) — same-algorithm plateau:**
+- Linears ≈ 93% of layer ≈ 88% of token; attacking the 7% residual cannot move t/s by more than ~7% even if free
+- gemv is now **issue-bound ~50%**: 189–239 Gw/s × ~10 ops/weight ≈ 1.9–2.4 Tops vs T2.3's measured issue rate ~4.1 Tops (350–450 Gw/s ceiling at 10 ops/weight) → **same-algorithm decode ceiling ≈ 9–12 t/s**; bandwidth floor 16.028 GB ÷ 273 GB/s ≈ 17.6 t/s at 100% (today 120.6 GB/s = 44%)
+- Getting past ~12 needs ops/weight ≤ 5 (different algorithm — MTP/verify-batch amortizes verify rows across drafter tokens) — **user gate sequences MTP after plain-decode 18 → circular; surface for decision**
+- Prefill unchanged: **86.8 / 79.5 / 71.0 t/s** @512/2048/8192, MMA wall 6.3 TFLOP/s vs 11.59 needed for 200 → ceiling ~116 theoretical, ~100–110 realistic
+- Remaining roadmap not blocked by the walls: T2.2 TTFT (3822 ms warm-up → load time), T2.4 quality gate (temp1/topk64/topp0.95), 100% coherence verify, paged-kv OQs
+
 ## T2.6 — gemv funnel micro (2026-09-23)
 
 **A — pk mask hoist:** the four `pk&0xFF`/`>>8`/`>>16` field extractions (20 ops/iter) were written inside the `it` loop; hoisted to locals before it. Bench: **gate 177 → 187 Gw/s** (+5.6%), lm/down/o flat — LLVM already hoisted on the long lm_head loop (in_tiles=16384), but evidently not on gate's shorter one (in_tiles=1344? gate in_tiles=21504/16=1344). Keep.

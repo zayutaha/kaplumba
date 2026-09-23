@@ -959,6 +959,9 @@ mod tests {
             ("gate", "model.language_model.layers.0.mlp.gate_proj"),
             ("down", "model.language_model.layers.0.mlp.down_proj"),
             ("o", "model.language_model.layers.0.self_attn.o_proj"),
+            ("q", "model.language_model.layers.0.self_attn.q_proj"),
+            ("k", "model.language_model.layers.0.self_attn.k_proj"),
+            ("v", "model.language_model.layers.0.self_attn.v_proj"),
             ("lm_head", "lm_head"),
         ];
         for (label, name) in names {

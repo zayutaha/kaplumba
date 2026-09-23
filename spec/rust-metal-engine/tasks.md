@@ -128,6 +128,15 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - Target: R2.1 (tg/s), toward T2.3's 350–450 Gw/s ops ceiling
 - Commit: `spec/rust-metal-engine: T2.6 gemv funnel micro`
 
+### T2.7 — decode phase profile (layer-scaling) → last-lever decision
+- [x] `decode_layer_scaling_slow`: fwd ms/token at `layers = 60 / 10 / 0` = **132.86 / 28.72 / 6.99 ms** → `fwd(n) = 7.89 + 2.083·n` (direct t0 6.99, ~0.9 ms sub-linear). Non-layer **a ≈ 7.9 ms (6%)** = lm_head ~5.9 + embed/norm/waits ~1–2; per-layer **2.083 ms (95%)**
+- [x] Bench q/k/v added (were missing): q 0.330 / k 0.235 / v 0.233 ms (+ gate 0.628, down 0.601, o 0.330) → isolated linear sum **2.357 ms/layer** vs in-model 2.083 → isolation submit overhead ~0.07–0.1/call; attn+rope/rms+launch residual **≈ 0.14 ms/layer ≈ 7% < 10%**. k/v Gw/s 94/95 (full incl. had), o/q 134, down 192, gate 184, lm 239
+- [x] **Decision (b):** linears ≈ 93% of layer ≈ 88% of token — same-algorithm plateau. gemv now issue-bound (~50% of T2.3's 4.1 Tops rate at ~189–239 Gw/s × ~10 ops/weight); ops ceiling ~9–12 t/s, bandwidth floor 16 GB ÷ 273 ≈ 17.6 t/s, neither reachable without cutting ops/weight ≤ 5 (different algorithm = MTP/verify-batch — user-gated at 18 → circular). **Stop decode grind toward 18; deliver end-of-track conflict report (200 pp/s MMA wall + 18/MTP circularity) with these tables; continue remaining roadmap (T2.2 TTFT, T2.4 quality, coherence verify) pending user's gate decision**
+- Files: `crates/engine/src/gemma4.rs` (`decode_layer_scaling_slow`), `crates/engine/src/metal_linear.rs` (bench q/k/v names)
+- Test: `decode_layer_scaling_slow` green + full gated suite stays green
+- Target: R2.1 (tg/s) — decides remaining decode work
+- Commit: `spec/rust-metal-engine: T2.7 decode phase profile`
+
 ## Phase 3 — Prefill kernels
 
 ### T3.1 — Verify EXL3 artifact (T3.1 from old plan, renamed)
