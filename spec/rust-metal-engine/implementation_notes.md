@@ -553,6 +553,21 @@ Cross-checks:
 - T2.3 ops ceiling: 350–450 Gw/s for the current gemv algorithm ≈ **9–12 t/s**
 - today 6.42 → plausible plain-decode ceiling **~9–12 t/s** after gemv ops-count work; **18 requires MTP/verify-batch** (Phase 4 T4.4/T4.6: rows=k amortize decode ops/weight below 5) — but the user gate sequences MTP *after* 18 via plain decode → circular; surface alongside the 200 pp/s conflict
 
+## T2.5 — gemv K-split + reduce (2026-09-23)
+
+**Finding (profile-first):** gemv Gw/s tracks **wave depth** almost perfectly — lm_head 16384 TGs = 51 waves → 241 Gw/s, gate 1344 = 4 waves → 172, down/o 336 = 1 wave → 149/119, k/v ≲0.5 waves worst. 1-wave shapes have no tail-latency hiding across the ~320 concurrent simdgroups (20 cores), so the funnel's load latency sits exposed. attn/glue/head ≈ 0 of the 155.6 ms token at short ctx — linears are the whole decode.
+
+**Change:** `exl3_gemv` grid → `(out_tiles, nsplit)`; `Exl3Params.nsplit` (7th u32, `set_bytes(4,28)`); each split TG accumulates `it ∈ [split*chunk, min(in, (split+1)*chunk))` and stores `y[(split*out_tiles+ot)*TILE+g]` — with `nsplit==1` the host binds `y` itself, so split-0 indexing is byte-identical to the old flat path (gate/up/lm_head take exactly this path: policy `nsplit = clamp(div_ceil(1024, out_tiles), 1, 8)` → 1344/16384 → 1). Split shapes write a transient partial `[nsplit, out_tiles, 16]` f32 (grown in `Exl3Gemv.partial`, ≤ 128 KB, not model/KV growth; old buffers survive mid-cb growth via Metal's set_buffer retain) and `exl3_gemv_reduce` (grid `out_tiles`, 32 thr) sums splits → `y`.
+
+**Gotcha:** Metal rejects kernel signatures mixing vector and scalar attribute args (`uint2 tg` + `uint tid` → "expecting input declarations with either all scalar types or all vector types"); use `uint2 thr` and take `.x`. Errors from `new_library_with_source` surface only at probe/pipeline build — easy to misread warnings in the same message as the failure.
+
+**Measured (release, M4 Pro):**
+- bench: **down 149 → 185 Gw/s (+24%)**, **o 119 → 135 (+13%)**, gate 172→177 and lm_head 241 flat (unsplit, as designed); down gemv 0.767 → 0.634 ms
+- end-to-end decode: **6.42 → 7.15 t/s** (155.6 → 139.8 ms/token; weight stream 103 → 114.6 GB/s); first tokens identical `[236773, 236798, …]` → reassociation inside token gates
+- suites: kernels 19, fast engine 113, full gated **113/0/4** (fixture 236773, span 0.55, batched-vs-gemv unchanged)
+
+**Remaining decode headroom:** 139.8 ms/token at 114.6 GB/s vs 273 rated; remaining levers ranked: (1) funnel ALU/issue on the already-multi-wave shapes (hoist `pk` field masks, software-pipeline loads — lm_head 241 vs issue-bound ~410 Gw/s ceiling from T2.3), (2) had_in/out share (~0.15 ms × 840 passes/token ≈ measurable once linears shrink), (3) then the T2.3/T4.0 walls: ops/weight ≤ ~8.7 needed for 18 t/s at full issue, bandwidth 17.6 t/s absolute → **18 + 28 (MTP) conflict report**.
+
 ## T4.2 — one command buffer per decode token (2026-09-22)
 
 **Problem:** the cached/GPU decode path encoded each of the ~471 dispatches per token (411 linears + 60 attentions + glue) into its own command buffer with `commit`+`wait_until_completed` — ~0.4 ms of CPU submit/wait each ⇒ **~180 ms of a ~275 ms token was pure overhead** (kernel time only ~93 ms).

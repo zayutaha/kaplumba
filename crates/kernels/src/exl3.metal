@@ -38,6 +38,11 @@ struct Exl3Params {
     uint twords;
     uint mode; // 0 = Default, 1 = Mcg (Mul1 stays on the CPU path)
     uint aligned; // trellis base is 4-byte aligned -> single u32 loads
+    // T2.5 K-split: threadgroups per out-tile (grid.y). Each split accumulates
+    // its slice of the in-tile range into y[split * out_tiles + ot]; the host
+    // either reads that directly (nsplit == 1 → identical indexing) or sums
+    // the splits in `exl3_gemv_reduce`.
+    uint nsplit;
 };
 
 // Same, plus the row count for the batched prefill GEMM (T3.2).
@@ -157,14 +162,21 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
                       device const uint *pair_tab [[buffer(2)]],
                       device float *y [[buffer(3)]],
                       constant Exl3Params &p [[buffer(4)]],
-                      uint tg [[threadgroup_position_in_grid]],
-                      uint tid [[thread_position_in_threadgroup]]) {
+                      uint2 tg [[threadgroup_position_in_grid]],
+                      uint2 thr [[thread_position_in_threadgroup]]) {
     threadgroup float shA[32 * WARPS];
     threadgroup float shB[32 * WARPS];
 
     uint sub = 0u;
+    uint tid = thr.x;
     uint g = tid & 31u;       // lane = kernel-order group
-    uint ot = tg * WARPS + sub;
+    uint ot = tg.x * WARPS + sub;
+    // T2.5 K-split: grid.y selects the in-tile slice (see Exl3Params.nsplit).
+    // nsplit == 1 / split == 0 reduces to the old flat indexing exactly.
+    uint nsplit = p.nsplit;
+    uint chunk = (p.in_tiles + nsplit - 1u) / nsplit;
+    uint it0 = tg.y * chunk;
+    uint it1 = min(p.in_tiles, it0 + chunk);
     bool live = ot < p.out_tiles;
 
     uint cA = g >> 2;   // 0..7  -> output columns 0..7
@@ -186,7 +198,7 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
     // `live` is warp-uniform, so the loop is skipped (not divergent) for the
     // padding warp of the last threadgroup while every warp still reaches the
     // barrier below.
-    for (uint it = 0; live && it < p.in_tiles; it++) {
+    for (uint it = it0; live && it < it1; it++) {
         // Stride is in u32 words; the tile is addressed as u16 pairs so that a
         // 2-mod-4 trellis offset still reads correctly.
         device const ushort *tile =
@@ -233,8 +245,29 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
                 s += shB[base + ((g - 8u) << 2) + q];
             }
         }
-        y[ot * TILE + g] = s;
+        // Split-slice store (T2.5): split == 0 keeps the old address exactly.
+        y[(tg.y * p.out_tiles + ot) * TILE + g] = s;
     }
+}
+
+// ---------------------------------------------------------------------------
+// T2.5: sum the K-split partials: y[ot, g] = Σ_s partial[s, ot, g].
+// grid = (out_tiles), 32 threads (first TILE active). f32 adds reassociate
+// relative to the unsplit loop — token-level gates only (argmax/ulp).
+// ---------------------------------------------------------------------------
+kernel void exl3_gemv_reduce(device const float *partial [[buffer(0)]],
+                             device float *y [[buffer(1)]],
+                             constant uint2 &p [[buffer(2)]], // x = out_tiles, y = nsplit
+                             uint tg [[threadgroup_position_in_grid]],
+                             uint tid [[thread_position_in_threadgroup]]) {
+    if (tid >= TILE) {
+        return;
+    }
+    float s = 0.0f;
+    for (uint sp = 0u; sp < p.y; sp++) {
+        s += partial[(sp * p.x + tg) * TILE + tid];
+    }
+    y[tg * TILE + tid] = s;
 }
 
 // ---------------------------------------------------------------------------

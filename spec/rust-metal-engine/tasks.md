@@ -110,6 +110,15 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - Target: AC6
 - Commit: `spec/rust-metal-engine: T2.4 quality gate`
 
+### T2.5 — gemv K-split + partial-sum reduce (decode occupancy)
+- [x] Measured pattern (T4.0/bench): Gw/s tracks wave depth — lm_head 51 waves = 241, gate 4 = 172, down 1 = 149, o 1 = 119, k/v ~0.2 waves worst; 1-wave shapes have no tail-latency hiding across ~320 concurrent simdgroups. Split the in-tile range across `grid.y` (`nsplit` param), each split-TG partial-sums into scratch `[nsplit, out_tiles, 16]`, new `exl3_gemv_reduce` sums splits → `y`. Policy: `nsplit = clamp(div_ceil(1024, out_tiles), 1, 8)` → gate/up/lm unchanged (1), down/o → 4, q → 2, k/v → 8. `nsplit==1` binds `y` directly (byte-identical path). Scratch ≤ 128 KB transient (not model/KV growth). f32 reassociation on split shapes only — token-level gates (argmax/span 0.55/gemv 2e-3) must hold
+  - Gotcha: Metal requires all kernel inputs uniformly scalar or uniformly vector — the new `uint2 tg` grid arg forced `uint2 thr` (mixed `uint2`+`uint` → compile error surfaced only via `build_probe` panic)
+- [x] **Verified:** kernels 19 (incl. `gemv_splits_policy_covers_shapes`); fast engine 113; full gated **113 passed / 0 failed / 4 ignored** (fixture 236773, span 0.55, batched-vs-gemv unchanged → reassociation inside gates); `bench_passes_slow`: **down 149→185 Gw/s (+24%), o 119→135 (+13%)**, gate 177 / lm 241 flat as designed; `decode_throughput_slow`: **6.42 → 7.15 t/s** (155.6 → 139.8 ms/token, 103 → 114.6 GB/s), decoded ids identical `[236773, …]`
+- Files: `crates/kernels/src/{exl3.metal,exl3.rs}`
+- Test: above
+- Target: R2.1 (tg/s), profile-before-machinery
+- Commit: `spec/rust-metal-engine: T2.5 gemv k-split`
+
 ## Phase 3 — Prefill kernels
 
 ### T3.1 — Verify EXL3 artifact (T3.1 from old plan, renamed)

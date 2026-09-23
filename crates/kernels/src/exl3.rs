@@ -200,6 +200,8 @@ pub struct Exl3Gemv {
     queue: CommandQueue,
     had_in: ComputePipelineState,
     gemv: ComputePipelineState,
+    /// T2.5: sums the K-split partials of `gemv` back into `y`.
+    gemv_reduce: ComputePipelineState,
     gemm: ComputePipelineState,
     /// Simdgroup tensor-core GEMM (v19c port; `rows ≥ 2`, see `sg_eligible`).
     gemm_sg: ComputePipelineState,
@@ -209,6 +211,10 @@ pub struct Exl3Gemv {
     /// (the decode geometry is per tile-position, not per layer).
     inv_perm: Buffer,
     scratch: RefCell<Option<Scratch>>,
+    /// T2.5 K-split partials `[nsplit, out_tiles, 16]` f32 (≤ ~128 KB).
+    /// Grown on demand; old buffers stay alive if an in-flight command
+    /// encoder still references them (Metal retains at `set_buffer`).
+    partial: RefCell<Option<(Buffer, usize)>>,
 }
 
 impl Exl3Gemv {
@@ -240,13 +246,39 @@ impl Exl3Gemv {
             queue: queue.clone(),
             had_in: build("exl3_had_in")?,
             gemv: build("exl3_gemv")?,
+            gemv_reduce: build("exl3_gemv_reduce")?,
             gemm: build("exl3_gemm")?,
             gemm_sg: build("exl3_gemm_sg")?,
             had_out: build("exl3_had_out")?,
             pair_tables: RefCell::new(HashMap::new()),
             inv_perm,
             scratch: RefCell::new(None),
+            partial: RefCell::new(None),
         })
+    }
+
+    /// T2.5 K-split policy: gemv shapes with few out-tiles only fill a small
+    /// slice of the GPU's concurrent simdgroups (measured Gw/s tracks wave
+    /// depth — lm_head 51 waves = 241, gate 4 = 172, down/o 1 = 149/119), so
+    /// split the in-tile range across `grid.y` until the dispatch reaches
+    /// ~1024 threadgroups, capped at 8 splits (partial ≤ ~128 KB).
+    fn gemv_splits(out_tiles: usize) -> usize {
+        const TARGET_TGS: usize = 1024;
+        const MAX_SPLIT: usize = 8;
+        TARGET_TGS.div_ceil(out_tiles.max(1)).clamp(1, MAX_SPLIT)
+    }
+
+    /// Grow the K-split partial buffer to at least `bytes`.
+    fn ensure_partial(&self, bytes: usize) {
+        let mut slot = self.partial.borrow_mut();
+        let ok = matches!(slot.as_ref(), Some((_, len)) if *len >= bytes);
+        if !ok {
+            *slot = Some((
+                self.device
+                    .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared),
+                bytes,
+            ));
+        }
     }
 
     fn pair_buffer(&self, k: u32) -> Buffer {
@@ -350,29 +382,68 @@ impl Exl3Gemv {
         // the per-tile stride is half the u16 tile length. `aligned` selects the
         // single-u32 load path (real artifacts: most tensors yes, lm_head no).
         debug_assert_eq!(shape.words_per_tile() % 2, 0);
-        let params: [u32; 6] = [
+        let nsplit = Self::gemv_splits(shape.out_tiles);
+        let params: [u32; 7] = [
             shape.in_tiles as u32,
             shape.out_tiles as u32,
             shape.k,
             (shape.words_per_tile() / 2) as u32,
             mode,
             u32::from(trellis.byte_offset % 4 == 0),
+            nsplit as u32,
         ];
+        // T2.5: split shapes write partials `[nsplit, out_tiles, 16]` and are
+        // summed by `exl3_gemv_reduce`; nsplit == 1 binds `y` directly, which
+        // keeps the old flat path byte-identical (split 0 → offset 0).
+        let need = nsplit * shape.out_tiles * TILE * 4;
+        let held = if nsplit > 1 {
+            self.ensure_partial(need);
+            Some(self.partial.borrow())
+        } else {
+            None
+        };
+        let dest: &Buffer = match held.as_ref() {
+            Some(slot) => &slot.as_ref().expect("ensure_partial").0,
+            None => y,
+        };
         enc.set_compute_pipeline_state(&self.gemv);
         enc.set_buffer(0, Some(xh), 0);
         enc.set_buffer(1, Some(trellis.buffer), trellis.byte_offset as u64);
         enc.set_buffer(2, Some(pair), 0);
-        enc.set_buffer(3, Some(y), 0);
-        enc.set_bytes(4, 24, params.as_ptr() as *const _);
+        enc.set_buffer(3, Some(dest), 0);
+        enc.set_bytes(4, 28, params.as_ptr() as *const _);
         // MUST match `WARPS` in exl3.metal (one out-tile per warp). These two
         // constants drifted once and the mismatch looked like a math bug: the
         // kernel indexed shA[] out of bounds and the tests went red.
         const WARPS: usize = 1;
         let groups = shape.out_tiles.div_ceil(WARPS) as u64;
         enc.dispatch_thread_groups(
-            MTLSize::new(groups, 1, 1),
+            MTLSize::new(groups, nsplit as u64, 1),
             MTLSize::new((32 * WARPS) as u64, 1, 1),
         );
+        if nsplit > 1 {
+            self.encode_gemv_reduce(enc, dest, y, nsplit, shape.out_tiles);
+        }
+        // Drop the partial borrow only after every set_buffer that references
+        // it has been encoded (Metal retains the buffer for the encoder).
+        drop(held);
+    }
+
+    /// T2.5: `y[ot] = Σ_s partial[s, ot]` after a K-split gemv.
+    fn encode_gemv_reduce(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        partial: &Buffer,
+        y: &Buffer,
+        nsplit: usize,
+        out_tiles: usize,
+    ) {
+        let p: [u32; 2] = [out_tiles as u32, nsplit as u32];
+        enc.set_compute_pipeline_state(&self.gemv_reduce);
+        enc.set_buffer(0, Some(partial), 0);
+        enc.set_buffer(1, Some(y), 0);
+        enc.set_bytes(2, 8, p.as_ptr() as *const _);
+        enc.dispatch_thread_groups(MTLSize::new(out_tiles as u64, 1, 1), MTLSize::new(32, 1, 1));
     }
 
     /// Batched prefill GEMM (T3.2): `y[m] = xh[m] @ decode(trellis)` for
@@ -969,6 +1040,21 @@ mod tests {
         let d = Device::system_default()?;
         let q = d.new_command_queue();
         Some((d, q))
+    }
+
+    /// T2.5 policy: gate/up/lm_head shapes stay unsplit (already multi-wave);
+    /// down/o split 4, q 2, small k/v 8; tiny shapes clamp to 8.
+    #[test]
+    fn gemv_splits_policy_covers_shapes() {
+        assert_eq!(Exl3Gemv::gemv_splits(16384), 1); // lm_head
+        assert_eq!(Exl3Gemv::gemv_splits(1344), 1); // gate/up (21504 out)
+        assert_eq!(Exl3Gemv::gemv_splits(1024), 1); // exactly target
+        assert_eq!(Exl3Gemv::gemv_splits(512), 2); // q (8192 out)
+        assert_eq!(Exl3Gemv::gemv_splits(336), 4); // down/o (5376 out)
+        assert_eq!(Exl3Gemv::gemv_splits(256), 4); // sliding k/v
+        assert_eq!(Exl3Gemv::gemv_splits(128), 8); // full-layer k/v
+        assert_eq!(Exl3Gemv::gemv_splits(64), 8); // clamped (want 16)
+        assert_eq!(Exl3Gemv::gemv_splits(1), 8);
     }
 
     fn build_probe(device: &Device, name: &str) -> ComputePipelineState {
