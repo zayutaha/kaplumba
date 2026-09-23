@@ -12,3 +12,9 @@
 - **Key Invariants & Proven Dead-Ends from History**:
   - Generic arbitrary-stride `simd_shuffle` tile weight ladders (T5.3r) are a net loss on M4 Pro due to 160-ALU barrel shuffle cost on 24-word tiles. Direct L1-resident loads are faster.
   - Weights must stay in their original memory-mapped positions without copying (resident memory limit ≤ 14.6 GB). Fused GEMVs use pointer dispatch.
+
+## Tasks Completed (T2, T3, T4, T5)
+- **T4 (`exl3_had_in_batched`)**: Multi-row pre-Hadamard operating on row-stacked `suh_stack`. Replaces 2 separate dispatches for Gate/Up and 3 separate dispatches for Q/K/V with a single multi-row launch (`grid.y = 2` or `grid.y = 3`). Verified bit-for-bit identical via `gpu_had_in_batched_matches_separate_passes`.
+- **T2 (`exl3_gemv_fused2`)**: Sibling 2-way GEMV dispatching 2,688 out-tiles (Gate 1344 + Up 1344) over 20 cores (134.4 threadgroups/core). Reaches 107 Gw/s in release mode. Verified exact match against separate GEMVs via `gpu_gemv_fused2_matches_separate_passes`.
+- **T3 (`exl3_gemv_fused3`)**: Sibling 3-way GEMV dispatching 1,024 out-tiles (Q 512 + K 256 + V 256). Expands K and V grid from 256 to 1,024 tiles (51.2 threadgroups/core), eliminating the 18.7 GB/s under-occupancy collapse. Measured latency dropped from 1.489 ms (separate Q+K+V) to 0.953 ms. Verified exact match via `gpu_gemv_fused3_matches_separate_passes`.
+- **T5 (`Fused2Handles` & `Fused3Handles`)**: Zero-copy device handles created on model load with pre-stacked `suh_stack` and `svh_cat` buffers (~4.4 MB total model overhead). Implemented `encode_fused2_with_scratch` and `encode_fused3_with_scratch`. Verified exact match via `gpu_encode_fused2_and_fused3_matches_separate_linears`.

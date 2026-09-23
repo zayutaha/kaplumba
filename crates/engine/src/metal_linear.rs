@@ -99,6 +99,209 @@ impl LinearHandles {
     }
 }
 
+/// Owned device handles for a fused 2-way sibling pair (e.g. Gate + Up or Q + K).
+#[derive(Clone)]
+pub struct Fused2Handles {
+    pub name: String,
+    pub shape_a: Exl3Shape,
+    pub shape_b: Exl3Shape,
+    pub mode: u32,
+    trellis_a: (Buffer, usize),
+    trellis_b: (Buffer, usize),
+    suh_stack: Buffer,
+    svh_cat: Buffer,
+}
+
+impl Fused2Handles {
+    pub fn new(
+        device: &metal::Device,
+        a: &LinearHandles,
+        b: &LinearHandles,
+    ) -> Result<Self, MetalLinearError> {
+        let inn = a.shape.in_features();
+        if b.shape.in_features() != inn {
+            return Err(KernelError::Unsupported(format!(
+                "Fused2 in_features mismatch: {inn} vs {}",
+                b.shape.in_features()
+            ))
+            .into());
+        }
+        if a.shape.k != b.shape.k || a.mode != b.mode {
+            return Err(KernelError::Unsupported("Fused2 k/mode mismatch".into()).into());
+        }
+        let suh_stack = device.new_buffer(
+            (2 * inn * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        unsafe {
+            let dst = suh_stack.contents() as *mut u8;
+            let src_a = a.suh().buffer.contents().add(a.suh().byte_offset) as *const u8;
+            let src_b = b.suh().buffer.contents().add(b.suh().byte_offset) as *const u8;
+            std::ptr::copy_nonoverlapping(src_a, dst, inn * 2);
+            std::ptr::copy_nonoverlapping(src_b, dst.add(inn * 2), inn * 2);
+        }
+        let out_a = a.shape.out_features();
+        let out_b = b.shape.out_features();
+        let svh_cat = device.new_buffer(
+            ((out_a + out_b) * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        unsafe {
+            let dst = svh_cat.contents() as *mut u8;
+            let src_a = a.svh().buffer.contents().add(a.svh().byte_offset) as *const u8;
+            let src_b = b.svh().buffer.contents().add(b.svh().byte_offset) as *const u8;
+            std::ptr::copy_nonoverlapping(src_a, dst, out_a * 2);
+            std::ptr::copy_nonoverlapping(src_b, dst.add(out_a * 2), out_b * 2);
+        }
+        Ok(Self {
+            name: format!("{}+{}", a.name, b.name),
+            shape_a: a.shape,
+            shape_b: b.shape,
+            mode: a.mode,
+            trellis_a: a.trellis.clone(),
+            trellis_b: b.trellis.clone(),
+            suh_stack,
+            svh_cat,
+        })
+    }
+
+    pub fn trellis_a(&self) -> DeviceSpan<'_> {
+        DeviceSpan {
+            buffer: &self.trellis_a.0,
+            byte_offset: self.trellis_a.1,
+        }
+    }
+
+    pub fn trellis_b(&self) -> DeviceSpan<'_> {
+        DeviceSpan {
+            buffer: &self.trellis_b.0,
+            byte_offset: self.trellis_b.1,
+        }
+    }
+
+    pub fn suh_stack(&self) -> DeviceSpan<'_> {
+        DeviceSpan {
+            buffer: &self.suh_stack,
+            byte_offset: 0,
+        }
+    }
+
+    pub fn svh_cat(&self) -> DeviceSpan<'_> {
+        DeviceSpan {
+            buffer: &self.svh_cat,
+            byte_offset: 0,
+        }
+    }
+}
+
+/// Owned device handles for a fused 3-way sibling triplet (e.g. Q + K + V).
+#[derive(Clone)]
+pub struct Fused3Handles {
+    pub name: String,
+    pub shape_a: Exl3Shape,
+    pub shape_b: Exl3Shape,
+    pub shape_c: Exl3Shape,
+    pub mode: u32,
+    trellis_a: (Buffer, usize),
+    trellis_b: (Buffer, usize),
+    trellis_c: (Buffer, usize),
+    suh_stack: Buffer,
+    svh_cat: Buffer,
+}
+
+impl Fused3Handles {
+    pub fn new(
+        device: &metal::Device,
+        a: &LinearHandles,
+        b: &LinearHandles,
+        c: &LinearHandles,
+    ) -> Result<Self, MetalLinearError> {
+        let inn = a.shape.in_features();
+        if b.shape.in_features() != inn || c.shape.in_features() != inn {
+            return Err(KernelError::Unsupported("Fused3 in_features mismatch".into()).into());
+        }
+        if a.shape.k != b.shape.k || a.shape.k != c.shape.k || a.mode != b.mode || a.mode != c.mode {
+            return Err(KernelError::Unsupported("Fused3 k/mode mismatch".into()).into());
+        }
+        let suh_stack = device.new_buffer(
+            (3 * inn * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        unsafe {
+            let dst = suh_stack.contents() as *mut u8;
+            let src_a = a.suh().buffer.contents().add(a.suh().byte_offset) as *const u8;
+            let src_b = b.suh().buffer.contents().add(b.suh().byte_offset) as *const u8;
+            let src_c = c.suh().buffer.contents().add(c.suh().byte_offset) as *const u8;
+            std::ptr::copy_nonoverlapping(src_a, dst, inn * 2);
+            std::ptr::copy_nonoverlapping(src_b, dst.add(inn * 2), inn * 2);
+            std::ptr::copy_nonoverlapping(src_c, dst.add(2 * inn * 2), inn * 2);
+        }
+        let out_a = a.shape.out_features();
+        let out_b = b.shape.out_features();
+        let out_c = c.shape.out_features();
+        let svh_cat = device.new_buffer(
+            ((out_a + out_b + out_c) * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        unsafe {
+            let dst = svh_cat.contents() as *mut u8;
+            let src_a = a.svh().buffer.contents().add(a.svh().byte_offset) as *const u8;
+            let src_b = b.svh().buffer.contents().add(b.svh().byte_offset) as *const u8;
+            let src_c = c.svh().buffer.contents().add(c.svh().byte_offset) as *const u8;
+            std::ptr::copy_nonoverlapping(src_a, dst, out_a * 2);
+            std::ptr::copy_nonoverlapping(src_b, dst.add(out_a * 2), out_b * 2);
+            std::ptr::copy_nonoverlapping(src_c, dst.add((out_a + out_b) * 2), out_c * 2);
+        }
+        Ok(Self {
+            name: format!("{}+{}+{}", a.name, b.name, c.name),
+            shape_a: a.shape,
+            shape_b: b.shape,
+            shape_c: c.shape,
+            mode: a.mode,
+            trellis_a: a.trellis.clone(),
+            trellis_b: b.trellis.clone(),
+            trellis_c: c.trellis.clone(),
+            suh_stack,
+            svh_cat,
+        })
+    }
+
+    pub fn trellis_a(&self) -> DeviceSpan<'_> {
+        DeviceSpan {
+            buffer: &self.trellis_a.0,
+            byte_offset: self.trellis_a.1,
+        }
+    }
+
+    pub fn trellis_b(&self) -> DeviceSpan<'_> {
+        DeviceSpan {
+            buffer: &self.trellis_b.0,
+            byte_offset: self.trellis_b.1,
+        }
+    }
+
+    pub fn trellis_c(&self) -> DeviceSpan<'_> {
+        DeviceSpan {
+            buffer: &self.trellis_c.0,
+            byte_offset: self.trellis_c.1,
+        }
+    }
+
+    pub fn suh_stack(&self) -> DeviceSpan<'_> {
+        DeviceSpan {
+            buffer: &self.suh_stack,
+            byte_offset: 0,
+        }
+    }
+
+    pub fn svh_cat(&self) -> DeviceSpan<'_> {
+        DeviceSpan {
+            buffer: &self.svh_cat,
+            byte_offset: 0,
+        }
+    }
+}
+
 impl MetalLinear {
     pub fn new(ctx: &MetalContext) -> Result<Self, MetalLinearError> {
         Ok(Self {
@@ -439,6 +642,64 @@ impl MetalLinear {
         )?;
         self.calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// spec/pure-decode-273gb R1: Fused 2-way sibling linear pass (e.g. Gate + Up or Q + K).
+    /// Executes batched had_in (2 rows) + gemv_fused2 + had_out in 3 monolithic dispatches.
+    pub fn encode_fused2_with_scratch(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        fused: &Fused2Handles,
+        x: &Buffer,
+        out: &Buffer,
+        scratch: &ChunkScratch,
+    ) -> Result<(), MetalLinearError> {
+        self.gemv.encode_linear_fused2_with_scratch(
+            enc,
+            x,
+            fused.suh_stack(),
+            fused.trellis_a(),
+            fused.trellis_b(),
+            fused.svh_cat(),
+            out,
+            fused.shape_a,
+            fused.shape_b,
+            fused.mode,
+            scratch,
+        )?;
+        self.calls
+            .fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// spec/pure-decode-273gb R2: Fused 3-way sibling linear pass (Q + K + V).
+    /// Executes batched had_in (3 rows) + gemv_fused3 + had_out in 3 monolithic dispatches.
+    pub fn encode_fused3_with_scratch(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        fused: &Fused3Handles,
+        x: &Buffer,
+        out: &Buffer,
+        scratch: &ChunkScratch,
+    ) -> Result<(), MetalLinearError> {
+        self.gemv.encode_linear_fused3_with_scratch(
+            enc,
+            x,
+            fused.suh_stack(),
+            fused.trellis_a(),
+            fused.trellis_b(),
+            fused.trellis_c(),
+            fused.svh_cat(),
+            out,
+            fused.shape_a,
+            fused.shape_b,
+            fused.shape_c,
+            fused.mode,
+            scratch,
+        )?;
+        self.calls
+            .fetch_add(3, std::sync::atomic::Ordering::Relaxed);
         Ok(())
     }
 
@@ -1019,6 +1280,279 @@ kernel void stream_sum_strided(device const uint *buf [[buffer(0)]],
         }
     }
 
+    /// spec/pure-decode-273gb R1: `gemv_fused2` must match individual `gemv` passes bit-for-bit.
+    #[test]
+    fn gpu_gemv_fused2_matches_separate_passes() {
+        let Some(c) = ctx() else { return };
+        for k in [2u32, 3, 4, 6] {
+            let src_a = SynthGpuSource::build(c.device(), k, 16, 32);
+            let src_b = SynthGpuSource::build(c.device(), k, 16, 16);
+            let mut rng = Rng(0x9999_0000u64 + k as u64);
+            let xh_a: Vec<f16> = (0..16)
+                .map(|_| f16::from_f32(((rng.next() % 2001) as f32 / 1000.0) - 1.0))
+                .collect();
+            let xh_b: Vec<f16> = (0..16)
+                .map(|_| f16::from_f32(((rng.next() % 2001) as f32 / 1000.0) - 1.0))
+                .collect();
+            let (buf_a, off_a) = src_a.device_span("l.trellis").unwrap();
+            let (buf_b, off_b) = src_b.device_span("l.trellis").unwrap();
+            let shape_a = Exl3Shape::new(16, 32, k).unwrap();
+            let shape_b = Exl3Shape::new(16, 16, k).unwrap();
+
+            let ml = MetalLinear::new(&c).unwrap();
+            let mut got_a = Vec::new();
+            ml.raw()
+                .gemv_pass(&xh_a, DeviceSpan { buffer: buf_a, byte_offset: off_a }, shape_a, 1, &mut got_a)
+                .expect("gemv a");
+            let mut got_b = Vec::new();
+            ml.raw()
+                .gemv_pass(&xh_b, DeviceSpan { buffer: buf_b, byte_offset: off_b }, shape_b, 1, &mut got_b)
+                .expect("gemv b");
+
+            let mut xh_cat = Vec::new();
+            xh_cat.extend_from_slice(&xh_a);
+            xh_cat.extend_from_slice(&xh_b);
+
+            let mut got_fused = Vec::new();
+            ml.raw()
+                .gemv_fused2_pass(
+                    &xh_cat,
+                    DeviceSpan { buffer: buf_a, byte_offset: off_a },
+                    DeviceSpan { buffer: buf_b, byte_offset: off_b },
+                    shape_a,
+                    shape_b,
+                    1,
+                    None,
+                    &mut got_fused,
+                )
+                .expect("gemv_fused2");
+
+            assert_eq!(got_fused.len(), 48);
+            for (i, (&w, &g)) in got_a.iter().zip(got_fused[0..32].iter()).enumerate() {
+                assert_eq!(w, g, "k={k} fused2 a[{i}] want {w} got {g}");
+            }
+            for (i, (&w, &g)) in got_b.iter().zip(got_fused[32..48].iter()).enumerate() {
+                assert_eq!(w, g, "k={k} fused2 b[{i}] want {w} got {g}");
+            }
+        }
+    }
+
+    /// spec/pure-decode-273gb R2: `gemv_fused3` must match individual `gemv` passes bit-for-bit.
+    #[test]
+    fn gpu_gemv_fused3_matches_separate_passes() {
+        let Some(c) = ctx() else { return };
+        for k in [2u32, 3, 4] {
+            let src_a = SynthGpuSource::build(c.device(), k, 16, 32);
+            let src_b = SynthGpuSource::build(c.device(), k, 16, 16);
+            let src_c = SynthGpuSource::build(c.device(), k, 16, 16);
+            let mut rng = Rng(0xAAAA_0000u64 + k as u64);
+            let xh_a: Vec<f16> = (0..16)
+                .map(|_| f16::from_f32(((rng.next() % 2001) as f32 / 1000.0) - 1.0))
+                .collect();
+            let xh_b: Vec<f16> = (0..16)
+                .map(|_| f16::from_f32(((rng.next() % 2001) as f32 / 1000.0) - 1.0))
+                .collect();
+            let xh_c: Vec<f16> = (0..16)
+                .map(|_| f16::from_f32(((rng.next() % 2001) as f32 / 1000.0) - 1.0))
+                .collect();
+            let (buf_a, off_a) = src_a.device_span("l.trellis").unwrap();
+            let (buf_b, off_b) = src_b.device_span("l.trellis").unwrap();
+            let (buf_c, off_c) = src_c.device_span("l.trellis").unwrap();
+            let shape_a = Exl3Shape::new(16, 32, k).unwrap();
+            let shape_b = Exl3Shape::new(16, 16, k).unwrap();
+            let shape_c = Exl3Shape::new(16, 16, k).unwrap();
+
+            let ml = MetalLinear::new(&c).unwrap();
+            let mut got_a = Vec::new();
+            ml.raw()
+                .gemv_pass(&xh_a, DeviceSpan { buffer: buf_a, byte_offset: off_a }, shape_a, 1, &mut got_a)
+                .expect("gemv a");
+            let mut got_b = Vec::new();
+            ml.raw()
+                .gemv_pass(&xh_b, DeviceSpan { buffer: buf_b, byte_offset: off_b }, shape_b, 1, &mut got_b)
+                .expect("gemv b");
+            let mut got_c = Vec::new();
+            ml.raw()
+                .gemv_pass(&xh_c, DeviceSpan { buffer: buf_c, byte_offset: off_c }, shape_c, 1, &mut got_c)
+                .expect("gemv c");
+
+            let mut xh_cat = Vec::new();
+            xh_cat.extend_from_slice(&xh_a);
+            xh_cat.extend_from_slice(&xh_b);
+            xh_cat.extend_from_slice(&xh_c);
+
+            let mut got_fused = Vec::new();
+            ml.raw()
+                .gemv_fused3_pass(
+                    &xh_cat,
+                    DeviceSpan { buffer: buf_a, byte_offset: off_a },
+                    DeviceSpan { buffer: buf_b, byte_offset: off_b },
+                    DeviceSpan { buffer: buf_c, byte_offset: off_c },
+                    shape_a,
+                    shape_b,
+                    shape_c,
+                    1,
+                    None,
+                    &mut got_fused,
+                )
+                .expect("gemv_fused3");
+
+            assert_eq!(got_fused.len(), 64);
+            for (i, (&w, &g)) in got_a.iter().zip(got_fused[0..32].iter()).enumerate() {
+                assert_eq!(w, g, "k={k} fused3 a[{i}] want {w} got {g}");
+            }
+            for (i, (&w, &g)) in got_b.iter().zip(got_fused[32..48].iter()).enumerate() {
+                assert_eq!(w, g, "k={k} fused3 b[{i}] want {w} got {g}");
+            }
+            for (i, (&w, &g)) in got_c.iter().zip(got_fused[48..64].iter()).enumerate() {
+                assert_eq!(w, g, "k={k} fused3 c[{i}] want {w} got {g}");
+            }
+        }
+    }
+
+    /// spec/pure-decode-273gb R3: `had_in_batched` must match separate `had_in` passes bit-for-bit.
+    #[test]
+    fn gpu_had_in_batched_matches_separate_passes() {
+        let Some(c) = ctx() else { return };
+        let mut rng = Rng(0xBBBB_0001);
+        let n = 256;
+        let x: Vec<f16> = (0..n)
+            .map(|_| f16::from_f32(((rng.next() % 2001) as f32 / 1000.0) - 1.0))
+            .collect();
+        let suh0: Vec<f16> = (0..n)
+            .map(|_| if rng.next() % 2 == 0 { f16::from_f32(1.0) } else { f16::from_f32(-1.0) })
+            .collect();
+        let suh1: Vec<f16> = (0..n)
+            .map(|_| if rng.next() % 2 == 0 { f16::from_f32(1.0) } else { f16::from_f32(-1.0) })
+            .collect();
+        let suh2: Vec<f16> = (0..n)
+            .map(|_| if rng.next() % 2 == 0 { f16::from_f32(1.0) } else { f16::from_f32(-1.0) })
+            .collect();
+
+        let ml = MetalLinear::new(&c).unwrap();
+        let suh0_buf = c.device().new_buffer_with_data(suh0.as_ptr() as *const _, (n * 2) as u64, MTLResourceOptions::StorageModeShared);
+        let suh1_buf = c.device().new_buffer_with_data(suh1.as_ptr() as *const _, (n * 2) as u64, MTLResourceOptions::StorageModeShared);
+        let suh2_buf = c.device().new_buffer_with_data(suh2.as_ptr() as *const _, (n * 2) as u64, MTLResourceOptions::StorageModeShared);
+
+        let mut want0 = Vec::new();
+        let mut want1 = Vec::new();
+        let mut want2 = Vec::new();
+        ml.raw().had_in_pass(&x, DeviceSpan { buffer: &suh0_buf, byte_offset: 0 }, &mut want0).unwrap();
+        ml.raw().had_in_pass(&x, DeviceSpan { buffer: &suh1_buf, byte_offset: 0 }, &mut want1).unwrap();
+        ml.raw().had_in_pass(&x, DeviceSpan { buffer: &suh2_buf, byte_offset: 0 }, &mut want2).unwrap();
+
+        let mut suh_stack = Vec::new();
+        suh_stack.extend_from_slice(&suh0);
+        suh_stack.extend_from_slice(&suh1);
+        suh_stack.extend_from_slice(&suh2);
+        let stack_buf = c.device().new_buffer_with_data(suh_stack.as_ptr() as *const _, (suh_stack.len() * 2) as u64, MTLResourceOptions::StorageModeShared);
+
+        let mut got_batched = Vec::new();
+        ml.raw().had_in_batched_pass(&x, DeviceSpan { buffer: &stack_buf, byte_offset: 0 }, 3, &mut got_batched).unwrap();
+
+        assert_eq!(got_batched.len(), 3 * n);
+        for i in 0..n {
+            assert_eq!(want0[i], got_batched[i], "row 0 mismatch at {i}");
+            assert_eq!(want1[i], got_batched[n + i], "row 1 mismatch at {i}");
+            assert_eq!(want2[i], got_batched[2 * n + i], "row 2 mismatch at {i}");
+        }
+    }
+
+    /// spec/pure-decode-273gb R1/R2/R4: `encode_fused2_with_scratch` and `encode_fused3_with_scratch`
+    /// must match separate `encode_linear_with_scratch` passes bit-for-bit.
+    #[test]
+    fn gpu_encode_fused2_and_fused3_matches_separate_linears() {
+        let Some(c) = ctx() else { return };
+        let ml = MetalLinear::new(&c).unwrap();
+        let k = 3;
+        let in_f = 128;
+        let out_a = 128;
+        let out_b = 128;
+        let out_c = 128;
+
+        let src_a = SynthGpuSource::build(c.device(), k, in_f, out_a);
+        let src_b = SynthGpuSource::build(c.device(), k, in_f, out_b);
+        let src_c = SynthGpuSource::build(c.device(), k, in_f, out_c);
+
+        let lin_a = linear_handles(&src_a, "l").unwrap();
+        let lin_b = linear_handles(&src_b, "l").unwrap();
+        let lin_c = linear_handles(&src_c, "l").unwrap();
+
+        let fused2 = Fused2Handles::new(c.device(), &lin_a, &lin_b).unwrap();
+        let fused3 = Fused3Handles::new(c.device(), &lin_a, &lin_b, &lin_c).unwrap();
+
+        let mut rng = Rng(0xCAFE_1234);
+        let x: Vec<f16> = (0..in_f)
+            .map(|_| f16::from_f32(((rng.next() % 2001) as f32 / 1000.0) - 1.0))
+            .collect();
+        let x_buf = c.device().new_buffer_with_data(
+            x.as_ptr() as *const _,
+            (in_f * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let (xh_need, y_need, p_need) = MetalLinear::chunk_scratch_needs(&lin_a, 1);
+        let scratch = ml.chunk_scratch(xh_need * 4, y_need * 4, p_need * 4);
+
+        // Separate passes
+        let out_a_buf = c.device().new_buffer((out_a * 2) as u64, MTLResourceOptions::StorageModeShared);
+        let out_b_buf = c.device().new_buffer((out_b * 2) as u64, MTLResourceOptions::StorageModeShared);
+        let out_c_buf = c.device().new_buffer((out_c * 2) as u64, MTLResourceOptions::StorageModeShared);
+
+        let cb = c.queue().new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        ml.encode_linear_with_scratch(enc, &lin_a, &x_buf, &out_a_buf, 1, &scratch).unwrap();
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let cb = c.queue().new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        ml.encode_linear_with_scratch(enc, &lin_b, &x_buf, &out_b_buf, 1, &scratch).unwrap();
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let cb = c.queue().new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        ml.encode_linear_with_scratch(enc, &lin_c, &x_buf, &out_c_buf, 1, &scratch).unwrap();
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        // Fused2 pass
+        let out_fused2_buf = c.device().new_buffer(((out_a + out_b) * 2) as u64, MTLResourceOptions::StorageModeShared);
+        let cb = c.queue().new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        ml.encode_fused2_with_scratch(enc, &fused2, &x_buf, &out_fused2_buf, &scratch).unwrap();
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        // Fused3 pass
+        let out_fused3_buf = c.device().new_buffer(((out_a + out_b + out_c) * 2) as u64, MTLResourceOptions::StorageModeShared);
+        let cb = c.queue().new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        ml.encode_fused3_with_scratch(enc, &fused3, &x_buf, &out_fused3_buf, &scratch).unwrap();
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        // Verify Fused2 matches separate A and B
+        let slice_a: &[f16] = unsafe { std::slice::from_raw_parts(out_a_buf.contents() as *const f16, out_a) };
+        let slice_b: &[f16] = unsafe { std::slice::from_raw_parts(out_b_buf.contents() as *const f16, out_b) };
+        let slice_f2: &[f16] = unsafe { std::slice::from_raw_parts(out_fused2_buf.contents() as *const f16, out_a + out_b) };
+        assert_eq!(slice_a, &slice_f2[0..out_a], "fused2 A output mismatch");
+        assert_eq!(slice_b, &slice_f2[out_a..out_a + out_b], "fused2 B output mismatch");
+
+        // Verify Fused3 matches separate A, B, and C
+        let slice_c: &[f16] = unsafe { std::slice::from_raw_parts(out_c_buf.contents() as *const f16, out_c) };
+        let slice_f3: &[f16] = unsafe { std::slice::from_raw_parts(out_fused3_buf.contents() as *const f16, out_a + out_b + out_c) };
+        assert_eq!(slice_a, &slice_f3[0..out_a], "fused3 A output mismatch");
+        assert_eq!(slice_b, &slice_f3[out_a..out_a + out_b], "fused3 B output mismatch");
+        assert_eq!(slice_c, &slice_f3[out_a + out_b..out_a + out_b + out_c], "fused3 C output mismatch");
+    }
+
     /// Host-only model of the MSL GEMV's index math: the pair table + funnel
     /// shift must reproduce `unpack_trellis_tile` for every K, and the group →
     /// (row, column) mapping must reproduce `tensor_core_perm`. If this passes
@@ -1183,6 +1717,72 @@ kernel void stream_sum_strided(device const uint *buf [[buffer(0)]],
                 g.suh().byte_offset % 4,
                 g.svh().byte_offset % 4,
                 weights as f64 / (fu_min / 1000.0) / 1e9,
+            );
+        }
+
+        // --- spec/pure-decode-273gb: Benchmark fused sibling linears ---
+        {
+            let gate = linear_handles(src, "model.language_model.layers.0.mlp.gate_proj").unwrap();
+            let up = linear_handles(src, "model.language_model.layers.0.mlp.up_proj").unwrap();
+            let inn = gate.shape.in_features();
+            let xh_fused2 = vec![f16::ZERO; 2 * inn];
+            const REPS: usize = 20;
+            let time = |f: &mut dyn FnMut()| -> (f64, f64) {
+                let mut v = Vec::with_capacity(REPS);
+                for _ in 0..REPS {
+                    let t = std::time::Instant::now();
+                    f();
+                    v.push(t.elapsed().as_secs_f64() * 1000.0);
+                }
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                (v[0], v[REPS / 2])
+            };
+            let (f2_min, f2_med) = time(&mut || {
+                let mut o = Vec::new();
+                ml.raw().gemv_fused2_pass(
+                    &xh_fused2,
+                    gate.trellis(),
+                    up.trellis(),
+                    gate.shape,
+                    up.shape,
+                    gate.mode,
+                    None,
+                    &mut o,
+                ).unwrap();
+            });
+            let total_w2 = inn * (gate.shape.out_features() + up.shape.out_features());
+            eprintln!(
+                "FUSED2   gate+up  {inn}x{} k={} · gemv_fused2 {f2_min:6.3}/{f2_med:6.3} ms · {:.0} Gw/s",
+                gate.shape.out_features() + up.shape.out_features(),
+                gate.shape.k,
+                total_w2 as f64 / (f2_min / 1000.0) / 1e9,
+            );
+
+            let q = linear_handles(src, "model.language_model.layers.0.self_attn.q_proj").unwrap();
+            let k = linear_handles(src, "model.language_model.layers.0.self_attn.k_proj").unwrap();
+            let v = linear_handles(src, "model.language_model.layers.0.self_attn.v_proj").unwrap();
+            let xh_fused3 = vec![f16::ZERO; 3 * inn];
+            let (f3_min, f3_med) = time(&mut || {
+                let mut o = Vec::new();
+                ml.raw().gemv_fused3_pass(
+                    &xh_fused3,
+                    q.trellis(),
+                    k.trellis(),
+                    v.trellis(),
+                    q.shape,
+                    k.shape,
+                    v.shape,
+                    q.mode,
+                    None,
+                    &mut o,
+                ).unwrap();
+            });
+            let total_w3 = inn * (q.shape.out_features() + k.shape.out_features() + v.shape.out_features());
+            eprintln!(
+                "FUSED3   q+k+v    {inn}x{} k={} · gemv_fused3 {f3_min:6.3}/{f3_med:6.3} ms · {:.0} Gw/s",
+                q.shape.out_features() + k.shape.out_features() + v.shape.out_features(),
+                q.shape.k,
+                total_w3 as f64 / (f3_min / 1000.0) / 1e9,
             );
         }
     }

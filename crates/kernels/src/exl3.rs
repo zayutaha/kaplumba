@@ -221,7 +221,10 @@ pub struct Exl3Gemv {
     device: Device,
     queue: CommandQueue,
     had_in: ComputePipelineState,
+    had_in_batched: ComputePipelineState,
     gemv: ComputePipelineState,
+    gemv_fused2: ComputePipelineState,
+    gemv_fused3: ComputePipelineState,
     /// spec/decode-20tps P1-T1: PonyExl3 v12 MT=1 parity shape (4 simdgroups
     /// per out-tile, 8 accs/lane, zero hot-loop barriers). A/B-able via
     /// `gemv_pass_v4`; production still uses `gemv` until the bench wins.
@@ -268,7 +271,10 @@ impl Exl3Gemv {
             device: device.clone(),
             queue: queue.clone(),
             had_in: build("exl3_had_in")?,
+            had_in_batched: build("exl3_had_in_batched")?,
             gemv: build("exl3_gemv")?,
+            gemv_fused2: build("exl3_gemv_fused2")?,
+            gemv_fused3: build("exl3_gemv_fused3")?,
             gemv4: build("exl3_gemv4")?,
             gemv_reduce: build("exl3_gemv_reduce")?,
             gemm: build("exl3_gemm")?,
@@ -514,6 +520,140 @@ impl Exl3Gemv {
         Ok(())
     }
 
+    /// spec/pure-decode-273gb R1: Full 2-way sibling linear pass with scratch arena.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_linear_fused2_with_scratch(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: &Buffer,
+        suh_stack: DeviceSpan<'_>,
+        trellis_a: DeviceSpan<'_>,
+        trellis_b: DeviceSpan<'_>,
+        svh_cat: DeviceSpan<'_>,
+        out: &Buffer,
+        shape_a: Exl3Shape,
+        shape_b: Exl3Shape,
+        mode: u32,
+        scratch: &ChunkScratch,
+    ) -> Result<(), KernelError> {
+        let inn = shape_a.in_features();
+        let outp = shape_a.out_features() + shape_b.out_features();
+        if mode > 1 {
+            return Err(KernelError::Unsupported(format!(
+                "codebook mode {mode} is CPU-only"
+            )));
+        }
+        if inn % HAD != 0 || outp % HAD != 0 {
+            return Err(KernelError::Unsupported(format!(
+                "hadamard needs multiples of {HAD}, got in={inn} out={outp}"
+            )));
+        }
+        Self::ensure_span_fits(
+            &trellis_a,
+            shape_a.in_tiles * shape_a.out_tiles * shape_a.words_per_tile() * 2,
+            "trellis_a",
+            2,
+        )?;
+        Self::ensure_span_fits(
+            &trellis_b,
+            shape_b.in_tiles * shape_b.out_tiles * shape_b.words_per_tile() * 2,
+            "trellis_b",
+            2,
+        )?;
+        Self::ensure_span_fits(&suh_stack, 2 * inn * 2, "suh_stack", 2)?;
+        Self::ensure_span_fits(&svh_cat, outp * 2, "svh_cat", 2)?;
+
+        let pair_buf = self.pair_buffer(shape_a.k);
+        self.encode_had_in_batched(enc, x, suh_stack, &scratch.xh, 2, inn);
+        self.encode_gemv_fused2(
+            enc,
+            &scratch.xh,
+            trellis_a,
+            trellis_b,
+            &pair_buf,
+            shape_a,
+            shape_b,
+            mode,
+            &scratch.y,
+            Some(&scratch.partial),
+            None,
+        );
+        self.encode_had_out(enc, &scratch.y, svh_cat, out, 1, outp);
+        Ok(())
+    }
+
+    /// spec/pure-decode-273gb R2: Full 3-way sibling linear pass with scratch arena.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_linear_fused3_with_scratch(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: &Buffer,
+        suh_stack: DeviceSpan<'_>,
+        trellis_a: DeviceSpan<'_>,
+        trellis_b: DeviceSpan<'_>,
+        trellis_c: DeviceSpan<'_>,
+        svh_cat: DeviceSpan<'_>,
+        out: &Buffer,
+        shape_a: Exl3Shape,
+        shape_b: Exl3Shape,
+        shape_c: Exl3Shape,
+        mode: u32,
+        scratch: &ChunkScratch,
+    ) -> Result<(), KernelError> {
+        let inn = shape_a.in_features();
+        let outp = shape_a.out_features() + shape_b.out_features() + shape_c.out_features();
+        if mode > 1 {
+            return Err(KernelError::Unsupported(format!(
+                "codebook mode {mode} is CPU-only"
+            )));
+        }
+        if inn % HAD != 0 || outp % HAD != 0 {
+            return Err(KernelError::Unsupported(format!(
+                "hadamard needs multiples of {HAD}, got in={inn} out={outp}"
+            )));
+        }
+        Self::ensure_span_fits(
+            &trellis_a,
+            shape_a.in_tiles * shape_a.out_tiles * shape_a.words_per_tile() * 2,
+            "trellis_a",
+            2,
+        )?;
+        Self::ensure_span_fits(
+            &trellis_b,
+            shape_b.in_tiles * shape_b.out_tiles * shape_b.words_per_tile() * 2,
+            "trellis_b",
+            2,
+        )?;
+        Self::ensure_span_fits(
+            &trellis_c,
+            shape_c.in_tiles * shape_c.out_tiles * shape_c.words_per_tile() * 2,
+            "trellis_c",
+            2,
+        )?;
+        Self::ensure_span_fits(&suh_stack, 3 * inn * 2, "suh_stack", 2)?;
+        Self::ensure_span_fits(&svh_cat, outp * 2, "svh_cat", 2)?;
+
+        let pair_buf = self.pair_buffer(shape_a.k);
+        self.encode_had_in_batched(enc, x, suh_stack, &scratch.xh, 3, inn);
+        self.encode_gemv_fused3(
+            enc,
+            &scratch.xh,
+            trellis_a,
+            trellis_b,
+            trellis_c,
+            &pair_buf,
+            shape_a,
+            shape_b,
+            shape_c,
+            mode,
+            &scratch.y,
+            Some(&scratch.partial),
+            None,
+        );
+        self.encode_had_out(enc, &scratch.y, svh_cat, out, 1, outp);
+        Ok(())
+    }
+
     fn encode_had_in(
         &self,
         enc: &ComputeCommandEncoderRef,
@@ -608,6 +748,167 @@ impl Exl3Gemv {
             self.encode_gemv_reduce(enc, dest, y, nsplit, shape.out_tiles);
         }
         // Keep any transient partial alive until after the last set_buffer.
+        drop(owned);
+    }
+
+    /// spec/pure-decode-273gb R3: Batched multi-row input Hadamard: transforms a
+    /// single input activation vector `x` with `n_rows` distinct `suh` scale rows in
+    /// `suh_stack`, writing `n_rows` output rows to `xh_stack`.
+    pub fn encode_had_in_batched(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: &Buffer,
+        suh_stack: DeviceSpan<'_>,
+        xh_stack: &Buffer,
+        n_rows: usize,
+        row_len: usize,
+    ) {
+        debug_assert_eq!(row_len % HAD, 0);
+        let hp = MslHad {
+            row_len: row_len as u32,
+        };
+        enc.set_compute_pipeline_state(&self.had_in_batched);
+        enc.set_buffer(0, Some(x), 0);
+        enc.set_buffer(1, Some(suh_stack.buffer), suh_stack.byte_offset as u64);
+        enc.set_buffer(2, Some(xh_stack), 0);
+        enc.set_bytes(3, 4, &hp as *const MslHad as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize::new((row_len / HAD) as u64, n_rows as u64, 1),
+            MTLSize::new(HAD as u64, 1, 1),
+        );
+    }
+
+    /// spec/pure-decode-273gb R1: Sibling 2-way GEMV (Gate + Up).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_gemv_fused2(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        xh: &Buffer, // [2, in_features]
+        trellis_a: DeviceSpan<'_>,
+        trellis_b: DeviceSpan<'_>,
+        pair: &Buffer,
+        shape_a: Exl3Shape,
+        shape_b: Exl3Shape,
+        mode: u32,
+        y: &Buffer,
+        ext_partial: Option<&Buffer>,
+        nsplit_override: Option<usize>,
+    ) {
+        debug_assert_eq!(shape_a.in_tiles, shape_b.in_tiles);
+        debug_assert_eq!(shape_a.k, shape_b.k);
+        let out_tiles_total = shape_a.out_tiles + shape_b.out_tiles;
+        let nsplit = nsplit_override.unwrap_or_else(|| Self::gemv_splits(out_tiles_total));
+        let aligned = u32::from(trellis_a.byte_offset % 4 == 0 && trellis_b.byte_offset % 4 == 0);
+        let params: [u32; 8] = [
+            shape_a.in_tiles as u32,
+            shape_a.out_tiles as u32,
+            shape_b.out_tiles as u32,
+            shape_a.k,
+            (shape_a.words_per_tile() / 2) as u32,
+            mode,
+            aligned,
+            nsplit as u32,
+        ];
+        let need = nsplit * out_tiles_total * TILE * 4;
+        let owned = if nsplit > 1 && ext_partial.is_none() {
+            Some(self.new_f32_buffer(need / 4))
+        } else {
+            None
+        };
+        let dest: &Buffer = if nsplit == 1 {
+            y
+        } else if let Some(p) = ext_partial {
+            debug_assert!(p.length() as usize >= need);
+            p
+        } else {
+            owned.as_ref().expect("transient partial")
+        };
+        enc.set_compute_pipeline_state(&self.gemv_fused2);
+        enc.set_buffer(0, Some(xh), 0);
+        enc.set_buffer(1, Some(trellis_a.buffer), trellis_a.byte_offset as u64);
+        enc.set_buffer(2, Some(trellis_b.buffer), trellis_b.byte_offset as u64);
+        enc.set_buffer(3, Some(pair), 0);
+        enc.set_buffer(4, Some(dest), 0);
+        enc.set_bytes(5, 32, params.as_ptr() as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize::new(out_tiles_total as u64, nsplit as u64, 1),
+            MTLSize::new(32, 1, 1),
+        );
+        if nsplit > 1 {
+            self.encode_gemv_reduce(enc, dest, y, nsplit, out_tiles_total);
+        }
+        drop(owned);
+    }
+
+    /// spec/pure-decode-273gb R2: Sibling 3-way GEMV (Q + K + V).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_gemv_fused3(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        xh: &Buffer, // [3, in_features]
+        trellis_a: DeviceSpan<'_>,
+        trellis_b: DeviceSpan<'_>,
+        trellis_c: DeviceSpan<'_>,
+        pair: &Buffer,
+        shape_a: Exl3Shape,
+        shape_b: Exl3Shape,
+        shape_c: Exl3Shape,
+        mode: u32,
+        y: &Buffer,
+        ext_partial: Option<&Buffer>,
+        nsplit_override: Option<usize>,
+    ) {
+        debug_assert_eq!(shape_a.in_tiles, shape_b.in_tiles);
+        debug_assert_eq!(shape_a.in_tiles, shape_c.in_tiles);
+        debug_assert_eq!(shape_a.k, shape_b.k);
+        debug_assert_eq!(shape_a.k, shape_c.k);
+        let out_tiles_total = shape_a.out_tiles + shape_b.out_tiles + shape_c.out_tiles;
+        let nsplit = nsplit_override.unwrap_or_else(|| Self::gemv_splits(out_tiles_total));
+        let aligned = u32::from(
+            trellis_a.byte_offset % 4 == 0
+                && trellis_b.byte_offset % 4 == 0
+                && trellis_c.byte_offset % 4 == 0,
+        );
+        let params: [u32; 9] = [
+            shape_a.in_tiles as u32,
+            shape_a.out_tiles as u32,
+            shape_b.out_tiles as u32,
+            shape_c.out_tiles as u32,
+            shape_a.k,
+            (shape_a.words_per_tile() / 2) as u32,
+            mode,
+            aligned,
+            nsplit as u32,
+        ];
+        let need = nsplit * out_tiles_total * TILE * 4;
+        let owned = if nsplit > 1 && ext_partial.is_none() {
+            Some(self.new_f32_buffer(need / 4))
+        } else {
+            None
+        };
+        let dest: &Buffer = if nsplit == 1 {
+            y
+        } else if let Some(p) = ext_partial {
+            debug_assert!(p.length() as usize >= need);
+            p
+        } else {
+            owned.as_ref().expect("transient partial")
+        };
+        enc.set_compute_pipeline_state(&self.gemv_fused3);
+        enc.set_buffer(0, Some(xh), 0);
+        enc.set_buffer(1, Some(trellis_a.buffer), trellis_a.byte_offset as u64);
+        enc.set_buffer(2, Some(trellis_b.buffer), trellis_b.byte_offset as u64);
+        enc.set_buffer(3, Some(trellis_c.buffer), trellis_c.byte_offset as u64);
+        enc.set_buffer(4, Some(pair), 0);
+        enc.set_buffer(5, Some(dest), 0);
+        enc.set_bytes(6, 36, params.as_ptr() as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize::new(out_tiles_total as u64, nsplit as u64, 1),
+            MTLSize::new(32, 1, 1),
+        );
+        if nsplit > 1 {
+            self.encode_gemv_reduce(enc, dest, y, nsplit, out_tiles_total);
+        }
         drop(owned);
     }
 
@@ -1129,6 +1430,223 @@ impl Exl3Gemv {
             }
             Ok(())
         })
+    }
+
+    /// spec/pure-decode-273gb R1: Isolated 2-way fused GEMV pass.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_fused2_pass(
+        &self,
+        xh: &[f16], // [2 * in_features]
+        trellis_a: DeviceSpan<'_>,
+        trellis_b: DeviceSpan<'_>,
+        shape_a: Exl3Shape,
+        shape_b: Exl3Shape,
+        mode: u32,
+        nsplit_override: Option<usize>,
+        out: &mut Vec<f32>,
+    ) -> Result<(), KernelError> {
+        let inn = shape_a.in_features();
+        if shape_b.in_features() != inn {
+            return Err(KernelError::Unsupported(format!(
+                "gemv_fused2 in_features mismatch: {inn} vs {}",
+                shape_b.in_features()
+            )));
+        }
+        if xh.len() != 2 * inn {
+            return Err(KernelError::Unsupported(format!(
+                "gemv_fused2 needs 2*{} activations, got {}",
+                inn,
+                xh.len()
+            )));
+        }
+        if mode > 1 {
+            return Err(KernelError::Unsupported(format!("mode {mode} is CPU-only")));
+        }
+        Self::ensure_span_fits(
+            &trellis_a,
+            shape_a.in_tiles * shape_a.out_tiles * shape_a.words_per_tile() * 2,
+            "trellis_a",
+            2,
+        )?;
+        Self::ensure_span_fits(
+            &trellis_b,
+            shape_b.in_tiles * shape_b.out_tiles * shape_b.words_per_tile() * 2,
+            "trellis_b",
+            2,
+        )?;
+        let out_total = shape_a.out_features() + shape_b.out_features();
+        out.resize(out_total, 0.0);
+        let pair = self.pair_buffer(shape_a.k);
+        let xh_buf = self.device.new_buffer_with_data(
+            xh.as_ptr() as *const _,
+            (xh.len() * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let y_buf = self.new_f32_buffer(out_total);
+        let cb = self.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        self.encode_gemv_fused2(
+            enc,
+            &xh_buf,
+            trellis_a,
+            trellis_b,
+            &pair,
+            shape_a,
+            shape_b,
+            mode,
+            &y_buf,
+            None,
+            nsplit_override,
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        if cb.status() != MTLCommandBufferStatus::Completed {
+            return Err(KernelError::CommandFailed(cb.status()));
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                y_buf.contents() as *const u8,
+                out.as_mut_ptr() as *mut u8,
+                out_total * 4,
+            );
+        }
+        Ok(())
+    }
+
+    /// spec/pure-decode-273gb R2: Isolated 3-way fused GEMV pass.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_fused3_pass(
+        &self,
+        xh: &[f16], // [3 * in_features]
+        trellis_a: DeviceSpan<'_>,
+        trellis_b: DeviceSpan<'_>,
+        trellis_c: DeviceSpan<'_>,
+        shape_a: Exl3Shape,
+        shape_b: Exl3Shape,
+        shape_c: Exl3Shape,
+        mode: u32,
+        nsplit_override: Option<usize>,
+        out: &mut Vec<f32>,
+    ) -> Result<(), KernelError> {
+        let inn = shape_a.in_features();
+        if shape_b.in_features() != inn || shape_c.in_features() != inn {
+            return Err(KernelError::Unsupported(
+                "gemv_fused3 in_features mismatch".into(),
+            ));
+        }
+        if xh.len() != 3 * inn {
+            return Err(KernelError::Unsupported(format!(
+                "gemv_fused3 needs 3*{} activations, got {}",
+                inn,
+                xh.len()
+            )));
+        }
+        if mode > 1 {
+            return Err(KernelError::Unsupported(format!("mode {mode} is CPU-only")));
+        }
+        Self::ensure_span_fits(
+            &trellis_a,
+            shape_a.in_tiles * shape_a.out_tiles * shape_a.words_per_tile() * 2,
+            "trellis_a",
+            2,
+        )?;
+        Self::ensure_span_fits(
+            &trellis_b,
+            shape_b.in_tiles * shape_b.out_tiles * shape_b.words_per_tile() * 2,
+            "trellis_b",
+            2,
+        )?;
+        Self::ensure_span_fits(
+            &trellis_c,
+            shape_c.in_tiles * shape_c.out_tiles * shape_c.words_per_tile() * 2,
+            "trellis_c",
+            2,
+        )?;
+        let out_total = shape_a.out_features() + shape_b.out_features() + shape_c.out_features();
+        out.resize(out_total, 0.0);
+        let pair = self.pair_buffer(shape_a.k);
+        let xh_buf = self.device.new_buffer_with_data(
+            xh.as_ptr() as *const _,
+            (xh.len() * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let y_buf = self.new_f32_buffer(out_total);
+        let cb = self.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        self.encode_gemv_fused3(
+            enc,
+            &xh_buf,
+            trellis_a,
+            trellis_b,
+            trellis_c,
+            &pair,
+            shape_a,
+            shape_b,
+            shape_c,
+            mode,
+            &y_buf,
+            None,
+            nsplit_override,
+        );
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        if cb.status() != MTLCommandBufferStatus::Completed {
+            return Err(KernelError::CommandFailed(cb.status()));
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                y_buf.contents() as *const u8,
+                out.as_mut_ptr() as *mut u8,
+                out_total * 4,
+            );
+        }
+        Ok(())
+    }
+
+    /// spec/pure-decode-273gb R3: Isolated batched `had_in` pass.
+    pub fn had_in_batched_pass(
+        &self,
+        x: &[f16],
+        suh_stack: DeviceSpan<'_>,
+        n_rows: usize,
+        out: &mut Vec<f16>,
+    ) -> Result<(), KernelError> {
+        let n = x.len();
+        if n == 0 || n % HAD != 0 {
+            return Err(KernelError::Unsupported(format!(
+                "had_in needs a multiple of {HAD}, got {n}"
+            )));
+        }
+        Self::ensure_span_fits(&suh_stack, n * n_rows * 2, "suh_stack", 2)?;
+        out.resize(n * n_rows, f16::ZERO);
+        let x_buf = self.device.new_buffer_with_data(
+            x.as_ptr() as *const _,
+            (n * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let xh_buf = self.device.new_buffer(
+            (n * n_rows * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let cb = self.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        self.encode_had_in_batched(enc, &x_buf, suh_stack, &xh_buf, n_rows, n);
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        if cb.status() != MTLCommandBufferStatus::Completed {
+            return Err(KernelError::CommandFailed(cb.status()));
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                xh_buf.contents() as *const u8,
+                out.as_mut_ptr() as *mut u8,
+                n * n_rows * 2,
+            );
+        }
+        Ok(())
     }
 
     /// Isolated `had_out` pass: `out = had_r_128(f16(y)) * svh` for one row.
