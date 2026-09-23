@@ -575,6 +575,56 @@ mod tests {
     use crate::metal_ctx::MetalContext;
     use std::collections::HashMap;
 
+    /// P0: contiguous read sum (each thread reads 8 consecutive u32s, stores
+    /// its partial to a per-thread slot — no atomic contention).
+    const P0_CONTIG_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void stream_sum_contig(device const uint *buf [[buffer(0)]],
+                              device uint *out [[buffer(1)]],
+                              constant uint &words [[buffer(2)]],
+                              uint id [[thread_position_in_grid]]) {
+    constexpr uint U = 8u;
+    uint s = 0u;
+    uint base = id * U;
+    uint e = min(base + U, words);
+    for (uint i = base; i < e; i++) { s += buf[i]; }
+    out[id] = s;
+}
+"#;
+
+    /// P0: gemv-strided read sum — 32 lanes read the `twords`-word tile at
+    /// `(it, ot)` with tile stride `out_tiles*twords*4` bytes, exactly the
+    /// exl3_gemv access pattern. grid = (out_tiles, nsplit); no decode.
+    const P0_STRIDED_MSL: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+kernel void stream_sum_strided(device const uint *buf [[buffer(0)]],
+                               device atomic_uint *out [[buffer(1)]],
+                               constant uint *p [[buffer(2)]],
+                               uint tg [[thread_position_in_grid]],
+                               uint thr [[thread_position_in_threadgroup]]) {
+    uint in_tiles = p[0];
+    uint out_tiles = p[1];
+    uint twords = p[2];
+    uint nsplit = p[3];
+    uint ot = tg % out_tiles;
+    uint split = tg / out_tiles;
+    uint chunk = (in_tiles + nsplit - 1u) / nsplit;
+    uint it0 = split * chunk;
+    uint it1 = min(in_tiles, it0 + chunk);
+    uint lane = thr;
+    uint s = 0u;
+    ulong tstride = (ulong)out_tiles * twords;
+    ulong base = (ulong)(it0 * out_tiles + ot) * twords + lane;
+    for (uint it = it0; it < it1; it++) {
+        if (lane < twords) { s += buf[base]; }
+        base += tstride;
+    }
+    if (lane == 0u) { atomic_fetch_add_explicit(out, s, memory_order_relaxed); }
+}
+"#;
+
     /// Deterministic PRNG (no external dep) for synthetic payloads.
     struct Rng(u64);
     impl Rng {
@@ -1140,6 +1190,162 @@ mod tests {
                 ));
             }
             eprintln!("{row}");
+        }
+    }
+
+    /// P0: stream-sum bandwidth probe. Two Metal kernels over one synthetic
+    /// u32 buffer: (a) contiguous read sum, (b) gemv-strided read sum that
+    /// replicates the exl3_gemv grid (out_tiles × nsplit, 32 lanes, tile
+    /// stride = out_tiles*twords*4 bytes). Prints GB/s for both, sweeping
+    /// nsplit on the strided variant. Decides whether the 79 GB/s decode
+    /// stream is an in-kernel compute wall (strided ≫ 79) or a memory-pattern
+    /// wall (strided ≈ 79–110). Pure measurement — no assertions.
+    #[test]
+    #[ignore]
+    fn bench_stream_bw_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(c) = ctx() else { return };
+        let device = c.device();
+        use std::time::Instant;
+
+        let opts = metal::CompileOptions::new();
+        struct Prog {
+            pipeline: metal::ComputePipelineState,
+            #[allow(dead_code)]
+            library: metal::Library,
+        }
+        let prog = |src: &str, name: &str| -> Prog {
+            let library = device
+                .new_library_with_source(src, &opts)
+                .unwrap_or_else(|e| panic!("compile {name}: {e:?}"));
+            let func = library.get_function(name, None).unwrap_or_else(|_| {
+                panic!("get_function {name}");
+            });
+            let pipeline = device
+                .new_compute_pipeline_state_with_function(&func)
+                .unwrap_or_else(|_| panic!("pipeline {name}"));
+            Prog { pipeline, library }
+        };
+
+        let contig = prog(P0_CONTIG_MSL, "stream_sum_contig");
+        let strided = prog(P0_STRIDED_MSL, "stream_sum_strided");
+
+        // 512 MB synthetic u32 buffer (far larger than L2 ~24 MB, DRAM-bound).
+        const WORDS: usize = 512 * 1024 * 1024 / 4;
+        let buf = device.new_buffer(
+            (WORDS * 4) as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        {
+            let ptr = buf.contents() as *mut u32;
+            unsafe {
+                for i in 0..WORDS {
+                    *ptr.add(i) = (i as u32).wrapping_mul(2654435761);
+                }
+            }
+        }
+
+        let params = |p: &[u32]| -> metal::Buffer {
+            let v: Vec<u8> = p.iter().flat_map(|x| x.to_le_bytes()).collect();
+            device.new_buffer_with_data(
+                v.as_ptr() as *const _,
+                v.len() as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+        };
+        let out_buf = || {
+            device.new_buffer(8, metal::MTLResourceOptions::StorageModeShared)
+        };
+        let simd_sum = |ptr: *mut std::os::raw::c_void| -> u64 {
+            unsafe { std::ptr::read_unaligned(ptr as *const u64) }
+        };
+
+        // (a) contiguous read over the full 512 MB.
+        let cpb = params(&[WORDS as u32]);
+        let contig_slots = (WORDS.div_ceil(8).max(1) * 4) as u64;
+        let contig_out = device.new_buffer(contig_slots, metal::MTLResourceOptions::StorageModeShared);
+        let run_contig = |n_pb: &metal::Buffer, o: &metal::Buffer, tgw: usize| {
+            let cb = c.queue().new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&contig.pipeline);
+            enc.set_buffer(0, Some(&buf), 0);
+            enc.set_buffer(1, Some(o), 0);
+            enc.set_buffer(2, Some(n_pb), 0);
+            let total = WORDS.div_ceil(8).max(1);
+            enc.dispatch_threads(
+                metal::MTLSize::new(total as u64, 1, 1),
+                metal::MTLSize::new(tgw as u64, 1, 1),
+            );
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+        };
+        run_contig(&cpb, &contig_out, contig.pipeline.thread_execution_width() as usize);
+        assert_ne!(
+            simd_sum(contig_out.contents()),
+            0,
+            "contig kernel read nothing"
+        );
+        let mut cvs = [0.0f64; 12];
+        for v in cvs.iter_mut() {
+            let t = Instant::now();
+            run_contig(&cpb, &contig_out, contig.pipeline.thread_execution_width() as usize);
+            *v = t.elapsed().as_secs_f64() * 1000.0;
+        }
+        cvs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let cgb = (WORDS * 4) as f64 / (cvs[0] / 1000.0) / 1e9;
+        eprintln!(
+            "P0 contig {:.1}MB: min {:.3} med {:.3} ms -> {cgb:.0} GB/s",
+            WORDS * 4 / (1024 * 1024),
+            cvs[0],
+            cvs[cvs.len() / 2]
+        );
+
+        // (b) gemv-strided read, sweep nsplit. Matrix mirrors the gate trellis
+        // shape: in_tiles×out_tiles tiles of `twords` u32 words, each (it,ot)
+        // tile read by a 32-lane threadgroup (contiguous 96 B window).
+        const IN_TILES: u32 = 2048;
+        const OUT_TILES: u32 = 1024;
+        const TWORDS: u32 = 24;
+        let strided_bytes = (IN_TILES as u64 * OUT_TILES as u64 * TWORDS as u64) * 4;
+        for nsplit in [1u32, 2, 4, 8] {
+            let gpb = params(&[IN_TILES, OUT_TILES, TWORDS, nsplit]);
+            let run = |o: &metal::Buffer| {
+                let cb = c.queue().new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&strided.pipeline);
+                enc.set_buffer(0, Some(&buf), 0);
+                enc.set_buffer(1, Some(o), 0);
+                enc.set_buffer(2, Some(&gpb), 0);
+                enc.dispatch_threads(
+                    metal::MTLSize::new((OUT_TILES as u64) * nsplit as u64, 1, 1),
+                    metal::MTLSize::new(32, 1, 1),
+                );
+                enc.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+            };
+            let ob0 = out_buf();
+            run(&ob0);
+            assert_ne!(simd_sum(ob0.contents()), 0, "strided read nothing");
+            let mut vs = [0.0f64; 12];
+            for v in vs.iter_mut() {
+                let ob = out_buf();
+                let t = Instant::now();
+                run(&ob);
+                *v = t.elapsed().as_secs_f64() * 1000.0;
+            }
+            vs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let gb = strided_bytes as f64 / (vs[0] / 1000.0) / 1e9;
+            eprintln!(
+                "P0 strided nsplit={nsplit}: min {:.3} med {:.3} ms ({} MB) -> {gb:.0} GB/s",
+                vs[0],
+                vs[vs.len() / 2],
+                strided_bytes / (1024 * 1024)
+            );
         }
     }
 

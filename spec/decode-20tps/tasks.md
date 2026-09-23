@@ -1,6 +1,6 @@
 # Tasks: Decode to 20 t/s
 
-- [ ] **P0: Stream-sum bandwidth probe (decision measurement)**
+- [x] **P0: Stream-sum bandwidth probe (decision measurement)**
   - **Files**: `crates/engine/src/metal_linear.rs` (new gated test
     `bench_stream_bw_slow`), kernel MSL inline in the test
   - **Intent**: Two Metal kernels over a synthetic buffer — (a) contiguous read
@@ -11,6 +11,14 @@
     restructuring before/with P1-T1.
   - **Testing**: gated `bench_stream_bw_slow`; no assertions, print + eyeball
     (decision input); suite unaffected.
+  - **Result**: contig 512 MB = 211 GB/s; strided nsplit=1 = 214 GB/s,
+    nsplit=2 = 334, nsplit=4 = 377, nsplit=8 = 381 GB/s. **Memory pattern is
+    NOT the wall — in-kernel compute is** (79 GB/s decode vs ≥210 GB/s
+    achievable for identical access pattern; splitting raises MLP to ~380).
+    P1-T1 parity restructure is the fix; 20 t/s plain decode (224 GB/s) is now
+    credible. Caveat: `dispatch_thread_groups` clamps big grids (65535),
+    silently under-runs — use `dispatch_threads`.
+  - **Commit**: TBD
 
 - [ ] **P1-T1: PonyExl3 v12 parity gemv (128-thread, 8-acc, static funnel, direct loads)**
   - **Files**: `crates/kernels/src/exl3.metal` (`exl3_gemv`), `crates/kernels/src/exl3.rs`
