@@ -21,15 +21,22 @@
   - **Commit**: TBD
 
 - [ ] **P1-T1: PonyExl3 v12 parity gemv (128-thread, 8-acc, static funnel, direct loads)**
-  - **Files**: `crates/kernels/src/exl3.metal` (`exl3_gemv`), `crates/kernels/src/exl3.rs`
-  - **Intent**: Rewrite main decode loop to v12 MT=1: 128 threads/TG (4 SG,
-    `NSG=4`), `acc[8]` register accumulators with tile-invariant funnel
-    geometry computed once, `simd_shuffle` x-fetch, direct word reads, in-kernel
-    conflict-free cross-SG reduction, zero hot-loop barriers, no dynamic
-    indexing. Keep `aligned` path + k=7 pair-table fallback + T5.2r nsplit hook.
-  - **Testing**: `cargo test -p kaplumba-kernels` (21), engine fast (116),
-    parity `gpu_gemv_matches_cpu_decoded_tile`, `debug_gemv_rows`, one-hot;
-    gated `bench_passes_slow` A/B vs 168 Gw/s gate baseline.
+  - **Files**: `crates/kernels/src/exl3.metal` (`exl3_gemv4`), `crates/kernels/src/exl3.rs`,
+    `crates/engine/src/metal_linear.rs`
+  - **Intent**: New v12-parity kernel kept **alongside** `exl3_gemv` for A/B:
+    128 threads/TG (NSG=4 in-tile stride), 8 register accs/lane, static funnel
+    windows, direct device word loads, in-kernel cross-SG reduction via
+    `tgw[NSG][TILE]` + one end barrier. Production **not** switched (revertable).
+  - **Testing**: kernels (21), engine fast (117 incl. `gpu_gemv4_matches_cpu_decoded_tile`),
+    gated `bench_passes_slow` A/B, split sweep A/B.
+  - **Result (NEGATIVE — v1 stays)**: v4 loses at every nsplit on the real
+    shapes. gate@n2 0.683 (v1) vs 0.709 (v4); down@n8 0.697 vs 0.709 (v4 best
+    n2); o@n8 0.368 vs 0.377; q@n1 0.361 beats 0.369 by 2% once (noise);
+    k 0.272 vs 0.275; lm_head@n1 5.847 vs 6.186 (−6%). Quadrupling ILP + 4-way
+    SG split changed nothing → the kernel is NOT dependency-latency-bound.
+    Marker commit ships kernel + A/B hooks as regression bench, production
+    untouched.
+  - **Commit**: TBD
 
 - [ ] **P1-T2: nsplit chooser → reference formula, re-sweep**
   - **Files**: `crates/kernels/src/exl3.rs` (`gemv_splits`), policy tests

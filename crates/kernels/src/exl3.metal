@@ -185,7 +185,9 @@ kernel void exl3_had_in(device const half *x [[buffer(0)]],
 // ---------------------------------------------------------------------------
 // One out-tile per 32-lane threadgroup. Fatter threadgroups (4 warps sharing a
 // threadgroup) measured *slower* on M4 Pro: with few out-tiles there are too
-// few threadgroups left to spread across 20 cores.
+// few threadgroups left to spread across 20 cores. (Superseded by P0 findings:
+// the gemv-strided read pattern sustains ≥214 GB/s and splitting raises read
+// MLP — the compute is the wall. See `exl3_gemv4` below for the parity shape.)
 constant uint WARPS = 1u;
 
 kernel void exl3_gemv(device const half *xh [[buffer(0)]],
@@ -375,6 +377,161 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
         uint c0 = g >> 2;
         y[(tg.y * p.out_tiles + ot) * TILE + c0] = accA;
         y[(tg.y * p.out_tiles + ot) * TILE + c0 + 8u] = accB;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// exl3_gemv4: PonyExl3 v12 MT=1 parity for rows=1 (spec/decode-20tps P1-T1).
+//
+// One out-tile per 128-thread threadgroup; NSG=4 simdgroups stride the in-tile
+// range (`it += NSG`) with ZERO hot-loop barriers. Each lane keeps 8 static
+// accumulator chains (accA[4]/accB[4]) instead of 2, hiding decode latency in
+// registers; words are read directly from device (the ds4 pattern), x via
+// simd_shuffle, funnel windows computed once (tile-invariant). The per-SG
+// column partials collapse in-warp (4 lanes/column), then across the 4
+// simdgroups through `tgw[NSG][TILE]` in one barrier at the very end. Same
+// bit-level semantics as `exl3_gemv` (same funnel decode, same position map,
+// same output indexing) — only the summation groups differ, which the reduce
+// path already allows (token-level gates only).
+// ---------------------------------------------------------------------------
+#define NSG 4u
+kernel void exl3_gemv4(device const half *xh [[buffer(0)]],
+                       device const ushort *trellis [[buffer(1)]],
+                       device const uint *pair_tab [[buffer(2)]],
+                       device float *y [[buffer(3)]],
+                       constant Exl3Params &p [[buffer(4)]],
+                       uint2 tg [[threadgroup_position_in_grid]],
+                       uint2 thr [[thread_position_in_threadgroup]]) {
+    uint tid = thr.x;
+    uint sg = tid >> 5u;
+    uint g = tid & 31u;
+    uint ot = tg.x;
+    uint nsplit = p.nsplit;
+    uint chunk = (p.in_tiles + nsplit - 1u) / nsplit;
+    uint it0 = tg.y * chunk;
+    uint it1 = min(p.in_tiles, it0 + chunk);
+    bool live = ot < p.out_tiles;
+
+    uint r0 = (g & 3u) * 2u;
+    bool aligned = p.aligned != 0u;
+
+    float accA[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float accB[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    const device ushort *tile =
+        trellis + ((ulong)min(it0, p.in_tiles) * p.out_tiles + ot) * p.twords * 2u;
+    const ulong tstride = (ulong)p.out_tiles * p.twords * 2u;
+
+    if (p.k != 7u) {
+        uint ig0_[2];
+        uint ig1_[2];
+        uint s3_[2];
+        int tw = int(p.twords);
+        for (uint gg = 0u; gg < 2u; gg++) {
+            uint c0 = g * 8u + gg * 4u;
+            int e_last = int(c0 + 4u) * int(p.k) + 256 * int(p.k);
+            int i_end = (e_last - 1) / 32;
+            ig1_[gg] = uint(((i_end % tw) + tw) % tw);
+            ig0_[gg] = uint((((i_end - 1) % tw) + tw) % tw);
+            s3_[gg] = uint((i_end + 1) * 32 - e_last);
+        }
+        for (uint it = it0 + sg; live && it < it1; it += NSG) {
+            half x_lane = xh[it * 16u + g];
+            float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+            float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+            float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+            float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+            {
+                uint a0 = ld_word(tile, ig0_[0], aligned);
+                uint b0 = ld_word(tile, ig1_[0], aligned);
+                ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                uint s0 = s3_[0];
+                uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+                uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
+                uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
+                uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
+
+                uint a1 = ld_word(tile, ig0_[1], aligned);
+                uint b1 = ld_word(tile, ig1_[1], aligned);
+                ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                uint s1 = s3_[1];
+                uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+                uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
+                uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
+                uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
+
+                accA[0] += x00 * exl3_decode_f(cw0_0, p.mode);
+                accA[1] += x01 * exl3_decode_f(cw0_1, p.mode);
+                accA[2] += x02 * exl3_decode_f(cw0_2, p.mode);
+                accA[3] += x03 * exl3_decode_f(cw0_3, p.mode);
+                accB[0] += x00 * exl3_decode_f(cw1_0, p.mode);
+                accB[1] += x01 * exl3_decode_f(cw1_1, p.mode);
+                accB[2] += x02 * exl3_decode_f(cw1_2, p.mode);
+                accB[3] += x03 * exl3_decode_f(cw1_3, p.mode);
+            }
+            tile += tstride;
+        }
+    } else {
+        // k=7: pair-table funnel path (spans 37 bits, crosses 3 words).
+        uint pk0 = pair_tab[4u * g];
+        uint pk1 = pair_tab[4u * g + 1u];
+        uint pk2 = pair_tab[4u * g + 2u];
+        uint pk3 = pair_tab[4u * g + 3u];
+        uint i0_0 = pk0 & 0xFFu;
+        uint i1_0 = (pk0 >> 8) & 0xFFu;
+        uint s1_0 = (pk0 >> 16) & 0xFFu;
+        uint i0_1 = pk1 & 0xFFu;
+        uint i1_1 = (pk1 >> 8) & 0xFFu;
+        uint s1_1 = (pk1 >> 16) & 0xFFu;
+        uint i0_2 = pk2 & 0xFFu;
+        uint i1_2 = (pk2 >> 8) & 0xFFu;
+        uint s1_2 = (pk2 >> 16) & 0xFFu;
+        uint i0_3 = pk3 & 0xFFu;
+        uint i1_3 = (pk3 >> 8) & 0xFFu;
+        uint s1_3 = (pk3 >> 16) & 0xFFu;
+        for (uint it = it0 + sg; live && it < it1; it += NSG) {
+            half x_lane = xh[it * 16u + (g & 15u)];
+            float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+            float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+            float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+            float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+            CodePair p0 = funnel_pair(tile, i0_0, i1_0, s1_0, p.k, p.mode, aligned);
+            CodePair p1 = funnel_pair(tile, i0_1, i1_1, s1_1, p.k, p.mode, aligned);
+            CodePair p2 = funnel_pair(tile, i0_2, i1_2, s1_2, p.k, p.mode, aligned);
+            CodePair p3 = funnel_pair(tile, i0_3, i1_3, s1_3, p.k, p.mode, aligned);
+            accA[0] += x00 * float(p0.lo);
+            accA[1] += x01 * float(p0.hi);
+            accA[2] += x02 * float(p1.lo);
+            accA[3] += x03 * float(p1.hi);
+            accB[0] += x00 * float(p2.lo);
+            accB[1] += x01 * float(p2.hi);
+            accB[2] += x02 * float(p3.lo);
+            accB[3] += x03 * float(p3.hi);
+            tile += tstride;
+        }
+    }
+
+    // In-warp collapse: 4 lanes per output column (unchanged position map)...
+    float a = (accA[0] + accA[1]) + (accA[2] + accA[3]);
+    float b = (accB[0] + accB[1]) + (accB[2] + accB[3]);
+    a += simd_shuffle_down(a, 1);
+    a += simd_shuffle_down(a, 2);
+    b += simd_shuffle_down(b, 1);
+    b += simd_shuffle_down(b, 2);
+
+    // ...then across the 4 simdgroups (disjoint in-tile subsets).
+    threadgroup float tgw[NSG][TILE];
+    if (live && (g & 3u) == 0u) {
+        tgw[sg][g >> 2] = a;
+        tgw[sg][(g >> 2) + 8u] = b;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (live && tid < TILE) {
+        float s = 0.0f;
+        for (uint gg = 0u; gg < NSG; gg++) {
+            s += tgw[gg][tid];
+        }
+        y[((ulong)tg.y * p.out_tiles + ot) * TILE + tid] = s;
     }
 }
 

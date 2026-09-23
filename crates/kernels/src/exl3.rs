@@ -222,6 +222,10 @@ pub struct Exl3Gemv {
     queue: CommandQueue,
     had_in: ComputePipelineState,
     gemv: ComputePipelineState,
+    /// spec/decode-20tps P1-T1: PonyExl3 v12 MT=1 parity shape (4 simdgroups
+    /// per out-tile, 8 accs/lane, zero hot-loop barriers). A/B-able via
+    /// `gemv_pass_v4`; production still uses `gemv` until the bench wins.
+    gemv4: ComputePipelineState,
     /// T2.5: sums the K-split partials of `gemv` back into `y`.
     gemv_reduce: ComputePipelineState,
     gemm: ComputePipelineState,
@@ -265,6 +269,7 @@ impl Exl3Gemv {
             queue: queue.clone(),
             had_in: build("exl3_had_in")?,
             gemv: build("exl3_gemv")?,
+            gemv4: build("exl3_gemv4")?,
             gemv_reduce: build("exl3_gemv_reduce")?,
             gemm: build("exl3_gemm")?,
             gemm_sg: build("exl3_gemm_sg")?,
@@ -590,6 +595,70 @@ impl Exl3Gemv {
             self.encode_gemv_reduce(enc, dest, y, nsplit, shape.out_tiles);
         }
         // Keep any transient partial alive until after the last set_buffer.
+        drop(owned);
+    }
+
+    /// P1-T1: `encode_gemv` on the v12-parity pipeline (`exl3_gemv4`). Same
+    /// buffers, same partial layout (`[nsplit, out_tiles, 16]`), same reduce —
+    /// only the placement differs: one out-tile per 128-thread threadgroup
+    /// (`NSG=4` warp stride), grid.x = out_tiles. MUST match `NSG` in the MSL.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_gemv4(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        xh: &Buffer,
+        trellis: DeviceSpan<'_>,
+        pair: &Buffer,
+        shape: Exl3Shape,
+        mode: u32,
+        y: &Buffer,
+        ext_partial: Option<&Buffer>,
+        nsplit_override: Option<usize>,
+    ) {
+        debug_assert_eq!(shape.words_per_tile() % 2, 0);
+        let nsplit = nsplit_override.unwrap_or_else(|| Self::gemv_splits(shape.out_tiles));
+        let params: [u32; 7] = [
+            shape.in_tiles as u32,
+            shape.out_tiles as u32,
+            shape.k,
+            (shape.words_per_tile() / 2) as u32,
+            mode,
+            u32::from(trellis.byte_offset % 4 == 0),
+            nsplit as u32,
+        ];
+        let need = nsplit * shape.out_tiles * TILE * 4;
+        let owned = if nsplit > 1 && ext_partial.is_none() {
+            Some(self.new_f32_buffer(need / 4))
+        } else {
+            None
+        };
+        let dest: &Buffer = if nsplit == 1 {
+            y
+        } else if let Some(p) = ext_partial {
+            debug_assert!(
+                p.length() as usize >= need,
+                "gemv4 partial too small: {} < {}",
+                p.length(),
+                need
+            );
+            p
+        } else {
+            owned.as_ref().expect("transient partial")
+        };
+        enc.set_compute_pipeline_state(&self.gemv4);
+        enc.set_buffer(0, Some(xh), 0);
+        enc.set_buffer(1, Some(trellis.buffer), trellis.byte_offset as u64);
+        enc.set_buffer(2, Some(pair), 0);
+        enc.set_buffer(3, Some(dest), 0);
+        enc.set_bytes(4, 28, params.as_ptr() as *const _);
+        const NSG: usize = 4;
+        enc.dispatch_thread_groups(
+            MTLSize::new(shape.out_tiles as u64, nsplit as u64, 1),
+            MTLSize::new((32 * NSG) as u64, 1, 1),
+        );
+        if nsplit > 1 {
+            self.encode_gemv_reduce(enc, dest, y, nsplit, shape.out_tiles);
+        }
         drop(owned);
     }
 
@@ -972,6 +1041,66 @@ impl Exl3Gemv {
             let cb = self.queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
             self.encode_gemv(enc, &sc.xh, trellis, &pair, shape, mode, &sc.y, None, nsplit);
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            if cb.status() != MTLCommandBufferStatus::Completed {
+                return Err(KernelError::CommandFailed(cb.status()));
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    sc.y.contents() as *const u8,
+                    out.as_mut_ptr() as *mut u8,
+                    shape.out_features() * 4,
+                );
+            }
+            Ok(())
+        })
+    }
+
+    /// P1-T1: `gemv_pass_nsplit` on the v12-parity kernel for A/B. Output is
+    /// summed in a different order (8 chains + 4-warp split) so results may
+    /// differ within float rounding; parity holds per the engine's token gates.
+    pub fn gemv_pass_v4(
+        &self,
+        xh: &[f16],
+        trellis: DeviceSpan<'_>,
+        shape: Exl3Shape,
+        mode: u32,
+        nsplit_override: Option<usize>,
+        out: &mut Vec<f32>,
+    ) -> Result<(), KernelError> {
+        if xh.len() != shape.in_features() {
+            return Err(KernelError::Unsupported(format!(
+                "gemv4 needs {} activations, got {}",
+                shape.in_features(),
+                xh.len()
+            )));
+        }
+        if mode > 1 {
+            return Err(KernelError::Unsupported(format!("mode {mode} is CPU-only")));
+        }
+        Self::ensure_span_fits(
+            &trellis,
+            shape.in_tiles * shape.out_tiles * shape.words_per_tile() * 2,
+            "trellis",
+            2,
+        )?;
+        let pair = self.pair_buffer(shape.k);
+        out.resize(shape.out_features(), 0.0);
+        self.with_scratch(xh.len(), shape.out_features(), 1, |sc| {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    xh.as_ptr() as *const u8,
+                    sc.xh.contents() as *mut u8,
+                    xh.len() * 2,
+                );
+            }
+            let cb = self.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            self.encode_gemv4(
+                enc, &sc.xh, trellis, &pair, shape, mode, &sc.y, None, nsplit_override,
+            );
             enc.end_encoding();
             cb.commit();
             cb.wait_until_completed();

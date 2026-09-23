@@ -969,6 +969,56 @@ kernel void stream_sum_strided(device const uint *buf [[buffer(0)]],
         }
     }
 
+    /// P1-T1: the v12-parity kernel (`exl3_gemv4`) must meet the same CPU
+    /// decode model as `exl3_gemv`. Summation order differs (8 chains + 4-warp
+    /// split), so the tolerance is identical to the v1 test, not tighter.
+    #[test]
+    fn gpu_gemv4_matches_cpu_decoded_tile() {
+        let Some(c) = ctx() else { return };
+        for k in 1u32..=8 {
+            let src = SynthGpuSource::build(c.device(), k, 16, 16);
+            let layer = src.linear();
+            let w = layer.trellis.decode_tile(0, 0, Mode::Mcg).unwrap();
+            let mut rng = Rng(0x7777_0000u64 + k as u64);
+            let xh: Vec<f16> = (0..16)
+                .map(|_| f16::from_f32(((rng.next() % 2001) as f32 / 1000.0) - 1.0))
+                .collect();
+            let mut want = [0f32; 16];
+            for (r, xr) in xh.iter().enumerate() {
+                for (c_idx, wc) in want.iter_mut().enumerate() {
+                    *wc += xr.to_f32() * w[r][c_idx].to_f32();
+                }
+            }
+            let Some((buf, off)) = src.device_span("l.trellis") else {
+                panic!("trellis span")
+            };
+            let shape = Exl3Shape::new(16, 16, k).unwrap();
+            let mut got = Vec::new();
+            MetalLinear::new(&c)
+                .unwrap()
+                .raw()
+                .gemv_pass_v4(
+                    &xh,
+                    DeviceSpan {
+                        buffer: buf,
+                        byte_offset: off,
+                    },
+                    shape,
+                    1,
+                    None,
+                    &mut got,
+                )
+                .expect("gemv4");
+            for (i, (w, g)) in want.iter().zip(got.iter()).enumerate() {
+                let scale = 1.0f32.max(w.abs()).max(g.abs());
+                assert!(
+                    (w - g).abs() / scale < 1e-3,
+                    "k={k} gemv4[{i}] want {w} got {g}"
+                );
+            }
+        }
+    }
+
     /// Host-only model of the MSL GEMV's index math: the pair table + funnel
     /// shift must reproduce `unpack_trellis_tile` for every K, and the group →
     /// (row, column) mapping must reproduce `tensor_core_perm`. If this passes
@@ -1114,6 +1164,12 @@ kernel void stream_sum_strided(device const uint *buf [[buffer(0)]],
                     .gemv_pass(&xh, g.trellis(), g.shape, g.mode, &mut o)
                     .unwrap();
             });
+            let (v4_min, v4_med) = time("gemv4", &mut || {
+                let mut o = Vec::new();
+                ml.raw()
+                    .gemv_pass_v4(&xh, g.trellis(), g.shape, g.mode, None, &mut o)
+                    .unwrap();
+            });
             xh.clear();
             let (fu_min, fu_med) = time("full", &mut || {
                 let _ = ml.try_linear(src, name, &x).unwrap().unwrap();
@@ -1121,7 +1177,7 @@ kernel void stream_sum_strided(device const uint *buf [[buffer(0)]],
 
             let weights = inn * outp;
             eprintln!(
-                "{label:8} {inn}x{outp} k={} off(t{}/s{}/{}) · full {fu_min:7.3}/{fu_med:7.3} · gemv {gv_min:6.3}/{gv_med:6.3} · had_in {hi_min:6.3}/{hi_med:6.3} · had_out {ho_min:6.3}/{ho_med:6.3} ms · {:.0} Gw/s",
+                "{label:8} {inn}x{outp} k={} off(t{}/s{}/{}) · full {fu_min:7.3}/{fu_med:7.3} · gemv {gv_min:6.3}/{gv_med:6.3} · gemv4 {v4_min:6.3}/{v4_med:6.3} · had_in {hi_min:6.3}/{hi_med:6.3} · had_out {ho_min:6.3}/{ho_med:6.3} ms · {:.0} Gw/s",
                 g.shape.k,
                 g.trellis().byte_offset % 4,
                 g.suh().byte_offset % 4,
@@ -1173,20 +1229,31 @@ kernel void stream_sum_strided(device const uint *buf [[buffer(0)]],
                     continue;
                 }
                 const REPS: usize = 12;
-                let mut best = f64::INFINITY;
+                let mut best_v1 = f64::INFINITY;
+                let mut best_v4 = f64::INFINITY;
                 for _ in 0..REPS {
                     let mut o = Vec::new();
                     let t = std::time::Instant::now();
                     ml.raw()
                         .gemv_pass_nsplit(&xh, g.trellis(), g.shape, g.mode, Some(nsplit), &mut o)
                         .unwrap();
-                    best = best.min(t.elapsed().as_secs_f64() * 1000.0);
+                    let e1 = t.elapsed().as_secs_f64() * 1000.0;
+                    best_v1 = best_v1.min(e1);
+                    let mut o2 = Vec::new();
+                    let t2 = std::time::Instant::now();
+                    ml.raw()
+                        .gemv_pass_v4(&xh, g.trellis(), g.shape, g.mode, Some(nsplit), &mut o2)
+                        .unwrap();
+                    let e2 = t2.elapsed().as_secs_f64() * 1000.0;
+                    best_v4 = best_v4.min(e2);
                 }
                 let gb = (inn * outp) as f64;
                 row.push_str(&format!(
-                    "  n{nsplit}={:.3}/{}",
-                    best,
-                    (gb / (best / 1000.0) / 1e9) as u32
+                    "  n{nsplit}=v1 {:.3}/{} · v4 {:.3}/{}",
+                    best_v1,
+                    (gb / (best_v1 / 1000.0) / 1e9) as u32,
+                    best_v4,
+                    (gb / (best_v4 / 1000.0) / 1e9) as u32,
                 ));
             }
             eprintln!("{row}");
