@@ -19,6 +19,33 @@ This document records technical decisions, benchmark measurements, register allo
 
 ## Log of Steps and Learnings
 
+### T5.0 — Cooperative GEMV attempt REVERTED (2026-09-23)
+- **Attempt**: in-place `exl3_gemv` rewrite to 128-thread / 4-simdgroup cooperative structure (T5.1, commit `d3d3ffb`) + ExllamaV3 coalesced 96B word loads with `simd_shuffle` fetch (T5.2, commit `182a101`) + `gemv_splits` heuristic `min_split_tiles=128` / target 8192 TGs.
+- **A/B measurement (same session, `bench_passes_slow`, this machine)**:
+  | linear | T4 (7197888) | T5.1+T5.2 | Δ |
+  |---|---|---|---|
+  | gate | 165 Gw/s | 130 | −21% |
+  | down | 168 | 131 | −22% |
+  | o | 109 | 95 | −13% |
+  | q | 111 | 81 | −27% |
+  | k | 70 | 55 | −21% |
+  | v | 76 | 55 | −28% |
+  | lm_head | 243 | 225 | −7% |
+  (T4 numbers reproduce the plan's original 7.15 t/s table — that premise was correct.)
+- **Root causes**:
+  1. The 4-simdgroup rewrite **discarded the T2.6 2-way unroll** (old loop loaded 32 lanes × 2B = one 64B burst covering two in-tiles per iteration) — T2.6 was worth +5% (7.15→7.52).
+  2. It also **ignored the file's own empirical warning** that was present before the rewrite: *"Fatter threadgroups (4 warps sharing a threadgroup) measured slower on M4 Pro"*.
+  3. `min_split_tiles=128` stopped k/v at nsplit=2 (in_tiles 336: 336/(2·2)=84 < 128 after first doubling... first check 336/2=168≥128 allows n=2, then 336/4=84<128 stops) — under-splits vs T2.9's measured k/v optimum ≈ 4.
+  4. Coalesced loads (T5.2) were never isolated from (1)/(2) — their independent value is still unknown; re-test on the 32-thread kernel (T5.3r).
+- **Correctness was NOT the problem**: one-hot `debug_gemv_rows` GPU==CPU all rows, decoded-tile parity, 116 fast engine tests — all green while perf regressed. Reverted in `c250fc0`.
+- **ExllamaV3 study (`/tmp/exllamav3/.../exl3_gemv_kernel.cuh`)**: it is an **MMA kernel** (mma.m16n8k16, QTIP-style, 512/256-thread NVIDIA blocks) — structure not portable to Apple SGs. Portable ideas: (a) lane-coalesced tile load + shuffle extraction (tested, see above), (b) **PF=4 prefetch ring** — next tile's words register-resident while current decodes — this is the un-copied trick that addresses our load-then-decode serial dependency (issue-bound ~50%, ~60% BW), (c) in-block k-split reduction (our T5.1 striding was an analogue; structure lost anyway).
+
+### T5.0b — Corrected bandwidth metric: 11.2 GB/token → roofline 24.4 t/s
+- `decode_throughput_slow` used `bytes_per_tok = 16.028e9` (raw disk shards incl. vision tower + embed). After T1 (vision filtered) and T2 (embed mmap host-side, decode reads one row), the true per-token GPU stream is **11.2 GB** (user-confirmed 2026-09-23).
+- **Old "hard ceiling" math was wrong**: 16.028 ÷ 273 ≈ 17.6 t/s was used in `spec/rust-metal-engine` and `spec/final-same-algorithm-ceiling` to declare 18/20 t/s physically unreachable. Corrected: **11.2 ÷ 273 ≈ 41.0 ms → ~24.4 t/s**. 20 t/s (50 ms) needs ~84% sustained bus utilization; lm_head already sustains 89% (243 Gw/s), so the target is bandwidth-valid with headroom.
+- Historical "103–134 GB/s achieved" figures are similarly understated in % terms (they divided the wrong numerator... actually they used 16 GB numerator so % was overstated-as-low: true stream 11.2 GB at the same ms/token yields LOWER achieved GB/s but the same t/s — the % of bus now reads ~37% at 8.39 t/s, i.e. **63% of the bus idle** — that's the real work).
+- Awaiting `decode_throughput_slow` re-run to record the corrected baseline line.
+
 ### T1: Filter vision tower tensors during model load
 - Implemented `is_vision_tensor` in `crates/engine/src/load.rs`.
 - Safetensors loader skips 356 tensors matching `model.vision_tower.*` and `model.embed_vision.*`.

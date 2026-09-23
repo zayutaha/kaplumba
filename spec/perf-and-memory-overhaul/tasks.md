@@ -20,32 +20,51 @@
   - **Intent**: Load `xh` once per 16 elements in a single coalesced 64-byte burst and distribute across rows via `simd_shuffle`, reducing activation DRAM loads by 8x.
   - **Testing**: `cargo test -p kaplumba-kernels` (21/21 passed), `gpu_linear_matches_cpu_reference` passed, `gpu_gemv_matches_cpu_decoded_tile` passed.
 
-- [x] **T5.1: Land cooperative 128-thread GEMV + re-tuned K-split policy**
-  - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`, `spec/perf-and-memory-overhaul/plan.md`
-  - **Intent**: In-place `exl3_gemv` rewrite (NSG=4, 128 threads/TG, `tk += 4` striding, on-chip `tg_cols[4][16]` reduction) + `gemv_splits(in,out)` heuristic (`min_split_tiles=128`, target 8192 TGs → lm 1, gate/q/k/v 2, o 4, down 8). Supersedes T2.9 nsplit=16 over-split.
-  - **Testing**: `cargo test -p kaplumba-kernels` 21/21, `cargo test -p kaplumba-engine --lib` 116/116.
-  - **Commit**: `d3d3ffb`
+- [x] **T5.0: Revert cooperative-GEMV regression (A/B proven)**
+  - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`
+  - **Intent**: T5.1+T5.2 (128-thread 4-simdgroup structure + min_split_tiles=128 policy + coalesced loads) regressed every shape vs T4 on this machine: gate 165→130, down 168→131, o 109→95, q 111→81, k 70→55, v 76→55, lm 243→225 Gw/s. Causes: discarded T2.6 2-way unroll, ignored the file's own "fat threadgroups slower on M4 Pro" finding, starved k/v to nsplit=2. Revert to T4 shape; keep goal.
+  - **Testing**: kernels 21/21, engine fast 116/116, bench_passes back to T4 numbers.
+  - **Commit**: `c250fc0`
 
-- [x] **T5.2: Coalesced 96-byte tile word loads + simd_shuffle word fetch**
+- [x] **T5.0b: Correct decode bandwidth metric (16.028 → 11.2 GB/token)**
+  - **Files**: `crates/engine/src/gemma4.rs`, `spec/perf-and-memory-overhaul/implementation_notes.md`
+  - **Intent**: True per-token stream = 11.2 GB (vision removed T1, embed mmap T2) → roofline 11.2÷273 ≈ 41 ms ≈ **24.4 t/s** (user-confirmed 11.2 GB). The old 16.028e9 figure overstated stream ~43% and produced the wrong 17.6 t/s "hard ceiling" used to declare 18/20 unreachable. Print roofline in `decode_throughput_slow`.
+  - **Testing**: `decode_throughput_slow` prints corrected GB/s + roofline; fast suite green.
+
+- [ ] **T5.1r: Prefetch ring in the T4 32-thread gemv (ExllamaV3's actual trick)**
   - **Files**: `crates/kernels/src/exl3.metal`
-  - **Intent**: ExllamaV3-style: when `aligned && twords <= 32`, lanes `0..twords-1` load the tile's u32 words in one contiguous burst (`w_lane`), fetch `ig0/ig1` via `simd_shuffle`. k=6 (lm_head, 48 words) + unaligned keep per-lane `ld_word` fallback. Keep `accA/accB` mapping (no acc[8] remap — approved scope cut).
-  - **Testing**: kernels 21/21, `gpu_linear_matches_cpu_reference`, `gpu_gemv_matches_cpu_decoded_tile`, `debug_gemv_rows` one-hot (T2.3 dead-end guard — GPU==CPU all rows).
-  - **Commit**: `182a101`
+  - **Intent**: PF depth 2–4 register prefetch: load tile i+PF words while decoding tile i (currently load-then-decode serial → latency never hidden → issue-bound ~50%, 60% BW). Keep T4 structure (32 threads, 2-way unroll, no fat TGs).
+  - **Testing**: kernels 21/21, parity tests, one-hot; **bench gate/down ≥ 200 Gw/s or revert**.
 
-- [ ] **T5.3: Measure per-pass bandwidth + decode throughput**
-  - **Files**: `spec/perf-and-memory-overhaul/implementation_notes.md`
-  - **Intent**: `bench_passes_slow` (target gate/down/o/q/k/v ≥ 200–240 Gw/s; k/v must jump from 93–94) + `decode_throughput_slow` baseline with new kernel. Tune constants only if a shape regresses.
-  - **Testing**: both gated benches run, numbers recorded; sanity gate `tg_tps > 0.5` stays.
+- [ ] **T5.2r: Split-policy empirical sweep**
+  - **Files**: `crates/kernels/src/exl3.rs`
+  - **Intent**: Measure k/v ∈ {2,4,8,16}, gate ∈ {1,2,4}, o ∈ {4,8,13}, q ∈ {2,4,8} isolated; bake per-shape argmax into `gemv_splits` + policy test. (T2.9 history: k/v best ≈ 4.)
+  - **Testing**: every shape ≥ its T4 baseline in bench_passes_slow; policy test updated.
 
-- [ ] **T5.4: Coherence & correctness (hard gate)**
-  - **Files**: none (verification only; fix kernel/policy if red)
-  - **Intent**: Full gated suite + `trace_chat_prompt_steps_slow` (token 818, margin > 8, 20 steps bit-exact) + live CLI France prompt → exact answer, no gibberish.
-  - **Testing**: full gated suite green (fixture 236773, span < 0.55, batched < 2e-3); CLI prints "The capital of France is Paris."
+- [ ] **T5.3r: Coalesced 96B loads on the 32-thread kernel (isolated)**
+  - **Files**: `crates/kernels/src/exl3.metal`
+  - **Intent**: Re-apply T5.2's lane-coalesced word burst + simd_shuffle fetch *inside the T4 2-way-unroll loop* — never measured without the structure change. Keep only if bench improves.
+  - **Testing**: one-hot + parity; bench shows per-shape gain or the change is dropped.
 
-- [ ] **T5.5: Close T5 — gate, docs, ceiling-conflict amendments**
-  - **Files**: `crates/engine/src/gemma4.rs`, `spec/perf-and-memory-overhaul/{tasks,implementation_notes}.md`, `spec/final-same-algorithm-ceiling/{tasks,spec}.md`
-  - **Intent**: If measured ≥ 19.5 t/s → flip `decode_throughput_slow` assert to `>= 19.5` (never land red; if short, keep sanity gate + record honest shortfall). Final notes table. Amend final-same-algorithm-ceiling: T2.12 superseded, T6.1 ceiling caveat (approved 2026-09-23).
-  - **Testing**: re-run `decode_throughput_slow` after gate flip; docs committed.
+- [ ] **T5.4r: R4 — inline had_in/had_out into `exl3_gemv`**
+  - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`
+  - **Intent**: rows=1 currently dispatches 3 kernels per linear × 420 linears ≈ **840 extra Hadamard dispatches/token** (~0.15–0.2 ms each isolated). Fuse had_in as gemv prologue (128-block butterfly in tg memory) and had_out as epilogue (y is f32 in registers → scale+FWT+store f16 directly). Drops 840 dispatches/token.
+  - **Testing**: kernels 21/21, `gpu_linear_matches_cpu_reference`, `gpu_gemv_matches_cpu_decoded_tile`, had-in/out ≤1 ulp parity retained via fused path; bench `full` time ↓.
+
+- [ ] **T5.5r: End-to-end 20 t/s push loop**
+  - **Files**: as needed
+  - **Intent**: Re-bench after each of T5.1r–T5.4r; iterate (prefill not in scope) until `decode_throughput_slow` ≤ 50 ms/token. Phase split (cpu_encode/gpu_wait/host) to find the next bottleneck if linears are fixed.
+  - **Testing**: gated decode bench trend recorded each iteration.
+
+- [ ] **T5.6r: Coherence & correctness (hard gate)**
+  - **Files**: none (verification)
+  - **Intent**: Full gated suite + `trace_chat_prompt_steps_slow` (token 818, margin > 8) + CLI France prompt → exact answer, no gibberish.
+  - **Testing**: fixture 236773, span < 0.55, batched < 2e-3 all hold.
+
+- [ ] **T5.7r: Close T5 — gate, docs, ceiling amendments**
+  - **Files**: `crates/engine/src/gemma4.rs`, spec docs, `spec/final-same-algorithm-ceiling/{spec,tasks}.md`
+  - **Intent**: If ≥ 19.5 measured → flip `decode_throughput_slow` assert (never land red). Final notes. Amend ceiling spec: 17.6 t/s roofline superseded by 24.4 (11.2 GB corrected); T2.12 split-cap superseded if sweep says so (approved 2026-09-23).
+  - **Testing**: re-run decode bench after gate flip; all docs committed.
 
 - [ ] **T6: Implement fixed-size stripe buffer and fast dequantize stripe kernel**
   - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`, `crates/engine/src/gpu_decode.rs`

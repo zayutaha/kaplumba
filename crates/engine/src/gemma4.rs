@@ -2522,10 +2522,15 @@ mod tests {
         let host_s = (wall - stats.prefill_s - stats.decode_s).max(0.0);
         let host_ms = host_s / stats.decode_steps as f64 * 1e3;
         let e2e = stats.decode_steps as f64 / (stats.decode_s + host_s);
-        // Resident weights per full forward: artifact shards measured 16.028 GB
-        // (trellis + had/svh tables + embed + lm_head); every token streams them.
-        let bytes_per_tok = 16.028e9;
+        // True streamed weights per decode step (T5.1 corrected metric):
+        // 11.2 GB — vision tower removed (T1), embed_tokens mmap'd host-side
+        // (T2, only the sampled row is read), leaving trellis linears + lm_head
+        // + norm/had tables. The old 16.028e9 figure overstated the stream by
+        // ~43% and made the bus look fuller than it is.
+        // Roofline: 11.2 GB ÷ 273 GB/s ≈ 41.0 ms → ~24.4 t/s.
+        let bytes_per_tok = 11.2e9;
         let gbs = bytes_per_tok / (fwd_ms / 1e3) / 1e9;
+        let roofline_tps = 273.0 / (bytes_per_tok / 1e9);
 
         eprintln!(
             "[T4.0] prefill {:.1} ms ({:.1} t/s) | prompt {:?}",
@@ -2540,7 +2545,7 @@ mod tests {
         eprintln!("[T4.0] host between tokens {host_ms:.2} ms/token (sample+convert+submit)");
         eprintln!("[T4.0] end-to-end decode {e2e:.2} t/s");
         eprintln!(
-            "[T4.0] implied weight stream {gbs:.1} GB/s ({:.3} GB/token)",
+            "[T4.0] implied weight stream {gbs:.1} GB/s ({:.3} GB/token) | roofline {roofline_tps:.1} t/s @ 273 GB/s",
             bytes_per_tok / 1e9
         );
         eprintln!(
