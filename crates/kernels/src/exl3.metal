@@ -242,7 +242,15 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
 
         // Each of the 4 simdgroups steps by 4 in-tiles independently.
         // Zero barriers in the hot loop.
-        if (aligned) {
+        if (aligned && p.twords <= 32u) {
+            // T5.2 ExllamaV3-style coalesced tile load (aligned, twords <= 32:
+            // k=1..4 → 8/16/24/32 words; k=3 = 24 words = 96 bytes). Lanes
+            // 0..twords-1 read the tile's u32 words in one contiguous burst
+            // into w_lane; each lane then fetches its scattered ig0/ig1 words
+            // at register speed via simd_shuffle instead of issuing up to 4
+            // independent device loads. T2.3's wrong-column dead-end staged
+            // through threadgroup memory — this path never touches tg memory.
+            // k=6 (lm_head, twords=48) and unaligned tensors use ld_word below.
             for (; live && it < it1; it += 4u) {
                 half x_lane = xh[it * 16u + (lane & 15u)];
                 float x00 = float(simd_shuffle(x_lane, ushort(r0)));
@@ -251,14 +259,20 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
                 float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
 
                 device const uint *words = (device const uint *)tile;
-                ulong m0 = ((ulong)words[ig0_[0]] << 32) | (ulong)words[ig1_[0]];
+                uint w_lane = (lane < p.twords) ? words[lane] : 0u;
+
+                uint a0 = simd_shuffle(w_lane, ushort(ig0_[0]));
+                uint b0 = simd_shuffle(w_lane, ushort(ig1_[0]));
+                ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
                 uint s0 = s3_[0];
                 uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
                 uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
                 uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
                 uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
 
-                ulong m1 = ((ulong)words[ig0_[1]] << 32) | (ulong)words[ig1_[1]];
+                uint a1 = simd_shuffle(w_lane, ushort(ig0_[1]));
+                uint b1 = simd_shuffle(w_lane, ushort(ig1_[1]));
+                ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
                 uint s1 = s3_[1];
                 uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
                 uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
@@ -272,7 +286,9 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
                 tile += tstep;
             }
         } else {
-            // Fallback for twords > 32 or unaligned pointers.
+            // Fallback: unaligned pointers (lm_head) or twords > 32 (k=6 →
+            // 48 words exceeds the 32-lane shuffle). ld_word handles both;
+            // for aligned it is the same u32 load as the coalesced path.
             for (; live && it < it1; it += 4u) {
                 half x_lane = xh[it * 16u + (lane & 15u)];
                 float x00 = float(simd_shuffle(x_lane, ushort(r0)));

@@ -20,10 +20,31 @@
   - **Intent**: Load `xh` once per 16 elements in a single coalesced 64-byte burst and distribute across rows via `simd_shuffle`, reducing activation DRAM loads by 8x.
   - **Testing**: `cargo test -p kaplumba-kernels` (21/21 passed), `gpu_linear_matches_cpu_reference` passed, `gpu_gemv_matches_cpu_decoded_tile` passed.
 
-- [ ] **T5: Implement 128-thread cooperative GEMV with coalesced word loads & verify ≥ 20.0 t/s**
-  - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`, `crates/engine/src/gpu_decode.rs`, `crates/engine/src/gemma4.rs`
-  - **Intent**: Implement 4-simdgroup cooperative GEMV (`NSG=4`, 128 threads/TG) with in-tile striding `tk += 4`, private register accumulation `acc[8]`, on-chip threadgroup reduction `tg_w[4][256]`, and ExllamaV3 coalesced 96-byte tile word loading with `simd_shuffle`. Re-tune K-split policy (`min_split_tiles = 128`).
-  - **Testing**: `cargo test -p kaplumba-kernels`, `gpu_linear_matches_cpu_reference`, `bench_passes_slow` (linears sustain ≥ 200–240 Gw/s), `trace_chat_prompt_steps_slow` (coherence exact), and `decode_throughput_slow` achieves ≥ 19.5 t/s (target ≥ 20.0 t/s).
+- [x] **T5.1: Land cooperative 128-thread GEMV + re-tuned K-split policy**
+  - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`, `spec/perf-and-memory-overhaul/plan.md`
+  - **Intent**: In-place `exl3_gemv` rewrite (NSG=4, 128 threads/TG, `tk += 4` striding, on-chip `tg_cols[4][16]` reduction) + `gemv_splits(in,out)` heuristic (`min_split_tiles=128`, target 8192 TGs → lm 1, gate/q/k/v 2, o 4, down 8). Supersedes T2.9 nsplit=16 over-split.
+  - **Testing**: `cargo test -p kaplumba-kernels` 21/21, `cargo test -p kaplumba-engine --lib` 116/116.
+  - **Commit**: `d3d3ffb`
+
+- [ ] **T5.2: Coalesced 96-byte tile word loads + simd_shuffle word fetch**
+  - **Files**: `crates/kernels/src/exl3.metal`
+  - **Intent**: ExllamaV3-style: when `aligned && twords <= 32`, lanes `0..twords-1` load the tile's u32 words in one contiguous burst (`w_lane`), fetch `ig0/ig1` via `simd_shuffle`. k=6 (lm_head, 48 words) + unaligned keep per-lane `ld_word` fallback. Keep `accA/accB` mapping (no acc[8] remap — approved scope cut).
+  - **Testing**: kernels 21/21, `gpu_linear_matches_cpu_reference`, `gpu_gemv_matches_cpu_decoded_tile`, `debug_gemv_rows` one-hot (T2.3 dead-end guard).
+
+- [ ] **T5.3: Measure per-pass bandwidth + decode throughput**
+  - **Files**: `spec/perf-and-memory-overhaul/implementation_notes.md`
+  - **Intent**: `bench_passes_slow` (target gate/down/o/q/k/v ≥ 200–240 Gw/s; k/v must jump from 93–94) + `decode_throughput_slow` baseline with new kernel. Tune constants only if a shape regresses.
+  - **Testing**: both gated benches run, numbers recorded; sanity gate `tg_tps > 0.5` stays.
+
+- [ ] **T5.4: Coherence & correctness (hard gate)**
+  - **Files**: none (verification only; fix kernel/policy if red)
+  - **Intent**: Full gated suite + `trace_chat_prompt_steps_slow` (token 818, margin > 8, 20 steps bit-exact) + live CLI France prompt → exact answer, no gibberish.
+  - **Testing**: full gated suite green (fixture 236773, span < 0.55, batched < 2e-3); CLI prints "The capital of France is Paris."
+
+- [ ] **T5.5: Close T5 — gate, docs, ceiling-conflict amendments**
+  - **Files**: `crates/engine/src/gemma4.rs`, `spec/perf-and-memory-overhaul/{tasks,implementation_notes}.md`, `spec/final-same-algorithm-ceiling/{tasks,spec}.md`
+  - **Intent**: If measured ≥ 19.5 t/s → flip `decode_throughput_slow` assert to `>= 19.5` (never land red; if short, keep sanity gate + record honest shortfall). Final notes table. Amend final-same-algorithm-ceiling: T2.12 superseded, T6.1 ceiling caveat (approved 2026-09-23).
+  - **Testing**: re-run `decode_throughput_slow` after gate flip; docs committed.
 
 - [ ] **T6: Implement fixed-size stripe buffer and fast dequantize stripe kernel**
   - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`, `crates/engine/src/gpu_decode.rs`
