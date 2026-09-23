@@ -16,7 +16,9 @@
 //! * a single row of activations (`rows == 1`, the decode shape).
 
 use half::f16;
-use kaplumba_kernels::{AttnParams, DeviceSpan, Exl3Attention, Exl3Gemv, Exl3Shape, KernelError};
+use kaplumba_kernels::{
+    AttnParams, ChunkScratch, DeviceSpan, Exl3Attention, Exl3Gemv, Exl3Shape, KernelError,
+};
 use metal::{Buffer, MTLResourceOptions};
 
 use crate::exl3::codebook::CodebookMode;
@@ -130,6 +132,32 @@ impl MetalLinear {
     /// Low-level kernel access (per-pass tests and T2.3 microbenchmarks).
     pub fn raw(&self) -> &Exl3Gemv {
         &self.gemv
+    }
+
+    /// Allocate the decoder's fixed linear arena (once at construction).
+    /// `max_in_elems` = max over linears of `xh_rows * in_features` (batch and rows=1).
+    /// `max_out_elems` = max over linears of `rows * out_features` (batch and rows=1).
+    /// `max_partial_bytes` = max over linears of sg K-split + gemv partial need.
+    /// Lives for the decoder's lifetime — not per-chunk, not grow-on-demand.
+    pub fn chunk_scratch(
+        &self,
+        max_in_elems: usize,
+        max_out_elems: usize,
+        max_partial_bytes: usize,
+    ) -> ChunkScratch {
+        self.gemv
+            .new_chunk_scratch(max_in_elems, max_out_elems, max_partial_bytes)
+    }
+
+    /// `(xh_elems, y_elems, partial_bytes)` this linear needs in the decoder's
+    /// fixed arena at `rows`, including the rows=1 gemv K-split partial.
+    /// Single-sources the kernels' eligibility / split policy — callers must
+    /// not re-derive the heuristic. Component-wise max across linears sizes
+    /// the one arena used for both decode and prefill.
+    pub fn chunk_scratch_needs(lin: &LinearHandles, rows: usize) -> (usize, usize, usize) {
+        let (xh, y, p) = Exl3Gemv::chunk_scratch_needs(lin.shape, lin.trellis().byte_offset, rows);
+        let p = p.max(Exl3Gemv::gemv_partial_bytes(lin.shape));
+        (xh, y, p)
     }
 
     /// Why `try_linear(src, name)` would fall back to the CPU reference, or
@@ -384,9 +412,38 @@ impl MetalLinear {
         )
     }
 
-    /// One EXL3 linear, encoded into `enc` (`x`/`out` are whole device buffers
-    /// covering `[rows, in/out_features]`; `rows == 1` is the decode GEMV,
-    /// `rows >= 2` the batched prefill GEMM).
+    /// One EXL3 linear using the decoder's fixed arena (production decode +
+    /// prefill). `x`/`out` are whole device buffers covering `[rows,
+    /// in/out_features]`; `rows == 1` is the decode GEMV, `rows >= 2` the
+    /// batched prefill GEMM. Does not allocate.
+    pub fn encode_linear_with_scratch(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        lin: &LinearHandles,
+        x: &Buffer,
+        out: &Buffer,
+        rows: usize,
+        scratch: &ChunkScratch,
+    ) -> Result<(), MetalLinearError> {
+        self.gemv.encode_linear_with_scratch(
+            enc,
+            x,
+            lin.trellis(),
+            lin.suh(),
+            lin.svh(),
+            out,
+            lin.shape,
+            lin.mode,
+            rows,
+            scratch,
+        )?;
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Test/bench only — allocates a transient scratch per call. Production
+    /// uses [`Self::encode_linear_with_scratch`] with the decoder arena.
     pub fn encode_linear(
         &self,
         enc: &metal::ComputeCommandEncoderRef,

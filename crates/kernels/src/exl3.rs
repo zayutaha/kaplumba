@@ -1,9 +1,12 @@
-//! Host side of the EXL3 Metal kernels: pipeline setup, per-`k` pair tables and
-//! grow-on-demand scratch buffers.
+//! Host side of the EXL3 Metal kernels: pipeline setup and per-`k` pair tables.
 //!
 //! One `linear_row` call = three dispatches in a single command buffer:
 //! `had_in` (x·suh followed by the 128-point Hadamard) → `gemv` (decoded
 //! trellis GEMV, f32 partials) → `had_out` (Hadamard × svh → f16).
+//!
+//! **No retained scratch on `Exl3Gemv`** (user directive 2026-09-23): production
+//! decode/prefill pass a caller-owned [`ChunkScratch`] (`encode_linear_with_scratch`);
+//! host test/bench hooks allocate a transient scratch per call only.
 //!
 //! Scope for T2.1: **single row** (decode-shaped) input, f16 `suh`/`svh`,
 //! codebook modes `Default`/`Mcg`, even-aligned device spans. Anything else
@@ -185,16 +188,35 @@ struct MslHad {
     row_len: u32,
 }
 
+/// Transient host-path scratch (test/bench hooks only — never retained).
 struct Scratch {
     x_stage: Buffer,
     xh: Buffer,
     y: Buffer,
     yh: Buffer,
-    x_elems: usize,
-    out_elems: usize,
+}
+
+/// Per-chunk scratch arena for prefill (rows >= 2). Allocated once per chunk
+/// by [`Exl3Gemv::new_chunk_scratch`], passed to every linear in that chunk,
+/// dropped after the chunk's command buffer completes. Keeps the shared decode
+/// `Scratch`/`partial` bounded at decode-max size instead of growing to
+/// prefill rows (spec/prefill-scratch-fix).
+pub struct ChunkScratch {
+    pub xh: Buffer,
+    pub y: Buffer,
+    /// T3.10 sg K-split partials `[nsplit, rows_pad, N]` f32. At rows=256
+    /// k/v needs 8.4 MB here — shared `partial` must stay gemv/rows=1-sized.
+    pub partial: Buffer,
 }
 
 /// Owns the pipelines, the per-`k` pair tables and reusable scratch buffers.
+///
+/// **No production scratch lives here.** Decode and prefill both pass a
+/// caller-owned [`ChunkScratch`] (the decoder's fixed arena); the shared
+/// grow-on-demand slots were removed so RSS cannot step on first decode
+/// or first prefill (spec/prefill-scratch-fix, user directive: no scratch).
+/// Host test/bench hooks (`linear_row`, `had_*_pass`, `encode_linear`)
+/// still allocate a **transient** scratch per call — never retained.
 pub struct Exl3Gemv {
     device: Device,
     queue: CommandQueue,
@@ -205,16 +227,13 @@ pub struct Exl3Gemv {
     gemm: ComputePipelineState,
     /// Simdgroup tensor-core GEMM (v19c port; `rows ≥ 2`, see `sg_eligible`).
     gemm_sg: ComputePipelineState,
+    /// T3.10: sums the K-split partials of `gemm_sg` back into `y`.
+    gemm_sg_reduce: ComputePipelineState,
     had_out: ComputePipelineState,
     pair_tables: RefCell<HashMap<u32, Buffer>>,
     /// Constant 256×u32 inverse tile permutation, shared by every linear
     /// (the decode geometry is per tile-position, not per layer).
     inv_perm: Buffer,
-    scratch: RefCell<Option<Scratch>>,
-    /// T2.5 K-split partials `[nsplit, out_tiles, 16]` f32 (≤ ~128 KB).
-    /// Grown on demand; old buffers stay alive if an in-flight command
-    /// encoder still references them (Metal retains at `set_buffer`).
-    partial: RefCell<Option<(Buffer, usize)>>,
 }
 
 impl Exl3Gemv {
@@ -249,11 +268,10 @@ impl Exl3Gemv {
             gemv_reduce: build("exl3_gemv_reduce")?,
             gemm: build("exl3_gemm")?,
             gemm_sg: build("exl3_gemm_sg")?,
+            gemm_sg_reduce: build("exl3_gemm_sg_reduce")?,
             had_out: build("exl3_had_out")?,
             pair_tables: RefCell::new(HashMap::new()),
             inv_perm,
-            scratch: RefCell::new(None),
-            partial: RefCell::new(None),
         })
     }
 
@@ -267,19 +285,6 @@ impl Exl3Gemv {
         const TARGET_TGS: usize = 4096;
         const MAX_SPLIT: usize = 16;
         TARGET_TGS.div_ceil(out_tiles.max(1)).clamp(1, MAX_SPLIT)
-    }
-
-    /// Grow the K-split partial buffer to at least `bytes`.
-    fn ensure_partial(&self, bytes: usize) {
-        let mut slot = self.partial.borrow_mut();
-        let ok = matches!(slot.as_ref(), Some((_, len)) if *len >= bytes);
-        if !ok {
-            *slot = Some((
-                self.device
-                    .new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared),
-                bytes,
-            ));
-        }
     }
 
     fn pair_buffer(&self, k: u32) -> Buffer {
@@ -302,47 +307,182 @@ impl Exl3Gemv {
             .new_buffer((n * 2).max(2) as u64, MTLResourceOptions::StorageModeShared)
     }
 
-    /// Grow the shared scratch to hold `in_elems` f16 inputs and `out_elems`
-    /// f32/f16 outputs. Buffers are reused across calls (a token issues ~340
-    /// linears), so this allocates at most a handful of times per process.
-    fn ensure_scratch(&self, in_elems: usize, out_elems: usize) {
-        let mut slot = self.scratch.borrow_mut();
-        let needs_grow = match slot.as_ref() {
-            Some(s) => s.x_elems < in_elems || s.out_elems < out_elems,
-            None => true,
-        };
-        if needs_grow {
-            let keep_in = slot.as_ref().map(|s| s.x_elems).unwrap_or(0).max(in_elems);
-            let keep_out = slot
-                .as_ref()
-                .map(|s| s.out_elems)
-                .unwrap_or(0)
-                .max(out_elems);
-            *slot = Some(Scratch {
-                x_stage: self.new_half_buffer(keep_in),
-                xh: self.new_half_buffer(keep_in),
-                // Metal returns a null object for a zero-length allocation; keep
-                // every slot at least one element so unused slots stay valid.
-                y: self.device.new_buffer(
-                    ((keep_out * 4) as u64).max(4),
-                    MTLResourceOptions::StorageModeShared,
-                ),
-                yh: self.new_half_buffer(keep_out),
-                x_elems: keep_in,
-                out_elems: keep_out,
-            });
-        }
+    /// Shared-mode f32 buffer of at least `elems` elements (≥1 so slots stay valid).
+    fn new_f32_buffer(&self, elems: usize) -> Buffer {
+        self.device.new_buffer(
+            ((elems * 4) as u64).max(4),
+            MTLResourceOptions::StorageModeShared,
+        )
     }
 
+    /// **Transient** scratch for one host test/bench call — never retained on
+    /// `self`. Production (`encode_linear_with_scratch`) uses the decoder's
+    /// fixed arena instead (user directive: no shared scratch buffers).
     fn with_scratch<R>(
         &self,
         in_elems: usize,
         out_elems: usize,
+        rows: usize,
         f: impl FnOnce(&Scratch) -> R,
     ) -> R {
-        self.ensure_scratch(in_elems, out_elems);
-        let slot = self.scratch.borrow();
-        f(slot.as_ref().unwrap())
+        let _ = rows; // retained for call-site clarity; always transient now
+        let tmp = Scratch {
+            x_stage: self.new_half_buffer(in_elems.max(1)),
+            xh: self.new_half_buffer(in_elems.max(1)),
+            y: self.new_f32_buffer(out_elems),
+            yh: self.new_half_buffer(out_elems.max(1)),
+        };
+        f(&tmp)
+    }
+
+    /// Per-chunk / decoder-owned temps for one linear family at `rows`.
+    /// Allocated once by the decoder (fixed, context-independent — not per-chunk).
+    /// `max_partial_bytes` = max over linears of [`Self::sg_partial_bytes`] /
+    /// [`Self::gemv_partial_bytes`] (≥4 even when no shape splits).
+    pub fn new_chunk_scratch(
+        &self,
+        max_in_elems: usize,
+        max_out_elems: usize,
+        max_partial_bytes: usize,
+    ) -> ChunkScratch {
+        ChunkScratch {
+            xh: self.new_half_buffer(max_in_elems.max(1)),
+            y: self.new_f32_buffer(max_out_elems.max(1)),
+            partial: self.device.new_buffer(
+                (max_partial_bytes as u64).max(4),
+                MTLResourceOptions::StorageModeShared,
+            ),
+        }
+    }
+
+    /// `(xh_elems, y_elems, partial_bytes)` a `ChunkScratch` needs for one
+    /// linear at `rows`. Single-sources `xh_rows`/`sg_eligible`/`sg_splits`
+    /// (the engine must never re-derive the eligibility heuristic — a
+    /// mismatch under-allocates `xh` and corrupts the pad-row reads).
+    /// `trellis_offset` = `lin.trellis().byte_offset` (eligibility only needs
+    /// the 4-byte alignment; taking the raw offset keeps this policy-testable
+    /// without a Metal device).
+    pub fn chunk_scratch_needs(
+        shape: Exl3Shape,
+        trellis_offset: usize,
+        rows: usize,
+    ) -> (usize, usize, usize) {
+        let eligible = rows >= 2 && Self::sg_eligible_at(shape, trellis_offset);
+        let xh_rows = if eligible {
+            rows.div_ceil(64) * 64
+        } else {
+            rows
+        };
+        let xh = xh_rows * shape.in_features();
+        let y = rows * shape.out_features();
+        (xh, y, Self::sg_partial_bytes(shape, trellis_offset, rows))
+    }
+
+    /// Bytes of sg K-split partial a rows>1 call may write
+    /// (`nsplit * rows_pad * N * 4`), or 0 when the shape binds `y` directly.
+    pub fn sg_partial_bytes(shape: Exl3Shape, trellis_offset: usize, rows: usize) -> usize {
+        if rows < 2 || !Self::sg_eligible_at(shape, trellis_offset) {
+            return 0;
+        }
+        let nsplit = Self::sg_splits(shape, rows);
+        if nsplit <= 1 {
+            return 0;
+        }
+        let rows_pad = rows.div_ceil(64) * 64;
+        nsplit * rows_pad * shape.out_features() * 4
+    }
+
+    /// Bytes of rows=1 gemv K-split partial (`nsplit * out_tiles * TILE * 4`),
+    /// or 0 when nsplit == 1. Decoder arena sizing must cover both this and
+    /// [`Self::sg_partial_bytes`] at `batch_rows`.
+    pub fn gemv_partial_bytes(shape: Exl3Shape) -> usize {
+        let nsplit = Self::gemv_splits(shape.out_tiles);
+        if nsplit <= 1 {
+            return 0;
+        }
+        nsplit * shape.out_tiles * TILE * 4
+    }
+
+    /// Encode a linear with caller-owned temps (decoder arena — both decode
+    /// `rows==1` and prefill). Does NOT touch any shared scratch (none exists).
+    pub fn encode_linear_with_scratch(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: &Buffer,
+        trellis: DeviceSpan<'_>,
+        suh: DeviceSpan<'_>,
+        svh: DeviceSpan<'_>,
+        out: &Buffer,
+        shape: Exl3Shape,
+        mode: u32,
+        rows: usize,
+        scratch: &ChunkScratch,
+    ) -> Result<(), KernelError> {
+        let inn = shape.in_features();
+        let outp = shape.out_features();
+        if rows == 0 {
+            return Err(KernelError::Unsupported("linear needs rows >= 1".into()));
+        }
+        if mode > 1 {
+            return Err(KernelError::Unsupported(format!(
+                "codebook mode {mode} is CPU-only"
+            )));
+        }
+        if inn % HAD != 0 || outp % HAD != 0 {
+            return Err(KernelError::Unsupported(format!(
+                "hadamard needs multiples of {HAD}, got in={inn} out={outp}"
+            )));
+        }
+        if (x.length() as usize) < rows * inn * 2 {
+            return Err(KernelError::Unsupported(format!(
+                "x buffer too small: {} < {}",
+                x.length(),
+                rows * inn * 2
+            )));
+        }
+        if (out.length() as usize) < rows * outp * 2 {
+            return Err(KernelError::Unsupported(format!(
+                "out buffer too small: {} < {}",
+                out.length(),
+                rows * outp * 2
+            )));
+        }
+        check_span_fits(
+            &trellis,
+            shape.in_tiles * shape.out_tiles * shape.words_per_tile() * 2,
+            "trellis",
+            2,
+        )?;
+        check_span_fits(&suh, inn * 2, "suh", 2)?;
+        check_span_fits(&svh, outp * 2, "svh", 2)?;
+        let pair_buf = self.pair_buffer(shape.k);
+        let x_rows = Self::xh_rows(rows, shape, trellis);
+        // Arena is sized to the chunk max across linears — exact equality only
+        // for the largest shape; must never be smaller than this call's need.
+        debug_assert!(
+            (scratch.xh.length() as usize) / 2 >= x_rows * inn,
+            "chunk xh under-allocated: {} < {}",
+            scratch.xh.length() / 2,
+            x_rows * inn
+        );
+        debug_assert!(
+            (scratch.y.length() as usize) >= rows * outp * 4,
+            "chunk y under-allocated"
+        );
+        self.encode_had_in(enc, x, suh, &scratch.xh, rows, inn);
+        self.encode_gem(
+            enc,
+            &scratch.xh,
+            trellis,
+            &pair_buf,
+            shape,
+            mode,
+            &scratch.y,
+            Some(&scratch.partial),
+            rows,
+        );
+        self.encode_had_out(enc, &scratch.y, svh, out, rows, outp);
+        Ok(())
     }
 
     fn encode_had_in(
@@ -378,6 +518,7 @@ impl Exl3Gemv {
         shape: Exl3Shape,
         mode: u32,
         y: &Buffer,
+        ext_partial: Option<&Buffer>,
     ) {
         // The kernel reads the trellis as u32 words (two packed u16s each), so
         // the per-tile stride is half the u16 tile length. `aligned` selects the
@@ -397,15 +538,26 @@ impl Exl3Gemv {
         // summed by `exl3_gemv_reduce`; nsplit == 1 binds `y` directly, which
         // keeps the old flat path byte-identical (split 0 → offset 0).
         let need = nsplit * shape.out_tiles * TILE * 4;
-        let held = if nsplit > 1 {
-            self.ensure_partial(need);
-            Some(self.partial.borrow())
+        // Production always passes the decoder arena's partial (see
+        // `encode_linear_with_scratch`). Host hooks without one allocate a
+        // transient buffer — never retained on `self`.
+        let owned = if nsplit > 1 && ext_partial.is_none() {
+            Some(self.new_f32_buffer(need / 4))
         } else {
             None
         };
-        let dest: &Buffer = match held.as_ref() {
-            Some(slot) => &slot.as_ref().expect("ensure_partial").0,
-            None => y,
+        let dest: &Buffer = if nsplit == 1 {
+            y
+        } else if let Some(p) = ext_partial {
+            debug_assert!(
+                p.length() as usize >= need,
+                "gemv partial too small: {} < {}",
+                p.length(),
+                need
+            );
+            p
+        } else {
+            owned.as_ref().expect("transient partial")
         };
         enc.set_compute_pipeline_state(&self.gemv);
         enc.set_buffer(0, Some(xh), 0);
@@ -425,9 +577,8 @@ impl Exl3Gemv {
         if nsplit > 1 {
             self.encode_gemv_reduce(enc, dest, y, nsplit, shape.out_tiles);
         }
-        // Drop the partial borrow only after every set_buffer that references
-        // it has been encoded (Metal retains the buffer for the encoder).
-        drop(held);
+        // Keep any transient partial alive until after the last set_buffer.
+        drop(owned);
     }
 
     /// T2.5: `y[ot] = Σ_s partial[s, ot]` after a K-split gemv.
@@ -502,12 +653,21 @@ impl Exl3Gemv {
         shape: Exl3Shape,
         mode: u32,
         y: &Buffer,
+        ext_partial: Option<&Buffer>,
         rows: usize,
     ) {
         debug_assert!(rows >= 2);
         debug_assert!(Self::sg_eligible(shape, trellis));
         debug_assert_eq!(shape.words_per_tile() % 2, 0);
-        let params: [u32; 7] = [
+        // T3.10: under-waved shapes split the stage range across grid.z.
+        const SG_BM: usize = 64;
+        const SG_OUT_TILES: usize = 4;
+        debug_assert_eq!(shape.out_tiles % SG_OUT_TILES, 0);
+        let nsplit = Self::sg_splits(shape, rows);
+        let rows_pad = rows.div_ceil(SG_BM) * SG_BM;
+        let n = shape.out_tiles * TILE;
+        let stride = rows_pad * n; // elements, slice pitch (see Exl3GemmSgParams)
+        let params: [u32; 9] = [
             shape.in_tiles as u32,
             shape.out_tiles as u32,
             shape.k,
@@ -515,26 +675,73 @@ impl Exl3Gemv {
             mode,
             u32::from(trellis.byte_offset % 4 == 0),
             rows as u32,
+            nsplit as u32,
+            stride as u32,
         ];
+        // T3.10: split shapes write partials `[nsplit, rows_pad, N]` and are
+        // summed by `exl3_gemm_sg_reduce`; nsplit == 1 binds `y` directly
+        // (tg.z=0 → offset 0), keeping the old path byte-identical.
+        let need = nsplit * stride * 4;
+        // T3.5→scratch-fix: production always passes the decoder arena's
+        // partial; host hooks without one allocate a transient (never retained).
+        let owned = if nsplit > 1 && ext_partial.is_none() {
+            Some(self.new_f32_buffer(need / 4))
+        } else {
+            None
+        };
+        let dest: &Buffer = if nsplit == 1 {
+            y
+        } else if let Some(p) = ext_partial {
+            debug_assert!(
+                p.length() as usize >= need,
+                "sg partial too small: {} < {}",
+                p.length(),
+                need
+            );
+            p
+        } else {
+            owned.as_ref().expect("transient sg partial")
+        };
         enc.set_compute_pipeline_state(&self.gemm_sg);
         enc.set_buffer(0, Some(xh), 0);
         enc.set_buffer(1, Some(trellis.buffer), trellis.byte_offset as u64);
         enc.set_buffer(2, Some(&self.inv_perm), 0);
-        enc.set_buffer(3, Some(y), 0);
-        enc.set_bytes(4, 28, params.as_ptr() as *const _);
+        enc.set_buffer(3, Some(dest), 0);
+        enc.set_bytes(4, 36, params.as_ptr() as *const _);
         // MUST match SG_BM/SG_THREADS in exl3.metal: grid over 64-row ×
-        // 4-out-tile blocks, 128 threads (4 simdgroups) per block.
-        const SG_BM: usize = 64;
-        const SG_OUT_TILES: usize = 4;
-        debug_assert_eq!(shape.out_tiles % SG_OUT_TILES, 0);
+        // 4-out-tile blocks, 128 threads (4 simdgroups) per block; z = split.
         enc.dispatch_thread_groups(
             MTLSize::new(
                 (shape.out_tiles / SG_OUT_TILES) as u64,
                 rows.div_ceil(SG_BM) as u64,
-                1,
+                nsplit as u64,
             ),
             MTLSize::new(128, 1, 1),
         );
+        if nsplit > 1 {
+            self.encode_gemm_sg_reduce(enc, dest, y, nsplit, stride, n * rows);
+        }
+        // Keep any transient partial alive until after the last set_buffer.
+        drop(owned);
+    }
+
+    /// T3.10: `y[i] = Σ_s partial[s, i]` over the live `rows × N` elements.
+    fn encode_gemm_sg_reduce(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        partial: &Buffer,
+        y: &Buffer,
+        nsplit: usize,
+        stride: usize,
+        total: usize,
+    ) {
+        let p: [u32; 3] = [nsplit as u32, stride as u32, total as u32];
+        enc.set_compute_pipeline_state(&self.gemm_sg_reduce);
+        enc.set_buffer(0, Some(partial), 0);
+        enc.set_buffer(1, Some(y), 0);
+        enc.set_bytes(2, 12, p.as_ptr() as *const _);
+        let groups = total.div_ceil(256) as u64;
+        enc.dispatch_thread_groups(MTLSize::new(groups, 1, 1), MTLSize::new(256, 1, 1));
     }
 
     /// Simdgroup-GEMM eligibility (see `exl3_gemm_sg`): even `in_tiles` (the
@@ -543,13 +750,39 @@ impl Exl3Gemv {
     /// same contract as the v19c reference). lm_head is 2-mod-4 but always
     /// takes the rows=1 GEMV path, so it never needs this gate to fire.
     fn sg_eligible(shape: Exl3Shape, trellis: DeviceSpan<'_>) -> bool {
-        shape.in_tiles % 2 == 0 && shape.out_tiles % 4 == 0 && trellis.byte_offset % 4 == 0
+        Self::sg_eligible_at(shape, trellis.byte_offset)
+    }
+
+    /// Alignment-only form of `sg_eligible` (policy helpers + tests take the
+    /// raw trellis byte_offset so they don't need a `DeviceSpan`/device).
+    fn sg_eligible_at(shape: Exl3Shape, trellis_offset: usize) -> bool {
+        shape.in_tiles % 2 == 0 && shape.out_tiles % 4 == 0 && trellis_offset % 4 == 0
+    }
+
+    /// T3.10 K-split policy for the sg GEMM: fill under-waved dispatches up
+    /// to the measured ~320 concurrent threadgroup slots (gate/k phase
+    /// profile: gate@256 = 1344 TGs = 4.2 waves × 2.86 ms = 12.03 ms ✓), leave
+    /// ≥1-wave shapes unsplit (`base ≥ 320` → 1 → the old grid + direct-to-y
+    /// store, byte-identical for gate/down at normal rows), and never exceed
+    /// `stages` (an empty slice would write garbage partials). Rows-aware:
+    /// a rows-blind policy splits every shape at small `rows` — including
+    /// gate at rows=64, where the split is an exact wave-time wash plus
+    /// partial I/O — and does nothing at rows=512 where tiny-out k/v already
+    /// got their win from the rows term (`base` grows with `rows.div_ceil(64)`).
+    fn sg_splits(shape: Exl3Shape, rows: usize) -> usize {
+        const TARGET_TGS: usize = 320;
+        const MAX_SPLIT: usize = 8;
+        let base = (shape.out_tiles / 4).max(1) * rows.div_ceil(64).max(1);
+        let stages = (shape.in_tiles / 2).max(1);
+        TARGET_TGS.div_ceil(base).clamp(1, MAX_SPLIT).min(stages)
     }
 
     /// The one gem-dispatch decision point: rows=1 → tuned single-row GEMV;
     /// sg-eligible multi-row → simdgroup tensor-core GEMM; otherwise the
-    /// scalar RGT=8 fallback. Shared by production (`encode_linear`) and the
-    /// phase bench so measurements reflect what production runs.
+    /// scalar RGT=8 fallback. Shared by production (`encode_linear_with_scratch`)
+    /// and the phase bench so measurements reflect what production runs.
+    /// `ext_partial`: decoder arena (`encode_linear_with_scratch`); `None` →
+    /// transient per-call partial (host test/bench hooks only).
     #[allow(clippy::too_many_arguments)]
     fn encode_gem(
         &self,
@@ -560,12 +793,13 @@ impl Exl3Gemv {
         shape: Exl3Shape,
         mode: u32,
         y: &Buffer,
+        ext_partial: Option<&Buffer>,
         rows: usize,
     ) {
         if rows == 1 {
-            self.encode_gemv(enc, xh, trellis, pair, shape, mode, y);
+            self.encode_gemv(enc, xh, trellis, pair, shape, mode, y, ext_partial);
         } else if Self::sg_eligible(shape, trellis) {
-            self.encode_gemm_sg(enc, xh, trellis, shape, mode, y, rows);
+            self.encode_gemm_sg(enc, xh, trellis, shape, mode, y, ext_partial, rows);
         } else {
             self.encode_gemm(enc, xh, trellis, pair, shape, mode, y, rows);
         }
@@ -653,7 +887,7 @@ impl Exl3Gemv {
         }
         Self::ensure_span_fits(&suh, n * 2, "suh", 2)?;
         out.resize(n, f16::ZERO);
-        self.with_scratch(n, 0, |sc| {
+        self.with_scratch(n, 0, 1, |sc| {
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     x.as_ptr() as *const u8,
@@ -701,7 +935,7 @@ impl Exl3Gemv {
         )?;
         let pair = self.pair_buffer(shape.k);
         out.resize(shape.out_features(), 0.0);
-        self.with_scratch(xh.len(), shape.out_features(), |sc| {
+        self.with_scratch(xh.len(), shape.out_features(), 1, |sc| {
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     xh.as_ptr() as *const u8,
@@ -711,7 +945,7 @@ impl Exl3Gemv {
             }
             let cb = self.queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
-            self.encode_gemv(enc, &sc.xh, trellis, &pair, shape, mode, &sc.y);
+            self.encode_gemv(enc, &sc.xh, trellis, &pair, shape, mode, &sc.y, None);
             enc.end_encoding();
             cb.commit();
             cb.wait_until_completed();
@@ -745,7 +979,7 @@ impl Exl3Gemv {
         }
         Self::ensure_span_fits(&svh, n * 2, "svh", 2)?;
         out.resize(n, f16::ZERO);
-        self.with_scratch(0, n, |sc| {
+        self.with_scratch(0, n, 1, |sc| {
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     y.as_ptr() as *const u8,
@@ -812,7 +1046,7 @@ impl Exl3Gemv {
         let pair_buf = self.pair_buffer(shape.k);
         out.resize(outp, f16::ZERO);
 
-        self.with_scratch(inn, outp, |sc| {
+        self.with_scratch(inn, outp, 1, |sc| {
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     x.as_ptr() as *const u8,
@@ -822,7 +1056,7 @@ impl Exl3Gemv {
             }
             self.submit(|enc| {
                 self.encode_had_in(enc, &sc.x_stage, suh, &sc.xh, 1, inn);
-                self.encode_gemv(enc, &sc.xh, trellis, &pair_buf, shape, mode, &sc.y);
+                self.encode_gemv(enc, &sc.xh, trellis, &pair_buf, shape, mode, &sc.y, None);
                 self.encode_had_out(enc, &sc.y, svh, &sc.yh, 1, outp);
             })?;
             unsafe {
@@ -898,9 +1132,11 @@ impl Exl3Gemv {
         check_span_fits(&svh, outp * 2, "svh", 2)?;
         let pair_buf = self.pair_buffer(shape.k);
         let x_rows = Self::xh_rows(rows, shape, trellis);
-        self.with_scratch(x_rows * inn, rows * outp, |sc| {
+        self.with_scratch(x_rows * inn, rows * outp, rows, |sc| {
             self.encode_had_in(enc, x, suh, &sc.xh, rows, inn);
-            self.encode_gem(enc, &sc.xh, trellis, &pair_buf, shape, mode, &sc.y, rows);
+            self.encode_gem(
+                enc, &sc.xh, trellis, &pair_buf, shape, mode, &sc.y, None, rows,
+            );
             self.encode_had_out(enc, &sc.y, svh, out, rows, outp);
         });
         Ok(())
@@ -938,12 +1174,12 @@ impl Exl3Gemv {
         let x_rows = Self::xh_rows(rows, shape, trellis);
 
         let mut result = (0.0f64, 0.0f64, 0.0f64);
-        self.with_scratch(x_rows * inn, rows * outp, |sc| {
+        self.with_scratch(x_rows * inn, rows * outp, rows, |sc| {
             // Warm-up (shader specialization / scratch residency).
             for _ in 0..2 {
                 self.submit(|enc| {
                     self.encode_had_in(enc, x, suh, &sc.xh, rows, inn);
-                    self.encode_gem(enc, &sc.xh, trellis, &pair_buf, shape, mode, &sc.y, rows);
+                    self.encode_gem(enc, &sc.xh, trellis, &pair_buf, shape, mode, &sc.y, None, rows);
                     self.encode_had_out(enc, &sc.y, svh, out, rows, outp);
                 })
                 .expect("warmup submit");
@@ -964,7 +1200,7 @@ impl Exl3Gemv {
                 let t0 = std::time::Instant::now();
                 for _ in 0..reps {
                     gemv.submit(|enc| {
-                        gemv.encode_gem(enc, &sc.xh, trellis, &pair_buf, shape, mode, &sc.y, rows);
+                        gemv.encode_gem(enc, &sc.xh, trellis, &pair_buf, shape, mode, &sc.y, None, rows);
                     })
                     .expect("gem submit");
                 }
@@ -989,7 +1225,7 @@ impl Exl3Gemv {
             for _ in 0..reps {
                 self.submit(|enc| {
                     self.encode_had_in(enc, x, suh, &sc.xh, rows, inn);
-                    self.encode_gem(enc, &sc.xh, trellis, &pair_buf, shape, mode, &sc.y, rows);
+                    self.encode_gem(enc, &sc.xh, trellis, &pair_buf, shape, mode, &sc.y, None, rows);
                     self.encode_had_out(enc, &sc.y, svh, out, rows, outp);
                 })
                 .expect("full submit");
@@ -1056,6 +1292,103 @@ mod tests {
         assert_eq!(Exl3Gemv::gemv_splits(256), 16); // k/v (4096 out), was 4
         assert_eq!(Exl3Gemv::gemv_splits(64), 16); // clamped (want 64)
         assert_eq!(Exl3Gemv::gemv_splits(1), 16);
+    }
+
+    /// T3.10 policy: split only under-waved shapes (base_tgs < 320), rows-
+    /// aware so gate/down stay unsplit (byte-identical) at normal rows, and
+    /// never exceed `stages` (empty slice would write garbage partials).
+    #[test]
+    fn sg_splits_policy_covers_shapes() {
+        let sh = |in_f: usize, out_f: usize| Exl3Shape::new(in_f, out_f, 3).expect("shape");
+        let gate = sh(5376, 21504); // out_tiles 1344
+        let kv = sh(5376, 4096); // out_tiles 256
+        let q = sh(5376, 8192); // out_tiles 512
+        let o = sh(5376, 5376); // out_tiles 336
+        let tiny_kv = sh(5376, 128); // out_tiles 8 (sliding-window layers)
+        let stages_capped = sh(32, 512); // in_tiles 2 → stages 1
+        // gate/down: ≥1 wave at every realistic rows → unsplit everywhere.
+        for rows in [2usize, 64, 128, 256, 512, 8192] {
+            assert_eq!(Exl3Gemv::sg_splits(gate, rows), 1, "gate rows={rows}");
+        }
+        // k/v: split only while under-waved (base < 320); rows=512 already
+        // 512 TGs → exact-wash regime → must stay unsplit.
+        assert_eq!(Exl3Gemv::sg_splits(kv, 64), 5); // base 64
+        assert_eq!(Exl3Gemv::sg_splits(kv, 256), 2); // base 256
+        assert_eq!(Exl3Gemv::sg_splits(kv, 512), 1); // base 512
+        assert_eq!(Exl3Gemv::sg_splits(kv, 8192), 1);
+        // q: mild split at tiny rows only.
+        assert_eq!(Exl3Gemv::sg_splits(q, 64), 3); // base 128
+        assert_eq!(Exl3Gemv::sg_splits(q, 256), 1); // base 512
+        // o: base 84 at rows=64 → 4; rows=256 → 336 → 1.
+        assert_eq!(Exl3Gemv::sg_splits(o, 64), 4);
+        assert_eq!(Exl3Gemv::sg_splits(o, 256), 1);
+        // tiny-out k/v layers: still starved at rows=512 → full 8.
+        assert_eq!(Exl3Gemv::sg_splits(tiny_kv, 512), 8); // base 16
+        assert_eq!(Exl3Gemv::sg_splits(tiny_kv, 8192), 2); // base 256
+        // stages cap: never split past the slice count (min with stages=1).
+        assert_eq!(Exl3Gemv::sg_splits(stages_capped, 64), 1);
+    }
+
+    /// T3.5 policy: `chunk_scratch_needs` single-sources `xh_rows` /
+    /// `sg_eligible` / `sg_splits` for the per-chunk prefill arena. The sg
+    /// K-split partial (up to ~8.4 MB at rows=256 k/v) must land here, never
+    /// in the shared decode `partial` (≤ ~344 KB, R4).
+    #[test]
+    fn chunk_scratch_needs_policy() {
+        let sh = |in_f: usize, out_f: usize| Exl3Shape::new(in_f, out_f, 3).expect("shape");
+        let gate = sh(5376, 21504); // out_tiles 1344, eligible
+        let kv = sh(5376, 4096); // out_tiles 256, eligible
+        let lm = sh(21504, 262144); // lm_head, out_tiles 16384
+        let aligned = 0usize; // trellis byte_offset % 4 == 0
+        let misaligned = 2usize;
+
+        // rows=1 (decode): no 64-row xh pad, no sg path, partial = 0.
+        assert_eq!(
+            Exl3Gemv::chunk_scratch_needs(kv, aligned, 1),
+            (5376, 4096, 0),
+            "rows=1 must not pad or split"
+        );
+
+        // k/v @ rows=256: eligible + nsplit=2 → partial = 2×256×4096×4.
+        assert_eq!(
+            Exl3Gemv::chunk_scratch_needs(kv, aligned, 256),
+            (256 * 5376, 256 * 4096, 2 * 256 * 4096 * 4),
+            "k/v rows=256 arena: xh unpadded (256%64==0), partial 8388608 B"
+        );
+        assert_eq!(
+            Exl3Gemv::chunk_scratch_needs(kv, aligned, 64).2,
+            5 * 64 * 4096 * 4
+        );
+        assert_eq!(
+            Exl3Gemv::chunk_scratch_needs(kv, aligned, 512).2,
+            0,
+            "nsplit=1 @512"
+        );
+
+        // gate @ rows=256: eligible (xh pads) but nsplit=1 → partial = 0.
+        let (gx, gy, gp) = Exl3Gemv::chunk_scratch_needs(gate, aligned, 256);
+        assert_eq!((gx, gy), (256 * 5376, 256 * 21504));
+        assert_eq!(gp, 0, "gate must never need sg partial");
+
+        // Ragged rows: xh pads to 64 (100 → 128), y does not.
+        let (kx, ky, kp) = Exl3Gemv::chunk_scratch_needs(kv, aligned, 100);
+        assert_eq!(kx, 128 * 5376, "xh pads to 64-row boundary");
+        assert_eq!(ky, 100 * 4096, "y is rows×N, unpadded");
+        assert_eq!(kp, Exl3Gemv::sg_partial_bytes(kv, aligned, 100));
+
+        // Misaligned trellis (byte_offset % 4 != 0): not sg-eligible → no pad,
+        // no partial, even for k/v at rows=256.
+        assert_eq!(
+            Exl3Gemv::chunk_scratch_needs(kv, misaligned, 256),
+            (256 * 5376, 256 * 4096, 0)
+        );
+
+        // lm_head @ rows=1 (last-chunk fallback uses encode_linear, but the
+        // sizes helper must still be well-defined): out%16 ok, rows=1 → no pad.
+        assert_eq!(
+            Exl3Gemv::chunk_scratch_needs(lm, aligned, 1),
+            (1 * 21504, 1 * 262144, 0)
+        );
     }
 
     fn build_probe(device: &Device, name: &str) -> ComputePipelineState {
@@ -1258,6 +1591,11 @@ mod tests {
             1,
             ROWS as u32,
         ];
+        // T3.10: the production sg kernel now reads Exl3GemmSgParams (36 B);
+        // nsplit=1 → old unsplit path, stride unused (tg.z=0).
+        let mut params_real: [u32; 9] = [0; 9];
+        params_real[..7].copy_from_slice(&params_dec);
+        params_real[7] = 1;
 
         let ceil_pipe = build_probe(&device, "exl3_gemm_sg_ceiling");
         let dec_pipe = build_probe(&device, "exl3_gemm_sg_decode_only");
@@ -1284,7 +1622,7 @@ mod tests {
                 enc.set_buffer(1, Some(&trellis), 0);
                 enc.set_buffer(2, Some(&inv_perm), 0);
                 enc.set_buffer(3, Some(&y), 0);
-                enc.set_bytes(4, 28, params_dec.as_ptr() as *const _);
+                enc.set_bytes(4, 36, params_real.as_ptr() as *const _);
                 dispatch_sg(enc, out_tiles, ROWS);
             })
             .expect("real sg dispatch");

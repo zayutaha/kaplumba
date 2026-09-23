@@ -38,7 +38,7 @@
 //! end by the recorded-fixture test.
 
 use half::f16;
-use kaplumba_kernels::{AttnParams, DeviceSpan, Exl3Shape};
+use kaplumba_kernels::{AttnParams, ChunkScratch, DeviceSpan, Exl3Shape};
 use metal::{Buffer, CommandBufferRef, ComputeCommandEncoderRef, Device, MTLResourceOptions};
 
 use crate::gemma4::{Gemma4Model, GemmaError, LayerKind};
@@ -92,6 +92,11 @@ struct LayerW {
 }
 
 /// Activation arena + weight staging for one model.
+///
+/// **No separate scratch buffers** (user directive 2026-09-23): GEMM temps
+/// (`xh`/`y`/sg-or-gemv `partial`) live in `lin_temps`, sized once at
+/// construction for `batch_rows` (decode row 0 fits). Not grow-on-demand,
+/// not per-chunk — the only KV growth with context is the KV cache itself.
 pub struct GpuDecoder {
     hidden: usize,
     intermediate: usize,
@@ -104,6 +109,8 @@ pub struct GpuDecoder {
     /// `cache_cap` this decoder was built for: RoPE tables are sized once, so a
     /// later cache with a **larger** capacity must rebuild (`ensure_decoder`).
     pub(crate) built_cap: usize,
+    /// Fixed linear temps for decode + prefill (one set, never reallocated).
+    lin_temps: ChunkScratch,
     /// Residual-stream ring (see module docs).
     x: [Buffer; 3],
     xn: Buffer,
@@ -252,6 +259,47 @@ impl GpuDecoder {
         }
 
         let a = |n: usize| half_buf(device, n);
+
+        // Fixed linear temps: component-wise max over every linear at both
+        // batch_rows (prefill) and rows=1 (decode + lm_head). Single-sources
+        // eligibility/sg-split/gemv-split via `chunk_scratch_needs`.
+        let mut max_xh = 0usize;
+        let mut max_y = 0usize;
+        let mut max_partial = 0usize;
+        {
+            let mut grow = |lin: &LinearHandles, rows: usize| {
+                let (xh, y, p) = MetalLinear::chunk_scratch_needs(lin, rows);
+                max_xh = max_xh.max(xh);
+                max_y = max_y.max(y);
+                max_partial = max_partial.max(p);
+            };
+            for lw in &layers {
+                for lin in [
+                    &lw.q,
+                    &lw.k,
+                    lw.v.as_ref().unwrap_or(&lw.k),
+                    &lw.o,
+                    &lw.gate,
+                    &lw.up,
+                    &lw.down,
+                ] {
+                    grow(lin, batch_rows);
+                    grow(lin, 1);
+                }
+            }
+            grow(&lm, 1);
+        }
+        let lin_temps = gpu.chunk_scratch(max_xh, max_y, max_partial);
+
+        // k/v row width: actual max over layers (`n_kv * head_dim`), not
+        // `MAX_NKV * MAX_HD` (8192) — real max is 16×256 = 4096 (−6.3 MB).
+        let max_kv_row = cfg
+            .layers
+            .iter()
+            .map(|lc| lc.n_kv * lc.head_dim)
+            .max()
+            .unwrap_or(MAX_NKV * MAX_HD);
+
         Ok(Some(Self {
             hidden,
             intermediate,
@@ -259,6 +307,7 @@ impl GpuDecoder {
             vocab,
             batch_rows,
             built_cap: cache_cap.max(1),
+            lin_temps,
             x: [
                 a(hidden * batch_rows),
                 a(hidden * batch_rows),
@@ -267,9 +316,9 @@ impl GpuDecoder {
             xn: a(hidden * batch_rows),
             q_raw: a(batch_rows * n_heads * MAX_HD),
             q: a(batch_rows * n_heads * MAX_HD),
-            k_raw: a(batch_rows * MAX_NKV * MAX_HD),
-            k_norm: a(batch_rows * MAX_NKV * MAX_HD),
-            v_raw: a(batch_rows * MAX_NKV * MAX_HD),
+            k_raw: a(batch_rows * max_kv_row),
+            k_norm: a(batch_rows * max_kv_row),
+            v_raw: a(batch_rows * max_kv_row),
             attn: a(batch_rows * n_heads * MAX_HD),
             o_proj: a(hidden * batch_rows),
             o_norm: a(hidden * batch_rows),
@@ -343,8 +392,8 @@ impl GpuDecoder {
                 hidden,
                 eps,
             )?;
-            gpu.encode_linear(enc, &lw.q, &self.xn, &self.q_raw, 1)?;
-            gpu.encode_linear(enc, &lw.k, &self.xn, &self.k_raw, 1)?;
+            gpu.encode_linear_with_scratch(enc, &lw.q, &self.xn, &self.q_raw, 1, &self.lin_temps)?;
+            gpu.encode_linear_with_scratch(enc, &lw.k, &self.xn, &self.k_raw, 1, &self.lin_temps)?;
             // q/k per-head norms, then rope. Rope reads two elements per output
             // element, so it always needs distinct in/out buffers: q ropes
             // q → q_raw (q_raw is free once the norm above has read it) and
@@ -371,7 +420,14 @@ impl GpuDecoder {
             // which is why it is computed before the roped k overwrites nothing
             // and never reads a roped buffer.
             match &lw.v {
-                Some(lin) => gpu.encode_linear(enc, lin, &self.xn, &self.v_raw, 1)?,
+                Some(lin) => gpu.encode_linear_with_scratch(
+                    enc,
+                    lin,
+                    &self.xn,
+                    &self.v_raw,
+                    1,
+                    &self.lin_temps,
+                )?,
                 None => gpu.encode_rms(
                     enc,
                     span(&self.k_raw),
@@ -440,7 +496,14 @@ impl GpuDecoder {
                     window: crate::gemma4::layer_window(lw.kind, model.cfg.sliding_window),
                 },
             )?;
-            gpu.encode_linear(enc, &lw.o, &self.attn, &self.o_proj, 1)?;
+            gpu.encode_linear_with_scratch(
+                enc,
+                &lw.o,
+                &self.attn,
+                &self.o_proj,
+                1,
+                &self.lin_temps,
+            )?;
             gpu.encode_rms(
                 enc,
                 span(&self.o_proj),
@@ -462,8 +525,15 @@ impl GpuDecoder {
                 hidden,
                 eps,
             )?;
-            gpu.encode_linear(enc, &lw.gate, &self.xn, &self.gu_gate, 1)?;
-            gpu.encode_linear(enc, &lw.up, &self.xn, &self.gu_up, 1)?;
+            gpu.encode_linear_with_scratch(
+                enc,
+                &lw.gate,
+                &self.xn,
+                &self.gu_gate,
+                1,
+                &self.lin_temps,
+            )?;
+            gpu.encode_linear_with_scratch(enc, &lw.up, &self.xn, &self.gu_up, 1, &self.lin_temps)?;
             gpu.encode_gelu_mul(
                 enc,
                 span(&self.gu_gate),
@@ -471,7 +541,14 @@ impl GpuDecoder {
                 span(&self.gu),
                 self.intermediate,
             )?;
-            gpu.encode_linear(enc, &lw.down, &self.gu, &self.down, 1)?;
+            gpu.encode_linear_with_scratch(
+                enc,
+                &lw.down,
+                &self.gu,
+                &self.down,
+                1,
+                &self.lin_temps,
+            )?;
             gpu.encode_rms(
                 enc,
                 span(&self.down),
@@ -503,7 +580,14 @@ impl GpuDecoder {
             hidden,
             eps,
         )?;
-        gpu.encode_linear(enc, &self.lm, &self.xn_final, &self.logits_h, 1)?;
+        gpu.encode_linear_with_scratch(
+            enc,
+            &self.lm,
+            &self.xn_final,
+            &self.logits_h,
+            1,
+            &self.lin_temps,
+        )?;
         enc.end_encoding();
 
         // --- the single sync of the token ---
@@ -571,6 +655,9 @@ impl GpuDecoder {
                 }
             }
 
+            // Temps live in `self.lin_temps` (fixed at construction — no
+            // per-chunk allocation; user directive: no scratch buffers).
+
             let mut cb = gpu.new_command_buffer();
             let mut enc = cb.new_compute_command_encoder();
             for i in 0..upto {
@@ -583,6 +670,7 @@ impl GpuDecoder {
                     LayerKind::Full => (&self.rope_full.0, &self.rope_full.1),
                 };
                 let hd = lw.head_dim;
+                let sc = &self.lin_temps;
 
                 // --- attention sublayer (rows = m) ---
                 gpu.encode_rms(
@@ -594,8 +682,8 @@ impl GpuDecoder {
                     hidden,
                     eps,
                 )?;
-                gpu.encode_linear(enc, &lw.q, &self.xn, &self.q_raw, m)?;
-                gpu.encode_linear(enc, &lw.k, &self.xn, &self.k_raw, m)?;
+                gpu.encode_linear_with_scratch(enc, &lw.q, &self.xn, &self.q_raw, m, sc)?;
+                gpu.encode_linear_with_scratch(enc, &lw.k, &self.xn, &self.k_raw, m, sc)?;
                 // Per-head norms flattened: row r of q_raw is head r % n_heads of
                 // token r / n_heads, so m*n_heads rows of head_dim norm correctly.
                 gpu.encode_rms(
@@ -617,7 +705,9 @@ impl GpuDecoder {
                     eps,
                 )?;
                 match &lw.v {
-                    Some(lin) => gpu.encode_linear(enc, lin, &self.xn, &self.v_raw, m)?,
+                    Some(lin) => {
+                        gpu.encode_linear_with_scratch(enc, lin, &self.xn, &self.v_raw, m, sc)?
+                    }
                     None => gpu.encode_rms(
                         enc,
                         span(&self.k_raw),
@@ -689,7 +779,7 @@ impl GpuDecoder {
                         window: crate::gemma4::layer_window(lw.kind, model.cfg.sliding_window),
                     },
                 )?;
-                gpu.encode_linear(enc, &lw.o, &self.attn, &self.o_proj, m)?;
+                gpu.encode_linear_with_scratch(enc, &lw.o, &self.attn, &self.o_proj, m, sc)?;
                 gpu.encode_rms(
                     enc,
                     span(&self.o_proj),
@@ -711,8 +801,8 @@ impl GpuDecoder {
                     hidden,
                     eps,
                 )?;
-                gpu.encode_linear(enc, &lw.gate, &self.xn, &self.gu_gate, m)?;
-                gpu.encode_linear(enc, &lw.up, &self.xn, &self.gu_up, m)?;
+                gpu.encode_linear_with_scratch(enc, &lw.gate, &self.xn, &self.gu_gate, m, sc)?;
+                gpu.encode_linear_with_scratch(enc, &lw.up, &self.xn, &self.gu_up, m, sc)?;
                 gpu.encode_gelu_mul(
                     enc,
                     span(&self.gu_gate),
@@ -720,7 +810,7 @@ impl GpuDecoder {
                     span(&self.gu),
                     self.intermediate * m,
                 )?;
-                gpu.encode_linear(enc, &lw.down, &self.gu, &self.down, m)?;
+                gpu.encode_linear_with_scratch(enc, &lw.down, &self.gu, &self.down, m, sc)?;
                 gpu.encode_rms(
                     enc,
                     span(&self.down),
@@ -767,7 +857,14 @@ impl GpuDecoder {
                     hidden,
                     eps,
                 )?;
-                gpu.encode_linear(enc, &self.lm, &self.xn_final, &self.logits_h, 1)?;
+                gpu.encode_linear_with_scratch(
+                    enc,
+                    &self.lm,
+                    &self.xn_final,
+                    &self.logits_h,
+                    1,
+                    &self.lin_temps,
+                )?;
             }
             if prof {
                 prof_encode += t_enc.elapsed().as_secs_f64() * 1e3;

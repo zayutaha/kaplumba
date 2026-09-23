@@ -2602,4 +2602,89 @@ mod tests {
         );
         assert!(a >= 0.0, "non-layer intercept negative? t0 {t0} t10 {t10}");
     }
+
+    /// T4 / R4: prefill must not grow process RSS beyond the KV window once
+    /// warm (decoder arena + linear temps are fixed at construction; there is
+    /// no shared grow-on-demand scratch anymore — user directive). Warmup at
+    /// full cap builds the decoder and parks any freelist high-water; the
+    /// measured prefill then must leave RSS growth ≤ 48 MB after the KV cache
+    /// is dropped on both sides of the comparison.
+    /// `KAPLUMBA_RUN_SLOW=1 cargo test -p kaplumba-engine --release --lib --
+    /// --ignored --nocapture prefill_memory_profile_slow`.
+    #[test]
+    #[ignore]
+    fn prefill_memory_profile_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+
+        fn rss_kb() -> u64 {
+            let out = std::process::Command::new("ps")
+                .args(["-o", "rss=", "-p", &std::process::id().to_string()])
+                .output()
+                .expect("ps -o rss=");
+            let s = String::from_utf8_lossy(&out.stdout);
+            s.trim().parse().expect("rss KB integer")
+        }
+
+        let ctx = crate::metal_ctx::MetalContext::new().expect("metal context");
+        let model = crate::load::load_exl3(&ctx, &dir).expect("load artifact");
+        let gpu = crate::metal_linear::MetalLinear::new(&ctx).expect("metal linear");
+        let g = Gemma4Model::from_model(&model)
+            .expect("gemma cfg")
+            .with_gpu(&gpu);
+        assert!(g.gpu_enabled(), "profile must run the GPU path");
+
+        const CAP: usize = 8200; // ≥ 8192 + slack; decoder built once at full cap
+        let tok = |n: usize| -> Vec<u32> { (0..n as u32).map(|i| (i % 997) + 2).collect() };
+        let span_prefill = |g: &Gemma4Model<'_>, n: usize| {
+            let mut kv = g.new_kv_cache(CAP);
+            let tokens = tok(n);
+            let t0 = std::time::Instant::now();
+            g.forward_cached(&mut kv, &tokens).expect("span prefill");
+            let dt = t0.elapsed().as_secs_f64();
+            assert_eq!(kv.len(), n, "token accounting");
+            eprintln!("[T4] prefill {n}: {dt:.1}s → {:.1} t/s", n as f64 / dt);
+        };
+
+        // Warmup at full cap: decode builds the decoder (fixed lin_temps +
+        // arena) and sizes the rows=1 path; multi-row + full prefill park any
+        // freelist high-water so the measured run does not pay it.
+        {
+            let mut kv = g.new_kv_cache(CAP);
+            assert!(
+                kv.is_device_backed(),
+                "device KV required for GPU span path"
+            );
+            g.forward_cached(&mut kv, &tok(1)).expect("warmup decode");
+            g.forward_cached(&mut kv, &tok(4)).expect("warmup 4-row");
+            g.forward_cached(&mut kv, &tok(256))
+                .expect("warmup 256-row");
+            assert_eq!(kv.len(), 1 + 4 + 256, "warmup accounting");
+        }
+        span_prefill(&g, 8192);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let rss0 = rss_kb();
+        eprintln!("[T4] baseline: rss={rss0}KB");
+
+        // Measured run: fresh full-cap KV → 8192-token span → drop KV (R4
+        // compares growth with the KV gone on both sides).
+        span_prefill(&g, 8192);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        let rss1 = rss_kb();
+        eprintln!("[T4] after:    rss={rss1}KB");
+        let growth_kb = rss1.saturating_sub(rss0);
+        assert!(
+            growth_kb <= 48 * 1024,
+            "RSS grew {growth_kb} KB after prefill with KV dropped (limit 48 MB, R4)"
+        );
+        eprintln!("[T4] RSS growth {growth_kb} KB (limit 49152)");
+    }
 }

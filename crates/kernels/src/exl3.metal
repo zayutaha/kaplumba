@@ -56,6 +56,23 @@ struct Exl3GemmParams {
     uint rows;
 };
 
+// T3.10 K-split extension for the sg path only (scalar exl3_gemm and the
+// T3.8 probes keep the 7-field Exl3GemmParams): `nsplit` slices the stage
+// range across grid.z and `stride` (elements) is the partial row-padded
+// slice pitch — buffer(3) is `y` when nsplit==1 (old flat path, tg.z=0 →
+// offset 0) or the shared partial buffer otherwise.
+struct Exl3GemmSgParams {
+    uint in_tiles;
+    uint out_tiles;
+    uint k;
+    uint twords;
+    uint mode;
+    uint aligned;
+    uint rows;
+    uint nsplit;
+    uint stride;
+};
+
 // Row geometry for the Hadamard passes: rows of `row_len` elements, so the
 // 2-D threadgroup grid is (row_len/128, rows) and row 0 with rows=1 reduces to
 // the original 1-D dispatch.
@@ -506,10 +523,12 @@ constant uint SG_THREADS = 128u;
 kernel void exl3_gemm_sg(device const half *xh [[buffer(0)]],
                          device const ushort *trellis [[buffer(1)]],
                          device const uint *inv_perm [[buffer(2)]],
-                         device float *y [[buffer(3)]],
-                         constant Exl3GemmParams &p [[buffer(4)]],
-                         uint2 tg [[threadgroup_position_in_grid]],
-                         uint2 thr [[thread_position_in_threadgroup]]) {
+                         device float *y [[buffer(3)]], // y (nsplit==1) or partial
+                         constant Exl3GemmSgParams &p [[buffer(4)]],
+                         uint3 tg3 [[threadgroup_position_in_grid]],
+                         // uint3 (not uint2): MSL requires every attribute
+                         // arg to be the same vector width as tg3.
+                         uint3 thr [[thread_position_in_threadgroup]]) {
     threadgroup half wblk[32u * SG_WS]; // 32 in × 64 out, stride 72 (4.5 KB)
     threadgroup float csc[4u * 64u];    // per-simdgroup 8×8 store scratch (1 KB)
 
@@ -519,8 +538,8 @@ kernel void exl3_gemm_sg(device const half *xh [[buffer(0)]],
     uint sgr = sgid >> 1u; // 0..1 → token rows  0..31 / 32..63
     uint sgc = sgid & 1u;  // 0..1 → out cols    0..31 / 32..31
 
-    uint ot0 = tg.x * 4u;
-    uint row0 = tg.y * SG_BM;
+    uint ot0 = tg3.x * 4u;
+    uint row0 = tg3.y * SG_BM;
     if (row0 >= p.rows) {
         return; // threadgroup-uniform: safe before any barrier
     }
@@ -530,6 +549,14 @@ kernel void exl3_gemm_sg(device const half *xh [[buffer(0)]],
     uint K = nin * TILE;
     uint N = nout * TILE;
     uint stages = nin >> 1u; // host gates in_tiles even (≥ 2)
+    // T3.10: this grid.z slice of the stage range. nsplit == 1 → ks_lo 0,
+    // ks_hi stages — the old loop exactly.
+    uint nsplit = p.nsplit;
+    uint chunk = (stages + nsplit - 1u) / nsplit;
+    uint ks_lo = tg3.z * chunk;
+    uint ks_hi = min(ks_lo + chunk, stages);
+    // Slice base: y (offset 0) or partial[tg.z] (row-padded pitch).
+    device float *dst = y + (ulong)tg3.z * p.stride;
     uint blk_len = p.rows - row0; // live token rows in this TG (1..=64)
 
     // Decode-position precompute (fixed per thread; `_decode_full_t` mapping).
@@ -560,7 +587,7 @@ kernel void exl3_gemm_sg(device const half *xh [[buffer(0)]],
         xh + (ulong)(row0 + sgr * 32u) * K;
     bool aligned = p.aligned != 0u; // host gates byte_offset % 4 == 0
 
-    for (uint ks = 0u; ks < stages; ks++) {
+    for (uint ks = ks_lo; ks < ks_hi; ks++) {
         // Previous stage's B fragment loads must finish before overwrite.
         threadgroup_barrier(mem_flags::mem_threadgroup);
         // T3.9 phase-split funnel: issue all 32 global loads for the stage
@@ -627,6 +654,8 @@ kernel void exl3_gemm_sg(device const half *xh [[buffer(0)]],
     // (exl3_had_out rounds), so the scatter writes straight through. Only
     // simdgroup_barriers: the ragged-tail `break` is sgr-uniform within a
     // simdgroup, so the 4 simdgroups may exit the loop at different r.
+    // T3.10: `dst` is y (nsplit==1, tg.z=0 → offset 0) or this split's
+    // partial slice — row-padded pitch keeps slice bases aligned to 64 rows.
     uint cb0 = ot0 * TILE + sgc * 32u;
     uint rbase = sgr * 32u;
     for (uint r = 0u; r < 4u; r++) {
@@ -641,13 +670,31 @@ kernel void exl3_gemm_sg(device const half *xh [[buffer(0)]],
                 uint cc = i & 7u;
                 uint gr = rbase + r * 8u + rr;
                 if (gr < blk_len) {
-                    y[(ulong)(row0 + gr) * N + cb0 + cf * 8u + cc] =
+                    dst[(ulong)(row0 + gr) * N + cb0 + cf * 8u + cc] =
                         csc[sgid * 64u + i];
                 }
             }
             simdgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
+}
+
+// T3.10: y[i] = Σ_s partial[s, i] after a K-split sg GEMM. Fixed
+// s-ascending order per element → deterministic run-to-run (greedy decode
+// determinism forbids atomics). `p` = {nsplit, stride elements, live total}.
+// Only live elements [0, rows*N) are read — padded store rows never written.
+kernel void exl3_gemm_sg_reduce(device const float *partial [[buffer(0)]],
+                                device float *y [[buffer(1)]],
+                                constant uint3 &p [[buffer(2)]],
+                                uint gid [[thread_position_in_grid]]) {
+    if (gid >= p.z) {
+        return;
+    }
+    float s = 0.0f;
+    for (uint sp = 0u; sp < p.x; sp++) {
+        s += partial[(ulong)sp * p.y + gid];
+    }
+    y[gid] = s;
 }
 
 // ---------------------------------------------------------------------------
