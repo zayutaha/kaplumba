@@ -62,6 +62,22 @@ This document records technical decisions, benchmark measurements, register allo
 - **Learned**: the "load-then-decode serial → issue-bound" theory is **not** confirmed on M4 Pro. With 2-way unroll already issuing 8 loads per iteration and ~hundreds of live threadgroups, the ~60% bus utilization is probably a genuine memory-system/coalescing ceiling, not latency. A non-array `simd_shuffle`/scalar double-buffer might dodge the spill issue, but the ExllamaV3 PF trick does not obviously transfer. Do not retry without a register-spill check (e.g. `xcrun metal -frameworks Metal -c ... -gline-tables-only` / compile with `-zeitgeist` or inspect SASS-like disassembly).
 - Correctness was NOT the problem: kernels 21/21, one-hot GPU==CPU, decoded-tile parity, `gpu_linear_matches_cpu_reference`, 116 fast engine tests — all green while perf regressed. Reverted in `fb26c21`.
 
+### T5.2r — nsplit sweep, baked argmax LANDED (2026-09-23)
+- **Instrumentation**: `gemv_pass` refactored → `gemv_pass_nsplit(xh, trellis, shape, mode, Some(nsplit), out)`; `encode_gemv` gained `nsplit_override: Option<usize>` (None → policy; production callers unchanged). Sweep test `bench_gemv_split_sweep_slow` (KAPLUMBA_RUN_SLOW, ignored) prints min-ms per nsplit ∈ {1,2,4,8,16,32} per real shape; gemv-only (no had), 12 reps.
+- **Sweep (swap 9501→9900/10240 MB, stable-ish)**, best nsplit → Gw/s:
+  | shape | in/out tiles | n=1 | 2 | 4 | 8 | 16 | 32 | argmax |
+  |---|---|---|---|---|---|---|---|---|
+  | gate | 336×1344 | 85 | 165 | **167** | 164 | 152 | 140 | 4 |
+  | down | 1344×336 | 142 | 154 | 161 | 163 | **167** | 161 | 16 |
+  | o | 512×336 | 105 | 109 | 113 | **114** | 113 | 111 | 8 |
+  | q | 336×512 | 110 | 115 | **119** | 111 | 112 | 106 | 4 |
+  | k | 336×256 | 76 | 78 | 81 | **89** | 78 | 76 | 8 |
+  | v | 336×256 | 73 | 72 | 78 | **78** | 78 | 75 | 8 |
+  | lm_head | 336×16384 | **241** | 238 | 235 | 225 | 207 | 184 | 1 |
+- **Policy change** (`gemv_splits`): only two real outliers from the 4096-TG target formula — q 8→4 (119 Gw/s), k/v 16→8 (89/78). gate 4, down/o 13 (band 8–16 straddled), lm 1 stay on the formula. Policy test updated.
+- **A/B `bench_passes_slow` (swap 9692/10240 both sides)**: gate 165→**168**, down 168→**168**, o 109→**113**, q 111→**115**, k 70→**76** (+9%), v 76→**79**, lm 243→**242**; no shape below T4 baseline. Commit `d8adb19`.
+- Note: opt. TG count for q/k/v ≈ 2048, not the 4096 target — but apex is pull-shaped, not a cliff (all ≥ ~111 at n≥4); the 4096 target stays fine for other shapes.
+
 ### T1: Filter vision tower tensors during model load
 - Implemented `is_vision_tensor` in `crates/engine/src/load.rs`.
 - Safetensors loader skips 356 tensors matching `model.vision_tower.*` and `model.embed_vision.*`.

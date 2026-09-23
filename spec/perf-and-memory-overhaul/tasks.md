@@ -37,10 +37,11 @@
   - **Result**: PF=4 ring (4-slot, dynamic `I&3` indexing, consume-then-refill I+4) regressed EVERY shape: gate 165→107, down 168→108, o 109→80, q 111→81, k 70→63, v 76→57, lm 243→135 Gw/s. Correctness fine (21/21, one-hot, parity, 116 fast). Likely cause: MSL arrays with dynamic indexing demoted to stack memory (spill) + occupancy cut. See implementation_notes §T5.1r.
   - **Testing**: kernels 21/21, parity tests, one-hot; **bench gate/down ≥ 200 Gw/s or revert** → reverted.
 
-- [ ] **T5.2r: Split-policy empirical sweep**
-  - **Files**: `crates/kernels/src/exl3.rs`
+- [x] **T5.2r: Split-policy empirical sweep** — LANDED `d8adb19`
+  - **Files**: `crates/kernels/src/exl3.rs`, `crates/engine/src/metal_linear.rs`
   - **Intent**: Measure k/v ∈ {2,4,8,16}, gate ∈ {1,2,4}, o ∈ {4,8,13}, q ∈ {2,4,8} isolated; bake per-shape argmax into `gemv_splits` + policy test. (T2.9 history: k/v best ≈ 4.)
-  - **Testing**: every shape ≥ its T4 baseline in bench_passes_slow; policy test updated.
+  - **Result**: sweep (gemv-only, 12 reps) argmax → gate 4 (167), down 16 (167), o 8 (114), q 4 (119), k 8 (89), v 8 (78), lm 1 (241). Baked only the 2 outliers vs 4096-TG formula: q 8→4, k/v 16→8. `bench_passes_slow` A/B: gate 165→168, down 168→168, o 109→113, q 111→115, k 70→76, v 76→79, lm 243→242 — no shape below baseline. Sweep harness `bench_gemv_split_sweep_slow` + `gemv_pass_nsplit` + `encode_gemv(nsplit_override)` retained for future splits.
+  - **Testing**: every shape ≥ T4 baseline in bench_passes_slow ✓; policy test updated; kernels 21/21, parity, 116 fast.
 
 - [ ] **T5.3r: Coalesced 96B loads on the 32-thread kernel (isolated)**
   - **Files**: `crates/kernels/src/exl3.metal`
