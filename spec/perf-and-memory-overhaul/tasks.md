@@ -21,9 +21,9 @@
   - **Testing**: `cargo test -p kaplumba-kernels`, `cargo test -p kaplumba-engine gpu_linear_matches_cpu_reference`.
 
 - [ ] **T5: Wire fast GEMV into `GpuDecoder::encode_token` & verify decode throughput**
-  - **Files**: `crates/engine/src/gpu_decode.rs`, `crates/engine/src/metal_linear.rs`
-  - **Intent**: Route single-row decode passes through the fast GEMV pipeline; measure generation throughput.
-  - **Testing**: `KAPLUMBA_RUN_SLOW=1 cargo test -p kaplumba-engine --release --lib -- --ignored --nocapture --test-threads=1 decode_throughput_slow` achieves ≥ 18.0 t/s.
+  - **Files**: `crates/engine/src/gpu_decode.rs`, `crates/engine/src/metal_linear.rs`, `crates/engine/tests/decode.rs`
+  - **Intent**: Route single-row decode passes through the fast GEMV pipeline; measure generation throughput and verify it reaches ≥ 20.0 t/s (gate ≥ 19.5 t/s).
+  - **Testing**: `KAPLUMBA_RUN_SLOW=1 cargo test -p kaplumba-engine --release --lib -- --ignored --nocapture --test-threads=1 decode_throughput_slow` achieves ≥ 19.5 t/s (target ≥ 20.0 t/s).
 
 - [ ] **T6: Implement fixed-size stripe buffer and fast dequantize stripe kernel**
   - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`, `crates/engine/src/gpu_decode.rs`

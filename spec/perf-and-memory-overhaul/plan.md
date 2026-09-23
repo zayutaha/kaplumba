@@ -23,7 +23,7 @@ x (1 row, hidden dim)
 [dq4 + simd_shuffle GEMV core]
   │  (Lane loads x_lane from tg_xh once; fetches row elements via simd_shuffle at register speed)
   │  (Lane loads two 32-bit words, extracts 4 codewords cw0..cw3 in one 64-bit window)
-  │  (Accumulates 8 weights per lane in registers; one threadgroup reduction at end)
+  │  (Accumulates 8 weights per lane in registers; simd_shuffle_down warp reduction: zero barrier, zero shared memory)
   ▼
 y (raw float output)
   │
@@ -64,7 +64,7 @@ y (m rows, out_features)
 2. `crates/kernels/src/exl3.metal`:
    - *Current*: `exl3_gemv` runs 4 `funnel_pair` calls with redundant 64-bit loads and scalar decode instructions; reads `xh` repeatedly from device memory; separate `exl3_had_in` dispatch.
    - *Change*:
-     - Add `exl3_gemv_fast` with inlined Hadamard prologue (`tg_xh`), SIMD shuffle for `x`, `dq4` window unpacking, and `half2` vector decoding.
+     - Add `exl3_gemv_fast` with inlined Hadamard prologue (`tg_xh`), SIMD shuffle for `x`, `dq4` window unpacking, `half2` vector decoding, and `simd_shuffle_down` warp reduction.
      - Add `exl3_dequant_stripe` kernel to decode 512 columns of EXL3 weights into FP16 buffer.
      - Add `exl3_stripe_gemm` kernel to run high-throughput FP16 tiled GEMM on the decoded stripe.
 
@@ -85,7 +85,7 @@ flowchart TD
     T1[T1: Omit Vision Tower in load.rs] --> T2[T2: Verify Resident Memory <= 14.6 GiB]
     T2 --> T3[T3: Vectorize exl3_decode & dq4 in exl3.metal]
     T3 --> T4[T4: SIMD-Shuffle Activations & Inlined Hadamard in GEMV]
-    T4 --> T5[T5: Integrate Fast GEMV into GpuDecoder & Verify Decode >= 18 t/s]
+    T4 --> T5[T5: Integrate Fast GEMV into GpuDecoder & Verify Decode >= 20 t/s]
     T5 --> T6[T6: Fixed Stripe Buffer & exl3_dequant_stripe Kernel]
     T6 --> T7[T7: High-Throughput Stripe GEMM Kernel]
     T7 --> T8[T8: Integrate Striped GEMM into GpuDecoder Prefill & Verify Prefill >= 200 t/s]

@@ -30,9 +30,9 @@ Eliminate memory bloat and performance bottlenecks in the Gemma 4 31B EXL3 engin
    The Hadamard right-side butterfly (`had_in`) must be inlined into the GEMV kernel for decode rows=1, eliminating separate kernel dispatches.
    *Testable*: `decode_throughput_slow` dispatches fewer command buffers/encoders and maintains numerical parity.
 
-5. **R5: Decode Generation Throughput ≥ 18.0 t/s**
-   Autoregressive generation (`decode_throughput_slow`, 64 tokens, greedy) must sustain ≥ 18.0 tokens/second on Apple M4 Pro.
-   *Testable*: `decode_throughput_slow` reports `tg_tps >= 18.0`.
+5. **R5: Decode Generation Throughput ≥ 20.0 t/s**
+   Autoregressive generation (`decode_throughput_slow`, 64 tokens, greedy) must sustain ≥ 20.0 tokens/second on Apple M4 Pro (with an automated test gate of ≥ 19.5 t/s to accommodate thermal margin, targeting ~20.0–20.8 t/s on cold runs).
+   *Testable*: `decode_throughput_slow` reports `tg_tps >= 19.5` and demonstrates 20.0+ t/s.
 
 6. **R6: Fixed-Size Striped Prefill GEMM**
    `GpuDecoder` owns a single, constant-sized 16 MB stripe buffer. Prefill decomposes wide linear layers into column stripes (e.g. 512 columns), dequantizing the stripe to FP16 and executing high-throughput tiled GEMM.
@@ -46,7 +46,7 @@ Eliminate memory bloat and performance bottlenecks in the Gemma 4 31B EXL3 engin
 - `cargo test -p kaplumba-kernels`: All tests pass.
 - `cargo test -p kaplumba-engine --lib -- --test-threads=1`: All 114+ tests pass.
 - `KAPLUMBA_RUN_SLOW=1 cargo test -p kaplumba-engine --release --lib -- --ignored --nocapture --test-threads=1`:
-  - `decode_throughput_slow`: ≥ 18.0 t/s.
+  - `decode_throughput_slow`: ≥ 20.0 t/s target (assertion gate ≥ 19.5 t/s).
   - `prefill_throughput_slow`: ≥ 200.0 t/s at 512 tokens.
   - `prefill_memory_profile_slow`: Baseline RSS ≤ 15.7 GB, prefill RSS delta ≤ 48 MB.
   - `real_artifact_cached_fixture_and_gpu_slow`: Golden fixture argmax token 236773 preserved.
