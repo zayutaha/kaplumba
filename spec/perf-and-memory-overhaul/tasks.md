@@ -20,10 +20,10 @@
   - **Intent**: Load `xh` once per 16 elements in a single coalesced 64-byte burst and distribute across rows via `simd_shuffle`, reducing activation DRAM loads by 8x.
   - **Testing**: `cargo test -p kaplumba-kernels` (21/21 passed), `gpu_linear_matches_cpu_reference` passed, `gpu_gemv_matches_cpu_decoded_tile` passed.
 
-- [ ] **T5: Wire fast GEMV into `GpuDecoder::encode_token` & verify decode throughput**
-  - **Files**: `crates/engine/src/gpu_decode.rs`, `crates/engine/src/metal_linear.rs`, `crates/engine/tests/decode.rs`
-  - **Intent**: Route single-row decode passes through the fast GEMV pipeline; measure generation throughput and verify it reaches ≥ 20.0 t/s (gate ≥ 19.5 t/s).
-  - **Testing**: `KAPLUMBA_RUN_SLOW=1 cargo test -p kaplumba-engine --release --lib -- --ignored --nocapture --test-threads=1 decode_throughput_slow` achieves ≥ 19.5 t/s (target ≥ 20.0 t/s).
+- [ ] **T5: Implement 128-thread cooperative GEMV with coalesced word loads & verify ≥ 20.0 t/s**
+  - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`, `crates/engine/src/gpu_decode.rs`, `crates/engine/src/gemma4.rs`
+  - **Intent**: Implement 4-simdgroup cooperative GEMV (`NSG=4`, 128 threads/TG) with in-tile striding `tk += 4`, private register accumulation `acc[8]`, on-chip threadgroup reduction `tg_w[4][256]`, and ExllamaV3 coalesced 96-byte tile word loading with `simd_shuffle`. Re-tune K-split policy (`min_split_tiles = 128`).
+  - **Testing**: `cargo test -p kaplumba-kernels`, `gpu_linear_matches_cpu_reference`, `bench_passes_slow` (linears sustain ≥ 200–240 Gw/s), `trace_chat_prompt_steps_slow` (coherence exact), and `decode_throughput_slow` achieves ≥ 19.5 t/s (target ≥ 20.0 t/s).
 
 - [ ] **T6: Implement fixed-size stripe buffer and fast dequantize stripe kernel**
   - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`, `crates/engine/src/gpu_decode.rs`

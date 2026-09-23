@@ -181,12 +181,15 @@ kernel void exl3_had_in(device const half *x [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------
-// y = xh @ decode(trellis)   (raw f32 output, one lane per output column)
+// y = xh @ decode(trellis)   (raw f32 output, 128 threads = 4 simdgroups/TG)
 // ---------------------------------------------------------------------------
-// One out-tile per 32-lane threadgroup. Fatter threadgroups (4 warps sharing a
-// threadgroup) measured *slower* on M4 Pro: with few out-tiles there are too
-// few threadgroups left to spread across 20 cores.
-constant uint WARPS = 1u;
+// T5: one out-tile per 128-thread threadgroup. The 4 simdgroups stride the
+// in-tile range together (it += 4, zero barriers in the hot loop) and collapse
+// through on-chip tg_cols[4][16] — the old 4-way split wrote DRAM partials.
+// K-split (grid.y = nsplit) adds cross-TG parallelism for narrow shapes
+// (see Exl3Params.nsplit / host gemv_splits policy). The historical "fatter
+// threadgroups are slower" finding applied to 4 warps WITHOUT striding —
+// occupancy is restored by the split policy instead of 1 warp/TG.
 
 kernel void exl3_gemv(device const half *xh [[buffer(0)]],
                       device const ushort *trellis [[buffer(1)]],
@@ -195,32 +198,33 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
                       constant Exl3Params &p [[buffer(4)]],
                       uint2 tg [[threadgroup_position_in_grid]],
                       uint2 thr [[thread_position_in_threadgroup]]) {
-    uint sub = 0u;
+    threadgroup float tg_cols[4][16];
+
     uint tid = thr.x;
-    uint g = tid & 31u;       // lane = kernel-order group
-    uint ot = tg.x * WARPS + sub;
-    // T2.5 K-split: grid.y selects the in-tile slice (see Exl3Params.nsplit).
-    // nsplit == 1 / split == 0 reduces to the old flat indexing exactly.
+    uint lane = tid & 31u;
+    uint sg = tid >> 5u; // 0..3 (4 simdgroups = 128 threads)
+    uint ot = tg.x;
     uint nsplit = p.nsplit;
     uint chunk = (p.in_tiles + nsplit - 1u) / nsplit;
     uint it0 = tg.y * chunk;
     uint it1 = min(p.in_tiles, it0 + chunk);
     bool live = ot < p.out_tiles;
 
-    uint r0 = (g & 3u) * 2u;
+    uint r0 = (lane & 3u) * 2u;
     bool aligned = p.aligned != 0u;
 
     float accA = 0.0f;
     float accB = 0.0f;
 
-    // Strength-reduced tile address.
-    const device ushort *tile =
-        trellis + ((ulong)min(it0, p.in_tiles) * p.out_tiles + ot) * p.twords * 2u;
+    // Strength-reduced tile address: step by 4 in-tiles for each of the 4 simdgroups.
     const ulong tstride = (ulong)p.out_tiles * p.twords * 2u;
-    uint it = it0;
+    const ulong tstep = 4u * tstride;
+    const device ushort *tile =
+        trellis + ((ulong)min(it0 + sg, p.in_tiles) * p.out_tiles + ot) * p.twords * 2u;
+    uint it = it0 + sg;
 
     if (p.k != 7u) {
-        // T3: dq4 64-bit window path for k in {1..6, 8}.
+        // T3/T5: dq4 64-bit window path with 128-thread cooperative striding.
         // A 4-aligned group of 4 codewords spans 3K+16 bits, which always fits
         // into a single 64-bit window of two words.
         uint ig0_[2];
@@ -228,7 +232,7 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
         uint s3_[2];
         int tw = int(p.twords);
         for (uint gg = 0u; gg < 2u; gg++) {
-            uint c0 = g * 8u + gg * 4u;
+            uint c0 = lane * 8u + gg * 4u;
             int e_last = int(c0 + 4u) * int(p.k) + 256 * int(p.k);
             int i_end = (e_last - 1) / 32;
             ig1_[gg] = uint(((i_end % tw) + tw) % tw);
@@ -236,14 +240,46 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
             s3_[gg] = uint((i_end + 1) * 32 - e_last);
         }
 
-        // 2-way unrolled loop: loads 4 words per tile from device and extracts 8 codewords.
-        for (; live && it + 1u < it1; it += 2u) {
-            half x_lane = xh[it * 16u + g];
-            float x00 = float(simd_shuffle(x_lane, ushort(r0)));
-            float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
-            float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
-            float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
-            {
+        // Each of the 4 simdgroups steps by 4 in-tiles independently.
+        // Zero barriers in the hot loop.
+        if (aligned) {
+            for (; live && it < it1; it += 4u) {
+                half x_lane = xh[it * 16u + (lane & 15u)];
+                float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+                float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+                float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+                float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+
+                device const uint *words = (device const uint *)tile;
+                ulong m0 = ((ulong)words[ig0_[0]] << 32) | (ulong)words[ig1_[0]];
+                uint s0 = s3_[0];
+                uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+                uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
+                uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
+                uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
+
+                ulong m1 = ((ulong)words[ig0_[1]] << 32) | (ulong)words[ig1_[1]];
+                uint s1 = s3_[1];
+                uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+                uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
+                uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
+                uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
+
+                accA += x00 * exl3_decode_f(cw0_0, p.mode) + x01 * exl3_decode_f(cw0_1, p.mode);
+                accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
+                accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
+                accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
+                tile += tstep;
+            }
+        } else {
+            // Fallback for twords > 32 or unaligned pointers.
+            for (; live && it < it1; it += 4u) {
+                half x_lane = xh[it * 16u + (lane & 15u)];
+                float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+                float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+                float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+                float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+
                 uint a0 = ld_word(tile, ig0_[0], aligned);
                 uint b0 = ld_word(tile, ig1_[0], aligned);
                 ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
@@ -266,75 +302,15 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
                 accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
                 accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
                 accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
+                tile += tstep;
             }
-            tile += tstride;
-            float x10 = float(simd_shuffle(x_lane, ushort(16u + r0)));
-            float x11 = float(simd_shuffle(x_lane, ushort(16u + r0 + 1u)));
-            float x12 = float(simd_shuffle(x_lane, ushort(16u + r0 + 8u)));
-            float x13 = float(simd_shuffle(x_lane, ushort(16u + r0 + 9u)));
-            {
-                uint a0 = ld_word(tile, ig0_[0], aligned);
-                uint b0 = ld_word(tile, ig1_[0], aligned);
-                ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
-                uint s0 = s3_[0];
-                uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
-                uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
-                uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
-                uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
-
-                uint a1 = ld_word(tile, ig0_[1], aligned);
-                uint b1 = ld_word(tile, ig1_[1], aligned);
-                ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
-                uint s1 = s3_[1];
-                uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
-                uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
-                uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
-                uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
-
-                accA += x10 * exl3_decode_f(cw0_0, p.mode) + x11 * exl3_decode_f(cw0_1, p.mode);
-                accA += x12 * exl3_decode_f(cw0_2, p.mode) + x13 * exl3_decode_f(cw0_3, p.mode);
-                accB += x10 * exl3_decode_f(cw1_0, p.mode) + x11 * exl3_decode_f(cw1_1, p.mode);
-                accB += x12 * exl3_decode_f(cw1_2, p.mode) + x13 * exl3_decode_f(cw1_3, p.mode);
-            }
-            tile += tstride;
-        }
-        for (; live && it < it1; it++) {
-            half x_lane = xh[it * 16u + (g & 15u)];
-            float x00 = float(simd_shuffle(x_lane, ushort(r0)));
-            float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
-            float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
-            float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
-
-            uint a0 = ld_word(tile, ig0_[0], aligned);
-            uint b0 = ld_word(tile, ig1_[0], aligned);
-            ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
-            uint s0 = s3_[0];
-            uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
-            uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
-            uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
-            uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
-
-            uint a1 = ld_word(tile, ig0_[1], aligned);
-            uint b1 = ld_word(tile, ig1_[1], aligned);
-            ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
-            uint s1 = s3_[1];
-            uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
-            uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
-            uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
-            uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
-
-            accA += x00 * exl3_decode_f(cw0_0, p.mode) + x01 * exl3_decode_f(cw0_1, p.mode);
-            accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
-            accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
-            accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
-            tile += tstride;
         }
     } else {
         // Fallback pair-table path for k=7 (spans 37 bits, crosses 3 words).
-        uint pk0 = pair_tab[4u * g];
-        uint pk1 = pair_tab[4u * g + 1u];
-        uint pk2 = pair_tab[4u * g + 2u];
-        uint pk3 = pair_tab[4u * g + 3u];
+        uint pk0 = pair_tab[4u * lane];
+        uint pk1 = pair_tab[4u * lane + 1u];
+        uint pk2 = pair_tab[4u * lane + 2u];
+        uint pk3 = pair_tab[4u * lane + 3u];
         uint i0_0 = pk0 & 0xFFu;
         uint i1_0 = (pk0 >> 8) & 0xFFu;
         uint s1_0 = (pk0 >> 16) & 0xFFu;
@@ -348,8 +324,8 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
         uint i1_3 = (pk3 >> 8) & 0xFFu;
         uint s1_3 = (pk3 >> 16) & 0xFFu;
 
-        for (; live && it < it1; it++) {
-            half x_lane = xh[it * 16u + (g & 15u)];
+        for (; live && it < it1; it += 4u) {
+            half x_lane = xh[it * 16u + (lane & 15u)];
             float x00 = float(simd_shuffle(x_lane, ushort(r0)));
             float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
             float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
@@ -362,19 +338,30 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
             accA += x02 * float(p1.lo) + x03 * float(p1.hi);
             accB += x00 * float(p2.lo) + x01 * float(p2.hi);
             accB += x02 * float(p3.lo) + x03 * float(p3.hi);
-            tile += tstride;
+            tile += tstep;
         }
     }
 
-    // SIMD warp reduction (T3): 4 lanes per output column collapse in registers.
+    // Step 1: SIMD warp reduction within each of the 4 simdgroups.
     accA += simd_shuffle_down(accA, 1);
     accA += simd_shuffle_down(accA, 2);
     accB += simd_shuffle_down(accB, 1);
     accB += simd_shuffle_down(accB, 2);
-    if (live && (g & 3u) == 0u) {
-        uint c0 = g >> 2;
-        y[(tg.y * p.out_tiles + ot) * TILE + c0] = accA;
-        y[(tg.y * p.out_tiles + ot) * TILE + c0 + 8u] = accB;
+
+    // Step 2: The 8 active lanes per simdgroup write their column sums into threadgroup memory.
+    if ((lane & 3u) == 0u) {
+        uint c0 = lane >> 2;
+        tg_cols[sg][c0] = accA;
+        tg_cols[sg][c0 + 8u] = accB;
+    }
+
+    // Step 3: Single barrier across the 128 threads to synchronize tg_cols.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 4: Threads 0..15 sum across the 4 simdgroups and write out the 16 output elements.
+    if (live && tid < 16u) {
+        float s = tg_cols[0][tid] + tg_cols[1][tid] + tg_cols[2][tid] + tg_cols[3][tid];
+        y[(tg.y * p.out_tiles + ot) * TILE + tid] = s;
     }
 }
 
