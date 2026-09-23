@@ -534,6 +534,17 @@ Cross-checks:
 
 **Order of next levers:** (1) small-N K-split (T3.10, ~600 ms) → (2) glue/fusion audit (114 ms + attn 71) → (3) stop, re-report the 200 pp/s conflict with end-to-end numbers (best-case ~116 t/s at the measured 6.3 TF MMA wall) → (4) decode track toward 18 t/s → MTP only after 18 + 100% coherency. *(K-split estimate STALE after T3.9: budget shows k/v/o already at 4.0–5.3 TF, not 0.97 — gains there ≈ 50–150 ms, not 600. Prefill levers now: residual funnel ~12%, structure-to-ceiling ~14%, glue 114 ms.)*
 
+## T3.10 — sg small-N K-split (landed with scratch-fix, 2026-09-23)
+
+**What landed:** `exl3_gemm_sg` gains K-split across `grid.z` + `exl3_gemm_sg_reduce` (s-ascending, no atomics → deterministic); `Exl3GemmSgParams` is 9 u32 (+nsplit, +stride elements); policy `sg_splits(shape, rows) = clamp(div_ceil(320, base_tgs), 1, 8)` with `base_tgs = (out_tiles/4) * rows.div_ceil(64)`, capped at `stages = in_tiles/2`. `nsplit==1` keeps the old grid + direct-to-y store (byte-identical for gate/down at normal rows). Partial buffers: sg path uses caller `ext_partial` (decoder arena after scratch-fix) or a **transient** per-call buffer (host hooks only) — **shared `ensure_partial` was removed**.
+
+**Acceptance:** measured **86.8 t/s @512** after T3.10 + scratch-fix (not the ≥94 / +8% target). Ceiling 93.7 in `spec/final-same-algorithm-ceiling` **not met** — ceiling spec remains on hold. Token gates held (span max_abs, batched-vs-gemv, argmax).
+
+**Entanglement:** T3.10 code (`exl3.metal` + host dispatch) shares working-tree edits with `spec/prefill-scratch-fix` T7 (scratch elimination). Specs committed separately (`a45be45` for original scratch-fix/ceiling specs; scratch-fix R1–R7 amendment + this note in the code commit).
+
+## T3.10 policy detail (pre-scratch-fix note, kept for history)
+Original task text said "host binds shared `ensure_partial` buffer" — superseded: production binds `GpuDecoder.lin_temps.partial`; host hooks allocate transient. No retained shared partial exists.
+
 ## T4.0 — decode baseline (2026-09-23)
 
 **Test:** `decode_throughput_slow` (`gemma4.rs`, gated + `#[ignore]`): real artifact, `MetalLinear::new` + `.with_gpu`, device KV, greedy, `eos=[]`, `KAPLUMBA_DECODE_STEPS` default 64.
@@ -680,3 +691,23 @@ State: T1.3c/d implemented (`crates/engine/src/gemma4.rs`); the facts below are 
 1. AGENTS.md, this spec folder, `spec/paged-kv-cache`, `spec/omlx-exl3-engine` (stub).
 2. Open OQs → user (none expected; see spec.md).
 3. First unchecked task in tasks.md; update tasks.md + this file every commit.
+
+## T7 / spec/prefill-scratch-fix — full scratch elimination (2026-09-23)
+
+**Directive:** user — "get rid of scratch buffers and save mem wherever you can. Keep KV buffers. No quality loss."
+
+**What landed (code):**
+- `Exl3Gemv`: removed `scratch`/`partial` fields, `ensure_scratch`/`ensure_partial`/`shared_scratch_elems`/`shared_partial_bytes`. `with_scratch` is host-test-only, always transient. `encode_gemv` takes `ext_partial`; new `gemv_partial_bytes(shape)`.
+- `GpuDecoder::lin_temps: ChunkScratch` allocated once in `new` (max over all layer linears + lm at `batch_rows` and rows=1). Decode + prefill both use `encode_linear_with_scratch(&self.lin_temps)`. Per-chunk alloc deleted.
+- `k_raw`/`k_norm`/`v_raw` sized `batch_rows * max(n_kv * head_dim)` = 4096 (was 8192) → −6.29 MB.
+- KV cache untouched (user: keep KV buffers).
+
+**Measured after T7 (release, M4 Pro, `--test-threads=1`):**
+- kernels 21/0 · fast 114/0/6 · gated `--ignored` 6/0 (494s)
+- `prefill_memory_profile_slow`: RSS growth **15072 KB** ≤ 48 MB (192272 → 207344)
+- `prefill_throughput_slow`: **87.6 / 81.7 / 72.3 t/s** @ 512 / 2048 / 8192 (token-loop 7.67)
+- `decode_throughput_slow`: **8.39 t/s** fwd / 8.37 e2e; 134.5 GB/s; ids start 236773
+
+**Symbols gone from `crates/`:** `shared_scratch_elems`, `shared_partial_bytes`, `ensure_partial`, `ensure_scratch` — grep is CLEAN.
+
+**Gotcha:** always `--test-threads=1` for gated tests (16 GB each; parallel ≈ 32 GB on 25.8 GB machine). Never stage `.freebuff/`.

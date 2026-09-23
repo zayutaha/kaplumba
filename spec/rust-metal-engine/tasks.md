@@ -155,13 +155,15 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - Commit: `spec/rust-metal-engine: T2.9 sibling fusion refuted, split policy deepened`
 
 ### T3.10 — small-N K-split for sg GEMM (prefill, T3.9 ranked #1)
-- [ ] Mirror the T2.5 pattern on `exl3_gemm_sg`: k/v/q run at 0.97–2.1 TFLOP/s (64–256 TGs) vs gate ~5 TF — split the `ks` stage range across a new grid dimension, each split-TG partial-accumulates its own `C[4][4]` segment, new reduce kernel sums partials to `y` (or stores per-split slices if csc already tiles). Policy: `sg_splits(shape) = clamp(div_ceil(1024, out_tiles), 1, 8)`; `nsplit==1` keeps the current grid exactly (byte-identical path for gate/down)
-- [ ] f32 reassociation on split shapes only → span/batched token gates must hold (argmax + max_abs < 0.55, batched-vs-gemv < 2e-3)
-- [ ] Verify: CPU-ref ceiling test extended to split path, `real_artifact_batched_linear_matches_gemv_slow`, full gated suite, `prefill_throughput_slow` ≥ +8% at 512 (expect ~600 ms/chunk → ~95–100 t/s); target best case ~110
+- [x] **Policy amended after re-profile (2026-09-23):** original `clamp(div_ceil(1024, out_tiles),1,8)` is rows-blind — at rows≥512 every shape already fills ≥1 wave (base_tgs ≥ ~320 slots, measured from gate/k phase profile: S≈320 concurrent TGs, gate@256 = 1344/320 waves × 2.86 ms = 12.03 ✓), so a split there is an exact wash (waves×(τ/n) = τ) plus partial-I/O overhead. New policy: **`sg_splits(shape, rows) = clamp(div_ceil(320, base_tgs), 1, 8)`** with `base_tgs = (out_tiles/4) * rows.div_ceil(64)`, also capped at `stages = in_tiles/2` — splits only sub-wave shapes (tiny-out k/v: L5 k = 128 out → 16 TGs even at rows=512; small prefill rows=2..63) and keeps gate/down byte-identical (`nsplit==1` → old grid, direct-to-y store)
+- [x] Mirror the T2.5 pattern on `exl3_gemm_sg`: split the `ks` stage range across `grid.z`, each split-TG partial-accumulates its own `C[4][4]`, writes `partial[tg.z][rows_pad, N]` f32 (host binds shared `ensure_partial` buffer), new `exl3_gemm_sg_reduce` sums splits in fixed s-ascending order (deterministic — no atomics) → `y`. New `Exl3GemmSgParams` (9 u32: +nsplit, +stride elements) so scalar `exl3_gemm` + T3.8 probes keep the 7-u32 `Exl3GemmParams` untouched. No atomics: run-to-run greedy determinism required
+- [x] f32 reassociation on split shapes only → span/batched token gates must hold (argmax + max_abs < 0.55, batched-vs-gemv < 2e-3)
+- [x] Verify: kernels suite (+ new `sg_splits_policy_covers_shapes`), fast engine, `real_artifact_batched_linear_matches_gemv_slow`, full gated suite, `prefill_throughput_slow` ≥ +8% at 512 (≥ ~94 t/s from 86.8 baseline; expect gains concentrated in tiny-kv layers + rows≤128 chunks — re-profile, do not expect the old ~600 ms rows-blind estimate)
+- **Acceptance note:** measured **86.8 t/s @512** after T3.10 + scratch-fix (not ≥94). Ceiling 93.7 in `spec/final-same-algorithm-ceiling` **not met** → ceiling spec remains on hold; do not claim +8%.
 - Files: `crates/kernels/src/{exl3.metal,exl3.rs}`
 - Test: above
 - Target: R2.1 (pp/s)
-- Commit: `spec/rust-metal-engine: T3.10 sg small-N K-split`
+- Commit: `spec/rust-metal-engine: T3.10 sg small-N K-split` (landed entangled with scratch-fix code; see prefill-scratch-fix commit)
 
 ### T2.2 — Working-set cap + load hygiene (TTFT warm-up relocation)
 - [ ] Move the one-time Metal residency + first-forward shader compile cost (3822 ms measured in T4.0's first forward) out of first-token latency: warm pipelines at end of `load_exl3` (build every production pipeline + dispatch a tiny probe) so `decode_throughput_slow`'s first forward ≈ steady-state token; record cold load vs warm load split
