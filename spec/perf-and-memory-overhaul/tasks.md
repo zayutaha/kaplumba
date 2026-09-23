@@ -26,10 +26,11 @@
   - **Testing**: `cargo test -p kaplumba-kernels` 21/21, `cargo test -p kaplumba-engine --lib` 116/116.
   - **Commit**: `d3d3ffb`
 
-- [ ] **T5.2: Coalesced 96-byte tile word loads + simd_shuffle word fetch**
+- [x] **T5.2: Coalesced 96-byte tile word loads + simd_shuffle word fetch**
   - **Files**: `crates/kernels/src/exl3.metal`
   - **Intent**: ExllamaV3-style: when `aligned && twords <= 32`, lanes `0..twords-1` load the tile's u32 words in one contiguous burst (`w_lane`), fetch `ig0/ig1` via `simd_shuffle`. k=6 (lm_head, 48 words) + unaligned keep per-lane `ld_word` fallback. Keep `accA/accB` mapping (no acc[8] remap — approved scope cut).
-  - **Testing**: kernels 21/21, `gpu_linear_matches_cpu_reference`, `gpu_gemv_matches_cpu_decoded_tile`, `debug_gemv_rows` one-hot (T2.3 dead-end guard).
+  - **Testing**: kernels 21/21, `gpu_linear_matches_cpu_reference`, `gpu_gemv_matches_cpu_decoded_tile`, `debug_gemv_rows` one-hot (T2.3 dead-end guard — GPU==CPU all rows).
+  - **Commit**: `182a101`
 
 - [ ] **T5.3: Measure per-pass bandwidth + decode throughput**
   - **Files**: `spec/perf-and-memory-overhaul/implementation_notes.md`
