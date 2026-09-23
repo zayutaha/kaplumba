@@ -55,3 +55,14 @@ Running log. Append as work proceeds. See AGENTS.md §5.
   change offline layout.
 - Metric targeted: tg/s (end-to-end). This phase did not move it; it moved the
   ERROR BAR on what plain decode can reach.
+
+## 2026-09-23 — P1-T2 nsplit sweep-argmax chooser
+
+- `gemv_splits` now has a measured argmax override table (v1 geometry):
+  `{1344 → 2 (gate), 336 → 8 (down + o share out_tiles=336), 512 → 2 (q),
+  256 → 8 (k/v)}`, formula fallback elsewhere. Memory note: hash of the
+  bench day — sweep argmax ordering was gate n2 ≈ n4 within noise, o n8 beats
+  n4 by 2%, q n2 beats n8 by 3.5%, k/v n8 by ~7% over n2 (reference formula's
+  128-floor would have picked n2 — overrides it).
+- Policy test updated; kernels 21 + engine fast 117 green. Committed before
+  any E2E re-verify (P2).

@@ -293,12 +293,25 @@ impl Exl3Gemv {
     /// q 4 (119 vs 111 @8), down/o ≈ 13 band (167/114 straddled 8–16),
     /// k/v 8 (89/78 vs 78/78 @16). Only the two measured outliers need
     /// overrides; the rest stay on the formula.
+    ///
+    /// P1-T2 (spec/decode-20tps): re-swept the v1 geometry against the
+    /// v12-parity kernel (bench_gemv_split_sweep_slow, v1 vs v4 columns).
+    /// Argmax table (v1, min-of-12 ms): gate@1344 out-tiles → n2 (0.683,
+    /// was n4=0.687); down/o@336 → n8 (down 0.697 vs n13≈0.70+, o 0.368 vs
+    /// n13≈0.38+); q@512 → n2 (0.369 vs n8=0.382); k/v@256 → n8 (0.271/0.272,
+    /// unchanged); lm@16384 → n1 (unchanged). The reference's 128-in-tiles/
+    /// split floor predicts n2 for k/v, which is ~7% off the measured n8 — the
+    /// measured argmax wins per T5.2r philosophy. ~1–2 ms/token expected.
+    /// Keyed by out_tiles only: the artifact's out_tile column uniquely
+    /// identifies each archetype (336 is shared by down/o and both want n8).
     fn gemv_splits(out_tiles: usize) -> usize {
         const TARGET_TGS: usize = 4096;
         const MAX_SPLIT: usize = 16;
         match out_tiles {
-            512 => 4, // q (8 → 4): 8192-out shape, 119 Gw/s
-            256 => 8, // k/v (16 → 8): 4096-out shape, 89/78 Gw/s
+            1344 => 2, // gate 5376x21504: sweep argmax
+            336 => 8,  // down 21504x5376 + o 8192x5376: sweep argmax
+            512 => 2,  // q 5376x8192: sweep argmax (was 4)
+            256 => 8,  // k/v 5376x4096: T5.2r + sweep argmax (unchanged)
             _ => TARGET_TGS.div_ceil(out_tiles.max(1)).clamp(1, MAX_SPLIT),
         }
     }
@@ -1434,18 +1447,20 @@ mod tests {
         Some((d, q))
     }
 
-    /// T2.5 policy (T2.9 deepened, T5.2r re-tuned): TARGET 4096 TGs — lm_head
-    /// (16384 tiles) stays 1, gate → 4, q → 4 (T5.2r: 8→4, 119 Gw/s), down/o
-    /// → 13 (band-straddled 8–16), k/v → 8 (T5.2r: 16→8, 89/78 Gw/s); tiny
-    /// shapes clamp to 16. Partial scratch ≤ ~344 KB transient.
+    /// T2.5 policy (T2.9 deepened, T5.2r re-tuned, P1-T2 sweep-argmax table):
+    /// TARGET 4096 TGs — lm_head (16384 tiles) stays 1; measured argmax
+    /// overrides from `bench_gemv_split_sweep_slow` (v1 geometry, min-of-12):
+    /// gate → 2, q → 2 (was 4), down/o → 8 (was 13-band), k/v → 8
+    /// (T5.2r unchanged); tiny shapes clamp to 16. Partial scratch ≤ ~344 KB
+    /// transient.
     #[test]
     fn gemv_splits_policy_covers_shapes() {
         assert_eq!(Exl3Gemv::gemv_splits(16384), 1); // lm_head (already 16k TGs)
         assert_eq!(Exl3Gemv::gemv_splits(4096), 1); // exactly target
-        assert_eq!(Exl3Gemv::gemv_splits(1344), 4); // gate (21504 out), was 1
-        assert_eq!(Exl3Gemv::gemv_splits(512), 4); // q (8192 out), T5.2r 8→4
-        assert_eq!(Exl3Gemv::gemv_splits(336), 13); // down/o (5376 out)
-        assert_eq!(Exl3Gemv::gemv_splits(256), 8); // k/v (4096 out), T5.2r 16→8
+        assert_eq!(Exl3Gemv::gemv_splits(1344), 2); // gate (21504 out), sweep argmax
+        assert_eq!(Exl3Gemv::gemv_splits(512), 2); // q (8192 out), sweep argmax (was 4)
+        assert_eq!(Exl3Gemv::gemv_splits(336), 8); // down/o (5376 out), sweep argmax (was 13-band)
+        assert_eq!(Exl3Gemv::gemv_splits(256), 8); // k/v (4096 out), T5.2r + sweep argmax
         assert_eq!(Exl3Gemv::gemv_splits(64), 16); // clamped (want 64)
         assert_eq!(Exl3Gemv::gemv_splits(1), 16);
     }

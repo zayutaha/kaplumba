@@ -38,7 +38,7 @@
     untouched.
   - **Commit**: TBD
 
-- [ ] **P1-T2: nsplit chooser → sweep argmax (v1 geometry)**
+- [x] **P1-T2: nsplit chooser → sweep argmax (v1 geometry)**
   - **Files**: `crates/kernels/src/exl3.rs` (`gemv_splits`), policy tests
   - **Intent**: Bake the measured argmax override table from
     `bench_gemv_split_sweep_slow` (gate n2, down n8, o n8, q n2, k/v n8, lm n1;
@@ -47,6 +47,9 @@
     wins per T5.2r philosophy. Expected ~1–2 ms/token.
   - **Testing**: `bench_gemv_split_sweep_slow` re-run shows engine policy ≥
     best-of-sweep per shape; kernels + fast + parity green.
+  - **Result**: done — override table {1344→2, 336→8, 512→2, 256→8}; policy
+    test updated; kernels (21) + engine fast (117) green.
+  - **Commit**: TBD
 
 - [ ] **P1-T3: Fuse had_in (and v18 post) into M=1 gemv**
   - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`,
