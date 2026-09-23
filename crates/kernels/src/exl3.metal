@@ -436,6 +436,239 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
     }
 }
 
+// ---------------------------------------------------------------------------
+// P4: function-constant specialization of exl3_gemv (spec/decode-20tps).
+// FC_K / FC_MODE / FC_ALIGNED are MSL *function constants* bound at pipeline
+// creation (see `gemv_spec_pipeline` in exl3.rs): the compiler folds the
+// codebook-mode branch of every codeword decode, both ld_word load paths and
+// the k==7 pair-table test at build time, and constant-folds the window-shift
+// addends (s + k). The decode math itself is byte-for-byte the generic one,
+// so outputs are bit-identical to exl3_gemv for the same (k, mode, aligned)
+// triple — engine test `gpu_gemv_spec_matches_generic` proves it for all k,
+// both modes and both alignments.
+// ---------------------------------------------------------------------------
+constant bool FC_ALIGNED [[function_constant(0)]];
+constant uint FC_MODE [[function_constant(1)]];
+constant uint FC_K [[function_constant(2)]];
+
+// Constant-mode clones of the generic decode helpers: identical arithmetic,
+// with `mode` as a compile-time value so the branch folds away.
+inline half exl3_decode_const(uint cw) {
+    uint x = cw & 0xFFFFu;
+    if (FC_MODE == 1u) {
+        x = x * 0xCBAC1FEDu;
+    } else {
+        x = x * 89226354u + 64248484u;
+    }
+    x = 0x3B603B60u ^ (x & 0x8FFF8FFFu);
+    half lo = as_type<half>((ushort)(x & 0xFFFFu));
+    half hi = as_type<half>((ushort)(x >> 16));
+    return lo + hi;
+}
+
+inline float exl3_decode_f_const(uint cw) {
+    uint x = cw & 0xFFFFu;
+    if (FC_MODE == 1u) {
+        x = x * 0xCBAC1FEDu;
+    } else {
+        x = x * 89226354u + 64248484u;
+    }
+    x = 0x3B603B60u ^ (x & 0x8FFF8FFFu);
+    half2 h2 = as_type<half2>(x);
+    return float(h2.x + h2.y);
+}
+
+inline CodePair funnel_pair_const(device const ushort *tile, uint i0, uint i1, uint s1) {
+    uint a = ld_word(tile, i0, FC_ALIGNED);
+    uint b = ld_word(tile, i1, FC_ALIGNED);
+    uint w1 = (uint)((((ulong)a) << 32 | (ulong)b) >> s1);
+    CodePair r;
+    r.lo = exl3_decode_const((w1 >> FC_K) & 0xFFFFu);
+    r.hi = exl3_decode_const(w1 & 0xFFFFu);
+    return r;
+}
+
+kernel void exl3_gemv_spec(device const half *xh [[buffer(0)]],
+                           device const ushort *trellis [[buffer(1)]],
+                           device const uint *pair_tab [[buffer(2)]],
+                           device float *y [[buffer(3)]],
+                           constant Exl3Params &p [[buffer(4)]],
+                           uint2 tg [[threadgroup_position_in_grid]],
+                           uint2 thr [[thread_position_in_threadgroup]]) {
+    uint tid = thr.x;
+    uint g = tid & 31u;       // lane = kernel-order group
+    uint ot = tg.x;           // one out-tile per threadgroup (WARPS == 1)
+    // K-split slicing stays runtime (grid.y) — identical to exl3_gemv.
+    uint chunk = (p.in_tiles + p.nsplit - 1u) / p.nsplit;
+    uint it0 = tg.y * chunk;
+    uint it1 = min(p.in_tiles, it0 + chunk);
+    bool live = ot < p.out_tiles;
+
+    uint r0 = (g & 3u) * 2u;
+
+    float accA = 0.0f;
+    float accB = 0.0f;
+
+    const device ushort *tile =
+        trellis + ((ulong)min(it0, p.in_tiles) * p.out_tiles + ot) * p.twords * 2u;
+    const ulong tstride = (ulong)p.out_tiles * p.twords * 2u;
+    uint it = it0;
+
+    if (FC_K != 7u) {
+        uint ig0_[2];
+        uint ig1_[2];
+        uint s3_[2];
+        int tw = int(p.twords);
+        for (uint gg = 0u; gg < 2u; gg++) {
+            uint c0 = g * 8u + gg * 4u;
+            int e_last = int(c0 + 4u) * int(FC_K) + 256 * int(FC_K);
+            int i_end = (e_last - 1) / 32;
+            ig1_[gg] = uint(((i_end % tw) + tw) % tw);
+            ig0_[gg] = uint((((i_end - 1) % tw) + tw) % tw);
+            s3_[gg] = uint((i_end + 1) * 32 - e_last);
+        }
+
+        for (; live && it + 1u < it1; it += 2u) {
+            half x_lane = xh[it * 16u + g];
+            float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+            float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+            float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+            float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+            {
+                uint a0 = ld_word(tile, ig0_[0], FC_ALIGNED);
+                uint b0 = ld_word(tile, ig1_[0], FC_ALIGNED);
+                ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                uint s0 = s3_[0];
+                uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+                uint cw0_2 = uint(m0 >> (s0 + FC_K)) & 0xFFFFu;
+                uint cw0_1 = uint(m0 >> (s0 + 2u * FC_K)) & 0xFFFFu;
+                uint cw0_0 = uint(m0 >> (s0 + 3u * FC_K)) & 0xFFFFu;
+
+                uint a1 = ld_word(tile, ig0_[1], FC_ALIGNED);
+                uint b1 = ld_word(tile, ig1_[1], FC_ALIGNED);
+                ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                uint s1 = s3_[1];
+                uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+                uint cw1_2 = uint(m1 >> (s1 + FC_K)) & 0xFFFFu;
+                uint cw1_1 = uint(m1 >> (s1 + 2u * FC_K)) & 0xFFFFu;
+                uint cw1_0 = uint(m1 >> (s1 + 3u * FC_K)) & 0xFFFFu;
+
+                accA += x00 * exl3_decode_f_const(cw0_0) + x01 * exl3_decode_f_const(cw0_1);
+                accA += x02 * exl3_decode_f_const(cw0_2) + x03 * exl3_decode_f_const(cw0_3);
+                accB += x00 * exl3_decode_f_const(cw1_0) + x01 * exl3_decode_f_const(cw1_1);
+                accB += x02 * exl3_decode_f_const(cw1_2) + x03 * exl3_decode_f_const(cw1_3);
+            }
+            tile += tstride;
+            float x10 = float(simd_shuffle(x_lane, ushort(16u + r0)));
+            float x11 = float(simd_shuffle(x_lane, ushort(16u + r0 + 1u)));
+            float x12 = float(simd_shuffle(x_lane, ushort(16u + r0 + 8u)));
+            float x13 = float(simd_shuffle(x_lane, ushort(16u + r0 + 9u)));
+            {
+                uint a0 = ld_word(tile, ig0_[0], FC_ALIGNED);
+                uint b0 = ld_word(tile, ig1_[0], FC_ALIGNED);
+                ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                uint s0 = s3_[0];
+                uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+                uint cw0_2 = uint(m0 >> (s0 + FC_K)) & 0xFFFFu;
+                uint cw0_1 = uint(m0 >> (s0 + 2u * FC_K)) & 0xFFFFu;
+                uint cw0_0 = uint(m0 >> (s0 + 3u * FC_K)) & 0xFFFFu;
+
+                uint a1 = ld_word(tile, ig0_[1], FC_ALIGNED);
+                uint b1 = ld_word(tile, ig1_[1], FC_ALIGNED);
+                ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                uint s1 = s3_[1];
+                uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+                uint cw1_2 = uint(m1 >> (s1 + FC_K)) & 0xFFFFu;
+                uint cw1_1 = uint(m1 >> (s1 + 2u * FC_K)) & 0xFFFFu;
+                uint cw1_0 = uint(m1 >> (s1 + 3u * FC_K)) & 0xFFFFu;
+
+                accA += x10 * exl3_decode_f_const(cw0_0) + x11 * exl3_decode_f_const(cw0_1);
+                accA += x12 * exl3_decode_f_const(cw0_2) + x13 * exl3_decode_f_const(cw0_3);
+                accB += x10 * exl3_decode_f_const(cw1_0) + x11 * exl3_decode_f_const(cw1_1);
+                accB += x12 * exl3_decode_f_const(cw1_2) + x13 * exl3_decode_f_const(cw1_3);
+            }
+            tile += tstride;
+        }
+        for (; live && it < it1; it++) {
+            half x_lane = xh[it * 16u + (g & 15u)];
+            float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+            float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+            float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+            float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+
+            uint a0 = ld_word(tile, ig0_[0], FC_ALIGNED);
+            uint b0 = ld_word(tile, ig1_[0], FC_ALIGNED);
+            ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+            uint s0 = s3_[0];
+            uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+            uint cw0_2 = uint(m0 >> (s0 + FC_K)) & 0xFFFFu;
+            uint cw0_1 = uint(m0 >> (s0 + 2u * FC_K)) & 0xFFFFu;
+            uint cw0_0 = uint(m0 >> (s0 + 3u * FC_K)) & 0xFFFFu;
+
+            uint a1 = ld_word(tile, ig0_[1], FC_ALIGNED);
+            uint b1 = ld_word(tile, ig1_[1], FC_ALIGNED);
+            ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+            uint s1 = s3_[1];
+            uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+            uint cw1_2 = uint(m1 >> (s1 + FC_K)) & 0xFFFFu;
+            uint cw1_1 = uint(m1 >> (s1 + 2u * FC_K)) & 0xFFFFu;
+            uint cw1_0 = uint(m1 >> (s1 + 3u * FC_K)) & 0xFFFFu;
+
+            accA += x00 * exl3_decode_f_const(cw0_0) + x01 * exl3_decode_f_const(cw0_1);
+            accA += x02 * exl3_decode_f_const(cw0_2) + x03 * exl3_decode_f_const(cw0_3);
+            accB += x00 * exl3_decode_f_const(cw1_0) + x01 * exl3_decode_f_const(cw1_1);
+            accB += x02 * exl3_decode_f_const(cw1_2) + x03 * exl3_decode_f_const(cw1_3);
+            tile += tstride;
+        }
+    } else {
+        // Fallback pair-table path for k=7 (spans 37 bits, crosses 3 words).
+        uint pk0 = pair_tab[4u * g];
+        uint pk1 = pair_tab[4u * g + 1u];
+        uint pk2 = pair_tab[4u * g + 2u];
+        uint pk3 = pair_tab[4u * g + 3u];
+        uint i0_0 = pk0 & 0xFFu;
+        uint i1_0 = (pk0 >> 8) & 0xFFu;
+        uint s1_0 = (pk0 >> 16) & 0xFFu;
+        uint i0_1 = pk1 & 0xFFu;
+        uint i1_1 = (pk1 >> 8) & 0xFFu;
+        uint s1_1 = (pk1 >> 16) & 0xFFu;
+        uint i0_2 = pk2 & 0xFFu;
+        uint i1_2 = (pk2 >> 8) & 0xFFu;
+        uint s1_2 = (pk2 >> 16) & 0xFFu;
+        uint i0_3 = pk3 & 0xFFu;
+        uint i1_3 = (pk3 >> 8) & 0xFFu;
+        uint s1_3 = (pk3 >> 16) & 0xFFu;
+
+        for (; live && it < it1; it++) {
+            half x_lane = xh[it * 16u + (g & 15u)];
+            float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+            float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+            float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+            float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+            CodePair p0 = funnel_pair_const(tile, i0_0, i1_0, s1_0);
+            CodePair p1 = funnel_pair_const(tile, i0_1, i1_1, s1_1);
+            CodePair p2 = funnel_pair_const(tile, i0_2, i1_2, s1_2);
+            CodePair p3 = funnel_pair_const(tile, i0_3, i1_3, s1_3);
+            accA += x00 * float(p0.lo) + x01 * float(p0.hi);
+            accA += x02 * float(p1.lo) + x03 * float(p1.hi);
+            accB += x00 * float(p2.lo) + x01 * float(p2.hi);
+            accB += x02 * float(p3.lo) + x03 * float(p3.hi);
+            tile += tstride;
+        }
+    }
+
+    // SIMD warp reduction (T3): identical to exl3_gemv.
+    accA += simd_shuffle_down(accA, 1);
+    accA += simd_shuffle_down(accA, 2);
+    accB += simd_shuffle_down(accB, 1);
+    accB += simd_shuffle_down(accB, 2);
+    if (live && (g & 3u) == 0u) {
+        uint c0 = g >> 2;
+        y[(tg.y * p.out_tiles + ot) * TILE + c0] = accA;
+        y[(tg.y * p.out_tiles + ot) * TILE + c0 + 8u] = accB;
+    }
+}
+
 // Sibling 2-way linear GEMV (spec/pure-decode-273gb R1: Gate + Up).
 // Grid: (out_tiles_a + out_tiles_b, nsplit, 1). Threads per threadgroup: 32.
 kernel void exl3_gemv_fused2(device const half *xh [[buffer(0)]],            // [2, in_tiles * 16]
@@ -1808,9 +2041,22 @@ kernel void exl3_gemv_post(device const half *xh [[buffer(0)]],
                            device const uint *pair_tab [[buffer(2)]],
                            device const half *svh [[buffer(3)]],
                            device half *out [[buffer(4)]],
-                           constant Exl3Params &p [[buffer(5)]],
+                           // P5: FC-specialized — pb is read once into a local
+                           // struct with k/mode/aligned replaced by the bound
+                           // function constants; every p.k / p.mode / p.aligned
+                           // read folds at compile time. Decode math identical.
+                           constant Exl3Params &pb [[buffer(5)]],
                            uint2 tg [[threadgroup_position_in_grid]],
                            uint2 thr [[thread_position_in_threadgroup]]) {
+    Exl3Params p;
+    p.in_tiles = pb.in_tiles;
+    p.out_tiles = pb.out_tiles;
+    p.k = FC_K;
+    p.twords = pb.twords;
+    p.mode = FC_MODE;
+    p.aligned = FC_ALIGNED ? 1u : 0u;
+    p.nsplit = pb.nsplit;
+
     threadgroup float sh[HAD];
     uint tid = thr.x;
     uint w = tid >> 5u;
@@ -2103,16 +2349,31 @@ kernel void exl3_gemv_post(device const half *xh [[buffer(0)]],
     }
 }
 
-// 2-Way Sibling GEMV with In-Kernel Hadamard Epilogue (Gate + Up)
+// 2-Way Sibling GEMV with In-Kernel Hadamard Epilogue (Gate + Up).
+// P4: FC-specialized — reads FC_K/FC_MODE/FC_ALIGNED function constants
+// (bound per (k, mode, aligned) pipeline, see `spec_pipeline` in exl3.rs)
+// instead of the params fields, so the codebook branch, load paths and
+// window-shift addends fold at build time. Decode math identical.
 kernel void exl3_gemv_post_fused2(device const half *xh [[buffer(0)]],            // [2, in_tiles * 16]
                                   device const ushort *trellis_a [[buffer(1)]],
                                   device const ushort *trellis_b [[buffer(2)]],
                                   device const uint *pair_tab [[buffer(3)]],
                                   device const half *svh_cat [[buffer(4)]],
                                   device half *out [[buffer(5)]],
-                                  constant Exl3Fused2Params &p [[buffer(6)]],
+                                  // P5: FC-specialized (see exl3_gemv_post).
+                                  constant Exl3Fused2Params &pb [[buffer(6)]],
                                   uint2 tg [[threadgroup_position_in_grid]],
                                   uint2 thr [[thread_position_in_threadgroup]]) {
+    Exl3Fused2Params p;
+    p.in_tiles = pb.in_tiles;
+    p.out_tiles_a = pb.out_tiles_a;
+    p.out_tiles_b = pb.out_tiles_b;
+    p.k = FC_K;
+    p.twords = pb.twords;
+    p.mode = FC_MODE;
+    p.aligned = FC_ALIGNED ? 1u : 0u;
+    p.nsplit = pb.nsplit;
+
     threadgroup float sh[HAD];
     uint tid = thr.x;
     uint w = tid >> 5u;
@@ -2320,9 +2581,21 @@ kernel void exl3_gemv_post_fused3(device const half *xh [[buffer(0)]],          
                                   device const uint *pair_tab [[buffer(4)]],
                                   device const half *svh_cat [[buffer(5)]],
                                   device half *out [[buffer(6)]],
-                                  constant Exl3Fused3Params &p [[buffer(7)]],
+                                  // P5: FC-specialized (see exl3_gemv_post).
+                                  constant Exl3Fused3Params &pb [[buffer(7)]],
                                   uint2 tg [[threadgroup_position_in_grid]],
                                   uint2 thr [[thread_position_in_threadgroup]]) {
+    Exl3Fused3Params p;
+    p.in_tiles = pb.in_tiles;
+    p.out_tiles_a = pb.out_tiles_a;
+    p.out_tiles_b = pb.out_tiles_b;
+    p.out_tiles_c = pb.out_tiles_c;
+    p.k = FC_K;
+    p.twords = pb.twords;
+    p.mode = FC_MODE;
+    p.aligned = FC_ALIGNED ? 1u : 0u;
+    p.nsplit = pb.nsplit;
+
     threadgroup float sh[HAD];
     uint tid = thr.x;
     uint w = tid >> 5u;

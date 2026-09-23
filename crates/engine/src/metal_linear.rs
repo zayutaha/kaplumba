@@ -1553,6 +1553,144 @@ kernel void stream_sum_strided(device const uint *buf [[buffer(0)]],
         assert_eq!(slice_c, &slice_f3[out_a + out_b..out_a + out_b + out_c], "fused3 C output mismatch");
     }
 
+    /// P4 (spec/decode-20tps): the `(k, mode, aligned)`-specialized
+    /// `exl3_gemv_spec` pipeline must produce **bit-identical** f32 GEMV
+    /// outputs to the generic `exl3_gemv` — the kernel is a byte-for-byte
+    /// clone of the generic body with the codebook-mode branch, both ld_word
+    /// load paths and the window-shift addends folded at pipeline build time.
+    /// Covers every k (1..=8: both the dq4 window path and the k=7 pair-table
+    /// funnel), both production modes, and both trellis alignments.
+    #[test]
+    fn gpu_gemv_spec_matches_generic() {
+        let Some(c) = ctx() else { return };
+        let ml = MetalLinear::new(&c).unwrap();
+        for k in 1u32..=8 {
+            for mode in [0u32, 1] {
+                // Two seed variants: byte_offset 0 (aligned) and 2 (unaligned,
+                // forces the paired-u16 load path in both kernels). The synth
+                // buffer itself sits at offset 0, so pad its end with 8 extra
+                // bytes to make the +2 variant in-bounds (both kernels read
+                // identical bytes either way — padded zeros are never decoded
+                // because the trellis stream is circular over its true length).
+                for off in [0usize, 2] {
+                    let src = SynthGpuSource::build(c.device(), k, 128, 128);
+                    let Some((buf, _)) = src.device_span("l.trellis") else {
+                        panic!("trellis span")
+                    };
+                    let padded = c
+                        .device()
+                        .new_buffer(
+                            buf.length() + 8,
+                            MTLResourceOptions::StorageModeShared,
+                        );
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            buf.contents() as *const u8,
+                            padded.contents() as *mut u8,
+                            buf.length() as usize,
+                        );
+                    }
+                    let trellis = DeviceSpan {
+                        buffer: &padded,
+                        byte_offset: off,
+                    };
+                    let shape = Exl3Shape::new(128, 128, k).unwrap();
+                    let mut rng = Rng(0x5EC_0001u64 + k as u64 + ((mode as u64) << 8));
+                    let xh: Vec<f16> = (0..128)
+                        .map(|_| f16::from_f32(((rng.next() % 2001) as f32 / 1000.0) - 1.0))
+                        .collect();
+                    let mut generic = Vec::new();
+                    ml.raw()
+                        .gemv_pass_nsplit(&xh, trellis, shape, mode, None, &mut generic)
+                        .unwrap_or_else(|e| panic!("k={k} m={mode} off={off} generic: {e}"));
+                    let mut spec = Vec::new();
+                    ml.raw()
+                        .gemv_pass_spec(&xh, trellis, shape, mode, None, &mut spec)
+                        .unwrap_or_else(|e| panic!("k={k} m={mode} off={off} spec: {e}"));
+                    assert_eq!(
+                        generic, spec,
+                        "k={k} mode={mode} aligned={}" ,
+                        off == 0
+                    );
+                }
+            }
+        }
+    }
+
+    /// A/B on the real artifact shapes: generic `exl3_gemv` vs specialized
+    /// `exl3_gemv_spec`, per linear, min-of-REPS. Gate: `KAPLUMBA_RUN_SLOW=1`;
+    /// run with `--ignored --nocapture`. The nsplit policy is the production
+    /// `gemv_splits` table for both sides, so the delta is pure kernel compute.
+    #[test]
+    #[ignore]
+    fn bench_gemv_spec_ab_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = crate::testutil::artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let Some(c) = ctx() else { return };
+        let model = crate::load::load_exl3(&c, &dir).expect("load artifact");
+        let ml = MetalLinear::new(&c).expect("metal linear");
+        let src: &dyn TensorSource = &model;
+        let names = [
+            ("gate", "model.language_model.layers.0.mlp.gate_proj"),
+            ("down", "model.language_model.layers.0.mlp.down_proj"),
+            ("o", "model.language_model.layers.0.self_attn.o_proj"),
+            ("q", "model.language_model.layers.0.self_attn.q_proj"),
+            ("k", "model.language_model.layers.0.self_attn.k_proj"),
+            ("v", "model.language_model.layers.0.self_attn.v_proj"),
+            ("lm", "lm_head"),
+        ];
+        const REPS: usize = 20;
+        for (label, name) in names {
+            let g = linear_handles(src, name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let inn = g.shape.in_features();
+            let xh: Vec<f16> = (0..inn)
+                .map(|i| f16::from_f32(((i % 17) as f32 - 8.0) / 64.0))
+                .collect();
+            let mut gen_out = Vec::new();
+            ml.raw()
+                .gemv_pass_nsplit(&xh, g.trellis(), g.shape, g.mode, None, &mut gen_out)
+                .expect("generic");
+            let mut spec_out = Vec::new();
+            ml.raw()
+                .gemv_pass_spec(&xh, g.trellis(), g.shape, g.mode, None, &mut spec_out)
+                .expect("spec");
+            assert_eq!(gen_out, spec_out, "{name}: spec must be bit-identical");
+            let time = |f: &mut dyn FnMut()| {
+                let mut v = Vec::with_capacity(REPS);
+                for _ in 0..REPS {
+                    let t = std::time::Instant::now();
+                    f();
+                    v.push(t.elapsed().as_secs_f64() * 1000.0);
+                }
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[0]
+            };
+            let mut o = Vec::new();
+            let t_gen = time(&mut || {
+                ml.raw()
+                    .gemv_pass_nsplit(&xh, g.trellis(), g.shape, g.mode, None, &mut o)
+                    .unwrap();
+            });
+            let t_spec = time(&mut || {
+                ml.raw()
+                    .gemv_pass_spec(&xh, g.trellis(), g.shape, g.mode, None, &mut o)
+                    .unwrap();
+            });
+            eprintln!(
+                "{label:6} {inn:>5}x{:<5} k={} · generic {t_gen:7.3} ms · spec {t_spec:7.3} ms · {:+.1}%",
+                g.shape.out_features(),
+                g.shape.k,
+                100.0 * (t_spec - t_gen) / t_gen
+            );
+        }
+    }
+
     /// spec/pure-decode-273gb T1: the fused rows=1 post-Hadamard linear
     /// (`encode_linear_with_scratch` → `exl3_gemv_post` / `exl3_gemv` +
     /// `exl3_gemv_reduce_post`) must reproduce the unfused GPU composition

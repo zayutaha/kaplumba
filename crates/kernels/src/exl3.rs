@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use half::f16;
 use metal::{
     Buffer, CommandQueue, CompileOptions, ComputeCommandEncoderRef, ComputePipelineState, Device,
-    MTLCommandBufferStatus, MTLResourceOptions, MTLSize,
+    FunctionConstantValues, MTLCommandBufferStatus, MTLDataType, MTLResourceOptions, MTLSize,
 };
 
 const MSL: &str = include_str!("exl3.metal");
@@ -220,18 +220,34 @@ pub struct ChunkScratch {
 pub struct Exl3Gemv {
     device: Device,
     queue: CommandQueue,
+    /// Shared source library — `gemv_spec_pipeline` compiles specializations
+    /// lazily from it after `new` returns.
+    lib: metal::Library,
     had_in: ComputePipelineState,
     had_in_batched: ComputePipelineState,
+    /// P5: all `exl3_gemv` dispatches go through the FC-specialized
+    /// `gemv_spec_pipeline` cache (bit-identical to the generic kernel, which
+    /// stays in the MSL as the test reference).
+    #[allow(dead_code)]
     gemv: ComputePipelineState,
-    gemv_post: ComputePipelineState,
+    /// P5: FC-specialized (function constants FC_K/FC_MODE/FC_ALIGNED) —
+    /// built lazily per (k, mode, aligned); see `spec_fn_pipeline`.
     gemv_fused2: ComputePipelineState,
-    gemv_post_fused2: ComputePipelineState,
     gemv_fused3: ComputePipelineState,
-    gemv_post_fused3: ComputePipelineState,
     /// spec/decode-20tps P1-T1: PonyExl3 v12 MT=1 parity shape (4 simdgroups
     /// per out-tile, 8 accs/lane, zero hot-loop barriers). A/B-able via
     /// `gemv_pass_v4`; production still uses `gemv` until the bench wins.
     gemv4: ComputePipelineState,
+    /// P4 (spec/decode-20tps): `(k, mode, aligned)`-specialized `exl3_gemv_spec`
+    /// pipelines (function constants FC_K/FC_MODE/FC_ALIGNED). Same math, same
+    /// outputs — the compiler folds the codebook branch, both load paths and
+    /// the window-shift addends at build time.
+    gemv_spec: RefCell<HashMap<(u32, u32, u32), ComputePipelineState>>,
+    /// P5: per-(`fn`, k, mode, aligned) FC-specialized pipelines for the
+    /// post-Hadamard hot kernels (exl3_gemv_post / _fused2 / _fused3). Lazy:
+    /// each specialization is a separate Metal compile, cached for the
+    /// decoder's lifetime.
+    spec_fns: RefCell<HashMap<(&'static str, u32, u32, u32), ComputePipelineState>>,
     /// T2.5: sums the K-split partials of `gemv` back into `y`.
     gemv_reduce: ComputePipelineState,
     /// Fused K-split partials reduction + Hadamard butterfly + SVH scaling directly to f16 out.
@@ -266,6 +282,9 @@ impl Exl3Gemv {
                 .new_compute_pipeline_state_with_function(&f)
                 .map_err(|e| KernelError::Pipeline(name.to_string(), e.to_string()))
         };
+        // P4: per-(k, mode, aligned) `exl3_gemv_spec` pipelines are built lazily
+        // on first use (each specialization is a separate Metal compile) and
+        // cached for the decoder's lifetime.
         let inv = tensor_core_perm_inverse();
         let inv_perm = device.new_buffer_with_data(
             inv.as_ptr() as *const _,
@@ -278,11 +297,8 @@ impl Exl3Gemv {
             had_in: build("exl3_had_in")?,
             had_in_batched: build("exl3_had_in_batched")?,
             gemv: build("exl3_gemv")?,
-            gemv_post: build("exl3_gemv_post")?,
             gemv_fused2: build("exl3_gemv_fused2")?,
-            gemv_post_fused2: build("exl3_gemv_post_fused2")?,
             gemv_fused3: build("exl3_gemv_fused3")?,
-            gemv_post_fused3: build("exl3_gemv_post_fused3")?,
             gemv4: build("exl3_gemv4")?,
             gemv_reduce: build("exl3_gemv_reduce")?,
             gemv_reduce_post: build("exl3_gemv_reduce_post")?,
@@ -291,8 +307,77 @@ impl Exl3Gemv {
             gemm_sg_reduce: build("exl3_gemm_sg_reduce")?,
             had_out: build("exl3_had_out")?,
             pair_tables: RefCell::new(HashMap::new()),
+            spec_fns: RefCell::new(HashMap::new()),
+            gemv_spec: RefCell::new(HashMap::new()),
             inv_perm,
+            // Moved last: the `build` closure borrows `lib`, so every
+            // pipeline above must be constructed before the move.
+            lib,
         })
+    }
+
+    /// P4: build (or fetch) the `exl3_gemv_spec` pipeline for one
+    /// `(k, mode, aligned)` triple. Function constants are bound by index to
+    /// match `FC_ALIGNED [[function_constant(0)]]`, `FC_MODE (1)`,
+    /// `FC_K (2)` in exl3.metal.
+    fn gemv_spec_pipeline(&self, k: u32, mode: u32, aligned: u32) -> ComputePipelineState {
+        let key = (k, mode, aligned);
+        if let Some(p) = self.gemv_spec.borrow().get(&key) {
+            return p.clone();
+        }
+        let consts = FunctionConstantValues::new();
+        consts.set_constant_value_at_index(
+            &aligned as *const u32 as *const _,
+            MTLDataType::Bool,
+            0,
+        );
+        consts.set_constant_value_at_index(&mode as *const u32 as *const _, MTLDataType::UInt, 1);
+        consts.set_constant_value_at_index(&k as *const u32 as *const _, MTLDataType::UInt, 2);
+        let f = self
+            .lib
+            .get_function("exl3_gemv_spec", Some(consts))
+            .unwrap_or_else(|e| panic!("exl3_gemv_spec({k},{mode},{aligned}): {e}"));
+        let p = self
+            .device
+            .new_compute_pipeline_state_with_function(&f)
+            .unwrap_or_else(|e| panic!("exl3_gemv_spec pipeline({k},{mode},{aligned}): {e}"));
+        self.gemv_spec.borrow_mut().insert(key, p.clone());
+        p
+    }
+
+    /// P5: build (or fetch) an FC-specialized pipeline for any of the
+    /// post-Hadamard hot kernels sharing the FC_ALIGNED/FC_MODE/FC_K
+    /// function-constant indices. `fn_name` must be one of `exl3_gemv_post`,
+    /// `exl3_gemv_post_fused2`, `exl3_gemv_post_fused3`.
+    fn spec_fn_pipeline(
+        &self,
+        fn_name: &'static str,
+        k: u32,
+        mode: u32,
+        aligned: u32,
+    ) -> ComputePipelineState {
+        let key = (fn_name, k, mode, aligned);
+        if let Some(p) = self.spec_fns.borrow().get(&key) {
+            return p.clone();
+        }
+        let consts = FunctionConstantValues::new();
+        consts.set_constant_value_at_index(
+            &aligned as *const u32 as *const _,
+            MTLDataType::Bool,
+            0,
+        );
+        consts.set_constant_value_at_index(&mode as *const u32 as *const _, MTLDataType::UInt, 1);
+        consts.set_constant_value_at_index(&k as *const u32 as *const _, MTLDataType::UInt, 2);
+        let f = self
+            .lib
+            .get_function(fn_name, Some(consts))
+            .unwrap_or_else(|e| panic!("{fn_name}({k},{mode},{aligned}): {e}"));
+        let p = self
+            .device
+            .new_compute_pipeline_state_with_function(&f)
+            .unwrap_or_else(|e| panic!("{fn_name} pipeline({k},{mode},{aligned}): {e}"));
+        self.spec_fns.borrow_mut().insert(key, p.clone());
+        p
     }
 
     /// T2.5 K-split policy: gemv shapes with few out-tiles only fill a small
@@ -526,7 +611,11 @@ impl Exl3Gemv {
                     aligned,
                     nsplit as u32,
                 ];
-                enc.set_compute_pipeline_state(&self.gemv);
+                enc.set_compute_pipeline_state(&self.gemv_spec_pipeline(
+            shape.k,
+            mode,
+            u32::from(trellis.byte_offset % 4 == 0),
+        ));
                 enc.set_buffer(0, Some(&scratch.xh), 0);
                 enc.set_buffer(1, Some(trellis.buffer), trellis.byte_offset as u64);
                 enc.set_buffer(2, Some(&pair_buf), 0);
@@ -775,7 +864,11 @@ impl Exl3Gemv {
         } else {
             owned.as_ref().expect("transient partial")
         };
-        enc.set_compute_pipeline_state(&self.gemv);
+        enc.set_compute_pipeline_state(&self.gemv_spec_pipeline(
+            shape.k,
+            mode,
+            u32::from(trellis.byte_offset % 4 == 0),
+        ));
         enc.set_buffer(0, Some(xh), 0);
         enc.set_buffer(1, Some(trellis.buffer), trellis.byte_offset as u64);
         enc.set_buffer(2, Some(pair), 0);
@@ -794,6 +887,75 @@ impl Exl3Gemv {
             self.encode_gemv_reduce(enc, dest, y, nsplit, shape.out_tiles);
         }
         // Keep any transient partial alive until after the last set_buffer.
+        drop(owned);
+    }
+
+    /// P4 (spec/decode-20tps): `encode_gemv` on the `(k, mode, aligned)`-
+    /// specialized `exl3_gemv_spec` pipeline. Same buffers, same params, same
+    /// partial layout and reduce — only the pipeline differs (function
+    /// constants fold the codebook branch, load paths and window shifts).
+    /// Outputs are bit-identical to [`Self::encode_gemv`]
+    /// (engine test `gpu_gemv_spec_matches_generic`).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_gemv_spec(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        xh: &Buffer,
+        trellis: DeviceSpan<'_>,
+        pair: &Buffer,
+        shape: Exl3Shape,
+        mode: u32,
+        y: &Buffer,
+        ext_partial: Option<&Buffer>,
+        nsplit_override: Option<usize>,
+    ) {
+        debug_assert_eq!(shape.words_per_tile() % 2, 0);
+        let nsplit = nsplit_override.unwrap_or_else(|| Self::gemv_splits(shape.out_tiles));
+        let params: [u32; 7] = [
+            shape.in_tiles as u32,
+            shape.out_tiles as u32,
+            shape.k,
+            (shape.words_per_tile() / 2) as u32,
+            mode,
+            u32::from(trellis.byte_offset % 4 == 0),
+            nsplit as u32,
+        ];
+        let need = nsplit * shape.out_tiles * TILE * 4;
+        let owned = if nsplit > 1 && ext_partial.is_none() {
+            Some(self.new_f32_buffer(need / 4))
+        } else {
+            None
+        };
+        let dest: &Buffer = if nsplit == 1 {
+            y
+        } else if let Some(p) = ext_partial {
+            debug_assert!(
+                p.length() as usize >= need,
+                "spec gemv partial too small: {} < {}",
+                p.length(),
+                need
+            );
+            p
+        } else {
+            owned.as_ref().expect("transient partial")
+        };
+        let aligned = u32::from(trellis.byte_offset % 4 == 0);
+        let pipeline = self.gemv_spec_pipeline(shape.k, mode, aligned);
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(xh), 0);
+        enc.set_buffer(1, Some(trellis.buffer), trellis.byte_offset as u64);
+        enc.set_buffer(2, Some(pair), 0);
+        enc.set_buffer(3, Some(dest), 0);
+        enc.set_bytes(4, 28, params.as_ptr() as *const _);
+        const WARPS: usize = 1; // MUST match the spec kernel: one out-tile per threadgroup
+        let groups = shape.out_tiles.div_ceil(WARPS) as u64;
+        enc.dispatch_thread_groups(
+            MTLSize::new(groups, nsplit as u64, 1),
+            MTLSize::new((32 * WARPS) as u64, 1, 1),
+        );
+        if nsplit > 1 {
+            self.encode_gemv_reduce(enc, dest, y, nsplit, shape.out_tiles);
+        }
         drop(owned);
     }
 
@@ -982,7 +1144,12 @@ impl Exl3Gemv {
             aligned,
             1,
         ];
-        enc.set_compute_pipeline_state(&self.gemv_post);
+        enc.set_compute_pipeline_state(&self.spec_fn_pipeline(
+            "exl3_gemv_post",
+            shape.k,
+            mode,
+            aligned,
+        ));
         enc.set_buffer(0, Some(xh), 0);
         enc.set_buffer(1, Some(trellis.buffer), trellis.byte_offset as u64);
         enc.set_buffer(2, Some(pair), 0);
@@ -1023,7 +1190,12 @@ impl Exl3Gemv {
             aligned,
             1,
         ];
-        enc.set_compute_pipeline_state(&self.gemv_post_fused2);
+        enc.set_compute_pipeline_state(&self.spec_fn_pipeline(
+            "exl3_gemv_post_fused2",
+            shape_a.k,
+            mode,
+            aligned,
+        ));
         enc.set_buffer(0, Some(xh), 0);
         enc.set_buffer(1, Some(trellis_a.buffer), trellis_a.byte_offset as u64);
         enc.set_buffer(2, Some(trellis_b.buffer), trellis_b.byte_offset as u64);
@@ -1072,7 +1244,12 @@ impl Exl3Gemv {
             aligned,
             1,
         ];
-        enc.set_compute_pipeline_state(&self.gemv_post_fused3);
+        enc.set_compute_pipeline_state(&self.spec_fn_pipeline(
+            "exl3_gemv_post_fused3",
+            shape_a.k,
+            mode,
+            aligned,
+        ));
         enc.set_buffer(0, Some(xh), 0);
         enc.set_buffer(1, Some(trellis_a.buffer), trellis_a.byte_offset as u64);
         enc.set_buffer(2, Some(trellis_b.buffer), trellis_b.byte_offset as u64);
@@ -1553,6 +1730,66 @@ impl Exl3Gemv {
             let cb = self.queue.new_command_buffer();
             let enc = cb.new_compute_command_encoder();
             self.encode_gemv(enc, &sc.xh, trellis, &pair, shape, mode, &sc.y, None, nsplit);
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            if cb.status() != MTLCommandBufferStatus::Completed {
+                return Err(KernelError::CommandFailed(cb.status()));
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    sc.y.contents() as *const u8,
+                    out.as_mut_ptr() as *mut u8,
+                    shape.out_features() * 4,
+                );
+            }
+            Ok(())
+        })
+    }
+
+    /// P4 (spec/decode-20tps): `gemv_pass` on the `(k, mode, aligned)`-
+    /// specialized `exl3_gemv_spec` pipeline. Bit-identical outputs to
+    /// [`Self::gemv_pass`] — test/bench hook for the A/B and the equivalence
+    /// gate; production flips via `encode_linear_with_scratch` once the bench
+    /// wins.
+    pub fn gemv_pass_spec(
+        &self,
+        xh: &[f16],
+        trellis: DeviceSpan<'_>,
+        shape: Exl3Shape,
+        mode: u32,
+        nsplit: Option<usize>,
+        out: &mut Vec<f32>,
+    ) -> Result<(), KernelError> {
+        if xh.len() != shape.in_features() {
+            return Err(KernelError::Unsupported(format!(
+                "gemv needs {} activations, got {}",
+                shape.in_features(),
+                xh.len()
+            )));
+        }
+        if mode > 1 {
+            return Err(KernelError::Unsupported(format!("mode {mode} is CPU-only")));
+        }
+        Self::ensure_span_fits(
+            &trellis,
+            shape.in_tiles * shape.out_tiles * shape.words_per_tile() * 2,
+            "trellis",
+            2,
+        )?;
+        let pair = self.pair_buffer(shape.k);
+        out.resize(shape.out_features(), 0.0);
+        self.with_scratch(xh.len(), shape.out_features(), 1, |sc| {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    xh.as_ptr() as *const u8,
+                    sc.xh.contents() as *mut u8,
+                    xh.len() * 2,
+                );
+            }
+            let cb = self.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            self.encode_gemv_spec(enc, &sc.xh, trellis, &pair, shape, mode, &sc.y, None, nsplit);
             enc.end_encoding();
             cb.commit();
             cb.wait_until_completed();
