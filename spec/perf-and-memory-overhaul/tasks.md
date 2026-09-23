@@ -43,10 +43,11 @@
   - **Result**: sweep (gemv-only, 12 reps) argmax → gate 4 (167), down 16 (167), o 8 (114), q 4 (119), k 8 (89), v 8 (78), lm 1 (241). Baked only the 2 outliers vs 4096-TG formula: q 8→4, k/v 16→8. `bench_passes_slow` A/B: gate 165→168, down 168→168, o 109→113, q 111→115, k 70→76, v 76→79, lm 243→242 — no shape below baseline. Sweep harness `bench_gemv_split_sweep_slow` + `gemv_pass_nsplit` + `encode_gemv(nsplit_override)` retained for future splits.
   - **Testing**: every shape ≥ T4 baseline in bench_passes_slow ✓; policy test updated; kernels 21/21, parity, 116 fast.
 
-- [ ] **T5.3r: Coalesced 96B loads on the 32-thread kernel (isolated)**
+- [x] **T5.3r: Coalesced 96B loads on the 32-thread kernel (isolated)** — ATTEMPTED, REVERTED `60a306d` (impl `807964a`)
   - **Files**: `crates/kernels/src/exl3.metal`
   - **Intent**: Re-apply T5.2's lane-coalesced word burst + simd_shuffle fetch *inside the T4 2-way-unroll loop* — never measured without the structure change. Keep only if bench improves.
-  - **Testing**: one-hot + parity; bench shows per-shape gain or the change is dropped.
+  - **Result**: regressed every k=3 shape: gate 168→92, down 168→120, o 113→96, q 115→97, k 76→70, v 79→69 Gw/s. lm_head (fallback path) unchanged → refactor neutral, burst mechanism is the loss (8 generic shuffles/tile × 5-hop butterfly ≈ 160 ALU each > load savings). Correctness fine (21/21, parity, one-hot, 116 fast).
+  - **Testing**: one-hot + parity; bench per-shape gain or dropped → dropped.
 
 - [ ] **T5.4r: R4 — inline had_in/had_out into `exl3_gemv`**
   - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`

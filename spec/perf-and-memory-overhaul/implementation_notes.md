@@ -78,6 +78,21 @@ This document records technical decisions, benchmark measurements, register allo
 - **A/B `bench_passes_slow` (swap 9692/10240 both sides)**: gate 165→**168**, down 168→**168**, o 109→**113**, q 111→**115**, k 70→**76** (+9%), v 76→**79**, lm 243→**242**; no shape below T4 baseline. Commit `d8adb19`.
 - Note: opt. TG count for q/k/v ≈ 2048, not the 4096 target — but apex is pull-shaped, not a cliff (all ≥ ~111 at n≥4); the 4096 target stays fine for other shapes.
 
+### T5.3r — coalesced burst loads REVERTED (2026-09-23)
+- **Attempt** (commit `807964a`): ported T5.2's ExllamaV3-style lane-coalesced tile load into the T4 32-thread 2-way loop. `exl3_load_burst`: lanes 0..twords-1 each read `words[lane]` in one contiguous burst (k=3 → 24 u32 = 96 B), then each lane fetches its scattered ig0/ig1 words via `simd_shuffle`. Applied under `if (aligned && p.twords <= 32u)` (all real linears except k=6 lm_head); lm_head + unaligned keep the per-lane `ld_word` fallback. Also factored the decode block into `exl3_acc_win` shared by both paths + the tail (kept, since only the tail ≤ 1 tile).
+- **A/B `bench_passes_slow` (swap 9612/10240 both sides)**:
+  | linear | T5.2r | burst | Δ |
+  |---|---|---|---|
+  | gate 168 Gw/s | 92 | −45% |
+  | down 168 | 120 | −29% |
+  | o 113 | 96 | −15% |
+  | q 115 | 97 | −16% |
+  | k 76 | 70 | −8% |
+  | v 79 | 69 | −13% |
+  | lm_head 242 | 241 | ~0 (fallback path) |
+- **Attribution**: lm_head (twords=48 → fallback `ld_word` branch, which was refactored to the same helper-based m0/m1-before-decode schedule) is *unchanged* → the ld_word refactor is neutral and the loss is squarely the burst+shuffle mechanism: 8 arbitrary-index `simd_shuffle` per tile (each a 5-hop 32-lane butterfly ≈ 160 ALU) per tile eats ~2x the load savings. **Conclusion: coalesced-burst + generic shuffle is a net loss on M4 Pro for ≤24-word tiles.** Do not retry without a *fixed-stride* shuffle or tg-memory staging (the tg staging dead-end guards the correctness, not performance). Reverted `60a306d`.
+- This closes the two portable ExllamaV3 tricks (PF ring, burst loads) as invalid on this HW. Remaining levers per plan: R4 had fusion (T5.4r), gemm-level and end-to-end loop tuning (T5.5r).
+
 ### T1: Filter vision tower tensors during model load
 - Implemented `is_vision_tensor` in `crates/engine/src/load.rs`.
 - Safetensors loader skips 356 tensors matching `model.vision_tower.*` and `model.embed_vision.*`.
