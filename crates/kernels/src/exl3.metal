@@ -693,13 +693,172 @@ kernel void exl3_gemv_fused3(device const half *xh [[buffer(0)]],            // 
             ig0_[gg] = uint((((i_end - 1) % tw) + tw) % tw);
             s3_[gg] = uint((i_end + 1) * 32 - e_last);
         }
-        for (; it + 1u < it1; it += 2u) {
-            half x_lane = xh_cur[it * 16u + g];
-            float x00 = float(simd_shuffle(x_lane, ushort(r0)));
-            float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
-            float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
-            float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
-            {
+        if (aligned && tw <= 32) {
+            uint utw = uint(tw);
+            for (; it + 1u < it1; it += 2u) {
+                half x_lane = xh_cur[it * 16u + g];
+                float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+                float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+                float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+                float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+                {
+                    uint tw0 = (g < utw) ? ((device const uint *)tile)[g] : 0u;
+                    uint a0 = simd_shuffle(tw0, ushort(ig0_[0]));
+                    uint b0 = simd_shuffle(tw0, ushort(ig1_[0]));
+                    ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                    uint s0 = s3_[0];
+                    uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+                    uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
+                    uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
+                    uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
+
+                    uint a1 = simd_shuffle(tw0, ushort(ig0_[1]));
+                    uint b1 = simd_shuffle(tw0, ushort(ig1_[1]));
+                    ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                    uint s1 = s3_[1];
+                    uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+                    uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
+                    uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
+                    uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
+
+                    accA += x00 * exl3_decode_f(cw0_0, p.mode) + x01 * exl3_decode_f(cw0_1, p.mode);
+                    accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
+                    accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
+                    accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
+                }
+                tile += tstride;
+                float x10 = float(simd_shuffle(x_lane, ushort(16u + r0)));
+                float x11 = float(simd_shuffle(x_lane, ushort(16u + r0 + 1u)));
+                float x12 = float(simd_shuffle(x_lane, ushort(16u + r0 + 8u)));
+                float x13 = float(simd_shuffle(x_lane, ushort(16u + r0 + 9u)));
+                {
+                    uint tw1 = (g < utw) ? ((device const uint *)tile)[g] : 0u;
+                    uint a0 = simd_shuffle(tw1, ushort(ig0_[0]));
+                    uint b0 = simd_shuffle(tw1, ushort(ig1_[0]));
+                    ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                    uint s0 = s3_[0];
+                    uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+                    uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
+                    uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
+                    uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
+
+                    uint a1 = simd_shuffle(tw1, ushort(ig0_[1]));
+                    uint b1 = simd_shuffle(tw1, ushort(ig1_[1]));
+                    ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                    uint s1 = s3_[1];
+                    uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+                    uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
+                    uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
+                    uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
+
+                    accA += x10 * exl3_decode_f(cw0_0, p.mode) + x11 * exl3_decode_f(cw0_1, p.mode);
+                    accA += x12 * exl3_decode_f(cw0_2, p.mode) + x13 * exl3_decode_f(cw0_3, p.mode);
+                    accB += x10 * exl3_decode_f(cw1_0, p.mode) + x11 * exl3_decode_f(cw1_1, p.mode);
+                    accB += x12 * exl3_decode_f(cw1_2, p.mode) + x13 * exl3_decode_f(cw1_3, p.mode);
+                }
+                tile += tstride;
+            }
+            for (; it < it1; it++) {
+                half x_lane = xh_cur[it * 16u + (g & 15u)];
+                float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+                float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+                float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+                float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+
+                uint tw0 = (g < utw) ? ((device const uint *)tile)[g] : 0u;
+                uint a0 = simd_shuffle(tw0, ushort(ig0_[0]));
+                uint b0 = simd_shuffle(tw0, ushort(ig1_[0]));
+                ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                uint s0 = s3_[0];
+                uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+                uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
+                uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
+                uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
+
+                uint a1 = simd_shuffle(tw0, ushort(ig0_[1]));
+                uint b1 = simd_shuffle(tw0, ushort(ig1_[1]));
+                ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                uint s1 = s3_[1];
+                uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+                uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
+                uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
+                uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
+
+                accA += x00 * exl3_decode_f(cw0_0, p.mode) + x01 * exl3_decode_f(cw0_1, p.mode);
+                accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
+                accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
+                accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
+                tile += tstride;
+            }
+        } else {
+            for (; it + 1u < it1; it += 2u) {
+                half x_lane = xh_cur[it * 16u + g];
+                float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+                float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+                float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+                float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+                {
+                    uint a0 = ld_word(tile, ig0_[0], aligned);
+                    uint b0 = ld_word(tile, ig1_[0], aligned);
+                    ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                    uint s0 = s3_[0];
+                    uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+                    uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
+                    uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
+                    uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
+
+                    uint a1 = ld_word(tile, ig0_[1], aligned);
+                    uint b1 = ld_word(tile, ig1_[1], aligned);
+                    ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                    uint s1 = s3_[1];
+                    uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+                    uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
+                    uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
+                    uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
+
+                    accA += x00 * exl3_decode_f(cw0_0, p.mode) + x01 * exl3_decode_f(cw0_1, p.mode);
+                    accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
+                    accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
+                    accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
+                }
+                tile += tstride;
+                float x10 = float(simd_shuffle(x_lane, ushort(16u + r0)));
+                float x11 = float(simd_shuffle(x_lane, ushort(16u + r0 + 1u)));
+                float x12 = float(simd_shuffle(x_lane, ushort(16u + r0 + 8u)));
+                float x13 = float(simd_shuffle(x_lane, ushort(16u + r0 + 9u)));
+                {
+                    uint a0 = ld_word(tile, ig0_[0], aligned);
+                    uint b0 = ld_word(tile, ig1_[0], aligned);
+                    ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                    uint s0 = s3_[0];
+                    uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+                    uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
+                    uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
+                    uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
+
+                    uint a1 = ld_word(tile, ig0_[1], aligned);
+                    uint b1 = ld_word(tile, ig1_[1], aligned);
+                    ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                    uint s1 = s3_[1];
+                    uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+                    uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
+                    uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
+                    uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
+
+                    accA += x10 * exl3_decode_f(cw0_0, p.mode) + x11 * exl3_decode_f(cw0_1, p.mode);
+                    accA += x12 * exl3_decode_f(cw0_2, p.mode) + x13 * exl3_decode_f(cw0_3, p.mode);
+                    accB += x10 * exl3_decode_f(cw1_0, p.mode) + x11 * exl3_decode_f(cw1_1, p.mode);
+                    accB += x12 * exl3_decode_f(cw1_2, p.mode) + x13 * exl3_decode_f(cw1_3, p.mode);
+                }
+                tile += tstride;
+            }
+            for (; it < it1; it++) {
+                half x_lane = xh_cur[it * 16u + (g & 15u)];
+                float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+                float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+                float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+                float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+
                 uint a0 = ld_word(tile, ig0_[0], aligned);
                 uint b0 = ld_word(tile, ig1_[0], aligned);
                 ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
@@ -722,68 +881,8 @@ kernel void exl3_gemv_fused3(device const half *xh [[buffer(0)]],            // 
                 accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
                 accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
                 accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
+                tile += tstride;
             }
-            tile += tstride;
-            float x10 = float(simd_shuffle(x_lane, ushort(16u + r0)));
-            float x11 = float(simd_shuffle(x_lane, ushort(16u + r0 + 1u)));
-            float x12 = float(simd_shuffle(x_lane, ushort(16u + r0 + 8u)));
-            float x13 = float(simd_shuffle(x_lane, ushort(16u + r0 + 9u)));
-            {
-                uint a0 = ld_word(tile, ig0_[0], aligned);
-                uint b0 = ld_word(tile, ig1_[0], aligned);
-                ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
-                uint s0 = s3_[0];
-                uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
-                uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
-                uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
-                uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
-
-                uint a1 = ld_word(tile, ig0_[1], aligned);
-                uint b1 = ld_word(tile, ig1_[1], aligned);
-                ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
-                uint s1 = s3_[1];
-                uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
-                uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
-                uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
-                uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
-
-                accA += x10 * exl3_decode_f(cw0_0, p.mode) + x11 * exl3_decode_f(cw0_1, p.mode);
-                accA += x12 * exl3_decode_f(cw0_2, p.mode) + x13 * exl3_decode_f(cw0_3, p.mode);
-                accB += x10 * exl3_decode_f(cw1_0, p.mode) + x11 * exl3_decode_f(cw1_1, p.mode);
-                accB += x12 * exl3_decode_f(cw1_2, p.mode) + x13 * exl3_decode_f(cw1_3, p.mode);
-            }
-            tile += tstride;
-        }
-        for (; it < it1; it++) {
-            half x_lane = xh_cur[it * 16u + (g & 15u)];
-            float x00 = float(simd_shuffle(x_lane, ushort(r0)));
-            float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
-            float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
-            float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
-
-            uint a0 = ld_word(tile, ig0_[0], aligned);
-            uint b0 = ld_word(tile, ig1_[0], aligned);
-            ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
-            uint s0 = s3_[0];
-            uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
-            uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
-            uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
-            uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
-
-            uint a1 = ld_word(tile, ig0_[1], aligned);
-            uint b1 = ld_word(tile, ig1_[1], aligned);
-            ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
-            uint s1 = s3_[1];
-            uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
-            uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
-            uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
-            uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
-
-            accA += x00 * exl3_decode_f(cw0_0, p.mode) + x01 * exl3_decode_f(cw0_1, p.mode);
-            accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
-            accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
-            accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
-            tile += tstride;
         }
     } else {
         uint pk0 = pair_tab[4u * g];
@@ -1006,6 +1105,50 @@ kernel void exl3_gemv_reduce(device const float *partial [[buffer(0)]],
     }
     y[tg * TILE + tid] = s;
 }
+
+// ---------------------------------------------------------------------------
+// Fused K-split partials reduction + Hadamard epilogue + SVH scaling.
+// grid = (out_tiles.div_ceil(8)), 128 threads per threadgroup.
+// Fuses: y[ot, g] = Σ_s partial[s, ot, g] -> float((half)y) -> Had128 -> svh -> out (f16).
+// Directly writes half output, eliminating intermediate DRAM buffer & had_out.
+// ---------------------------------------------------------------------------
+kernel void exl3_gemv_reduce_post(device const float *partial [[buffer(0)]],
+                                  device const half *svh [[buffer(1)]],
+                                  device half *out [[buffer(2)]],
+                                  constant uint2 &p [[buffer(3)]], // x = out_tiles, y = nsplit
+                                  uint tg [[threadgroup_position_in_grid]],
+                                  uint tid [[thread_position_in_threadgroup]]) {
+    threadgroup float sh[HAD];
+    uint out_tiles = p.x;
+    uint nsplit = p.y;
+    uint ot = tg * 8u + (tid >> 4u);
+    uint g = tid & 15u;
+
+    float s = 0.0f;
+    if (ot < out_tiles) {
+        for (uint sp = 0u; sp < nsplit; sp++) {
+            s += partial[(sp * out_tiles + ot) * 16u + g];
+        }
+    }
+    sh[tid] = float((half)s);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stage = 1u; stage < HAD; stage <<= 1u) {
+        if ((tid & stage) == 0u) {
+            float a = sh[tid];
+            float b = sh[tid + stage];
+            sh[tid] = a + b;
+            sh[tid + stage] = a - b;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    uint global_idx = tg * HAD + tid;
+    if (global_idx < out_tiles * TILE) {
+        out[global_idx] = (half)(sh[tid] * as_type<float>(0x3DB504F3u) * float(svh[global_idx]));
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // out = had_r(y) * svh    (one 128-block per threadgroup; y is the f32 GEMV out)
@@ -1653,3 +1796,746 @@ kernel void exl3_gemm_sg_mma_peak(device const half *xh [[buffer(0)]],
         }
     }
 }
+
+// ===========================================================================
+// spec/pure-decode-273gb Phase 1: In-Kernel Hadamard Epilogue (gemv_post)
+// Fuses GEMV + Threadgroup SRAM 128-column Hadamard butterfly + SVH scaling.
+// Directly writes half output, eliminating intermediate DRAM buffer & had_out.
+// ===========================================================================
+
+kernel void exl3_gemv_post(device const half *xh [[buffer(0)]],
+                           device const ushort *trellis [[buffer(1)]],
+                           device const uint *pair_tab [[buffer(2)]],
+                           device const half *svh [[buffer(3)]],
+                           device half *out [[buffer(4)]],
+                           constant Exl3Params &p [[buffer(5)]],
+                           uint2 tg [[threadgroup_position_in_grid]],
+                           uint2 thr [[thread_position_in_threadgroup]]) {
+    threadgroup float sh[HAD];
+    uint tid = thr.x;
+    uint w = tid >> 5u;
+    uint g = tid & 31u;
+    uint ot = tg.x * 8u + w;
+    bool live = ot < p.out_tiles;
+
+    uint it0 = 0u;
+    uint it1 = p.in_tiles;
+    uint r0 = (g & 3u) * 2u;
+    bool aligned = p.aligned != 0u;
+
+    float accA = 0.0f;
+    float accB = 0.0f;
+
+    const device ushort *tile =
+        trellis + ((ulong)min(it0, p.in_tiles) * p.out_tiles + ot) * p.twords * 2u;
+    const ulong tstride = (ulong)p.out_tiles * p.twords * 2u;
+    uint it = it0;
+
+    if (p.k != 7u) {
+        uint ig0_[2];
+        uint ig1_[2];
+        uint s3_[2];
+        int tw = int(p.twords);
+        for (uint gg = 0u; gg < 2u; gg++) {
+            uint c0 = g * 8u + gg * 4u;
+            int e_last = int(c0 + 4u) * int(p.k) + 256 * int(p.k);
+            int i_end = (e_last - 1) / 32;
+            ig1_[gg] = uint(((i_end % tw) + tw) % tw);
+            ig0_[gg] = uint((((i_end - 1) % tw) + tw) % tw);
+            s3_[gg] = uint((i_end + 1) * 32 - e_last);
+        }
+
+        if (aligned && tw <= 32) {
+            uint utw = uint(tw);
+            for (; live && it + 1u < it1; it += 2u) {
+                half x_lane = xh[it * 16u + g];
+                float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+                float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+                float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+                float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+                {
+                    uint tw0 = (g < utw) ? ((device const uint *)tile)[g] : 0u;
+                    uint a0 = simd_shuffle(tw0, ushort(ig0_[0]));
+                    uint b0 = simd_shuffle(tw0, ushort(ig1_[0]));
+                    ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                    uint s0 = s3_[0];
+                    uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+                    uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
+                    uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
+                    uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
+
+                    uint a1 = simd_shuffle(tw0, ushort(ig0_[1]));
+                    uint b1 = simd_shuffle(tw0, ushort(ig1_[1]));
+                    ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                    uint s1 = s3_[1];
+                    uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+                    uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
+                    uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
+                    uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
+
+                    accA += x00 * exl3_decode_f(cw0_0, p.mode) + x01 * exl3_decode_f(cw0_1, p.mode);
+                    accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
+                    accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
+                    accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
+                }
+                tile += tstride;
+                float x10 = float(simd_shuffle(x_lane, ushort(16u + r0)));
+                float x11 = float(simd_shuffle(x_lane, ushort(16u + r0 + 1u)));
+                float x12 = float(simd_shuffle(x_lane, ushort(16u + r0 + 8u)));
+                float x13 = float(simd_shuffle(x_lane, ushort(16u + r0 + 9u)));
+                {
+                    uint tw1 = (g < utw) ? ((device const uint *)tile)[g] : 0u;
+                    uint a0 = simd_shuffle(tw1, ushort(ig0_[0]));
+                    uint b0 = simd_shuffle(tw1, ushort(ig1_[0]));
+                    ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                    uint s0 = s3_[0];
+                    uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+                    uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
+                    uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
+                    uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
+
+                    uint a1 = simd_shuffle(tw1, ushort(ig0_[1]));
+                    uint b1 = simd_shuffle(tw1, ushort(ig1_[1]));
+                    ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                    uint s1 = s3_[1];
+                    uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+                    uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
+                    uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
+                    uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
+
+                    accA += x10 * exl3_decode_f(cw0_0, p.mode) + x11 * exl3_decode_f(cw0_1, p.mode);
+                    accA += x12 * exl3_decode_f(cw0_2, p.mode) + x13 * exl3_decode_f(cw0_3, p.mode);
+                    accB += x10 * exl3_decode_f(cw1_0, p.mode) + x11 * exl3_decode_f(cw1_1, p.mode);
+                    accB += x12 * exl3_decode_f(cw1_2, p.mode) + x13 * exl3_decode_f(cw1_3, p.mode);
+                }
+                tile += tstride;
+            }
+            for (; live && it < it1; it++) {
+                half x_lane = xh[it * 16u + (g & 15u)];
+                float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+                float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+                float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+                float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+
+                uint tw0 = (g < utw) ? ((device const uint *)tile)[g] : 0u;
+                uint a0 = simd_shuffle(tw0, ushort(ig0_[0]));
+                uint b0 = simd_shuffle(tw0, ushort(ig1_[0]));
+                ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                uint s0 = s3_[0];
+                uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+                uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
+                uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
+                uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
+
+                uint a1 = simd_shuffle(tw0, ushort(ig0_[1]));
+                uint b1 = simd_shuffle(tw0, ushort(ig1_[1]));
+                ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                uint s1 = s3_[1];
+                uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+                uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
+                uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
+                uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
+
+                accA += x00 * exl3_decode_f(cw0_0, p.mode) + x01 * exl3_decode_f(cw0_1, p.mode);
+                accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
+                accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
+                accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
+                tile += tstride;
+            }
+        } else {
+            for (; live && it + 1u < it1; it += 2u) {
+                half x_lane = xh[it * 16u + g];
+                float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+                float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+                float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+                float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+                {
+                    uint a0 = ld_word(tile, ig0_[0], aligned);
+                    uint b0 = ld_word(tile, ig1_[0], aligned);
+                    ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                    uint s0 = s3_[0];
+                    uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+                    uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
+                    uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
+                    uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
+
+                    uint a1 = ld_word(tile, ig0_[1], aligned);
+                    uint b1 = ld_word(tile, ig1_[1], aligned);
+                    ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                    uint s1 = s3_[1];
+                    uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+                    uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
+                    uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
+                    uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
+
+                    accA += x00 * exl3_decode_f(cw0_0, p.mode) + x01 * exl3_decode_f(cw0_1, p.mode);
+                    accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
+                    accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
+                    accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
+                }
+                tile += tstride;
+                float x10 = float(simd_shuffle(x_lane, ushort(16u + r0)));
+                float x11 = float(simd_shuffle(x_lane, ushort(16u + r0 + 1u)));
+                float x12 = float(simd_shuffle(x_lane, ushort(16u + r0 + 8u)));
+                float x13 = float(simd_shuffle(x_lane, ushort(16u + r0 + 9u)));
+                {
+                    uint a0 = ld_word(tile, ig0_[0], aligned);
+                    uint b0 = ld_word(tile, ig1_[0], aligned);
+                    ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                    uint s0 = s3_[0];
+                    uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+                    uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
+                    uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
+                    uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
+
+                    uint a1 = ld_word(tile, ig0_[1], aligned);
+                    uint b1 = ld_word(tile, ig1_[1], aligned);
+                    ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                    uint s1 = s3_[1];
+                    uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+                    uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
+                    uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
+                    uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
+
+                    accA += x10 * exl3_decode_f(cw0_0, p.mode) + x11 * exl3_decode_f(cw0_1, p.mode);
+                    accA += x12 * exl3_decode_f(cw0_2, p.mode) + x13 * exl3_decode_f(cw0_3, p.mode);
+                    accB += x10 * exl3_decode_f(cw1_0, p.mode) + x11 * exl3_decode_f(cw1_1, p.mode);
+                    accB += x12 * exl3_decode_f(cw1_2, p.mode) + x13 * exl3_decode_f(cw1_3, p.mode);
+                }
+                tile += tstride;
+            }
+            for (; live && it < it1; it++) {
+                half x_lane = xh[it * 16u + (g & 15u)];
+                float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+                float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+                float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+                float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+
+                uint a0 = ld_word(tile, ig0_[0], aligned);
+                uint b0 = ld_word(tile, ig1_[0], aligned);
+                ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                uint s0 = s3_[0];
+                uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+                uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
+                uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
+                uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
+
+                uint a1 = ld_word(tile, ig0_[1], aligned);
+                uint b1 = ld_word(tile, ig1_[1], aligned);
+                ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                uint s1 = s3_[1];
+                uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+                uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
+                uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
+                uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
+
+                accA += x00 * exl3_decode_f(cw0_0, p.mode) + x01 * exl3_decode_f(cw0_1, p.mode);
+                accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
+                accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
+                accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
+                tile += tstride;
+            }
+        }
+    } else {
+        uint pk0 = pair_tab[4u * g];
+        uint pk1 = pair_tab[4u * g + 1u];
+        uint pk2 = pair_tab[4u * g + 2u];
+        uint pk3 = pair_tab[4u * g + 3u];
+        uint i0_0 = pk0 & 0xFFu;
+        uint i1_0 = (pk0 >> 8) & 0xFFu;
+        uint s1_0 = (pk0 >> 16) & 0xFFu;
+        uint i0_1 = pk1 & 0xFFu;
+        uint i1_1 = (pk1 >> 8) & 0xFFu;
+        uint s1_1 = (pk1 >> 16) & 0xFFu;
+        uint i0_2 = pk2 & 0xFFu;
+        uint i1_2 = (pk2 >> 8) & 0xFFu;
+        uint s1_2 = (pk2 >> 16) & 0xFFu;
+        uint i0_3 = pk3 & 0xFFu;
+        uint i1_3 = (pk3 >> 8) & 0xFFu;
+        uint s1_3 = (pk3 >> 16) & 0xFFu;
+
+        for (; live && it < it1; it++) {
+            half x_lane = xh[it * 16u + (g & 15u)];
+            float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+            float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+            float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+            float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+            CodePair p0 = funnel_pair(tile, i0_0, i1_0, s1_0, p.k, p.mode, aligned);
+            CodePair p1 = funnel_pair(tile, i0_1, i1_1, s1_1, p.k, p.mode, aligned);
+            CodePair p2 = funnel_pair(tile, i0_2, i1_2, s1_2, p.k, p.mode, aligned);
+            CodePair p3 = funnel_pair(tile, i0_3, i1_3, s1_3, p.k, p.mode, aligned);
+            accA += x00 * float(p0.lo) + x01 * float(p0.hi);
+            accA += x02 * float(p1.lo) + x03 * float(p1.hi);
+            accB += x00 * float(p2.lo) + x01 * float(p2.hi);
+            accB += x02 * float(p3.lo) + x03 * float(p3.hi);
+            tile += tstride;
+        }
+    }
+
+    accA += simd_shuffle_down(accA, 1);
+    accA += simd_shuffle_down(accA, 2);
+    accB += simd_shuffle_down(accB, 1);
+    accB += simd_shuffle_down(accB, 2);
+
+    if (live && (g & 3u) == 0u) {
+        uint c0 = g >> 2;
+        sh[w * 16u + c0] = float((half)accA);
+        sh[w * 16u + c0 + 8u] = float((half)accB);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stage = 1u; stage < HAD; stage <<= 1u) {
+        if (tid < 128u && (tid & stage) == 0u) {
+            float a = sh[tid];
+            float b = sh[tid + stage];
+            sh[tid] = a + b;
+            sh[tid + stage] = a - b;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid < 128u) {
+        uint global_idx = tg.x * HAD + tid;
+        if (global_idx < p.out_tiles * TILE) {
+            out[global_idx] = (half)(sh[tid] * as_type<float>(0x3DB504F3u) * float(svh[global_idx]));
+        }
+    }
+}
+
+// 2-Way Sibling GEMV with In-Kernel Hadamard Epilogue (Gate + Up)
+kernel void exl3_gemv_post_fused2(device const half *xh [[buffer(0)]],            // [2, in_tiles * 16]
+                                  device const ushort *trellis_a [[buffer(1)]],
+                                  device const ushort *trellis_b [[buffer(2)]],
+                                  device const uint *pair_tab [[buffer(3)]],
+                                  device const half *svh_cat [[buffer(4)]],
+                                  device half *out [[buffer(5)]],
+                                  constant Exl3Fused2Params &p [[buffer(6)]],
+                                  uint2 tg [[threadgroup_position_in_grid]],
+                                  uint2 thr [[thread_position_in_threadgroup]]) {
+    threadgroup float sh[HAD];
+    uint tid = thr.x;
+    uint w = tid >> 5u;
+    uint g = tid & 31u;
+    uint ot_global = tg.x * 8u + w;
+    uint out_tiles_total = p.out_tiles_a + p.out_tiles_b;
+    bool live = ot_global < out_tiles_total;
+
+    bool is_b = (ot_global >= p.out_tiles_a);
+    uint ot = is_b ? (ot_global - p.out_tiles_a) : ot_global;
+    device const ushort *trellis = is_b ? trellis_b : trellis_a;
+    device const half *xh_cur = xh + (is_b ? (p.in_tiles * TILE) : 0u);
+    uint out_tiles_cur = is_b ? p.out_tiles_b : p.out_tiles_a;
+
+    uint it0 = 0u;
+    uint it1 = p.in_tiles;
+    uint r0 = (g & 3u) * 2u;
+    bool aligned = p.aligned != 0u;
+
+    float accA = 0.0f;
+    float accB = 0.0f;
+
+    const device ushort *tile =
+        trellis + ((ulong)min(it0, p.in_tiles) * out_tiles_cur + ot) * p.twords * 2u;
+    const ulong tstride = (ulong)out_tiles_cur * p.twords * 2u;
+    uint it = it0;
+
+    if (p.k != 7u) {
+        uint ig0_[2];
+        uint ig1_[2];
+        uint s3_[2];
+        int tw = int(p.twords);
+        for (uint gg = 0u; gg < 2u; gg++) {
+            uint c0 = g * 8u + gg * 4u;
+            int e_last = int(c0 + 4u) * int(p.k) + 256 * int(p.k);
+            int i_end = (e_last - 1) / 32;
+            ig1_[gg] = uint(((i_end % tw) + tw) % tw);
+            ig0_[gg] = uint((((i_end - 1) % tw) + tw) % tw);
+            s3_[gg] = uint((i_end + 1) * 32 - e_last);
+        }
+        for (; live && it + 1u < it1; it += 2u) {
+            half x_lane = xh_cur[it * 16u + g];
+            float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+            float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+            float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+            float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+            {
+                uint a0 = ld_word(tile, ig0_[0], aligned);
+                uint b0 = ld_word(tile, ig1_[0], aligned);
+                ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                uint s0 = s3_[0];
+                uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+                uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
+                uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
+                uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
+
+                uint a1 = ld_word(tile, ig0_[1], aligned);
+                uint b1 = ld_word(tile, ig1_[1], aligned);
+                ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                uint s1 = s3_[1];
+                uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+                uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
+                uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
+                uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
+
+                accA += x00 * exl3_decode_f(cw0_0, p.mode) + x01 * exl3_decode_f(cw0_1, p.mode);
+                accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
+                accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
+                accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
+            }
+            tile += tstride;
+            float x10 = float(simd_shuffle(x_lane, ushort(16u + r0)));
+            float x11 = float(simd_shuffle(x_lane, ushort(16u + r0 + 1u)));
+            float x12 = float(simd_shuffle(x_lane, ushort(16u + r0 + 8u)));
+            float x13 = float(simd_shuffle(x_lane, ushort(16u + r0 + 9u)));
+            {
+                uint a0 = ld_word(tile, ig0_[0], aligned);
+                uint b0 = ld_word(tile, ig1_[0], aligned);
+                ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                uint s0 = s3_[0];
+                uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+                uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
+                uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
+                uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
+
+                uint a1 = ld_word(tile, ig0_[1], aligned);
+                uint b1 = ld_word(tile, ig1_[1], aligned);
+                ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                uint s1 = s3_[1];
+                uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+                uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
+                uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
+                uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
+
+                accA += x10 * exl3_decode_f(cw0_0, p.mode) + x11 * exl3_decode_f(cw0_1, p.mode);
+                accA += x12 * exl3_decode_f(cw0_2, p.mode) + x13 * exl3_decode_f(cw0_3, p.mode);
+                accB += x10 * exl3_decode_f(cw1_0, p.mode) + x11 * exl3_decode_f(cw1_1, p.mode);
+                accB += x12 * exl3_decode_f(cw1_2, p.mode) + x13 * exl3_decode_f(cw1_3, p.mode);
+            }
+            tile += tstride;
+        }
+        for (; live && it < it1; it++) {
+            half x_lane = xh_cur[it * 16u + (g & 15u)];
+            float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+            float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+            float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+            float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+
+            uint a0 = ld_word(tile, ig0_[0], aligned);
+            uint b0 = ld_word(tile, ig1_[0], aligned);
+            ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+            uint s0 = s3_[0];
+            uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+            uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
+            uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
+            uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
+
+            uint a1 = ld_word(tile, ig0_[1], aligned);
+            uint b1 = ld_word(tile, ig1_[1], aligned);
+            ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+            uint s1 = s3_[1];
+            uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+            uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
+            uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
+            uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
+
+            accA += x00 * exl3_decode_f(cw0_0, p.mode) + x01 * exl3_decode_f(cw0_1, p.mode);
+            accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
+            accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
+            accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
+            tile += tstride;
+        }
+    } else {
+        uint pk0 = pair_tab[4u * g];
+        uint pk1 = pair_tab[4u * g + 1u];
+        uint pk2 = pair_tab[4u * g + 2u];
+        uint pk3 = pair_tab[4u * g + 3u];
+        uint i0_0 = pk0 & 0xFFu;
+        uint i1_0 = (pk0 >> 8) & 0xFFu;
+        uint s1_0 = (pk0 >> 16) & 0xFFu;
+        uint i0_1 = pk1 & 0xFFu;
+        uint i1_1 = (pk1 >> 8) & 0xFFu;
+        uint s1_1 = (pk1 >> 16) & 0xFFu;
+        uint i0_2 = pk2 & 0xFFu;
+        uint i1_2 = (pk2 >> 8) & 0xFFu;
+        uint s1_2 = (pk2 >> 16) & 0xFFu;
+        uint i0_3 = pk3 & 0xFFu;
+        uint i1_3 = (pk3 >> 8) & 0xFFu;
+        uint s1_3 = (pk3 >> 16) & 0xFFu;
+
+        for (; live && it < it1; it++) {
+            half x_lane = xh_cur[it * 16u + (g & 15u)];
+            float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+            float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+            float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+            float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+            CodePair p0 = funnel_pair(tile, i0_0, i1_0, s1_0, p.k, p.mode, aligned);
+            CodePair p1 = funnel_pair(tile, i0_1, i1_1, s1_1, p.k, p.mode, aligned);
+            CodePair p2 = funnel_pair(tile, i0_2, i1_2, s1_2, p.k, p.mode, aligned);
+            CodePair p3 = funnel_pair(tile, i0_3, i1_3, s1_3, p.k, p.mode, aligned);
+            accA += x00 * float(p0.lo) + x01 * float(p0.hi);
+            accA += x02 * float(p1.lo) + x03 * float(p1.hi);
+            accB += x00 * float(p2.lo) + x01 * float(p2.hi);
+            accB += x02 * float(p3.lo) + x03 * float(p3.hi);
+            tile += tstride;
+        }
+    }
+
+    accA += simd_shuffle_down(accA, 1);
+    accA += simd_shuffle_down(accA, 2);
+    accB += simd_shuffle_down(accB, 1);
+    accB += simd_shuffle_down(accB, 2);
+
+    if (live && (g & 3u) == 0u) {
+        uint c0 = g >> 2;
+        sh[w * 16u + c0] = float((half)accA);
+        sh[w * 16u + c0 + 8u] = float((half)accB);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stage = 1u; stage < HAD; stage <<= 1u) {
+        if (tid < 128u && (tid & stage) == 0u) {
+            float a = sh[tid];
+            float b = sh[tid + stage];
+            sh[tid] = a + b;
+            sh[tid + stage] = a - b;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid < 128u) {
+        uint global_idx = tg.x * HAD + tid;
+        if (global_idx < out_tiles_total * TILE) {
+            out[global_idx] = (half)(sh[tid] * as_type<float>(0x3DB504F3u) * float(svh_cat[global_idx]));
+        }
+    }
+}
+
+// 3-Way Sibling GEMV with In-Kernel Hadamard Epilogue (Q + K + V)
+kernel void exl3_gemv_post_fused3(device const half *xh [[buffer(0)]],            // [3, in_tiles * 16]
+                                  device const ushort *trellis_a [[buffer(1)]],
+                                  device const ushort *trellis_b [[buffer(2)]],
+                                  device const ushort *trellis_c [[buffer(3)]],
+                                  device const uint *pair_tab [[buffer(4)]],
+                                  device const half *svh_cat [[buffer(5)]],
+                                  device half *out [[buffer(6)]],
+                                  constant Exl3Fused3Params &p [[buffer(7)]],
+                                  uint2 tg [[threadgroup_position_in_grid]],
+                                  uint2 thr [[thread_position_in_threadgroup]]) {
+    threadgroup float sh[HAD];
+    uint tid = thr.x;
+    uint w = tid >> 5u;
+    uint g = tid & 31u;
+    uint ot_global = tg.x * 8u + w;
+    uint out_tiles_ab = p.out_tiles_a + p.out_tiles_b;
+    uint out_tiles_total = out_tiles_ab + p.out_tiles_c;
+    bool live = ot_global < out_tiles_total;
+
+    uint sub;
+    uint ot;
+    uint out_tiles_cur;
+    device const ushort *trellis;
+    if (ot_global < p.out_tiles_a) {
+        sub = 0u;
+        ot = ot_global;
+        out_tiles_cur = p.out_tiles_a;
+        trellis = trellis_a;
+    } else if (ot_global < out_tiles_ab) {
+        sub = 1u;
+        ot = ot_global - p.out_tiles_a;
+        out_tiles_cur = p.out_tiles_b;
+        trellis = trellis_b;
+    } else {
+        sub = 2u;
+        ot = ot_global - out_tiles_ab;
+        out_tiles_cur = p.out_tiles_c;
+        trellis = trellis_c;
+    }
+    device const half *xh_cur = xh + sub * (p.in_tiles * TILE);
+
+    uint it0 = 0u;
+    uint it1 = p.in_tiles;
+    uint r0 = (g & 3u) * 2u;
+    bool aligned = p.aligned != 0u;
+
+    float accA = 0.0f;
+    float accB = 0.0f;
+
+    const device ushort *tile =
+        trellis + ((ulong)min(it0, p.in_tiles) * out_tiles_cur + ot) * p.twords * 2u;
+    const ulong tstride = (ulong)out_tiles_cur * p.twords * 2u;
+    uint it = it0;
+
+    if (p.k != 7u) {
+        uint ig0_[2];
+        uint ig1_[2];
+        uint s3_[2];
+        int tw = int(p.twords);
+        for (uint gg = 0u; gg < 2u; gg++) {
+            uint c0 = g * 8u + gg * 4u;
+            int e_last = int(c0 + 4u) * int(p.k) + 256 * int(p.k);
+            int i_end = (e_last - 1) / 32;
+            ig1_[gg] = uint(((i_end % tw) + tw) % tw);
+            ig0_[gg] = uint((((i_end - 1) % tw) + tw) % tw);
+            s3_[gg] = uint((i_end + 1) * 32 - e_last);
+        }
+        for (; live && it + 1u < it1; it += 2u) {
+            half x_lane = xh_cur[it * 16u + g];
+            float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+            float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+            float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+            float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+            {
+                uint a0 = ld_word(tile, ig0_[0], aligned);
+                uint b0 = ld_word(tile, ig1_[0], aligned);
+                ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                uint s0 = s3_[0];
+                uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+                uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
+                uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
+                uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
+
+                uint a1 = ld_word(tile, ig0_[1], aligned);
+                uint b1 = ld_word(tile, ig1_[1], aligned);
+                ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                uint s1 = s3_[1];
+                uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+                uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
+                uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
+                uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
+
+                accA += x00 * exl3_decode_f(cw0_0, p.mode) + x01 * exl3_decode_f(cw0_1, p.mode);
+                accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
+                accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
+                accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
+            }
+            tile += tstride;
+            float x10 = float(simd_shuffle(x_lane, ushort(16u + r0)));
+            float x11 = float(simd_shuffle(x_lane, ushort(16u + r0 + 1u)));
+            float x12 = float(simd_shuffle(x_lane, ushort(16u + r0 + 8u)));
+            float x13 = float(simd_shuffle(x_lane, ushort(16u + r0 + 9u)));
+            {
+                uint a0 = ld_word(tile, ig0_[0], aligned);
+                uint b0 = ld_word(tile, ig1_[0], aligned);
+                ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                uint s0 = s3_[0];
+                uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+                uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
+                uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
+                uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
+
+                uint a1 = ld_word(tile, ig0_[1], aligned);
+                uint b1 = ld_word(tile, ig1_[1], aligned);
+                ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                uint s1 = s3_[1];
+                uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+                uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
+                uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
+                uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
+
+                accA += x10 * exl3_decode_f(cw0_0, p.mode) + x11 * exl3_decode_f(cw0_1, p.mode);
+                accA += x12 * exl3_decode_f(cw0_2, p.mode) + x13 * exl3_decode_f(cw0_3, p.mode);
+                accB += x10 * exl3_decode_f(cw1_0, p.mode) + x11 * exl3_decode_f(cw1_1, p.mode);
+                accB += x12 * exl3_decode_f(cw1_2, p.mode) + x13 * exl3_decode_f(cw1_3, p.mode);
+            }
+            tile += tstride;
+        }
+        for (; live && it < it1; it++) {
+            half x_lane = xh_cur[it * 16u + (g & 15u)];
+            float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+            float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+            float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+            float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+
+            uint a0 = ld_word(tile, ig0_[0], aligned);
+            uint b0 = ld_word(tile, ig1_[0], aligned);
+            ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+            uint s0 = s3_[0];
+            uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+            uint cw0_2 = uint(m0 >> (s0 + p.k)) & 0xFFFFu;
+            uint cw0_1 = uint(m0 >> (s0 + 2u * p.k)) & 0xFFFFu;
+            uint cw0_0 = uint(m0 >> (s0 + 3u * p.k)) & 0xFFFFu;
+
+            uint a1 = ld_word(tile, ig0_[1], aligned);
+            uint b1 = ld_word(tile, ig1_[1], aligned);
+            ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+            uint s1 = s3_[1];
+            uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+            uint cw1_2 = uint(m1 >> (s1 + p.k)) & 0xFFFFu;
+            uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
+            uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
+
+            accA += x00 * exl3_decode_f(cw0_0, p.mode) + x01 * exl3_decode_f(cw0_1, p.mode);
+            accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
+            accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
+            accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
+            tile += tstride;
+        }
+    } else {
+        uint pk0 = pair_tab[4u * g];
+        uint pk1 = pair_tab[4u * g + 1u];
+        uint pk2 = pair_tab[4u * g + 2u];
+        uint pk3 = pair_tab[4u * g + 3u];
+        uint i0_0 = pk0 & 0xFFu;
+        uint i1_0 = (pk0 >> 8) & 0xFFu;
+        uint s1_0 = (pk0 >> 16) & 0xFFu;
+        uint i0_1 = pk1 & 0xFFu;
+        uint i1_1 = (pk1 >> 8) & 0xFFu;
+        uint s1_1 = (pk1 >> 16) & 0xFFu;
+        uint i0_2 = pk2 & 0xFFu;
+        uint i1_2 = (pk2 >> 8) & 0xFFu;
+        uint s1_2 = (pk2 >> 16) & 0xFFu;
+        uint i0_3 = pk3 & 0xFFu;
+        uint i1_3 = (pk3 >> 8) & 0xFFu;
+        uint s1_3 = (pk3 >> 16) & 0xFFu;
+
+        for (; live && it < it1; it++) {
+            half x_lane = xh_cur[it * 16u + (g & 15u)];
+            float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+            float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+            float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+            float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+            CodePair p0 = funnel_pair(tile, i0_0, i1_0, s1_0, p.k, p.mode, aligned);
+            CodePair p1 = funnel_pair(tile, i0_1, i1_1, s1_1, p.k, p.mode, aligned);
+            CodePair p2 = funnel_pair(tile, i0_2, i1_2, s1_2, p.k, p.mode, aligned);
+            CodePair p3 = funnel_pair(tile, i0_3, i1_3, s1_3, p.k, p.mode, aligned);
+            accA += x00 * float(p0.lo) + x01 * float(p0.hi);
+            accA += x02 * float(p1.lo) + x03 * float(p1.hi);
+            accB += x00 * float(p2.lo) + x01 * float(p2.hi);
+            accB += x02 * float(p3.lo) + x03 * float(p3.hi);
+            tile += tstride;
+        }
+    }
+
+    accA += simd_shuffle_down(accA, 1);
+    accA += simd_shuffle_down(accA, 2);
+    accB += simd_shuffle_down(accB, 1);
+    accB += simd_shuffle_down(accB, 2);
+
+    if (live && (g & 3u) == 0u) {
+        uint c0 = g >> 2;
+        sh[w * 16u + c0] = float((half)accA);
+        sh[w * 16u + c0 + 8u] = float((half)accB);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stage = 1u; stage < HAD; stage <<= 1u) {
+        if (tid < 128u && (tid & stage) == 0u) {
+            float a = sh[tid];
+            float b = sh[tid + stage];
+            sh[tid] = a + b;
+            sh[tid + stage] = a - b;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (tid < 128u) {
+        uint global_idx = tg.x * HAD + tid;
+        if (global_idx < out_tiles_total * TILE) {
+            out[global_idx] = (half)(sh[tid] * as_type<float>(0x3DB504F3u) * float(svh_cat[global_idx]));
+        }
+    }
+}
+

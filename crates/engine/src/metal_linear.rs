@@ -1553,6 +1553,114 @@ kernel void stream_sum_strided(device const uint *buf [[buffer(0)]],
         assert_eq!(slice_c, &slice_f3[out_a + out_b..out_a + out_b + out_c], "fused3 C output mismatch");
     }
 
+    /// spec/pure-decode-273gb T1: the fused rows=1 post-Hadamard linear
+    /// (`encode_linear_with_scratch` → `exl3_gemv_post` / `exl3_gemv` +
+    /// `exl3_gemv_reduce_post`) must reproduce the unfused GPU composition
+    /// `had_out(gemv(had_in(x)))`.
+    ///
+    /// Two production routes exist (see implementation notes, split-policy
+    /// consequence) and both are gated here:
+    ///
+    /// * **Route A (nsplit > 1**, every decode linear except lm_head):
+    ///   `gemv` writes the same K-split partials, `gemv_reduce_post` sums
+    ///   them in the same split order as `gemv_reduce` and rounds the same
+    ///   full column sum to f16 at the same single point. Same products,
+    ///   same accumulation order, same rounding → **bit-identical**.
+    /// * **Route B (nsplit == 1**, lm_head): direct `exl3_gemv_post`
+    ///   accumulates each column in a single f32 chain (2-way unrolled) while
+    ///   `exl3_gemv` uses 4 sub-chains + a cross-warp tree — same products,
+    ///   different f32 summation order, absorbed by the single f16 rounding
+    ///   of the Hadamard input → **≤ 1 f16 ulp** (same precedent as
+    ///   `gpu_had_out_matches_cpu_reference`'s FMA-contraction bound).
+    #[test]
+    fn gpu_gemv_post_matches_unfused() {
+        let Some(c) = ctx() else { return };
+        let ml = MetalLinear::new(&c).unwrap();
+        // (k, in_f, out_f) — out_f selects the gemv_splits route: 128 → heavy
+        // K-split (16), 512 → q's nsplit=2 table hit, 65536 → nsplit=1
+        // (lm_head-shaped: direct `exl3_gemv_post`). k mix covers the
+        // aligned+tw≤32 simd_shuffle sub-branch (k=2,3,4) and the ld_word
+        // dq4 window branch (k=6).
+        let cases: &[(u32, usize, usize)] = &[
+            (2, 128, 128),
+            (3, 128, 128),
+            (4, 128, 128),
+            (6, 128, 128),
+            (3, 128, 512),
+            (3, 128, 640),
+            (3, 128, 65536),
+        ];
+        for (case_i, &(k, in_f, out_f)) in cases.iter().enumerate() {
+            let src = SynthGpuSource::build(c.device(), k, in_f, out_f);
+            let lin = linear_handles(&src, "l").unwrap();
+            let shape = lin.shape;
+            let mode = lin.mode;
+            let mut rng = Rng(0xD00D_0001u64 + case_i as u64);
+            let x: Vec<f16> = (0..in_f)
+                .map(|_| f16::from_f32(((rng.next() % 2001) as f32 / 1000.0) - 1.0))
+                .collect();
+
+            // Reference: the unfused GPU composition (same kernels the old
+            // three-dispatch path ran).
+            let mut xh = Vec::new();
+            ml.raw()
+                .had_in_pass(&x, lin.suh(), &mut xh)
+                .expect("had_in");
+            let mut y = Vec::new();
+            ml.raw()
+                .gemv_pass_nsplit(&xh, lin.trellis(), shape, mode, None, &mut y)
+                .expect("gemv");
+            let mut want = Vec::new();
+            ml.raw()
+                .had_out_pass(&y, lin.svh(), &mut want)
+                .expect("had_out");
+
+            // Production: the fused rows=1 path under test.
+            let x_buf = c.device().new_buffer_with_data(
+                x.as_ptr() as *const _,
+                (in_f * 2) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let out_buf = c
+                .device()
+                .new_buffer((out_f * 2) as u64, MTLResourceOptions::StorageModeShared);
+            let (xh_need, y_need, p_need) = MetalLinear::chunk_scratch_needs(&lin, 1);
+            let scratch = ml.chunk_scratch(xh_need, y_need, p_need);
+            let cb = c.queue().new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            ml.encode_linear_with_scratch(enc, &lin, &x_buf, &out_buf, 1, &scratch)
+                .unwrap();
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            let got: &[f16] =
+                unsafe { std::slice::from_raw_parts(out_buf.contents() as *const f16, out_f) };
+
+            if Exl3Gemv::gemv_partial_bytes(shape) > 0 {
+                // Route A: K-split reduce + epilogue — must be bit-identical.
+                assert_eq!(
+                    want, got,
+                    "k={k} {in_f}x{out_f} route A (nsplit>1) diverged from unfused"
+                );
+            } else {
+                // Route B: direct gemv_post — ≤ 1 f16 ulp (f32 reorder only).
+                let mut worst = 0i32;
+                for (i, (&w, &g)) in want.iter().zip(got.iter()).enumerate() {
+                    let zero_ok = w.to_f32() == 0.0 && g.to_f32() == 0.0;
+                    let d = (w.to_bits() as i32 - g.to_bits() as i32).abs();
+                    assert!(
+                        zero_ok || d <= 1,
+                        "k={k} {in_f}x{out_f} route B out[{i}] want {:#06x} got {:#06x} ({d} ulp)",
+                        w.to_bits(),
+                        g.to_bits()
+                    );
+                    worst = worst.max(d);
+                }
+                assert!(worst <= 1, "k={k} {in_f}x{out_f} route B worst {worst} ulp");
+            }
+        }
+    }
+
     /// Host-only model of the MSL GEMV's index math: the pair table + funnel
     /// shift must reproduce `unpack_trellis_tile` for every K, and the group →
     /// (row, column) mapping must reproduce `tensor_core_perm`. If this passes

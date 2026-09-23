@@ -1,5 +1,60 @@
 # Implementation Notes: Pure Decode 273 GB/s Bandwidth Saturation
 
+## T1 Completion Audit (2026-09-23, session resumption)
+
+State found in the working tree: T1 kernels, bindings, and engine rewire were
+already written but uncommitted and untested (session died mid-T1). Full audit
+results:
+
+- **MSL kernels present and structurally complete** (`exl3.metal`):
+  - `exl3_gemv_post` (L1806): single-linear GEMV, in-threadgroup SRAM butterfly,
+    direct f16 out. Body is a faithful copy of `exl3_gemv`'s dot-product
+    (dq4 64-bit window path for k≠7 incl. the aligned+tw≤32 `simd_shuffle`
+    sub-branch, pair-table funnel for k=7) + `exl3_had_out`'s epilogue.
+  - `exl3_gemv_post_fused2` (L2107) / `exl3_gemv_post_fused3` (L2316): same,
+    with per-tile trellis pointer select (`is_b ? trellis_b : trellis_a`,
+    3-way `sub` select) and `xh` row offset per sibling.
+  - `exl3_gemv_reduce_post` (L1115): sums K-split partials `[nsplit, ot, 16]`
+    in split order → f16 round → butterfly → svh → f16 out (128 threads/TG,
+    8 out-tiles per TG).
+- **Bindings present** (`exl3.rs`): pipelines `gemv_post`, `gemv_post_fused2`,
+  `gemv_post_fused3`, `gemv_reduce_post` built in `Exl3Gemv::new`; public
+  `encode_gemv_post` / `encode_gemv_post_fused2` / `encode_gemv_post_fused3` /
+  `encode_gemv_reduce_post`; `encode_linear_with_scratch` rows=1 branch rewired
+  to had_in → (`gemv_post` | `gemv` + `gemv_reduce_post`); fused2/fused3
+  `*_with_scratch` entries now end in the post-epilogue kernels (no y, no
+  had_out dispatch).
+- **Param byte-layouts verified against `set_bytes` sizes**: `Exl3Params` 7×u32
+  = 28 B, `Exl3Fused2Params` 8×u32 = 32 B, `Exl3Fused3Params` 9×u32 = 36 B.
+  `exl3_gemv_post` never reads `p.nsplit` (harmless trailing member, keeps the
+  struct identical to `exl3_gemv`'s).
+- **Dispatch geometry**: post kernels run 8 out-tiles per 256-thread TG
+  (8 warps × 32 lanes, warp w = out-tile, lanes = columns); butterfly runs on
+  tid<128 after all 8 warps fill `sh[128]`. Grid = out_tiles.div_ceil(8).
+  `exl3_gemv` stays WARPS=1/32 threads (new rows=1 K-split dispatch in the
+  rows=1 branch matches `encode_gemv`'s geometry).
+- **Rounding-point equivalence argument (why bit-exactness is preserved)**:
+  old path rounds the *full* f32 column sum to f16 inside `had_out`
+  (`sh[t] = float((half)y[...])`) before the butterfly; new paths round the
+  same full sum (nsplit=1: in-kernel `float((half)accA/accB)` after the
+  simd_shuffle_down collapse; nsplit>1: `gemv_reduce_post` sums the same
+  partials in the same split order as `gemv_reduce` before rounding). Same
+  products, same per-split accumulation order, same reduce order, same single
+  rounding point → bit-identical f16 outputs.
+- **Split-policy consequence**: with the P1-T2 argmax table (gate 2, q 2,
+  down/o 8, k/v 8, lm 1) every decode linear *except lm_head* takes the
+  `gemv + gemv_reduce_post` route; lm_head (16384 out-tiles → nsplit=1) is the
+  only `exl3_gemv_post` caller in production. Both routes must therefore be
+  unit-covered — see T1 test below.
+- **Arena sizing**: `chunk_scratch_needs` + `gemv_partial_bytes` already
+  single-source the `partial` requirement (`metal_linear.rs` maxes it in), so
+  the decoder arena covers the new rows=1 K-split partial use without change.
+- **Gap found by the audit**: T1's unit test (`gpu_gemv_post_matches_unfused`)
+  did not exist yet — written in this session, see T1 entry in tasks.md.
+  Note `gpu_encode_fused2_and_fused3_matches_separate_linears` (T5) now
+  implicitly exercises the post epilogue too, because its separate/fused
+  comparisons both route through the rewired `*_with_scratch` entries.
+
 ## Architecture Log & Live Measurements
 
 - **Hardware**: Apple M4 Pro (20 GPU cores, 273 GB/s memory bandwidth).

@@ -223,14 +223,19 @@ pub struct Exl3Gemv {
     had_in: ComputePipelineState,
     had_in_batched: ComputePipelineState,
     gemv: ComputePipelineState,
+    gemv_post: ComputePipelineState,
     gemv_fused2: ComputePipelineState,
+    gemv_post_fused2: ComputePipelineState,
     gemv_fused3: ComputePipelineState,
+    gemv_post_fused3: ComputePipelineState,
     /// spec/decode-20tps P1-T1: PonyExl3 v12 MT=1 parity shape (4 simdgroups
     /// per out-tile, 8 accs/lane, zero hot-loop barriers). A/B-able via
     /// `gemv_pass_v4`; production still uses `gemv` until the bench wins.
     gemv4: ComputePipelineState,
     /// T2.5: sums the K-split partials of `gemv` back into `y`.
     gemv_reduce: ComputePipelineState,
+    /// Fused K-split partials reduction + Hadamard butterfly + SVH scaling directly to f16 out.
+    gemv_reduce_post: ComputePipelineState,
     gemm: ComputePipelineState,
     /// Simdgroup tensor-core GEMM (v19c port; `rows ≥ 2`, see `sg_eligible`).
     gemm_sg: ComputePipelineState,
@@ -273,10 +278,14 @@ impl Exl3Gemv {
             had_in: build("exl3_had_in")?,
             had_in_batched: build("exl3_had_in_batched")?,
             gemv: build("exl3_gemv")?,
+            gemv_post: build("exl3_gemv_post")?,
             gemv_fused2: build("exl3_gemv_fused2")?,
+            gemv_post_fused2: build("exl3_gemv_post_fused2")?,
             gemv_fused3: build("exl3_gemv_fused3")?,
+            gemv_post_fused3: build("exl3_gemv_post_fused3")?,
             gemv4: build("exl3_gemv4")?,
             gemv_reduce: build("exl3_gemv_reduce")?,
+            gemv_reduce_post: build("exl3_gemv_reduce_post")?,
             gemm: build("exl3_gemm")?,
             gemm_sg: build("exl3_gemm_sg")?,
             gemm_sg_reduce: build("exl3_gemm_sg_reduce")?,
@@ -500,6 +509,47 @@ impl Exl3Gemv {
             scratch.xh.length() / 2,
             x_rows * inn
         );
+
+        if rows == 1 {
+            let nsplit = Self::gemv_splits(shape.out_tiles);
+            self.encode_had_in(enc, x, suh, &scratch.xh, 1, inn);
+            if nsplit == 1 {
+                self.encode_gemv_post(enc, &scratch.xh, trellis, &pair_buf, svh, out, shape, mode);
+            } else {
+                let aligned = u32::from(trellis.byte_offset % 4 == 0);
+                let params: [u32; 7] = [
+                    shape.in_tiles as u32,
+                    shape.out_tiles as u32,
+                    shape.k,
+                    (shape.words_per_tile() / 2) as u32,
+                    mode,
+                    aligned,
+                    nsplit as u32,
+                ];
+                enc.set_compute_pipeline_state(&self.gemv);
+                enc.set_buffer(0, Some(&scratch.xh), 0);
+                enc.set_buffer(1, Some(trellis.buffer), trellis.byte_offset as u64);
+                enc.set_buffer(2, Some(&pair_buf), 0);
+                enc.set_buffer(3, Some(&scratch.partial), 0);
+                enc.set_bytes(4, 28, params.as_ptr() as *const _);
+                const WARPS: usize = 1;
+                let groups = shape.out_tiles.div_ceil(WARPS) as u64;
+                enc.dispatch_thread_groups(
+                    MTLSize::new(groups, nsplit as u64, 1),
+                    MTLSize::new((32 * WARPS) as u64, 1, 1),
+                );
+                self.encode_gemv_reduce_post(
+                    enc,
+                    &scratch.partial,
+                    svh,
+                    out,
+                    nsplit,
+                    shape.out_tiles,
+                );
+            }
+            return Ok(());
+        }
+
         debug_assert!(
             (scratch.y.length() as usize) >= rows * outp * 4,
             "chunk y under-allocated"
@@ -565,20 +615,18 @@ impl Exl3Gemv {
 
         let pair_buf = self.pair_buffer(shape_a.k);
         self.encode_had_in_batched(enc, x, suh_stack, &scratch.xh, 2, inn);
-        self.encode_gemv_fused2(
+        self.encode_gemv_post_fused2(
             enc,
             &scratch.xh,
             trellis_a,
             trellis_b,
             &pair_buf,
+            svh_cat,
+            out,
             shape_a,
             shape_b,
             mode,
-            &scratch.y,
-            Some(&scratch.partial),
-            None,
         );
-        self.encode_had_out(enc, &scratch.y, svh_cat, out, 1, outp);
         Ok(())
     }
 
@@ -635,22 +683,20 @@ impl Exl3Gemv {
 
         let pair_buf = self.pair_buffer(shape_a.k);
         self.encode_had_in_batched(enc, x, suh_stack, &scratch.xh, 3, inn);
-        self.encode_gemv_fused3(
+        self.encode_gemv_post_fused3(
             enc,
             &scratch.xh,
             trellis_a,
             trellis_b,
             trellis_c,
             &pair_buf,
+            svh_cat,
+            out,
             shape_a,
             shape_b,
             shape_c,
             mode,
-            &scratch.y,
-            Some(&scratch.partial),
-            None,
         );
-        self.encode_had_out(enc, &scratch.y, svh_cat, out, 1, outp);
         Ok(())
     }
 
@@ -911,6 +957,158 @@ impl Exl3Gemv {
         }
         drop(owned);
     }
+
+    /// spec/pure-decode-273gb Phase 1: In-kernel post-Hadamard single GEMV.
+    /// Fuses GEMV dot product, threadgroup SRAM 128-column butterfly, and SVH scaling.
+    /// Output buffer directly receives final f16 results.
+    pub fn encode_gemv_post(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        xh: &Buffer,
+        trellis: DeviceSpan<'_>,
+        pair: &Buffer,
+        svh: DeviceSpan<'_>,
+        out: &Buffer,
+        shape: Exl3Shape,
+        mode: u32,
+    ) {
+        let aligned = u32::from(trellis.byte_offset % 4 == 0);
+        let params: [u32; 7] = [
+            shape.in_tiles as u32,
+            shape.out_tiles as u32,
+            shape.k,
+            (shape.words_per_tile() / 2) as u32,
+            mode,
+            aligned,
+            1,
+        ];
+        enc.set_compute_pipeline_state(&self.gemv_post);
+        enc.set_buffer(0, Some(xh), 0);
+        enc.set_buffer(1, Some(trellis.buffer), trellis.byte_offset as u64);
+        enc.set_buffer(2, Some(pair), 0);
+        enc.set_buffer(3, Some(svh.buffer), svh.byte_offset as u64);
+        enc.set_buffer(4, Some(out), 0);
+        enc.set_bytes(5, 28, params.as_ptr() as *const _);
+        let blocks = shape.out_tiles.div_ceil(8) as u64;
+        enc.dispatch_thread_groups(
+            MTLSize::new(blocks, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+    }
+
+    /// spec/pure-decode-273gb Phase 1: In-kernel post-Hadamard 2-way fused sibling GEMV (Gate + Up).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_gemv_post_fused2(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        xh: &Buffer,
+        trellis_a: DeviceSpan<'_>,
+        trellis_b: DeviceSpan<'_>,
+        pair: &Buffer,
+        svh_cat: DeviceSpan<'_>,
+        out: &Buffer,
+        shape_a: Exl3Shape,
+        shape_b: Exl3Shape,
+        mode: u32,
+    ) {
+        let out_tiles_total = shape_a.out_tiles + shape_b.out_tiles;
+        let aligned = u32::from(trellis_a.byte_offset % 4 == 0 && trellis_b.byte_offset % 4 == 0);
+        let params: [u32; 8] = [
+            shape_a.in_tiles as u32,
+            shape_a.out_tiles as u32,
+            shape_b.out_tiles as u32,
+            shape_a.k,
+            (shape_a.words_per_tile() / 2) as u32,
+            mode,
+            aligned,
+            1,
+        ];
+        enc.set_compute_pipeline_state(&self.gemv_post_fused2);
+        enc.set_buffer(0, Some(xh), 0);
+        enc.set_buffer(1, Some(trellis_a.buffer), trellis_a.byte_offset as u64);
+        enc.set_buffer(2, Some(trellis_b.buffer), trellis_b.byte_offset as u64);
+        enc.set_buffer(3, Some(pair), 0);
+        enc.set_buffer(4, Some(svh_cat.buffer), svh_cat.byte_offset as u64);
+        enc.set_buffer(5, Some(out), 0);
+        enc.set_bytes(6, 32, params.as_ptr() as *const _);
+        let blocks = out_tiles_total.div_ceil(8) as u64;
+        enc.dispatch_thread_groups(
+            MTLSize::new(blocks, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+    }
+
+    /// spec/pure-decode-273gb Phase 1: In-kernel post-Hadamard 3-way fused sibling GEMV (Q + K + V).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_gemv_post_fused3(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        xh: &Buffer,
+        trellis_a: DeviceSpan<'_>,
+        trellis_b: DeviceSpan<'_>,
+        trellis_c: DeviceSpan<'_>,
+        pair: &Buffer,
+        svh_cat: DeviceSpan<'_>,
+        out: &Buffer,
+        shape_a: Exl3Shape,
+        shape_b: Exl3Shape,
+        shape_c: Exl3Shape,
+        mode: u32,
+    ) {
+        let out_tiles_total = shape_a.out_tiles + shape_b.out_tiles + shape_c.out_tiles;
+        let aligned = u32::from(
+            trellis_a.byte_offset % 4 == 0
+                && trellis_b.byte_offset % 4 == 0
+                && trellis_c.byte_offset % 4 == 0,
+        );
+        let params: [u32; 9] = [
+            shape_a.in_tiles as u32,
+            shape_a.out_tiles as u32,
+            shape_b.out_tiles as u32,
+            shape_c.out_tiles as u32,
+            shape_a.k,
+            (shape_a.words_per_tile() / 2) as u32,
+            mode,
+            aligned,
+            1,
+        ];
+        enc.set_compute_pipeline_state(&self.gemv_post_fused3);
+        enc.set_buffer(0, Some(xh), 0);
+        enc.set_buffer(1, Some(trellis_a.buffer), trellis_a.byte_offset as u64);
+        enc.set_buffer(2, Some(trellis_b.buffer), trellis_b.byte_offset as u64);
+        enc.set_buffer(3, Some(trellis_c.buffer), trellis_c.byte_offset as u64);
+        enc.set_buffer(4, Some(pair), 0);
+        enc.set_buffer(5, Some(svh_cat.buffer), svh_cat.byte_offset as u64);
+        enc.set_buffer(6, Some(out), 0);
+        enc.set_bytes(7, 36, params.as_ptr() as *const _);
+        let blocks = out_tiles_total.div_ceil(8) as u64;
+        enc.dispatch_thread_groups(
+            MTLSize::new(blocks, 1, 1),
+            MTLSize::new(256, 1, 1),
+        );
+    }
+
+    /// Fused K-split partials reduction + Hadamard butterfly + SVH scaling directly to f16 out.
+    pub fn encode_gemv_reduce_post(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        partial: &Buffer,
+        svh: DeviceSpan<'_>,
+        out: &Buffer,
+        nsplit: usize,
+        out_tiles: usize,
+    ) {
+        let p: [u32; 2] = [out_tiles as u32, nsplit as u32];
+        enc.set_compute_pipeline_state(&self.gemv_reduce_post);
+        enc.set_buffer(0, Some(partial), 0);
+        enc.set_buffer(1, Some(svh.buffer), svh.byte_offset as u64);
+        enc.set_buffer(2, Some(out), 0);
+        enc.set_bytes(3, 8, p.as_ptr() as *const _);
+        let blocks = out_tiles.div_ceil(8) as u64;
+        enc.dispatch_thread_groups(MTLSize::new(blocks, 1, 1), MTLSize::new(128, 1, 1));
+    }
+
+
 
     /// P1-T1: `encode_gemv` on the v12-parity pipeline (`exl3_gemv4`). Same
     /// buffers, same partial layout (`[nsplit, out_tiles, 16]`), same reduce —
