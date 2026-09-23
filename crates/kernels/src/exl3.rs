@@ -261,10 +261,11 @@ impl Exl3Gemv {
     /// slice of the GPU's concurrent simdgroups (measured Gw/s tracks wave
     /// depth — lm_head 51 waves = 241, gate 4 = 172, down/o 1 = 149/119), so
     /// split the in-tile range across `grid.y` until the dispatch reaches
-    /// ~1024 threadgroups, capped at 8 splits (partial ≤ ~128 KB).
+    /// ~4096 threadgroups (T2.9 pivot: 1024 left k/v at 94/106 Gw/s with
+    /// nsplit=4), capped at 16 splits (partial ≤ ~344 KB).
     fn gemv_splits(out_tiles: usize) -> usize {
-        const TARGET_TGS: usize = 1024;
-        const MAX_SPLIT: usize = 8;
+        const TARGET_TGS: usize = 4096;
+        const MAX_SPLIT: usize = 16;
         TARGET_TGS.div_ceil(out_tiles.max(1)).clamp(1, MAX_SPLIT)
     }
 
@@ -1042,19 +1043,19 @@ mod tests {
         Some((d, q))
     }
 
-    /// T2.5 policy: gate/up/lm_head shapes stay unsplit (already multi-wave);
-    /// down/o split 4, q 2, small k/v 8; tiny shapes clamp to 8.
+    /// T2.5 policy (T2.9 deepened): TARGET 4096 TGs — lm_head (16384 tiles)
+    /// stays 1, gate → 4, q → 8, down/o → 13, k/v → 16 (was 4 at 94/106
+    /// Gw/s); tiny shapes clamp to 16. Partial scratch ≤ ~344 KB transient.
     #[test]
     fn gemv_splits_policy_covers_shapes() {
-        assert_eq!(Exl3Gemv::gemv_splits(16384), 1); // lm_head
-        assert_eq!(Exl3Gemv::gemv_splits(1344), 1); // gate/up (21504 out)
-        assert_eq!(Exl3Gemv::gemv_splits(1024), 1); // exactly target
-        assert_eq!(Exl3Gemv::gemv_splits(512), 2); // q (8192 out)
-        assert_eq!(Exl3Gemv::gemv_splits(336), 4); // down/o (5376 out)
-        assert_eq!(Exl3Gemv::gemv_splits(256), 4); // sliding k/v
-        assert_eq!(Exl3Gemv::gemv_splits(128), 8); // full-layer k/v
-        assert_eq!(Exl3Gemv::gemv_splits(64), 8); // clamped (want 16)
-        assert_eq!(Exl3Gemv::gemv_splits(1), 8);
+        assert_eq!(Exl3Gemv::gemv_splits(16384), 1); // lm_head (already 16k TGs)
+        assert_eq!(Exl3Gemv::gemv_splits(4096), 1); // exactly target
+        assert_eq!(Exl3Gemv::gemv_splits(1344), 4); // gate (21504 out), was 1
+        assert_eq!(Exl3Gemv::gemv_splits(512), 8); // q (8192 out), was 2
+        assert_eq!(Exl3Gemv::gemv_splits(336), 13); // down/o (5376 out), was 4
+        assert_eq!(Exl3Gemv::gemv_splits(256), 16); // k/v (4096 out), was 4
+        assert_eq!(Exl3Gemv::gemv_splits(64), 16); // clamped (want 64)
+        assert_eq!(Exl3Gemv::gemv_splits(1), 16);
     }
 
     fn build_probe(device: &Device, name: &str) -> ComputePipelineState {

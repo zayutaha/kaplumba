@@ -145,13 +145,14 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - Target: R2.1 (tg/s), toward T2.3's 350–450 Gw/s ops ceiling
 - Commit: `spec/rust-metal-engine: T2.8 gemv address hoist`
 
-### T2.9 — decode sibling fusion: qkv + gate+up (T4.1 semantics)
-- [ ] On the `encode_token` path: fuse q/k/v into one dispatch per layer (one `x`/`xn` read, three trellis streams, one barrier trailer) and gate+up into one dispatch (shared `xn` read, two outputs `gu_gate`/`gu_up`) — only where output buffers stay disjoint (topology guard: never write the same output from both siblings); f32 add order per output unchanged → token gates hold. Small-N tail shapes (n_kv 4096/16 heads) must keep the same split policy
-- [ ] Verify: synthetic wrong-fusion guard test, `gpu_gemm_rows_match_per_row_gemv_and_cpu`-style per-sibling CPU-ref match, full gated suite (fixture 236773, span 0.55, batched-vs-gemv), `decode_throughput_slow` ≥ prior, `prefill_throughput_slow` ≥ prior (fusion touches span path too — keep or guard by rows)
-- Files: `crates/engine/src/{gpu_decode,metal_linear}.rs`, `crates/kernels/src/{exl3,fuse}.{rs,metal}`
+### T2.9 — decode sibling fusion: qkv + gate+up (T4.1 semantics) → PIVOTED
+- [!] **Precondition REFUTED by measurement:** new gated test `sibling_input_tables_shared_slow` memcmp's `suh` (input Hadamard table) for every sibling pair on the real artifact — **q≠k, gate≠up, q≠v, q≠gate** (converter quantized each tensor's input scale independently). One `had_in` per group cannot feed siblings; the fusion's entire win (shared input prep + shared xh) does not exist on this artifact. Remaining fusion value = dispatch-count only (~0.3 ms/token — host already batches one cb, T4.2), not worth the surface area (rope-race precedent). Test kept as evidence + guard
+- [x] **Pivot (occupancy-2):** deepen the T2.5 K-split policy — k/v bench at 94/106 Gw/s (weakest shapes) run only `nsplit=4` (TARGET_TGS=1024 ÷ out_tiles=256); raise TARGET_TGS to 4096 / MAX_SPLIT to 16 so every gemv shape reaches ~4096 TGs (k/v → 16, down/o → 13, q → 8, gate → 4, lm_head stays 1 — already 16384 TGs; partial ≤ ~344 KB transient). f32 reassociation on the newly-split shapes only → token gates must hold
+- [x] **Verified:** `gemv_splits_policy_covers_shapes` updated (16384→1, 4096→1, 1344→4, 512→8, 336→13, 256→16, 1→16); kernels 19, fast engine 114, full gated **114 passed / 0 failed / 5 ignored** (fixture 236773, span 0.55, batched-vs-gemv unchanged); `bench_passes_slow`: gate 205, down 212, q 145, lm 247 Gw/s up; k/v isolated bench regressed 106/95 → 94/93 (chunk 84 → 21 iters/TG: per-TG fixed cost not amortized) — **end-to-end decode still wins**: `decode_throughput_slow` **8.08 → 8.39 t/s** (123.8 → 119.2 ms/token, 134.5 GB/s). Note: greedy ids flip at position 5 on the empty-prompt run (`236770→236828`) — new f32 reassociation on newly-split gate/q; position-0 fixture + all token gates hold (cross-build mid-sequence greedy identity is not a spec property; R8.1 is within-build)
+- Files: `crates/kernels/src/exl3.rs` (`gemv_splits` + policy test), `crates/engine/src/metal_linear.rs` (`sibling_input_tables_shared_slow` evidence test)
 - Test: above
-- Target: AC4, R3.1 (tg + pp — fewer dispatches/barriers per layer)
-- Commit: `spec/rust-metal-engine: T2.9 decode sibling fusion`
+- Target: AC4, R3.1→R2.1 (tg/s occupancy)
+- Commit: `spec/rust-metal-engine: T2.9 sibling fusion refuted, split policy deepened`
 
 ### T3.10 — small-N K-split for sg GEMM (prefill, T3.9 ranked #1)
 - [ ] Mirror the T2.5 pattern on `exl3_gemm_sg`: k/v/q run at 0.97–2.1 TFLOP/s (64–256 TGs) vs gate ~5 TF — split the `ks` stage range across a new grid dimension, each split-TG partial-accumulates its own `C[4][4]` segment, new reduce kernel sums partials to `y` (or stores per-split slices if csc already tiles). Policy: `sg_splits(shape) = clamp(div_ceil(1024, out_tiles), 1, 8)`; `nsplit==1` keeps the current grid exactly (byte-identical path for gate/down)

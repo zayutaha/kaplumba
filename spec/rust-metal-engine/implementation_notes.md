@@ -553,6 +553,16 @@ Cross-checks:
 - T2.3 ops ceiling: 350–450 Gw/s for the current gemv algorithm ≈ **9–12 t/s**
 - today 6.42 → plausible plain-decode ceiling **~9–12 t/s** after gemv ops-count work; **18 requires MTP/verify-batch** (Phase 4 T4.4/T4.6: rows=k amortize decode ops/weight below 5) — but the user gate sequences MTP *after* 18 via plain decode → circular; surface alongside the 200 pp/s conflict
 
+## T2.9 — sibling fusion refuted + split policy deepened (2026-09-23)
+
+**Refutation (evidence kept as `sibling_input_tables_shared_slow`):** the T4.1 premise (siblings share input prep) is FALSE on this artifact — `suh` (input Hadamard/scale table) memcmp differs for **every** pair tested: q≠k, gate≠up, q≠v, q≠gate. The converter quantized each tensor's input scale independently, so one `had_in` cannot feed a group and the fusion's win (shared input prep + shared xh) does not exist. Remaining value was dispatch-count only (~0.3 ms/token; T4.2 already batches one cb) — not worth the surface area given the rope-race precedent. T4.1 superseded.
+
+**Pivot — split policy deepened (occupancy-2):** k/v sat at 94/106 Gw/s with `nsplit=4` (TARGET_TGS 1024). Raised `TARGET_TGS` 1024 → **4096**, `MAX_SPLIT` 8 → **16**: k/v → 16 splits, down/o → 13, q → 8, gate → 4 (newly split → f32 reassociation), lm_head stays 1.
+
+**Measured:** decode **8.08 → 8.39 t/s** (123.8 → 119.2 ms/token, 134.5 GB/s); bench gate 205 / down 212 / q 145 / lm 247 Gw/s up; **k/v isolated bench regressed** 106/95 → 94/93 (chunk 84 → 21 iters/TG — per-TG fixed cost dominates short chunks) yet end-to-end still wins (k/v are a small share; gate/down/o gains dominate). Full gated suite **114/0/5**. **Greedy flip at empty-prompt pos 5** (`236770→236828`): new reassociation on newly-split gate/q crossed a near-tie argmax; pos-0 fixture 236773 + span/batched gates hold — cross-build mid-sequence greedy identity was never a gated property (R8.1 = within-build spec-vs-plain).
+
+**Decode track:** 6.42 (T4.0) → 7.15 (T2.5) → 7.52 (T2.6) → 8.08 (T2.8) → **8.39 (T2.9)**. Bandwidth 134.5/273 = 49%. Remaining: T3.10 (prefill), T2.2 (TTFT), quality/coherence/RSS/close.
+
 ## T2.8 — gemv address hoist (2026-09-23)
 
 The T2.6 unroll bodies each recomputed `tile = trellis + (ulong)(it * out_tiles + ot) * twords * 2u` — a 64-bit mul chain per body (2× per unrolled iter). Strength-reduced to: hoisted base at `it0` (clamped `min(it0, in_tiles)` — tiny synthetics can have `nsplit > in_tiles`, pointer must never be formed past the column), `const ulong tstride = out_tiles * twords * 2`, pointer += stride between bodies; `xrow += TILE`; `it` moved out of for-init so the odd-tail remainder loop continues from the already-advanced pointer (old conditional start expression collapses to `it < it1`).

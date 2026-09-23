@@ -1880,4 +1880,74 @@ mod tests {
             eprintln!("{name}: {rows} rows vs per-row gemv worst rel err {worst:.2e}");
         }
     }
+
+    /// T2.9 precondition: sibling linears share the input Hadamard table
+    /// (`suh`) byte-for-byte — only then may one `had_in` feed the group.
+    /// RESULT (measured): q/k suh **differ** on this artifact → qkv
+    /// shared-had_in fusion is impossible; the test reports every pair so the
+    /// gate+up decision is also evidence-based. A non-sibling pair (q vs
+    /// gate — different rms inputs) must differ, proving discrimination.
+    #[test]
+    fn sibling_input_tables_shared_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = crate::testutil::artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let Some(c) = ctx() else { return };
+        let model = crate::load::load_exl3(&c, &dir).expect("load artifact");
+        let src: &dyn TensorSource = &model;
+        let base = "model.language_model.layers.0";
+        let qh = linear_handles(src, &format!("{base}.self_attn.q_proj")).expect("eligible");
+        let kh = linear_handles(src, &format!("{base}.self_attn.k_proj")).expect("eligible");
+        let gh = linear_handles(src, &format!("{base}.mlp.gate_proj")).expect("eligible");
+        let uh = linear_handles(src, &format!("{base}.mlp.up_proj")).expect("eligible");
+        let vh = linear_handles(src, &format!("{base}.self_attn.v_proj")).ok();
+        let inn = qh.shape.in_features() * 2;
+        let same = |a: DeviceSpan<'_>, b: DeviceSpan<'_>| -> bool {
+            let (pa, pb) = (a.byte_offset as usize, b.byte_offset as usize);
+            let (ba, bb) = (
+                unsafe {
+                    std::slice::from_raw_parts(a.buffer.contents().add(pa) as *const u8, inn)
+                },
+                unsafe {
+                    std::slice::from_raw_parts(b.buffer.contents().add(pb) as *const u8, inn)
+                },
+            );
+            ba == bb
+        };
+        let report = |label: &str, eq: bool| {
+            eprintln!(
+                "suh[{label}] {}",
+                if eq {
+                    "SHARED → had_in fusable"
+                } else {
+                    "DIFFER → no share"
+                }
+            );
+            eq
+        };
+        let q = qh.suh();
+        let k = kh.suh();
+        let g = gh.suh();
+        let u = uh.suh();
+        let qk = report("q==k", same(q, k));
+        let qu = report("gate==up", same(g, u));
+        match vh.as_ref() {
+            Some(v) => {
+                report("q==v", same(q, v.suh()));
+            }
+            None => eprintln!("suh[q==v] v_proj not present (k_eq_v?)"),
+        }
+        assert!(
+            !same(q, g),
+            "q vs gate suh unexpectedly equal — comparison not discriminating"
+        );
+        // The fusion callers gate on these exact facts.
+        assert_eq!(qk, false, "qkv share suh now? fuse qkv");
+        assert_eq!(qu, false, "gate/up share suh now? fuse gate+up");
+    }
 }
