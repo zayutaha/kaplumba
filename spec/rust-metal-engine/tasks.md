@@ -138,8 +138,8 @@ Legend: `[ ]` todo · `[x]` done · `[~]` in progress · `[!]` blocked/diverged
 - Commit: `spec/rust-metal-engine: T2.7 decode phase profile`
 
 ### T2.8 — gemv ALU trim: hoisted tile-address increments (decode)
-- [ ] Replace the per-iteration `(ulong)(it * p.out_tiles + ot) * p.twords * 2u` recompute (64-bit mul chain) in `exl3_gemv` with a `device const ushort *tile` pointer advanced by a hoisted `stride` const (and `xrow` by `TILE`); same for the unroll bodies and remainder loop. Addressing-only change → bit-identical outputs
-- [ ] Verify: kernels suite, engine fast + gated suites, `bench_passes_slow` (gate/lm/down/o Gw/s up or neutral), `decode_throughput_slow` ≥ 7.52 t/s; if neutral/regress, revert (profile-before-machinery)
+- [x] Replaced the per-body `(ulong)(it * p.out_tiles + ot) * p.twords * 2u` 64-bit recompute with one hoisted base (clamped `min(it0, in_tiles)` so pathological tiny-shape `nsplit > in_tiles` never forms a past-column address) + `tstride` pointer advances; `xrow` advanced by `TILE`; `it` hoisted out of the for-init so the remainder loop reuses the already-advanced `tile`/`xrow` (odd-tail condition collapses to `it < it1`). Funnel/x-load statement order and acc sequence unchanged → bit-identical
+- [x] **Verified:** kernels 19, fast engine 113, full gated **113 passed / 0 failed / 5 ignored** (fixture 236773, span 0.55, batched-vs-gemv unchanged); `bench_passes_slow`: **gate 184→203, down 192→205, o 134→157, q 134→142, lm 239→250 Gw/s** (k/v flat 106/95 — their it-loop is too short for the address chain to matter); `decode_throughput_slow`: **7.52 → 8.08 t/s** (132.9 → 123.8 ms/token, 129.4 GB/s), decoded ids identical `[236773, …]`
 - Files: `crates/kernels/src/exl3.metal` (`exl3_gemv` only)
 - Test: above
 - Target: R2.1 (tg/s), toward T2.3's 350–450 Gw/s ops ceiling

@@ -553,6 +553,14 @@ Cross-checks:
 - T2.3 ops ceiling: 350–450 Gw/s for the current gemv algorithm ≈ **9–12 t/s**
 - today 6.42 → plausible plain-decode ceiling **~9–12 t/s** after gemv ops-count work; **18 requires MTP/verify-batch** (Phase 4 T4.4/T4.6: rows=k amortize decode ops/weight below 5) — but the user gate sequences MTP *after* 18 via plain decode → circular; surface alongside the 200 pp/s conflict
 
+## T2.8 — gemv address hoist (2026-09-23)
+
+The T2.6 unroll bodies each recomputed `tile = trellis + (ulong)(it * out_tiles + ot) * twords * 2u` — a 64-bit mul chain per body (2× per unrolled iter). Strength-reduced to: hoisted base at `it0` (clamped `min(it0, in_tiles)` — tiny synthetics can have `nsplit > in_tiles`, pointer must never be formed past the column), `const ulong tstride = out_tiles * twords * 2`, pointer += stride between bodies; `xrow += TILE`; `it` moved out of for-init so the odd-tail remainder loop continues from the already-advanced pointer (old conditional start expression collapses to `it < it1`).
+
+**Measured:** bench gate 184→**203**, down 192→**205**, o 134→**157**, q 134→142, lm 239→**250** Gw/s (k/v flat — it-loop too short to feel the chain); decode **7.52 → 8.08 t/s** (123.8 ms/token, 129.4 GB/s), ids identical `[236773, …]`; suites kernels 19 / fast 113 / gated **113/0/5**.
+
+**Running decode track:** 6.42 (T4.0) → 7.15 (T2.5) → 7.52 (T2.6) → **8.08 (T2.8)**. Next: T2.9 sibling fusion (dispatch/barrier count), then the same-algorithm plateau ~9–12 vs walls 18/17.6.
+
 ## T2.7 — decode phase profile (2026-09-23)
 
 **Method:** `decode_layer_scaling_slow` runs the same 64-step greedy decode at `GenParams.layers = 60 / 10 / 0` (GPU kv path honors `upto` — `layers=0` = embed + final norm + lm_head only; outputs meaningless, timing-only).
