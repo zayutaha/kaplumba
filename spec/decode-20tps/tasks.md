@@ -67,7 +67,7 @@
   - **Testing**: n/a (decision from P1-T1 ALU-roof + bench_passes_slow "full"
     vs isolated numbers).
 
-- [ ] **P2: End-to-end re-verify + ceiling amendment**
+- [x] **P2: End-to-end re-verify + ceiling amendment**
   - **Files**: `crates/engine/src/gemma4.rs`, `spec/final-same-algorithm-ceiling/{spec,tasks}.md`,
     `spec/decode-20tps/implementation_notes.md`
   - **Intent**: Gated `decode_throughput_slow` with swap sampling (chunk before/
@@ -75,6 +75,9 @@
     ceiling spec to the measured practical number (40–45% of bus), keep gate
     unflipped, document. Never land red.
   - **Testing**: two consecutive stable gated runs, no swap-file growth.
+  - **Result**: done (commit `99ee413`) — measured 144.5 ms/token fwd-only
+    (6.92 t/s), ceiling spec updated to ALU roof (6.9–7.0 t/s).
+  - **Commit**: `99ee413`
 
 - [ ] **P3 (PRIMARY): spec/verify-gated-spec-dec — interview**
   - **Files**: new `spec/verify-gated-spec-dec/{spec,plan,tasks}.md`
