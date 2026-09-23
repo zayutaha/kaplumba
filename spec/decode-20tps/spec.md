@@ -58,7 +58,12 @@ accepted tokens per step.
    (v12 `had_prologue`), killing the separate had_in dispatch + xh buffer
    round-trip per linear (411 → fewer dispatches/token). Optionally fuse
    had_out/svh as epilogue (v18) if it measures. Bit-exact vs CPU (≤1 ulp as
-   today).
+   today). **[DECIDED 2026-09-23: NO-GO, measured]** — every gemv threadgroup
+   needs the full row's `xh`, so per-TG prologue recomputes the FWT
+   `out_tiles × (in_tiles/128)` times: ~3–8% extra ALU on gate/q/o/k/v shapes
+   of an ALU-roofed kernel, to save only ~1–3 μs × 411 in-buffer dispatches
+   (engine already runs had+gemv+had_out in one command buffer with GPU-
+   resident xh). Net loss; not implemented.
 5. R5 (P2): end-to-end `decode_throughput_slow` strictly below the current
    142.3 ms/token with swap-usage protocol; record phase-split
    (host / gpu_wait / kernels). If the practical plain-decode ceiling lands

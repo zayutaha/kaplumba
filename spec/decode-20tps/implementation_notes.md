@@ -66,3 +66,15 @@ Running log. Append as work proceeds. See AGENTS.md §5.
   128-floor would have picked n2 — overrides it).
 - Policy test updated; kernels 21 + engine fast 117 green. Committed before
   any E2E re-verify (P2).
+
+## 2026-09-23 — P1-T3 fused had_in: NO-GO (measured reasoning)
+
+- Not implemented. Our gemv grid is one threadgroup per out-tile column; every
+  TG consumes the FULL row's xh, so a v12-style in-kernel FWT prologue would
+  recompute the transform `out_tiles × (in_tiles/128)` times: gate ~8% extra
+  decode-ALU, q/o/k/v ~3–4%. The bottleneck is decode ALU (P1-T1) and the
+  kernel is at its ALU roof, so +3–8% ALU ≈ +3–8% wall time. The saving it
+  buys: one fewer dispatch + one xh write/read round trip per linear, which
+  the engine ALREADY amortizes (single command buffer, GPU-resident xh;
+  bench "full" vs gemv shows both hads ≤ ~20 μs/linear in-engine). Net loss —
+  recorded in spec R4 as decided-NO-GO.

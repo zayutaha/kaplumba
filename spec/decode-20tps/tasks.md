@@ -51,15 +51,21 @@
     test updated; kernels (21) + engine fast (117) green.
   - **Commit**: TBD
 
-- [ ] **P1-T3: Fuse had_in (and v18 post) into M=1 gemv**
-  - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`,
-    `crates/engine/src/metal_linear.rs`
-  - **Intent**: In-kernel 128-point FWT prologue over the x slice before the
-    tile loop (v12 `had_prologue`), dropping the separate had_in dispatch +
-    xh buffer round-trip per linear. Measure had_out/svh epilogue; keep only
-    if it wins (v18: one TG owns a 128-col block).
-  - **Testing**: parity/one-hot/had-ulp tests via fused path; `bench_passes_slow`:
-    `full` time strictly below current; suites green.
+- [x] **P1-T3: fuse had_in — NO-GO (measured decision, not implemented)**
+  - **Files**: none (spec.amended)
+  - **Intent (was)**: in-kernel 128-point FWT prologue over the x slice before
+    the tile loop (v12 `had_prologue`), dropping the separate had_in dispatch +
+    xh round trip per linear (411 fewer dispatches).
+  - **Why NO-GO**: our geometry is one threadgroup per OUT-tile column and every
+    TG needs the full row's `xh`, so a per-TG prologue recomputes the FWT
+    `out_tiles × (in_tiles/128)` times — ~3% (q) to ~8% (gate) extra ALU on an
+    ALU-roofed kernel (the wall is decode ALU, see P1-T1 notes) — to save
+    ~1–3 μs × 411 in-buffer dispatches the engine already amortizes (one
+    command buffer, GPU-resident xh). Net loss. v12's prologue is cheap only
+    because their MT=1 grid has ~1 TG per split-chunk; ours would need a
+    grid-wide cooperative FWT, i.e. the current two-dispatch design.
+  - **Testing**: n/a (decision from P1-T1 ALU-roof + bench_passes_slow "full"
+    vs isolated numbers).
 
 - [ ] **P2: End-to-end re-verify + ceiling amendment**
   - **Files**: `crates/engine/src/gemma4.rs`, `spec/final-same-algorithm-ceiling/{spec,tasks}.md`,
