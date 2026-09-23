@@ -38,3 +38,17 @@ Close the `spec/rust-metal-engine` same-algorithm track by (a) measuring and clo
 
 ## Open questions
 - None — all gates and ceilings are measured; this spec only closes the remaining measurement/trim work.
+
+## Ceiling correction 2026-09-23 (supersedes the "9–12 t/s" estimate)
+
+Re-measured after `spec/decode-20tps` P0–P2: the same-algorithm decode ceiling
+is an **ALU roof, not a bus ceiling**. The funnel+`exl3_decode_f`+MAC path
+costs ~6–7 int/fp32 ops per decoded weight ⇒ ~200G ALU ops/token on the M4 Pro
+(~1.4–2.0T ops/s) ⇒ **plain-decode ceiling ≈ 6.9–7.0 t/s measured (144.5 ms/
+token forward-only, 2026-09-23), ~7–10 t/s extrapolated at optimistic ALU**. The
+earlier "9–12 t/s / 40–45% of bus" prediction conflated bus headroom with ALU
+availability; the bandwidth probe (P0) confirmed 214–381 GB/s is achievable for
+the load pattern alone, i.e. memory is not the binder. Parity restructures
+(v12-geometry `exl3_gemv4`) and nsplit argmax tuning (P1-T2) did not move the
+measured number beyond run noise. `spec/decode-20tps` therefore moves the 20 t/s
+deliverable to MTP/verify-gated speculation as the primary route.

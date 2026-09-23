@@ -78,3 +78,19 @@ Running log. Append as work proceeds. See AGENTS.md §5.
   the engine ALREADY amortizes (single command buffer, GPU-resident xh;
   bench "full" vs gemv shows both hads ≤ ~20 μs/linear in-engine). Net loss —
   recorded in spec R4 as decided-NO-GO.
+
+## 2026-09-23 — P2 E2E re-verify (after P1-T2 argmax chooser)
+
+- `decode_throughput_slow`, 32 steps, prompt=[2], greedy, eos=[]:
+  prefill 1299 ms; **forward-only 144.5 ms/token → 6.92 t/s** (was 142.3 →
+  7.03); host 0.27 ms; implied stream 77.5 GB/s (11.2 GB/token), roofline
+  24.4 t/s @ 273 GB/s. So the P1-T2 nsplit argmax change is within run noise
+  (~±2 ms) — no e2e win banked, but no regression. Decoded[0..8] =
+  [236773…] identical fixtures → coherence preserved.
+- THE MEASURED PLAIN-DECODE NUMBER to quote: **144.5 ms/token fwd-only**.
+- Swap note: `vm.swapusage` started at 9889/11264 MB used (88%!) and rose to
+  10281 MB after the run — machine was already heavily swapped by other
+  workloads; not attributable to the model run alone. Protocol kept: record
+  before/after, flag growth, rerun for gate flips.
+- Ceiling correction written into `spec/final-same-algorithm-ceiling` (ALU
+  roof ≈ 6.9–7.0 t/s measured; "9–12 t/s / 40–45% of bus" estimate retracted).
