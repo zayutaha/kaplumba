@@ -797,7 +797,7 @@ impl Exl3Gemv {
         debug_assert_eq!(shape_a.in_tiles, shape_b.in_tiles);
         debug_assert_eq!(shape_a.k, shape_b.k);
         let out_tiles_total = shape_a.out_tiles + shape_b.out_tiles;
-        let nsplit = nsplit_override.unwrap_or_else(|| Self::gemv_splits(out_tiles_total));
+        let nsplit = nsplit_override.unwrap_or(1);
         let aligned = u32::from(trellis_a.byte_offset % 4 == 0 && trellis_b.byte_offset % 4 == 0);
         let params: [u32; 8] = [
             shape_a.in_tiles as u32,
@@ -863,7 +863,7 @@ impl Exl3Gemv {
         debug_assert_eq!(shape_a.k, shape_b.k);
         debug_assert_eq!(shape_a.k, shape_c.k);
         let out_tiles_total = shape_a.out_tiles + shape_b.out_tiles + shape_c.out_tiles;
-        let nsplit = nsplit_override.unwrap_or_else(|| Self::gemv_splits(out_tiles_total));
+        let nsplit = nsplit_override.unwrap_or(1);
         let aligned = u32::from(
             trellis_a.byte_offset % 4 == 0
                 && trellis_b.byte_offset % 4 == 0

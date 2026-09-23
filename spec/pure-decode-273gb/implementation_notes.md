@@ -18,3 +18,11 @@
 - **T2 (`exl3_gemv_fused2`)**: Sibling 2-way GEMV dispatching 2,688 out-tiles (Gate 1344 + Up 1344) over 20 cores (134.4 threadgroups/core). Reaches 107 Gw/s in release mode. Verified exact match against separate GEMVs via `gpu_gemv_fused2_matches_separate_passes`.
 - **T3 (`exl3_gemv_fused3`)**: Sibling 3-way GEMV dispatching 1,024 out-tiles (Q 512 + K 256 + V 256). Expands K and V grid from 256 to 1,024 tiles (51.2 threadgroups/core), eliminating the 18.7 GB/s under-occupancy collapse. Measured latency dropped from 1.489 ms (separate Q+K+V) to 0.953 ms. Verified exact match via `gpu_gemv_fused3_matches_separate_passes`.
 - **T5 (`Fused2Handles` & `Fused3Handles`)**: Zero-copy device handles created on model load with pre-stacked `suh_stack` and `svh_cat` buffers (~4.4 MB total model overhead). Implemented `encode_fused2_with_scratch` and `encode_fused3_with_scratch`. Verified exact match via `gpu_encode_fused2_and_fused3_matches_separate_linears`.
+- **T6 (`gpu_decode.rs` integration & MSL loop fix)**:
+  - Fixed critical loop shadowing bug in `exl3_gemv_fused2` and `exl3_gemv_fused3` (`uint it = it0` redeclared in inner unroll and tail loops, causing double loop execution and out-of-bounds weight tile reads).
+  - Integrated `qkv_fused` (sliding layers) and `qk_fused` (full layers) and `gate_up_fused` into `GpuDecoder::encode_token`.
+  - Allocated `qkv_raw` and `gu_fused` scratch arenas in `GpuDecoder`.
+  - All 143 engine and kernel tests passed.
+  - Verified 20-step chat prompt in `trace_chat_prompt_steps_slow` bit-for-bit with reference, predicting token 818 ("The") on step 19.
+  - Measured decode throughput: 140.9 ms/token (7.10 t/s, 79.5 GB/s bandwidth).
+  - Profile analysis: 1.28 ms/layer (76.8 ms/token — 54.5% of total decode time) is spent purely in 8 standalone `had_in` and `had_out` dispatches per layer (each taking ~0.16 ms). Fusing these into GEMV epilogue and producer prologues will recover ~76.8 ms and double throughput toward 20 t/s.

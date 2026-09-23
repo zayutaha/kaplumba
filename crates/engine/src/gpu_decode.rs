@@ -43,7 +43,7 @@ use metal::{Buffer, CommandBufferRef, ComputeCommandEncoderRef, Device, MTLResou
 
 use crate::gemma4::{Gemma4Model, GemmaError, LayerKind};
 use crate::kv_cache::KvCache;
-use crate::metal_linear::{LinearHandles, MetalLinear};
+use crate::metal_linear::{Fused2Handles, Fused3Handles, LinearHandles, MetalLinear};
 
 /// Maximum head dim in this model family (full-attention layers).
 const MAX_HD: usize = 512;
@@ -89,6 +89,9 @@ struct LayerW {
     gate: LinearHandles,
     up: LinearHandles,
     down: LinearHandles,
+    qkv_fused: Option<Fused3Handles>,
+    qk_fused: Option<Fused2Handles>,
+    gate_up_fused: Fused2Handles,
 }
 
 /// Activation arena + weight staging for one model.
@@ -124,6 +127,8 @@ pub struct GpuDecoder {
     o_norm: Buffer,
     gu_gate: Buffer,
     gu_up: Buffer,
+    gu_fused: Buffer,
+    qkv_raw: Buffer,
     gu: Buffer,
     down: Buffer,
     down_norm: Buffer,
@@ -223,6 +228,18 @@ impl GpuDecoder {
                 // Either the layer reuses k for values, or it must have v_proj.
                 return Ok(None);
             }
+            let (qkv_fused, qk_fused) = if let Some(ref v_lin) = v {
+                let f3 = Fused3Handles::new(device, &q, &k, v_lin)
+                    .map_err(|e| GemmaError::Config(format!("layer {i} qkv fusion failed: {e}")))?;
+                (Some(f3), None)
+            } else {
+                let f2 = Fused2Handles::new(device, &q, &k)
+                    .map_err(|e| GemmaError::Config(format!("layer {i} qk fusion failed: {e}")))?;
+                (None, Some(f2))
+            };
+            let gate_up_fused = Fused2Handles::new(device, &gate, &up)
+                .map_err(|e| GemmaError::Config(format!("layer {i} gate+up fusion failed: {e}")))?;
+
             layers.push(LayerW {
                 input_ln: norm("input_layernorm.weight", hidden)?,
                 post_attn_ln: norm("post_attention_layernorm.weight", hidden)?,
@@ -241,6 +258,9 @@ impl GpuDecoder {
                 gate,
                 up,
                 down,
+                qkv_fused,
+                qk_fused,
+                gate_up_fused,
             });
         }
         let final_norm = {
@@ -263,8 +283,8 @@ impl GpuDecoder {
         // Fixed linear temps: component-wise max over every linear at both
         // batch_rows (prefill) and rows=1 (decode + lm_head). Single-sources
         // eligibility/sg-split/gemv-split via `chunk_scratch_needs`.
-        let mut max_xh = 0usize;
-        let mut max_y = 0usize;
+        let mut max_xh = 3 * hidden;
+        let mut max_y = 2 * intermediate;
         let mut max_partial = 0usize;
         {
             let mut grow = |lin: &LinearHandles, rows: usize| {
@@ -324,6 +344,8 @@ impl GpuDecoder {
             o_norm: a(hidden * batch_rows),
             gu_gate: a(intermediate * batch_rows),
             gu_up: a(intermediate * batch_rows),
+            gu_fused: a(batch_rows * 2 * intermediate),
+            qkv_raw: a(batch_rows * (n_heads * MAX_HD + 2 * max_kv_row)),
             gu: a(intermediate * batch_rows),
             down: a(hidden * batch_rows),
             down_norm: a(hidden * batch_rows),
@@ -392,15 +414,42 @@ impl GpuDecoder {
                 hidden,
                 eps,
             )?;
-            gpu.encode_linear_with_scratch(enc, &lw.q, &self.xn, &self.q_raw, 1, &self.lin_temps)?;
-            gpu.encode_linear_with_scratch(enc, &lw.k, &self.xn, &self.k_raw, 1, &self.lin_temps)?;
-            // q/k per-head norms, then rope. Rope reads two elements per output
-            // element, so it always needs distinct in/out buffers: q ropes
-            // q → q_raw (q_raw is free once the norm above has read it) and
-            // attention consumes q_raw.
+            let q_len = lw.q.shape.out_features();
+            let k_len = lw.k.shape.out_features();
+            let q_span = DeviceSpan {
+                buffer: &self.qkv_raw,
+                byte_offset: 0,
+            };
+            let k_span = DeviceSpan {
+                buffer: &self.qkv_raw,
+                byte_offset: q_len * 2,
+            };
+            let v_span = DeviceSpan {
+                buffer: &self.qkv_raw,
+                byte_offset: (q_len + k_len) * 2,
+            };
+
+            if let Some(ref qkv) = lw.qkv_fused {
+                gpu.encode_fused3_with_scratch(
+                    enc,
+                    qkv,
+                    &self.xn,
+                    &self.qkv_raw,
+                    &self.lin_temps,
+                )?;
+            } else if let Some(ref qk) = lw.qk_fused {
+                gpu.encode_fused2_with_scratch(
+                    enc,
+                    qk,
+                    &self.xn,
+                    &self.qkv_raw,
+                    &self.lin_temps,
+                )?;
+            }
+
             gpu.encode_rms(
                 enc,
-                span(&self.q_raw),
+                q_span,
                 Some(span(&lw.q_norm)),
                 span(&self.q),
                 self.n_heads,
@@ -409,52 +458,41 @@ impl GpuDecoder {
             )?;
             gpu.encode_rms(
                 enc,
-                span(&self.k_raw),
+                k_span,
                 Some(span(&lw.k_norm)),
                 span(&self.k_norm),
                 lw.n_kv,
                 hd,
                 eps,
             )?;
-            // v: its own projection, or (k_eq_v) a weightless norm of the RAW k —
-            // which is why it is computed before the roped k overwrites nothing
-            // and never reads a roped buffer.
-            match &lw.v {
-                Some(lin) => {
-                    gpu.encode_linear_with_scratch(
-                        enc,
-                        lin,
-                        &self.xn,
-                        &self.v_raw,
-                        1,
-                        &self.lin_temps,
-                    )?;
-                    gpu.encode_rms(
-                        enc,
-                        span(&self.v_raw),
-                        None,
-                        span(&self.v_raw),
-                        lw.n_kv,
-                        hd,
-                        eps,
-                    )?;
-                }
-                None => gpu.encode_rms(
+
+            if lw.v.is_some() {
+                gpu.encode_rms(
                     enc,
-                    span(&self.k_raw),
+                    v_span,
                     None,
-                    span(&self.v_raw),
+                    v_span,
                     lw.n_kv,
                     hd,
                     eps,
-                )?,
+                )?;
+            } else {
+                gpu.encode_rms(
+                    enc,
+                    k_span,
+                    None,
+                    v_span,
+                    lw.n_kv,
+                    hd,
+                    eps,
+                )?;
             }
             gpu.encode_rope(
                 enc,
                 span(&self.q),
                 span(cos),
                 span(sin),
-                span(&self.q_raw),
+                q_span,
                 self.n_heads,
                 hd,
                 pos,
@@ -479,7 +517,7 @@ impl GpuDecoder {
             )?;
             gpu.encode_copy(
                 enc,
-                span(&self.v_raw),
+                v_span,
                 cache
                     .row_span(i, true, kv_rows - 1)
                     .ok_or_else(|| GemmaError::Config("kv v row span".into()))?,
@@ -488,7 +526,7 @@ impl GpuDecoder {
 
             gpu.encode_attention(
                 enc,
-                span(&self.q_raw),
+                q_span,
                 cache
                     .layer_keys_span(i)
                     .ok_or_else(|| GemmaError::Config("kv k span".into()))?,
@@ -536,19 +574,25 @@ impl GpuDecoder {
                 hidden,
                 eps,
             )?;
-            gpu.encode_linear_with_scratch(
+            gpu.encode_fused2_with_scratch(
                 enc,
-                &lw.gate,
+                &lw.gate_up_fused,
                 &self.xn,
-                &self.gu_gate,
-                1,
+                &self.gu_fused,
                 &self.lin_temps,
             )?;
-            gpu.encode_linear_with_scratch(enc, &lw.up, &self.xn, &self.gu_up, 1, &self.lin_temps)?;
+            let gu_gate_span = DeviceSpan {
+                buffer: &self.gu_fused,
+                byte_offset: 0,
+            };
+            let gu_up_span = DeviceSpan {
+                buffer: &self.gu_fused,
+                byte_offset: self.intermediate * 2,
+            };
             gpu.encode_gelu_mul(
                 enc,
-                span(&self.gu_gate),
-                span(&self.gu_up),
+                gu_gate_span,
+                gu_up_span,
                 span(&self.gu),
                 self.intermediate,
             )?;

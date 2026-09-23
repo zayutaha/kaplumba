@@ -471,6 +471,7 @@ kernel void exl3_gemv_fused2(device const half *xh [[buffer(0)]],            // 
     const device ushort *tile =
         trellis + ((ulong)min(it0, p.in_tiles) * out_tiles_cur + ot) * p.twords * 2u;
     const ulong tstride = (ulong)out_tiles_cur * p.twords * 2u;
+    uint it = it0;
 
     if (p.k != 7u) {
         uint ig0_[2];
@@ -485,7 +486,7 @@ kernel void exl3_gemv_fused2(device const half *xh [[buffer(0)]],            // 
             ig0_[gg] = uint((((i_end - 1) % tw) + tw) % tw);
             s3_[gg] = uint((i_end + 1) * 32 - e_last);
         }
-        for (uint it = it0; it + 1u < it1; it += 2u) {
+        for (; it + 1u < it1; it += 2u) {
             half x_lane = xh_cur[it * 16u + g];
             float x00 = float(simd_shuffle(x_lane, ushort(r0)));
             float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
@@ -546,7 +547,7 @@ kernel void exl3_gemv_fused2(device const half *xh [[buffer(0)]],            // 
             }
             tile += tstride;
         }
-        for (uint it = it0; it < it1; it++) {
+        for (; it < it1; it++) {
             half x_lane = xh_cur[it * 16u + (g & 15u)];
             float x00 = float(simd_shuffle(x_lane, ushort(r0)));
             float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
@@ -595,7 +596,7 @@ kernel void exl3_gemv_fused2(device const half *xh [[buffer(0)]],            // 
         uint i1_3 = (pk3 >> 8) & 0xFFu;
         uint s1_3 = (pk3 >> 16) & 0xFFu;
 
-        for (uint it = it0; it < it1; it++) {
+        for (; it < it1; it++) {
             half x_lane = xh_cur[it * 16u + (g & 15u)];
             float x00 = float(simd_shuffle(x_lane, ushort(r0)));
             float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
@@ -677,6 +678,7 @@ kernel void exl3_gemv_fused3(device const half *xh [[buffer(0)]],            // 
     const device ushort *tile =
         trellis + ((ulong)min(it0, p.in_tiles) * out_tiles_cur + ot) * p.twords * 2u;
     const ulong tstride = (ulong)out_tiles_cur * p.twords * 2u;
+    uint it = it0;
 
     if (p.k != 7u) {
         uint ig0_[2];
@@ -691,7 +693,7 @@ kernel void exl3_gemv_fused3(device const half *xh [[buffer(0)]],            // 
             ig0_[gg] = uint((((i_end - 1) % tw) + tw) % tw);
             s3_[gg] = uint((i_end + 1) * 32 - e_last);
         }
-        for (uint it = it0; it + 1u < it1; it += 2u) {
+        for (; it + 1u < it1; it += 2u) {
             half x_lane = xh_cur[it * 16u + g];
             float x00 = float(simd_shuffle(x_lane, ushort(r0)));
             float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
@@ -752,7 +754,7 @@ kernel void exl3_gemv_fused3(device const half *xh [[buffer(0)]],            // 
             }
             tile += tstride;
         }
-        for (uint it = it0; it < it1; it++) {
+        for (; it < it1; it++) {
             half x_lane = xh_cur[it * 16u + (g & 15u)];
             float x00 = float(simd_shuffle(x_lane, ushort(r0)));
             float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
@@ -801,7 +803,7 @@ kernel void exl3_gemv_fused3(device const half *xh [[buffer(0)]],            // 
         uint i1_3 = (pk3 >> 8) & 0xFFu;
         uint s1_3 = (pk3 >> 16) & 0xFFu;
 
-        for (uint it = it0; it < it1; it++) {
+        for (; it < it1; it++) {
             half x_lane = xh_cur[it * 16u + (g & 15u)];
             float x00 = float(simd_shuffle(x_lane, ushort(r0)));
             float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
