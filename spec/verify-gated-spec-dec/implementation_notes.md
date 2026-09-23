@@ -19,3 +19,10 @@ Running log. Append as work proceeds. See AGENTS.md §5.
     - 4-row batched verify: 374.86 ms total (93.71 ms/token, 10.67 t/s, 1.51x speedup).
   - Confirmed decode ALU amortization without tensor core padding overhead.
 
+## 2026-09-23 — T2: KV Cache Rewind/Truncate Support
+
+- Added `KvCache::truncate(&mut self, target_len: usize) -> Result<(), GemmaError>`.
+- Truncates sequence length to `target_len` without reallocations or memory leaks.
+- Handles sliding window layers: accurately computes valid rows within `l.start .. target_len`, resets row pointers, and allows immediate continuation of `reserve_row` / `reserve_rows` at the rollback position.
+- Unit test `truncate_rolls_back_speculative_tokens` passed; all 118 engine tests pass.
+

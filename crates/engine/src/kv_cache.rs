@@ -261,6 +261,33 @@ impl KvCache {
         self.len = 0;
     }
 
+    /// Truncate / rewind the cache to `target_len` tokens (for speculative decoding rollback).
+    /// `target_len` must be <= `self.len`.
+    pub fn truncate(&mut self, target_len: usize) -> Result<(), GemmaError> {
+        if target_len > self.len {
+            return Err(GemmaError::Config(format!(
+                "cannot truncate kv cache from {} to larger length {target_len}",
+                self.len
+            )));
+        }
+        if target_len == self.len {
+            return Ok(());
+        }
+        for l in self.layers.iter_mut() {
+            if target_len <= l.start {
+                l.len = 0;
+                l.start = target_len;
+            } else {
+                let valid_rows = target_len - l.start;
+                if valid_rows < l.len {
+                    l.len = valid_rows;
+                }
+            }
+        }
+        self.len = target_len;
+        Ok(())
+    }
+
     fn push(&mut self, i: usize, k_row: &[f16], v_row: &[f16], window: usize) {
         self.layers[i].push(k_row, v_row, window);
     }
@@ -643,5 +670,74 @@ mod tests {
             .reserve_rows(&cfg, 0, 0, 5)
             .expect_err("batch larger than window");
         assert!(matches!(err, GemmaError::Config(_)), "got {err}");
+    }
+
+    #[test]
+    fn truncate_rolls_back_speculative_tokens() {
+        let (_src, cfg) = cfg();
+        let mut kv = KvCache::new(&cfg, 64);
+
+        // Append 10 tokens
+        for pos in 0..10 {
+            for i in 0..cfg.layers.len() {
+                kv.reserve_rows(&cfg, i, pos, 1).expect("reserve");
+            }
+            kv.end_tokens(1);
+        }
+        assert_eq!(kv.len(), 10);
+
+        // Truncate back to 7
+        kv.truncate(7).expect("truncate to 7");
+        assert_eq!(kv.len(), 7);
+
+        // Verify layer states
+        for i in 0..cfg.layers.len() {
+            let l = kv.layer(i);
+            match cfg.layers[i].kind {
+                LayerKind::Full => {
+                    assert_eq!(l.len(), 7);
+                    assert_eq!(l.start(), 0);
+                }
+                LayerKind::Sliding => {
+                    // Window is 4. Before truncate (pos 10), window was 6..=9 (start=6, len=4).
+                    // After truncate to 7 (pos 0..=6), the only retained token in 6..=9 is pos 6.
+                    // So start=6, len=1 (pos 6).
+                    assert_eq!(l.len(), 1);
+                    assert_eq!(l.start(), 6);
+                }
+            }
+        }
+
+        // Now append token at pos 7 and verify reserve_rows succeeds
+        for i in 0..cfg.layers.len() {
+            let (start, rows) = kv.reserve_rows(&cfg, i, 7, 1).expect("reserve at pos 7");
+            match cfg.layers[i].kind {
+                LayerKind::Full => {
+                    assert_eq!(start, 0);
+                    assert_eq!(rows, 8);
+                }
+                LayerKind::Sliding => {
+                    // At pos 7, window covers pos 6 and pos 7 (start=6, rows=2)
+                    assert_eq!(start, 6);
+                    assert_eq!(rows, 2);
+                }
+            }
+        }
+        kv.end_tokens(1);
+        assert_eq!(kv.len(), 8);
+
+        // Truncate to larger than current len must fail
+        assert!(kv.truncate(20).is_err());
+
+        // Truncate to current len is no-op
+        assert!(kv.truncate(8).is_ok());
+        assert_eq!(kv.len(), 8);
+
+        // Truncate to 0
+        kv.truncate(0).expect("truncate to 0");
+        assert_eq!(kv.len(), 0);
+        for i in 0..cfg.layers.len() {
+            assert_eq!(kv.layer(i).len(), 0);
+        }
     }
 }

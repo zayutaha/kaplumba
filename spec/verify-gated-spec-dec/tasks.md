@@ -7,10 +7,12 @@
   - **Result**: Done. 1-row plain decode = 141.7 ms (7.06 t/s). 2-row batched verify = 249.0 ms (124.5 ms/tok, 8.03 t/s, 1.14x speedup). 4-row batched verify = 374.9 ms (93.7 ms/tok, 10.67 t/s, 1.51x speedup). Validated decode ALU amortization.
   - **Commit**: TBD
 
-- [ ] **T2: KV cache rewind/truncate support for speculative draft (R3)**
-  - **Files**: `crates/engine/src/gemma4.rs` (`KvCache`)
-  - **Intent**: Implement safe truncation / rewind in `KvCache` to rollback unaccepted speculative draft tokens without allocations or memory leaks.
-  - **Testing**: Unit tests verifying cache length and content before and after rewind match non-speculative sequential evaluation.
+- [x] **T2: KV cache rewind/truncate support for speculative draft (R3)**
+  - **Files**: `crates/engine/src/kv_cache.rs`
+  - **Intent**: Implement safe truncation / rewind in `KvCache::truncate` to rollback unaccepted speculative draft tokens without allocations or memory leaks.
+  - **Testing**: `cargo test -p kaplumba-engine truncate_rolls_back_speculative_tokens` passed, all 118 fast engine tests green.
+  - **Result**: Done. Truncate correctly resets `l.len` and sequence `self.len`, properly handles sliding window boundaries, rejects invalid lengths > `self.len`, and allows seamless appending at the truncated position.
+  - **Commit**: TBD
 
 - [ ] **T3: Implement shallow-layer target drafter (R2)**
   - **Files**: `crates/engine/src/gpu_decode.rs`
