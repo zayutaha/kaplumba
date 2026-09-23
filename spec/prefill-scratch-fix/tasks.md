@@ -25,7 +25,7 @@ Update immediately after every task; record commit hash when landed.
 - [x] `cargo fmt`
 - [x] `spec/rust-metal-engine/tasks.md`: tick T3.10 with acceptance-failed note (86.8 < 94 / 93.7, ceiling spec on hold)
 - [x] `spec/rust-metal-engine/implementation_notes.md`: T3.10 facts + T7/scratch-fix facts + combined-commit deviation
-- [x] Commit: specs (scratch-fix amendment) then one code commit — never stage `.freebuff/`
+- [x] Specs commit `c11559f`; code commit `6772a8a` — never staged `.freebuff/`
 
 ### T7 — Eliminate shared scratch; fixed decoder arena; k_* shrink (user directive 2026-09-23)
 - [x] `exl3.rs`: remove `scratch`/`partial` fields, `ensure_scratch`/`ensure_partial`/`shared_scratch_elems`/`shared_partial_bytes`; `with_scratch` always transient; `Scratch` drops size fields
