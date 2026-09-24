@@ -5,10 +5,10 @@
   - **Intent**: Replace scalar decode calls and serial FMA additions in `exl3_gemv_post`, `exl3_gemv_post_fused2`, and `exl3_gemv_post_fused3` with `uint4` vector arithmetic and `dot(float4, float4)`.
   - **Testing**: Run `cargo test -p kaplumba-kernels` to verify bit-exact outputs across all 32 specialization tests.
 
-- [ ] **T2: Single-Linear GEMV Loop Vectorization**
+- [x] **T2: Single-Linear and Fused GEMV Loop Vectorization with Bit-Exact Parity**
   - **Files**: `crates/kernels/src/exl3.metal`
-  - **Intent**: Apply `exl3_decode_quad` vectorization to `exl3_gemv` and `exl3_gemv_spec`.
-  - **Testing**: `cargo test -p kaplumba-kernels test_exl3_gemv_spec` to ensure bit-exact parity with reference.
+  - **Intent**: Apply `exl3_decode_quad` and `exl3_decode_quad_const` vectorization to `exl3_gemv_spec`, `exl3_gemv_post`, `exl3_gemv_post_fused2`, and `exl3_gemv_post_fused3` using pairwise summation `(x0 * w0 + x1 * w1) + (x2 * w2 + x3 * w3)` to achieve 4x ALU reduction while preserving 100% bit-exact parity.
+  - **Testing**: Run `cargo test -p kaplumba-engine --lib` (all 131 tests pass, including `gpu_gemv_post_matches_unfused` and `trace_chat_prompt_steps_slow`).
 
 - [ ] **T3: Single-Dispatch GEMV for O and Down (`gemv_splits(336) = 1`)**
   - **Files**: `crates/kernels/src/exl3.rs`

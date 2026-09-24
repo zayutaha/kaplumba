@@ -498,6 +498,22 @@ inline float exl3_decode_f_const(uint cw) {
     return float(h2.x + h2.y);
 }
 
+// Quad-vectorized exl3_decode_f_const (spec/bandwidth-saturate T2):
+inline float4 exl3_decode_quad_const(uint4 cw) {
+    uint4 x = cw & 0xFFFFu;
+    if (FC_MODE == 1u) {
+        x = x * 0xCBAC1FEDu;
+    } else {
+        x = x * 89226354u + 64248484u;
+    }
+    uint4 r = 0x3B603B60u ^ (x & 0x8FFF8FFFu);
+    half2 h0 = as_type<half2>(r.x);
+    half2 h1 = as_type<half2>(r.y);
+    half2 h2 = as_type<half2>(r.z);
+    half2 h3 = as_type<half2>(r.w);
+    return float4(float(h0.x + h0.y), float(h1.x + h1.y), float(h2.x + h2.y), float(h3.x + h3.y));
+}
+
 inline CodePair funnel_pair_const(device const ushort *tile, uint i0, uint i1, uint s1) {
     uint a = ld_word(tile, i0, FC_ALIGNED);
     uint b = ld_word(tile, i1, FC_ALIGNED);
@@ -573,10 +589,10 @@ kernel void exl3_gemv_spec(device const half *xh [[buffer(0)]],
                 uint cw1_1 = uint(m1 >> (s1 + 2u * FC_K)) & 0xFFFFu;
                 uint cw1_0 = uint(m1 >> (s1 + 3u * FC_K)) & 0xFFFFu;
 
-                accA += x00 * exl3_decode_f_const(cw0_0) + x01 * exl3_decode_f_const(cw0_1);
-                accA += x02 * exl3_decode_f_const(cw0_2) + x03 * exl3_decode_f_const(cw0_3);
-                accB += x00 * exl3_decode_f_const(cw1_0) + x01 * exl3_decode_f_const(cw1_1);
-                accB += x02 * exl3_decode_f_const(cw1_2) + x03 * exl3_decode_f_const(cw1_3);
+                float4 w0 = exl3_decode_quad_const(uint4(cw0_0, cw0_1, cw0_2, cw0_3));
+                float4 w1 = exl3_decode_quad_const(uint4(cw1_0, cw1_1, cw1_2, cw1_3));
+                accA += (x00 * w0.x + x01 * w0.y) + (x02 * w0.z + x03 * w0.w);
+                accB += (x00 * w1.x + x01 * w1.y) + (x02 * w1.z + x03 * w1.w);
             }
             tile += tstride;
             float x10 = float(simd_shuffle(x_lane, ushort(16u + r0)));
@@ -602,10 +618,10 @@ kernel void exl3_gemv_spec(device const half *xh [[buffer(0)]],
                 uint cw1_1 = uint(m1 >> (s1 + 2u * FC_K)) & 0xFFFFu;
                 uint cw1_0 = uint(m1 >> (s1 + 3u * FC_K)) & 0xFFFFu;
 
-                accA += x10 * exl3_decode_f_const(cw0_0) + x11 * exl3_decode_f_const(cw0_1);
-                accA += x12 * exl3_decode_f_const(cw0_2) + x13 * exl3_decode_f_const(cw0_3);
-                accB += x10 * exl3_decode_f_const(cw1_0) + x11 * exl3_decode_f_const(cw1_1);
-                accB += x12 * exl3_decode_f_const(cw1_2) + x13 * exl3_decode_f_const(cw1_3);
+                float4 w0 = exl3_decode_quad_const(uint4(cw0_0, cw0_1, cw0_2, cw0_3));
+                float4 w1 = exl3_decode_quad_const(uint4(cw1_0, cw1_1, cw1_2, cw1_3));
+                accA += (x10 * w0.x + x11 * w0.y) + (x12 * w0.z + x13 * w0.w);
+                accB += (x10 * w1.x + x11 * w1.y) + (x12 * w1.z + x13 * w1.w);
             }
             tile += tstride;
         }
@@ -634,10 +650,10 @@ kernel void exl3_gemv_spec(device const half *xh [[buffer(0)]],
             uint cw1_1 = uint(m1 >> (s1 + 2u * FC_K)) & 0xFFFFu;
             uint cw1_0 = uint(m1 >> (s1 + 3u * FC_K)) & 0xFFFFu;
 
-            accA += x00 * exl3_decode_f_const(cw0_0) + x01 * exl3_decode_f_const(cw0_1);
-            accA += x02 * exl3_decode_f_const(cw0_2) + x03 * exl3_decode_f_const(cw0_3);
-            accB += x00 * exl3_decode_f_const(cw1_0) + x01 * exl3_decode_f_const(cw1_1);
-            accB += x02 * exl3_decode_f_const(cw1_2) + x03 * exl3_decode_f_const(cw1_3);
+            float4 w0 = exl3_decode_quad_const(uint4(cw0_0, cw0_1, cw0_2, cw0_3));
+            float4 w1 = exl3_decode_quad_const(uint4(cw1_0, cw1_1, cw1_2, cw1_3));
+            accA += (x00 * w0.x + x01 * w0.y) + (x02 * w0.z + x03 * w0.w);
+            accB += (x00 * w1.x + x01 * w1.y) + (x02 * w1.z + x03 * w1.w);
             tile += tstride;
         }
     } else {
@@ -2141,9 +2157,8 @@ kernel void exl3_gemv_post(device const half *xh [[buffer(0)]],
 
                 float4 w0 = exl3_decode_quad(uint4(cw0_0, cw0_1, cw0_2, cw0_3), p.mode);
                 float4 w1 = exl3_decode_quad(uint4(cw1_0, cw1_1, cw1_2, cw1_3), p.mode);
-                float4 x0 = float4(x00, x01, x02, x03);
-                accA += dot(x0, w0);
-                accB += dot(x0, w1);
+                accA += (x00 * w0.x + x01 * w0.y) + (x02 * w0.z + x03 * w0.w);
+                accB += (x00 * w1.x + x01 * w1.y) + (x02 * w1.z + x03 * w1.w);
             }
                 tile += tstride;
                 float x10 = float(simd_shuffle(x_lane, ushort(16u + r0)));
@@ -2172,9 +2187,8 @@ kernel void exl3_gemv_post(device const half *xh [[buffer(0)]],
 
                 float4 w0 = exl3_decode_quad(uint4(cw0_0, cw0_1, cw0_2, cw0_3), p.mode);
                 float4 w1 = exl3_decode_quad(uint4(cw1_0, cw1_1, cw1_2, cw1_3), p.mode);
-                float4 x1 = float4(x10, x11, x12, x13);
-                accA += dot(x1, w0);
-                accB += dot(x1, w1);
+                accA += (x10 * w0.x + x11 * w0.y) + (x12 * w0.z + x13 * w0.w);
+                accB += (x10 * w1.x + x11 * w1.y) + (x12 * w1.z + x13 * w1.w);
             }
                 tile += tstride;
             }
@@ -2206,9 +2220,8 @@ kernel void exl3_gemv_post(device const half *xh [[buffer(0)]],
 
                 float4 w0 = exl3_decode_quad(uint4(cw0_0, cw0_1, cw0_2, cw0_3), p.mode);
                 float4 w1 = exl3_decode_quad(uint4(cw1_0, cw1_1, cw1_2, cw1_3), p.mode);
-                float4 x0 = float4(x00, x01, x02, x03);
-                accA += dot(x0, w0);
-                accB += dot(x0, w1);
+                accA += (x00 * w0.x + x01 * w0.y) + (x02 * w0.z + x03 * w0.w);
+                accB += (x00 * w1.x + x01 * w1.y) + (x02 * w1.z + x03 * w1.w);
                 tile += tstride;
             }
         } else {
@@ -2237,11 +2250,11 @@ kernel void exl3_gemv_post(device const half *xh [[buffer(0)]],
                     uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
                     uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
 
-                    accA += x00 * exl3_decode_f(cw0_0, p.mode) + x01 * exl3_decode_f(cw0_1, p.mode);
-                    accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
-                    accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
-                    accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
-                }
+                float4 w0 = exl3_decode_quad(uint4(cw0_0, cw0_1, cw0_2, cw0_3), p.mode);
+                float4 w1 = exl3_decode_quad(uint4(cw1_0, cw1_1, cw1_2, cw1_3), p.mode);
+                accA += (x00 * w0.x + x01 * w0.y) + (x02 * w0.z + x03 * w0.w);
+                accB += (x00 * w1.x + x01 * w1.y) + (x02 * w1.z + x03 * w1.w);
+            }
                 tile += tstride;
                 float x10 = float(simd_shuffle(x_lane, ushort(16u + r0)));
                 float x11 = float(simd_shuffle(x_lane, ushort(16u + r0 + 1u)));
@@ -2266,11 +2279,11 @@ kernel void exl3_gemv_post(device const half *xh [[buffer(0)]],
                     uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
                     uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
 
-                    accA += x10 * exl3_decode_f(cw0_0, p.mode) + x11 * exl3_decode_f(cw0_1, p.mode);
-                    accA += x12 * exl3_decode_f(cw0_2, p.mode) + x13 * exl3_decode_f(cw0_3, p.mode);
-                    accB += x10 * exl3_decode_f(cw1_0, p.mode) + x11 * exl3_decode_f(cw1_1, p.mode);
-                    accB += x12 * exl3_decode_f(cw1_2, p.mode) + x13 * exl3_decode_f(cw1_3, p.mode);
-                }
+                float4 w0 = exl3_decode_quad(uint4(cw0_0, cw0_1, cw0_2, cw0_3), p.mode);
+                float4 w1 = exl3_decode_quad(uint4(cw1_0, cw1_1, cw1_2, cw1_3), p.mode);
+                accA += (x10 * w0.x + x11 * w0.y) + (x12 * w0.z + x13 * w0.w);
+                accB += (x10 * w1.x + x11 * w1.y) + (x12 * w1.z + x13 * w1.w);
+            }
                 tile += tstride;
             }
             for (; live && it < it1; it++) {
@@ -2298,10 +2311,10 @@ kernel void exl3_gemv_post(device const half *xh [[buffer(0)]],
                 uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
                 uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
 
-                accA += x00 * exl3_decode_f(cw0_0, p.mode) + x01 * exl3_decode_f(cw0_1, p.mode);
-                accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
-                accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
-                accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
+                float4 w0 = exl3_decode_quad(uint4(cw0_0, cw0_1, cw0_2, cw0_3), p.mode);
+                float4 w1 = exl3_decode_quad(uint4(cw1_0, cw1_1, cw1_2, cw1_3), p.mode);
+                accA += (x00 * w0.x + x01 * w0.y) + (x02 * w0.z + x03 * w0.w);
+                accB += (x00 * w1.x + x01 * w1.y) + (x02 * w1.z + x03 * w1.w);
                 tile += tstride;
             }
         }
@@ -2464,9 +2477,8 @@ kernel void exl3_gemv_post_fused2(device const half *xh [[buffer(0)]],          
 
                 float4 w0 = exl3_decode_quad(uint4(cw0_0, cw0_1, cw0_2, cw0_3), p.mode);
                 float4 w1 = exl3_decode_quad(uint4(cw1_0, cw1_1, cw1_2, cw1_3), p.mode);
-                float4 x0 = float4(x00, x01, x02, x03);
-                accA += dot(x0, w0);
-                accB += dot(x0, w1);
+                accA += (x00 * w0.x + x01 * w0.y) + (x02 * w0.z + x03 * w0.w);
+                accB += (x00 * w1.x + x01 * w1.y) + (x02 * w1.z + x03 * w1.w);
             }
             tile += tstride;
             float x10 = float(simd_shuffle(x_lane, ushort(16u + r0)));
@@ -2494,9 +2506,8 @@ kernel void exl3_gemv_post_fused2(device const half *xh [[buffer(0)]],          
 
                 float4 w0 = exl3_decode_quad(uint4(cw0_0, cw0_1, cw0_2, cw0_3), p.mode);
                 float4 w1 = exl3_decode_quad(uint4(cw1_0, cw1_1, cw1_2, cw1_3), p.mode);
-                float4 x1 = float4(x10, x11, x12, x13);
-                accA += dot(x1, w0);
-                accB += dot(x1, w1);
+                accA += (x10 * w0.x + x11 * w0.y) + (x12 * w0.z + x13 * w0.w);
+                accB += (x10 * w1.x + x11 * w1.y) + (x12 * w1.z + x13 * w1.w);
             }
             tile += tstride;
         }
@@ -2527,9 +2538,8 @@ kernel void exl3_gemv_post_fused2(device const half *xh [[buffer(0)]],          
 
             float4 w0 = exl3_decode_quad(uint4(cw0_0, cw0_1, cw0_2, cw0_3), p.mode);
             float4 w1 = exl3_decode_quad(uint4(cw1_0, cw1_1, cw1_2, cw1_3), p.mode);
-            float4 x0 = float4(x00, x01, x02, x03);
-            accA += dot(x0, w0);
-            accB += dot(x0, w1);
+            accA += (x00 * w0.x + x01 * w0.y) + (x02 * w0.z + x03 * w0.w);
+            accB += (x00 * w1.x + x01 * w1.y) + (x02 * w1.z + x03 * w1.w);
             tile += tstride;
         }
     } else {
@@ -2706,9 +2716,8 @@ kernel void exl3_gemv_post_fused3(device const half *xh [[buffer(0)]],          
 
                 float4 w0 = exl3_decode_quad(uint4(cw0_0, cw0_1, cw0_2, cw0_3), p.mode);
                 float4 w1 = exl3_decode_quad(uint4(cw1_0, cw1_1, cw1_2, cw1_3), p.mode);
-                float4 x0 = float4(x00, x01, x02, x03);
-                accA += dot(x0, w0);
-                accB += dot(x0, w1);
+                accA += (x00 * w0.x + x01 * w0.y) + (x02 * w0.z + x03 * w0.w);
+                accB += (x00 * w1.x + x01 * w1.y) + (x02 * w1.z + x03 * w1.w);
             }
             tile += tstride;
             float x10 = float(simd_shuffle(x_lane, ushort(16u + r0)));
@@ -2736,9 +2745,8 @@ kernel void exl3_gemv_post_fused3(device const half *xh [[buffer(0)]],          
 
                 float4 w0 = exl3_decode_quad(uint4(cw0_0, cw0_1, cw0_2, cw0_3), p.mode);
                 float4 w1 = exl3_decode_quad(uint4(cw1_0, cw1_1, cw1_2, cw1_3), p.mode);
-                float4 x1 = float4(x10, x11, x12, x13);
-                accA += dot(x1, w0);
-                accB += dot(x1, w1);
+                accA += (x10 * w0.x + x11 * w0.y) + (x12 * w0.z + x13 * w0.w);
+                accB += (x10 * w1.x + x11 * w1.y) + (x12 * w1.z + x13 * w1.w);
             }
             tile += tstride;
         }
@@ -2769,9 +2777,8 @@ kernel void exl3_gemv_post_fused3(device const half *xh [[buffer(0)]],          
 
             float4 w0 = exl3_decode_quad(uint4(cw0_0, cw0_1, cw0_2, cw0_3), p.mode);
             float4 w1 = exl3_decode_quad(uint4(cw1_0, cw1_1, cw1_2, cw1_3), p.mode);
-            float4 x0 = float4(x00, x01, x02, x03);
-            accA += dot(x0, w0);
-            accB += dot(x0, w1);
+            accA += (x00 * w0.x + x01 * w0.y) + (x02 * w0.z + x03 * w0.w);
+            accB += (x00 * w1.x + x01 * w1.y) + (x02 * w1.z + x03 * w1.w);
             tile += tstride;
         }
     } else {

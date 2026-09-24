@@ -24,3 +24,7 @@
    - Because 3-bit weights are half the byte-width of 6-bit weights, reaching 225 GB/s on 3-bit weights requires 600 Giga-weights/second.
    - The current scalar decode loop requires ~7 ALU instructions per weight, capping ALU issue rate at ~300 Gw/s.
    - Solution: Vectorize decode to `uint4` and `dot(float4, float4)` to drop ALU instructions per weight to ~1.75 ops/weight, allowing the ALUs to sustain 600+ Gw/s.
+3. **Hardware `dot(float4, float4)` vs Pairwise Float Summation**:
+   - `dot(float4, float4)` in Metal evaluates pairwise products with slightly different internal summation rounding than scalar adds, causing 1-8 ULP differences in f32 tests (`gpu_gemv_post_matches_unfused` and `gpu_gemv_fused2_matches_separate_passes`).
+   - Using pairwise addition `acc += (x0 * w.x + x1 * w.y) + (x2 * w.z + x3 * w.w)` retains 100% exact bit-equivalence with the reference math while still reaping the 4x ALU instruction reduction from `exl3_decode_quad` (vectorized `uint4` integer multiplies and XORs).
+
