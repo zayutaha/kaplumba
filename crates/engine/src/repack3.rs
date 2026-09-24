@@ -24,6 +24,10 @@ pub enum DenseLayout {
     /// Slabs of 4 out-tiles, ordered `[otblock][it][ot_local]`. Tile content,
     /// word order and padding inside a tile are preserved verbatim.
     Wide4,
+    /// Slabs of 4 out-tiles, ordered `[otblock][ot_local][it]`: each out-tile's
+    /// full in-range is one contiguous run (per-line runs, e.g. 32 KB for a
+    /// 336-in-tile row).
+    Wide1,
 }
 
 #[derive(Debug, Error)]
@@ -108,6 +112,64 @@ pub fn unpack_wide4(
     Ok(out)
 }
 
+/// `[otblock][ot_local][it]` repack: per-line contiguous runs. Same bytes as
+/// `blob`, tile content verbatim.
+pub fn pack_wide1(
+    blob: &[u8],
+    in_tiles: usize,
+    out_tiles: usize,
+) -> Result<Vec<u8>, RepackError> {
+    if out_tiles == 0 || out_tiles % 4 != 0 {
+        return Err(RepackError::OutTilesNotDivisible(out_tiles, DenseLayout::Wide1));
+    }
+    let tile = tile_u16_of(blob.len(), in_tiles, out_tiles)?;
+    let tile_bytes = tile * 2;
+    let mut dense = vec![0u8; blob.len()];
+    let src = |it: usize, ot: usize| (it * out_tiles + ot) * tile_bytes;
+    let mut dst = 0usize;
+    for s in 0..out_tiles / 4 {
+        for otl in 0..4 {
+            let ot = s * 4 + otl;
+            for it in 0..in_tiles {
+                let s0 = src(it, ot);
+                let d0 = dst;
+                dense[d0..d0 + tile_bytes].copy_from_slice(&blob[s0..s0 + tile_bytes]);
+                dst += tile_bytes;
+            }
+        }
+    }
+    debug_assert_eq!(dst, dense.len());
+    Ok(dense)
+}
+
+/// Inverse of [`pack_wide1`]: reconstructs the original word blob.
+pub fn unpack_wide1(
+    dense: &[u8],
+    in_tiles: usize,
+    out_tiles: usize,
+) -> Result<Vec<u8>, RepackError> {
+    if out_tiles == 0 || out_tiles % 4 != 0 {
+        return Err(RepackError::OutTilesNotDivisible(out_tiles, DenseLayout::Wide1));
+    }
+    let tile = tile_u16_of(dense.len(), in_tiles, out_tiles)?;
+    let tile_bytes = tile * 2;
+    let mut out = vec![0u8; dense.len()];
+    let dst = |it: usize, ot: usize| (it * out_tiles + ot) * tile_bytes;
+    let mut src = 0usize;
+    for s in 0..out_tiles / 4 {
+        for otl in 0..4 {
+            let ot = s * 4 + otl;
+            for it in 0..in_tiles {
+                let s0 = src;
+                let d0 = dst(it, ot);
+                out[d0..d0 + tile_bytes].copy_from_slice(&dense[s0..s0 + tile_bytes]);
+                src += tile_bytes;
+            }
+        }
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,6 +217,73 @@ mod tests {
             pack_wide4(short, 4, 4),
             Err(RepackError::BadLength(..))
         ));
+    }
+
+    #[test]
+    fn wide1_roundtrips_synthetic_shapes() {
+        for (it, ot, tw) in [
+            (1usize, 4usize, 24usize),
+            (7, 4, 48),
+            (336, 1344, 48),
+            (1344, 336, 48),
+            (512, 512, 48),
+            (336, 4, 96),
+            (2, 4, 1),
+        ] {
+            let blob = synth_blob(it, ot, tw);
+            let dense = pack_wide1(&blob, it, ot).unwrap();
+            assert_eq!(dense.len(), blob.len());
+            let back = unpack_wide1(&dense, it, ot).unwrap();
+            assert_eq!(back, blob, "wide1 round-trip (it={it} ot={ot} tw={tw})");
+        }
+    }
+
+    #[test]
+    fn wide1_rejects_bad_length() {
+        let blob = synth_blob(4, 4, 48);
+        let short = &blob[..blob.len() - 2];
+        assert!(matches!(
+            pack_wide1(short, 4, 4),
+            Err(RepackError::BadLength(..))
+        ));
+    }
+
+    #[test]
+    fn wide1_real_artifact_roundtrips() {
+        let Some(dir) = artifact_dir() else {
+            eprintln!("skip: no artifact (KAPLUMBA_MODEL_DIR)");
+            return;
+        };
+        for (layer, which) in [
+            (0usize, "self_attn.v_proj"),
+            (0, "mlp.down_proj"),
+            (29, "mlp.gate_proj"),
+            (59, "self_attn.o_proj"),
+        ] {
+            let base = format!("model.language_model.layers.{layer}.{which}");
+            let (blob, _, shape) = read_tensor(&dir, &format!("{base}.trellis")).unwrap();
+            let (it, ot) = (shape[0], shape[1]);
+            let tw = shape[2];
+            assert_eq!(tw, 48, "{base} k=3 => 48 u16/tile");
+            assert_eq!(blob.len(), it * ot * tw * 2, "{base} byte len");
+
+            let dense = pack_wide1(&blob, it, ot).unwrap();
+            assert_eq!(dense.len(), blob.len());
+            let back = unpack_wide1(&dense, it, ot).unwrap();
+            assert_eq!(back, blob, "{base} wide1 round-trip");
+            // W1: dense[0..it*tile] is ot=0's whole it-column. In the native
+            // blob, tile (it,0) is strided at (it*ot)*tile, so compare per-tile.
+            let tile = tw * 2;
+            for i in 0..it {
+                let d0 = i * tile;
+                let b0 = (i * ot + 0) * tile;
+                assert_eq!(
+                    &dense[d0..d0 + tile],
+                    &blob[b0..b0 + tile],
+                    "{base} ot0 it={i} verbatim"
+                );
+            }
+        }
     }
 
     #[test]
