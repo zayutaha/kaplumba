@@ -431,7 +431,7 @@ impl Exl3Gemv {
         const MAX_SPLIT: usize = 16;
         match out_tiles {
             1344 => 2, // gate 5376x21504: sweep argmax
-            336 => 8,  // down 21504x5376 + o 8192x5376: sweep argmax
+            336 => 1,  // down 21504x5376 + o 8192x5376: single direct exl3_gemv_post
             512 => 2,  // q 5376x8192: sweep argmax (was 4)
             256 => 8,  // k/v 5376x4096: T5.2r + sweep argmax (unchanged)
             _ => TARGET_TGS.div_ceil(out_tiles.max(1)).clamp(1, MAX_SPLIT),
@@ -2492,7 +2492,7 @@ mod tests {
         assert_eq!(Exl3Gemv::gemv_splits(4096), 1); // exactly target
         assert_eq!(Exl3Gemv::gemv_splits(1344), 2); // gate (21504 out), sweep argmax
         assert_eq!(Exl3Gemv::gemv_splits(512), 2); // q (8192 out), sweep argmax (was 4)
-        assert_eq!(Exl3Gemv::gemv_splits(336), 8); // down/o (5376 out), sweep argmax (was 13-band)
+        assert_eq!(Exl3Gemv::gemv_splits(336), 1); // down/o (5376 out), single direct exl3_gemv_post
         assert_eq!(Exl3Gemv::gemv_splits(256), 8); // k/v (4096 out), T5.2r + sweep argmax
         assert_eq!(Exl3Gemv::gemv_splits(64), 16); // clamped (want 64)
         assert_eq!(Exl3Gemv::gemv_splits(1), 16);

@@ -10,10 +10,10 @@
   - **Intent**: Apply `exl3_decode_quad` and `exl3_decode_quad_const` vectorization to `exl3_gemv_spec`, `exl3_gemv_post`, `exl3_gemv_post_fused2`, and `exl3_gemv_post_fused3` using pairwise summation `(x0 * w0 + x1 * w1) + (x2 * w2 + x3 * w3)` to achieve 4x ALU reduction while preserving 100% bit-exact parity.
   - **Testing**: Run `cargo test -p kaplumba-engine --lib` (all 131 tests pass, including `gpu_gemv_post_matches_unfused` and `trace_chat_prompt_steps_slow`).
 
-- [ ] **T3: Single-Dispatch GEMV for O and Down (`gemv_splits(336) = 1`)**
+- [x] **T3: Single-Dispatch GEMV for O and Down (`gemv_splits(336) = 1`)**
   - **Files**: `crates/kernels/src/exl3.rs`
   - **Intent**: Change `gemv_splits(336)` from `8` to `1` so `o_proj` and `down_proj` execute direct `exl3_gemv_post` in a single dispatch instead of K-splits with `gemv_reduce_post` and partials buffer.
-  - **Testing**: `gpu_gemv_post_matches_unfused` and `gemma4::tests::trace_chat_prompt_steps_slow` to verify token 818 exact match.
+  - **Testing**: `gpu_gemv_post_matches_unfused` and `gemma4::tests::trace_chat_prompt_steps_slow` to verify token 818 exact match. All 131 tests pass.
 
 - [ ] **T4: Fused RMSNorm + Hadamard Prologue (`exl3_rms_had_in_batched`)**
   - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`, `crates/engine/src/metal_linear.rs`, `crates/engine/src/gpu_decode.rs`

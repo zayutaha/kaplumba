@@ -27,4 +27,9 @@
 3. **Hardware `dot(float4, float4)` vs Pairwise Float Summation**:
    - `dot(float4, float4)` in Metal evaluates pairwise products with slightly different internal summation rounding than scalar adds, causing 1-8 ULP differences in f32 tests (`gpu_gemv_post_matches_unfused` and `gpu_gemv_fused2_matches_separate_passes`).
    - Using pairwise addition `acc += (x0 * w.x + x1 * w.y) + (x2 * w.z + x3 * w.w)` retains 100% exact bit-equivalence with the reference math while still reaping the 4x ALU instruction reduction from `exl3_decode_quad` (vectorized `uint4` integer multiplies and XORs).
+4. **Single-Dispatch GEMV for O and Down (`gemv_splits(336) = 1`)**:
+   - Setting `gemv_splits(336) = 1` directs `o_proj` and `down_proj` into `exl3_gemv_post` directly instead of K-splits (nsplit=8).
+   - Eliminates 120 dispatches per token (2 dispatches eliminated per layer across 60 layers) and cuts all DRAM roundtrips to `scratch.partial`.
+   - All 131 tests pass with 100% bit-exact parity including `trace_chat_prompt_steps_slow` (predicting token 818).
+
 
