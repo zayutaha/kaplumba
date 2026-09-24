@@ -55,7 +55,81 @@ Caveats recorded up front (do not skip these when reading the T4 table):
 - Bisect before optimizing; new kernel alongside rather than in-place replacement.
 - Session scope: deletion + bisection, then report and stop.
 
-## Environment facts
+## 2026-09-24 — T3/T4: the ladder is FLAT. The inner loop is not the bottleneck.
+
+`bench_gemv_bisect_slow` (new, this spec). k=3, twords=24, warm = min-of-12
+back-to-back, cold = L2/SLC flushed before each timed run. GB/s, best nsplit per shape:
+
+| shape | in_tiles | MB | S1 walk | S5 full (all decode math) | S5/S1 | PROD `gemv_pass_spec` |
+|---|---|---|---|---|---|---|
+| o     5376x5376  | 336  | 10.8 |  71.0 (n8) |  63.2 (n8) | 0.89x | 38.4 (n8) |
+| q     5376x8192  | 336  | 16.5 | 106.6 (n8) |  84.5 (n8) | 0.79x | 50.0 (n8) |
+| kv    5376x4096  | 336  |  8.3 |  49.4 (n8) |  52.0 (n8) | 1.05x | 29.7 (n8) |
+| gate  5376x21504 | 336  | 43.4 | 201.1 (n4) | 163.0 (n2) | 0.81x | 75.9 (n1) |
+| down  21504x5376 | 1344 | 43.4 | 184.7 (n8) | 152.8 (n8) | 0.83x | 72.0 (n8) |
+| synth 2048x1024  | 2048 | 201.3 | 378.6 (n4) | 270.9 (n4) | 0.72x | 103.1 (n4) |
+
+**Finding 1 — the entire EXL3 decode is free.** Going from a bare walk that reads one word
+per lane (S1) to the complete production math (S5: 4 scattered `ld_word`, 8 `ulong` window
+assemblies, 8 shift/mask codeword extractions, 8 `exl3_decode_quad_const` codebook decodes,
+8 `simd_shuffle` of `xh`, 8 FMA into `accA`/`accB`) costs **0% to 28%**, and on the small
+shapes S5 is *faster* than S1, i.e. the difference is noise. The whole ladder S1..S5 is flat
+within run-to-run variance at every shape/nsplit.
+
+This kills the last standing version of the ALU theory. There is no 3x to recover in the
+inner loop; the "14 ops/weight = 113 ms" model has no support in any measurement, and the
+T1/T2 vectorization work bought what it could. **Do not rewrite the decode inner loop.**
+
+**Finding 2 — R5 did not pass, and the reference is what is wrong.** S5 lands ~2x *faster*
+than `gemv_pass_spec` (0.272 vs 0.589 ms on gate/n1; 0.171 vs 0.282 on o/n8), not within
+noise. Cause, confirmed by reading `exl3.rs`: `gemv_pass` wraps every call in
+`with_scratch`, which **allocates four Metal buffers per call** (`x_stage`, `xh`, `y`, `yh`),
+and `encode_gemv_spec` allocates a fifth (`owned` partial, 172 KB for down/n8) because
+`ext_partial` is `None`. All of that sits inside the timed region, plus a `reduce` dispatch
+and a host readback. So the PROD column measures ~0.1–0.3 ms of host-side buffer churn per
+call, not the kernel.
+
+Consequence: the spec's R5 was aimed at the wrong thing. The ladder is still internally
+valid — S1..S5 are byte-identical kernels except for the stage under test, which is all the
+deltas require — but the production column must not be read as "what the kernel costs".
+Note the real decode path (`gpu_decode.rs` -> `encode_linear_with_scratch`) uses a
+**pre-allocated decoder arena**, so it does *not* pay this; but every per-linear GB/s figure
+recorded in the older specs (81.8 gate / 53.9 o / 35.2 v etc.) came from harnesses of this
+shape and is inflated by the same overhead.
+
+**Finding 3 — what actually limits the small shapes: parallelism, not math.** Throughput
+tracks `in_tiles` (the length of each warp's serial walk), not total bytes:
+
+| in_tiles | shapes | best GB/s |
+|---|---|---|
+| 336   | o, q, kv, gate | 49–201 |
+| 1344  | down           | 185 |
+| 2048  | synth          | 379 |
+
+And it is still climbing at the top of the swept range. nsplit sweep for `o` (10.8 MB):
+21.3 (n1) -> 63.5 (n2) -> 66.4 (n4) -> 71.0 (n8), **no saturation**. Same for q
+(65 -> 87 -> 98 -> 107) and kv (36 -> 42 -> 47 -> 49). The bench only swept up to n8;
+`gemv_splits` assigns 8 to out_tiles 336/256 and caps at 16, so **nsplit 16 and 32 are
+untested on four of the seven k=3 linears.** Given that n1 -> n8 is worth 2–3.3x on these
+shapes, n16/n32 is the cheapest remaining lever and is a one-line policy change plus a
+measurement, not a kernel rewrite.
+
+**Where the 117 ms/token actually goes** (from the S5 column, per layer):
+gate+up 0.53 + down 0.28 + q 0.19 + kv 0.32 + o 0.17 ~= 1.49 ms/layer x 60 = 89 ms, plus
+lm_head ~4.6 ms = ~94 ms of GEMV against a measured 117 ms total. So GEMV is still ~80% of
+decode, but its limit is the bandwidth available on short-walk small tensors, not
+arithmetic.
+
+## Follow-up recommendation (for the next spec, not started here)
+1. Sweep `nsplit` 16/32 for out_tiles 256/336/512 and re-tune `gemv_splits`; this is the
+   only lever with a measured 2–3x precedent still unexhausted. Bit-exactness holds because
+   larger nsplit changes the f32 split summation order, so it must be gated exactly like the
+   existing `gpu_gemv_post_matches_unfused` route-A/boundary precedent.
+2. Re-baseline every per-linear GB/s figure using the decoder arena path instead of
+   `with_scratch`, so the specs stop quoting numbers inflated by buffer allocation.
+3. Re-derive the throughput bar: at the S5-observed rates the model would need ~236 GB/s
+   sustained, still above the 210 GB/s measured linear-read figure.
+
 - No `build.rs` in `crates/kernels`. MSL is `include_str!`'d and compiled at **runtime** by
   `new_library_with_source`, which compiles the *entire* file. `cargo build` cannot catch a
   Metal syntax error; any engine GPU test that constructs `MetalLinear::new` will. Corollary

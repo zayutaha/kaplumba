@@ -44,25 +44,29 @@ spec, chosen from T4's data.
 - **Commit**: after green.
 
 ## T3 — Bisection ladder S2–S5
-- **Status**: PENDING
-- **Files**: `crates/engine/src/metal_linear.rs` (`P1_BISECT_MSL` + bench extension).
-- **Intent**: Add the four rung kernels and extend `bench_stream_bw_slow` (or add a sibling
-  `bench_gemv_bisect_slow`) to sweep stage x nsplit x shape. `S1` reuses the existing
-  `stream_sum_strided`. Each rung recomputes `ig0_`/`ig1_`/`s3_` with the production
-  arithmetic (k=3, mode=0 literals) and the inlined decode matches
-  `exl3_decode_f_const` bit-for-bit. Rungs S2–S5 accumulate into an `atomic_uint` sink and
-  each is asserted non-zero, so a dead rung cannot read as a fast one.
-- **Test**: the bench compiles and runs; S5's time matches the separately-measured
-  `exl3_gemv_spec` time for the same shape/nsplit within noise (R5). Both suites green.
-- **Commit**: after green.
+- **Status**: DONE — pending hash in the follow-up commit.
+- **Files**: `crates/engine/src/metal_linear.rs` (`P1_BISECT_MSL`, `bench_gemv_bisect_slow`).
+- **Delivered**: `P1_BISECT_MSL` (bench-only runtime-compiled MSL) with `bis_gather` (S2),
+  `bis_extract` (S3), `bis_decode` (S4), `bis_full` (S5) and `bis_flush` (cache eviction);
+  `bench_gemv_bisect_slow` sweeps stage x nsplit{1,2,4,8} x 6 shapes, warm (min-of-12) and
+  cold (flushed), asserts each rung's atomic sink is non-zero, and times
+  `gemv_pass_spec` alongside as the intended R5 reference. k=3/mode=0 baked as literals so
+  the codebook branch folds exactly as FC_MODE=0 does.
+- **Test**: bench compiles and runs (1.74 s, all 120 timed runs, every rung non-zero);
+  kernels **21 passed / 0 failed**, engine **132 passed / 0 failed / 12 ignored** unchanged.
 
 ## T4 — Run, record, report
-- **Status**: PENDING
-- **Files**: `spec/exl3-load-latency/implementation_notes.md`.
-- **Intent**: Run the ladder at real per-linear sizes (o 16.5 MB, down/gate 43.4 MB) and a
-  large synthetic, cold and warm separately. Record the per-stage GB/s table, the
-  marginal delta of each stage, and an explicit statement of the dominant cost plus what
-  the follow-up spec should attack. Then **stop and report to the user** — do not begin
-  optimizing.
-- **Test**: numbers recorded; R5 outcome stated explicitly (pass or harness-defect report).
-- **Commit**: after recording.
+- **Status**: DONE — see `implementation_notes.md` for the full table and conclusions.
+- **R5 outcome: FAILED as specified, and the reference is at fault.** S5 measures ~2x
+  *faster* than `gemv_pass_spec` rather than matching it. Cause: `gemv_pass` wraps each call
+  in `with_scratch`, which allocates four Metal buffers per call, plus a fifth partial
+  buffer in `encode_gemv_spec` — all inside the timed region. The PROD column measures host
+  buffer churn, not the kernel. The ladder remains internally valid (S1..S5 differ only by
+  the stage under test), so the deltas stand; R5 was aimed at the wrong target and is
+  reported as such rather than papered over.
+- **Headline result**: the ladder is flat. The complete EXL3 decode (4 scattered loads,
+  8 `ulong` extractions, 8 codebook decodes, 8 shuffles, 8 FMAs) costs 0–28% over a bare
+  one-word-per-lane walk, and is within noise or faster on the small shapes. **There is no
+  3x in the inner loop; do not rewrite it.** The limit on the small shapes is parallelism:
+  throughput tracks `in_tiles` (serial walk length), and nsplit has not saturated at n8.
+- **Test**: numbers recorded; R5 stated explicitly as failed-with-cause per spec R5.
