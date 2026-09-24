@@ -4,19 +4,24 @@ Order matters; commit after every task (AGENTS §4). Gated benchmarks run with
 `KAPLUMBA_RUN_SLOW=1`, release profile, `--ignored --nocapture`; record
 `vm.swapusage` alongside each.
 
-## RT0 — T0 probe: is k=3 per-symbol ALU the limiter? (go/no-go)
-- **Files**: `crates/kernels/src/exl3.metal` (probe kernels on a scratch branch),
-  `crates/engine/src/metal_linear.rs` (probe bench behind `#[ignore]`).
-- **Intent**: Disambiguate ALU/dependency vs memory for the k=3 plateau. Synthetic
-  microbench on identical byte volume: (a) k=3 decode vs (b) k=3 bytes fed through a
-  k=6-style ½-symbol-per-byte decoder (same bytes, half the funnel ops), (c) same with
-  a fake "free" decoder (sum bytes only) to bound the pure-stream ceiling; optionally
-  MTLCounterSampleBuffer ALU/utilization if present on the device.
-- **Testing**: Expected signature if hypothesis holds: (a)→(c) scales with symbol/byte
-  as observed. Also re-run `bench_linear_bandwidth_slow` on k/v at nsplit up to 32 to
-  check TG-count confound. All probes in scratch; nothing lands.
-- **Exit**: decision recorded in `tasks.md` here + `implementation_notes.md`; if
-  hypothesis fails, amend `plan.md`/`spec.md` before any further kernel work.
+## RT0 — T0 probe: is k=3 per-symbol ALU the limiter? (go/no-go) — DONE
+- **Probe kernel** `exl3_gemv_probe` (FC k=3/0/1, `probe_mode` 0=full funnel+decode,
+  1=half symbols, 2=pure u32 stream-sum; `probe_nsplit` override) + `encode_gemv_probe`
+  + gated bench `bench_gemv_probe_alu_slow` on real down/o/k trellis bytes.
+- **Verdict — hypothesis REJECTED (memory/load-structure-bound)**: m0 ≈ m2 on the same
+  bytes (down 0.613 vs 0.656 ms; o 0.344 vs 0.344; k 0.231 vs 0.259); m1 (half the
+  decode ALU) only ~10-19% faster. Per-symbol decode ALU is effectively free; a
+  symbol-free decoder is NOT the path to 180 GB/s for these shapes.
+- **Revised mechanism (plan.md updated)**: lm's 228 vs k=3's ~50-75 comes from
+  load/loop structure (wider independent loads in flight, whole-in-range per TG);
+  the dense repack targets **long contiguous per-thread read runs** (L-wide; also
+  L-planar's three contiguous streams), not ALU reduction.
+- **Caveat for future gated runs**: swap pressure inflates absolute ms; Mm
+  relative (same-run) comparisons; keep probe records alongside
+  `bench_linear_bandwidth_slow`. Misaligned tensors (e.g. lm_head) fault the
+  FC_ALIGNED=1 probe → probes only on aligned tensors.
+- **Go decision**: proceed to RT1/RT2 with both layouts, keeping the ≥180 GB/s bar
+  and bit-exact gates. Exit recorded here + `implementation_notes.md`.
 
 ## RT1 — Lossless `repack3` (Rust, offline) with reference round-trip
 - **Files**: `crates/engine/src/repack3.rs` (new), `crates/engine/src/load.rs` (variant

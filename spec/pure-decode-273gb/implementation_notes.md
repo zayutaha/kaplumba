@@ -159,3 +159,22 @@ Widened 2-way→4-way (8 ld_word in flight per warp), validated by fast bit-exac
 
 ### Conclusion after P6-T1..T3
 Geometry/nsplit/spec-split/LUT/unroll are exhausted within the current shared EXL3 trellis layout. k=3 linears cap ~55-95 GB/s vs k=6 lm 228. Dominating remaining hypothesis: per-byte decode-ALU/dependency (k=3 ≈ 2× k=6 per byte). Only a format/layout repack (new spec, affects converter + on-disk + memory layout) can cut it — needs user decision. No in-band knob untested.
+
+## trellis-dense-repack RT0 (2026-09-24) — ALU hypothesis REJECTED
+Probe `bench_gemv_probe_alu_slow` (new kernel `exl3_gemv_probe`, FC k=3/0/1, modes
+0=full funnel+decode / 1=half symbols / 2=pure u32 stream-sum; probe_nsplit override;
+encode_gemv_probe in Exl3Gemv). Real down/o/k trellis, release, min-of-20, warm:
+- down k3: m0 0.613ms(71GB/s) m1 0.475(91) m2(ushort) 1.119(39) m2(u32) 0.656(66)
+- o    k3: m0 0.344(48) m1 0.294(56) m2(u32) 0.344(48)
+- k    k3: m0 0.231(36) m1 0.207(40) m2(u32) 0.259(32)
+- nsplit sweep of m2 on down/o (swap-noisy, relative OK): m2n8 best ≈ m0 decode.
+VERDICT: stream-sum ≈ full decode ⇒ per-symbol decode ALU effectively free; halving
+symbols gains only ~10-19%. The k=3 plateau (~50-75 GB/s) vs lm_head 228 GB/s is a
+load/loop-structure gap (independent loads in flight / contiguous runs), NOT ALU.
+=> dense repack's mechanism = long contiguous per-thread read spans (L-wide; L-planar
+three streams), not ALU reduction. plan.md/spec.md amended accordingly.
+Notes/ops: (1) probe pipeline is FC_ALIGNED=1; misaligned tensors (lm_head known) fault
+the device and hang wait_until_completed for minutes — probes on aligned tensors only;
+(2) an orphaned cargo/rustc from a killed timed-out run held target/.cargo-lock and made
+subsequent `cargo test` appear to hang with no output — check `pgrep cargo` + remove
+stale `.cargo-lock` when a cargo test prints nothing.

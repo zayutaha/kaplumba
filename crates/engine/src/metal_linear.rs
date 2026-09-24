@@ -1851,6 +1851,98 @@ kernel void stream_sum_strided(device const uint *buf [[buffer(0)]],
         );
     }
 
+    /// spec/trellis-dense-repack RT0: decode-ALU scaling probe on real trellis
+    /// bytes. Runs `exl3_gemv_probe` (k=3 FC-specialized, same grid/nsplit and
+    /// loads as `exl3_gemv_spec`) at probe_mode 0 (full funnel+decode),
+    /// 1 (same loads, 2 of 4 codewords decoded) and 2 (pure word-sum ceiling).
+    /// If the k=3 plateau is per-symbol ALU/dependency, mode 1 ≪ mode 0 and
+    /// mode 2 ≪ mode 1 on the same bytes; if memory-bound, all three converge.
+    /// Pure measurement — gate `KAPLUMBA_RUN_SLOW=1`.
+    #[test]
+    #[ignore]
+    fn bench_gemv_probe_alu_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = crate::testutil::artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let Some(c) = ctx() else { return };
+        let model = crate::load::load_exl3(&c, &dir).expect("load artifact");
+        let ml = MetalLinear::new(&c).expect("metal linear");
+        let src: &dyn TensorSource = &model;
+        const REPS: usize = 20;
+
+        let trellis_bytes = |lin: &LinearHandles| -> f64 {
+            (lin.shape.in_features() / 16
+                * lin.shape.out_features() / 16
+                * lin.shape.k as usize
+                * 32) as f64
+        };
+
+        for (label, name) in [
+            ("down", "model.language_model.layers.0.mlp.down_proj"),
+            ("o", "model.language_model.layers.0.self_attn.o_proj"),
+            ("k", "model.language_model.layers.0.self_attn.k_proj"),
+        ] {
+            let lin = linear_handles(src, name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let inn = lin.shape.in_features();
+            let out_f = lin.shape.out_features();
+            let x16: Vec<f16> = (0..inn)
+                .map(|i| f16::from_f32(((i % 17) as f32 - 8.0) / 64.0))
+                .collect();
+            let x_buf = c.device().new_buffer_with_data(
+                x16.as_ptr() as *const _,
+                (inn * 2) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let out_buf = c
+                .device()
+                .new_buffer((out_f * 2) as u64, MTLResourceOptions::StorageModeShared);
+            let bytes = trellis_bytes(&lin);
+
+            let run = |mode: u32, nsplit_override: u32| -> (f64, f64) {
+                let mut times = Vec::with_capacity(REPS);
+                for _ in 0..REPS {
+                    let cb = c.queue().new_command_buffer();
+                    let enc = cb.new_compute_command_encoder();
+                    ml.raw().encode_gemv_probe(
+                        enc,
+                        &x_buf,
+                        lin.trellis(),
+                        lin.shape,
+                        mode,
+                        nsplit_override,
+                        &out_buf,
+                    );
+                    enc.end_encoding();
+                    let t0 = std::time::Instant::now();
+                    cb.commit();
+                    cb.wait_until_completed();
+                    times.push(t0.elapsed().as_secs_f64() * 1e3);
+                }
+                times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let t = times[0];
+                (t, bytes / (t * 1e-3) / 1e9)
+            };
+
+            let mut row = format!("{label:5} {inn}x{out_f} k={} ", lin.shape.k);
+            let (t0, g0) = run(0, 0);
+            row.push_str(&format!(" m0=p/tg {t0:.3}/{g0:.0}"));
+            for nsplit in [1usize, 2, 8, 32] {
+                if nsplit > inn / 16 {
+                    row.push_str("  -");
+                    continue;
+                }
+                let (t2, g2) = run(2, nsplit as u32);
+                row.push_str(&format!("  m2n{nsplit}={t2:.3}/{g2:.0}"));
+            }
+            eprintln!("{row}");
+        }
+    }
+
     /// spec/pure-decode-273gb T1: the fused rows=1 post-Hadamard linear
     /// (`encode_linear_with_scratch` → `exl3_gemv_post` / `exl3_gemv` +
     /// `exl3_gemv_reduce_post`) must reproduce the unfused GPU composition

@@ -2812,3 +2812,106 @@ kernel void exl3_gemv_post_fused3(device const half *xh [[buffer(0)]],          
     }
 }
 
+
+// ---------------------------------------------------------------------------
+// RT0 probe (spec/trellis-dense-repack): same grid/loads as exl3_gemv_spec's
+// k!=7 path, per-symbol decode ALU scaled by `probe_mode` to disambiguate
+// ALU/dependency vs memory for the k=3 plateau:
+//   0 = full replacement (identical to spec k-neq-7 decode work)
+//   1 = same loads, but only 2 of the 4 codewords decode into accA/accB
+//   2 = pure stream: sum all words, no funnel/decode at all (ceiling)
+// Outputs are deliberately non-meaningful; this kernel never runs in
+// production. Compile-time FC_K = 3, FC_ALIGNED = 1, FC_MODE = 0 (probe).
+// ---------------------------------------------------------------------------
+kernel void exl3_gemv_probe(device const half *xh [[buffer(0)]],
+                            device const ushort *trellis [[buffer(1)]],
+                            device float *y [[buffer(3)]],
+                            constant Exl3Params &p [[buffer(4)]],
+                            constant uint &probe_mode [[buffer(5)]],
+                            constant uint &probe_nsplit [[buffer(6)]],
+                            uint2 tg [[threadgroup_position_in_grid]],
+                            uint2 thr [[thread_position_in_threadgroup]]) {
+    uint g = thr.x & 31u;
+    uint ot = tg.x;
+    uint nsplit = probe_nsplit > 0u ? probe_nsplit : p.nsplit;
+    uint chunk = (p.in_tiles + nsplit - 1u) / nsplit;
+    uint it0 = tg.y * chunk;
+    uint it1 = min(p.in_tiles, it0 + chunk);
+    bool live = ot < p.out_tiles;
+    uint r0 = (g & 3u) * 2u;
+
+    float accA = 0.0f;
+    float accB = 0.0f;
+
+    const device ushort *tile =
+        trellis + ((ulong)min(it0, p.in_tiles) * p.out_tiles + ot) * p.twords * 2u;
+    const ulong tstride = (ulong)p.out_tiles * p.twords * 2u;
+    uint it = it0;
+
+    if (probe_mode == 2u) {
+        uint accu = 0u;
+        const device uint *w = (const device uint *)tile;
+        uint n32 = (it1 - it0) * (p.twords / 2u);
+        for (uint wi = 0u; wi < n32; wi++) {
+            accu += w[wi];
+        }
+        accA += float(accu & 0xFFFFu);
+        accB += float(accu >> 16);
+    } else {
+        uint ig0_[2];
+        uint ig1_[2];
+        uint s3_[2];
+        for (uint gg = 0u; gg < 2u; gg++) {
+            uint c0 = g * 8u + gg * 4u;
+            int e_last = int(c0 + 4u) * int(FC_K) + 256 * int(FC_K);
+            int i_end = (e_last - 1) / 32;
+            ig1_[gg] = uint(((i_end % p.twords) + p.twords) % p.twords);
+            ig0_[gg] = uint((((i_end - 1) % p.twords) + p.twords) % p.twords);
+            s3_[gg] = uint((i_end + 1) * 32 - e_last);
+        }
+        for (; live && it < it1; it++) {
+            half x_lane = xh[it * 16u + g];
+            float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+            float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+            float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+            float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+            uint a0 = ld_word(tile, ig0_[0], FC_ALIGNED);
+            uint b0 = ld_word(tile, ig1_[0], FC_ALIGNED);
+            ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+            uint s0 = s3_[0];
+            uint a1 = ld_word(tile, ig0_[1], FC_ALIGNED);
+            uint b1 = ld_word(tile, ig1_[1], FC_ALIGNED);
+            ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+            uint s1 = s3_[1];
+            if (probe_mode == 1u) {
+                uint cw0 = uint(m0 >> s0) & 0xFFFFu;
+                uint cw1 = uint(m1 >> s1) & 0xFFFFu;
+                accA += x00 * exl3_decode_f_const(cw0);
+                accB += x00 * exl3_decode_f_const(cw1);
+            } else {
+                uint cw0_3 = uint(m0 >> s0) & 0xFFFFu;
+                uint cw0_2 = uint(m0 >> (s0 + FC_K)) & 0xFFFFu;
+                uint cw0_1 = uint(m0 >> (s0 + 2u * FC_K)) & 0xFFFFu;
+                uint cw0_0 = uint(m0 >> (s0 + 3u * FC_K)) & 0xFFFFu;
+                uint cw1_3 = uint(m1 >> s1) & 0xFFFFu;
+                uint cw1_2 = uint(m1 >> (s1 + FC_K)) & 0xFFFFu;
+                uint cw1_1 = uint(m1 >> (s1 + 2u * FC_K)) & 0xFFFFu;
+                uint cw1_0 = uint(m1 >> (s1 + 3u * FC_K)) & 0xFFFFu;
+                accA += x00 * exl3_decode_f_const(cw0_0) + x01 * exl3_decode_f_const(cw0_1);
+                accA += x02 * exl3_decode_f_const(cw0_2) + x03 * exl3_decode_f_const(cw0_3);
+                accB += x00 * exl3_decode_f_const(cw1_0) + x01 * exl3_decode_f_const(cw1_1);
+                accB += x02 * exl3_decode_f_const(cw1_2) + x03 * exl3_decode_f_const(cw1_3);
+            }
+            tile += tstride;
+        }
+        accA += simd_shuffle_down(accA, 1);
+        accA += simd_shuffle_down(accA, 2);
+        accB += simd_shuffle_down(accB, 1);
+        accB += simd_shuffle_down(accB, 2);
+    }
+    if (live && (g & 3u) == 0u) {
+        uint c0 = g >> 2;
+        y[(tg.y * p.out_tiles + ot) * TILE + c0] = accA;
+        y[(tg.y * p.out_tiles + ot) * TILE + c0 + 8u] = accB;
+    }
+}

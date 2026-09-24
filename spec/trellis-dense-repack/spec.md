@@ -2,11 +2,13 @@
 
 ## Goal
 Raise single-token decode throughput from the measured ~8.55 t/s toward the ≥19.5 t/s
-(flip) / 20 t/s gate by removing the per-byte decode cost that caps every k=3 layer
-linear at ~55–95 GB/s (vs lm_head k=6 at ~228 GB/s). Achieve this strictly by
-**repacking the in-memory/on-disk layout of the k=3 EXL3 trellis symbol stream** —
-same symbols, same per-weight values, bit-exact decode output — so that a per-warp
-decode pass reads the same bytes with strictly fewer per-symbol ALU/dependency ops.
+(flip) / 20 t/s gate by **repacking the in-memory/on-disk layout of the k=3 EXL3
+trellis symbol stream** so that each thread reads long contiguous sequential spans
+instead of the current short strided window bursts. RT0 (probe, real artifact)
+established the decode funnel ALU is *free* (pure stream-sum ≈ full decode; halving
+symbols ≠ 2×); the k=3 linears' ~50-75 GB/s vs lm_head's 228 GB/s is a load/loop-
+structure gap, and a dense layout that yields big per-thread sequential runs is the
+target mechanism.
 
 The decoder stays verify-free because no numerics change: a dense repack only permutes
 where each weight's 3-bit symbol lives in memory; the value each symbol decodes to is

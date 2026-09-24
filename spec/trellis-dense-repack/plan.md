@@ -11,13 +11,26 @@ LUT and 4-way-unroll A/B negative (see `spec/pure-decode-273gb/implementation_no
 The k=3/k=6 ratio ~2.0 in both per-symbol decode ALU and measured GB/s is the correlating
 signal: k=3 pays ~2× the funnel+decode ALU per byte of the same trellis word format.
 
-## Working hypothesis (T0 will test; see Task T0)
-k=3 linears are limited by per-symbol ALU/dependency (funnel shift+mask per symbol +
-decode_f chain), not by raw L2/L1 bandwidth — lm_head shows the hardware streams at
-~228 GB/s with the same trellis when symbols per byte are halved. If TF = true, a dense
-repack that materially cuts per-symbol ALU must move k=3 toward ~200 GB/s and is the
-correct lever. If TF = false (memory-side bound at ~80 for *all* parallel shapes and k),
-the repack spec must be amended to focus on read-stream count/geometry instead.
+## Working hypothesis (updated by RT0 verdict — see tasks.md RT0)
+**RT0 (measured on real artifact, `bench_gemv_probe_alu_slow`): the k=3 plateau is
+NOT per-symbol decode ALU.** The probe kernel (same grid/nsplit/loads as
+`exl3_gemv_spec`) scaled per-symbol decode work: full funnel+decode (m0) ≈ pure
+u32 stream-sum (m2) on the same bytes (down 0.613 vs 0.656 ms; o 0.344 vs 0.344;
+k 0.231 vs 0.259), and halving decoded symbols (m1) gains only ~10-19%. So the
+funnel/decode is essentially free; even a perfect symbol-free decoder cannot lift
+these shapes — the read structure itself caps k=3 linears at ~50-75 GB/s.
+
+The real difference vs lm_head's 228 GB/s is **load/loop structure per thread**:
+the k=3 linears' per-warp windows are short/RW-strided bursts (~4 loads then
+depend), while lm (nsplit=1, whole in-range per TG, 2048 TGs) keeps far more
+independent loads in flight. The dense repack's job is therefore to hand each
+thread **long contiguous sequential runs** (large per-thread spans, fewer
+per-burst branch/dependency chains advancing one tile at a time) — exactly the
+L-wide layout, and incidentally what L-planar's three contiguous streams give.
+Reducing per-symbol ALU is abandoned as a goal (measured irrelevant).
+
+RT0 outcome: keep the ~180 GB/s per-linear bar and the two layout candidates;
+the pass/fail mechanism at RT4 is now "load-pattern reach" not "ALU reduction".
 
 ## Current layout to be preserved/read (facts)
 - Tile: 16×16 weights (`TILE=16`, `Exl3Shape`, crates/kernels/src/exl3.rs:29).

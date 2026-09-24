@@ -258,6 +258,9 @@ pub struct Exl3Gemv {
     /// T3.10: sums the K-split partials of `gemm_sg` back into `y`.
     gemm_sg_reduce: ComputePipelineState,
     had_out: ComputePipelineState,
+    /// RT0 probe (spec/trellis-dense-repack): decode-ALU scaling probe,
+    /// FC-specialized to (k=3, mode=0, aligned=1); never used in production.
+    probe: ComputePipelineState,
     pair_tables: RefCell<HashMap<u32, Buffer>>,
     /// Constant 256×u32 inverse tile permutation, shared by every linear
     /// (the decode geometry is per tile-position, not per layer).
@@ -306,6 +309,25 @@ impl Exl3Gemv {
             gemm_sg: build("exl3_gemm_sg")?,
             gemm_sg_reduce: build("exl3_gemm_sg_reduce")?,
             had_out: build("exl3_had_out")?,
+            probe: {
+                let consts = FunctionConstantValues::new();
+                let aligned = 1u32;
+                let mode = 0u32;
+                let k = 3u32;
+                consts.set_constant_value_at_index(
+                    &aligned as *const u32 as *const _,
+                    MTLDataType::Bool,
+                    0,
+                );
+                consts.set_constant_value_at_index(&mode as *const u32 as *const _, MTLDataType::UInt, 1);
+                consts.set_constant_value_at_index(&k as *const u32 as *const _, MTLDataType::UInt, 2);
+                let pf = lib
+                    .get_function("exl3_gemv_probe", Some(consts))
+                    .map_err(|e| KernelError::Function("exl3_gemv_probe".into(), e.to_string()))?;
+                device
+                    .new_compute_pipeline_state_with_function(&pf)
+                    .map_err(|e| KernelError::Pipeline("exl3_gemv_probe".into(), e.to_string()))?
+            },
             pair_tables: RefCell::new(HashMap::new()),
             spec_fns: RefCell::new(HashMap::new()),
             gemv_spec: RefCell::new(HashMap::new()),
@@ -948,6 +970,64 @@ impl Exl3Gemv {
         enc.set_buffer(3, Some(dest), 0);
         enc.set_bytes(4, 28, params.as_ptr() as *const _);
         const WARPS: usize = 1; // MUST match the spec kernel: one out-tile per threadgroup
+        let groups = shape.out_tiles.div_ceil(WARPS) as u64;
+        enc.dispatch_thread_groups(
+            MTLSize::new(groups, nsplit as u64, 1),
+            MTLSize::new((32 * WARPS) as u64, 1, 1),
+        );
+        if nsplit > 1 {
+            self.encode_gemv_reduce(enc, dest, y, nsplit, shape.out_tiles);
+        }
+        drop(owned);
+    }
+
+    /// RT0 probe (spec/trellis-dense-repack): runs `exl3_gemv_probe` on one
+    /// linear's trellis with `probe_mode` (0 = full decode ALU, 1 = half,
+    /// 2 = stream-only ceiling). Same grid/nsplit layout as `encode_gemv_spec`
+    /// so memory traffic is comparable; outputs are meaningless by design.
+    pub fn encode_gemv_probe(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        xh: &Buffer,
+        trellis: DeviceSpan<'_>,
+        shape: Exl3Shape,
+        probe_mode: u32,
+        probe_nsplit: u32,
+        y: &Buffer,
+    ) {
+        let nsplit = if probe_nsplit > 0 {
+            probe_nsplit as usize
+        } else {
+            Self::gemv_splits(shape.out_tiles)
+        };
+        let params: [u32; 7] = [
+            shape.in_tiles as u32,
+            shape.out_tiles as u32,
+            shape.k,
+            (shape.words_per_tile() / 2) as u32,
+            0, // decode mode (probe is FC_MODE=0)
+            1, // aligned: probe builds with FC_ALIGNED=1
+            nsplit as u32,
+        ];
+        let need = nsplit * shape.out_tiles * TILE * 4;
+        let owned = if nsplit > 1 {
+            Some(self.new_f32_buffer(need / 4))
+        } else {
+            None
+        };
+        let dest: &Buffer = if nsplit == 1 {
+            y
+        } else {
+            owned.as_ref().expect("probe transient partial")
+        };
+        enc.set_compute_pipeline_state(&self.probe);
+        enc.set_buffer(0, Some(xh), 0);
+        enc.set_buffer(1, Some(trellis.buffer), trellis.byte_offset as u64);
+        enc.set_buffer(3, Some(dest), 0);
+        enc.set_bytes(4, 28, params.as_ptr() as *const _);
+        enc.set_bytes(5, 4, &probe_mode as *const u32 as *const _);
+        enc.set_bytes(6, 4, &probe_nsplit as *const u32 as *const _);
+        const WARPS: usize = 1;
         let groups = shape.out_tiles.div_ceil(WARPS) as u64;
         enc.dispatch_thread_groups(
             MTLSize::new(groups, nsplit as u64, 1),
