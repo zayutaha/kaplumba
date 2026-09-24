@@ -244,7 +244,70 @@ non-GEMV ~70 ms is the largest addressable block in the model. **T4/T6 are reins
 used a 16×16 shape (1 in-tile) where `sg>0` never enters the loop. New gate
 `gpu_gemv4_multisimdgroup_matches_spec` fails on the old code (`want -29.225, got 10.046`).
 
-## Follow-up, in priority order
+## 2026-09-24 — T6: the ladder on real data, uncacheable. The kernel is not the problem.
+
+Every earlier ladder run used a **synthetic 43 MB buffer**, which is SLC-resident, so it
+measured the kernel with memory essentially free. Rewritten to walk **60 distinct real
+`gate_proj` tensors = 2.60 GB aggregate** in one command buffer: the working set dwarfs any
+cache, so every read is a genuine DRAM read, with no flush and no subtraction to amplify
+noise (`bench_ladder_real_cold_slow`).
+
+```
+S1 walk        455.1 GB/s   1 word/lane
+S2 gather      347.6 GB/s   + the 4x scattered ld_word  (-24%)
+S3 extract     344.6 GB/s   + ulong assembly + 64-bit shift/mask   (free)
+S4 decode      346.1 GB/s   + exl3_decode_quad_const               (free)
+S5 full        333.0 GB/s   + simd_shuffle of xh + FMA             (free)
+S6 partial     337.9 GB/s   + the real 16-float f32 partial write  (free)
+```
+
+**The entire EXL3 decode — 4 scattered loads, 8 `ulong` window assemblies, 8 shift/mask
+extractions, 8 codebook decodes, 8 shuffles, 8 FMAs, and the f32 partial write — costs
+3% over a bare walk.** The only real per-tile cost is the 4x load amplification (24%).
+
+**And the production GEMV is running at 110 GB/s, not 337.** The mechanism is now clear and
+it is not the kernel:
+
+- 60 independent `gate` dispatches in one command buffer: 7.7 ms total, **0.128 ms each**.
+- A single `gate` GEMV in isolation: **0.392 ms**.
+- The same work is therefore **overlapping ~3x on this hardware** when the dispatches are
+  independent. A lone linear does not saturate the memory system; several in flight do.
+
+Our decode is a chain of 60 strictly dependent layers, so the only concurrency available
+is *within* a layer: `q/k/v` (attention branch) and `gate/up` (MLP branch) are independent
+of each other, which is roughly 3 streams — not 60. That is the whole 3x.
+
+This is consistent with, and finally explains, every earlier observation:
+- `gemv_splits(336) = 1` was 2.2x slower: 42 threadgroups cannot fill the machine.
+- `gemv4`'s 4-simdgroup split was slower: it trades threadgroups for threads-per-group and
+  does not add cross-dispatch concurrency.
+- `exl3_gemv_cvt` was slower: fewer transactions per tile, same concurrency.
+- The dense repack was slower: layout is free (S1 above).
+- lm_head hits 254 GB/s: 16384 out-tiles = enough threadgroups to saturate **on its own**.
+
+So the lever is **cross-dispatch concurrency, not anything inside the kernel.** Two ways
+to get it, both without touching quality or bytes:
+
+1. **More independent streams per layer.** `q/k/v` (33 MB) and `gate/up` (87 MB) are
+   independent. Today they are separate back-to-back dispatches in one encoder; whether
+   the driver actually overlaps them is now the question to answer. If it does not, issue
+   them on **concurrent command buffers** (`MTLCommandBufferDescriptor.concurrentCommands`),
+   which is the only Metal mechanism that makes independent work genuinely overlap.
+2. **Split the dependent chain by out-tile groups.** Not possible — activation dependency
+   is total.
+
+Budget if within-layer overlap is achieved: per layer 180 MB at the 3-stream aggregate
+(~200-250 GB/s) = 0.72-0.90 ms, x60 = 43-54 ms, + lm_head 4.2 ms = **47-58 ms = 17-21 t/s**.
+
+## Next, in order
+1. Determine whether consecutive independent dispatches in one encoder already overlap
+   (compare: qkv alone, gate+up alone, both in one CB, both on concurrent CBs).
+2. If not overlapping, switch the attention and MLP branches onto concurrent command
+   buffers. This is the change that should produce the 2-3x.
+3. Re-tune `gemv_splits` **with amortised timing** — the entire existing policy was tuned
+   against measurements dominated by the submit round trip, so its argmax is unverified.
+
+
 1. **Re-run every per-linear and per-phase bench with the submit cost amortised.** All
    historical per-linear GB/s figures in `spec/bandwidth-saturate`,
    `spec/pure-decode-273gb` and `spec/trellis-dense-repack` are inflated and must not be

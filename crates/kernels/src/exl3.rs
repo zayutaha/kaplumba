@@ -1042,7 +1042,7 @@ impl Exl3Gemv {
     /// Outputs are bit-identical to [`Self::encode_gemv`]
     /// (engine test `gpu_gemv_spec_matches_generic`).
     #[allow(clippy::too_many_arguments)]
-    fn encode_gemv_spec(
+    pub fn encode_gemv_spec(
         &self,
         enc: &ComputeCommandEncoderRef,
         xh: &Buffer,
@@ -1102,6 +1102,46 @@ impl Exl3Gemv {
             self.encode_gemv_reduce(enc, dest, y, nsplit, shape.out_tiles);
         }
         drop(owned);
+    }
+
+    /// spec/exl3-load-latency: `encode_gemv_spec` without the trailing
+    /// `gemv_reduce` pass, so `bench_reduce_dispatch_cost_slow` can price the
+    /// reduction against the same GEMV inside one command buffer. Bench-only;
+    /// production always reduces (the partials are meaningless otherwise).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_gemv_spec_noreduce(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        xh: &Buffer,
+        trellis: DeviceSpan<'_>,
+        pair: &Buffer,
+        shape: Exl3Shape,
+        mode: u32,
+        partial: &Buffer,
+        nsplit: usize,
+    ) {
+        let aligned = u32::from(trellis.byte_offset % 4 == 0);
+        let params: [u32; 7] = [
+            shape.in_tiles as u32,
+            shape.out_tiles as u32,
+            shape.k,
+            (shape.words_per_tile() / 2) as u32,
+            mode,
+            aligned,
+            nsplit as u32,
+        ];
+        let pipeline = self.gemv_spec_pipeline(shape.k, mode, aligned);
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(xh), 0);
+        enc.set_buffer(1, Some(trellis.buffer), trellis.byte_offset as u64);
+        enc.set_buffer(2, Some(pair), 0);
+        enc.set_buffer(3, Some(partial), 0);
+        enc.set_bytes(4, 28, params.as_ptr() as *const _);
+        const WARPS: usize = 1;
+        enc.dispatch_thread_groups(
+            MTLSize::new(shape.out_tiles as u64, nsplit as u64, 1),
+            MTLSize::new((32 * WARPS) as u64, 1, 1),
+        );
     }
 
     /// RT0 probe (spec/trellis-dense-repack): runs `exl3_gemv_probe` on one
