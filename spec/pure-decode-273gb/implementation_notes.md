@@ -200,3 +200,21 @@ RT1 = lossless CPU packer, blob level only. `crates/engine/src/repack3.rs` +
 Facts for RT2 kernel design: trellis shape axis0=in_tiles axis1=out_tiles; e.g. down_proj
 = [1344,336], gate/up=[336,1344], v_proj=[336,256], q/k/o=[336,336]. blob len =
 in*out*48*2. Native tile (it,ot) at (it*out+ot)*96 bytes.
+
+## 2026-09-24 — spec/trellis-dense-repack RT2 part a: W1 packer (repack3)
+Added `DenseLayout::Wide1` + `pack_wide1`/`unpack_wide1` to repack3.rs (uncommitted until
+this note + tasks.md land). W1 order = [otblock(4)][ot_local][it]: per (block, ot_local)
+the FULL it-range is one contiguous run (line), e.g. 336*96 = ~32 KB per out-tile line.
+Both Wide1 and Wide4 still require ot%4==0 (gate/down/v/q/k/o all divisible). W1 is
+exactly the Wide4/block-size-1 specialization (order [ot][it]) — no new machinery in the
+packer; the kernel difference is tile advance: W1 `tile += twords*2` per `it` vs W4 slab
+`tile += out_tiles*twords*2`.
+BUG FOUND IN MY OWN TEST (would have shipped a wrong check): the W1 real-artifact verbatim
+assert must NOT compare dense[0..it*96] to blob[0..it*96] — in the native blob, tile
+(it,0) is strided at (it*out_tiles)*96 bytes, so blob[0..run] is NOT ot=0's it-column.
+Fixed to per-tile comparison dense[i*tile] vs blob[(i*ot+0)*tile]. Lesson: when asserting
+"line verbatim" against a different-layout blob, always recompute the source offset.
+wide1 tests (3): synthetic shapes incl (2,4,1), rejects_bad_length, real artifacts
+(v/down/gate/o). repack3 suite green: 7 passed / 0 failed.
+Next: exl3_gemv_dense3_wide1 kernel (== exl3_gemv_spec with linear tile advance), then
+wide4 kernel, then fast GPU gates gpu_dense3_{wide1,wide4}_matches_word.

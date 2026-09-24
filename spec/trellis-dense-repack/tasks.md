@@ -54,7 +54,7 @@ Order matters; commit after every task (AGENTS §4). Gated benchmarks run with
   and **W4** (`[otblock][it][ot 0..4]`, 4-line interleave; packer ships in RT1).
 - **Status**: in progress — **part a done** (W1 packer, see below); part b (wide1/wide4
   kernels + gates) pending. See `implementation_notes` for build/measure details at each step.
-- **Part a (commit `…` — filled next commit)**: `pack_wide1`/`unpack_wide1` =
+- **Part a (commit `df25c3a`)**: `pack_wide1`/`unpack_wide1` =
   `[otblock(4)][ot_local][it]` per-line contiguous runs (per out-tile line ~32 KB);
   W1 == Wide4 with block size 1, no new packer machinery. 3 tests (synthetic incl
   (2,4,1), rejects_bad_length, real artifacts round-trip + per-tile verbatim).
