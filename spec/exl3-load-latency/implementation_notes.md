@@ -120,15 +120,72 @@ lm_head ~4.6 ms = ~94 ms of GEMV against a measured 117 ms total. So GEMV is sti
 decode, but its limit is the bandwidth available on short-walk small tensors, not
 arithmetic.
 
-## Follow-up recommendation (for the next spec, not started here)
-1. Sweep `nsplit` 16/32 for out_tiles 256/336/512 and re-tune `gemv_splits`; this is the
-   only lever with a measured 2–3x precedent still unexhausted. Bit-exactness holds because
-   larger nsplit changes the f32 split summation order, so it must be gated exactly like the
-   existing `gpu_gemv_post_matches_unfused` route-A/boundary precedent.
-2. Re-baseline every per-linear GB/s figure using the decoder arena path instead of
+## 2026-09-24 — T5 (added): the read ceiling is ~250 GB/s, and the earlier 210 was wrong
+
+`bench_read_ceiling_slow` (new). The P0 `stream_sum_contig` control wrote one u32 per
+thread — 134 MB of stores while reading 512 MB — so its "210 GB/s" was paying for write
+traffic it never counted. `bis_read_bw` keeps every lane's accumulator live but reduces via
+a per-warp atomic, so the only DRAM traffic is the read.
+
+| working set | warm ms | warm GB/s | cold GB/s |
+|---|---|---|---|
+| 1 MB   | 0.160 |   6.2 |   5.8 |
+| 8 MB   | 0.207 |  38.7 |  35.1 |
+| 43 MB  | 0.437 |  98.3 |  87.3 |
+| 86 MB  | 0.517 | 166.2 | 160.5 |
+| 201 MB | 0.964 | 208.4 | 197.4 |
+| 512 MB | 2.181 | 234.8 | 225.8 |
+| 1024 MB| 4.179 | 245.0 | 239.7 |
+
+**A 1 MB read takes 0.160 ms.** That is physically impossible as memory time (it would be
+6.2 GB/s), so it is a **fixed ~0.16 ms cost per timed dispatch** in this harness — command
+buffer create + commit + `wait_until_completed` round trip. Subtracting it:
+
+- **true read ceiling: ~250–255 GB/s** (92–93% of the 273 GB/s nominal bus). This is
+  consistent with the user's own MLX data point: MLX 4-bit, 15.1 GB at 16–17 t/s implies
+  **249 GB/s** on this same chip.
+- fits `t ~= 0.16 ms fixed + ~0.10 ms DRAM ramp + bytes / 250 GB/s`.
+
+**Two corrections to earlier claims in this file and in conversation:**
+
+1. The "210 GB/s ceiling / 17.8 t/s max / 20 t/s unreachable" conclusion is **withdrawn**.
+   The real ceiling is ~250 GB/s.
+2. The suggestion that moving to 4-bit would reach 20 t/s is **wrong and backwards**. 4-bit
+   *increases* the bytes: the 10.776 GB of k=3 linears becomes ~14.37 GB, so ~15.4 GB/token
+   total, i.e. ~14.9 t/s at 250 GB/s — **worse** than k=3. In a bandwidth-bound regime fewer
+   bits is strictly better. (MLX's 4-bit advantage is that it sustains 249 GB/s, not that it
+   uses 4 bits.)
+
+**Where that leaves the target:**
+- 20.0 t/s needs 236.7 GB/s = **95% of the measured ceiling with zero allowance for any
+  non-GEMV work**. Not reachable in practice.
+- 19.5 t/s needs 242.6 GB/s = 97% of ceiling. Above the warm 1 GB figure's margin.
+- 18.0 t/s needs 225 GB/s = 90% of ceiling. Plausible.
+- 16.0 t/s needs 199 GB/s = 80% of ceiling. Comfortable.
+
+**And where the time actually goes.** GEMV, priced from the S5 column, is ~1.49 ms/layer
+x 60 + 4.6 ms lm_head ~= 94 ms of the measured 117 ms. That leaves **~23 ms of non-GEMV
+work** (had_in, had_out, rms, rope, attention, gelu — ~24 dispatches per layer, ~1440 per
+token). GEMV itself is already within ~2x of the ceiling and its remaining gap is the
+untested nsplit 16/32. So the two levers are: (a) nsplit sweep, (b) the ~1440 small
+dispatches per token.
+
+**This reverses the earlier T4/T6 cancellation.** Those tasks (fuse rms+had_in, fuse
+qkv_prep) were cancelled on 2026-09-24 because the then-current diagnosis said dispatch
+overhead was not dominant. With GEMV priced at ~94 of 117 ms, the non-GEMV ~23 ms is the
+largest single addressable block left. T4/T6 deserve revival.
+
+## Follow-up recommendation (supersedes the one above)
+1. **nsplit 16/32 sweep** for out_tiles 256/336/512, re-tune `gemv_splits`, gated for
+   bit-exactness (larger splits change f32 split summation order).
+2. **Revive the cancelled T4/T6 fusions** (rms+had_in, qkv_prep) and re-run the
+   `decode_throughput_slow` split to confirm where the ~23 ms actually sits before
+   committing effort.
+3. Re-baseline the acceptance bar to **18 t/s** as the target and 16 t/s as the gated floor,
+   with the 250 GB/s ceiling recorded as the physical justification.
+4. Re-baseline every per-linear GB/s figure using the decoder arena instead of
    `with_scratch`, so the specs stop quoting numbers inflated by buffer allocation.
-3. Re-derive the throughput bar: at the S5-observed rates the model would need ~236 GB/s
-   sustained, still above the 210 GB/s measured linear-read figure.
+
 
 - No `build.rs` in `crates/kernels`. MSL is `include_str!`'d and compiled at **runtime** by
   `new_library_with_source`, which compiles the *entire* file. `cargo build` cannot catch a

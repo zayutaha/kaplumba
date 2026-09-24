@@ -1180,6 +1180,26 @@ kernel void bis_full(device const half *xh [[buffer(0)]],
     BIS_SINK(as_type<uint>(accA) ^ as_type<uint>(accB))
 }
 
+// Pure read-bandwidth ceiling. The P0 `stream_sum_contig` control wrote one u32
+// per thread — 134 MB of stores while reading 512 MB — so its "210 GB/s" figure
+// was paying for write traffic it was not counting. This kernel keeps every
+// lane's accumulator live but reduces through a per-warp atomic instead, so
+// the only DRAM traffic is the read itself.
+kernel void bis_read_bw(device const uint *buf [[buffer(0)]],
+                        device atomic_uint *out [[buffer(1)]],
+                        constant uint *p [[buffer(2)]],   // [nwords, nthreads]
+                        uint gid [[thread_position_in_grid]]) {
+    uint nwords = p[0];
+    uint nthreads = p[1];
+    uint acc = 0u;
+    for (uint i = gid; i < nwords; i += nthreads) {
+        acc += buf[i];
+    }
+    if ((gid & 31u) == 0u) {
+        atomic_fetch_add_explicit(out, acc, memory_order_relaxed);
+    }
+}
+
 // Evicts L2/SLC by writing a buffer larger than any cache on the part.
 kernel void bis_flush(device uint *b [[buffer(0)]],
                       constant uint &nwords [[buffer(1)]],
@@ -2707,6 +2727,133 @@ kernel void bis_flush(device uint *b [[buffer(0)]],
                 ));
             }
             eprintln!("{row}");
+        }
+    }
+
+    /// spec/exl3-load-latency: the true read-bandwidth ceiling.
+    ///
+    /// Re-measures the P0 contig control without its 134 MB of output stores, and
+    /// sweeps the working set so SLC residency is visible. This is the number the
+    /// throughput target has to be judged against: 20.0 t/s at 11.833 GB/token
+    /// needs 236.7 GB/s sustained, so the ceiling decides whether the target is
+    /// physically reachable at k=3.
+    #[test]
+    #[ignore]
+    fn bench_read_ceiling_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(c) = ctx() else { return };
+        let device = c.device();
+        use std::time::Instant;
+
+        let opts = metal::CompileOptions::new();
+        let lib = device
+            .new_library_with_source(P1_BISECT_MSL, &opts)
+            .expect("compile P1_BISECT_MSL");
+        let f = lib.get_function("bis_read_bw", None).expect("bis_read_bw");
+        let pipe = device
+            .new_compute_pipeline_state_with_function(&f)
+            .expect("pipeline");
+        let ff = lib.get_function("bis_flush", None).expect("bis_flush");
+        let flush_pipe = device
+            .new_compute_pipeline_state_with_function(&ff)
+            .expect("flush pipeline");
+
+        const FLUSH_WORDS: u32 = 64 * 1024 * 1024;
+        let flush_buf = device.new_buffer(
+            (FLUSH_WORDS as u64) * 4,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let flush_n = device.new_buffer_with_data(
+            &FLUSH_WORDS.to_le_bytes() as *const u8 as *const _,
+            4,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let do_flush = || {
+            let cb = c.queue().new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&flush_pipe);
+            enc.set_buffer(0, Some(&flush_buf), 0);
+            enc.set_buffer(1, Some(&flush_n), 0);
+            enc.dispatch_threads(
+                metal::MTLSize::new((FLUSH_WORDS / 8) as u64, 1, 1),
+                metal::MTLSize::new(64, 1, 1),
+            );
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+        };
+
+        eprintln!("== true read ceiling (no output stores) ==");
+        for mb in [1usize, 2, 4, 8, 16, 43, 86, 201, 512, 1024] {
+            let nwords = (mb * 1024 * 1024 / 4) as u32;
+            let buf = device.new_buffer(
+                (nwords as u64) * 4,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            {
+                let ptr = buf.contents() as *mut u32;
+                for i in 0..nwords as usize {
+                    unsafe { *ptr.add(i) = (i as u32).wrapping_mul(2654435761); }
+                }
+            }
+            let out = device.new_buffer(8, metal::MTLResourceOptions::StorageModeShared);
+            // Enough threads to saturate, few enough that the atomic reduce is free.
+            let nthreads = (nwords / 8).max(1);
+            let pv: Vec<u8> = [nwords, nthreads]
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect();
+            let pb = device.new_buffer_with_data(
+                pv.as_ptr() as *const _,
+                pv.len() as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let run = || {
+                let cb = c.queue().new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pipe);
+                enc.set_buffer(0, Some(&buf), 0);
+                enc.set_buffer(1, Some(&out), 0);
+                enc.set_buffer(2, Some(&pb), 0);
+                enc.dispatch_threads(
+                    metal::MTLSize::new(nthreads as u64, 1, 1),
+                    metal::MTLSize::new(64, 1, 1),
+                );
+                enc.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+            };
+            run();
+            let sink = unsafe { std::ptr::read_unaligned(out.contents() as *const u64) };
+            assert_ne!(sink, 0, "read nothing at {mb} MB");
+
+            const REPS: usize = 12;
+            let mut warm = Vec::with_capacity(REPS);
+            for _ in 0..REPS {
+                let t = Instant::now();
+                run();
+                warm.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            warm.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let mut cold = Vec::with_capacity(3);
+            for _ in 0..3 {
+                do_flush();
+                let t = Instant::now();
+                run();
+                cold.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            cold.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let gb = (mb as f64) / 1000.0;
+            eprintln!(
+                "{mb:5} MB  warm {:7.3} ms -> {:6.1} GB/s   cold {:7.3} ms -> {:6.1} GB/s",
+                warm[0],
+                gb / (warm[0] / 1e3),
+                cold[0],
+                gb / (cold[0] / 1e3),
+            );
         }
     }
 
