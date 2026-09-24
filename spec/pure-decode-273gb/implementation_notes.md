@@ -178,3 +178,25 @@ the device and hang wait_until_completed for minutes — probes on aligned tenso
 (2) an orphaned cargo/rustc from a killed timed-out run held target/.cargo-lock and made
 subsequent `cargo test` appear to hang with no output — check `pgrep cargo` + remove
 stale `.cargo-lock` when a cargo test prints nothing.
+
+## 2026-09-24 — spec/trellis-dense-repack RT1 (commit e574e19)
+RT1 = lossless CPU packer, blob level only. `crates/engine/src/repack3.rs` +
+`pub mod repack3;` in lib.rs.
+- SAFETENSORS stores trellis as shape [in_tiles, out_tiles, 48], dtype I16 (48 u16
+  words/tile = k=3). No `.weight` tensor needed to derive geometry; there is no
+  `X.weight` for these linears at all (packed weights only: `X.trellis`, `X.suh`,
+  `X.svh`, `X.mcg`).
+- `DenseLayout::Wide4`: order [otblock(4)][it][ot_local]; each 4-ot × in-range slab is
+  one contiguous span => the kernel walks slabs linearly (target mechanism from RT0).
+- pack_wide4/unpack_wide4 are pure byte permutations; generic over k (tile_u16 from
+  geometry). Errors: OutTilesNotDivisible (ot%4!=0), BadLength.
+- Tests: 4 synthetic shapes (incl. degenerate 1-u16 tiles, 2- and 3-axis) + real
+  full-tensor round-trip on layer 0 v/down, layer 29 gate, layer 59 o (spot layers).
+  Corner tiles implicit in full round-trip. Suite: 128 pass / 12 ignored.
+- Scope changes vs tasks.md RT1 draft (documented in tasks.md): alignment 0..7 deferred
+  to RT2 GPU gates (not a packer property); dense3 meta/side-car files + loader variant
+  scan + k!=3 rejection deferred to RT5 (winner layout known after RT4 A/B). Don't build
+  file plumbing for a layout that may be discarded.
+Facts for RT2 kernel design: trellis shape axis0=in_tiles axis1=out_tiles; e.g. down_proj
+= [1344,336], gate/up=[336,1344], v_proj=[336,256], q/k/o=[336,336]. blob len =
+in*out*48*2. Native tile (it,ot) at (it*out+ot)*96 bytes.
