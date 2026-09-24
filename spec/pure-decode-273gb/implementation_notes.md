@@ -81,3 +81,62 @@ results:
   - Verified 20-step chat prompt in `trace_chat_prompt_steps_slow` bit-for-bit with reference, predicting token 818 ("The") on step 19.
   - Measured decode throughput: 140.9 ms/token (7.10 t/s, 79.5 GB/s bandwidth).
   - Profile analysis: 1.28 ms/layer (76.8 ms/token — 54.5% of total decode time) is spent purely in 8 standalone `had_in` and `had_out` dispatches per layer (each taking ~0.16 ms). Fusing these into GEMV epilogue and producer prologues will recover ~76.8 ms and double throughput toward 20 t/s.
+
+## P6 LUT-decode experiment (2026-09-24) — ABANDONED, measured negative
+
+**Hypothesis**: the per-codeword integer mix (mode×cw mul → xor → half2 add, ~5-6
+integer ALU ops / 16-bit window) could be replaced by one 2-byte gather from a
+host-precomputed 65536×half LUT (128 KiB, L2-resident). Mix is k-independent,
+mode-only, so `decode_table` on the host (exact same integer mix + one IEEE
+binary16 add) is bit-identical by construction.
+
+**Implementation (MSL + Rust + engine, then reverted — nothing committed)**:
+- `exl3.metal`: `constant bool FC_LUT [[function_constant(3)]]`, helpers
+  `exl3_decode_sel(cw, mode, cb)` / `exl3_decode_sel_const(cw, cb)` folding on
+  FC_LUT (ternary folds at pipeline build), `device const half *codebook`
+  buffer param appended to all 8 decode kernels (gemv@5, gemv4@5, spec@5,
+  fused2@6, fused3@7, post@6, post_fused2@7, post_fused3@8). Because the
+  generic kernels (exl3_gemv/_fused2/_fused3/_gemv4) now reference a function
+  constant, `get_function(name, None)` → "function cannot be used to build a
+  pipeline state"; all four generic pipelines must be built via
+  `constantValues` with defaults (FC_ALIGNED=false, FC_MODE=0, FC_K=0,
+  FC_LUT=false).
+- `exl3.rs`: `decode_table(mode) -> Vec<f16>` (65536 entries), cached
+  `codebook_buffer(mode)` (single 128 KiB shared buffer per mode), pipeline
+  caches keyed (+bool lut), `set_decode_lut(bool)`.
+- Engine: `MetalLinear::set_decode_lut`, fast bit-exact gate
+  `gpu_decode_lut_matches_alu` (proved bit-identical across k=1..8, both
+  modes, both alignments, and the full rows=1 encode / fused2 / fused3 paths),
+  gated A/B `bench_decode_lut_slow`.
+
+**Measured result (bench_decode_lut_slow, release, real artifact, min-of-12)**:
+
+| linear | alu (ms) | lut (ms) | delta |
+|--------|---------|---------|-------|
+| down 21504x5376 k=3 | 0.845 | 1.350 | +59.7% |
+| o 8192x5376 k=3 | 0.325 | 0.627 | +92.9% |
+| lm 5376x262144 k=6 | 4.614 | 14.369 | +211.4% |
+| gate+up (fused2) | 0.951 | 2.520 | +165.0% |
+| qkv (fused3) | 0.488 | 1.118 | +129.0% |
+
+LUT loses ~everywhere by 1.6-3.1×. The device-memory gathers (4/tile) thrash
+L1/L2 (each lane pulls a random 2-byte value from a 128 KiB region; consecutive
+k-splits sweep disjoint windows) and cost far more than the ~5 integer ALU ops
+they replace — M4 Pro has abundant integer ALU throughput but a single shared
+L2. Absolute times above are also inflated vs production decode by artifact
+page-faults under swap pressure (used=3.0/4.0 GiB); RELATIVE result is valid.
+LUT cannot fit `constant` address space (needs 128 KiB, constant space is
+bounded at 64 KiB total per entry point), so no tighter variant exists.
+
+**Decision**: abandon the LUT. Outputs would already be bit-identical (gate
+proved), so flipping would have been safe — but it's ~2× SLOWER. This frees the
+decode-stage ALU budget as an anti-knowledge: M4's integer units are not the
+bottleneck at ~8.6 t/s; memory load/store path is. Next lever priorities
+(revisited): (1) reduce per-layer dispatch/overhead further and attack
+memory-side stalls (e.g. read-once weight streaming, larger in-threadgroup
+working sets), (2) post-P5 nsplit re-sweep for down/o/k/v to remove
+`gemv_reduce_post` round-trips, (3) re-check LM head (k=6, 5376→262144) split
+policy — it dominates at ~5.9 ms/token.
+Reverted via `git checkout --` the three touched files (exl3.metal, exl3.rs,
+metal_linear.rs). HEAD remains `5e4e830` (P5). Fast suites green afterwards
+(engine 124 + kernels 21).
