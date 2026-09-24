@@ -337,10 +337,11 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
                 uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
                 uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
 
-                accA += x00 * exl3_decode_f(cw0_0, p.mode) + x01 * exl3_decode_f(cw0_1, p.mode);
-                accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
-                accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
-                accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
+                float4 w0 = exl3_decode_quad(uint4(cw0_0, cw0_1, cw0_2, cw0_3), p.mode);
+                float4 w1 = exl3_decode_quad(uint4(cw1_0, cw1_1, cw1_2, cw1_3), p.mode);
+                float4 x0 = float4(x00, x01, x02, x03);
+                accA += dot(x0, w0);
+                accB += dot(x0, w1);
             }
             tile += tstride;
             float x10 = float(simd_shuffle(x_lane, ushort(16u + r0)));
@@ -366,10 +367,11 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
                 uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
                 uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
 
-                accA += x10 * exl3_decode_f(cw0_0, p.mode) + x11 * exl3_decode_f(cw0_1, p.mode);
-                accA += x12 * exl3_decode_f(cw0_2, p.mode) + x13 * exl3_decode_f(cw0_3, p.mode);
-                accB += x10 * exl3_decode_f(cw1_0, p.mode) + x11 * exl3_decode_f(cw1_1, p.mode);
-                accB += x12 * exl3_decode_f(cw1_2, p.mode) + x13 * exl3_decode_f(cw1_3, p.mode);
+                float4 w0 = exl3_decode_quad(uint4(cw0_0, cw0_1, cw0_2, cw0_3), p.mode);
+                float4 w1 = exl3_decode_quad(uint4(cw1_0, cw1_1, cw1_2, cw1_3), p.mode);
+                float4 x1 = float4(x10, x11, x12, x13);
+                accA += dot(x1, w0);
+                accB += dot(x1, w1);
             }
             tile += tstride;
         }
@@ -398,10 +400,11 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
             uint cw1_1 = uint(m1 >> (s1 + 2u * p.k)) & 0xFFFFu;
             uint cw1_0 = uint(m1 >> (s1 + 3u * p.k)) & 0xFFFFu;
 
-            accA += x00 * exl3_decode_f(cw0_0, p.mode) + x01 * exl3_decode_f(cw0_1, p.mode);
-            accA += x02 * exl3_decode_f(cw0_2, p.mode) + x03 * exl3_decode_f(cw0_3, p.mode);
-            accB += x00 * exl3_decode_f(cw1_0, p.mode) + x01 * exl3_decode_f(cw1_1, p.mode);
-            accB += x02 * exl3_decode_f(cw1_2, p.mode) + x03 * exl3_decode_f(cw1_3, p.mode);
+            float4 w0 = exl3_decode_quad(uint4(cw0_0, cw0_1, cw0_2, cw0_3), p.mode);
+            float4 w1 = exl3_decode_quad(uint4(cw1_0, cw1_1, cw1_2, cw1_3), p.mode);
+            float4 x0 = float4(x00, x01, x02, x03);
+            accA += dot(x0, w0);
+            accB += dot(x0, w1);
             tile += tstride;
         }
     } else {
