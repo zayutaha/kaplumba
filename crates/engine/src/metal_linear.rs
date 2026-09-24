@@ -1200,6 +1200,32 @@ kernel void bis_read_bw(device const uint *buf [[buffer(0)]],
     }
 }
 
+// Two independent streams in ONE dispatch: the first half of the grid walks
+// buffer `a`, the rest walks `b`. Lets us ask whether reading two independent
+// weight sets concurrently recovers the large-transfer bandwidth, or whether
+// the ramp is a per-transfer property that only transfer size can fix.
+kernel void bis_read2(device const uint *a [[buffer(0)]],
+                      device const uint *b [[buffer(1)]],
+                      device atomic_uint *out [[buffer(2)]],
+                      constant uint *p [[buffer(3)]],  // [nwords_a, nwords_b, nthreads]
+                      uint gid [[thread_position_in_grid]]) {
+    uint na = p[0];
+    uint nb = p[1];
+    uint nt = p[2];
+    uint nhalf = nt / 2u;
+    uint rest = nt - nhalf;
+    uint acc = 0u;
+    if (gid < nhalf) {
+        for (uint i = gid; i < na; i += nhalf) { acc += a[i]; }
+    } else {
+        uint j = gid - nhalf;
+        for (uint i = j; i < nb; i += rest) { acc += b[i]; }
+    }
+    if ((gid & 31u) == 0u) {
+        atomic_fetch_add_explicit(out, acc, memory_order_relaxed);
+    }
+}
+
 // Evicts L2/SLC by writing a buffer larger than any cache on the part.
 kernel void bis_flush(device uint *b [[buffer(0)]],
                       constant uint &nwords [[buffer(1)]],
@@ -2778,6 +2804,160 @@ kernel void bis_flush(device uint *b [[buffer(0)]],
             }
             eprintln!("{row}");
         }
+    }
+
+    /// spec/exl3-load-latency: does overlapping two independent weight reads
+    /// recover the large-transfer bandwidth?
+    ///
+    /// The read-ceiling sweep shows bandwidth rising with transfer size
+    /// (43 MB -> ~155 GB/s, 201 MB -> ~250 GB/s). If that ramp is a property of
+    /// the *transfer* then only a bigger transfer helps and overlapping is
+    /// pointless. If it is a property of the memory pipeline *filling up*, then
+    /// keeping two independent streams in flight should reach the large-transfer
+    /// rate with no extra bytes.
+    ///
+    /// Per decode layer the attention branch (q,k,v,o ~ 44 MB) and the MLP
+    /// branch (gate,up,down ~ 130 MB) are independent of each other, so this is
+    /// directly actionable. Three cases at equal total bytes:
+    ///   one   = single 174 MB buffer, one dispatch
+    ///   two-s = 44 MB + 130 MB, two dispatches, serial in one command buffer
+    ///   two-c = 44 MB + 130 MB, both in ONE dispatch (true concurrency)
+    #[test]
+    #[ignore]
+    fn bench_overlap_ceiling_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(c) = ctx() else { return };
+        let device = c.device();
+        use std::time::Instant;
+
+        let opts = metal::CompileOptions::new();
+        let lib = device
+            .new_library_with_source(P1_BISECT_MSL, &opts)
+            .expect("compile P1_BISECT_MSL");
+        let mk = |name: &str| {
+            let f = lib.get_function(name, None).unwrap_or_else(|_| panic!("{name}"));
+            device
+                .new_compute_pipeline_state_with_function(&f)
+                .unwrap_or_else(|e| panic!("{name}: {e}"))
+        };
+        let read1 = mk("bis_read_bw");
+        let read2 = mk("bis_read2");
+
+        const MB: usize = 1024 * 1024;
+        let mkbuf = |mb: usize| {
+            let nwords = (mb * MB / 4) as u32;
+            let b = device.new_buffer(
+                (nwords as u64) * 4,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let ptr = b.contents() as *mut u32;
+            for i in 0..nwords as usize {
+                unsafe { *ptr.add(i) = (i as u32).wrapping_mul(2654435761); }
+            }
+            (b, nwords)
+        };
+        let pbuf = |v: &[u32]| {
+            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            device.new_buffer_with_data(
+                bytes.as_ptr() as *const _,
+                bytes.len() as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+        };
+
+        // Per-layer split: attention branch vs MLP branch.
+        let (a_mb, b_mb) = (44usize, 130usize);
+        let (a_buf, a_words) = mkbuf(a_mb);
+        let (b_buf, b_words) = mkbuf(b_mb);
+        let (whole_buf, whole_words) = mkbuf(a_mb + b_mb);
+        let out = device.new_buffer(8, metal::MTLResourceOptions::StorageModeShared);
+        let total_mb = a_mb + b_mb;
+
+        let nt1 = (whole_words / 8).max(1);
+        let p_whole = pbuf(&[whole_words, nt1]);
+        let nt_a = (a_words / 8).max(1);
+        let p_a = pbuf(&[a_words, nt_a]);
+        let nt_b = (b_words / 8).max(1);
+        let p_b = pbuf(&[b_words, nt_b]);
+        let nt2 = (a_words / 16 + b_words / 16).max(2);
+        let p_2 = pbuf(&[a_words, b_words, nt2]);
+
+        let run_one = || {
+            let cb = c.queue().new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&read1);
+            enc.set_buffer(0, Some(&whole_buf), 0);
+            enc.set_buffer(1, Some(&out), 0);
+            enc.set_buffer(2, Some(&p_whole), 0);
+            enc.dispatch_threads(
+                metal::MTLSize::new(nt1 as u64, 1, 1),
+                metal::MTLSize::new(64, 1, 1),
+            );
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+        };
+        let run_serial = || {
+            let cb = c.queue().new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            for (buf, p, nt) in [(&a_buf, &p_a, nt_a), (&b_buf, &p_b, nt_b)] {
+                enc.set_compute_pipeline_state(&read1);
+                enc.set_buffer(0, Some(buf), 0);
+                enc.set_buffer(1, Some(&out), 0);
+                enc.set_buffer(2, Some(p), 0);
+                enc.dispatch_threads(
+                    metal::MTLSize::new(nt as u64, 1, 1),
+                    metal::MTLSize::new(64, 1, 1),
+                );
+            }
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+        };
+        let run_concurrent = || {
+            let cb = c.queue().new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&read2);
+            enc.set_buffer(0, Some(&a_buf), 0);
+            enc.set_buffer(1, Some(&b_buf), 0);
+            enc.set_buffer(2, Some(&out), 0);
+            enc.set_buffer(3, Some(&p_2), 0);
+            enc.dispatch_threads(
+                metal::MTLSize::new(nt2 as u64, 1, 1),
+                metal::MTLSize::new(64, 1, 1),
+            );
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+        };
+
+        let time = |f: &dyn Fn()| {
+            f();
+            let mut v = Vec::with_capacity(12);
+            for _ in 0..12 {
+                let t = Instant::now();
+                f();
+                v.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[0]
+        };
+        let gb = (total_mb as f64) / 1000.0;
+        eprintln!("== overlap probe: {a_mb} MB + {b_mb} MB = {total_mb} MB ==");
+        let t1 = time(&run_one);
+        let ts = time(&run_serial);
+        let tc = time(&run_concurrent);
+        eprintln!("one   174MB single dispatch : {t1:6.3} ms -> {:6.1} GB/s", gb / (t1 / 1e3));
+        eprintln!("two-s 44+130 serial         : {ts:6.3} ms -> {:6.1} GB/s", gb / (ts / 1e3));
+        eprintln!("two-c 44+130 one dispatch   : {tc:6.3} ms -> {:6.1} GB/s", gb / (tc / 1e3));
+        eprintln!(
+            "overlap gain vs serial: {:.2}x   vs single big: {:.2}x",
+            ts / tc,
+            t1 / tc
+        );
     }
 
     /// spec/exl3-load-latency: the true read-bandwidth ceiling.
