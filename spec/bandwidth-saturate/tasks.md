@@ -15,22 +15,23 @@
   - **Intent**: Change `gemv_splits(336)` from `8` to `1` so `o_proj` and `down_proj` execute direct `exl3_gemv_post` in a single dispatch instead of K-splits with `gemv_reduce_post` and partials buffer.
   - **Testing**: `gpu_gemv_post_matches_unfused` and `gemma4::tests::trace_chat_prompt_steps_slow` to verify token 818 exact match. All 131 tests pass.
 
-- [ ] **T4: Fused RMSNorm + Hadamard Prologue (`exl3_rms_had_in_batched`)**
+- [~] **T4: Fused RMSNorm + Hadamard Prologue (`exl3_rms_had_in_batched`)** — **CANCELLED 2026-09-24**
   - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`, `crates/engine/src/metal_linear.rs`, `crates/engine/src/gpu_decode.rs`
-  - **Intent**: Fuse `input_layernorm` and `pre_feedforward_layernorm` directly into `exl3_had_in_batched`, writing `xh_stack` directly without intermediate `xn` DRAM buffer.
-  - **Testing**: Unit test verifying `rms_had_in_batched(x, ln, suh)` produces bit-identical result to `had_in_batched(rms(x, ln), suh)`.
+  - **Was**: Fuse `input_layernorm` and `pre_feedforward_layernorm` into `exl3_had_in_batched`, writing `xh_stack` directly without the intermediate `xn` DRAM buffer.
+  - **Why cancelled**: was implemented (435 additive lines, `gpu_rms_had_in_batched_matches_separate_passes` green) but never wired into `gpu_decode.rs` nor benchmarked. The control experiment in `implementation_notes.md` shows the dominant term is the `exl3_gemv_spec` inner loop, not dispatch count / activation round-trips, so this work targets a non-dominant cost. Reverted (tree back to `4b3708f`). Can be revived if the T4 stage-delta table in `spec/exl3-load-latency` ever implicates dispatch overhead.
 
 - [x] **T5: Fused GELU + Hadamard Prologue (`exl3_gelu_had_in`)**
   - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`, `crates/engine/src/metal_linear.rs`, `crates/engine/src/gpu_decode.rs`
   - **Intent**: Fuse `gelu_mul(gate, up)` into `had_in` prologue for `down_proj`, eliminating standalone `gelu_mul` dispatch and `gu` buffer.
   - **Testing**: `gpu_gelu_had_in_matches_separate_passes` passes 100% bit-exact; `trace_chat_prompt_steps_slow` predicts golden token 818; decode throughput reaches 8.53 t/s (117.3 ms).
 
-- [ ] **T6: Fused Attention Post-Processing (`exl3_qkv_prep`)**
+- [~] **T6: Fused Attention Post-Processing (`exl3_qkv_prep`)** — **DEFERRED 2026-09-24**
   - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`, `crates/engine/src/metal_linear.rs`, `crates/engine/src/gpu_decode.rs`
-  - **Intent**: Fuse Q/K RMS norm, RoPE rotation, and V cache write into unified `qkv_prep` kernel, cutting 5 dispatches per layer.
-  - **Testing**: Compare KV cache and Q output against separate RMS/RoPE/Copy passes.
+  - **Was**: Fuse Q/K RMS norm, RoPE rotation, and V cache write into a unified `qkv_prep` kernel, cutting 5 dispatches per layer.
+  - **Why deferred**: same reasoning as T4 — activation/dispatch overhead is not the dominant term per the `bench_stream_bw_slow` control. Revisit only if the stage-delta table implicates it.
 
-- [ ] **T7: End-to-End Throughput Verification (≥ 20.0 t/s)**
+- [ ] **T7: End-to-End Throughput Verification (≥ 20.0 t/s)** — **BAR KNOWN UNREACHABLE AT k=3 (2026-09-24)**
   - **Files**: `crates/engine/src/gemma4.rs`
-  - **Intent**: Run `decode_throughput_slow` and assert forward decode throughput ≥ 20.0 t/s (≤ 50.0 ms/token).
-  - **Testing**: Verify `trace_chat_prompt_steps_slow` predicts token 818 ("The") bit-identically.
+  - **Was**: Run `decode_throughput_slow` and assert forward decode throughput ≥ 20.0 t/s (≤ 50.0 ms/token).
+  - **Status**: 20.0 t/s needs 236.7 GB/s sustained and 19.5 t/s needs 242.6 GB/s, but a pure linear read on this M4 Pro measured **210 GB/s** (`bench_stream_bw_slow`). At 11.833 GB/token that caps k=3 decode near **17.8 t/s**. The assertion therefore stays **unflipped** and is expected to stay red. Bar kept by explicit user decision.
+  - **Testing**: `trace_chat_prompt_steps_slow` must still predict token 818 ("The") bit-identically at every commit.

@@ -36,4 +36,50 @@
    - Verified 100% bit-exact in `gpu_gelu_had_in_matches_separate_passes` and `trace_chat_prompt_steps_slow` (golden token 818).
    - Latency dropped to **117.3 ms/token (8.53 t/s, 95.5 GB/s)**.
 
+## 2026-09-24 — RETRACTION: the memory-pattern premise is falsified
+
+The control experiment `bench_stream_bw_slow`
+(`crates/engine/src/metal_linear.rs`) had been written but never run. Run on the M4 Pro
+over a 512 MB synthetic u32 buffer:
+
+```
+P0 contig 512MB: min 2.558 med 2.625 ms -> 210 GB/s
+P0 strided nsplit=1: min 0.949 med 1.006 ms (192 MB) -> 212 GB/s
+P0 strided nsplit=2: min 0.624 med 0.664 ms (192 MB) -> 323 GB/s
+P0 strided nsplit=4: min 0.544 med 0.561 ms (192 MB) -> 370 GB/s
+P0 strided nsplit=8: min 0.548 med 0.560 ms (192 MB) -> 368 GB/s
+```
+
+`stream_sum_strided` replicates the `exl3_gemv` grid (32 lanes/TG, tile stride
+`out_tiles * twords` words) and walks the trellis with **no arithmetic at all**.
+
+**Two earlier conclusions in this file are wrong and are withdrawn:**
+
+- **WITHDRAWN — "the ~21 KB tile stride caps the bus at ~68 GB/s"** (the premise inherited
+  from `spec/trellis-dense-repack`, restated as the "336 straws" model in the ASCII
+  explanation). The strided walk is *not slower than a fully linear read*: 212 vs 210 GB/s.
+  The native `[it][ot]` layout is fine as-is. This retrospectively explains why both dense
+  repack candidates (W1, W4) measured **slower** than the plain word layout — they were
+  built to remove a stride the hardware handles natively.
+- **WITHDRAWN — "per-symbol decode ALU is effectively free"** (from `exl3_gemv_probe`,
+  m0 ≈ m2). That probe kept the production per-lane gather structure and the production
+  grid, so mode 0 and mode 2 were both pinned at the same non-DRAM ceiling. It measured the
+  kernel, not the memory system. The related "14 ops/weight = 113 ms of pure ALU" model is
+  likewise unsupported.
+
+**What survives:** the real gap is *inside* `exl3_gemv_spec` — 30–95 GB/s achieved against
+212 GB/s available for the identical walk with no math. That ~3x is decomposed
+stage-by-stage in `spec/exl3-load-latency`.
+
+**Caveats (do not quote these numbers without them):**
+- 370 GB/s exceeds the 273 GB/s nominal bus figure, so it is almost certainly SLC residency
+  and/or boost-clock variance on a 192 MB working set. The defensible comparison point is
+  the nsplit=1 figure (212 GB/s), which is same-shape against the contiguous control.
+- 210 GB/s is a single 512 MB launch. Real linears are 16–87 MB and may sit partly in the
+  SLC, so a single "ceiling" number is misleading.
+- Consequently **20.0 t/s (236.7 GB/s) and the ≥ 19.5 t/s gate (242.6 GB/s) both sit above
+  the 210 GB/s measured linear-read figure**, implying ~17.8 t/s at 11.833 GB/token. The
+  bar is kept by explicit user decision; the assertion stays unflipped and is expected to
+  stay red. Reaching 20 t/s at k=3 would require fewer bytes per token, not better kernels.
+
 

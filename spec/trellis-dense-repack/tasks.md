@@ -52,9 +52,26 @@ Order matters; commit after every task (AGENTS §4). Gated benchmarks run with
 - **Note**: L-planar superseded by RT0 (decode ≈ stream ⇒ bit-plane ALU savings are nil).
   The A/B is the two contiguous-span layouts **W1** (`[otblock][ot][it]`, per-line runs)
   and **W4** (`[otblock][it][ot 0..4]`, 4-line interleave; packer ships in RT1).
-- **Status**: in progress — **parts a+b done** (W1 packer, wide1/wide4 kernels); part c
-  (pipeline/encode, exl3.rs) next; part d (gates) after. See `implementation_notes` for
-  build/measure details at each step.
+- **Status**: **CANCELLED 2026-09-24 — the premise is falsified and both candidates lost.**
+  RT2c/RT2d/RT4 are cancelled; the `exl3_gemv_dense1`/`exl3_gemv_dense4` kernels are
+  deleted from `exl3.metal` (their host plumbing and gates were already removed in
+  `4b3708f`). The packers in `repack3.rs` remain — they are correct, tested, and harmless.
+- **Why cancelled (measured)**: the whole spec rested on RT0's claim that the native
+  `[it][ot]` tile stride (≈21 KB between consecutive reads by one warp) caps the memory bus
+  at ~68 GB/s. The control experiment `bench_stream_bw_slow` — written earlier but never
+  run — measures the **identical** stride with zero arithmetic at **212 GB/s**
+  (nsplit=1), versus **210 GB/s** for a fully contiguous linear read. The stride is not a
+  problem; the hardware handles it natively. Consequently the direct A/B
+  (`bench_dense_ab_slow`, real layer-0 tensors) found both candidates **slower** than the
+  plain word layout on every shape measured — e.g. gate W1 41.4 vs word 60.6 GB/s, down W4
+  40.3 vs word 53.2 GB/s. Repacking was solving a non-problem.
+- **What actually limits decode**: the ~3x gap *inside* `exl3_gemv_spec` (30–95 GB/s
+  achieved vs 212 GB/s available for the same walk with no math). Decomposed
+  stage-by-stage in `spec/exl3-load-latency`. Anyone reviving a layout idea should first
+  read that spec's `implementation_notes.md` retraction.
+- **Note**: L-planar superseded by RT0 (decode ≈ stream ⇒ bit-plane ALU savings are nil).
+  The A/B is the two contiguous-span layouts **W1** (`[otblock][ot][it]`, per-line runs)
+  and **W4** (`[otblock][it][ot 0..4]`, 4-line interleave; packer ships in RT1).
 - **Deviation (decided during part b)**: no `_post` dense twins. Every k=3 dense
   linear has nsplit≥2 via `gemv_splits` (gate/up n2, down/o n8, q n2, k/v n8), so the
   spec-family (partials) kernels cover ALL production dense paths; nsplit==1 dense uses
@@ -62,7 +79,7 @@ Order matters; commit after every task (AGENTS §4). Gated benchmarks run with
   summation order → bit-identical). Also **rows>1 prefill gates deferred to RT6** —
   dense encode is rows==1 only this iteration (tests below say "rows 1 and 64" → rows 1
   only).
-- **Part b (in progress, kernels appended)**: `exl3_gemv_dense1` (W1) and
+- **Part b (kernels appended, now deleted)**: `exl3_gemv_dense1` (W1) and
   `exl3_gemv_dense4` (W4) appended to `exl3.metal` — spec-geometry (one warp per
   out-tile / per 4-out-tile block, grid.y = nsplit chunk, partials in the
   `[(split*out_tiles+ot)*TILE+..]` layout `exl3_gemv_reduce[_post]` reads). W1 tile init
