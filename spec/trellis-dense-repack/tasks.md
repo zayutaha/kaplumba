@@ -24,7 +24,7 @@ Order matters; commit after every task (AGENTS §4). Gated benchmarks run with
   and bit-exact gates. Exit recorded here + `implementation_notes.md`.
 
 ## RT1 — Lossless `repack3` (Rust, offline) with reference round-trip
-- **Status**: DONE — commit `…`; scope refined vs plan (see below).
+- **Status**: DONE — commits `e574e19` (packer+tests), `b6f9fef` (notes); scope refined vs plan (see below).
 - **Files**: `crates/engine/src/repack3.rs` (new), `crates/engine/src/lib.rs` (pub mod), unit tests in `repack3.rs`.
 - **Intent**: For both candidate layouts, implement CPU pack(unpack_ref(blob)) producing
   `dense3` side-car blobs (`<tensor>.trellis.dense3`, magic `D3\0`+layout id) for the
@@ -49,13 +49,24 @@ Order matters; commit after every task (AGENTS §4). Gated benchmarks run with
 - **Commit**: after tests green.
 
 ## RT2 — Dense decode kernels (both layouts) + fast GPU gates
-- **Files**: `crates/kernels/src/exl3.metal` (add `exl3_gemv_dense3_planar`,
-  `exl3_gemv_dense3_wide` + `_post` twins with same 128-thread/8-out-tile/nsplit
-  geometry), `crates/kernels/src/exl3.rs` (pipeline/family selector, pool key gains
-  format dimension), `crates/engine/src/metal_linear.rs` (`LinearFormat` on handles,
-  `encode_gemv`-family dispatch by format).
-- **Testing**: fast GPU gates `gpu_dense3_planar_matches_word` and
-  `gpu_dense3_wide_matches_word` on real layer-0 linears (7 shapes, both modes,
+- **Note**: L-planar superseded by RT0 (decode ≈ stream ⇒ bit-plane ALU savings are nil).
+  The A/B is the two contiguous-span layouts **W1** (`[otblock][ot][it]`, per-line runs)
+  and **W4** (`[otblock][it][ot 0..4]`, 4-line interleave; packer ships in RT1).
+- **Status**: in progress — **part a done** (W1 packer, see below); part b (wide1/wide4
+  kernels + gates) pending. See `implementation_notes` for build/measure details at each step.
+- **Part a (commit `…` — filled next commit)**: `pack_wide1`/`unpack_wide1` =
+  `[otblock(4)][ot_local][it]` per-line contiguous runs (per out-tile line ~32 KB);
+  W1 == Wide4 with block size 1, no new packer machinery. 3 tests (synthetic incl
+  (2,4,1), rejects_bad_length, real artifacts round-trip + per-tile verbatim).
+  Wide1/Wide4 both require ot%4==0; real k=3 geometries all divisible by 4.
+- **Files**: `crates/engine/src/repack3.rs` (add `pack_wide1`/`unpack_wide1` + tests),
+  `crates/kernels/src/exl3.metal` (add `exl3_gemv_dense3_wide1` + `exl3_gemv_dense3_wide4`
+  (+ `_post` twins, same 128-thread/8-out-tile/nsplit geometry)), `crates/kernels/src/exl3.rs`
+  (pipeline/family selector, pool key gains layout dimension),
+  `crates/engine/src/metal_linear.rs` (`LinearFormat` on handles, `encode_gemv`-family
+  dispatch by format, gates).
+- **Testing**: fast GPU gates `gpu_dense3_wide1_matches_word` and
+  `gpu_dense3_wide4_matches_word` on real layer-0 linears (4 shapes, both modes,
   byte-offset 0 and 2, rows 1 and 64): bit-identical outputs vs the current word
   kernels; plus fused2/fused3 dense variants for the winner in RT4.
 - **Commit**: gates green.

@@ -68,22 +68,26 @@ For each, the per-warp decode work = read `bytes_per_tile` and emit the same 16 
 accumulators. Both keep the warm 128-thread/8-out-tile threadgroup geometry of the spec
 kernels (that geometry already hits ~228 on lm k=6) and the nsplit policy.
 
-- **L-planar**: three separate byte-aligned plains per tensor: sign plane (1 bit per
-  weight → 32 B per tile), magnitude plane (2 bits per weight → 64 B per tile), plus
-  the k_scale/exponent word grid unchanged. Decode: one `uchar4`/`half2`-ish load per
-  plane; sign-xor, magnitude→ 2^m via small `constant` power table (k-fold, fits), fma.
-  ~3 parallel load streams per tile instead of 1, per-symbol ALU ≈ sign/mag only
-  (funnel gone).
-- **L-wide**: keep the word stream but give each thread a contiguous aligned span of
-  full tiles (byte-aligned, e.g. 96 B/tile groups), decode via wide 32-bit loads + a
-  single fused mask/extract that yields all symbols of a 32-bit window with ~1 op each
-  (precomputed per-position masks in `constant`), average per-symbol extract cost ↓.
-  Closer to today's format → packs with zero wasted bits (3/word exactly 10+2 spare
-  consolidated by permuting symbols across the 16-subrow grid so spares aggregate).
+RT0 rejected the ALU hypothesis: stream-sum ≈ full decode, so per-symbol funnel ops are
+free; the k=3 plateau is a load/loop-structure gap (short strided bursts of 96 B per
+thread vs lm's long contiguous 64 KB runs). RT0 also kills L-planar: its premise was
+shaving per-symbol ALU by splitting sign/mantissa planes — wasted once decode ≈ stream.
+The A/B is therefore between two *contiguous-span* rewraps of the same 3-bit word stream:
 
-T0 tells which hypothesis each targets; measure both at R4 (min-of-20, warm), keep winner.
-(The funnel transforms and the two plane streams are the concrete per-symbol-op deltas;
-exact op counts get instrumented in T0.)
+- **W1 (contiguous per-line)**: pack `[otblock][ot_local][it]`; each out-tile's full
+  in-range (e.g. down = 336 tiles × 96 B = 32 KB) is one contiguous run. Kernel = current
+  `exl3_gemv_spec` with only the tile advance changed (`tile += twords*2` instead of
+  `tstride`) — bit-exactness by construction, per-warp run 2× shorter than lm's but
+  same warp count.
+- **W4 (4-line interleave)**: pack `[otblock][it][ot_local 0..3]`; a warp owns 4
+  out-tiles (8 accumulators), reads 4×96 B tiles per `it` and the whole slab linearly.
+  Runs 2× longer than lm's (129 KB vs 64 KB) at 1/4 the warp count; same per-lane
+  accumulation order over `it` → bit-exact. Packer already ships in RT1 as `pack_wide4`.
+
+Both consume identical bytes and identical tile content; only memory ORDER changes.
+Measure both at R4 (min-of-20, warm); the loser's kernel and packer are dropped.
+(Dense fused-gu2/qkv3 variants are built only for the winner, RT4/R5.)
+The k_scale/exponent word grids (`n`, `suh`, `svh`, `mcg`) are untouched by both.
 
 ## Feature flag / rollback (R2/R5/R7)
 - `LinearFormat` enum on `LinearHandles`: `Word` | `Dense3`. Decode path selects

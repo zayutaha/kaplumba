@@ -35,11 +35,15 @@ bit-identical by construction, and correctness is proven by bit-exact GPU A/B ga
    decode(dense3(k)) bit-for-bit for every weight in the tensor (verified per-contact
    CPU round-trip against the packed reference decoder for a full tensor).
 2. **R2 — Two candidate layouts.** The spec A/Bs exactly two dense layouts and keeps
-   the faster one, measured on real weights:
-   - **L-planar**: sign and mantissa bit-planes as separate byte-aligned streams
-     (vector-friendly loads, more independent load streams per tensor).
-   - **L-wide**: each thread owns one large contiguous aligned span of the k=3 stream
-     and decodes it with wide (32-bit) masks/half2 tricks, minimizing funnel ops.
+   the faster one, measured on real weights (RT0 showed contiguity of read runs — not
+   ALU reduction, and not bit-plane splitting — is the k=3 bandwidth lever, so L-planar
+   is superseded by the two contiguous-span variants below):
+   - **W1 (contiguous per-line)** — `[otblock][ot][it]`: each out-tile's full in-range
+     is one contiguous run (the native kernel unchanged except `tile += 96 B` instead
+     of the `tstride` jump; minimal bit-exactness delta).
+   - **W4 (4-line interleave)** — `[otblock][it][ot 0..4]`: a warp owns 4 out-tiles and
+     walks slabs linearly, reading 4×96 B contiguous tiles per `it`; same per-lane
+     accumulation order over `it`, hence bit-exact.
 3. **R3 — GPU decode gate.** For the kept layout, a fast unit test proves the on-GPU
    dense decode is bit-identical to the current word-layout decode for all seven
    k=3 linears of layer 0 (and spot-checks layer 29/59), across both `mode` values and
