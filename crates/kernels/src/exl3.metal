@@ -1274,9 +1274,14 @@ kernel void exl3_gemv4(device const half *xh [[buffer(0)]],
     float accA[4] = {0.0f, 0.0f, 0.0f, 0.0f};
     float accB[4] = {0.0f, 0.0f, 0.0f, 0.0f};
 
+    // Simdgroup `sg` owns in-tiles it0+sg, it0+sg+NSG, ... so the tile pointer
+    // must start at `it0 + sg` AND advance by NSG tiles per iteration. Starting
+    // at `it0` with a 1-tile advance (the original code) decoded weights from
+    // tile it0+j while reading activations from tile it0+sg+j*NSG — a
+    // misalignment of `sg` tiles, invisible for sg==0 and wrong for sg 1..3.
     const device ushort *tile =
-        trellis + ((ulong)min(it0, p.in_tiles) * p.out_tiles + ot) * p.twords * 2u;
-    const ulong tstride = (ulong)p.out_tiles * p.twords * 2u;
+        trellis + ((ulong)min(it0 + sg, p.in_tiles) * p.out_tiles + ot) * p.twords * 2u;
+    const ulong tstride = (ulong)p.out_tiles * p.twords * 2u * NSG;
 
     if (p.k != 7u) {
         uint ig0_[2];

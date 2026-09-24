@@ -1652,6 +1652,56 @@ kernel void bis_flush(device uint *b [[buffer(0)]],
         }
     }
 
+    /// spec/exl3-load-latency: `exl3_gemv4` must be correct when **all four
+    /// simdgroups** do work.
+    ///
+    /// The original `gpu_gemv4_matches_cpu_decoded_tile` could not catch the
+    /// tile/`it` misalignment this covers: it used a 16x16 shape (= 1 in-tile)
+    /// with the default nsplit, so every threadgroup got a 1-tile chunk and
+    /// simdgroups 1..3 never entered the loop — only `sg == 0` ever ran. This
+    /// test forces nsplit=1 on a multi-tile shape so the four simdgroups stride
+    /// the whole in-range, and compares against `exl3_gemv_spec` (the production
+    /// path). Accumulation order differs (4 accumulators x 4 simdgroups reduced
+    /// at the end vs 2 accumulators + shuffle), so this is a tolerance check,
+    /// not bit-identity.
+    #[test]
+    fn gpu_gemv4_multisimdgroup_matches_spec() {
+        let Some(c) = ctx() else { return };
+        for (k, in_f, out_f) in [(3u32, 256usize, 128usize), (3, 512, 256), (6, 256, 128)] {
+            let src = SynthGpuSource::build(c.device(), k, in_f, out_f);
+            let lin = linear_handles(&src, "l").expect("eligible");
+            let shape = lin.shape;
+            let mut rng = Rng(0x4A17_0000u64 + k as u64);
+            let xh: Vec<f16> = (0..in_f)
+                .map(|_| f16::from_f32(((rng.next() % 2001) as f32 / 1000.0) - 1.0))
+                .collect();
+            let (buf, off) = src.device_span("l.trellis").expect("trellis span");
+            let span = DeviceSpan {
+                buffer: buf,
+                byte_offset: off,
+            };
+            let ml = MetalLinear::new(&c).unwrap();
+            let mut got = Vec::new();
+            let mut want = Vec::new();
+            // nsplit=1 => one threadgroup per out-tile owns the whole in-range,
+            // so all NSG=4 simdgroups stride it and every one of them is live.
+            ml.raw()
+                .gemv_pass_v4(&xh, span, shape, lin.mode, Some(1), &mut got)
+                .expect("gemv4");
+            ml.raw()
+                .gemv_pass_spec(&xh, span, shape, lin.mode, Some(1), &mut want)
+                .expect("gemv_spec");
+            assert_eq!(got.len(), want.len(), "k={k} {in_f}x{out_f} length");
+            for (i, (w, g)) in want.iter().zip(got.iter()).enumerate() {
+                let scale = 1.0f32.max(w.abs()).max(g.abs());
+                assert!(
+                    (w - g).abs() / scale < 1e-3,
+                    "k={k} {in_f}x{out_f} gemv4[{i}] want {w} got {g}"
+                );
+            }
+        }
+    }
+
     /// spec/pure-decode-273gb R1: `gemv_fused2` must match individual `gemv` passes bit-for-bit.
     #[test]
     fn gpu_gemv_fused2_matches_separate_passes() {
