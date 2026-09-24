@@ -12,10 +12,11 @@ spec, chosen from T4's data.
   It targets Hadamard dispatch overhead, which the control experiment identifies as
   non-dominant. The work was never wired into `gpu_decode.rs` and was never benchmarked,
   so nothing in production depended on it.
-- **Test**: `git diff --stat` empty; both suites still at their `4b3708f` pass counts.
+- **Test**: `git diff --stat` empty; both suites still at their `4b3708f` pass counts
+  (kernels 21/0, engine 132/0/12 — re-measured, not assumed).
 
 ## T1 — Record the control result; kill the two dead premises
-- **Status**: DONE — pending commit hash below.
+- **Status**: DONE — commit `b98e4f5`.
 - **Files**: `spec/bandwidth-saturate/implementation_notes.md`,
   `spec/bandwidth-saturate/tasks.md`, `spec/trellis-dense-repack/tasks.md`.
 - **Intent**: Append the `bench_stream_bw_slow` table to the bandwidth-saturate notes and
@@ -27,17 +28,19 @@ spec, chosen from T4's data.
 - **Test**: none (docs). Verify the numbers quoted match the recorded run exactly.
 
 ## T2 — Delete the dead dense-repack kernels
-- **Status**: PENDING
+- **Status**: DONE — pending hash in the follow-up commit.
 - **Files**: `crates/kernels/src/exl3.metal`.
 - **Intent**: Remove `exl3_gemv_dense1` and `exl3_gemv_dense4`. Their host plumbing and
   gates were already removed in `4b3708f`; only the MSL remained, unreferenced. The
   native `[it][ot]` layout is confirmed at least as fast as a linear read, so there is no
   layout problem for them to solve.
-- **Test**: `grep -c exl3_gemv_dense crates/kernels/src/exl3.metal` == 0; whole MSL still
-  compiles (`gpu_gemv_spec_matches_generic` constructs `MetalLinear::new`, which calls
-  `new_library_with_source` on the entire file — a syntax error anywhere fails it);
-  `cargo test -p kaplumba-kernels --lib` and `cargo test -p kaplumba-engine --lib` both
-  0 failed, counts recorded.
+- **Delivered**: pure deletion of lines 2991–3450 (461 lines, the RT2 banner + both
+  kernels to EOF). `git diff` shows 0 added lines. `grep -rn exl3_gemv_dense crates/`
+  returns nothing.
+- **Test**: whole MSL still compiles — kernels **21 passed / 0 failed**, engine
+  **132 passed / 0 failed / 12 ignored**, identical to the `4b3708f` baseline. (Any engine
+  GPU test constructing `MetalLinear::new` compiles the entire MSL, so a syntax error
+  anywhere would have failed the suite.)
 - **Commit**: after green.
 
 ## T3 — Bisection ladder S2–S5
