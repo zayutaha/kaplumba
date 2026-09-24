@@ -1691,6 +1691,166 @@ kernel void stream_sum_strided(device const uint *buf [[buffer(0)]],
         }
     }
 
+    /// P7 (spec/pure-decode-273gb): isolated per-linear decode bandwidth, raw
+    /// streaming GB/s, on the real artifact shapes via the production rows=1
+    /// kernel. Tells us which linear is leaving DRAM bandwidth on the table
+    /// (at HEAD the layer linears read ~94 GB/s while lm_head nsplit=1 hits
+    /// ~179 GB/s — i.e. the K-split/reduce archetypes are the laggards, not
+    /// the memory subsystem as a whole). Gate: `KAPLUMBA_RUN_SLOW=1`.
+    #[test]
+    #[ignore]
+    fn bench_linear_bandwidth_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = crate::testutil::artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let Some(c) = ctx() else { return };
+        let model = crate::load::load_exl3(&c, &dir).expect("load artifact");
+        let ml = MetalLinear::new(&c).expect("metal linear");
+        let src: &dyn TensorSource = &model;
+        const REPS: usize = 20;
+
+        // trellis bytes = in_tiles*out_tiles*packed*2, packed = k*16.
+        let trellis_bytes = |lin: &LinearHandles| -> f64 {
+            (lin.shape.in_features() / 16 * lin.shape.out_features() / 16
+                * lin.shape.k as usize
+                * 32) as f64
+        };
+
+        for (label, name) in [
+            ("gate", "model.language_model.layers.0.mlp.gate_proj"),
+            ("up", "model.language_model.layers.0.mlp.up_proj"),
+            ("down", "model.language_model.layers.0.mlp.down_proj"),
+            ("o", "model.language_model.layers.0.self_attn.o_proj"),
+            ("q", "model.language_model.layers.0.self_attn.q_proj"),
+            ("k", "model.language_model.layers.0.self_attn.k_proj"),
+            ("v", "model.language_model.layers.0.self_attn.v_proj"),
+            ("lm", "lm_head"),
+        ] {
+            let lin = linear_handles(src, name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let inn = lin.shape.in_features();
+            let out_f = lin.shape.out_features();
+            let x16: Vec<f16> = (0..inn)
+                .map(|i| f16::from_f32(((i % 17) as f32 - 8.0) / 64.0))
+                .collect();
+            let x_buf = c.device().new_buffer_with_data(
+                x16.as_ptr() as *const _,
+                (inn * 2) as u64,
+                MTLResourceOptions::StorageModeShared,
+            );
+            let out_buf = c
+                .device()
+                .new_buffer((out_f * 2) as u64, MTLResourceOptions::StorageModeShared);
+            let (xh_need, y_need, p_need) = MetalLinear::chunk_scratch_needs(&lin, 1);
+            let scratch = ml.chunk_scratch(xh_need * 4, y_need * 4, p_need * 4);
+            let mut times = Vec::with_capacity(REPS);
+            for _ in 0..REPS {
+                let t0 = std::time::Instant::now();
+                let cb = c.queue().new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                ml.encode_linear_with_scratch(enc, &lin, &x_buf, &out_buf, 1, &scratch)
+                    .unwrap();
+                enc.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+                times.push(t0.elapsed().as_secs_f64() * 1e3);
+            }
+            times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let t = times[0];
+            let gbps = trellis_bytes(&lin) / (t * 1e-3) / 1e9;
+            eprintln!(
+                "{label:5} {inn:>6}x{out_f:<7} k={} · {t:8.3} ms · {gbps:6.1} GB/s",
+                lin.shape.k
+            );
+        }
+
+        // Fused siblings: the production layer dispatch, same metric.
+        let gate = linear_handles(src, "model.language_model.layers.0.mlp.gate_proj").unwrap();
+        let up = linear_handles(src, "model.language_model.layers.0.mlp.up_proj").unwrap();
+        let fused2 = Fused2Handles::new(c.device(), &gate, &up).unwrap();
+        let (inn, out_f) = (
+            gate.shape.in_features(),
+            gate.shape.out_features() + up.shape.out_features(),
+        );
+        let x16: Vec<f16> = (0..inn)
+            .map(|i| f16::from_f32(((i % 17) as f32 - 8.0) / 64.0))
+            .collect();
+        let x_buf = c.device().new_buffer_with_data(
+            x16.as_ptr() as *const _,
+            (inn * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let out_f2 = c
+            .device()
+            .new_buffer((out_f * 2) as u64, MTLResourceOptions::StorageModeShared);
+        let (xh_need, y_need, p_need) = MetalLinear::chunk_scratch_needs(&gate, 2);
+        let scratch = ml.chunk_scratch(xh_need * 4, y_need * 4, p_need * 4);
+        let mut times = Vec::with_capacity(REPS);
+        for _ in 0..REPS {
+            let t0 = std::time::Instant::now();
+            let cb = c.queue().new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            ml.encode_fused2_with_scratch(enc, &fused2, &x_buf, &out_f2, &scratch)
+                .unwrap();
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            times.push(t0.elapsed().as_secs_f64() * 1e3);
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let t = times[0];
+        let bytes = (trellis_bytes(&gate) + trellis_bytes(&up)) as f64;
+        eprintln!(
+            "gu2    {inn:>6}x{out_f:<7} · {t:8.3} ms · {:6.1} GB/s",
+            bytes / (t * 1e-3) / 1e9
+        );
+
+        let q = linear_handles(src, "model.language_model.layers.0.self_attn.q_proj").unwrap();
+        let k = linear_handles(src, "model.language_model.layers.0.self_attn.k_proj").unwrap();
+        let v = linear_handles(src, "model.language_model.layers.0.self_attn.v_proj").unwrap();
+        let fused3 = Fused3Handles::new(c.device(), &q, &k, &v).unwrap();
+        let (inn, out_f) = (
+            q.shape.in_features(),
+            q.shape.out_features() + k.shape.out_features() + v.shape.out_features(),
+        );
+        let x16: Vec<f16> = (0..inn)
+            .map(|i| f16::from_f32(((i % 17) as f32 - 8.0) / 64.0))
+            .collect();
+        let x_buf = c.device().new_buffer_with_data(
+            x16.as_ptr() as *const _,
+            (inn * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let out_f3 = c
+            .device()
+            .new_buffer((out_f * 2) as u64, MTLResourceOptions::StorageModeShared);
+        let (xh_need, y_need, p_need) = MetalLinear::chunk_scratch_needs(&q, 3);
+        let scratch = ml.chunk_scratch(xh_need * 4, y_need * 4, p_need * 4);
+        let mut times = Vec::with_capacity(REPS);
+        for _ in 0..REPS {
+            let t0 = std::time::Instant::now();
+            let cb = c.queue().new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            ml.encode_fused3_with_scratch(enc, &fused3, &x_buf, &out_f3, &scratch)
+                .unwrap();
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            times.push(t0.elapsed().as_secs_f64() * 1e3);
+        }
+        times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let t = times[0];
+        let bytes = trellis_bytes(&q) + trellis_bytes(&k) + trellis_bytes(&v);
+        eprintln!(
+            "qkv3   {inn:>6}x{out_f:<7} · {t:8.3} ms · {:6.1} GB/s",
+            bytes / (t * 1e-3) / 1e9
+        );
+    }
+
     /// spec/pure-decode-273gb T1: the fused rows=1 post-Hadamard linear
     /// (`encode_linear_with_scratch` → `exl3_gemv_post` / `exl3_gemv` +
     /// `exl3_gemv_reduce_post`) must reproduce the unfused GPU composition
