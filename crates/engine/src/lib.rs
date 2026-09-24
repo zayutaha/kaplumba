@@ -16,6 +16,7 @@ pub mod kv_cache;
 pub mod load;
 pub mod metal_ctx;
 pub mod metal_linear;
+pub mod repack3;
 pub mod sampler;
 
 #[cfg(test)]

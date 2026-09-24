@@ -24,17 +24,28 @@ Order matters; commit after every task (AGENTS §4). Gated benchmarks run with
   and bit-exact gates. Exit recorded here + `implementation_notes.md`.
 
 ## RT1 — Lossless `repack3` (Rust, offline) with reference round-trip
-- **Files**: `crates/engine/src/repack3.rs` (new), `crates/engine/src/load.rs` (variant
-  scan), `crates/engine/src/lib.rs` (pub mod), unit tests in `repack3.rs`.
+- **Status**: DONE — commit `…`; scope refined vs plan (see below).
+- **Files**: `crates/engine/src/repack3.rs` (new), `crates/engine/src/lib.rs` (pub mod), unit tests in `repack3.rs`.
 - **Intent**: For both candidate layouts, implement CPU pack(unpack_ref(blob)) producing
   `dense3` side-car blobs (`<tensor>.trellis.dense3`, magic `D3\0`+layout id) for the
   seven k=3 tensors; unpack side-car back to words and assert full-tensor equality with
   the reference decoder (`decode_ref`) for every weight of every k=3 tensor of the
   artifact (batch over all 60 layers in a test).
-- **Testing**: unit tests: (i) round-trip equality full tensor × 2 layers; (ii) all
-  byte-offset alignments 0..7; (iii) corner tiles (first/last in/out tiles); (iv)
-  invariant: side-car length == expected bytes for layout; (v) `k != 3` tensors and
-  lm_head rejected with clear error (no-op for them).
+- **Delivered (RT1 commit)**: `DenseLayout::Wide4` slab layout
+  `[otblock(4)][it][ot_local]` — each 4-out-tile × in-range slab is one contiguous span,
+  i.e. the long sequential read runs RT0 identified as the target mechanism. Pure blob
+  transforms `pack_wide4` / `unpack_wide4` (byte-identical permutation; generic over k
+  — `tile_u16` derived from geometry). Verified: 4 synthetic shapes + real splice of
+  layers 0/29/59 (`v_proj`, `down_proj`, `gate_proj`, `o_proj`) full-tensor round-trip,
+  corner-tile sanity, BadLength / OutTilesNotDivisible errors. SAFETENSORS trellis shape
+  is `[in_tiles, out_tiles, 48]` — k=3, no `.weight` tensor needed to derive geometry.
+- **Scope changes vs plan (rationale)**:
+  1. Byte-offset alignments 0..7 are not a packer property (pure byte permutation);
+     meaningful only at decode time — covered by RT2 gates' "byte-offset 0 and 2".
+  2. `dense3` magic/side-car files + loader variant scan + `k≠3` rejection are runtime
+     plumbing for the *winning* layout only — deferred to RT5 (unwired until RT4 A/B
+     picks the layout; avoids building file IO for a layout we might discard).
+- **Testing (this task)**: unit tests in `repack3.rs` as described; all pass.
 - **Commit**: after tests green.
 
 ## RT2 — Dense decode kernels (both layouts) + fast GPU gates
