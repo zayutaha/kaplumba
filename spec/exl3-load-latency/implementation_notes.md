@@ -299,7 +299,76 @@ to get it, both without touching quality or bytes:
 Budget if within-layer overlap is achieved: per layer 180 MB at the 3-stream aggregate
 (~200-250 GB/s) = 0.72-0.90 ms, x60 = 43-54 ms, + lm_head 4.2 ms = **47-58 ms = 17-21 t/s**.
 
-## Next, in order
+## 2026-09-24 — T7: the amortised nsplit re-sweep. The kernel is not the bottleneck.
+
+The entire `gemv_splits` policy was tuned with one `commit()` + `wait()` per dispatch — a
+cost that dominates any kernel under ~0.3 ms, i.e. *every measurement that produced it*.
+Re-swept with 60 distinct real tensors per point (2.60 GB aggregate, uncacheable), one
+command buffer (`bench_nsplit_resweep_slow`), using the S5 production-math kernel:
+
+| shape | ns1 | ns2 | ns4 | ns8 | ns16 | ns32 | policy |
+|---|---|---|---|---|---|---|---|
+| gate 5376x21504 | 339 | 336 | 341 | 343 | 344 | 347 | 2 |
+| down 21504x5376 | 124 | 227 | **340** | 334 | 341 | 348 | 8 |
+| o    8192x5376  | 139 | 249 | 363 | 367 | 360 | **377** | 8 |
+| k    5376x4096  |  84 | 149 | 237 | **273** | 278 | 264 | 8 |
+
+GB/s. Two things fall out:
+
+1. **The kernel sustains 340–377 GB/s on the real weights** — above the 258 GB/s we get
+   from a pure sequential read of the same allocation, because the tile walk has better
+   DRAM page behaviour than a linear sweep here. The EXL3 access pattern is not a
+   liability; it is an asset.
+2. **`nsplit <= 2` is catastrophic for the narrow shapes** (down 124, o 139, k 84 GB/s) and
+   everything saturates by **ns4–ns8**. The policy's choices (2/8/2/8) are on the right
+   side of that knee, so the *policy* is roughly right — but it was right by luck, and
+   `down` would prefer ns4 (340 vs 334) and `o` ns32 (377 vs 367). Those are 2-3% and are
+   not worth the churn.
+
+**The single-linear rate is the problem, not the split.** One `gate` in isolation costs
+0.402 ms; the same tensor dispatched as part of a 60-way independent batch costs 0.128 ms.
+A lone linear cannot saturate this memory system. `bench_dispatch_overlap_slow` measures
+what concurrency is actually available inside one command buffer:
+
+```
+A alone 0.402 ms   B alone 0.254 ms
+A+B     0.423 ms   -> 1.55x overlap   (sum 0.656)
+A+B+C   0.587 ms   -> 1.71x overlap   (sum 0.958)
+```
+
+So independent dispatches **do** overlap already, no `concurrentCommands` needed (and the
+`metal` crate does not expose it anyway) — but overlap saturates around 1.7x at three
+streams. A decode layer offers exactly three independent streams: the attention branch
+(`q/k/v` -> attn -> `o`) and the two MLP inputs (`gate`, `up`), with `down` gated behind
+`gate`+`up`. That is the whole concurrency budget, and it is fixed by the dependency graph.
+
+## Where the 117 ms actually goes
+Per layer 1.95 ms, of which the MLP chain (gate+up+down = 130 MB) at the single-linear
+108 GB/s is 1.20 ms and the attention chain (qkv+o = 44 MB) is 0.41 ms; overlapped they
+bound at 1.20 ms. The measured 1.95 ms leaves ~0.75 ms/layer (~45 ms/token) in the
+small kernels (6 RMS + 2 rope + attention per layer) and in imperfect overlap.
+
+**Ceiling with the current dependency graph, everything else perfect:**
+MLP chain 130 MB x 60 = 7.8 GB at 108 GB/s = 72 ms, attention chain overlapped, lm_head
+4.2 ms => ~76 ms => **13 t/s**. Reaching 20 t/s (50 ms) needs the *single-linear* rate up,
+and the only untested lever for that is giving one linear more threadgroups than
+`nsplit` can supply — i.e. splitting the in-tile range across threads *within* a
+threadgroup without the 4x index-prologue penalty that sank `exl3_gemv4`. That is the one
+optimisation this session has not falsified.
+
+## Summary of the whole investigation
+| claim | status |
+|---|---|
+| hardware ceiling on our weights | 258 GB/s sequential, **340-377 GB/s strided** |
+| EXL3 decode arithmetic | **free** (3% over a bare walk, S2->S5 ladder) |
+| f32 partial write + reduce | **free** (S6 == S5; reduce dispatch 0.8 ms/token) |
+| access pattern / tile stride | **free to beneficial** (S1 455 GB/s) |
+| layout repacking (W1/W4) | **slower** — no problem to solve |
+| nsplit | saturated by ns4-8; policy ~right |
+| cross-dispatch overlap | available, saturates ~1.7x at 3 streams |
+| single-linear rate | **108 GB/s — this is the binding constraint** |
+| decode today | 117 ms/token, 95.5 GB/s, 8.53 t/s |
+
 1. Determine whether consecutive independent dispatches in one encoder already overlap
    (compare: qkv alone, gate+up alone, both in one CB, both on concurrent CBs).
 2. If not overlapping, switch the attention and MLP branches onto concurrent command
