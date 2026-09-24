@@ -2806,6 +2806,389 @@ kernel void bis_flush(device uint *b [[buffer(0)]],
         }
     }
 
+    /// spec/exl3-load-latency: overhead-free per-linear rate.
+    ///
+    /// Every per-linear number so far has been polluted by the ~0.16 ms
+    /// `commit()` + `wait_until_completed()` round trip, which is not an
+    /// additive constant — it *dominates* any kernel below ~0.3 ms and is
+    /// hidden above it. That is why an 8 MB tensor "measured" 48 GB/s while a
+    /// full-model stream measures 258 GB/s on the very same memory.
+    ///
+    /// This puts REPS reads of the same tensor **inside one command buffer**, so
+    /// the submit cost is paid once and amortised, and reports the true marginal
+    /// cost of one read. Compares, at identical size and identical bytes:
+    ///   linear   — the whole tensor as one sequential stream
+    ///   strided  — the exl3_gemv walk (32 lanes per (out_tile, split), 96 B
+    ///              per tile, 21 KB stride between consecutive in-tiles)
+    /// Both are pure reads; no decode, no math. The ratio is the cost of the
+    /// access pattern itself, with every measurement artefact removed.
+    #[test]
+    #[ignore]
+    fn bench_walk_vs_linear_amortised_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = crate::testutil::artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let Some(c) = ctx() else { return };
+        let device = c.device();
+        use std::time::Instant;
+
+        let opts = metal::CompileOptions::new();
+        let lib = device
+            .new_library_with_source(P1_BISECT_MSL, &opts)
+            .expect("compile P1_BISECT_MSL");
+        let mk = |name: &str| {
+            let f = lib.get_function(name, None).unwrap_or_else(|_| panic!("{name}"));
+            device
+                .new_compute_pipeline_state_with_function(&f)
+                .unwrap_or_else(|e| panic!("{name}: {e}"))
+        };
+        let read1 = mk("bis_read_bw");
+        // `stream_sum_strided` lives in the P0 string, not P1.
+        let strided = {
+            let f0 = device
+                .new_library_with_source(P0_STRIDED_MSL, &opts)
+                .expect("compile P0_STRIDED_MSL")
+                .get_function("stream_sum_strided", None)
+                .expect("stream_sum_strided");
+            device
+                .new_compute_pipeline_state_with_function(&f0)
+                .expect("strided pipeline")
+        };
+
+        let model = crate::load::load_exl3(&c, &dir).expect("load artifact");
+        let src: &dyn TensorSource = &model;
+        let out = device.new_buffer(8, metal::MTLResourceOptions::StorageModeShared);
+        const REPS: usize = 40;
+
+        let pbuf = |v: &[u32]| {
+            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            device.new_buffer_with_data(
+                bytes.as_ptr() as *const _,
+                bytes.len() as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+        };
+
+        eprintln!("== amortised: {REPS} reads in ONE command buffer ==");
+        for (label, name) in [
+            ("gate", "model.language_model.layers.0.mlp.gate_proj"),
+            ("down", "model.language_model.layers.0.mlp.down_proj"),
+            ("o", "model.language_model.layers.0.self_attn.o_proj"),
+            ("k", "model.language_model.layers.0.self_attn.k_proj"),
+        ] {
+            let lin = linear_handles(src, name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let (buf, off) = src.device_span(&format!("{name}.trellis")).expect("span");
+            let it = lin.shape.in_tiles as u32;
+            let ot = lin.shape.out_tiles as u32;
+            let tw = (lin.shape.words_per_tile() / 2) as u32;
+            let nwords = it * ot * tw;
+            let gb = (nwords as f64 * 4.0) / 1e9;
+
+            // linear: one dispatch over the whole tensor, REPS times
+            let nt = (nwords / 8).max(1);
+            let p_lin = pbuf(&[nwords, nt]);
+            let run_lin = || {
+                let cb = c.queue().new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                for _ in 0..REPS {
+                    enc.set_compute_pipeline_state(&read1);
+                    enc.set_buffer(0, Some(buf), 0);
+                    enc.set_buffer(1, Some(&out), 0);
+                    enc.set_buffer(2, Some(&p_lin), 0);
+                    enc.dispatch_threads(
+                        metal::MTLSize::new(nt as u64, 1, 1),
+                        metal::MTLSize::new(64, 1, 1),
+                    );
+                }
+                enc.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+            };
+
+            // strided: the exl3_gemv grid, REPS times, at the production nsplit
+            let pol = match ot {
+                1344 => 2usize,
+                336 | 256 => 8,
+                512 => 2,
+                _ => 4096usize.div_ceil(ot as usize).clamp(1, 16),
+            };
+            let p_str = pbuf(&[it, ot, tw, pol as u32]);
+            let run_str = || {
+                let cb = c.queue().new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                for _ in 0..REPS {
+                    enc.set_compute_pipeline_state(&strided);
+                    enc.set_buffer(0, Some(buf), 0);
+                    enc.set_buffer(1, Some(&out), 0);
+                    enc.set_buffer(2, Some(&p_str), 0);
+                    enc.dispatch_threads(
+                        metal::MTLSize::new((ot as u64) * pol as u64, 1, 1),
+                        metal::MTLSize::new(32, 1, 1),
+                    );
+                }
+                enc.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+            };
+
+            let t = |f: &dyn Fn()| {
+                f();
+                let mut v = Vec::with_capacity(6);
+                for _ in 0..6 {
+                    let s = Instant::now();
+                    f();
+                    v.push(s.elapsed().as_secs_f64() * 1e3);
+                }
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[0] / REPS as f64
+            };
+            let tl = t(&run_lin);
+            let ts = t(&run_str);
+            eprintln!(
+                "{label:5} {gb:6.3} GB · linear {tl:6.3} ms ({:6.1} GB/s) · strided(ns{pol}) {ts:6.3} ms ({:6.1} GB/s) · stride costs {:.2}x",
+                gb / (tl / 1e3),
+                gb / (ts / 1e3),
+                ts / tl
+            );
+        }
+    }
+
+    /// spec/exl3-load-latency: the one number that settles it — read the WHOLE
+    /// model allocation as a single sequential stream, exactly as a token does,
+    /// and compare against the 101 GB/s `decode_throughput_slow` achieves.
+    ///
+    /// Every per-linear bench so far has been polluted by ~0.16-0.25 ms of
+    /// per-dispatch `with_scratch` allocation, which dominates an 8-43 MB
+    /// measurement and made the k=3 linears look 2x further from the ceiling
+    /// than they are. This has no such overhead: one buffer, one dispatch, one
+    /// timing. If the raw full-model stream runs near 250 GB/s then the kernel
+    /// is leaving 2.5x on the table; if it runs near 100 GB/s then decode is
+    /// already at the machine's limit and 20 t/s is unreachable at k=3.
+    #[test]
+    #[ignore]
+    fn bench_full_model_stream_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = crate::testutil::artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let Some(c) = ctx() else { return };
+        let device = c.device();
+        use std::time::Instant;
+
+        let opts = metal::CompileOptions::new();
+        let lib = device
+            .new_library_with_source(P1_BISECT_MSL, &opts)
+            .expect("compile P1_BISECT_MSL");
+        let f = lib.get_function("bis_read_bw", None).expect("bis_read_bw");
+        let pipe = device
+            .new_compute_pipeline_state_with_function(&f)
+            .expect("pipeline");
+
+        let model = crate::load::load_exl3(&c, &dir).expect("load artifact");
+        let src: &dyn TensorSource = &model;
+        let out = device.new_buffer(8, metal::MTLResourceOptions::StorageModeShared);
+
+        // Find the largest single allocation the loader made — that is the
+        // packed-weight pool, and reading it end to end is a whole-token read.
+        let mut biggest: Option<(&metal::Buffer, u64)> = None;
+        for name in [
+            "model.language_model.layers.0.mlp.gate_proj",
+            "model.language_model.layers.59.mlp.down_proj",
+            "lm_head",
+            "model.embed_tokens",
+        ] {
+            if let Some((buf, _)) = src.device_span(&format!("{name}.trellis")) {
+                let len = buf.length();
+                if biggest.as_ref().map(|(_, l)| len > *l).unwrap_or(true) {
+                    biggest = Some((buf, len));
+                }
+            }
+        }
+        let (buf, len) = biggest.expect("no trellis span");
+        eprintln!(
+            "largest packed-weight allocation: {:.2} GB",
+            len as f64 / 1e9
+        );
+
+        // Read the whole thing as one stream, 4 interleaved passes so the grid
+        // is large enough to saturate.
+        for nwords in [
+            (len / 4 / 4) as u32, // quarter
+            (len / 4 / 2) as u32, // half
+            (len / 4) as u32,     // all
+        ] {
+            let nthreads = (nwords / 8).max(1);
+            let pv: Vec<u8> = [nwords, nthreads]
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect();
+            let pb = device.new_buffer_with_data(
+                pv.as_ptr() as *const _,
+                pv.len() as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let run = || {
+                let cb = c.queue().new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pipe);
+                enc.set_buffer(0, Some(&buf), 0);
+                enc.set_buffer(1, Some(&out), 0);
+                enc.set_buffer(2, Some(&pb), 0);
+                enc.dispatch_threads(
+                    metal::MTLSize::new(nthreads as u64, 1, 1),
+                    metal::MTLSize::new(64, 1, 1),
+                );
+                enc.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+            };
+            run();
+            let mut v = Vec::with_capacity(6);
+            for _ in 0..6 {
+                let t = Instant::now();
+                run();
+                v.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let gb = (nwords as f64 * 4.0) / 1e9;
+            eprintln!(
+                "raw sequential read {:7.3} GB -> {:7.3} ms -> {:6.1} GB/s   ({:.1} t/s if that were the whole model)",
+                gb,
+                v[0],
+                gb / (v[0] / 1e3),
+                1e3 / v[0]
+            );
+        }
+    }
+
+    /// spec/exl3-load-latency: is the k=3 deficit a TLB / page-table effect?
+    ///
+    /// The bisection ladder hit 163 GB/s on a *synthetic* buffer with the exact
+    /// gate geometry, while the real `gate_proj` GEMV off the 11.8 GB model
+    /// allocation manages only 73 GB/s. Same shape, same kernel math, 2.2x
+    /// apart. The difference that remains is where the bytes live: a 43 MB
+    /// synthetic buffer is a few thousand pages (TLB-resident after one pass),
+    /// whereas the model spans ~720k 16 KB pages out of an 11.8 GB address
+    /// space, so every walk takes page-table misses the synthetic never does.
+    ///
+    /// This reads both with the identical raw kernel and the identical access
+    /// pattern. A large real-vs-synthetic gap is the signature.
+    #[test]
+    #[ignore]
+    fn bench_tlb_real_vs_synth_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = crate::testutil::artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let Some(c) = ctx() else { return };
+        let device = c.device();
+        use std::time::Instant;
+
+        let opts = metal::CompileOptions::new();
+        let lib = device
+            .new_library_with_source(P1_BISECT_MSL, &opts)
+            .expect("compile P1_BISECT_MSL");
+        let f = lib.get_function("bis_read_bw", None).expect("bis_read_bw");
+        let pipe = device
+            .new_compute_pipeline_state_with_function(&f)
+            .expect("pipeline");
+
+        let model = crate::load::load_exl3(&c, &dir).expect("load artifact");
+        let src: &dyn TensorSource = &model;
+        let out = device.new_buffer(8, metal::MTLResourceOptions::StorageModeShared);
+
+        let time_read = |buf: &Buffer, nwords: u32, label: &str| {
+            let nthreads = (nwords / 8).max(1);
+            let pv: Vec<u8> = [nwords, nthreads]
+                .iter()
+                .flat_map(|x| x.to_le_bytes())
+                .collect();
+            let pb = device.new_buffer_with_data(
+                pv.as_ptr() as *const _,
+                pv.len() as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let run = || {
+                let cb = c.queue().new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                enc.set_compute_pipeline_state(&pipe);
+                enc.set_buffer(0, Some(buf), 0);
+                enc.set_buffer(1, Some(&out), 0);
+                enc.set_buffer(2, Some(&pb), 0);
+                enc.dispatch_threads(
+                    metal::MTLSize::new(nthreads as u64, 1, 1),
+                    metal::MTLSize::new(64, 1, 1),
+                );
+                enc.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+            };
+            run();
+            let mut v = Vec::with_capacity(12);
+            for _ in 0..12 {
+                let t = Instant::now();
+                run();
+                v.push(t.elapsed().as_secs_f64() * 1e3);
+            }
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let gb = (nwords as f64 * 4.0) / 1e9;
+            eprintln!(
+                "{label:28} {:8.3} ms -> {:6.1} GB/s",
+                v[0],
+                gb / (v[0] / 1e3)
+            );
+            v[0]
+        };
+
+        eprintln!("== raw sequential read: real model tensor vs synthetic, same size ==");
+        for name in [
+            "model.language_model.layers.0.mlp.gate_proj",
+            "model.language_model.layers.0.mlp.down_proj",
+            "model.language_model.layers.0.self_attn.o_proj",
+            "model.language_model.layers.0.self_attn.k_proj",
+            "lm_head",
+        ] {
+            let lin = linear_handles(src, name).unwrap_or_else(|e| panic!("{name}: {e}"));
+            let (buf, _off) = src.device_span(&format!("{name}.trellis")).expect("span");
+            let nwords =
+                (lin.shape.in_tiles * lin.shape.out_tiles * lin.shape.words_per_tile() / 2) as u32;
+            eprintln!("-- {name}  {} KB", nwords as u64 * 4 / 1024);
+            // Real: read the tensor in place, at its real offset in the 11.8 GB
+            // allocation. bis_read_bw takes the whole span, so point at a
+            // zero-offset view by reading `nwords` from the span start.
+            let t_real = time_read(buf, nwords, "real (in 11.8GB alloc)");
+            let synth = device.new_buffer(
+                (nwords as u64) * 4,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            {
+                let p = synth.contents() as *mut u32;
+                for i in 0..nwords as usize {
+                    unsafe { *p.add(i) = (i as u32).wrapping_mul(2654435761); }
+                }
+            }
+            let t_synth = time_read(&synth, nwords, "synthetic (fresh alloc)");
+            eprintln!(
+                "   -> real is {:.2}x {} than synthetic",
+                if t_real > t_synth { t_real / t_synth } else { t_synth / t_real },
+                if t_real > t_synth { "SLOWER" } else { "faster" }
+            );
+        }
+    }
+
     /// spec/exl3-load-latency: does overlapping two independent weight reads
     /// recover the large-transfer bandwidth?
     ///

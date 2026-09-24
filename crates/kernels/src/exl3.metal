@@ -742,7 +742,6 @@ kernel void exl3_gemv_spec(device const half *xh [[buffer(0)]],
 }
 
 // Sibling 2-way linear GEMV (spec/pure-decode-273gb R1: Gate + Up).
-// Grid: (out_tiles_a + out_tiles_b, nsplit, 1). Threads per threadgroup: 32.
 kernel void exl3_gemv_fused2(device const half *xh [[buffer(0)]],            // [2, in_tiles * 16]
                              device const ushort *trellis_a [[buffer(1)]],
                              device const ushort *trellis_b [[buffer(2)]],

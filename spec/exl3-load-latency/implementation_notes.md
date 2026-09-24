@@ -175,8 +175,86 @@ qkv_prep) were cancelled on 2026-09-24 because the then-current diagnosis said d
 overhead was not dominant. With GEMV priced at ~94 of 117 ms, the non-GEMV ~23 ms is the
 largest single addressable block left. T4/T6 deserve revival.
 
-## Follow-up recommendation (supersedes the one above)
-1. **nsplit 16/32 sweep** for out_tiles 256/336/512, re-tune `gemv_splits`, gated for
+## 2026-09-24 — the measurement was the problem: submit overhead swamped every small kernel
+
+Every per-linear number in every spec so far was measured with one
+`commit()` + `wait_until_completed()` round trip **per dispatch**. That round trip is
+**not an additive constant** — it dominates any kernel below ~0.3 ms and vanishes above
+it. A 1 MB read "measured" 0.160 ms, i.e. 6.2 GB/s, which is physically impossible as
+memory time; it was almost entirely round trip.
+
+Fix: put N reads **inside one command buffer** so the submit is paid once
+(`bench_walk_vs_linear_amortised_slow`, 40 reps in one buffer, real layer-0 tensors):
+
+| tensor | MB | linear | strided (exl3_gemv walk) |
+|---|---|---|---|
+| gate | 43.4 | 0.170 ms / 254.6 GB/s | **0.095 ms / 456.4 GB/s** |
+| down | 43.4 | 0.169 ms / 255.8 GB/s | **0.094 ms / 461.5 GB/s** |
+| o    | 17.3 | 0.054 ms / 304.3 GB/s | **0.030 ms / 552.1 GB/s** |
+| k    |  8.3 | 0.023 ms / 365.1 GB/s | **0.016 ms / 515.8 GB/s** |
+
+(The >DRAM figures are SLC-resident at these sizes — that is the point: the pattern has
+**no intrinsic cost**. 456 GB/s vs a 254 GB/s linear read means the 21 KB-stride walk is
+if anything *better* for this access pattern, when it is not being timed by a stopwatch
+that mostly measures `commit()`.)
+
+And the DRAM-rate reference, no per-dispatch overhead at all
+(`bench_full_model_stream_slow`, the real packed-weight allocation):
+
+```
+6.378 GB -> 24.729 ms -> 257.9 GB/s
+3.189 GB -> 12.095 ms -> 263.7 GB/s
+1.594 GB ->  6.194 ms -> 257.4 GB/s
+```
+
+**The machine does 258 GB/s on our own weights.** Decode runs at 101 GB/s (11.833 GB /
+117 ms). GEMV at the DRAM rate would be `10.776/0.258 + 1.057/0.254 = 46 ms`, i.e. the
+46 ms of GEMV plus everything else is what stands between 117 ms and 20 t/s. **~70 ms per
+token is not GEMV.**
+
+### This reverses the T4/T6 cancellation
+
+`spec/bandwidth-saturate` T4 (fuse RMSNorm+had_in) and T6 (fuse qkv_prep) were cancelled
+on 2026-09-24 on the reasoning "dispatch overhead is not the dominant term". That
+reasoning was wrong — it rested on per-pass benches whose absolute values are inflated by
+exactly the round-trip cost quantified above, and on a GEMV-is-slow theory that has now
+been falsified five separate ways. With GEMV priced at ~46 ms of a possible 117 ms, the
+non-GEMV ~70 ms is the largest addressable block in the model. **T4/T6 are reinstated.**
+
+### Falsified this session (all measured, none speculative)
+1. **Tile stride / layout** — strided walk 456 GB/s vs linear 254 GB/s. No cost.
+2. **Decode ALU** — bisection ladder S1..S5 flat, 0–28%.
+3. **nsplit 16/32** — worse; policy within 2% of argmax.
+4. **4-simdgroup geometry** (`exl3_gemv4`) — slower (4x index prologue per unit work).
+   *Also carried a real correctness bug, now fixed and gated — see below.*
+5. **Concurrent independent streams** — 0.98x. No win.
+6. **Load amplification** — `exl3_gemv_cvt` (one coalesced word per lane + `simd_shuffle`
+   for the other three, 128 -> 24 transactions per tile) was **bit-identical** to spec and
+   **20–30% slower**: the redundant loads were hitting L1 cheaply, and `simd_shuffle` is a
+   crossbar op. Kernel deleted after measurement.
+7. **TLB / huge pages** — real model tensor vs fresh same-size allocation, identical raw
+   read: within 1–13%. No page-table effect.
+8. **mmap / demand paging** — all 11.9 GB is read every token, so there is no reuse to
+   exploit; and the 5.3x-amplified gather *requires* cached memory, so an uncached mapping
+   would be strictly worse.
+
+### Bug found and fixed
+`exl3_gemv4` decoded weights from tile `it0+j` while reading activations from
+`it0+sg+j*NSG` — wrong results for simdgroups 1–3, invisible to the old test because it
+used a 16×16 shape (1 in-tile) where `sg>0` never enters the loop. New gate
+`gpu_gemv4_multisimdgroup_matches_spec` fails on the old code (`want -29.225, got 10.046`).
+
+## Follow-up, in priority order
+1. **Re-run every per-linear and per-phase bench with the submit cost amortised.** All
+   historical per-linear GB/s figures in `spec/bandwidth-saturate`,
+   `spec/pure-decode-273gb` and `spec/trellis-dense-repack` are inflated and must not be
+   used to target work.
+2. **Reinstated T4/T6**: fuse RMSNorm+had_in and the qkv post-processing. This is the
+   ~70 ms.
+3. Measure the real phase split (rms / had_in / had_out / attention / gemv) with the
+   amortised method before choosing between them.
+
+
    bit-exactness (larger splits change f32 split summation order).
 2. **Revive the cancelled T4/T6 fusions** (rms+had_in, qkv_prep) and re-run the
    `decode_throughput_slow` split to confirm where the ~23 ms actually sits before
