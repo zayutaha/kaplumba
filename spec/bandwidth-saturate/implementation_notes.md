@@ -27,9 +27,13 @@
 3. **Hardware `dot(float4, float4)` vs Pairwise Float Summation**:
    - `dot(float4, float4)` in Metal evaluates pairwise products with slightly different internal summation rounding than scalar adds, causing 1-8 ULP differences in f32 tests (`gpu_gemv_post_matches_unfused` and `gpu_gemv_fused2_matches_separate_passes`).
    - Using pairwise addition `acc += (x0 * w.x + x1 * w.y) + (x2 * w.z + x3 * w.w)` retains 100% exact bit-equivalence with the reference math while still reaping the 4x ALU instruction reduction from `exl3_decode_quad` (vectorized `uint4` integer multiplies and XORs).
-4. **Single-Dispatch GEMV for O and Down (`gemv_splits(336) = 1`)**:
-   - Setting `gemv_splits(336) = 1` directs `o_proj` and `down_proj` into `exl3_gemv_post` directly instead of K-splits (nsplit=8).
-   - Eliminates 120 dispatches per token (2 dispatches eliminated per layer across 60 layers) and cuts all DRAM roundtrips to `scratch.partial`.
-   - All 131 tests pass with 100% bit-exact parity including `trace_chat_prompt_steps_slow` (predicting token 818).
+4. **Single-Dispatch GEMV for O and Down (`gemv_splits(336) = 1`) vs K-splits**:
+   - Setting `gemv_splits(336) = 1` directs `o_proj` and `down_proj` into `exl3_gemv_post` directly without K-splits, launching 42 threadgroups total (2.1 warps/core), which causes DRAM stalls on M4 Pro (1.18 ms for down).
+   - Restoring `gemv_splits(336) = 8` launches 2,688 threadgroups (134 warps/core), rocketing `down` to 0.538 ms (80.6 GB/s, 2.2x faster).
+5. **T5 Fused GELU + Hadamard Prologue (`exl3_gelu_had_in`)**:
+   - Evaluates `(half)(gelu_tanh(gate) * up)` inside the threadgroup register file and directly multiplies by `suh` before running Sylvester FWT.
+   - Eliminates 60 standalone `gelu_mul` dispatches and completely deletes the 21,504-element intermediate DRAM buffer `gu` from `GpuDecoder`.
+   - Verified 100% bit-exact in `gpu_gelu_had_in_matches_separate_passes` and `trace_chat_prompt_steps_slow` (golden token 818).
+   - Latency dropped to **117.3 ms/token (8.53 t/s, 95.5 GB/s)**.
 
 

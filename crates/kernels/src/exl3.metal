@@ -254,6 +254,42 @@ kernel void exl3_had_in_batched(device const half *x [[buffer(0)]],
 }
 
 // ---------------------------------------------------------------------------
+// spec/bandwidth-saturate T5: Fused GELU + Hadamard Prologue (down_proj)
+// Computes gu = (half)(gelu_tanh(gate) * up) in registers and feeds into had_in.
+// ---------------------------------------------------------------------------
+inline float gelu_tanh_f(float x) {
+    const float k = 0.7978845608f; // sqrt(2/pi)
+    return 0.5f * x * (1.0f + tanh(k * (x + 0.044715f * x * x * x)));
+}
+
+kernel void exl3_gelu_had_in(device const half *gate [[buffer(0)]],
+                             device const half *up [[buffer(1)]],
+                             device const half *suh [[buffer(2)]],
+                             device half *xh [[buffer(3)]],
+                             constant HadParams &hp [[buffer(4)]],
+                             uint2 tg [[threadgroup_position_in_grid]],
+                             uint2 thr [[thread_position_in_threadgroup]]) {
+    threadgroup float sh[HAD];
+    uint t = thr.x;
+    uint base = tg.y * hp.row_len + tg.x * HAD;
+    uint idx = base + t;
+    half gu_val = (half)(gelu_tanh_f(float(gate[idx])) * float(up[idx]));
+    sh[t] = float(gu_val) * float(suh[tg.x * HAD + t]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (uint stage = 1u; stage < HAD; stage <<= 1u) {
+        if ((t & stage) == 0u) {
+            float a = sh[t];
+            float b = sh[t + stage];
+            sh[t] = a + b;
+            sh[t + stage] = a - b;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    xh[base + t] = (half)(sh[t] * as_type<float>(0x3DB504F3u));
+}
+
+// ---------------------------------------------------------------------------
 // y = xh @ decode(trellis)   (raw f32 output, one lane per output column)
 // ---------------------------------------------------------------------------
 // One out-tile per 32-lane threadgroup. Fatter threadgroups (4 warps sharing a

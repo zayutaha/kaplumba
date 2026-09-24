@@ -51,8 +51,8 @@ pub fn tile_u16_of(blob_len: usize, in_tiles: usize, out_tiles: usize) -> Result
     Ok(w)
 }
 
-/// `[otblock][it][ot_local]` repack. Returns dense `Vec<u8>` of the same
-/// number of bytes as `blob`.
+/// `[otblock][it][u32_word][ot_local(4)]` repack. 4 out-tiles are interleaved
+/// word-by-word into `uint4` vectors. Returns dense `Vec<u8>` of the same length as `blob`.
 pub fn pack_wide4(
     blob: &[u8],
     in_tiles: usize,
@@ -61,25 +61,34 @@ pub fn pack_wide4(
     if out_tiles == 0 || out_tiles % 4 != 0 {
         return Err(RepackError::OutTilesNotDivisible(out_tiles, DenseLayout::Wide4));
     }
-    let tile = tile_u16_of(blob.len(), in_tiles, out_tiles)?;
-    let words = blob.len() / 2;
-    let tile_words = tile;
-    let tile_bytes = tile_words * 2;
+    let tile_u16 = tile_u16_of(blob.len(), in_tiles, out_tiles)?;
+    if tile_u16 % 2 != 0 {
+        return Err(RepackError::BadLength(blob.len(), in_tiles, out_tiles, tile_u16));
+    }
+    let tile_u32 = tile_u16 / 2;
     let mut dense = vec![0u8; blob.len()];
-    let src = |it: usize, ot: usize| (it * out_tiles + ot) * tile_bytes;
+    let blob_u32: &[u32] = unsafe {
+        std::slice::from_raw_parts(blob.as_ptr() as *const u32, blob.len() / 4)
+    };
+    let dense_u32: &mut [u32] = unsafe {
+        std::slice::from_raw_parts_mut(dense.as_mut_ptr() as *mut u32, dense.len() / 4)
+    };
+
+    let src = |it: usize, ot: usize, w: usize| (it * out_tiles + ot) * tile_u32 + w;
     let mut dst = 0usize;
     for s in 0..out_tiles / 4 {
+        let base_ot = s * 4;
         for it in 0..in_tiles {
-            let base_ot = s * 4;
-            for otl in 0..4 {
-                let s0 = src(it, base_ot + otl);
-                let d0 = dst;
-                dense[d0..d0 + tile_bytes].copy_from_slice(&blob[s0..s0 + tile_bytes]);
-                dst += tile_bytes;
+            for w in 0..tile_u32 {
+                dense_u32[dst] = blob_u32[src(it, base_ot + 0, w)];
+                dense_u32[dst + 1] = blob_u32[src(it, base_ot + 1, w)];
+                dense_u32[dst + 2] = blob_u32[src(it, base_ot + 2, w)];
+                dense_u32[dst + 3] = blob_u32[src(it, base_ot + 3, w)];
+                dst += 4;
             }
         }
     }
-    debug_assert_eq!(dst, words * 2);
+    debug_assert_eq!(dst, blob.len() / 4);
     Ok(dense)
 }
 
@@ -92,24 +101,35 @@ pub fn unpack_wide4(
     if out_tiles == 0 || out_tiles % 4 != 0 {
         return Err(RepackError::OutTilesNotDivisible(out_tiles, DenseLayout::Wide4));
     }
-    let tile = tile_u16_of(dense.len(), in_tiles, out_tiles)?;
-    let blob = vec![0u8; dense.len()];
-    let tile_bytes = tile * 2;
-    let mut out = blob;
-    let dst = |it: usize, ot: usize| (it * out_tiles + ot) * tile_bytes;
+    let tile_u16 = tile_u16_of(dense.len(), in_tiles, out_tiles)?;
+    if tile_u16 % 2 != 0 {
+        return Err(RepackError::BadLength(dense.len(), in_tiles, out_tiles, tile_u16));
+    }
+    let tile_u32 = tile_u16 / 2;
+    let mut blob = vec![0u8; dense.len()];
+    let dense_u32: &[u32] = unsafe {
+        std::slice::from_raw_parts(dense.as_ptr() as *const u32, dense.len() / 4)
+    };
+    let blob_u32: &mut [u32] = unsafe {
+        std::slice::from_raw_parts_mut(blob.as_mut_ptr() as *mut u32, blob.len() / 4)
+    };
+
+    let dst = |it: usize, ot: usize, w: usize| (it * out_tiles + ot) * tile_u32 + w;
     let mut src = 0usize;
     for s in 0..out_tiles / 4 {
+        let base_ot = s * 4;
         for it in 0..in_tiles {
-            let base_ot = s * 4;
-            for otl in 0..4 {
-                let s0 = src;
-                let d0 = dst(it, base_ot + otl);
-                out[d0..d0 + tile_bytes].copy_from_slice(&dense[s0..s0 + tile_bytes]);
-                src += tile_bytes;
+            for w in 0..tile_u32 {
+                blob_u32[dst(it, base_ot + 0, w)] = dense_u32[src];
+                blob_u32[dst(it, base_ot + 1, w)] = dense_u32[src + 1];
+                blob_u32[dst(it, base_ot + 2, w)] = dense_u32[src + 2];
+                blob_u32[dst(it, base_ot + 3, w)] = dense_u32[src + 3];
+                src += 4;
             }
         }
     }
-    Ok(out)
+    debug_assert_eq!(src, dense.len() / 4);
+    Ok(blob)
 }
 
 /// `[otblock][ot_local][it]` repack: per-line contiguous runs. Same bytes as
@@ -190,7 +210,7 @@ mod tests {
             (1344, 336, 48),
             (512, 512, 48),
             (336, 4, 96),
-            (2, 4, 1), // degenerate 2-byte tiles
+            (2, 4, 2), // degenerate 4-byte tiles (1 u32)
         ] {
             let blob = synth_blob(it, ot, tw);
             let dense = pack_wide4(&blob, it, ot).unwrap();
@@ -313,17 +333,16 @@ mod tests {
             assert_eq!(dense.len(), blob.len());
             let back = unpack_wide4(&dense, it, ot).unwrap();
             assert_eq!(back, blob, "{base} round-trip");
-            // Slab 0 sanity: dense starts with it=0 ots 0..4 contiguous.
-            let tile = tw * 2;
-            assert_eq!(&dense[0..tile], &blob[0..tile], "{base} first tile verbatim");
-            for otl in 1..4 {
-                let d0 = otl * tile;
-                let b0 = (0 * ot + otl) * tile;
-                assert_eq!(
-                    &dense[d0..d0 + tile],
-                    &blob[b0..b0 + tile],
-                    "{base} slab0 tile ot_local={otl}"
-                );
+            // Interleaved word sanity: word 0 of the 4 out-tiles are at dense[0..16].
+            let blob_u32: &[u32] = unsafe {
+                std::slice::from_raw_parts(blob.as_ptr() as *const u32, blob.len() / 4)
+            };
+            let dense_u32: &[u32] = unsafe {
+                std::slice::from_raw_parts(dense.as_ptr() as *const u32, dense.len() / 4)
+            };
+            let tile_u32 = tw / 2;
+            for otl in 0..4 {
+                assert_eq!(dense_u32[otl], blob_u32[otl * tile_u32], "{base} word 0 of otl={otl}");
             }
         }
     }

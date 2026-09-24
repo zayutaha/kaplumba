@@ -225,6 +225,7 @@ pub struct Exl3Gemv {
     lib: metal::Library,
     had_in: ComputePipelineState,
     had_in_batched: ComputePipelineState,
+    gelu_had_in: ComputePipelineState,
     /// P5: all `exl3_gemv` dispatches go through the FC-specialized
     /// `gemv_spec_pipeline` cache (bit-identical to the generic kernel, which
     /// stays in the MSL as the test reference).
@@ -299,6 +300,7 @@ impl Exl3Gemv {
             queue: queue.clone(),
             had_in: build("exl3_had_in")?,
             had_in_batched: build("exl3_had_in_batched")?,
+            gelu_had_in: build("exl3_gelu_had_in")?,
             gemv: build("exl3_gemv")?,
             gemv_fused2: build("exl3_gemv_fused2")?,
             gemv_fused3: build("exl3_gemv_fused3")?,
@@ -431,7 +433,7 @@ impl Exl3Gemv {
         const MAX_SPLIT: usize = 16;
         match out_tiles {
             1344 => 2, // gate 5376x21504: sweep argmax
-            336 => 1,  // down 21504x5376 + o 8192x5376: single direct exl3_gemv_post
+            336 => 8,  // down 21504x5376 + o 8192x5376: sweep argmax
             512 => 2,  // q 5376x8192: sweep argmax (was 4)
             256 => 8,  // k/v 5376x4096: T5.2r + sweep argmax (unchanged)
             _ => TARGET_TGS.div_ceil(out_tiles.max(1)).clamp(1, MAX_SPLIT),
@@ -681,6 +683,98 @@ impl Exl3Gemv {
         Ok(())
     }
 
+    /// spec/bandwidth-saturate T5: Fuse gelu_mul(gate, up) into had_in prologue for down_proj.
+    /// Runs down_proj using (gate, up) directly without intermediate DRAM buffer or separate gelu_mul.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_linear_gelu_down_with_scratch(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        gate: &Buffer,
+        up: &Buffer,
+        trellis: DeviceSpan<'_>,
+        suh: DeviceSpan<'_>,
+        svh: DeviceSpan<'_>,
+        out: &Buffer,
+        shape: Exl3Shape,
+        mode: u32,
+        rows: usize,
+        scratch: &ChunkScratch,
+    ) -> Result<(), KernelError> {
+        let inn = shape.in_features();
+        let outp = shape.out_features();
+        let pair_buf = self.pair_buffer(shape.k);
+        let x_rows = Self::xh_rows(rows, shape, trellis);
+        debug_assert!(
+            (scratch.xh.length() as usize) / 2 >= x_rows * inn,
+            "chunk xh under-allocated: {} < {}",
+            scratch.xh.length() / 2,
+            x_rows * inn
+        );
+
+        if rows == 1 {
+            let nsplit = Self::gemv_splits(shape.out_tiles);
+            self.encode_gelu_had_in(enc, gate, up, suh, &scratch.xh, 1, inn);
+            if nsplit == 1 {
+                self.encode_gemv_post(enc, &scratch.xh, trellis, &pair_buf, svh, out, shape, mode);
+            } else {
+                let aligned = u32::from(trellis.byte_offset % 4 == 0);
+                let params: [u32; 7] = [
+                    shape.in_tiles as u32,
+                    shape.out_tiles as u32,
+                    shape.k,
+                    (shape.words_per_tile() / 2) as u32,
+                    mode,
+                    aligned,
+                    nsplit as u32,
+                ];
+                enc.set_compute_pipeline_state(&self.gemv_spec_pipeline(
+                    shape.k,
+                    mode,
+                    aligned,
+                ));
+                enc.set_buffer(0, Some(&scratch.xh), 0);
+                enc.set_buffer(1, Some(trellis.buffer), trellis.byte_offset as u64);
+                enc.set_buffer(2, Some(&pair_buf), 0);
+                enc.set_buffer(3, Some(&scratch.partial), 0);
+                enc.set_bytes(4, 28, params.as_ptr() as *const _);
+                const WARPS: usize = 1;
+                let groups = shape.out_tiles.div_ceil(WARPS) as u64;
+                enc.dispatch_thread_groups(
+                    MTLSize::new(groups, nsplit as u64, 1),
+                    MTLSize::new((32 * WARPS) as u64, 1, 1),
+                );
+                self.encode_gemv_reduce_post(
+                    enc,
+                    &scratch.partial,
+                    svh,
+                    out,
+                    nsplit,
+                    shape.out_tiles,
+                );
+            }
+            return Ok(());
+        }
+
+        debug_assert!(
+            (scratch.y.length() as usize) >= rows * outp * 4,
+            "chunk y under-allocated"
+        );
+        self.encode_gelu_had_in(enc, gate, up, suh, &scratch.xh, rows, inn);
+        self.encode_gem(
+            enc,
+            &scratch.xh,
+            trellis,
+            &pair_buf,
+            shape,
+            mode,
+            &scratch.y,
+            Some(&scratch.partial),
+            rows,
+        );
+        self.encode_had_out(enc, &scratch.y, svh, out, rows, outp);
+        Ok(())
+    }
+
     /// spec/pure-decode-273gb R1: Full 2-way sibling linear pass with scratch arena.
     #[allow(clippy::too_many_arguments)]
     pub fn encode_linear_fused2_with_scratch(
@@ -829,6 +923,35 @@ impl Exl3Gemv {
         enc.set_buffer(1, Some(suh.buffer), suh.byte_offset as u64);
         enc.set_buffer(2, Some(xh), 0);
         enc.set_bytes(3, 4, &hp as *const MslHad as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize::new((row_len / HAD) as u64, rows as u64, 1),
+            MTLSize::new(HAD as u64, 1, 1),
+        );
+    }
+
+    /// spec/bandwidth-saturate T5: Fused GELU + Hadamard prologue (for down_proj).
+    /// Computes gu = (half)(gelu(gate) * up) in registers and transforms directly
+    /// with suh into xh. Eliminates standalone gelu_mul kernel and intermediate gu buffer.
+    pub fn encode_gelu_had_in(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        gate: &Buffer,
+        up: &Buffer,
+        suh: DeviceSpan<'_>,
+        xh: &Buffer,
+        rows: usize,
+        row_len: usize,
+    ) {
+        debug_assert_eq!(row_len % HAD, 0);
+        let hp = MslHad {
+            row_len: row_len as u32,
+        };
+        enc.set_compute_pipeline_state(&self.gelu_had_in);
+        enc.set_buffer(0, Some(gate), 0);
+        enc.set_buffer(1, Some(up), 0);
+        enc.set_buffer(2, Some(suh.buffer), suh.byte_offset as u64);
+        enc.set_buffer(3, Some(xh), 0);
+        enc.set_bytes(4, 4, &hp as *const MslHad as *const _);
         enc.dispatch_thread_groups(
             MTLSize::new((row_len / HAD) as u64, rows as u64, 1),
             MTLSize::new(HAD as u64, 1, 1),
@@ -1757,6 +1880,55 @@ impl Exl3Gemv {
         })
     }
 
+    /// spec/bandwidth-saturate T5: Isolated `gelu_had_in` pass:
+    /// `xh = had_r_128(gelu_mul(gate, up) * suh)` for one row.
+    pub fn gelu_had_in_pass(
+        &self,
+        gate: &[f16],
+        up: &[f16],
+        suh: DeviceSpan<'_>,
+        out: &mut Vec<f16>,
+    ) -> Result<(), KernelError> {
+        let n = gate.len();
+        if n != up.len() {
+            return Err(KernelError::Unsupported(format!(
+                "gelu_had_in lengths differ: gate={} up={}",
+                n,
+                up.len()
+            )));
+        }
+        if n == 0 || n % HAD != 0 {
+            return Err(KernelError::Unsupported(format!(
+                "gelu_had_in needs a multiple of {HAD}, got {n}"
+            )));
+        }
+        Self::ensure_span_fits(&suh, n * 2, "suh", 2)?;
+        out.resize(n, f16::ZERO);
+        let gate_buf = self.device.new_buffer_with_data(
+            gate.as_ptr() as *const _,
+            (n * 2) as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        let up_buf = self.device.new_buffer_with_data(
+            up.as_ptr() as *const _,
+            (n * 2) as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+        );
+        self.with_scratch(n, 0, 1, |sc| {
+            self.submit(|enc| {
+                self.encode_gelu_had_in(enc, &gate_buf, &up_buf, suh, &sc.xh, 1, n);
+            })?;
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    sc.xh.contents() as *const u8,
+                    out.as_mut_ptr() as *mut u8,
+                    n * 2,
+                );
+            }
+            Ok(())
+        })
+    }
+
     /// Isolated GEMV pass: `y = xh @ decode(trellis)` in f32 (no Hadamards).
     /// Test/bench hook.
     pub fn gemv_pass(
@@ -2492,7 +2664,7 @@ mod tests {
         assert_eq!(Exl3Gemv::gemv_splits(4096), 1); // exactly target
         assert_eq!(Exl3Gemv::gemv_splits(1344), 2); // gate (21504 out), sweep argmax
         assert_eq!(Exl3Gemv::gemv_splits(512), 2); // q (8192 out), sweep argmax (was 4)
-        assert_eq!(Exl3Gemv::gemv_splits(336), 1); // down/o (5376 out), single direct exl3_gemv_post
+        assert_eq!(Exl3Gemv::gemv_splits(336), 8); // down/o (5376 out), sweep argmax (was 13-band)
         assert_eq!(Exl3Gemv::gemv_splits(256), 8); // k/v (4096 out), T5.2r + sweep argmax
         assert_eq!(Exl3Gemv::gemv_splits(64), 16); // clamped (want 64)
         assert_eq!(Exl3Gemv::gemv_splits(1), 16);

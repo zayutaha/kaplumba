@@ -645,6 +645,36 @@ impl MetalLinear {
         Ok(())
     }
 
+    /// spec/bandwidth-saturate T5: Fuse gelu_mul(gate, up) into had_in prologue for down_proj.
+    /// Runs down_proj using (gate, up) directly without intermediate DRAM buffer or separate gelu_mul.
+    pub fn encode_gelu_had_in_down(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        gate: &Buffer,
+        up: &Buffer,
+        down: &LinearHandles,
+        out: &Buffer,
+        rows: usize,
+        scratch: &ChunkScratch,
+    ) -> Result<(), MetalLinearError> {
+        self.gemv.encode_linear_gelu_down_with_scratch(
+            enc,
+            gate,
+            up,
+            down.trellis(),
+            down.suh(),
+            down.svh(),
+            out,
+            down.shape,
+            down.mode,
+            rows,
+            scratch,
+        )?;
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
     /// spec/pure-decode-273gb R1: Fused 2-way sibling linear pass (e.g. Gate + Up or Q + K).
     /// Executes batched had_in (2 rows) + gemv_fused2 + had_out in 3 monolithic dispatches.
     pub fn encode_fused2_with_scratch(
@@ -1127,6 +1157,53 @@ kernel void stream_sum_strided(device const uint *buf [[buffer(0)]],
                 w.to_bits(),
                 g.to_bits()
             );
+        }
+    }
+
+    /// spec/bandwidth-saturate T5: `gelu_had_in` must match separate `gelu_mul` + `had_in` bit-for-bit.
+    #[test]
+    fn gpu_gelu_had_in_matches_separate_passes() {
+        let Some(c) = ctx() else { return };
+        let n = 256;
+        let mut rng = Rng(0xCCCC_0001);
+        let gate: Vec<f16> = (0..n)
+            .map(|_| f16::from_f32(((rng.next() % 2001) as f32 / 1000.0) - 1.0))
+            .collect();
+        let up: Vec<f16> = (0..n)
+            .map(|_| f16::from_f32(((rng.next() % 2001) as f32 / 1000.0) - 1.0))
+            .collect();
+        let suh: Vec<f16> = (0..n)
+            .map(|_| if rng.next() % 2 == 0 { f16::from_f32(1.0) } else { f16::from_f32(-1.0) })
+            .collect();
+
+        let ml = MetalLinear::new(&c).unwrap();
+        let gate_buf = c.device().new_buffer_with_data(gate.as_ptr() as *const _, (n * 2) as u64, MTLResourceOptions::StorageModeShared);
+        let up_buf = c.device().new_buffer_with_data(up.as_ptr() as *const _, (n * 2) as u64, MTLResourceOptions::StorageModeShared);
+        let suh_buf = c.device().new_buffer_with_data(suh.as_ptr() as *const _, (n * 2) as u64, MTLResourceOptions::StorageModeShared);
+        let gu_buf = c.device().new_buffer((n * 2) as u64, MTLResourceOptions::StorageModeShared);
+
+        // Separate: gelu_mul -> had_in
+        let cb = c.queue().new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        ml.encode_gelu_mul(enc, DeviceSpan { buffer: &gate_buf, byte_offset: 0 }, DeviceSpan { buffer: &up_buf, byte_offset: 0 }, DeviceSpan { buffer: &gu_buf, byte_offset: 0 }, n).unwrap();
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let mut gu_host = vec![f16::ZERO; n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(gu_buf.contents() as *const u8, gu_host.as_mut_ptr() as *mut u8, n * 2);
+        }
+        let mut want = Vec::new();
+        ml.raw().had_in_pass(&gu_host, DeviceSpan { buffer: &suh_buf, byte_offset: 0 }, &mut want).unwrap();
+
+        // Fused: gelu_had_in
+        let mut got = Vec::new();
+        ml.raw().gelu_had_in_pass(&gate, &up, DeviceSpan { buffer: &suh_buf, byte_offset: 0 }, &mut got).unwrap();
+
+        assert_eq!(want.len(), got.len());
+        for (i, (w, g)) in want.iter().zip(got.iter()).enumerate() {
+            assert_eq!(w.to_bits(), g.to_bits(), "index {i}: separate want {:#06x} vs fused got {:#06x}", w.to_bits(), g.to_bits());
         }
     }
 

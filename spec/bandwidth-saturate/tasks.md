@@ -20,10 +20,10 @@
   - **Intent**: Fuse `input_layernorm` and `pre_feedforward_layernorm` directly into `exl3_had_in_batched`, writing `xh_stack` directly without intermediate `xn` DRAM buffer.
   - **Testing**: Unit test verifying `rms_had_in_batched(x, ln, suh)` produces bit-identical result to `had_in_batched(rms(x, ln), suh)`.
 
-- [ ] **T5: Fused GELU + Hadamard Prologue (`exl3_gelu_had_in`)**
+- [x] **T5: Fused GELU + Hadamard Prologue (`exl3_gelu_had_in`)**
   - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`, `crates/engine/src/metal_linear.rs`, `crates/engine/src/gpu_decode.rs`
   - **Intent**: Fuse `gelu_mul(gate, up)` into `had_in` prologue for `down_proj`, eliminating standalone `gelu_mul` dispatch and `gu` buffer.
-  - **Testing**: Unit test verifying `gelu_had_in(gate, up, suh)` produces bit-identical result to `had_in(gelu_mul(gate, up), suh)`.
+  - **Testing**: `gpu_gelu_had_in_matches_separate_passes` passes 100% bit-exact; `trace_chat_prompt_steps_slow` predicts golden token 818; decode throughput reaches 8.53 t/s (117.3 ms).
 
 - [ ] **T6: Fused Attention Post-Processing (`exl3_qkv_prep`)**
   - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`, `crates/engine/src/metal_linear.rs`, `crates/engine/src/gpu_decode.rs`
