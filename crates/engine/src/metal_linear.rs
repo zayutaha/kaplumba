@@ -2917,6 +2917,275 @@ kernel void bis_flush(device uint *b [[buffer(0)]],
         }
     }
 
+    /// spec/exl3-load-latency: re-tune `gemv_splits` with amortised timing.
+    ///
+    /// The existing policy (1344->2, 336->8, 512->2, 256->8, cap 16) was tuned
+    /// with one `commit()`+`wait()` per dispatch, a cost that dominates any
+    /// kernel under ~0.3 ms — i.e. every measurement that produced it. Its
+    /// argmax is therefore unverified.
+    ///
+    /// This walks 60 distinct real `gate_proj` tensors (2.60 GB, uncacheable) per
+    /// point, all in one command buffer, so the submit is paid once and every
+    /// read is a genuine DRAM read. The ladder above showed a single gate at
+    /// nsplit=2 aggregates to 338 GB/s across 60 dispatches but takes 0.402 ms
+    /// alone — so per-linear threadgroup count is exactly the thing that decides
+    /// whether one linear saturates the machine on its own.
+    #[test]
+    #[ignore]
+    fn bench_nsplit_resweep_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = crate::testutil::artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let Some(c) = ctx() else { return };
+        let device = c.device();
+        use std::time::Instant;
+
+        let opts = metal::CompileOptions::new();
+        let lib = device
+            .new_library_with_source(P1_BISECT_MSL, &opts)
+            .expect("P1");
+        let f = lib.get_function("bis_full", None).expect("bis_full");
+        let pipe = device
+            .new_compute_pipeline_state_with_function(&f)
+            .expect("pipeline");
+
+        let model = crate::load::load_exl3(&c, &dir).expect("load artifact");
+        let src: &dyn TensorSource = &model;
+        let out = device.new_buffer(8, metal::MTLResourceOptions::StorageModeShared);
+        let pbuf = |v: &[u32]| {
+            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            device.new_buffer_with_data(
+                bytes.as_ptr() as *const _,
+                bytes.len() as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+        };
+
+        for (label, which) in [
+            ("gate 5376x21504", "mlp.gate_proj"),
+            ("down 21504x5376", "mlp.down_proj"),
+            ("o    8192x5376 ", "self_attn.o_proj"),
+            ("k    5376x4096 ", "self_attn.k_proj"),
+        ] {
+            let mut items: Vec<(&metal::Buffer, usize, u32, f64)> = Vec::new();
+            for l in 0..60u32 {
+                let name = format!("model.language_model.layers.{l}.{which}");
+                let Ok(lin) = linear_handles(src, &name) else { continue };
+                let Some((tbuf, toff)) = src.device_span(&format!("{name}.trellis")) else {
+                    continue;
+                };
+                let it = lin.shape.in_tiles as u32;
+                let ot = lin.shape.out_tiles as u32;
+                let tw = (lin.shape.words_per_tile() / 2) as u32;
+                let gb = (it * ot * tw) as f64 * 4.0 / 1e9;
+                items.push((tbuf, toff, ot, gb));
+            }
+            if items.is_empty() {
+                continue;
+            }
+            let it0 = linear_handles(
+                src,
+                &format!("model.language_model.layers.0.{which}"),
+            )
+            .map(|l| l.shape.in_tiles as u32)
+            .unwrap_or(336);
+            let ot0 = items[0].2;
+            let tw0 = (linear_handles(src, &format!("model.language_model.layers.0.{which}"))
+                .map(|l| (l.shape.words_per_tile() / 2) as u32)
+                .unwrap_or(24));
+            let xh_len = (it0 as usize) * 16 + 64;
+            let xh_host: Vec<f16> = (0..xh_len)
+                .map(|i| f16::from_f32(((i % 17) as f32 - 8.0) / 64.0))
+                .collect();
+            let xbuf = device.new_buffer_with_data(
+                xh_host.as_ptr() as *const _,
+                (xh_host.len() * 2) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let total_gb: f64 = items.iter().map(|i| i.3).sum();
+            let per = total_gb / items.len() as f64;
+            eprintln!("-- {label}  {} tensors, {:.3} GB each", items.len(), per);
+
+            for ns in [1usize, 2, 4, 8, 16, 32] {
+                let p = pbuf(&[it0, ot0, tw0, ns as u32]);
+                let run = || {
+                    let cb = c.queue().new_command_buffer();
+                    let enc = cb.new_compute_command_encoder();
+                    for (tbuf, toff, ot, _gb) in &items {
+                        enc.set_compute_pipeline_state(&pipe);
+                        enc.set_buffer(0, Some(&xbuf), 0);
+                        enc.set_buffer(1, Some(tbuf), *toff as u64);
+                        enc.set_buffer(2, Some(&out), 0);
+                        enc.set_buffer(3, Some(&p), 0);
+                        enc.dispatch_threads(
+                            metal::MTLSize::new((*ot as u64) * ns as u64, 1, 1),
+                            metal::MTLSize::new(32, 1, 1),
+                        );
+                    }
+                    enc.end_encoding();
+                    cb.commit();
+                    cb.wait_until_completed();
+                };
+                run();
+                let mut v = Vec::with_capacity(5);
+                for _ in 0..5 {
+                    let s = Instant::now();
+                    run();
+                    v.push(s.elapsed().as_secs_f64() * 1e3);
+                }
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let per_ms = v[0] / items.len() as f64;
+                eprintln!(
+                    "   ns{ns:<3} {:7.3} ms/tensor -> {:6.1} GB/s   ({:6} threadgroups)",
+                    per_ms,
+                    per / (per_ms / 1e3),
+                    ot0 as usize * ns
+                );
+            }
+        }
+    }
+
+    /// spec/exl3-load-latency: **do independent dispatches in one encoder
+    /// overlap?** This decides whether the 3x needs concurrent command buffers or
+    /// is already available.
+    ///
+    /// The ladder showed 60 independent `gate` dispatches aggregate to 0.128 ms
+    /// each while one alone takes 0.392 ms — a ~3x overlap. If that overlap is
+    /// already available inside a single command encoder, then the fix is purely
+    /// to give each layer more independent streams. If consecutive dispatches
+    /// serialise, the ~3x needs `MTLCommandBufferDescriptor.concurrentCommands`,
+    /// which the `metal` crate does not currently expose.
+    ///
+    /// Test: time A alone, B alone, and A+B together (A and B are different
+    /// tensors, so genuinely independent). Overlap => A+B ~= max(A,B).
+    /// Serialised => A+B ~= A+B.
+    #[test]
+    #[ignore]
+    fn bench_dispatch_overlap_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = crate::testutil::artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let Some(c) = ctx() else { return };
+        let device = c.device();
+        use std::time::Instant;
+
+        let opts = metal::CompileOptions::new();
+        let lib = device
+            .new_library_with_source(P0_STRIDED_MSL, &opts)
+            .expect("P0");
+        let f = lib
+            .get_function("stream_sum_strided", None)
+            .expect("stream_sum_strided");
+        let pipe = device
+            .new_compute_pipeline_state_with_function(&f)
+            .expect("pipeline");
+
+        let model = crate::load::load_exl3(&c, &dir).expect("load artifact");
+        let src: &dyn TensorSource = &model;
+        let out = device.new_buffer(8, metal::MTLResourceOptions::StorageModeShared);
+        let pbuf = |v: &[u32]| {
+            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            device.new_buffer_with_data(
+                bytes.as_ptr() as *const _,
+                bytes.len() as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+        };
+
+        // Two independent MLP-branch tensors (different layers) plus one
+        // attention-branch tensor, so the mix mirrors a real layer.
+        let mut items: Vec<(&metal::Buffer, usize, u32, u32, metal::Buffer, u32, f64)> =
+            Vec::new();
+        for (l, which) in [(0u32, "mlp.gate_proj"), (0, "self_attn.o_proj"), (1, "mlp.gate_proj")]
+        {
+            let name = format!("model.language_model.layers.{l}.{which}");
+            let Ok(lin) = linear_handles(src, &name) else { continue };
+            let Some((tbuf, toff)) = src.device_span(&format!("{name}.trellis")) else {
+                continue;
+            };
+            let it = lin.shape.in_tiles as u32;
+            let ot = lin.shape.out_tiles as u32;
+            let tw = (lin.shape.words_per_tile() / 2) as u32;
+            let ns = if ot == 1344 { 2usize } else { 8 };
+            let p = pbuf(&[it, ot, tw, ns as u32]);
+            let gb = (it * ot * tw) as f64 * 4.0 / 1e9;
+            items.push((tbuf, toff, ot, tw, p, ((ot as usize) * ns) as u32, gb));
+        }
+        if items.len() < 3 {
+            eprintln!("skip: need 3 spans, got {}", items.len());
+            return;
+        }
+
+        let dispatch = |enc: &metal::ComputeCommandEncoderRef, k: usize| {
+            let (tbuf, toff, _ot, _tw, p, threads, _gb) = &items[k];
+            enc.set_compute_pipeline_state(&pipe);
+            enc.set_buffer(0, Some(tbuf), *toff as u64);
+            enc.set_buffer(1, Some(&out), 0);
+            enc.set_buffer(2, Some(p), 0);
+            enc.dispatch_threads(
+                metal::MTLSize::new(*threads as u64, 1, 1),
+                metal::MTLSize::new(32, 1, 1),
+            );
+        };
+        let run = |ks: &[usize]| {
+            let cb = c.queue().new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            for k in ks {
+                dispatch(&enc, *k);
+            }
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+        };
+        let time = |ks: &[usize]| {
+            run(ks);
+            let mut v = Vec::with_capacity(6);
+            for _ in 0..6 {
+                let s = Instant::now();
+                run(ks);
+                v.push(s.elapsed().as_secs_f64() * 1e3);
+            }
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            v[0]
+        };
+        let a = time(&[0]);
+        let b = time(&[1]);
+        let ab = time(&[0, 1]);
+        let abc = time(&[0, 1, 2]);
+        eprintln!("== independent-dispatch overlap, one command buffer each ==");
+        eprintln!(
+            "A alone      {a:7.3} ms",
+        );
+        eprintln!(
+            "B alone      {b:7.3} ms",
+        );
+        eprintln!(
+            "A+B          {ab:7.3} ms   sum={:.3} max={:.3} -> {:.2}x overlap",
+            a + b,
+            a.max(b),
+            (a + b) / ab
+        );
+        eprintln!(
+            "A+B+C        {abc:7.3} ms   sum={:.3} -> {:.2}x overlap",
+            a + b + time(&[2]),
+            (a + b + time(&[2])) / abc
+        );
+        eprintln!(
+            "=> {} overlap",
+            if ab < (a + b) * 0.85 { "YES — concurrency is free" } else { "NO — dispatches serialise" }
+        );
+    }
+
     /// spec/exl3-load-latency: the ladder on real tensors with a working set
     /// that cannot be cached.
     ///
