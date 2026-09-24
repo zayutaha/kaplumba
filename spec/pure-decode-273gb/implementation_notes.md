@@ -218,3 +218,33 @@ wide1 tests (3): synthetic shapes incl (2,4,1), rejects_bad_length, real artifac
 (v/down/gate/o). repack3 suite green: 7 passed / 0 failed.
 Next: exl3_gemv_dense3_wide1 kernel (== exl3_gemv_spec with linear tile advance), then
 wide4 kernel, then fast GPU gates gpu_dense3_{wide1,wide4}_matches_word.
+
+## 2026-09-24 — spec/trellis-dense-repack RT2 part b: dense kernels (exl3.metal)
+Appended `exl3_gemv_dense1` (W1) and `exl3_gemv_dense4` (W4) after `exl3_gemv_probe`
+(~L2917, file now ~L3560). Drafted fully (not line-by-line edits): they are the
+`exl3_gemv_spec` body with dense tile addressing — W1 line-advance per `it`
+(`tile += twords*2`), W4 slab (tile = `dense + (block*in_tiles+it)*4*twords*2`, slots at
+`+0/+1/+2/+3` twords*2, advance `+= 4*twords*2`), 4×2 accumulators. Correctness net:
+- Same word indices (ig0_/ig1_/s3_ from FC_K/FC_MODE c0) and same per-slot column order
+  for both accA/accB as spec (accA += x00*x01 then x02*x03; then accB same) → same f32
+  partial sums per (row,it) → bit-identical partials → same reduce_post result.
+- Grid: tg.x = out-tile (W1) / 4-out-tile block (W4), tg.y = nsplit chunk, partials to
+  y[(tg.y*out_tiles+ot)*TILE + c0]/+8 exactly as spec; `live` guards block OOB.
+- k==7 pair path is a no-op (dense only ever k=3); FC_K buffer-wide constant.
+- W4 lane math identical to W1 except each 16-row group covers all 4 tiles of the it.
+DECISION (documented in tasks.md): NO `_post` dense twins. gemv_splits gives every k=3
+dense linear nsplit≥2 (gate/up n2, down/o n8, q n2, k/v n8), so dense spec kernels cover
+all production decode paths; nsplit==1 dense (never on real shapes) falls back to dense
+spec + encode_gemv_reduce_post with identical math. Also deferred: prefill rows>1 dense
+(no `_fused2/_fused3` dense variants yet) → RT6. rows==1 only this iteration.
+VALIDATION gotcha (update your mental model): this crate has NO build.rs; MSL is
+include_str!'d and compiled at RUNTIME by new_library_with_source, so `cargo build`
+does NOT catch Metal errors. Any engine test that constructs MetalLinear::new validates
+the whole library. Used `gpu_gemv_spec_matches_generic` → whole library compiled, test
+PASSED (1 passed / 0 failed). Repack3 suite still 7/0.
+Also: Metal `new_library_with_source` compiles the ENTIRE source even if a function
+is never fetched — one bad kernel anywhere = every GPU test fails. Good early failure.
+Next: RT2 part c — exl3.rs: DenseLayout enum, dense pipeline pool keyed
+(layout,k,mode,aligned) + builder, encode_gemv_dense_spec (W1 groups=out_tiles,
+W4 = div_ceil(out_tiles,4); partial buffer reuse chunk_scratch), encode_linear_dense_with_scratch
+(rows==1: had_in → dense spec partial → encode_gemv_reduce_post → f16 out).

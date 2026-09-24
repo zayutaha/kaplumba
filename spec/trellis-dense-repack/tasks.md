@@ -52,23 +52,42 @@ Order matters; commit after every task (AGENTS §4). Gated benchmarks run with
 - **Note**: L-planar superseded by RT0 (decode ≈ stream ⇒ bit-plane ALU savings are nil).
   The A/B is the two contiguous-span layouts **W1** (`[otblock][ot][it]`, per-line runs)
   and **W4** (`[otblock][it][ot 0..4]`, 4-line interleave; packer ships in RT1).
-- **Status**: in progress — **part a done** (W1 packer, see below); part b (wide1/wide4
-  kernels + gates) pending. See `implementation_notes` for build/measure details at each step.
+- **Status**: in progress — **parts a+b done** (W1 packer, wide1/wide4 kernels); part c
+  (pipeline/encode, exl3.rs) next; part d (gates) after. See `implementation_notes` for
+  build/measure details at each step.
+- **Deviation (decided during part b)**: no `_post` dense twins. Every k=3 dense
+  linear has nsplit≥2 via `gemv_splits` (gate/up n2, down/o n8, q n2, k/v n8), so the
+  spec-family (partials) kernels cover ALL production dense paths; nsplit==1 dense uses
+  the dense spec kernel + `encode_gemv_reduce_post` (same products, same f32 split
+  summation order → bit-identical). Also **rows>1 prefill gates deferred to RT6** —
+  dense encode is rows==1 only this iteration (tests below say "rows 1 and 64" → rows 1
+  only).
+- **Part b (in progress, kernels appended)**: `exl3_gemv_dense1` (W1) and
+  `exl3_gemv_dense4` (W4) appended to `exl3.metal` — spec-geometry (one warp per
+  out-tile / per 4-out-tile block, grid.y = nsplit chunk, partials in the
+  `[(split*out_tiles+ot)*TILE+..]` layout `exl3_gemv_reduce[_post]` reads). W1 tile init
+  `dense + (ot*in_tiles+it0)*twords*2`, advance `tile += twords*2` per `it`; W4
+  block=grid.x, base_ot=block*4, init `dense+(block*in_tiles+it0)*4*twords*2`, advance
+  `tile += 4*twords*2`, slot j = `tile + j*twords*2`, 4×2 accumulators, 4 partial row
+  writes. Per-slot accumulation statement order mirrors `exl3_gemv_spec` exactly
+  (bit-exact). k==7 path a no-op. Whole-MSL library compile validated via
+  `gpu_gemv_spec_matches_generic` (Metal compile errors are library-wide).
 - **Part a (commit `df25c3a`)**: `pack_wide1`/`unpack_wide1` =
   `[otblock(4)][ot_local][it]` per-line contiguous runs (per out-tile line ~32 KB);
   W1 == Wide4 with block size 1, no new packer machinery. 3 tests (synthetic incl
   (2,4,1), rejects_bad_length, real artifacts round-trip + per-tile verbatim).
   Wide1/Wide4 both require ot%4==0; real k=3 geometries all divisible by 4.
 - **Files**: `crates/engine/src/repack3.rs` (add `pack_wide1`/`unpack_wide1` + tests),
-  `crates/kernels/src/exl3.metal` (add `exl3_gemv_dense3_wide1` + `exl3_gemv_dense3_wide4`
-  (+ `_post` twins, same 128-thread/8-out-tile/nsplit geometry)), `crates/kernels/src/exl3.rs`
+  `crates/kernels/src/exl3.metal` (add `exl3_gemv_dense1` + `exl3_gemv_dense4`, k=3,
+  spec geometry; dense twins of the `_post` kernel deliberately NOT added — see
+  deviation), `crates/kernels/src/exl3.rs`
   (pipeline/family selector, pool key gains layout dimension),
   `crates/engine/src/metal_linear.rs` (`LinearFormat` on handles, `encode_gemv`-family
   dispatch by format, gates).
 - **Testing**: fast GPU gates `gpu_dense3_wide1_matches_word` and
   `gpu_dense3_wide4_matches_word` on real layer-0 linears (4 shapes, both modes,
-  byte-offset 0 and 2, rows 1 and 64): bit-identical outputs vs the current word
-  kernels; plus fused2/fused3 dense variants for the winner in RT4.
+  byte-offset 0 and 2, rows 1 — prefill rows deferred to RT6): bit-identical outputs
+  vs the current word kernels; plus fused2/fused3 dense variants for the winner in RT4.
 - **Commit**: gates green.
 
 ## RT3 — Broad bit-exactness gates across layers
