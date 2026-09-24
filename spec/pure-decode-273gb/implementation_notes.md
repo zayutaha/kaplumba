@@ -140,3 +140,22 @@ policy — it dominates at ~5.9 ms/token.
 Reverted via `git checkout --` the three touched files (exl3.metal, exl3.rs,
 metal_linear.rs). HEAD remains `5e4e830` (P5). Fast suites green afterwards
 (engine 124 + kernels 21).
+
+## P6 continuation (2026-09-24, after LUT revert)
+
+### Clean post-LUT baselines (fresh, release, HEAD 5e4e830)
+- decode_throughput_slow (forward-only): **117.0 ms/token → 8.55 t/s**; e2e 8.53 t/s; implied 95.8 GB/s over 11.200 GB/token; roofline 24.4 t/s @ 273 GB/s.
+- decode_layer_scaling_slow: fwd(n) = 6.78 + 1.837·n ms (60 layers → 110.2 ms); non-layer fixed a ≈ 6.8 ms ≈ lm_head (4.64 ms isolated) + embed + waits; L=0 → 5.53 ms/token.
+- Roofline math: 50 ms/token (20 t/s) needs 224 GB/s → per-layer ≈ 0.75 ms ≈ 239 GB/s vs measured 1.837 ms/layer ≈ 97.6 GB/s in-context. lm fixed cost ≈ 4.6 ms must also drop proportionally (×~0.5).
+
+### bench_linear_bandwidth_slow (engine, gated) — per-linear isolated, release, warm min-of-20, REAL trellis bytes
+gate 0.530ms 81.8 GB/s; up 82.0; down 81.7; o 53.9; q 53.4; k 35.9; v 35.2; lm k6 **228.2 GB/s**; gu2 (fused) 93.0; qkv3 (fused) 69.3. NB: sweep bench prints GB/s=(in×out)/t which overstates by k/8 (weights-count not trellis bytes); scale ×k/8 for real.
+
+### bench_gemv_split_sweep_slow rerun (release, min-of-12, v1 generic)
+real GB/s ≈ shown × k/8: down n8 0.575·200→75, o n8 0.328·134→50, q n2 0.333·132→50, k/v ~85→32, lm n1 4.665·302→226. Policy (gate→2, q→2, down/o→8, k/v→8, lm→1, tiny→16) confirmed; no argmax changes.
+
+### 4-way unroll experiment (exl3_gemv_spec k≠7 loop) — NEGATIVE, reverted
+Widened 2-way→4-way (8 ld_word in flight per warp), validated by fast bit-exact gates (gpu_gemv_spec_matches_generic; fixture argmax 236773). Bandwidth vs 2-way: down 81.7 (81.8), o 53.9 (57.3), q 53.4 (54.6), k 35.9 (37.9), v 35.2 (36.9), lm 228.2 (227.8), gu2 93.0 (94.7), qkv3 69.3 (72.2). Flat-to-worse ⇒ backend already software-pipelines; more register pressure. Reverted via git checkout; suites green (engine 124, kernels 21).
+
+### Conclusion after P6-T1..T3
+Geometry/nsplit/spec-split/LUT/unroll are exhausted within the current shared EXL3 trellis layout. k=3 linears cap ~55-95 GB/s vs k=6 lm 228. Dominating remaining hypothesis: per-byte decode-ALU/dependency (k=3 ≈ 2× k=6 per byte). Only a format/layout repack (new spec, affects converter + on-disk + memory layout) can cut it — needs user decision. No in-band knob untested.
