@@ -90,5 +90,11 @@ stage-by-stage in `spec/exl3-load-latency`.
 - Eliminates 60 separate RMSNorm launches per token (and avoids DRAM round-trip for 60 * 5376 floats).
 - Forward-only decode latency drops to **115.0 ms/token (8.70 t/s, 97.4 GB/s)**. Bit-exact parity verified with golden token 818.
 
+## 2026-09-25 — T5.2: Coalesced 64-Byte SIMD Store for GEMV (`exl3_gemv`, `exl3_gemv_spec`, fused)
+- Replaced the 8-lane strided 2-float stores `(g & 3u) == 0u` in `exl3_gemv`, `exl3_gemv_spec`, `exl3_gemv_fused2`, and `exl3_gemv_fused3` with a 16-lane contiguous 64-byte burst store via `simd_shuffle`.
+- Eliminates uncoalesced memory transactions across 320,000+ threadgroup stores per token.
+- Bit-exact parity maintained across all test suites and `trace_chat_prompt_steps_slow` (token 818).
+
+
 
 

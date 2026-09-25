@@ -549,10 +549,10 @@ kernel void exl3_gemv(device const half *xh [[buffer(0)]],
     accA += simd_shuffle_down(accA, 2);
     accB += simd_shuffle_down(accB, 1);
     accB += simd_shuffle_down(accB, 2);
-    if (live && (g & 3u) == 0u) {
-        uint c0 = g >> 2;
-        y[(tg.y * p.out_tiles + ot) * TILE + c0] = accA;
-        y[(tg.y * p.out_tiles + ot) * TILE + c0 + 8u] = accB;
+    float val = (g < 8u) ? simd_shuffle(accA, ushort(g * 4u))
+                         : simd_shuffle(accB, ushort((g - 8u) * 4u));
+    if (live && g < 16u) {
+        y[(tg.y * p.out_tiles + ot) * TILE + g] = val;
     }
 }
 
@@ -798,10 +798,10 @@ kernel void exl3_gemv_spec(device const half *xh [[buffer(0)]],
     accA += simd_shuffle_down(accA, 2);
     accB += simd_shuffle_down(accB, 1);
     accB += simd_shuffle_down(accB, 2);
-    if (live && (g & 3u) == 0u) {
-        uint c0 = g >> 2;
-        y[(tg.y * p.out_tiles + ot) * TILE + c0] = accA;
-        y[(tg.y * p.out_tiles + ot) * TILE + c0 + 8u] = accB;
+    float val = (g < 8u) ? simd_shuffle(accA, ushort(g * 4u))
+                         : simd_shuffle(accB, ushort((g - 8u) * 4u));
+    if (live && g < 16u) {
+        y[(tg.y * p.out_tiles + ot) * TILE + g] = val;
     }
 }
 
@@ -1106,10 +1106,10 @@ kernel void exl3_gemv_fused2(device const half *xh [[buffer(0)]],            // 
     accA += simd_shuffle_down(accA, 2);
     accB += simd_shuffle_down(accB, 1);
     accB += simd_shuffle_down(accB, 2);
-    if ((g & 3u) == 0u) {
-        uint c0 = g >> 2;
-        y[(tg.y * out_tiles_total + ot_global) * TILE + c0] = accA;
-        y[(tg.y * out_tiles_total + ot_global) * TILE + c0 + 8u] = accB;
+    float val = (g < 8u) ? simd_shuffle(accA, ushort(g * 4u))
+                         : simd_shuffle(accB, ushort((g - 8u) * 4u));
+    if (g < 16u) {
+        y[(tg.y * out_tiles_total + ot_global) * TILE + g] = val;
     }
 }
 
@@ -1412,10 +1412,10 @@ kernel void exl3_gemv_fused3(device const half *xh [[buffer(0)]],            // 
     accA += simd_shuffle_down(accA, 2);
     accB += simd_shuffle_down(accB, 1);
     accB += simd_shuffle_down(accB, 2);
-    if ((g & 3u) == 0u) {
-        uint c0 = g >> 2;
-        y[(tg.y * out_tiles_total + ot_global) * TILE + c0] = accA;
-        y[(tg.y * out_tiles_total + ot_global) * TILE + c0 + 8u] = accB;
+    float val = (g < 8u) ? simd_shuffle(accA, ushort(g * 4u))
+                         : simd_shuffle(accB, ushort((g - 8u) * 4u));
+    if (g < 16u) {
+        y[(tg.y * out_tiles_total + ot_global) * TILE + g] = val;
     }
 }
 

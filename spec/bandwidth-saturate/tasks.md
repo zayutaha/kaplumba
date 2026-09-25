@@ -30,6 +30,11 @@
   - **Intent**: Fuse `pre_ff_ln` RMSNorm into Gate+Up GEMV via `encode_rms_fused2_with_scratch` and update `encode_gelu_had_in_down` to read `gate` and `up` slices directly from `gu_raw`, eliminating intermediate `xn` write and separate RMSNorm dispatch per layer (60 dispatches/token eliminated).
   - **Testing**: `gpu_gelu_had_in_matches_separate_passes` and all 135 unit tests pass; `trace_chat_prompt_steps_slow` predicts golden token 818; decode forward-only latency reaches 115.0 ms/token (8.70 t/s, 97.4 GB/s).
 
+- [x] **T5.2: Coalesced 64-Byte SIMD Store for GEMV (`exl3_gemv`, `exl3_gemv_spec`, fused)**
+  - **Files**: `crates/kernels/src/exl3.metal`
+  - **Intent**: Replace the 8-lane strided 2-float stores in `exl3_gemv`, `exl3_gemv_spec`, `exl3_gemv_fused2`, and `exl3_gemv_fused3` with a 16-lane contiguous 64-byte burst write via `simd_shuffle`, eliminating uncoalesced memory transactions across all GEMV partial dispatches.
+  - **Testing**: All 21 kernel tests pass; all 135 engine unit tests pass; `trace_chat_prompt_steps_slow` predicts golden token 818 bit-identically.
+
 - [~] **T6: Fused Attention Post-Processing (`exl3_qkv_prep`)** — **DEFERRED 2026-09-24**
   - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`, `crates/engine/src/metal_linear.rs`, `crates/engine/src/gpu_decode.rs`
   - **Was**: Fuse Q/K RMS norm, RoPE rotation, and V cache write into a unified `qkv_prep` kernel, cutting 5 dispatches per layer.
