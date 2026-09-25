@@ -57,6 +57,17 @@
 - Real metadata test passed with `KAPLUMBA_TEST_MODEL=/Users/zayaantaha/.kaplumba/models/Gxma/Gxma cargo test -p kaplumba-engine -- --ignored`; it reads headers only and reports 14,876,563,172 text bytes and 1,151,487,072 vision bytes excluded.
 - T2 commit: `8e5eca9` (`spec/gemma4-metal-engine: T2 parse checkpoint metadata`).
 
+## T3 — Metal-owned text weights
+
+- Added `MetalContext` with system-device/queue ownership, shared-storage buffer creation, maximum-buffer validation, and explicit allocation-size errors.
+- Added a chunked `WeightArena`; the default 512 MiB segments avoid single-buffer limits for the 2.8 GB embedding and 1.06 GB language head, while allowing tensors to span segments.
+- Added read-only mmap with RAII `munmap`; source shards are released when loading returns.
+- Plain BF16 tensors are converted in 8 MiB chunks to FP16; FP16 and packed EXL3 tensor bytes are copied without transformation.
+- The arena enforces the 18,000,000,000-byte resident limit before allocation and reports logical versus allocated capacity separately.
+- Synthetic tests cover BF16 conversion, packed-byte retention, F16 spans crossing segments, vision exclusion, unsupported dtypes, allocation-limit failure, and real text-selection compatibility.
+- The real selection test passed without allocating model weights; all 14,876,563,172 text bytes classify successfully and vision tensors remain excluded.
+- With 512 MiB segments, the current text selection plans for 28 segments and 15,032,385,536 allocated bytes, below the 18 GB gate; this is a capacity calculation, not a completed model-load RSS measurement.
+
 ## Current risks
 
 - Metal-owned copies of approximately 14.88 GB of text data plus 8k KV and runtime buffers must remain below the agreed 18 GB RSS ceiling.

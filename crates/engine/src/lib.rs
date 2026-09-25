@@ -1,5 +1,7 @@
 pub mod config;
+pub mod metal;
 pub mod safetensors;
+pub mod weights;
 
 pub const ENGINE_NAME: &str = "kaplumba-engine";
 
