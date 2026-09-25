@@ -951,6 +951,83 @@ impl MetalLinear {
         Ok(())
     }
 
+    /// Probe: the Gate+Up prologue alone (RMSNorm + Hadamard + 2-row batched
+    /// xh), so the combined `encode_rms_fused2_with_scratch` cost can be split.
+    pub fn probe_rms_had_in_batched(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        x: DeviceSpan<'_>,
+        w: Option<DeviceSpan<'_>>,
+        eps: f32,
+        suh_stack: DeviceSpan<'_>,
+        xh_stack: &Buffer,
+        n_rows: usize,
+        row_len: usize,
+    ) {
+        self.gemv
+            .encode_rms_had_in_batched(enc, x, w, eps, suh_stack, xh_stack, n_rows, row_len);
+    }
+
+    /// Probe: the Gate+Up GEMV alone (`exl3_gemv_post_fused2`, no prologue).
+    pub fn probe_gemv_post_fused2(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        xh: &Buffer,
+        fused: &Fused2Handles,
+        out: &Buffer,
+    ) {
+        self.gemv.encode_gemv_post_fused2(
+            enc,
+            xh,
+            fused.trellis_a(),
+            fused.trellis_b(),
+            &self.gemv.pair_buffer_for_test(fused.shape_a.k),
+            fused.svh_cat(),
+            out,
+            fused.shape_a,
+            fused.shape_b,
+            fused.mode,
+        );
+    }
+
+    /// Probe: `exl3_gemv_fused2` only (writes f32 partials, no Hadamard).
+    pub fn probe_gemv_fused2(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        xh: &Buffer,
+        fused: &Fused2Handles,
+        partial: &Buffer,
+        nsplit: usize,
+    ) {
+        self.gemv.encode_gemv_fused2(
+            enc,
+            xh,
+            fused.trellis_a(),
+            fused.trellis_b(),
+            &self.gemv.pair_buffer_for_test(fused.shape_a.k),
+            fused.shape_a,
+            fused.shape_b,
+            fused.mode,
+            partial,
+            None,
+            Some(nsplit),
+        );
+    }
+
+    /// Probe: the K-split reduce + Hadamard + SVH epilogue on its own.
+    pub fn probe_reduce_post(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        partial: &Buffer,
+        svh_cat: DeviceSpan<'_>,
+        out: &Buffer,
+        nsplit: usize,
+        out_tiles: usize,
+    ) {
+        self.gemv
+            .encode_gemv_reduce_post(enc, partial, svh_cat, out, nsplit, out_tiles);
+    }
+
     /// spec/bandwidth-saturate: Unified attention prologue (Q, K, V post-processing in one kernel launch).
     #[allow(clippy::too_many_arguments)]
     pub fn encode_rms_rope_qkv(

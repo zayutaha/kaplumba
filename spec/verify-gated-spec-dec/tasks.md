@@ -14,6 +14,12 @@
   - **Result**: Done. Truncate correctly resets `l.len` and sequence `self.len`, properly handles sliding window boundaries, rejects invalid lengths > `self.len`, and allows seamless appending at the truncated position.
   - **Commit**: TBD
 
+- [ ] **T3.5: Small-M verify latency probe — decide T4 kernel path (R3 pre-work)**
+  - **Files**: `crates/engine/src/gpu_decode.rs` (test only), possibly `crates/kernels/src/exl3.rs`
+  - **Intent**: T1 measured 4-row verify at 374.9 ms (93.7 ms/row) — ~8× the 12.5–14.4 ms/row prefill marginal cost (`spec/prefill-scratch-fix`) and ~8× the 12.4 ms/row tensor-core compute floor. The gap: M=2..31 takes `exl3_gemm` (RGT=8, ~0.7 TFLOP/s) while M≥32 takes `exl3_gemm_sg` (BM=64, ~5 TFLOP/s). Probe verify wall-clock for M ∈ {1,2,4,8,16,32,64} with **amortised timing** (one commit+wait per M, never per-linear — the `exl3-load-latency` measurement bug), on real weights, reporting ms/row. This decides whether T4 targets 20 t/s (needs ≤~100 ms for 4 rows) or whether the spec re-baselines to ~12 t/s.
+  - **Testing**: `KAPLUMBA_RUN_SLOW=1 cargo test -p kaplumba-engine --release --lib bench_verify_rowsweep_slow -- --ignored --nocapture --test-threads=1`.
+  - **Rationale for placement**: plan.md's amortization math assumes ~40 ms for K=3 verify, which T1's own measurement contradicts by ~8×. Measure the real curve before writing T3/T4 code.
+
 - [ ] **T3: Implement shallow-layer target drafter (R2)**
   - **Files**: `crates/engine/src/gpu_decode.rs`
   - **Intent**: Add shallow-layer drafting method (`draft_step`) that runs $L_{\text{draft}} \in [2, 4]$ layers and projects logits to propose speculative tokens.

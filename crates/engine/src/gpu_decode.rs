@@ -374,6 +374,14 @@ impl GpuDecoder {
         let hidden = self.hidden;
         let eps = model.cfg.eps as f32;
 
+        // ---- diagnostic probe flags (KAPLUMBA_PROBE_SKIP_*) -----------------
+        // Timing-only stage omission; output is garbage whenever a stage is
+        // skipped. Measures the *marginal* cost of a dispatch inside the real
+        // dependency chain, which the isolated 60-layer sub-passes cannot show,
+        // because those run without a preceding drain.
+        let skip_ew = std::env::var_os("KAPLUMBA_PROBE_SKIP_EW").is_some();
+        let skip_attn = std::env::var_os("KAPLUMBA_PROBE_SKIP_ATTN").is_some();
+
         // Host: embedding row (bf16 → f16 ×√hidden) into ring slot 0.
         {
             let row = model.embed_row(token)?;
@@ -446,6 +454,9 @@ impl GpuDecoder {
                 .ok_or_else(|| GemmaError::Config("kv v row span".into()))?;
 
             let v_in = if lw.v.is_some() { v_span } else { k_span };
+            if skip_attn {
+                gpu.encode_copy(enc, q_span, q_span, k_len + lw.n_kv * hd)?;
+            } else {
             gpu.encode_rms_rope_qkv(
                 enc,
                 q_span,
@@ -464,7 +475,9 @@ impl GpuDecoder {
                 pos,
                 eps,
             )?;
+            }
 
+            if !skip_attn {
             gpu.encode_attention(
                 enc,
                 q_span,
@@ -486,6 +499,7 @@ impl GpuDecoder {
                     window: crate::gemma4::layer_window(lw.kind, model.cfg.sliding_window),
                 },
             )?;
+            }
             gpu.encode_linear_with_scratch(
                 enc,
                 &lw.o,
@@ -494,16 +508,18 @@ impl GpuDecoder {
                 1,
                 &self.lin_temps,
             )?;
-            gpu.encode_rms_add(
-                enc,
-                span(&self.o_proj),
-                Some(span(&lw.post_attn_ln)),
-                span(x_in),
-                span(x_mid),
-                1,
-                hidden,
-                eps,
-            )?;
+            if !skip_ew {
+                gpu.encode_rms_add(
+                    enc,
+                    span(&self.o_proj),
+                    Some(span(&lw.post_attn_ln)),
+                    span(x_in),
+                    span(x_mid),
+                    1,
+                    hidden,
+                    eps,
+                )?;
+            }
 
             // --- MLP sublayer ---
             let intermediate = lw.gate.shape.out_features();
@@ -533,17 +549,19 @@ impl GpuDecoder {
                 1,
                 &self.lin_temps,
             )?;
-            gpu.encode_rms_add_scale(
-                enc,
-                span(&self.down),
-                Some(span(&lw.post_ff_ln)),
-                span(x_mid),
-                span(x_out),
-                1,
-                hidden,
-                eps,
-                lw.scalar,
-            )?;
+            if !skip_ew {
+                gpu.encode_rms_add_scale(
+                    enc,
+                    span(&self.down),
+                    Some(span(&lw.post_ff_ln)),
+                    span(x_mid),
+                    span(x_out),
+                    1,
+                    hidden,
+                    eps,
+                    lw.scalar,
+                )?;
+            }
         }
 
         // --- final norm + lm_head (whole head in one dispatch; the CPU path
@@ -1300,6 +1318,65 @@ mod tests {
             for i in 0..60 {
                 let lw = &decoder.layers[i];
                 gpu.encode_rms_fused2_split_with_scratch(enc, &lw.gate_up_fused, span(&decoder.x[1]), Some(span(&lw.pre_ff_ln)), eps, &decoder.gu_raw, &decoder.lin_temps, 8).unwrap();
+            }
+        });
+
+        // 6d/6e: split the Gate+Up stage into its prologue and its GEMV so the
+        // 47 ms total can be attributed. Case 6 above runs both together.
+        time_cmd("6d. rms_had_in (g+u)", &|enc| {
+            for i in 0..60 {
+                let lw = &decoder.layers[i];
+                let inn = lw.gate.shape.in_features();
+                gpu.probe_rms_had_in_batched(
+                    enc,
+                    span(&decoder.x[1]),
+                    Some(span(&lw.pre_ff_ln)),
+                    eps,
+                    lw.gate_up_fused.suh_stack(),
+                    &decoder.lin_temps.xh,
+                    2,
+                    inn,
+                );
+            }
+        });
+        time_cmd("6e. gemv_post_fused2", &|enc| {
+            for i in 0..60 {
+                let lw = &decoder.layers[i];
+                gpu.probe_gemv_post_fused2(
+                    enc,
+                    &decoder.lin_temps.xh,
+                    &lw.gate_up_fused,
+                    &decoder.gu_raw,
+                );
+            }
+        });
+
+        // 6f/6g: split the nsplit path so the GEMV and the Hadamard+SVH
+        // epilogue are timed separately.
+        time_cmd("6f. gemv_fused2 (nosp)", &|enc| {
+            for i in 0..60 {
+                let lw = &decoder.layers[i];
+                gpu.probe_gemv_fused2(
+                    enc,
+                    &decoder.lin_temps.xh,
+                    &lw.gate_up_fused,
+                    &decoder.lin_temps.partial,
+                    1,
+                );
+            }
+        });
+        time_cmd("6g. reduce_post (ns=1)", &|enc| {
+            for i in 0..60 {
+                let lw = &decoder.layers[i];
+                let ot = lw.gate.shape.out_features() / 16 + lw.up.shape.out_features() / 16;
+                gpu.probe_reduce_post(
+                    enc,
+                    &decoder.lin_temps.partial,
+                    lw.gate_up_fused.svh_cat(),
+                    &decoder.gu_raw,
+                    1,
+                    ot,
+                );
             }
         });
 

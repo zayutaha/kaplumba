@@ -136,3 +136,73 @@ stage-by-stage in `spec/exl3-load-latency`.
 - Unit tested bit-exactness in `rms_rope_qkv_matches_separate_passes`. All 24 kernel tests and 135 engine unit tests pass.
 - Verified golden token 818 ("The") in `trace_chat_prompt_steps_slow`.
 - Pass 2 latency (`RoPE Q,K + Norm V`) dropped from 0.60 ms to **0.34 ms** across 60 layers. Total decode latency drops to **113.14 ms**.
+
+## 2026-09-25 — Coherence gates + decode bottleneck campaign (8.63 t/s, still 112.4 ms/token)
+
+### Gates landed and proven effective
+- `9ba195b` added `trace_chat_prompt_steps_slow` (asserts all 20 prompt-step argmaxes
+  `[236773,236773,236773,616,236749,7243,1331,3207,7001,1852,108,669,100,100,100,100,45518,107,101,818]`)
+  and `decode_coherence_slow` (asserts the 24-token `EXPECTED` vector +
+  `text.contains("capital of France is Paris")`). Both caught the first fused-dispatch bug
+  on their first run.
+- **Run them one at a time.** They are *env-gated*, not `#[ignore]` — `KAPLUMBA_RUN_SLOW=1 cargo test
+  -p kaplumba-engine --release --lib trace_chat_prompt_steps_slow -- --nocapture` (drop `--ignored`).
+  Running two gates in one process loads the 11.8 GB artifact twice: 157 s vs 8 s each.
+  Model load is one `load_exl3` into a single shared device buffer (64-byte aligned offsets →
+  `aligned=1` always); peak RSS 8.14 GB single test / 8.93 GB both — no double residency.
+
+### Isolated stage table (`bench_decode_breakdown_slow`, 60 layers) — sums to 112.55 ≈ 112.40 measured
+| stage | ms | MB | GB/s |
+|---|---|---|---|
+| QKV | 21.90 | 2023 | 92 |
+| RoPE Q,K + Norm V | 0.35 | — | — |
+| Attention (s=1) | 0.40 | — | — |
+| O proj | 11.16 | 1156 | 104 |
+| Post-Attn RMSAdd | 1.65 | — | — |
+| Gate+Up | 47.07 | 5202 | 111 |
+| Down (GELU+Had) | 23.75 | 2601 | 110 |
+| Post-FF RMSAddScale | 1.58 | — | — |
+| FinalNorm+LM | 4.69 | 1057 | **225** |
+No hidden cross-stage overhead. `MetalLinear::calls()` does not count `encode_attention`/`encode_rms`.
+
+### Dispatch count is NOT the bottleneck (probe in `encode_token`, `KAPLUMBA_PROBE_SKIP_EW`/`_ATTN`)
+baseline 113.7 ms · skip elementwise (120 dispatches) 110.1 · skip attn+rope 112.5 · both 110.1.
+**Marginal ≈ 0.015 ms/dispatch.** 591 dispatches/token (`bench_dispatch_count_slow`, 9.85/layer).
+
+### Per-in-tile-step cost is fixed at ~300 ns — and it is NOT latency/MLP-bound
+Derived: bandwidth = resident_warps(~336) × bytes_per_step / step_time. Everything that changes
+concurrency is flat: `FC_WARPS` (1/2/4/8 → 114.1/113.5/113.3/113.3 ms), `nsplit` 1/2/4/8 flat,
+`exl3_gemv_mg` no better. **Deeper MLP is also flat**, which kills the DRAM-latency theory:
+- unroll-2 load hoisting (issue all 8 loads before any decode): Gate+Up 46.05 → 46.73 ms.
+- unroll-4 hoisted loads: Gate+Up → 46.32 ms, QKV 21.90 → 21.83 ms.
+Conclusion: the step is **issue/ALU-bound**, not outstanding-bytes-bound. Do not retry MLP tuning.
+
+### Codeword decode = 35% of GEMV time — and it cannot be looked up
+- Probe: stub `exl3_decode_quad_const` to `return float4(1.0f)` (loads + FMAs intact) →
+  **Gate+Up 46.76 → 30.05 ms (−35%)**.
+- Attempted fix (REVERTED): host-built 65536-entry f32 codebook + `exl3_decode_quad_lut(cb, cw)`
+  bound at `buffer(7)` on `exl3_gemv_spec/fused2/fused3/post`. **4–7× regression**:
+  O 11.06→46.44, Down 23.75→105.06, LM 4.74→24.75, `encode_gemv_fused2` 46.78→221.92 ms.
+  Control (keep `cb` bound, restore inline decode) → 11.21/46.49/4.69 = baseline, so the binding
+  was correct and the **LUT itself** is the cost.
+- Cause: `cw` is data-dependent, so lookups are random 4-B reads into 256 KB — each fetches a
+  64-B line (16× amplification, no reuse within a step) and sits on the critical path *after* the
+  trellis DRAM load. Any `cw → value` precompute needs a dependent load, which costs more than the
+  ~50 ALU ops it replaces.
+- **Do not retry a codebook/weight LUT** unless keys are lane-adjacent (coalesced) or the table
+  fits in registers. `git checkout -- crates/kernels/src/exl3.metal crates/kernels/src/exl3.rs` reverts.
+
+### Structural reason lm_head is 2× faster per byte
+`words_per_tile` = 96 (lm) vs 48 (all layer tensors, from `quantization_config.json` trellis shapes
+`[336,512,48] q, [336,256,48] k, [512,336,48] o, [336,1344,48] gate, [1344,336,48] down`).
+Each lane issues 4 `ld_word`s per in-tile step = 512 B of load traffic regardless of cell size, so
+redundancy = 512 / cell_bytes = **5.33× for layers (96 B cell) vs 2.67× for lm (192 B cell)** →
+105 vs 225 GB/s. Larger cells amortize the fixed load count; the fix would be a trellis re-slice
+with a matching output mapping, not a kernel-local change.
+
+### Read-ceiling model caps a perfect GEMV at ~10.3 t/s
+`t(ms) = 0.216 + MB/269` fitted to `bench_read_ceiling_slow`. Applied per stage:
+QKV 20.5, O 17.3, Gate+Up 32.3, Down 22.6, LM 4.14 + non-GEMV 4.7 ≈ **97 ms → 10.3 t/s**.
+Measured 112.4, so the whole gap to the model is **Gate+Up (+14.5 ms)**; O actually *beats* its
+model by 6.2 ms. Hitting 12 t/s (83.3 ms, 144.5 GB/s) requires beating the read ceiling, i.e.
+raising bytes-per-step (larger `words_per_tile`) — not tuning dispatch geometry.

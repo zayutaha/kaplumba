@@ -77,6 +77,17 @@ To break this roof and reach $\ge 20.0$ t/s without quality loss, we implement v
 
 ## Risks and Fallbacks
 
+0. **Risk (highest — raised 2026-09-25)**: T1's measured verify latencies (2-row 249.0 ms,
+   4-row 374.9 ms → 93.7 ms/row) contradict this plan's ~40 ms K=3 assumption by ~8×.
+   Root cause hypothesis: M=2..31 falls to `exl3_gemm` (RGT=8, decode-style, ~0.7 TFLOP/s)
+   while prefill at M≥32 gets `exl3_gemm_sg` tensor cores at 12.5–14.4 ms/row marginal
+   (`spec/prefill-scratch-fix`) and the compute floor is 12.4 ms/row (62 GFLOP @ 5 TFLOP/s).
+   *Mitigation*: **T3.5 first** — measure the M-sweep with amortised timing before any T3/T4
+   code. If 4-row verify can reach ≤100 ms (e.g. by extending `exl3_gemm_sg` to small M with
+   `SG_BM` ∈ {8,16,32}), 20 t/s holds: cycle ≈ 27 ms draft + ~80 ms verify ≈ 110 ms →
+   18–30 t/s at 1.35–2.0 acceptance. If not, the achievable ceiling with K≤4 is ~10–12 t/s
+   and the ≥19.5 t/s gate in R5 must be re-baselined with the user before T7.
+
 1. **Risk**: `lm_head` multi-row latency might be higher if not taking `gemm_sg`.
    - *Mitigation*: `lm_head` has $N = 262144$ columns. For $M=1$ it is 5.5 ms. For $M=4$, with tensor cores (`exl3_gemm_sg`), the trellis tile decode is shared across all 4 rows, keeping latency well under ~8 ms.
 2. **Risk**: Shallow-layer draft acceptance might vary across prompts.
