@@ -881,6 +881,47 @@ impl MetalLinear {
         Ok(())
     }
 
+    /// spec/bandwidth-saturate T6.1: Fused RMSNorm + residual add.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_rms_add(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        x: DeviceSpan<'_>,
+        weight: Option<DeviceSpan<'_>>,
+        residual: DeviceSpan<'_>,
+        out: DeviceSpan<'_>,
+        rows: usize,
+        row_len: usize,
+        eps: f32,
+    ) -> Result<(), MetalLinearError> {
+        self.fuse
+            .encode_rms_add(enc, x, weight, residual, out, rows, row_len, eps)?;
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// spec/bandwidth-saturate T6.1: Fused RMSNorm + scaled residual add.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_rms_add_scale(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        x: DeviceSpan<'_>,
+        weight: Option<DeviceSpan<'_>>,
+        residual: DeviceSpan<'_>,
+        out: DeviceSpan<'_>,
+        rows: usize,
+        row_len: usize,
+        eps: f32,
+        scalar: f32,
+    ) -> Result<(), MetalLinearError> {
+        self.fuse
+            .encode_rms_add_scale(enc, x, weight, residual, out, rows, row_len, eps, scalar)?;
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
     pub fn encode_copy(
         &self,
         enc: &metal::ComputeCommandEncoderRef,

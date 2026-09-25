@@ -103,6 +103,15 @@ stage-by-stage in `spec/exl3-load-latency`.
 - Bit-exact parity verified with new `rms_rope_matches_separate_passes` test across all configurations.
 - Forward-only decode latency drops to **114.1 ms/token (8.77 t/s, 98.2 GB/s)**. Bit-exact golden token 818 verified (6.57s).
 
+## 2026-09-25 — T6.1: Fused Residual Additions (`kr_rms_add` + `kr_rms_add_scale`)
+- Implemented `kr_rms_add` and `kr_rms_add_scale` in `fuse.metal` and `fuse.rs`.
+- Fused post-attention RMSNorm and residual addition (`x = x + post_attn_norm(attn_out)`), writing directly to `x_mid`.
+- Fused post-feedforward RMSNorm and residual addition with layer scaling (`x = (x + post_ff_norm(ff_out)) * scalar`), writing directly to `x`.
+- Eliminates 120 separate elementwise add kernel dispatches per token (cutting total decode dispatches by another 120).
+- Bit-exact parity verified in `rms_add_and_scale_matches_separate_passes`.
+- `trace_chat_prompt_steps_slow` latency drops to **6.00s** (predicting golden token 818 bit-identically). Forward decode throughput reaches 8.67 t/s (115.3 ms/token, 97.1 GB/s).
+
+
 
 
 

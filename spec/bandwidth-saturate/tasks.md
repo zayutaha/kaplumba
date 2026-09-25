@@ -40,6 +40,11 @@
   - **Intent**: Fuse per-head RMSNorm + Neox RoPE in registers via `kr_rms_rope` for Q and K, write K directly to KV cache, and normalize V directly into KV cache (eliminating `kr_copy`). Cuts 3 dispatches per layer (180 dispatches/token eliminated) and removes intermediate DRAM round-trips for Q/K/V.
   - **Testing**: `rms_rope_matches_separate_passes` bit-exact across all head dimensions, positions, and weighted/unweighted modes; all 22 kernel tests and 135 engine unit tests pass; `trace_chat_prompt_steps_slow` predicts golden token 818 (6.57s); forward-only decode latency drops to 114.1 ms/token (8.77 t/s, 98.2 GB/s).
 
+- [x] **T6.1: Fused Residual Additions (`kr_rms_add` + `kr_rms_add_scale`)**
+  - **Files**: `crates/kernels/src/fuse.metal`, `crates/kernels/src/fuse.rs`, `crates/engine/src/metal_linear.rs`, `crates/engine/src/gpu_decode.rs`
+  - **Intent**: Fuse post-attention RMSNorm + residual addition (`kr_rms_add`) and post-feedforward RMSNorm + scaled residual addition (`kr_rms_add_scale`), eliminating 120 separate elementwise add launches per token and intermediate DRAM round-trips.
+  - **Testing**: `rms_add_and_scale_matches_separate_passes` verified bit-exact; all 23 kernel tests and 135 engine unit tests pass; `trace_chat_prompt_steps_slow` drops to 6.00s predicting golden token 818; decode forward-only latency reaches 115.3 ms/token (8.67 t/s, 97.1 GB/s).
+
 
 - [ ] **T7: End-to-End Throughput Verification (≥ 20.0 t/s)** — **BAR KNOWN UNREACHABLE AT k=3 (2026-09-24)**
   - **Files**: `crates/engine/src/gemma4.rs`

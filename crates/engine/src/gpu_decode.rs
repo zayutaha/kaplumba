@@ -521,16 +521,16 @@ impl GpuDecoder {
                 1,
                 &self.lin_temps,
             )?;
-            gpu.encode_rms(
+            gpu.encode_rms_add(
                 enc,
                 span(&self.o_proj),
                 Some(span(&lw.post_attn_ln)),
-                span(&self.o_norm),
+                span(x_in),
+                span(x_mid),
                 1,
                 hidden,
                 eps,
             )?;
-            gpu.encode_add(enc, span(x_in), span(&self.o_norm), span(x_mid), hidden)?;
 
             // --- MLP sublayer ---
             let intermediate = lw.gate.shape.out_features();
@@ -560,21 +560,15 @@ impl GpuDecoder {
                 1,
                 &self.lin_temps,
             )?;
-            gpu.encode_rms(
+            gpu.encode_rms_add_scale(
                 enc,
                 span(&self.down),
                 Some(span(&lw.post_ff_ln)),
-                span(&self.down_norm),
+                span(x_mid),
+                span(x_out),
                 1,
                 hidden,
                 eps,
-            )?;
-            gpu.encode_add_scale(
-                enc,
-                span(x_mid),
-                span(&self.down_norm),
-                span(x_out),
-                hidden,
                 lw.scalar,
             )?;
         }

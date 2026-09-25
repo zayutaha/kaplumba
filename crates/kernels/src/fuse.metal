@@ -32,6 +32,12 @@ struct RmsRopeParams {
     float eps;
 };
 
+struct RmsAddScaleParams {
+    uint row_len;
+    float eps;
+    float scalar;
+};
+
 // ---------------------------------------------------------------------------
 // kr_rms: RMSNorm over rows of `row_len`, optional f32 weight (length row_len).
 //
@@ -76,6 +82,92 @@ kernel void kr_rms(device const half *x [[buffer(0)]],
             v *= w[i];
         }
         orow[i] = (half)v;
+    }
+}
+
+// ---------------------------------------------------------------------------
+// kr_rms_add: Fused RMSNorm + residual add (spec/bandwidth-saturate T6.1).
+// Computes o = residual + rms(x, w) bit-exact with separate kr_rms + kr_add.
+// Eliminates separate kr_add dispatch and intermediate norm buffer in DRAM.
+// ---------------------------------------------------------------------------
+kernel void kr_rms_add(device const half *x [[buffer(0)]],
+                       device const float *w [[buffer(1)]],
+                       device const half *residual [[buffer(2)]],
+                       device half *o [[buffer(3)]],
+                       constant RmsParams &p [[buffer(4)]],
+                       uint row [[threadgroup_position_in_grid]],
+                       uint tid [[thread_position_in_threadgroup]]) {
+    const uint n = p.row_len;
+    device const half *xr = x + (ulong)row * n;
+    device const half *res = residual + (ulong)row * n;
+    device half *orow = o + (ulong)row * n;
+
+    float s = 0.0f;
+    for (uint i = tid; i < n; i += 128u) {
+        const float v = float(xr[i]);
+        s += v * v;
+    }
+    for (uint m = 16u; m > 0u; m >>= 1u) {
+        s += simd_shuffle_xor(s, (ushort)m);
+    }
+    threadgroup float shw[4];
+    if ((tid & 31u) == 0u) {
+        shw[tid >> 5] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float total = shw[0] + shw[1] + shw[2] + shw[3];
+    const float ms = total / float(n) + p.eps;
+    const float inv = 1.0f / sqrt(ms);
+
+    for (uint i = tid; i < n; i += 128u) {
+        float v = float(xr[i]) * inv;
+        if (w != nullptr) {
+            v *= w[i];
+        }
+        orow[i] = (half)(float(res[i]) + float((half)v));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// kr_rms_add_scale: Fused RMSNorm + scaled residual add (spec/bandwidth-saturate T6.1).
+// Computes o = (residual + rms(x, w)) * scalar bit-exact with kr_rms + kr_add_scale.
+// Eliminates separate kr_add_scale dispatch and intermediate norm buffer in DRAM.
+// ---------------------------------------------------------------------------
+kernel void kr_rms_add_scale(device const half *x [[buffer(0)]],
+                             device const float *w [[buffer(1)]],
+                             device const half *residual [[buffer(2)]],
+                             device half *o [[buffer(3)]],
+                             constant RmsAddScaleParams &p [[buffer(4)]],
+                             uint row [[threadgroup_position_in_grid]],
+                             uint tid [[thread_position_in_threadgroup]]) {
+    const uint n = p.row_len;
+    device const half *xr = x + (ulong)row * n;
+    device const half *res = residual + (ulong)row * n;
+    device half *orow = o + (ulong)row * n;
+
+    float s = 0.0f;
+    for (uint i = tid; i < n; i += 128u) {
+        const float v = float(xr[i]);
+        s += v * v;
+    }
+    for (uint m = 16u; m > 0u; m >>= 1u) {
+        s += simd_shuffle_xor(s, (ushort)m);
+    }
+    threadgroup float shw[4];
+    if ((tid & 31u) == 0u) {
+        shw[tid >> 5] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float total = shw[0] + shw[1] + shw[2] + shw[3];
+    const float ms = total / float(n) + p.eps;
+    const float inv = 1.0f / sqrt(ms);
+
+    for (uint i = tid; i < n; i += 128u) {
+        float v = float(xr[i]) * inv;
+        if (w != nullptr) {
+            v *= w[i];
+        }
+        orow[i] = (half)((float(res[i]) + float((half)v)) * p.scalar);
     }
 }
 

@@ -52,6 +52,14 @@ struct MslRmsRope {
     eps: f32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MslRmsAddScale {
+    row_len: u32,
+    eps: f32,
+    scalar: f32,
+}
+
 /// Pipelines + queue for the glue kernels.
 pub struct Fuse {
     device: Device,
@@ -59,6 +67,8 @@ pub struct Fuse {
     rms: ComputePipelineState,
     rope: ComputePipelineState,
     rms_rope: ComputePipelineState,
+    rms_add: ComputePipelineState,
+    rms_add_scale: ComputePipelineState,
     copy: ComputePipelineState,
     gelu_mul: ComputePipelineState,
     add: ComputePipelineState,
@@ -88,6 +98,8 @@ impl Fuse {
             rms: build("kr_rms")?,
             rope: build("kr_rope")?,
             rms_rope: build("kr_rms_rope")?,
+            rms_add: build("kr_rms_add")?,
+            rms_add_scale: build("kr_rms_add_scale")?,
             copy: build("kr_copy")?,
             gelu_mul: build("kr_gelu_mul")?,
             add: build("kr_add")?,
@@ -129,6 +141,87 @@ impl Fuse {
             3,
             std::mem::size_of::<MslRms>() as u64,
             &p as *const MslRms as *const _,
+        );
+        enc.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(128, 1, 1));
+        Ok(())
+    }
+
+    /// Fused RMSNorm + residual add: `out = residual + rms(x, weight)`.
+    pub fn encode_rms_add(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: DeviceSpan<'_>,
+        weight: Option<DeviceSpan<'_>>,
+        residual: DeviceSpan<'_>,
+        out: DeviceSpan<'_>,
+        rows: usize,
+        row_len: usize,
+        eps: f32,
+    ) -> Result<(), KernelError> {
+        check_span_fits(&x, rows * row_len * 2, "rms_add x", 2)?;
+        check_span_fits(&residual, rows * row_len * 2, "rms_add residual", 2)?;
+        check_span_fits(&out, rows * row_len * 2, "rms_add out", 2)?;
+        if let Some(w) = weight {
+            check_span_fits(&w, row_len * 4, "rms_add weight", 4)?;
+        }
+        let p = MslRms {
+            row_len: row_len as u32,
+            eps,
+        };
+        enc.set_compute_pipeline_state(&self.rms_add);
+        enc.set_buffer(0, Some(x.buffer), x.byte_offset as u64);
+        match weight {
+            Some(w) => enc.set_buffer(1, Some(w.buffer), w.byte_offset as u64),
+            None => enc.set_buffer(1, None, 0),
+        }
+        enc.set_buffer(2, Some(residual.buffer), residual.byte_offset as u64);
+        enc.set_buffer(3, Some(out.buffer), out.byte_offset as u64);
+        enc.set_bytes(
+            4,
+            std::mem::size_of::<MslRms>() as u64,
+            &p as *const MslRms as *const _,
+        );
+        enc.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(128, 1, 1));
+        Ok(())
+    }
+
+    /// Fused RMSNorm + scaled residual add: `out = (residual + rms(x, weight)) * scalar`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_rms_add_scale(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: DeviceSpan<'_>,
+        weight: Option<DeviceSpan<'_>>,
+        residual: DeviceSpan<'_>,
+        out: DeviceSpan<'_>,
+        rows: usize,
+        row_len: usize,
+        eps: f32,
+        scalar: f32,
+    ) -> Result<(), KernelError> {
+        check_span_fits(&x, rows * row_len * 2, "rms_add_scale x", 2)?;
+        check_span_fits(&residual, rows * row_len * 2, "rms_add_scale residual", 2)?;
+        check_span_fits(&out, rows * row_len * 2, "rms_add_scale out", 2)?;
+        if let Some(w) = weight {
+            check_span_fits(&w, row_len * 4, "rms_add_scale weight", 4)?;
+        }
+        let p = MslRmsAddScale {
+            row_len: row_len as u32,
+            eps,
+            scalar,
+        };
+        enc.set_compute_pipeline_state(&self.rms_add_scale);
+        enc.set_buffer(0, Some(x.buffer), x.byte_offset as u64);
+        match weight {
+            Some(w) => enc.set_buffer(1, Some(w.buffer), w.byte_offset as u64),
+            None => enc.set_buffer(1, None, 0),
+        }
+        enc.set_buffer(2, Some(residual.buffer), residual.byte_offset as u64);
+        enc.set_buffer(3, Some(out.buffer), out.byte_offset as u64);
+        enc.set_bytes(
+            4,
+            std::mem::size_of::<MslRmsAddScale>() as u64,
+            &p as *const MslRmsAddScale as *const _,
         );
         enc.dispatch_thread_groups(MTLSize::new(rows as u64, 1, 1), MTLSize::new(128, 1, 1));
         Ok(())
@@ -939,6 +1032,57 @@ mod tests {
                     got[i].to_bits()
                 );
             }
+        }
+    }
+
+    /// spec/bandwidth-saturate T6.1: `kr_rms_add` and `kr_rms_add_scale` must match separate passes bit-for-bit.
+    #[test]
+    fn rms_add_and_scale_matches_separate_passes() {
+        let Some((device, queue)) = ctx() else {
+            eprintln!("skip: no Metal device");
+            return;
+        };
+        let fuse = Fuse::new(&device, &queue).expect("pipelines");
+        let mut rng = Rng(0x7777);
+        let n = 5376usize;
+        let eps = 1e-6f32;
+        let scalar = 0.8125f32;
+
+        let x: Vec<f16> = (0..n).map(|_| rng.half()).collect();
+        let res: Vec<f16> = (0..n).map(|_| rng.half()).collect();
+        let w: Vec<f32> = (0..n).map(|_| ((rng.next() % 2001) as f32 / 1000.0) + 0.5).collect();
+
+        let xb = fuse.half_buffer(&x);
+        let resb = fuse.half_buffer(&res);
+        let wb = fuse.f32_buffer(&w);
+
+        let norm_b = fuse.buffer(n * 2);
+        let want_add_b = fuse.buffer(n * 2);
+        let got_add_b = fuse.buffer(n * 2);
+        let want_scale_b = fuse.buffer(n * 2);
+        let got_scale_b = fuse.buffer(n * 2);
+
+        // Separate: rms -> add, rms -> add_scale
+        fuse.submit(|enc| {
+            fuse.encode_rms(enc, Fuse::span(&xb), Some(Fuse::span(&wb)), Fuse::span(&norm_b), 1, n, eps).unwrap();
+            fuse.encode_add(enc, Fuse::span(&resb), Fuse::span(&norm_b), Fuse::span(&want_add_b), n).unwrap();
+            fuse.encode_add_scale(enc, Fuse::span(&resb), Fuse::span(&norm_b), Fuse::span(&want_scale_b), n, scalar).unwrap();
+        }).expect("separate submit");
+
+        // Fused: rms_add, rms_add_scale
+        fuse.submit(|enc| {
+            fuse.encode_rms_add(enc, Fuse::span(&xb), Some(Fuse::span(&wb)), Fuse::span(&resb), Fuse::span(&got_add_b), 1, n, eps).unwrap();
+            fuse.encode_rms_add_scale(enc, Fuse::span(&xb), Some(Fuse::span(&wb)), Fuse::span(&resb), Fuse::span(&got_scale_b), 1, n, eps, scalar).unwrap();
+        }).expect("fused submit");
+
+        let want_add = Fuse::read_half(&want_add_b, n);
+        let got_add = Fuse::read_half(&got_add_b, n);
+        let want_scale = Fuse::read_half(&want_scale_b, n);
+        let got_scale = Fuse::read_half(&got_scale_b, n);
+
+        for i in 0..n {
+            assert_eq!(want_add[i].to_bits(), got_add[i].to_bits(), "rms_add mismatch at {i}: want {:#06x} got {:#06x}", want_add[i].to_bits(), got_add[i].to_bits());
+            assert_eq!(want_scale[i].to_bits(), got_scale[i].to_bits(), "rms_add_scale mismatch at {i}: want {:#06x} got {:#06x}", want_scale[i].to_bits(), got_scale[i].to_bits());
         }
     }
 }
