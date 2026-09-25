@@ -100,7 +100,7 @@
 - Added `TextWeights::packed_u16` handoff for packed EXL3 tensors without dense reconstruction.
 - Parity passes for 128×128 matrices across K=1–8 plain/MCG/mul1 and fractional 1.5/2.5/3.5 mul1.
 - The current correctness-first kernel uses one output thread and serial input reduction; T7 must tile/reuse decoded weights for prefill throughput.
-- T6 commit: pending.
+- T6 commit: `0cbd089` (`spec/gemma4-metal-engine: T6 add packed linear kernels`).
 
 ## Current risks
 

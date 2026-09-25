@@ -34,7 +34,7 @@
   - Files: `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`, `crates/engine/src/weights.rs` dispatch wiring.
   - Intent: Provide packed EXL3 GEMV for all model projection shapes without dense reconstruction.
   - Test: Random matrix parity, all current checkpoint shapes, K/codebook matrix, and repeated-dispatch stability.
-  - Commit: pending.
+  - Commit: `0cbd089`.
 
 - [ ] **T7 — Implement tiled quantized prefill linear kernels**
   - Files: `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`, prefill benchmark tests.
