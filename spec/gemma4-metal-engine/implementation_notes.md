@@ -55,6 +55,7 @@
 - Corrected the text-byte accounting: the complete text selection is 14,876,563,172 bytes; the quantization metadata sum is 14,876,563,052 bytes because 60 BF16 layer-scalar tensors add 120 bytes.
 - Synthetic tests cover valid headers, missing index entries, overlap, dtype/shape mismatches, path traversal, total-size mismatch, vision exclusion, config boundaries, and quantization failures.
 - Real metadata test passed with `KAPLUMBA_TEST_MODEL=/Users/zayaantaha/.kaplumba/models/Gxma/Gxma cargo test -p kaplumba-engine -- --ignored`; it reads headers only and reports 14,876,563,172 text bytes and 1,151,487,072 vision bytes excluded.
+- T2 commit: `8e5eca9` (`spec/gemma4-metal-engine: T2 parse checkpoint metadata`).
 
 ## Current risks
 

@@ -10,7 +10,7 @@
   - Files: `crates/engine/src/config.rs`, `crates/engine/src/safetensors.rs`, config/header unit tests.
   - Intent: Validate the Gemma 4 graph, locate shards/offsets/dtypes, and exclude all vision tensors.
   - Test: Synthetic headers, missing/overlap/type/shape failures, and the real checkpoint metadata without uploading vision.
-  - Commit: pending.
+  - Commit: `8e5eca9`.
 
 - [ ] **T3 — Load and convert text weights into Metal-owned buffers**
   - Files: `crates/engine/src/weights.rs`, `crates/engine/src/metal.rs`, loader tests.
