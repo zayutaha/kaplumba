@@ -1029,6 +1029,55 @@ mod tests {
         );
     }
 
+    /// Count real dispatches per decode token.
+    ///
+    /// The read-ceiling fit (bench_read_ceiling_slow) gives t = 0.216 ms +
+    /// bytes/269 GB/s, i.e. **~0.216 ms of fixed cost per dispatch**. At 60
+    /// layers that budget dominates: 10 dispatches/layer would be 130 ms of pure
+    /// ramp against a 114 ms token. The exact count says whether fusing is worth
+    /// it and which encoders to attack.
+    #[test]
+    #[ignore]
+    fn bench_dispatch_count_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let ctx = MetalContext::new().expect("metal context");
+        let model = load_exl3(&ctx, &dir).expect("load artifact");
+        let gpu = MetalLinear::new(&ctx).expect("metal linear");
+        let gm = Gemma4Model::from_model(&model)
+            .expect("gemma cfg")
+            .with_gpu(&gpu);
+        let nl = gm.cfg.n_layers;
+
+        let measure = |label: &str, n_layers: usize| -> u64 {
+            let mut kv = gm.new_kv_cache(64);
+            let before = gpu.calls();
+            gm.forward_cached_layers(&mut kv, &[2], n_layers.min(nl))
+                .expect("encode");
+            let n = gpu.calls() - before;
+            eprintln!(
+                "  {label:10} {n:5} dispatches ({:.2}/layer) -> {:.1} ms ramp @0.216",
+                n as f64 / n_layers.max(1) as f64,
+                n as f64 * 0.216
+            );
+            n
+        };
+        eprintln!("== dispatches per decode token ==");
+        let full = measure("full", nl);
+        let one = measure("1 layer", 1);
+        eprintln!(
+            "  => per-layer {} dispatches, non-layer overhead {} dispatches",
+            full.saturating_sub(one) / (nl.max(2) - 1) as u64,
+            full - (full - one)
+        );
+    }
+
     #[test]
     #[ignore]
     fn bench_decode_breakdown_slow() {
