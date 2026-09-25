@@ -57,7 +57,7 @@ fn codebook_vectors_match_format() {
     let expected = [
         (Codebook::Plain, [0x3a25, 0xbb5b, 0xc066, 0xb7f8, 0xb110]),
         (Codebook::Mcg, [0x3f60, 0x304e, 0x3e0f, 0xb915, 0x3acd]),
-        (Codebook::Mul1, [0xc2e8, 0x3920, 0xb8a0, 0xbaf0, 0xb930]),
+        (Codebook::Mul1, [0xc2e8, 0x3921, 0xb89e, 0xbaf2, 0xb936]),
     ];
     for (codebook, values) in expected {
         for (state, expected_bits) in [0_u16, 1, 0x1234, 0x8000, 0xffff].into_iter().zip(values) {

@@ -24,7 +24,7 @@
   - Test: Pack/unpack round trips, codebook vectors, transform identities, and every supported variant combination.
   - Commit: `5555c0a`.
 
-- [ ] **T5 — Implement Metal EXL3 decode and transform kernels**
+- [x] **T5 — Implement Metal EXL3 decode and transform kernels**
   - Files: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`, parity tests.
   - Intent: Decode packed trellis tiles and apply the exact tensor-core permutation/Hadamard path on Metal.
   - Test: Metal output against the CPU reference for every variant, including fp16/bf16 scale boundaries.

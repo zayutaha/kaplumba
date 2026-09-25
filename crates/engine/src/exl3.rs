@@ -189,7 +189,7 @@ fn decode_mul1(mut state: u32) -> f32 {
     let value = f16::from_bits(byte_sum as u16);
     let inverse = f16::from_bits(0x1eee);
     let bias = f16::from_bits(0xc931);
-    (value * inverse + bias).to_f32()
+    f16::from_f32(value.to_f32() * inverse.to_f32() + bias.to_f32()).to_f32()
 }
 
 pub fn unpack_trellis(packed: &[u16], rate: BitRate) -> Result<Vec<u16>, Exl3Error> {

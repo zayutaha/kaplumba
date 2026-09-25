@@ -1,3 +1,5 @@
+pub mod exl3;
+
 pub const KERNELS_NAME: &str = "kaplumba-kernels";
 
 #[cfg(test)]

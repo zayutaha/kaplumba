@@ -85,6 +85,14 @@
 - Real K=3 MCG tile decoding passed against the supplied checkpoint’s first q-projection trellis tile.
 - T4 commit: `5555c0a` (`spec/gemma4-metal-engine: T4 add CPU EXL3 reference`).
 
+## T5 — Metal EXL3 decode and transforms
+
+- Added runtime-compiled raw Metal kernels for integer/fractional trellis windows, all three codebooks, tensor-core permutation, and 128-point Hadamard transforms.
+- Added a retained `Exl3Kernels` context with shared input/output buffers, bounded dispatch, command completion checks, and readback helpers.
+- Metal parity passes for K=1–8 plain/MCG/mul1, fractional 1.5/2.5/3.5 mul1, and multi-vector Hadamard output.
+- Aligned the CPU mul1 reference with the upstream fused FP16 multiply-add after Metal parity exposed the intermediate-rounding difference.
+- T5 commit: pending.
+
 ## Current risks
 
 - Metal-owned copies of approximately 14.88 GB of text data plus 8k KV and runtime buffers must remain below the agreed 18 GB RSS ceiling.
