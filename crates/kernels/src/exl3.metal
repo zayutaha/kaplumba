@@ -80,6 +80,12 @@ struct HadParams {
     uint row_len;
 };
 
+// spec/bandwidth-saturate T4: Fused RMSNorm + Hadamard Prologue
+struct RmsHadParams {
+    uint row_len;
+    float eps;
+};
+
 // Sibling linear fusion parameters (spec/pure-decode-273gb R1).
 struct Exl3Fused2Params {
     uint in_tiles;
@@ -241,6 +247,64 @@ kernel void exl3_had_in_batched(device const half *x [[buffer(0)]],
     sh[t] = float(x[in_idx]) * float(suh_stack[row_offset + in_idx]);
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
+    for (uint stage = 1u; stage < HAD; stage <<= 1u) {
+        if ((t & stage) == 0u) {
+            float a = sh[t];
+            float b = sh[t + stage];
+            sh[t] = a + b;
+            sh[t + stage] = a - b;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    xh_stack[row_offset + in_idx] = (half)(sh[t] * as_type<float>(0x3DB504F3u));
+}
+
+// Batched multi-row RMSNorm + input Hadamard (spec/bandwidth-saturate T4):
+// Fuses RMSNorm reduction and scale of vector `x` with `N` distinct `suh` scale rows in
+// `suh_stack`, writing `N` output rows to `xh_stack`.
+// Grid: (row_len / 128, n_rows). Threads per threadgroup: 128.
+kernel void exl3_rms_had_in_batched(device const half *x [[buffer(0)]],
+                                    device const float *w [[buffer(1)]],
+                                    device const half *suh_stack [[buffer(2)]],
+                                    device half *xh_stack [[buffer(3)]],
+                                    constant RmsHadParams &hp [[buffer(4)]],
+                                    uint2 tg [[threadgroup_position_in_grid]],
+                                    uint2 thr [[thread_position_in_threadgroup]]) {
+    threadgroup float shw[4];
+    threadgroup float sh[HAD];
+    uint t = thr.x;
+    uint row = tg.y;
+    uint block = tg.x;
+    uint row_offset = row * hp.row_len;
+    uint in_idx = block * HAD + t;
+
+    // 1. RMSNorm reduction over row of length hp.row_len
+    const uint n = hp.row_len;
+    float s = 0.0f;
+    for (uint i = t; i < n; i += 128u) {
+        const float v = float(x[i]);
+        s += v * v;
+    }
+    for (uint m = 16u; m > 0u; m >>= 1u) {
+        s += simd_shuffle_xor(s, (ushort)m);
+    }
+    if ((t & 31u) == 0u) {
+        shw[t >> 5] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float total = shw[0] + shw[1] + shw[2] + shw[3];
+    const float ms = total / float(n) + hp.eps;
+    const float inv = 1.0f / sqrt(ms);
+
+    // 2. Normalize and Hadamard butterfly input
+    float v = float(x[in_idx]) * inv;
+    if (w != nullptr) {
+        v *= w[in_idx];
+    }
+    sh[t] = float((half)v) * float(suh_stack[row_offset + in_idx]);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 3. Sylvester FWT, 7 stages; H is symmetric so `H · block` needs no transpose.
     for (uint stage = 1u; stage < HAD; stage <<= 1u) {
         if ((t & stage) == 0u) {
             float a = sh[t];

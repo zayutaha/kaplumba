@@ -188,6 +188,13 @@ struct MslHad {
     row_len: u32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MslRmsHad {
+    row_len: u32,
+    eps: f32,
+}
+
 /// Transient host-path scratch (test/bench hooks only — never retained).
 struct Scratch {
     x_stage: Buffer,
@@ -225,6 +232,7 @@ pub struct Exl3Gemv {
     lib: metal::Library,
     had_in: ComputePipelineState,
     had_in_batched: ComputePipelineState,
+    rms_had_in_batched: ComputePipelineState,
     gelu_had_in: ComputePipelineState,
     /// P5: all `exl3_gemv` dispatches go through the FC-specialized
     /// `gemv_spec_pipeline` cache (bit-identical to the generic kernel, which
@@ -303,6 +311,7 @@ impl Exl3Gemv {
             queue: queue.clone(),
             had_in: build("exl3_had_in")?,
             had_in_batched: build("exl3_had_in_batched")?,
+            rms_had_in_batched: build("exl3_rms_had_in_batched")?,
             gelu_had_in: build("exl3_gelu_had_in")?,
             gemv: build("exl3_gemv")?,
             gemv_fused2: build("exl3_gemv_fused2")?,
@@ -935,6 +944,140 @@ impl Exl3Gemv {
         Ok(())
     }
 
+    /// spec/bandwidth-saturate T4: Fused RMSNorm + 3-way sibling linear pass with scratch arena.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_linear_rms_fused3_with_scratch(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: DeviceSpan<'_>,
+        w: Option<DeviceSpan<'_>>,
+        eps: f32,
+        suh_stack: DeviceSpan<'_>,
+        trellis_a: DeviceSpan<'_>,
+        trellis_b: DeviceSpan<'_>,
+        trellis_c: DeviceSpan<'_>,
+        svh_cat: DeviceSpan<'_>,
+        out: &Buffer,
+        shape_a: Exl3Shape,
+        shape_b: Exl3Shape,
+        shape_c: Exl3Shape,
+        mode: u32,
+        scratch: &ChunkScratch,
+    ) -> Result<(), KernelError> {
+        let inn = shape_a.in_features();
+        let outp = shape_a.out_features() + shape_b.out_features() + shape_c.out_features();
+        if mode > 1 {
+            return Err(KernelError::Unsupported(format!(
+                "codebook mode {mode} is CPU-only"
+            )));
+        }
+        if inn % HAD != 0 || outp % HAD != 0 {
+            return Err(KernelError::Unsupported(format!(
+                "hadamard needs multiples of {HAD}, got in={inn} out={outp}"
+            )));
+        }
+        Self::ensure_span_fits(
+            &trellis_a,
+            shape_a.in_tiles * shape_a.out_tiles * shape_a.words_per_tile() * 2,
+            "trellis_a",
+            2,
+        )?;
+        Self::ensure_span_fits(
+            &trellis_b,
+            shape_b.in_tiles * shape_b.out_tiles * shape_b.words_per_tile() * 2,
+            "trellis_b",
+            2,
+        )?;
+        Self::ensure_span_fits(
+            &trellis_c,
+            shape_c.in_tiles * shape_c.out_tiles * shape_c.words_per_tile() * 2,
+            "trellis_c",
+            2,
+        )?;
+        Self::ensure_span_fits(&suh_stack, 3 * inn * 2, "suh_stack", 2)?;
+        Self::ensure_span_fits(&svh_cat, outp * 2, "svh_cat", 2)?;
+
+        let pair_buf = self.pair_buffer(shape_a.k);
+        self.encode_rms_had_in_batched(enc, x, w, eps, suh_stack, &scratch.xh, 3, inn);
+        self.encode_gemv_post_fused3(
+            enc,
+            &scratch.xh,
+            trellis_a,
+            trellis_b,
+            trellis_c,
+            &pair_buf,
+            svh_cat,
+            out,
+            shape_a,
+            shape_b,
+            shape_c,
+            mode,
+        );
+        Ok(())
+    }
+
+    /// spec/bandwidth-saturate T4: Fused RMSNorm + 2-way sibling linear pass with scratch arena.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_linear_rms_fused2_with_scratch(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: DeviceSpan<'_>,
+        w: Option<DeviceSpan<'_>>,
+        eps: f32,
+        suh_stack: DeviceSpan<'_>,
+        trellis_a: DeviceSpan<'_>,
+        trellis_b: DeviceSpan<'_>,
+        svh_cat: DeviceSpan<'_>,
+        out: &Buffer,
+        shape_a: Exl3Shape,
+        shape_b: Exl3Shape,
+        mode: u32,
+        scratch: &ChunkScratch,
+    ) -> Result<(), KernelError> {
+        let inn = shape_a.in_features();
+        let outp = shape_a.out_features() + shape_b.out_features();
+        if mode > 1 {
+            return Err(KernelError::Unsupported(format!(
+                "codebook mode {mode} is CPU-only"
+            )));
+        }
+        if inn % HAD != 0 || outp % HAD != 0 {
+            return Err(KernelError::Unsupported(format!(
+                "hadamard needs multiples of {HAD}, got in={inn} out={outp}"
+            )));
+        }
+        Self::ensure_span_fits(
+            &trellis_a,
+            shape_a.in_tiles * shape_a.out_tiles * shape_a.words_per_tile() * 2,
+            "trellis_a",
+            2,
+        )?;
+        Self::ensure_span_fits(
+            &trellis_b,
+            shape_b.in_tiles * shape_b.out_tiles * shape_b.words_per_tile() * 2,
+            "trellis_b",
+            2,
+        )?;
+        Self::ensure_span_fits(&suh_stack, 2 * inn * 2, "suh_stack", 2)?;
+        Self::ensure_span_fits(&svh_cat, outp * 2, "svh_cat", 2)?;
+
+        let pair_buf = self.pair_buffer(shape_a.k);
+        self.encode_rms_had_in_batched(enc, x, w, eps, suh_stack, &scratch.xh, 2, inn);
+        self.encode_gemv_post_fused2(
+            enc,
+            &scratch.xh,
+            trellis_a,
+            trellis_b,
+            &pair_buf,
+            svh_cat,
+            out,
+            shape_a,
+            shape_b,
+            mode,
+        );
+        Ok(())
+    }
+
     fn encode_had_in(
         &self,
         enc: &ComputeCommandEncoderRef,
@@ -1419,6 +1562,40 @@ impl Exl3Gemv {
         enc.set_buffer(1, Some(suh_stack.buffer), suh_stack.byte_offset as u64);
         enc.set_buffer(2, Some(xh_stack), 0);
         enc.set_bytes(3, 4, &hp as *const MslHad as *const _);
+        enc.dispatch_thread_groups(
+            MTLSize::new((row_len / HAD) as u64, n_rows as u64, 1),
+            MTLSize::new(HAD as u64, 1, 1),
+        );
+    }
+
+    /// spec/bandwidth-saturate T4: Batched multi-row RMSNorm + input Hadamard.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_rms_had_in_batched(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: DeviceSpan<'_>,
+        w: Option<DeviceSpan<'_>>,
+        eps: f32,
+        suh_stack: DeviceSpan<'_>,
+        xh_stack: &Buffer,
+        n_rows: usize,
+        row_len: usize,
+    ) {
+        debug_assert_eq!(row_len % HAD, 0);
+        let hp = MslRmsHad {
+            row_len: row_len as u32,
+            eps,
+        };
+        enc.set_compute_pipeline_state(&self.rms_had_in_batched);
+        enc.set_buffer(0, Some(x.buffer), x.byte_offset as u64);
+        if let Some(w_span) = w {
+            enc.set_buffer(1, Some(w_span.buffer), w_span.byte_offset as u64);
+        } else {
+            enc.set_buffer(1, None, 0);
+        }
+        enc.set_buffer(2, Some(suh_stack.buffer), suh_stack.byte_offset as u64);
+        enc.set_buffer(3, Some(xh_stack), 0);
+        enc.set_bytes(4, 8, &hp as *const MslRmsHad as *const _);
         enc.dispatch_thread_groups(
             MTLSize::new((row_len / HAD) as u64, n_rows as u64, 1),
             MTLSize::new(HAD as u64, 1, 1),
@@ -2556,6 +2733,74 @@ impl Exl3Gemv {
         let cb = self.queue.new_command_buffer();
         let enc = cb.new_compute_command_encoder();
         self.encode_had_in_batched(enc, &x_buf, suh_stack, &xh_buf, n_rows, n);
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+        if cb.status() != MTLCommandBufferStatus::Completed {
+            return Err(KernelError::CommandFailed(cb.status()));
+        }
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                xh_buf.contents() as *const u8,
+                out.as_mut_ptr() as *mut u8,
+                n * n_rows * 2,
+            );
+        }
+        Ok(())
+    }
+
+    /// spec/bandwidth-saturate T4: Isolated fused RMSNorm + batched `had_in` pass.
+    pub fn rms_had_in_batched_pass(
+        &self,
+        x: &[f16],
+        w: Option<&[f32]>,
+        eps: f32,
+        suh_stack: DeviceSpan<'_>,
+        n_rows: usize,
+        out: &mut Vec<f16>,
+    ) -> Result<(), KernelError> {
+        let n = x.len();
+        if n == 0 || n % HAD != 0 {
+            return Err(KernelError::Unsupported(format!(
+                "rms_had_in needs a multiple of {HAD}, got {n}"
+            )));
+        }
+        Self::ensure_span_fits(&suh_stack, n * n_rows * 2, "suh_stack", 2)?;
+        out.resize(n * n_rows, f16::ZERO);
+        let x_buf = self.device.new_buffer_with_data(
+            x.as_ptr() as *const _,
+            (n * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let w_buf = w.map(|slice| {
+            self.device.new_buffer_with_data(
+                slice.as_ptr() as *const _,
+                (slice.len() * 4) as u64,
+                MTLResourceOptions::StorageModeShared,
+            )
+        });
+        let xh_buf = self.device.new_buffer(
+            (n * n_rows * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let cb = self.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        self.encode_rms_had_in_batched(
+            enc,
+            DeviceSpan {
+                buffer: &x_buf,
+                byte_offset: 0,
+            },
+            w_buf.as_ref().map(|b| DeviceSpan {
+                buffer: b,
+                byte_offset: 0,
+            }),
+            eps,
+            suh_stack,
+            &xh_buf,
+            n_rows,
+            n,
+        );
         enc.end_encoding();
         cb.commit();
         cb.wait_until_completed();

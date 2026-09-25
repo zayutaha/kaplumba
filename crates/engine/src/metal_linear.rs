@@ -733,6 +733,72 @@ impl MetalLinear {
         Ok(())
     }
 
+    /// spec/bandwidth-saturate T4: Fused RMSNorm + 3-way sibling linear pass (Q + K + V).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_rms_fused3_with_scratch(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        fused: &Fused3Handles,
+        x: DeviceSpan<'_>,
+        w: Option<DeviceSpan<'_>>,
+        eps: f32,
+        out: &Buffer,
+        scratch: &ChunkScratch,
+    ) -> Result<(), MetalLinearError> {
+        self.gemv.encode_linear_rms_fused3_with_scratch(
+            enc,
+            x,
+            w,
+            eps,
+            fused.suh_stack(),
+            fused.trellis_a(),
+            fused.trellis_b(),
+            fused.trellis_c(),
+            fused.svh_cat(),
+            out,
+            fused.shape_a,
+            fused.shape_b,
+            fused.shape_c,
+            fused.mode,
+            scratch,
+        )?;
+        self.calls
+            .fetch_add(3, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// spec/bandwidth-saturate T4: Fused RMSNorm + 2-way sibling linear pass (Q + K).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_rms_fused2_with_scratch(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        fused: &Fused2Handles,
+        x: DeviceSpan<'_>,
+        w: Option<DeviceSpan<'_>>,
+        eps: f32,
+        out: &Buffer,
+        scratch: &ChunkScratch,
+    ) -> Result<(), MetalLinearError> {
+        self.gemv.encode_linear_rms_fused2_with_scratch(
+            enc,
+            x,
+            w,
+            eps,
+            fused.suh_stack(),
+            fused.trellis_a(),
+            fused.trellis_b(),
+            fused.svh_cat(),
+            out,
+            fused.shape_a,
+            fused.shape_b,
+            fused.mode,
+            scratch,
+        )?;
+        self.calls
+            .fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
     /// Test/bench only — allocates a transient scratch per call. Production
     /// uses [`Self::encode_linear_with_scratch`] with the decoder arena.
     pub fn encode_linear(
@@ -1226,6 +1292,164 @@ kernel void bis_read2(device const uint *a [[buffer(0)]],
     }
 }
 
+// `exl3_gemv_spec` copied VERBATIM into the bench library, with the three
+// function constants turned into #defines so it can be dispatched from the
+// harness with the same geometry production uses.
+//
+// Why a verbatim copy: every source-level hypothesis has been falsified
+// (fast-math, 4-byte alignment, 2-way unroll, `live` in the trip condition, the
+// decode function, the sink, persistent grids, nsplit, threads-per-out-tile),
+// yet `exl3_gemv_spec` measured 107 GB/s while a hand-written kernel doing the
+// identical arithmetic measured 229 GB/s at the identical dispatch. The two
+// live in different MSL libraries reached through different host paths, so
+// every A/B so far has been confounded. With both in ONE library under ONE
+// compiler configuration, flipping a single line is decisive.
+#define SV_K 3u
+#define SV_ALIGNED true
+inline uint sv_ld(device const ushort *t, uint w) {
+    return *(device const uint *)(t + 2u * w);
+}
+inline float4 sv_decode(uint4 cw) {
+    uint4 x = cw & 0xFFFFu;
+    x = x * 89226354u + 64248484u;
+    uint4 r = 0x3B603B60u ^ (x & 0x8FFF8FFFu);
+    half2 h0 = as_type<half2>(r.x);
+    half2 h1 = as_type<half2>(r.y);
+    half2 h2 = as_type<half2>(r.z);
+    half2 h3 = as_type<half2>(r.w);
+    return float4(float(h0.x + h0.y), float(h1.x + h1.y),
+                  float(h2.x + h2.y), float(h3.x + h3.y));
+}
+kernel void spec_verbatim(device const half *xh [[buffer(0)]],
+                          device const ushort *trellis [[buffer(1)]],
+                          device float *y [[buffer(3)]],
+                          constant uint *p [[buffer(4)]],  // [in,out,tw,nsplit]
+                          uint2 tg [[threadgroup_position_in_grid]],
+                          uint2 thr [[thread_position_in_threadgroup]]) {
+    uint tid = thr.x;
+    uint g = tid & 31u;
+    uint ot = tg.x;
+    uint chunk = (p[0] + p[3] - 1u) / p[3];
+    uint it0 = tg.y * chunk;
+    uint it1 = min(p[0], it0 + chunk);
+    bool live = ot < p[1];
+    uint r0 = (g & 3u) * 2u;
+    float accA = 0.0f;
+    float accB = 0.0f;
+    const device ushort *tile =
+        trellis + ((ulong)min(it0, p[0]) * p[1] + ot) * p[2] * 2u;
+    const ulong tstride = (ulong)p[1] * p[2] * 2u;
+    uint it = it0;
+    {
+        uint ig0_[2];
+        uint ig1_[2];
+        uint s3_[2];
+        int tw = int(p[2]);
+        for (uint gg = 0u; gg < 2u; gg++) {
+            uint c0 = g * 8u + gg * 4u;
+            int e_last = int(c0 + 4u) * int(SV_K) + 256 * int(SV_K);
+            int i_end = (e_last - 1) / 32;
+            ig1_[gg] = uint(((i_end % tw) + tw) % tw);
+            ig0_[gg] = uint((((i_end - 1) % tw) + tw) % tw);
+            s3_[gg] = uint((i_end + 1) * 32 - e_last);
+        }
+        for (; live && it + 1u < it1; it += 2u) {
+            half x_lane = xh[it * 16u + g];
+            float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+            float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+            float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+            float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+            {
+                uint a0 = sv_ld(tile, ig0_[0]);
+                uint b0 = sv_ld(tile, ig1_[0]);
+                ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                uint s0 = s3_[0];
+                float4 w0 = sv_decode(uint4(
+                    (uint(m0 >> (s0 + 3u * SV_K))) & 0xFFFFu,
+                    (uint(m0 >> (s0 + 2u * SV_K))) & 0xFFFFu,
+                    (uint(m0 >> (s0 + SV_K))) & 0xFFFFu,
+                    (uint(m0 >> s0)) & 0xFFFFu));
+                uint a1 = sv_ld(tile, ig0_[1]);
+                uint b1 = sv_ld(tile, ig1_[1]);
+                ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                uint s1 = s3_[1];
+                float4 w1 = sv_decode(uint4(
+                    (uint(m1 >> (s1 + 3u * SV_K))) & 0xFFFFu,
+                    (uint(m1 >> (s1 + 2u * SV_K))) & 0xFFFFu,
+                    (uint(m1 >> (s1 + SV_K))) & 0xFFFFu,
+                    (uint(m1 >> s1)) & 0xFFFFu));
+                accA += (x00 * w0.x + x01 * w0.y) + (x02 * w0.z + x03 * w0.w);
+                accB += (x00 * w1.x + x01 * w1.y) + (x02 * w1.z + x03 * w1.w);
+            }
+            tile += tstride;
+            float x10 = float(simd_shuffle(x_lane, ushort(16u + r0)));
+            float x11 = float(simd_shuffle(x_lane, ushort(16u + r0 + 1u)));
+            float x12 = float(simd_shuffle(x_lane, ushort(16u + r0 + 8u)));
+            float x13 = float(simd_shuffle(x_lane, ushort(16u + r0 + 9u)));
+            {
+                uint a0 = sv_ld(tile, ig0_[0]);
+                uint b0 = sv_ld(tile, ig1_[0]);
+                ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                uint s0 = s3_[0];
+                float4 w0 = sv_decode(uint4(
+                    (uint(m0 >> (s0 + 3u * SV_K))) & 0xFFFFu,
+                    (uint(m0 >> (s0 + 2u * SV_K))) & 0xFFFFu,
+                    (uint(m0 >> (s0 + SV_K))) & 0xFFFFu,
+                    (uint(m0 >> s0)) & 0xFFFFu));
+                uint a1 = sv_ld(tile, ig0_[1]);
+                uint b1 = sv_ld(tile, ig1_[1]);
+                ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                uint s1 = s3_[1];
+                float4 w1 = sv_decode(uint4(
+                    (uint(m1 >> (s1 + 3u * SV_K))) & 0xFFFFu,
+                    (uint(m1 >> (s1 + 2u * SV_K))) & 0xFFFFu,
+                    (uint(m1 >> (s1 + SV_K))) & 0xFFFFu,
+                    (uint(m1 >> s1)) & 0xFFFFu));
+                accA += (x10 * w0.x + x11 * w0.y) + (x12 * w0.z + x13 * w0.w);
+                accB += (x10 * w1.x + x11 * w1.y) + (x12 * w1.z + x13 * w1.w);
+            }
+            tile += tstride;
+        }
+        for (; live && it < it1; it++) {
+            half x_lane = xh[it * 16u + (g & 15u)];
+            float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+            float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+            float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+            float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+            uint a0 = sv_ld(tile, ig0_[0]);
+            uint b0 = sv_ld(tile, ig1_[0]);
+            ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+            uint s0 = s3_[0];
+            float4 w0 = sv_decode(uint4(
+                (uint(m0 >> (s0 + 3u * SV_K))) & 0xFFFFu,
+                (uint(m0 >> (s0 + 2u * SV_K))) & 0xFFFFu,
+                (uint(m0 >> (s0 + SV_K))) & 0xFFFFu,
+                (uint(m0 >> s0)) & 0xFFFFu));
+            uint a1 = sv_ld(tile, ig0_[1]);
+            uint b1 = sv_ld(tile, ig1_[1]);
+            ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+            uint s1 = s3_[1];
+            float4 w1 = sv_decode(uint4(
+                (uint(m1 >> (s1 + 3u * SV_K))) & 0xFFFFu,
+                (uint(m1 >> (s1 + 2u * SV_K))) & 0xFFFFu,
+                (uint(m1 >> (s1 + SV_K))) & 0xFFFFu,
+                (uint(m1 >> s1)) & 0xFFFFu));
+            accA += (x00 * w0.x + x01 * w0.y) + (x02 * w0.z + x03 * w0.w);
+            accB += (x00 * w1.x + x01 * w1.y) + (x02 * w1.z + x03 * w1.w);
+            tile += tstride;
+        }
+    }
+    accA += simd_shuffle_down(accA, 1);
+    accA += simd_shuffle_down(accA, 2);
+    accB += simd_shuffle_down(accB, 1);
+    accB += simd_shuffle_down(accB, 2);
+    if (live && (g & 3u) == 0u) {
+        uint c0 = g >> 2;
+        y[(tg.y * p[1] + ot) * 16u + c0] = accA;
+        y[(tg.y * p[1] + ot) * 16u + c0 + 8u] = accB;
+    }
+}
+
 // S6 = S5 but with the production f32 partial write (16 floats per threadgroup
 // into the [(split*out_tiles+ot)*TILE + c] layout) instead of an 8-byte atomic
 // sink. Isolates the cost of the partial traffic itself, separate from the
@@ -1334,6 +1558,98 @@ kernel void bis_full_partial(device const half *xh [[buffer(0)]],
         uint c0 = g >> 2;
         yout[(split * out_tiles + ot) * 16u + c0] = accA;
         yout[(split * out_tiles + ot) * 16u + c0 + 8u] = accB;
+    }
+}
+
+// Persistent grid-stride GEMV. Identical math to `bis_full`, but the grid is a
+// fixed number of threadgroups that each walk MANY out-tiles with a grid stride,
+// decoupling the thread count from out_tiles.
+//
+// The measurement that motivates this: the same kernel at 1,344 concurrent
+// threads reaches 339 GB/s, at 5,376 threads 311 GB/s, and at 43,008 threads
+// 105 GB/s. Every extra concurrent stream is another DRAM row the memory
+// controller must keep open; past a few thousand they thrash. `out_tiles` forced
+// one threadgroup per out-tile, so narrow shapes launched 43k streams to read
+// 17 MB. A persistent grid lets the hardware see a few long sequential walks.
+kernel void bis_full_persist(device const half *xh [[buffer(0)]],
+                             device const uint *buf [[buffer(1)]],
+                             device atomic_uint *out [[buffer(2)]],
+                             constant uint *p [[buffer(3)]],  // [in,out,tw,nsplit,groups]
+                             uint tg [[thread_position_in_grid]],
+                             uint thr [[thread_position_in_threadgroup]]) {
+    uint in_tiles = p[0];
+    uint out_tiles = p[1];
+    uint twords = p[2];
+    uint groups = p[4];
+    uint g = thr;
+    uint r0 = (g & 3u) * 2u;
+    const ulong tstride = (ulong)out_tiles * twords * 2u;
+
+    // Per-lane decode indices: same arithmetic as exl3_gemv_spec, hoisted out
+    // of the out-tile loop so it is paid once per launch, not once per tile.
+    uint ig0_[2];
+    uint ig1_[2];
+    uint s3_[2];
+    int tw = int(twords);
+    for (uint gg = 0u; gg < 2u; gg++) {
+        uint c0 = g * 8u + gg * 4u;
+        int e_last = int(c0 + 4u) * 3 + 256 * 3;
+        int i_end = (e_last - 1) / 32;
+        ig1_[gg] = uint(((i_end % tw) + tw) % tw);
+        ig0_[gg] = uint((((i_end - 1) % tw) + tw) % tw);
+        s3_[gg] = uint((i_end + 1) * 32 - e_last);
+    }
+
+    // Base offset MUST match BIS_SETUP: (it0 * out_tiles + ot) * twords * 2.
+    // The first cut of this kernel used ot * in_tiles, which reads ~2x past the
+    // tensor; it "measured" 9-290 GB/s of out-of-bounds traffic and was void.
+    for (uint ot = tg; ot < out_tiles; ot += groups) {
+        const device ushort *tile =
+            (device const ushort *)buf + ((ulong)ot) * twords * 2u;
+        float accA = 0.0f;
+        float accB = 0.0f;
+        for (uint it = 0u; it < in_tiles; it++) {
+            half x_lane = xh[it * 16u + g];
+            float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+            float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+            float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+            float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+            {
+                uint a0 = bis_ld(tile, ig0_[0]);
+                uint b0 = bis_ld(tile, ig1_[0]);
+                ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                uint a1 = bis_ld(tile, ig0_[1]);
+                uint b1 = bis_ld(tile, ig1_[1]);
+                ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                float4 w0 = bis_decode(uint4(
+                    (uint(m0 >> (s3_[0] + 3u * K3))) & 0xFFFFu,
+                    (uint(m0 >> (s3_[0] + 2u * K3))) & 0xFFFFu,
+                    (uint(m0 >> (s3_[0] + K3))) & 0xFFFFu,
+                    (uint(m0 >> s3_[0])) & 0xFFFFu));
+                float4 w1 = bis_decode(uint4(
+                    (uint(m1 >> (s3_[1] + 3u * K3))) & 0xFFFFu,
+                    (uint(m1 >> (s3_[1] + 2u * K3))) & 0xFFFFu,
+                    (uint(m1 >> (s3_[1] + K3))) & 0xFFFFu,
+                    (uint(m1 >> s3_[1])) & 0xFFFFu));
+                accA += (x00 * w0.x + x01 * w0.y) + (x02 * w0.z + x03 * w0.w);
+                accB += (x00 * w1.x + x01 * w1.y) + (x02 * w1.z + x03 * w1.w);
+            }
+            tile += tstride;
+        }
+        accA += simd_shuffle_down(accA, 1);
+        accA += simd_shuffle_down(accA, 2);
+        accB += simd_shuffle_down(accB, 1);
+        accB += simd_shuffle_down(accB, 2);
+        if ((g & 3u) == 0u) {
+            uint c0 = g >> 2;
+            // Atomic sink keeps the comparison against bis_full apples-to-apples;
+            // a production version writes the reduced columns to the real output.
+            atomic_fetch_add_explicit(
+                out,
+                as_type<uint>(accA) ^ as_type<uint>(accB) ^ (ot * 2654435761u),
+                memory_order_relaxed
+            );
+        }
     }
 }
 
@@ -1636,6 +1952,66 @@ kernel void bis_flush(device uint *b [[buffer(0)]],
         assert_eq!(want.len(), got.len());
         for (i, (w, g)) in want.iter().zip(got.iter()).enumerate() {
             assert_eq!(w.to_bits(), g.to_bits(), "index {i}: separate want {:#06x} vs fused got {:#06x}", w.to_bits(), g.to_bits());
+        }
+    }
+
+    /// spec/bandwidth-saturate T4: `rms_had_in_batched` must match separate `rms` + `had_in_batched` bit-for-bit.
+    #[test]
+    fn gpu_rms_had_in_batched_matches_separate_passes() {
+        let Some(c) = ctx() else { return };
+        let mut rng = Rng(0xDDDD_0001);
+        let n = 256;
+        let eps = 1e-6f32;
+        let x: Vec<f16> = (0..n)
+            .map(|_| f16::from_f32(((rng.next() % 2001) as f32 / 1000.0) - 1.0))
+            .collect();
+        let w: Vec<f32> = (0..n)
+            .map(|_| ((rng.next() % 2001) as f32 / 1000.0) + 0.1)
+            .collect();
+        let suh0: Vec<f16> = (0..n)
+            .map(|_| if rng.next() % 2 == 0 { f16::from_f32(1.0) } else { f16::from_f32(-1.0) })
+            .collect();
+        let suh1: Vec<f16> = (0..n)
+            .map(|_| if rng.next() % 2 == 0 { f16::from_f32(1.0) } else { f16::from_f32(-1.0) })
+            .collect();
+        let suh2: Vec<f16> = (0..n)
+            .map(|_| if rng.next() % 2 == 0 { f16::from_f32(1.0) } else { f16::from_f32(-1.0) })
+            .collect();
+
+        let ml = MetalLinear::new(&c).unwrap();
+        let x_buf = c.device().new_buffer_with_data(x.as_ptr() as *const _, (n * 2) as u64, MTLResourceOptions::StorageModeShared);
+        let w_buf = c.device().new_buffer_with_data(w.as_ptr() as *const _, (n * 4) as u64, MTLResourceOptions::StorageModeShared);
+        let xn_buf = c.device().new_buffer((n * 2) as u64, MTLResourceOptions::StorageModeShared);
+
+        // Separate: rms -> had_in_batched
+        let cb = c.queue().new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        ml.encode_rms(enc, DeviceSpan { buffer: &x_buf, byte_offset: 0 }, Some(DeviceSpan { buffer: &w_buf, byte_offset: 0 }), DeviceSpan { buffer: &xn_buf, byte_offset: 0 }, 1, n, eps).unwrap();
+        enc.end_encoding();
+        cb.commit();
+        cb.wait_until_completed();
+
+        let mut xn_host = vec![f16::ZERO; n];
+        unsafe {
+            std::ptr::copy_nonoverlapping(xn_buf.contents() as *const u8, xn_host.as_mut_ptr() as *mut u8, n * 2);
+        }
+
+        let mut suh_stack = Vec::new();
+        suh_stack.extend_from_slice(&suh0);
+        suh_stack.extend_from_slice(&suh1);
+        suh_stack.extend_from_slice(&suh2);
+        let stack_buf = c.device().new_buffer_with_data(suh_stack.as_ptr() as *const _, (suh_stack.len() * 2) as u64, MTLResourceOptions::StorageModeShared);
+
+        let mut want_batched = Vec::new();
+        ml.raw().had_in_batched_pass(&xn_host, DeviceSpan { buffer: &stack_buf, byte_offset: 0 }, 3, &mut want_batched).unwrap();
+
+        // Fused: rms_had_in_batched
+        let mut got_batched = Vec::new();
+        ml.raw().rms_had_in_batched_pass(&x, Some(&w), eps, DeviceSpan { buffer: &stack_buf, byte_offset: 0 }, 3, &mut got_batched).unwrap();
+
+        assert_eq!(want_batched.len(), got_batched.len());
+        for (i, (w_val, g_val)) in want_batched.iter().zip(got_batched.iter()).enumerate() {
+            assert_eq!(w_val.to_bits(), g_val.to_bits(), "index {i}: separate want {:#06x} vs fused got {:#06x}", w_val.to_bits(), g_val.to_bits());
         }
     }
 
@@ -3074,6 +3450,16 @@ kernel void bis_flush(device uint *b [[buffer(0)]],
             let bpipe = device
                 .new_compute_pipeline_state_with_function(&bf)
                 .expect("bis_full pipe");
+            let sv_pipe = device
+                .new_compute_pipeline_state_with_function(
+                    &blib.get_function("spec_verbatim", None).expect("spec_verbatim"),
+                )
+                .expect("spec_verbatim pipe");
+            let bpart_pipe = device
+                .new_compute_pipeline_state_with_function(
+                    &blib.get_function("bis_full_partial", None).expect("bis_full_partial"),
+                )
+                .expect("bis_full_partial pipe");
             let out_small =
                 device.new_buffer(8, metal::MTLResourceOptions::StorageModeShared);
             let it0_u = it0;
@@ -3109,7 +3495,13 @@ kernel void bis_flush(device uint *b [[buffer(0)]],
                     enc.set_buffer(1, Some(tbuf), *toff as u64);
                     enc.set_buffer(2, Some(&out_small), 0);
                     enc.set_buffer(3, Some(&pbuf), 0);
-                    enc.dispatch_threads(
+                    // Was dispatch_threads, which takes a TOTAL thread count:
+                    // ot*ns threads / 32 per group = only ot*ns/32 threadgroups,
+                    // so it computed 42 of gate's 1344 out-tiles while the timing
+                    // credited it with the full 43 MB. That is the source of the
+                    // bogus "317 GB/s". One threadgroup per (out-tile, split) is
+                    // what BIS_SETUP's `ot = tg % out_tiles` expects.
+                    enc.dispatch_thread_groups(
                         metal::MTLSize::new(ot0_u as u64 * ns as u64, 1, 1),
                         metal::MTLSize::new(32, 1, 1),
                     );
@@ -3204,7 +3596,7 @@ kernel void bis_flush(device uint *b [[buffer(0)]],
                     v.sort_by(|a, b| a.partial_cmp(b).unwrap());
                     v[0] / items.len() as f64
                 };
-                let tn = |mg: bool| {
+                let tn = |_mg: bool| {
                     run_nr();
                     let mut v = Vec::with_capacity(3);
                     for _ in 0..3 {
@@ -3218,17 +3610,370 @@ kernel void bis_flush(device uint *b [[buffer(0)]],
                 let ts = t(false);
                 let tm = t(true);
                 let tnr = tn(false);
+                // exl3_gemv_post: the nsplit==1 fused path. 256 threads, 8
+                // out-tiles per threadgroup (= one 128-point Hadamard block),
+                // Hadamard + svh in-kernel, f16 straight out. No K-split, no
+                // partial buffer, no reduce dispatch.
+                let svh_all: Vec<f16> = (0..outp as usize)
+                    .map(|i| if i % 3 == 0 { f16::from_f32(1.0) } else { f16::from_f32(0.5) })
+                    .collect();
+                let svh_buf = device.new_buffer_with_data(
+                    svh_all.as_ptr() as *const _,
+                    (svh_all.len() * 2) as u64,
+                    metal::MTLResourceOptions::StorageModeShared,
+                );
+                let f16out = device.new_buffer(
+                    (outp as u64) * 2,
+                    metal::MTLResourceOptions::StorageModeShared,
+                );
+                let run_post = || {
+                    let cb = c.queue().new_command_buffer();
+                    let enc = cb.new_compute_command_encoder();
+                    for (tbuf, toff, _gb) in &items {
+                        ml.raw().encode_gemv_post(
+                            enc,
+                            &scratch.xh,
+                            DeviceSpan {
+                                buffer: tbuf,
+                                byte_offset: *toff,
+                            },
+                            &pair,
+                            DeviceSpan {
+                                buffer: &svh_buf,
+                                byte_offset: 0,
+                            },
+                            &f16out,
+                            l0.shape,
+                            mode,
+                        );
+                    }
+                    enc.end_encoding();
+                    cb.commit();
+                    cb.wait_until_completed();
+                };
+                // S6 kernel: bis_full's math with the production f32 partial store.
+            let bpart = device
+                .new_buffer(
+                    (ot0 as usize * 16 * 4) as u64,
+                    metal::MTLResourceOptions::StorageModeShared,
+                );
+            let run_bpart = || {
+                let pbuf = pb_p(1);
+                let cb = c.queue().new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                for (tbuf, toff, _gb) in &items {
+                    enc.set_compute_pipeline_state(&bpart_pipe);
+                    enc.set_buffer(0, Some(&xh_pad), 0);
+                    enc.set_buffer(1, Some(tbuf), *toff as u64);
+                    enc.set_buffer(2, Some(&bpart), 0);
+                    enc.set_buffer(3, Some(&pbuf), 0);
+                    enc.dispatch_thread_groups(
+                        metal::MTLSize::new(ot0 as u64, 1, 1),
+                        metal::MTLSize::new(32, 1, 1),
+                    );
+                }
+                enc.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+            };
+            // spec_verbatim in the SAME library, PRODUCTION dispatch.
+            let sv_partial = device.new_buffer(
+                (ot0 as usize * 16 * 4 * 8) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let t_sv = {
+                for ns in [1usize, 4, 8] {
+                    let sp = pb_p(ns);
+                    let cb = c.queue().new_command_buffer();
+                    let enc = cb.new_compute_command_encoder();
+                    for (tbuf, toff, _gb) in &items {
+                        enc.set_compute_pipeline_state(&sv_pipe);
+                        enc.set_buffer(0, Some(&xh_pad), 0);
+                        enc.set_buffer(1, Some(tbuf), *toff as u64);
+                        enc.set_buffer(3, Some(&sv_partial), 0);
+                        enc.set_buffer(4, Some(&sp), 0);
+                        enc.dispatch_thread_groups(
+                            metal::MTLSize::new(ot0 as u64, ns as u64, 1),
+                            metal::MTLSize::new(32, 1, 1),
+                        );
+                    }
+                    enc.end_encoding();
+                    cb.commit();
+                    cb.wait_until_completed();
+                    let mut v = Vec::with_capacity(3);
+                    for _ in 0..3 {
+                        let st = std::time::Instant::now();
+                        let cb = c.queue().new_command_buffer();
+                        let enc = cb.new_compute_command_encoder();
+                        for (tbuf, toff, _gb) in &items {
+                            enc.set_compute_pipeline_state(&sv_pipe);
+                            enc.set_buffer(0, Some(&xh_pad), 0);
+                            enc.set_buffer(1, Some(tbuf), *toff as u64);
+                            enc.set_buffer(3, Some(&sv_partial), 0);
+                            enc.set_buffer(4, Some(&sp), 0);
+                            enc.dispatch_thread_groups(
+                                metal::MTLSize::new(ot0 as u64, ns as u64, 1),
+                                metal::MTLSize::new(32, 1, 1),
+                            );
+                        }
+                        enc.end_encoding();
+                        cb.commit();
+                        cb.wait_until_completed();
+                        v.push(st.elapsed().as_secs_f64() * 1e3);
+                    }
+                    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    let t = v[0] / items.len() as f64;
+                    eprintln!("   spec_verbatim (same lib, production dispatch) n{ns}: {:6.1} GB/s", per_gb / (t / 1e3));
+                }
+                0.0
+            };
+            let _ = t_sv;
+
+            let t_bpart = {
+                run_bpart();
+                let mut v = Vec::with_capacity(3);
+                for _ in 0..3 {
+                    let st = std::time::Instant::now();
+                    run_bpart();
+                    v.push(st.elapsed().as_secs_f64() * 1e3);
+                }
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[0] / items.len() as f64
+            };
+
+            let tpost = {
+                    run_post();
+                    let mut v = Vec::with_capacity(3);
+                    for _ in 0..3 {
+                        let st = std::time::Instant::now();
+                        run_post();
+                        v.push(st.elapsed().as_secs_f64() * 1e3);
+                    }
+                    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    v[0] / items.len() as f64
+                };
                 let gbs = |ms: f64| per_gb / (ms / 1e3);
                 let tb = t_bis(ns);
                 row.push_str(&format!(
-                    " n{ns}:{:.0}/{:.0}/{:.0}/{:.0}",
+                    " n{ns}:{:.0}/{:.0}/{:.0}/{:.0}/{:.0}/{:.0}",
                     gbs(ts),
                     gbs(tm),
                     gbs(tnr),
-                    gbs(tb)
+                    gbs(tb),
+                    gbs(t_bpart),
+                    gbs(tpost)
                 ));
             }
-            eprintln!("{row}  (GB/s spec / mg / spec-noreduce / bis_full-atomic)");
+            eprintln!("{row}  (spec / mg / spec-nr / bis_full-atomic / bis_full-PARTIAL / post)");
+        }
+    }
+
+    /// spec/exl3-load-latency: are the real trellis byte offsets 4-aligned?
+    ///
+    /// `ld_word(t, w, aligned)` has two paths: one u32 load when aligned, and
+    /// two u16 loads + shift + or when not. `encode_gemv_spec` picks per tensor
+    /// from the byte offset, and the source comment already records that real
+    /// artifacts put *some* trellis tensors at 2-mod-4. The bench kernel
+    /// `bis_ld` hardcodes the aligned path and is 2x faster at identical
+    /// dispatch, which is exactly the signature of the unaligned path being
+    /// taken in production. If the layer linears are 2-mod-4, every one of them
+    /// is paying double load instructions and half the decode bandwidth is
+    /// recoverable for free.
+    #[test]
+    #[ignore]
+    fn bench_trellis_alignment_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = crate::testutil::artifact_dir() else { return };
+        let Some(c) = ctx() else { return };
+        let model = crate::load::load_exl3(&c, &dir).expect("load artifact");
+        let src: &dyn TensorSource = &model;
+        eprintln!("== trellis byte offsets (mod 4) across layer linears ==");
+        for which in [
+            "mlp.gate_proj",
+            "mlp.down_proj",
+            "self_attn.o_proj",
+            "self_attn.k_proj",
+        ] {
+            let mut counts = [0usize; 4];
+            let mut first_bad = None;
+            for l in 0..20u32 {
+                let name = format!("model.language_model.layers.{l}.{which}");
+                if let Some((_b, off)) = src.device_span(&format!("{name}.trellis")) {
+                    counts[off % 4] += 1;
+                    if off % 4 != 0 && first_bad.is_none() {
+                        first_bad = Some((l, off));
+                    }
+                }
+            }
+            eprintln!(
+                "  {which:22} mod4 counts [0,1,2,3] = {counts:?}   first misaligned: {first_bad:?}"
+            );
+        }
+    }
+
+    /// spec/exl3-load-latency: sweep the **persistent grid size**.
+    ///
+    /// The A/B showed the same kernel at 1,344 concurrent threads reaches
+    /// 339 GB/s and at 43,008 threads only 105 — concurrent streams thrash the
+    /// memory controller. `out_tiles` fixes the thread count today (one
+    /// threadgroup per out-tile), so a 336-out-tile shape launches 43k streams
+    /// to read 17 MB. `bis_full_persist` decouples them: a fixed grid, each
+    /// threadgroup walking many out-tiles with a grid stride.
+    ///
+    /// If the trend holds, the fix is a small persistent grid and the old
+    /// `gemv_splits` "hit 4096 threadgroups" heuristic is exactly backwards.
+    #[test]
+    #[ignore]
+    fn bench_persist_grid_sweep_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = crate::testutil::artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let Some(c) = ctx() else { return };
+        let device = c.device();
+        use std::time::Instant;
+
+        let opts = metal::CompileOptions::new();
+        let lib = device
+            .new_library_with_source(P1_BISECT_MSL, &opts)
+            .expect("P1");
+        let mk = |n: &str| {
+            let f = lib.get_function(n, None).unwrap_or_else(|_| panic!("{n}"));
+            device
+                .new_compute_pipeline_state_with_function(&f)
+                .unwrap_or_else(|e| panic!("{n}: {e}"))
+        };
+        let persist = mk("bis_full_persist");
+        let per_out = mk("bis_full");
+
+        let model = crate::load::load_exl3(&c, &dir).expect("load artifact");
+        let src: &dyn TensorSource = &model;
+        let out = device.new_buffer(8, metal::MTLResourceOptions::StorageModeShared);
+        let pbuf = |v: &[u32]| {
+            let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            device.new_buffer_with_data(
+                bytes.as_ptr() as *const _,
+                bytes.len() as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            )
+        };
+
+        eprintln!("== persistent grid sweep, 20 distinct real tensors/point ==");
+        for (label, which) in [
+            ("gate 5376x21504", "mlp.gate_proj"),
+            ("down 21504x5376", "mlp.down_proj"),
+            ("o    8192x5376 ", "self_attn.o_proj"),
+            ("k    5376x4096 ", "self_attn.k_proj"),
+        ] {
+            let mut items: Vec<(&metal::Buffer, usize, f64)> = Vec::new();
+            for l in 0..20u32 {
+                let name = format!("model.language_model.layers.{l}.{which}");
+                let Ok(lin) = linear_handles(src, &name) else { continue };
+                let Some((tbuf, toff)) = src.device_span(&format!("{name}.trellis")) else {
+                    continue;
+                };
+                let it = lin.shape.in_tiles as u32;
+                let ot = lin.shape.out_tiles as u32;
+                let tw = (lin.shape.words_per_tile() / 2) as u32;
+                items.push((tbuf, toff, (it * ot * tw) as f64 * 4.0 / 1e9));
+            }
+            if items.is_empty() {
+                continue;
+            }
+            let l0 = linear_handles(src, &format!("model.language_model.layers.0.{which}"))
+                .expect("layer 0");
+            let it0 = l0.shape.in_tiles as u32;
+            let ot0 = l0.shape.out_tiles as u32;
+            let tw0 = (l0.shape.words_per_tile() / 2) as u32;
+            let per_gb = items[0].2;
+            let xh: Vec<f16> = (0..(it0 as usize * 16 + 64))
+                .map(|i| f16::from_f32(((i % 17) as f32 - 8.0) / 64.0))
+                .collect();
+            let xbuf = device.new_buffer_with_data(
+                xh.as_ptr() as *const _,
+                (xh.len() * 2) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+
+            // Baseline: one threadgroup per out-tile (production geometry).
+            let pb = pbuf(&[it0, ot0, tw0, 1]);
+            let run_base = || {
+                let cb = c.queue().new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                for (tbuf, toff, _gb) in &items {
+                    enc.set_compute_pipeline_state(&per_out);
+                    enc.set_buffer(0, Some(&xbuf), 0);
+                    enc.set_buffer(1, Some(tbuf), *toff as u64);
+                    enc.set_buffer(2, Some(&out), 0);
+                    enc.set_buffer(3, Some(&pb), 0);
+                    enc.dispatch_thread_groups(
+                        metal::MTLSize::new(ot0 as u64, 1, 1),
+                        metal::MTLSize::new(32, 1, 1),
+                    );
+                }
+                enc.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+            };
+            let tb = {
+                run_base();
+                let mut v = Vec::with_capacity(3);
+                for _ in 0..3 {
+                    let st = Instant::now();
+                    run_base();
+                    v.push(st.elapsed().as_secs_f64() * 1e3);
+                }
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[0] / items.len() as f64
+            };
+            eprintln!(
+                "-- {label} {per_gb:6.3} GB  production (one-TG-per-out-tile, {ot0} warps in flight): {:6.1} GB/s",
+                per_gb / (tb / 1e3)
+            );
+            for groups in [24u32, 42, 64, 96, 128, 168, 256, 336, 512, 768, 1024, 1344] {
+                let pg = pbuf(&[it0, ot0, tw0, 1, groups]);
+                let run = || {
+                    let cb = c.queue().new_command_buffer();
+                    let enc = cb.new_compute_command_encoder();
+                    for (tbuf, toff, _gb) in &items {
+                        enc.set_compute_pipeline_state(&persist);
+                        enc.set_buffer(0, Some(&xbuf), 0);
+                        enc.set_buffer(1, Some(tbuf), *toff as u64);
+                        enc.set_buffer(2, Some(&out), 0);
+                        enc.set_buffer(3, Some(&pg), 0);
+                        enc.dispatch_thread_groups(
+                            metal::MTLSize::new(groups as u64, 1, 1),
+                            metal::MTLSize::new(32, 1, 1),
+                        );
+                    }
+                    enc.end_encoding();
+                    cb.commit();
+                    cb.wait_until_completed();
+                };
+                run();
+                let mut v = Vec::with_capacity(3);
+                for _ in 0..3 {
+                    let st = Instant::now();
+                    run();
+                    v.push(st.elapsed().as_secs_f64() * 1e3);
+                }
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let t = v[0] / items.len() as f64;
+                eprintln!(
+                    "     {:5} warps in flight: {:7.3} ms -> {:6.1} GB/s  ({:.2}x)",
+                    groups,
+                    t,
+                    per_gb / (t / 1e3),
+                    tb / t
+                );
+            }
         }
     }
 
@@ -3310,9 +4055,9 @@ kernel void bis_flush(device uint *b [[buffer(0)]],
             .map(|l| l.shape.in_tiles as u32)
             .unwrap_or(336);
             let ot0 = items[0].2;
-            let tw0 = (linear_handles(src, &format!("model.language_model.layers.0.{which}"))
+            let tw0 = linear_handles(src, &format!("model.language_model.layers.0.{which}"))
                 .map(|l| (l.shape.words_per_tile() / 2) as u32)
-                .unwrap_or(24));
+                .unwrap_or(24);
             let xh_len = (it0 as usize) * 16 + 64;
             let xh_host: Vec<f16> = (0..xh_len)
                 .map(|i| f16::from_f32(((i % 17) as f32 - 8.0) / 64.0))
@@ -3337,7 +4082,7 @@ kernel void bis_flush(device uint *b [[buffer(0)]],
                         enc.set_buffer(1, Some(tbuf), *toff as u64);
                         enc.set_buffer(2, Some(&out), 0);
                         enc.set_buffer(3, Some(&p), 0);
-                        enc.dispatch_threads(
+                        enc.dispatch_thread_groups(
                             metal::MTLSize::new((*ot as u64) * ns as u64, 1, 1),
                             metal::MTLSize::new(32, 1, 1),
                         );
@@ -3778,7 +4523,7 @@ kernel void bis_flush(device uint *b [[buffer(0)]],
                     enc.set_buffer(0, Some(b), 0);
                     enc.set_buffer(1, Some(&out), 0);
                     enc.set_buffer(2, Some(&p_str), 0);
-                    enc.dispatch_threads(
+                    enc.dispatch_thread_groups(
                         metal::MTLSize::new((ot as u64) * ns as u64, 1, 1),
                         metal::MTLSize::new(32, 1, 1),
                     );
@@ -4055,7 +4800,7 @@ kernel void bis_flush(device uint *b [[buffer(0)]],
             ("k", "model.language_model.layers.0.self_attn.k_proj"),
         ] {
             let lin = linear_handles(src, name).unwrap_or_else(|e| panic!("{name}: {e}"));
-            let (buf, off) = src.device_span(&format!("{name}.trellis")).expect("span");
+            let (buf, _off) = src.device_span(&format!("{name}.trellis")).expect("span");
             let it = lin.shape.in_tiles as u32;
             let ot = lin.shape.out_tiles as u32;
             let tw = (lin.shape.words_per_tile() / 2) as u32;

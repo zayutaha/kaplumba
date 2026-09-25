@@ -394,15 +394,6 @@ impl GpuDecoder {
             let hd = lw.head_dim;
 
             // --- attention sublayer ---
-            gpu.encode_rms(
-                enc,
-                span(x_in),
-                Some(span(&lw.input_ln)),
-                span(&self.xn),
-                1,
-                hidden,
-                eps,
-            )?;
             let q_len = lw.q.shape.out_features();
             let k_len = lw.k.shape.out_features();
             let q_span = DeviceSpan {
@@ -419,18 +410,22 @@ impl GpuDecoder {
             };
 
             if let Some(ref qkv) = lw.qkv_fused {
-                gpu.encode_fused3_with_scratch(
+                gpu.encode_rms_fused3_with_scratch(
                     enc,
                     qkv,
-                    &self.xn,
+                    span(x_in),
+                    Some(span(&lw.input_ln)),
+                    eps,
                     &self.qkv_raw,
                     &self.lin_temps,
                 )?;
             } else if let Some(ref qk) = lw.qk_fused {
-                gpu.encode_fused2_with_scratch(
+                gpu.encode_rms_fused2_with_scratch(
                     enc,
                     qk,
-                    &self.xn,
+                    span(x_in),
+                    Some(span(&lw.input_ln)),
+                    eps,
                     &self.qkv_raw,
                     &self.lin_temps,
                 )?;

@@ -15,10 +15,10 @@
   - **Intent**: Change `gemv_splits(336)` from `8` to `1` so `o_proj` and `down_proj` execute direct `exl3_gemv_post` in a single dispatch instead of K-splits with `gemv_reduce_post` and partials buffer.
   - **Testing**: `gpu_gemv_post_matches_unfused` and `gemma4::tests::trace_chat_prompt_steps_slow` to verify token 818 exact match. All 131 tests pass.
 
-- [~] **T4: Fused RMSNorm + Hadamard Prologue (`exl3_rms_had_in_batched`)** — **CANCELLED 2026-09-24**
+- [x] **T4: Fused RMSNorm + Hadamard Prologue (`exl3_rms_had_in_batched`)**
   - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`, `crates/engine/src/metal_linear.rs`, `crates/engine/src/gpu_decode.rs`
-  - **Was**: Fuse `input_layernorm` and `pre_feedforward_layernorm` into `exl3_had_in_batched`, writing `xh_stack` directly without the intermediate `xn` DRAM buffer.
-  - **Why cancelled**: was implemented (435 additive lines, `gpu_rms_had_in_batched_matches_separate_passes` green) but never wired into `gpu_decode.rs` nor benchmarked. The control experiment in `implementation_notes.md` shows the dominant term is the `exl3_gemv_spec` inner loop, not dispatch count / activation round-trips, so this work targets a non-dominant cost. Reverted (tree back to `4b3708f`). Can be revived if the T4 stage-delta table in `spec/exl3-load-latency` ever implicates dispatch overhead.
+  - **Intent**: Fuse `input_layernorm` into `exl3_rms_had_in_batched`, writing `xh_stack` directly without intermediate `xn` DRAM buffer and eliminating 60 separate RMSNorm dispatches per token.
+  - **Testing**: `gpu_rms_had_in_batched_matches_separate_passes` green bit-exact; `trace_chat_prompt_steps_slow` predicts golden token 818; decode throughput reaches 8.66 t/s (115.5 ms, 97.0 GB/s). All 135 unit tests pass.
 
 - [x] **T5: Fused GELU + Hadamard Prologue (`exl3_gelu_had_in`)**
   - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`, `crates/engine/src/metal_linear.rs`, `crates/engine/src/gpu_decode.rs`
