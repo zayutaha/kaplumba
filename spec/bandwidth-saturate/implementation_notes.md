@@ -111,6 +111,19 @@ stage-by-stage in `spec/exl3-load-latency`.
 - Bit-exact parity verified in `rms_add_and_scale_matches_separate_passes`.
 - `trace_chat_prompt_steps_slow` latency drops to **6.00s** (predicting golden token 818 bit-identically). Forward decode throughput reaches 8.67 t/s (115.3 ms/token, 97.1 GB/s).
 
+## 2026-09-25 — T6.2: FC-Specialization and Quad Vectorization for Fused2 & Fused3
+- Vectorized and specialized `exl3_gemv_fused2` (Gate+Up) and `exl3_gemv_fused3` (QKV) in `exl3.metal` using function constants `FC_ALIGNED`, `FC_MODE`, and `FC_K` alongside `exl3_decode_quad_const`.
+- Replaced per-quad scalar function calls with 4-element SIMD vector decoding directly into registers, eliminating branch conditions and bit-shifts on the inner loop.
+- Wired function constant specialization into `exl3.rs` via `spec_fn_pipeline` for both fused kernels.
+- Benchmark breakdown (`bench_decode_breakdown_slow`) measured across all 60 layers:
+  - Gate + Up (`exl3_gemv_fused2`): 47.47 ms (72.8 GB/s)
+  - Down Proj (`encode_gelu_had_in_down`): 24.00 ms (72.7 GB/s)
+  - QKV (`exl3_gemv_fused3`): 21.97 ms (52.4 GB/s)
+  - O Proj (`encode_linear_with_scratch`): 11.33 ms (43.4 GB/s)
+  - LM Head: 5.14 ms (221.6 GB/s)
+  - All non-GEMV stages (attention, rope, rms, adds): 4.17 ms total (< 4% of decode).
+- `trace_chat_prompt_steps_slow` execution time drops from 6.00s to **5.76s** with bit-exact prediction of golden token 818.
+
 
 
 

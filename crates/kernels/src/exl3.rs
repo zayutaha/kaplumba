@@ -239,10 +239,6 @@ pub struct Exl3Gemv {
     /// stays in the MSL as the test reference).
     #[allow(dead_code)]
     gemv: ComputePipelineState,
-    /// P5: FC-specialized (function constants FC_K/FC_MODE/FC_ALIGNED) —
-    /// built lazily per (k, mode, aligned); see `spec_fn_pipeline`.
-    gemv_fused2: ComputePipelineState,
-    gemv_fused3: ComputePipelineState,
     /// spec/decode-20tps P1-T1: PonyExl3 v12 MT=1 parity shape (4 simdgroups
     /// per out-tile, 8 accs/lane, zero hot-loop barriers). A/B-able via
     /// `gemv_pass_v4`; production still uses `gemv` until the bench wins.
@@ -314,8 +310,6 @@ impl Exl3Gemv {
             rms_had_in_batched: build("exl3_rms_had_in_batched")?,
             gelu_had_in: build("exl3_gelu_had_in")?,
             gemv: build("exl3_gemv")?,
-            gemv_fused2: build("exl3_gemv_fused2")?,
-            gemv_fused3: build("exl3_gemv_fused3")?,
             gemv4: build("exl3_gemv4")?,
             gemv_reduce: build("exl3_gemv_reduce")?,
             gemv_reduce_post: build("exl3_gemv_reduce_post")?,
@@ -1647,7 +1641,8 @@ impl Exl3Gemv {
         } else {
             owned.as_ref().expect("transient partial")
         };
-        enc.set_compute_pipeline_state(&self.gemv_fused2);
+        let pipeline = self.spec_fn_pipeline("exl3_gemv_fused2", shape_a.k, mode, aligned);
+        enc.set_compute_pipeline_state(&pipeline);
         enc.set_buffer(0, Some(xh), 0);
         enc.set_buffer(1, Some(trellis_a.buffer), trellis_a.byte_offset as u64);
         enc.set_buffer(2, Some(trellis_b.buffer), trellis_b.byte_offset as u64);
@@ -1718,7 +1713,8 @@ impl Exl3Gemv {
         } else {
             owned.as_ref().expect("transient partial")
         };
-        enc.set_compute_pipeline_state(&self.gemv_fused3);
+        let pipeline = self.spec_fn_pipeline("exl3_gemv_fused3", shape_a.k, mode, aligned);
+        enc.set_compute_pipeline_state(&pipeline);
         enc.set_buffer(0, Some(xh), 0);
         enc.set_buffer(1, Some(trellis_a.buffer), trellis_a.byte_offset as u64);
         enc.set_buffer(2, Some(trellis_b.buffer), trellis_b.byte_offset as u64);

@@ -1055,4 +1055,174 @@ mod tests {
             (4.0 * t1_med) / t4_med
         );
     }
+
+    #[test]
+    #[ignore]
+    fn bench_decode_breakdown_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let ctx = MetalContext::new().expect("metal context");
+        let model = load_exl3(&ctx, &dir).expect("load artifact");
+        let gpu = MetalLinear::new(&ctx).expect("metal linear");
+        let gm = Gemma4Model::from_model(&model)
+            .expect("gemma cfg")
+            .with_gpu(&gpu);
+        let decoder = GpuDecoder::new(&gm, &gpu, 1024)
+            .expect("decoder build")
+            .expect("eligible");
+
+        eprintln!("=== Decode Stage Breakdown Probe ===");
+
+        // Warm up
+        let mut cache = gm.new_kv_cache(1024);
+        let cb0 = gpu.new_command_buffer();
+        let _ = decoder.encode_token(&gm, &gpu, &cb0, &mut cache, 2, 60).expect("warmup");
+
+        let time_token = |n_layers: usize| -> f64 {
+            let mut samples = Vec::new();
+            for _ in 0..5 {
+                let mut c = gm.new_kv_cache(1024);
+                let cb0 = gpu.new_command_buffer();
+                let _ = decoder.encode_token(&gm, &gpu, &cb0, &mut c, 2, n_layers).expect("warmup");
+                c.end_token();
+                let cb = gpu.new_command_buffer();
+                let t0 = std::time::Instant::now();
+                let _ = decoder.encode_token(&gm, &gpu, &cb, &mut c, 818, n_layers).expect("step");
+                c.end_token();
+                samples.push(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            samples[2]
+        };
+
+        for &l in &[0, 1, 2, 5, 10, 20, 30, 60] {
+            let ms = time_token(l);
+            eprintln!("layers = {l:2}: {ms:6.2} ms");
+        }
+
+        // Profile each component isolated across all 60 layers in a single command buffer
+        let time_cmd = |name: &str, f: &dyn Fn(&metal::ComputeCommandEncoderRef)| {
+            let mut v = Vec::new();
+            for _ in 0..5 {
+                let cb = gpu.new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                f(&enc);
+                enc.end_encoding();
+                let t0 = std::time::Instant::now();
+                cb.commit();
+                cb.wait_until_completed();
+                v.push(t0.elapsed().as_secs_f64() * 1000.0);
+            }
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            eprintln!("{name:24} (60 layers): {:6.2} ms ({:.3} ms/layer)", v[2], v[2] / 60.0);
+        };
+
+        let eps = gm.cfg.eps as f32;
+        let hd_max = gm.cfg.layers.iter().map(|l| l.head_dim).max().unwrap_or(256);
+        let q_span = DeviceSpan { buffer: &decoder.qkv_raw, byte_offset: 0 };
+        let k_span = DeviceSpan { buffer: &decoder.qkv_raw, byte_offset: decoder.n_heads * hd_max * 2 };
+        let v_span = DeviceSpan { buffer: &decoder.qkv_raw, byte_offset: (decoder.n_heads + 16) * hd_max * 2 };
+        let (ref cos, ref sin) = decoder.rope_sliding;
+
+        eprintln!("--- Isolated 60-layer sub-passes ---");
+
+        // 1. QKV across 60 layers
+        time_cmd("1. QKV (fused3/2)", &|enc| {
+            for i in 0..60 {
+                let lw = &decoder.layers[i];
+                if let Some(ref qkv) = lw.qkv_fused {
+                    gpu.encode_rms_fused3_with_scratch(enc, qkv, span(&decoder.x[0]), Some(span(&lw.input_ln)), eps, &decoder.qkv_raw, &decoder.lin_temps).unwrap();
+                } else if let Some(ref qk) = lw.qk_fused {
+                    gpu.encode_rms_fused2_with_scratch(enc, qk, span(&decoder.x[0]), Some(span(&lw.input_ln)), eps, &decoder.qkv_raw, &decoder.lin_temps).unwrap();
+                }
+            }
+        });
+
+        // 2. RoPE Q, K, Norm V across 60 layers
+        time_cmd("2. RoPE Q,K + Norm V", &|enc| {
+            for i in 0..60 {
+                let lw = &decoder.layers[i];
+                let hd = gm.cfg.layers[i].head_dim;
+                let k_cache_span = cache.row_span(i, false, 0).unwrap();
+                let v_cache_span = cache.row_span(i, true, 0).unwrap();
+                gpu.encode_rms_rope(enc, q_span, Some(span(&lw.q_norm)), span(cos), span(sin), q_span, decoder.n_heads, hd, 1, eps).unwrap();
+                gpu.encode_rms_rope(enc, k_span, Some(span(&lw.k_norm)), span(cos), span(sin), k_cache_span, lw.n_kv, hd, 1, eps).unwrap();
+                gpu.encode_rms(enc, v_span, None, v_cache_span, lw.n_kv, hd, eps).unwrap();
+            }
+        });
+
+        // 3. Attention across 60 layers
+        time_cmd("3. Attention (s=1)", &|enc| {
+            for i in 0..60 {
+                let lw = &decoder.layers[i];
+                let hd = gm.cfg.layers[i].head_dim;
+                gpu.encode_attention(enc, q_span, cache.layer_keys_span(i).unwrap(), cache.layer_values_span(i).unwrap(), span(&decoder.attn), kaplumba_kernels::attn::AttnParams {
+                    s: 1,
+                    kv_rows: 1,
+                    q_pos0: 1,
+                    kv_pos0: 0,
+                    n_heads: decoder.n_heads,
+                    n_kv: lw.n_kv,
+                    head_dim: hd,
+                    window: crate::gemma4::layer_window(lw.kind, gm.cfg.sliding_window),
+                }).unwrap();
+            }
+        });
+
+        // 4. O proj across 60 layers
+        time_cmd("4. O proj", &|enc| {
+            for i in 0..60 {
+                let lw = &decoder.layers[i];
+                gpu.encode_linear_with_scratch(enc, &lw.o, &decoder.attn, &decoder.o_proj, 1, &decoder.lin_temps).unwrap();
+            }
+        });
+
+        // 5. RMSNorm Add (post-attn) across 60 layers
+        time_cmd("5. Post-Attn RMSAdd", &|enc| {
+            for i in 0..60 {
+                let lw = &decoder.layers[i];
+                gpu.encode_rms_add(enc, span(&decoder.o_proj), Some(span(&lw.post_attn_ln)), span(&decoder.x[0]), span(&decoder.x[1]), 1, gm.cfg.hidden, eps).unwrap();
+            }
+        });
+
+        // 6. Gate + Up across 60 layers
+        time_cmd("6. Gate + Up (fused2)", &|enc| {
+            for i in 0..60 {
+                let lw = &decoder.layers[i];
+                gpu.encode_rms_fused2_with_scratch(enc, &lw.gate_up_fused, span(&decoder.x[1]), Some(span(&lw.pre_ff_ln)), eps, &decoder.gu_raw, &decoder.lin_temps).unwrap();
+            }
+        });
+
+        // 7. Down proj across 60 layers
+        time_cmd("7. Down proj (GELU+Had)", &|enc| {
+            for i in 0..60 {
+                let lw = &decoder.layers[i];
+                let intermediate = lw.gate.shape.out_features();
+                let gate_span = DeviceSpan { buffer: &decoder.gu_raw, byte_offset: 0 };
+                let up_span = DeviceSpan { buffer: &decoder.gu_raw, byte_offset: intermediate * 2 };
+                gpu.encode_gelu_had_in_down(enc, gate_span, up_span, &lw.down, &decoder.down, 1, &decoder.lin_temps).unwrap();
+            }
+        });
+
+        // 8. RMSNorm Add Scale across 60 layers
+        time_cmd("8. Post-FF RMSAddScale", &|enc| {
+            for i in 0..60 {
+                let lw = &decoder.layers[i];
+                gpu.encode_rms_add_scale(enc, span(&decoder.down), Some(span(&lw.post_ff_ln)), span(&decoder.x[1]), span(&decoder.x[2]), 1, gm.cfg.hidden, eps, lw.scalar).unwrap();
+            }
+        });
+
+        // 9. Final norm + LM head
+        time_cmd("9. FinalNorm + LM Head", &|enc| {
+            gpu.encode_rms(enc, span(&decoder.x[0]), Some(span(&decoder.final_norm)), span(&decoder.xn_final), 1, gm.cfg.hidden, eps).unwrap();
+            gpu.encode_linear_with_scratch(enc, &decoder.lm, &decoder.xn_final, &decoder.logits_h, 1, &decoder.lin_temps).unwrap();
+        });
+    }
 }
+

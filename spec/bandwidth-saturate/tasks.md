@@ -45,6 +45,12 @@
   - **Intent**: Fuse post-attention RMSNorm + residual addition (`kr_rms_add`) and post-feedforward RMSNorm + scaled residual addition (`kr_rms_add_scale`), eliminating 120 separate elementwise add launches per token and intermediate DRAM round-trips.
   - **Testing**: `rms_add_and_scale_matches_separate_passes` verified bit-exact; all 23 kernel tests and 135 engine unit tests pass; `trace_chat_prompt_steps_slow` drops to 6.00s predicting golden token 818; decode forward-only latency reaches 115.3 ms/token (8.67 t/s, 97.1 GB/s).
 
+- [x] **T6.2: FC-Specialization and `exl3_decode_quad_const` for `exl3_gemv_fused2` and `exl3_gemv_fused3`**
+  - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`
+  - **Intent**: Specialize `exl3_gemv_fused2` (Gate+Up) and `exl3_gemv_fused3` (QKV) with function constants `FC_ALIGNED`, `FC_MODE`, `FC_K` and vectorized `exl3_decode_quad_const`, eliminating 16 scalar decode function calls per iteration and runtime branch/bit-shift overhead across 60 layers (responsible for 61% of token decode latency).
+  - **Testing**: `gpu_gemv_fused2_matches_separate_passes`, `gpu_gemv_fused3_matches_separate_passes`, and `gpu_encode_fused2_and_fused3_matches_separate_linears` bit-exact; all 23 kernel tests and 135 engine unit tests pass; `trace_chat_prompt_steps_slow` predicts golden token 818 in 5.76s.
+
+
 
 - [ ] **T7: End-to-End Throughput Verification (≥ 20.0 t/s)** — **BAR KNOWN UNREACHABLE AT k=3 (2026-09-24)**
   - **Files**: `crates/engine/src/gemma4.rs`
