@@ -263,6 +263,9 @@ pub struct Exl3Gemv {
     /// FC-specialized to (k=3, mode=0, aligned=1); never used in production.
     probe: ComputePipelineState,
     pair_tables: RefCell<HashMap<u32, Buffer>>,
+    /// spec/exl3-load-latency T8: cached `exl3_gemv_mg` decode-index tables,
+    /// keyed (k, twords).
+    mg_idx_tables: RefCell<HashMap<(u32, usize), Buffer>>,
     /// Constant 256×u32 inverse tile permutation, shared by every linear
     /// (the decode geometry is per tile-position, not per layer).
     inv_perm: Buffer,
@@ -331,6 +334,7 @@ impl Exl3Gemv {
                     .map_err(|e| KernelError::Pipeline("exl3_gemv_probe".into(), e.to_string()))?
             },
             pair_tables: RefCell::new(HashMap::new()),
+            mg_idx_tables: RefCell::new(HashMap::new()),
             spec_fns: RefCell::new(HashMap::new()),
             gemv_spec: RefCell::new(HashMap::new()),
             inv_perm,
@@ -438,6 +442,32 @@ impl Exl3Gemv {
             256 => 8,  // k/v 5376x4096: T5.2r + sweep argmax (unchanged)
             _ => TARGET_TGS.div_ceil(out_tiles.max(1)).clamp(1, MAX_SPLIT),
         }
+    }
+
+    pub fn gemv_spec_pipeline_for_test(
+        &self,
+        k: u32,
+        mode: u32,
+        aligned: u32,
+    ) -> ComputePipelineState {
+        self.gemv_spec_pipeline(k, mode, aligned)
+    }
+
+    pub fn mg_pipeline_for_test(
+        &self,
+        k: u32,
+        mode: u32,
+        aligned: u32,
+    ) -> ComputePipelineState {
+        self.spec_fn_pipeline("exl3_gemv_mg", k, mode, aligned)
+    }
+
+    pub fn mg_idx_buf_for_test(&self, k: u32, twords: usize) -> Buffer {
+        self.mg_index_buffer(k, twords)
+    }
+
+    pub fn pair_buffer_for_test(&self, k: u32) -> Buffer {
+        self.pair_buffer(k)
     }
 
     fn pair_buffer(&self, k: u32) -> Buffer {
@@ -1102,6 +1132,172 @@ impl Exl3Gemv {
             self.encode_gemv_reduce(enc, dest, y, nsplit, shape.out_tiles);
         }
         drop(owned);
+    }
+
+    /// Host-built decode-index table for `exl3_gemv_mg`: 32 lanes x
+    /// `[ig0_0, ig0_1, ig1_0, ig1_1, s3_0, s3_1]`. This is exactly the
+    /// `ig0_/ig1_/s3_` prologue that `exl3_gemv_spec` recomputes per launch with
+    /// two integer modulos each; hoisting it here is what makes the
+    /// multi-simdgroup geometry profitable.
+    pub fn mg_index_table(k: u32, twords: usize) -> Vec<u32> {
+        let mut v = Vec::with_capacity(32 * 6);
+        let twi = twords as i64;
+        for g in 0..32u32 {
+            let mut ig0 = [0u32; 2];
+            let mut ig1 = [0u32; 2];
+            let mut s3 = [0u32; 2];
+            for gg in 0..2usize {
+                let c0 = (g * 8 + gg as u32 * 4) as i64;
+                let e_last = (c0 + 4) * k as i64 + 256 * k as i64;
+                let i_end = (e_last - 1) / 32;
+                ig1[gg] = (((i_end % twi) + twi) % twi) as u32;
+                ig0[gg] = ((((i_end - 1) % twi) + twi) % twi) as u32;
+                s3[gg] = ((i_end + 1) * 32 - e_last) as u32;
+            }
+            v.push(ig0[0]);
+            v.push(ig0[1]);
+            v.push(ig1[0]);
+            v.push(ig1[1]);
+            v.push(s3[0]);
+            v.push(s3[1]);
+        }
+        v
+    }
+
+    fn mg_index_buffer(&self, k: u32, twords: usize) -> Buffer {
+        let key = (k, twords);
+        if let Some(b) = self.mg_idx_tables.borrow().get(&key) {
+            return b.clone();
+        }
+        let t = Self::mg_index_table(k, twords);
+        let buf = self.device.new_buffer_with_data(
+            t.as_ptr() as *const _,
+            (t.len() * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        self.mg_idx_tables.borrow_mut().insert(key, buf.clone());
+        buf
+    }
+
+    /// `exl3_gemv_mg`: NSG simdgroups (128 threads) per out-tile, decode indices
+    /// from the precomputed table. `nsplit` slices the in-tile range across
+    /// `grid.y` as usual; `nsplit == 1` means one partial per out-tile and no
+    /// reduction pass at all.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_gemv_mg_enc(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        xh: &Buffer,
+        trellis: DeviceSpan<'_>,
+        shape: Exl3Shape,
+        mode: u32,
+        y: &Buffer,
+        ext_partial: Option<&Buffer>,
+        nsplit_override: Option<usize>,
+    ) {
+        let twords = shape.words_per_tile() / 2;
+        let nsplit = nsplit_override.unwrap_or_else(|| Self::gemv_splits(shape.out_tiles));
+        let need = nsplit * shape.out_tiles * TILE * 4;
+        let owned = if nsplit > 1 && ext_partial.is_none() {
+            Some(self.new_f32_buffer(need / 4))
+        } else {
+            None
+        };
+        let dest: &Buffer = if nsplit == 1 {
+            y
+        } else if let Some(p) = ext_partial {
+            debug_assert!(
+                p.length() as usize >= need,
+                "mg partial too small: {} < {}",
+                p.length(),
+                need
+            );
+            p
+        } else {
+            owned.as_ref().expect("transient mg partial")
+        };
+        let idx = self.mg_index_buffer(shape.k, twords);
+        let aligned = u32::from(trellis.byte_offset % 4 == 0);
+        let params: [u32; 7] = [
+            shape.in_tiles as u32,
+            shape.out_tiles as u32,
+            shape.k,
+            twords as u32,
+            mode,
+            aligned,
+            nsplit as u32,
+        ];
+        let pipeline = self.spec_fn_pipeline("exl3_gemv_mg", shape.k, mode, aligned);
+        enc.set_compute_pipeline_state(&pipeline);
+        enc.set_buffer(0, Some(xh), 0);
+        enc.set_buffer(1, Some(trellis.buffer), trellis.byte_offset as u64);
+        enc.set_buffer(2, Some(&idx), 0);
+        enc.set_buffer(3, Some(dest), 0);
+        enc.set_bytes(4, 28, params.as_ptr() as *const _);
+        const NSG_HOST: usize = 4; // MUST match NSG in the MSL
+        enc.dispatch_thread_groups(
+            MTLSize::new(shape.out_tiles as u64, nsplit as u64, 1),
+            MTLSize::new((32 * NSG_HOST) as u64, 1, 1),
+        );
+        if nsplit > 1 {
+            self.encode_gemv_reduce(enc, dest, y, nsplit, shape.out_tiles);
+        }
+        drop(owned);
+    }
+
+    /// Isolated `exl3_gemv_mg` pass, mirroring [`Self::gemv_pass_spec`].
+    pub fn gemv_pass_mg(
+        &self,
+        xh: &[f16],
+        trellis: DeviceSpan<'_>,
+        shape: Exl3Shape,
+        mode: u32,
+        nsplit: Option<usize>,
+        out: &mut Vec<f32>,
+    ) -> Result<(), KernelError> {
+        if xh.len() != shape.in_features() {
+            return Err(KernelError::Unsupported(format!(
+                "gemv needs {} activations, got {}",
+                shape.in_features(),
+                xh.len()
+            )));
+        }
+        if mode > 1 {
+            return Err(KernelError::Unsupported(format!("mode {mode} is CPU-only")));
+        }
+        Self::ensure_span_fits(
+            &trellis,
+            shape.in_tiles * shape.out_tiles * shape.words_per_tile() * 2,
+            "trellis",
+            2,
+        )?;
+        out.resize(shape.out_features(), 0.0);
+        self.with_scratch(xh.len(), shape.out_features(), 1, |sc| {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    xh.as_ptr() as *const u8,
+                    sc.xh.contents() as *mut u8,
+                    xh.len() * 2,
+                );
+            }
+            let cb = self.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            self.encode_gemv_mg_enc(enc, &sc.xh, trellis, shape, mode, &sc.y, None, nsplit);
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+            if cb.status() != MTLCommandBufferStatus::Completed {
+                return Err(KernelError::CommandFailed(cb.status()));
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    sc.y.contents() as *const u8,
+                    out.as_mut_ptr() as *mut u8,
+                    shape.out_features() * 4,
+                );
+            }
+            Ok(())
+        })
     }
 
     /// spec/exl3-load-latency: `encode_gemv_spec` without the trailing

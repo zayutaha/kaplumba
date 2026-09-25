@@ -2917,6 +2917,321 @@ kernel void bis_flush(device uint *b [[buffer(0)]],
         }
     }
 
+    /// spec/exl3-load-latency T8: the host-built index table must reproduce
+    /// exactly what `exl3_gemv_spec` computes inline, and `exl3_gemv_mg` must
+    /// agree with `exl3_gemv_spec` to f32 rounding.
+    #[test]
+    fn gpu_gemv_mg_matches_spec() {
+        let Some(c) = ctx() else { return };
+        // (a) table == inline prologue, for every k the artifact uses.
+        for k in [2u32, 3, 4, 6, 7] {
+            for tw in [8usize, 16, 24, 32, 48] {
+                let tab = kaplumba_kernels::exl3::Exl3Gemv::mg_index_table(k, tw);
+                assert_eq!(tab.len(), 32 * 6, "table size k={k} tw={tw}");
+                for g in 0..32usize {
+                    for gg in 0..2usize {
+                        let c0 = (g * 8 + gg * 4) as i64;
+                        let e_last = (c0 + 4) * k as i64 + 256 * k as i64;
+                        let i_end = (e_last - 1) / 32;
+                        let twi = tw as i64;
+                        let ig1 = (((i_end % twi) + twi) % twi) as u32;
+                        let ig0 = ((((i_end - 1) % twi) + twi) % twi) as u32;
+                        let s3 = ((i_end + 1) * 32 - e_last) as u32;
+                        assert_eq!(tab[g * 6 + gg], ig0, "ig0 k={k} tw={tw} g={g} gg={gg}");
+                        assert_eq!(tab[g * 6 + 2 + gg], ig1, "ig1 k={k} tw={tw} g={g} gg={gg}");
+                        assert_eq!(tab[g * 6 + 4 + gg], s3, "s3 k={k} tw={tw} g={g} gg={gg}");
+                    }
+                }
+            }
+        }
+        // (b) kernel agreement. Accumulation order differs (NSG f32 chains vs
+        // one chain), so this is a tolerance check; the token-level golden
+        // fixtures are the real gate.
+        for (k, in_f, out_f) in [
+            (3u32, 128usize, 128usize),
+            (3, 512, 256),
+            (3, 256, 512),
+            (3, 1024, 128),
+            (3, 2048, 128),
+            (6, 256, 128),
+        ] {
+            let src = SynthGpuSource::build(c.device(), k, in_f, out_f);
+            let lin = linear_handles(&src, "l").expect("eligible");
+            let shape = lin.shape;
+            let mut rng = Rng(0xB165_0000u64 + k as u64);
+            let xh: Vec<f16> = (0..in_f)
+                .map(|_| f16::from_f32(((rng.next() % 2001) as f32 / 1000.0) - 1.0))
+                .collect();
+            let (buf, off) = src.device_span("l.trellis").expect("trellis span");
+            let span = DeviceSpan {
+                buffer: buf,
+                byte_offset: off,
+            };
+            let ml = MetalLinear::new(&c).unwrap();
+            for ns in [Some(1usize), Some(2), Some(4), Some(8)] {
+                let mut got = Vec::new();
+                let mut want = Vec::new();
+                ml.raw()
+                    .gemv_pass_mg(&xh, span, shape, lin.mode, ns, &mut got)
+                    .expect("mg");
+                ml.raw()
+                    .gemv_pass_spec(&xh, span, shape, lin.mode, ns, &mut want)
+                    .expect("spec");
+                assert_eq!(got.len(), want.len());
+                let mut worst = 0.0f32;
+                for (w, g) in want.iter().zip(got.iter()) {
+                    let scale = 1.0f32.max(w.abs()).max(g.abs());
+                    worst = worst.max((w - g).abs() / scale);
+                }
+                assert!(
+                    worst < 1e-3,
+                    "k={k} {in_f}x{out_f} nsplit={ns:?} worst rel {worst}"
+                );
+            }
+        }
+    }
+
+    /// spec/exl3-load-latency T8: A/B `exl3_gemv_mg` vs `exl3_gemv_spec` in the
+    /// production-like regime (60 *distinct* real tensors, so the working set
+    /// is uncacheable), trimmed to 20 tensors / 3 reps / 3 split points so it
+    /// finishes in seconds.
+    #[test]
+    #[ignore]
+    fn bench_gemv_mg_ab_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = crate::testutil::artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        let Some(c) = ctx() else { return };
+        let device = c.device();
+        let model = crate::load::load_exl3(&c, &dir).expect("load artifact");
+        let ml = MetalLinear::new(&c).expect("metal linear");
+        let src: &dyn TensorSource = &model;
+
+        eprintln!("== mg vs spec, 20 DISTINCT real tensors/point (0.87 GB) ==");
+        for (label, which) in [
+            ("gate 5376x21504", "mlp.gate_proj"),
+            ("down 21504x5376", "mlp.down_proj"),
+            ("o    8192x5376 ", "self_attn.o_proj"),
+            ("k    5376x4096 ", "self_attn.k_proj"),
+        ] {
+            let mut items: Vec<(&metal::Buffer, usize, f64)> = Vec::new();
+            for l in 0..20u32 {
+                let name = format!("model.language_model.layers.{l}.{which}");
+                let Ok(lin) = linear_handles(src, &name) else { continue };
+                let Some((tbuf, toff)) = src.device_span(&format!("{name}.trellis")) else {
+                    continue;
+                };
+                let it = lin.shape.in_tiles as u32;
+                let ot = lin.shape.out_tiles as u32;
+                let tw = (lin.shape.words_per_tile() / 2) as u32;
+                items.push((tbuf, toff, (it * ot * tw) as f64 * 4.0 / 1e9));
+            }
+            if items.is_empty() {
+                continue;
+            }
+            let l0 = linear_handles(src, &format!("model.language_model.layers.0.{which}"))
+                .expect("layer 0");
+            let it0 = l0.shape.in_tiles as u32;
+            let ot0 = l0.shape.out_tiles as u32;
+            let tw0 = (l0.shape.words_per_tile() / 2) as u32;
+            let mode = l0.mode;
+            let k = l0.shape.k;
+            let inn = l0.shape.in_features();
+            let outp = l0.shape.out_features() as u32;
+            let per_gb = items[0].2;
+
+            let xh: Vec<f16> = (0..inn)
+                .map(|i| f16::from_f32(((i % 17) as f32 - 8.0) / 64.0))
+                .collect();
+            let need_max = 32 * ot0 as usize * 16 * 4;
+            let scratch = ml
+                .raw()
+                .new_chunk_scratch(inn, outp as usize, need_max.max(outp as usize * 4));
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    xh.as_ptr() as *const u8,
+                    scratch.xh.contents() as *mut u8,
+                    inn * 2,
+                );
+            }
+            let ybuf =
+                c.device()
+                    .new_buffer((outp as u64) * 4, metal::MTLResourceOptions::StorageModeShared);
+            let pair = ml.raw().pair_buffer_for_test(k);
+
+            // bis_full: same math, but an 8-byte atomic sink instead of the
+            // f32 partial block. Isolates partial-write cost from kernel cost.
+            let opts2 = metal::CompileOptions::new();
+            let blib = device.new_library_with_source(P1_BISECT_MSL, &opts2).expect("P1");
+            let bf = blib
+                .get_function("bis_full", None)
+                .expect("bis_full");
+            let bpipe = device
+                .new_compute_pipeline_state_with_function(&bf)
+                .expect("bis_full pipe");
+            let out_small =
+                device.new_buffer(8, metal::MTLResourceOptions::StorageModeShared);
+            let it0_u = it0;
+            let ot0_u = ot0;
+            let tw0_u = tw0;
+            let xh_pad_len = (it0 as usize) * 16 + 64;
+            let xh_pad_host: Vec<f16> = (0..xh_pad_len)
+                .map(|i| f16::from_f32(((i % 17) as f32 - 8.0) / 64.0))
+                .collect();
+            let xh_pad = device.new_buffer_with_data(
+                xh_pad_host.as_ptr() as *const _,
+                (xh_pad_host.len() * 2) as u64,
+                metal::MTLResourceOptions::StorageModeShared,
+            );
+            let pb_p = |ns: usize| -> metal::Buffer {
+                let v: Vec<u8> = [it0_u, ot0_u, tw0_u, ns as u32]
+                    .iter()
+                    .flat_map(|x| x.to_le_bytes())
+                    .collect();
+                device.new_buffer_with_data(
+                    v.as_ptr() as *const _,
+                    v.len() as u64,
+                    metal::MTLResourceOptions::StorageModeShared,
+                )
+            };
+            let run_bis = |ns: usize| {
+                let pbuf = pb_p(ns);
+                let cb = c.queue().new_command_buffer();
+                let enc = cb.new_compute_command_encoder();
+                for (tbuf, toff, _gb) in &items {
+                    enc.set_compute_pipeline_state(&bpipe);
+                    enc.set_buffer(0, Some(&xh_pad), 0);
+                    enc.set_buffer(1, Some(tbuf), *toff as u64);
+                    enc.set_buffer(2, Some(&out_small), 0);
+                    enc.set_buffer(3, Some(&pbuf), 0);
+                    enc.dispatch_threads(
+                        metal::MTLSize::new(ot0_u as u64 * ns as u64, 1, 1),
+                        metal::MTLSize::new(32, 1, 1),
+                    );
+                }
+                enc.end_encoding();
+                cb.commit();
+                cb.wait_until_completed();
+            };
+            let t_bis = |ns: usize| {
+                run_bis(ns);
+                let mut v = Vec::with_capacity(3);
+                for _ in 0..3 {
+                    let st = std::time::Instant::now();
+                    run_bis(ns);
+                    v.push(st.elapsed().as_secs_f64() * 1e3);
+                }
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[0] / items.len() as f64
+            };
+
+            let mut row = format!("{label} {per_gb:6.3} GB");
+            for ns in [1usize, 4, 8] {
+                // Use the production encoders so partial-vs-output destination
+                // selection and the reduce pass are included exactly as in decode.
+                let run = |mg: bool| {
+                    let cb = c.queue().new_command_buffer();
+                    let enc = cb.new_compute_command_encoder();
+                    for (tbuf, toff, _gb) in &items {
+                        let span = DeviceSpan {
+                            buffer: tbuf,
+                            byte_offset: *toff,
+                        };
+                        if mg {
+                            ml.raw().encode_gemv_mg_enc(
+                                enc,
+                                &scratch.xh,
+                                span,
+                                l0.shape,
+                                mode,
+                                &ybuf,
+                                Some(&scratch.partial),
+                                Some(ns),
+                            );
+                        } else {
+                            ml.raw().encode_gemv_spec(
+                                enc,
+                                &scratch.xh,
+                                span,
+                                &pair,
+                                l0.shape,
+                                mode,
+                                &ybuf,
+                                Some(&scratch.partial),
+                                Some(ns),
+                            );
+                        }
+                    }
+                    enc.end_encoding();
+                    cb.commit();
+                    cb.wait_until_completed();
+                };
+                let run_nr = || {
+                    let cb = c.queue().new_command_buffer();
+                    let enc = cb.new_compute_command_encoder();
+                    for (tbuf, toff, _gb) in &items {
+                        ml.raw().encode_gemv_spec_noreduce(
+                            enc,
+                            &scratch.xh,
+                            DeviceSpan {
+                                buffer: tbuf,
+                                byte_offset: *toff,
+                            },
+                            &pair,
+                            l0.shape,
+                            mode,
+                            &scratch.partial,
+                            ns,
+                        );
+                    }
+                    enc.end_encoding();
+                    cb.commit();
+                    cb.wait_until_completed();
+                };
+                let t = |mg: bool| {
+                    run(mg);
+                    let mut v = Vec::with_capacity(3);
+                    for _ in 0..3 {
+                        let st = std::time::Instant::now();
+                        run(mg);
+                        v.push(st.elapsed().as_secs_f64() * 1e3);
+                    }
+                    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    v[0] / items.len() as f64
+                };
+                let tn = |mg: bool| {
+                    run_nr();
+                    let mut v = Vec::with_capacity(3);
+                    for _ in 0..3 {
+                        let st = std::time::Instant::now();
+                        run_nr();
+                        v.push(st.elapsed().as_secs_f64() * 1e3);
+                    }
+                    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    v[0] / items.len() as f64
+                };
+                let ts = t(false);
+                let tm = t(true);
+                let tnr = tn(false);
+                let gbs = |ms: f64| per_gb / (ms / 1e3);
+                let tb = t_bis(ns);
+                row.push_str(&format!(
+                    " n{ns}:{:.0}/{:.0}/{:.0}/{:.0}",
+                    gbs(ts),
+                    gbs(tm),
+                    gbs(tnr),
+                    gbs(tb)
+                ));
+            }
+            eprintln!("{row}  (GB/s spec / mg / spec-noreduce / bis_full-atomic)");
+        }
+    }
+
     /// spec/exl3-load-latency: re-tune `gemv_splits` with amortised timing.
     ///
     /// The existing policy (1344->2, 336->8, 512->2, 256->8, cap 16) was tuned
@@ -3601,7 +3916,7 @@ kernel void bis_flush(device uint *b [[buffer(0)]],
                 );
             }
             let ybuf = c.device().new_buffer(
-                (outp * 4) as u64,
+                (outp as u64) * 4,
                 metal::MTLResourceOptions::StorageModeShared,
             );
 

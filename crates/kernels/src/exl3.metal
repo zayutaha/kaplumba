@@ -742,6 +742,126 @@ kernel void exl3_gemv_spec(device const half *xh [[buffer(0)]],
 }
 
 // Sibling 2-way linear GEMV (spec/pure-decode-273gb R1: Gate + Up).
+// spec/exl3-load-latency T8: `exl3_gemv_mg` — NSG simdgroups (128 threads) per
+// out-tile, each striding the in-tile range, with the per-lane decode indices
+// **precomputed on the host**.
+//
+// `exl3_gemv4` had exactly this geometry and lost, for one reason: every lane
+// recomputed `ig0_/ig1_/s3_` with two integer modulos each. With 4 simdgroups
+// that is 4x the prologue cost per unit of work. But those indices depend only
+// on (lane, k, twords) — 32 lanes x 6 u32 for k=3, a 768-byte table. Lifting
+// them to a host-built, L1-resident buffer replaces four integer divisions per
+// lane per launch with six byte loads, so raising threads-per-out-tile becomes
+// free.
+//
+// This is the lever for the measured constraint: one linear in isolation runs at
+// 108 GB/s because a lone linear cannot saturate the memory system, while the
+// same kernel dispatched many times concurrently reaches 340-377 GB/s. More
+// threadgroups per linear is the only way to get there without a second wave.
+//
+// Accumulation order differs from `exl3_gemv_spec` (NSG per-simdgroup f32
+// chains summed at the end, vs one chain), so this is gated on the token-level
+// golden fixtures plus a tolerance check, not bit-identity.
+#define MG_NSG 4u
+
+kernel void exl3_gemv_mg(device const half *xh [[buffer(0)]],
+                         device const ushort *trellis [[buffer(1)]],
+                         device const uint *idx_tab [[buffer(2)]],
+                         device float *y [[buffer(3)]],
+                         constant Exl3Params &p [[buffer(4)]],
+                         uint2 tg [[threadgroup_position_in_grid]],
+                         uint2 thr [[thread_position_in_threadgroup]]) {
+    uint tid = thr.x;
+    uint sg = tid >> 5u;
+    uint g = tid & 31u;
+    uint ot = tg.x;
+    uint nsplit = p.nsplit;
+    uint chunk = (p.in_tiles + nsplit - 1u) / nsplit;
+    uint it0 = tg.y * chunk;
+    uint it1 = min(p.in_tiles, it0 + chunk);
+    bool live = ot < p.out_tiles;
+
+    // Six table loads replace the modulo prologue. Table is 32*6 u32 = 768 B,
+    // L1-resident for the life of the pipeline.
+    uint ig0_0 = idx_tab[g * 6u + 0u];
+    uint ig0_1 = idx_tab[g * 6u + 1u];
+    uint ig1_0 = idx_tab[g * 6u + 2u];
+    uint ig1_1 = idx_tab[g * 6u + 3u];
+    uint s3_0 = idx_tab[g * 6u + 4u];
+    uint s3_1 = idx_tab[g * 6u + 5u];
+
+    uint r0 = (g & 3u) * 2u;
+    float accA[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    float accB[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+
+    // Simdgroup sg owns it0+sg, it0+sg+MG_NSG, ... so the pointer starts at it0+sg
+    // and advances MG_NSG tiles. (exl3_gemv4 got this wrong: it started at it0 and
+    // advanced one tile, misaligning simdgroups 1..3 by sg tiles.)
+    const device ushort *tile =
+        trellis + ((ulong)min(it0 + sg, p.in_tiles) * p.out_tiles + ot) * p.twords * 2u;
+    const ulong tstride = (ulong)p.out_tiles * p.twords * 2u * MG_NSG;
+
+    if (FC_K != 7u) {
+        for (uint it = it0 + sg; live && it < it1; it += MG_NSG) {
+            half x_lane = xh[it * 16u + g];
+            float x00 = float(simd_shuffle(x_lane, ushort(r0)));
+            float x01 = float(simd_shuffle(x_lane, ushort(r0 + 1u)));
+            float x02 = float(simd_shuffle(x_lane, ushort(r0 + 8u)));
+            float x03 = float(simd_shuffle(x_lane, ushort(r0 + 9u)));
+            {
+                uint a0 = ld_word(tile, ig0_0, FC_ALIGNED);
+                uint b0 = ld_word(tile, ig1_0, FC_ALIGNED);
+                ulong m0 = ((ulong)a0 << 32) | (ulong)b0;
+                uint a1 = ld_word(tile, ig0_1, FC_ALIGNED);
+                uint b1 = ld_word(tile, ig1_1, FC_ALIGNED);
+                ulong m1 = ((ulong)a1 << 32) | (ulong)b1;
+                float4 w0 = exl3_decode_quad_const(uint4(
+                    (uint(m0 >> (s3_0 + 3u * FC_K))) & 0xFFFFu,
+                    (uint(m0 >> (s3_0 + 2u * FC_K))) & 0xFFFFu,
+                    (uint(m0 >> (s3_0 + FC_K))) & 0xFFFFu,
+                    (uint(m0 >> s3_0)) & 0xFFFFu));
+                float4 w1 = exl3_decode_quad_const(uint4(
+                    (uint(m1 >> (s3_1 + 3u * FC_K))) & 0xFFFFu,
+                    (uint(m1 >> (s3_1 + 2u * FC_K))) & 0xFFFFu,
+                    (uint(m1 >> (s3_1 + FC_K))) & 0xFFFFu,
+                    (uint(m1 >> s3_1)) & 0xFFFFu));
+                accA[0] += x00 * w0.x;
+                accA[1] += x01 * w0.y;
+                accA[2] += x02 * w0.z;
+                accA[3] += x03 * w0.w;
+                accB[0] += x00 * w1.x;
+                accB[1] += x01 * w1.y;
+                accB[2] += x02 * w1.z;
+                accB[3] += x03 * w1.w;
+            }
+            tile += tstride;
+        }
+    }
+
+    // In-warp collapse (4 lanes per output column), then across the MG_NSG
+    // simdgroups through threadgroup memory — one partial per out-tile.
+    float a = (accA[0] + accA[1]) + (accA[2] + accA[3]);
+    float b = (accB[0] + accB[1]) + (accB[2] + accB[3]);
+    a += simd_shuffle_down(a, 1);
+    a += simd_shuffle_down(a, 2);
+    b += simd_shuffle_down(b, 1);
+    b += simd_shuffle_down(b, 2);
+
+    threadgroup float tgw[MG_NSG][TILE];
+    if (live && (g & 3u) == 0u) {
+        tgw[sg][g >> 2] = a;
+        tgw[sg][(g >> 2) + 8u] = b;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (live && tid < TILE) {
+        float sum = 0.0f;
+        for (uint gg = 0u; gg < MG_NSG; gg++) {
+            sum += tgw[gg][tid];
+        }
+        y[(tg.y * p.out_tiles + ot) * TILE + tid] = sum;
+    }
+}
+
 kernel void exl3_gemv_fused2(device const half *xh [[buffer(0)]],            // [2, in_tiles * 16]
                              device const ushort *trellis_a [[buffer(1)]],
                              device const ushort *trellis_b [[buffer(2)]],

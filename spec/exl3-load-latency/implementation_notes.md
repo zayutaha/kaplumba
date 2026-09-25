@@ -356,7 +356,70 @@ and the only untested lever for that is giving one linear more threadgroups than
 threadgroup without the 4x index-prologue penalty that sank `exl3_gemv4`. That is the one
 optimisation this session has not falsified.
 
-## Summary of the whole investigation
+## 2026-09-25 — T8: option 1 built, measured, and it found the real 3x
+
+Built `exl3_gemv_mg` — NSG=4 simdgroups (128 threads) per out-tile, each striding the
+in-tile range, with the per-lane `ig0_/ig1_/s3_` prologue **precomputed host-side** into a
+768-byte L1-resident table. This was the fix for `exl3_gemv4`'s known failure mode (it lost
+to `exl3_gemv_spec` because 4 simdgroups re-ran the modulo prologue 4x per unit work).
+
+Verified: `mg_index_table(k, tw)` reproduces the inline prologue **exactly** for
+k in {2,3,4,6,7} x tw in {8,16,24,32,48}; `gpu_gemv_mg_matches_spec` passes for
+k in {3,6} x four shapes x nsplit in {1,2,4,8} at <1e-3 relative.
+
+**Result: option 1 does not win.** On real layer-0 tensors, amortised, uncacheable:
+
+```
+shape   nsplit  spec   mg     bis_full(8B atomic sink)
+gate    4       110    106    326 GB/s
+down    4       106    105    326
+o       4        99     97    281
+k       4        87     88    205
+```
+
+`mg` matches `spec` everywhere (and wins 10-13% only at nsplit=1 on the narrow shapes).
+Hoisting the prologue was necessary but not sufficient.
+
+**But the same table isolates the actual 3x.** `spec-noreduce` (identical except it skips
+the reduce dispatch) measures the same as `spec` — 107-111 vs 105-110 — so the reduce is
+free, as `bench_reduce_dispatch_cost_slow` said (0.8 ms/token, 2%). The only remaining
+difference between `exl3_gemv_spec` and `bis_full` is **where the result goes**:
+
+- `exl3_gemv_spec`: each threadgroup stores 16 f32 (64 B) to
+  `y[(split*out_tiles + ot)*TILE + c]`, from the 8 lanes with `(g & 3) == 0`, each writing
+  2 floats at 16 B stride.
+- `bis_full`: one `atomic_fetch_add` of a single uint from lane 0, 8 bytes total.
+
+That store pattern is **3x the cost of the entire 43 MB weight read** — 344 KB of
+poorly-coalesced, highly-contended f32 stores (2688 threadgroups per dispatch, 20
+dispatches reusing the same `scratch.partial`, every core writing the same 344 KB region)
+versus 8 bytes.
+
+This is the first thing all session that is a real, located, 3x lever, and it is not the
+inner loop, the layout, the split count, the threadgroup shape, or the memory system.
+It is the K-split partial buffer.
+
+**Candidate fixes, in order of expected value:**
+1. **Fuse the Hadamard epilogue and emit f16 directly** (`exl3_gemv_post` shape) so the
+   per-out-tile store is 32 B of f16 instead of 64 B of f32, and the reduce/had_out pass
+   disappears entirely. Needs enough threadgroups to fill the machine — which is exactly
+   what `mg` provides at 128 threads/out-tile with nsplit=1.
+2. **Grid-wide completion counter**: last threadgroup for an out-tile does the split
+   reduction in-kernel, so exactly one writer per out-tile and no shared partial traffic.
+3. Widen the store to full-warp coalescing (one lane per column, 16 lanes x 4 B) instead
+   of 8 lanes x 8 B at stride.
+
+Option 1 + `mg` together are the natural next experiment: 128-thread groups, one out-tile
+each, in-kernel Hadamard + f16 store, zero K-split, zero partial buffer.
+
+## Status of the three requested options
+- **1 (in-threadgroup split, precomputed indices)**: built, correct, **does not win**.
+  Retained as the vehicle for fix #1 above.
+- **2 (reinstate T4/T6 fusions)**: not started; the 45 ms of small kernels is real but is
+  now secondary to the 3x partial-store finding.
+- **3 (weight prefetch across the dependency chain)**: not started; still valid, and more
+  attractive now that the kernel's read side is known to be capable of 326 GB/s.
+
 | claim | status |
 |---|---|
 | hardware ceiling on our weights | 258 GB/s sequential, **340-377 GB/s strided** |
