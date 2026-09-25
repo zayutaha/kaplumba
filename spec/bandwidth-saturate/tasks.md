@@ -55,6 +55,11 @@
   - **Intent**: Specialize `exl3_gemv_post` (LM head, single linears), `exl3_gemv_post_fused2` (Gate+Up production path), and `exl3_gemv_post_fused3` (QKV production path) with compile-time function constants `FC_ALIGNED`, `FC_MODE`, `FC_K` and vectorized `exl3_decode_quad_const`, folding branch conditions, bit-shifts, and ld_word inlines at Metal build time.
   - **Testing**: All 23 kernel unit tests and all 135 engine unit tests pass; `trace_chat_prompt_steps_slow` passes bit-identically predicting golden token 818 ("The").
 
+- [x] **T6.4: Unified Attention Prologue (`kr_rms_rope_qkv`)**
+  - **Files**: `crates/kernels/src/fuse.metal`, `crates/kernels/src/fuse.rs`, `crates/engine/src/metal_linear.rs`, `crates/engine/src/gpu_decode.rs`
+  - **Intent**: Combine `encode_rms_rope(Q)`, `encode_rms_rope(K)`, and `encode_rms(V)` into a single unified kernel launch `kr_rms_rope_qkv`, evaluating Q and K normalization + RoPE and V normalization in 64 concurrent threadgroups. Cuts 2 kernel launches per layer (120 launches/token eliminated).
+  - **Testing**: `rms_rope_qkv_matches_separate_passes` bit-exact; all 24 kernel tests and 135 engine unit tests pass; `trace_chat_prompt_steps_slow` passes bit-identically predicting golden token 818 ("The"); pass 2 latency drops from 0.60 ms to 0.34 ms across 60 layers.
+
 - [ ] **T7: End-to-End Throughput Verification (≥ 20.0 t/s)** — **BAR KNOWN UNREACHABLE AT k=3 (2026-09-24)**
   - **Files**: `crates/engine/src/gemma4.rs`
   - **Was**: Run `decode_throughput_slow` and assert forward decode throughput ≥ 20.0 t/s (≤ 50.0 ms/token).

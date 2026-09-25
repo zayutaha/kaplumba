@@ -445,52 +445,25 @@ impl GpuDecoder {
                 .row_span(i, true, kv_rows - 1)
                 .ok_or_else(|| GemmaError::Config("kv v row span".into()))?;
 
-            gpu.encode_rms_rope(
+            let v_in = if lw.v.is_some() { v_span } else { k_span };
+            gpu.encode_rms_rope_qkv(
                 enc,
                 q_span,
-                Some(span(&lw.q_norm)),
-                span(cos),
-                span(sin),
-                q_span,
-                self.n_heads,
-                hd,
-                pos,
-                eps,
-            )?;
-            gpu.encode_rms_rope(
-                enc,
                 k_span,
+                v_in,
+                Some(span(&lw.q_norm)),
                 Some(span(&lw.k_norm)),
                 span(cos),
                 span(sin),
+                q_span,
                 k_cache_span,
+                v_cache_span,
+                self.n_heads,
                 lw.n_kv,
                 hd,
                 pos,
                 eps,
             )?;
-
-            if lw.v.is_some() {
-                gpu.encode_rms(
-                    enc,
-                    v_span,
-                    None,
-                    v_cache_span,
-                    lw.n_kv,
-                    hd,
-                    eps,
-                )?;
-            } else {
-                gpu.encode_rms(
-                    enc,
-                    k_span,
-                    None,
-                    v_cache_span,
-                    lw.n_kv,
-                    hd,
-                    eps,
-                )?;
-            }
 
             gpu.encode_attention(
                 enc,
@@ -1192,16 +1165,32 @@ mod tests {
             }
         });
 
-        // 2. RoPE Q, K, Norm V across 60 layers
+        // 2. RoPE Q, K, Norm V across 60 layers (unified QKV pass)
         time_cmd("2. RoPE Q,K + Norm V", &|enc| {
             for i in 0..60 {
                 let lw = &decoder.layers[i];
                 let hd = gm.cfg.layers[i].head_dim;
                 let k_cache_span = cache.row_span(i, false, 0).unwrap();
                 let v_cache_span = cache.row_span(i, true, 0).unwrap();
-                gpu.encode_rms_rope(enc, q_span, Some(span(&lw.q_norm)), span(cos), span(sin), q_span, decoder.n_heads, hd, 1, eps).unwrap();
-                gpu.encode_rms_rope(enc, k_span, Some(span(&lw.k_norm)), span(cos), span(sin), k_cache_span, lw.n_kv, hd, 1, eps).unwrap();
-                gpu.encode_rms(enc, v_span, None, v_cache_span, lw.n_kv, hd, eps).unwrap();
+                let v_in = if lw.v.is_some() { v_span } else { k_span };
+                gpu.encode_rms_rope_qkv(
+                    enc,
+                    q_span,
+                    k_span,
+                    v_in,
+                    Some(span(&lw.q_norm)),
+                    Some(span(&lw.k_norm)),
+                    span(cos),
+                    span(sin),
+                    q_span,
+                    k_cache_span,
+                    v_cache_span,
+                    decoder.n_heads,
+                    lw.n_kv,
+                    hd,
+                    1,
+                    eps,
+                ).unwrap();
             }
         });
 

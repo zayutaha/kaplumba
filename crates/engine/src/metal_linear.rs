@@ -951,6 +951,36 @@ impl MetalLinear {
         Ok(())
     }
 
+    /// spec/bandwidth-saturate: Unified attention prologue (Q, K, V post-processing in one kernel launch).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_rms_rope_qkv(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        q_in: DeviceSpan<'_>,
+        k_in: DeviceSpan<'_>,
+        v_in: DeviceSpan<'_>,
+        q_norm: Option<DeviceSpan<'_>>,
+        k_norm: Option<DeviceSpan<'_>>,
+        cos: DeviceSpan<'_>,
+        sin: DeviceSpan<'_>,
+        q_out: DeviceSpan<'_>,
+        k_cache: DeviceSpan<'_>,
+        v_cache: DeviceSpan<'_>,
+        n_heads: usize,
+        n_kv: usize,
+        head_dim: usize,
+        pos: usize,
+        eps: f32,
+    ) -> Result<(), MetalLinearError> {
+        self.fuse.encode_rms_rope_qkv(
+            enc, q_in, k_in, v_in, q_norm, k_norm, cos, sin, q_out, k_cache, v_cache, n_heads,
+            n_kv, head_dim, pos, eps,
+        )?;
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
     /// spec/bandwidth-saturate T6.1: Fused RMSNorm + residual add.
     #[allow(clippy::too_many_arguments)]
     pub fn encode_rms_add(

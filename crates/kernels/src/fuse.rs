@@ -54,6 +54,16 @@ struct MslRmsRope {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct MslRmsRopeQkv {
+    n_heads: u32,
+    n_kv: u32,
+    head_dim: u32,
+    pos: u32,
+    eps: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct MslRmsAddScale {
     row_len: u32,
     eps: f32,
@@ -67,6 +77,7 @@ pub struct Fuse {
     rms: ComputePipelineState,
     rope: ComputePipelineState,
     rms_rope: ComputePipelineState,
+    rms_rope_qkv: ComputePipelineState,
     rms_add: ComputePipelineState,
     rms_add_scale: ComputePipelineState,
     copy: ComputePipelineState,
@@ -98,6 +109,7 @@ impl Fuse {
             rms: build("kr_rms")?,
             rope: build("kr_rope")?,
             rms_rope: build("kr_rms_rope")?,
+            rms_rope_qkv: build("kr_rms_rope_qkv")?,
             rms_add: build("kr_rms_add")?,
             rms_add_scale: build("kr_rms_add_scale")?,
             copy: build("kr_copy")?,
@@ -346,6 +358,93 @@ impl Fuse {
             &p as *const MslRmsRope as *const _,
         );
         enc.dispatch_thread_groups(MTLSize::new(n_heads as u64, 1, 1), MTLSize::new(128, 1, 1));
+        Ok(())
+    }
+
+    /// Unified attention prologue (Q + K + V post-processing in one kernel launch).
+    /// Dispatches `n_heads + 2 * n_kv` threadgroups of 128 threads to normalize and RoPE
+    /// Q and K and normalize V in parallel, cutting 2 dispatches per layer (120 launches/token).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_rms_rope_qkv(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        q_in: DeviceSpan<'_>,
+        k_in: DeviceSpan<'_>,
+        v_in: DeviceSpan<'_>,
+        q_norm: Option<DeviceSpan<'_>>,
+        k_norm: Option<DeviceSpan<'_>>,
+        cos: DeviceSpan<'_>,
+        sin: DeviceSpan<'_>,
+        q_out: DeviceSpan<'_>,
+        k_cache: DeviceSpan<'_>,
+        v_cache: DeviceSpan<'_>,
+        n_heads: usize,
+        n_kv: usize,
+        head_dim: usize,
+        pos: usize,
+        eps: f32,
+    ) -> Result<(), KernelError> {
+        let q_total = n_heads * head_dim;
+        let kv_total = n_kv * head_dim;
+        check_span_fits(&q_in, q_total * 2, "rms_rope_qkv q_in", 2)?;
+        check_span_fits(&k_in, kv_total * 2, "rms_rope_qkv k_in", 2)?;
+        check_span_fits(&v_in, kv_total * 2, "rms_rope_qkv v_in", 2)?;
+        check_span_fits(&q_out, q_total * 2, "rms_rope_qkv q_out", 2)?;
+        check_span_fits(&k_cache, kv_total * 2, "rms_rope_qkv k_cache", 2)?;
+        check_span_fits(&v_cache, kv_total * 2, "rms_rope_qkv v_cache", 2)?;
+        if let Some(w) = q_norm {
+            check_span_fits(&w, head_dim * 4, "rms_rope_qkv q_norm", 4)?;
+        }
+        if let Some(w) = k_norm {
+            check_span_fits(&w, head_dim * 4, "rms_rope_qkv k_norm", 4)?;
+        }
+        let half = head_dim / 2;
+        if cos.byte_offset % 4 != 0 || sin.byte_offset % 4 != 0 {
+            return Err(KernelError::Unsupported(
+                "rope tables must be 4-byte aligned".into(),
+            ));
+        }
+        for (s, what) in [(cos, "cos"), (sin, "sin")] {
+            let need = (pos + 1) * half * 4;
+            if (s.buffer.length() as usize) < s.byte_offset + need {
+                return Err(KernelError::Unsupported(format!(
+                    "rope {what}: needs {need} bytes at offset {}, buffer is {}",
+                    s.byte_offset,
+                    s.buffer.length()
+                )));
+            }
+        }
+        let p = MslRmsRopeQkv {
+            n_heads: n_heads as u32,
+            n_kv: n_kv as u32,
+            head_dim: head_dim as u32,
+            pos: pos as u32,
+            eps,
+        };
+        enc.set_compute_pipeline_state(&self.rms_rope_qkv);
+        enc.set_buffer(0, Some(q_in.buffer), q_in.byte_offset as u64);
+        enc.set_buffer(1, Some(k_in.buffer), k_in.byte_offset as u64);
+        enc.set_buffer(2, Some(v_in.buffer), v_in.byte_offset as u64);
+        match q_norm {
+            Some(w) => enc.set_buffer(3, Some(w.buffer), w.byte_offset as u64),
+            None => enc.set_buffer(3, None, 0),
+        }
+        match k_norm {
+            Some(w) => enc.set_buffer(4, Some(w.buffer), w.byte_offset as u64),
+            None => enc.set_buffer(4, None, 0),
+        }
+        enc.set_buffer(5, Some(cos.buffer), cos.byte_offset as u64);
+        enc.set_buffer(6, Some(sin.buffer), sin.byte_offset as u64);
+        enc.set_buffer(7, Some(q_out.buffer), q_out.byte_offset as u64);
+        enc.set_buffer(8, Some(k_cache.buffer), k_cache.byte_offset as u64);
+        enc.set_buffer(9, Some(v_cache.buffer), v_cache.byte_offset as u64);
+        enc.set_bytes(
+            10,
+            std::mem::size_of::<MslRmsRopeQkv>() as u64,
+            &p as *const MslRmsRopeQkv as *const _,
+        );
+        let total_tgs = (n_heads + 2 * n_kv) as u64;
+        enc.dispatch_thread_groups(MTLSize::new(total_tgs, 1, 1), MTLSize::new(128, 1, 1));
         Ok(())
     }
 
@@ -1083,6 +1182,101 @@ mod tests {
         for i in 0..n {
             assert_eq!(want_add[i].to_bits(), got_add[i].to_bits(), "rms_add mismatch at {i}: want {:#06x} got {:#06x}", want_add[i].to_bits(), got_add[i].to_bits());
             assert_eq!(want_scale[i].to_bits(), got_scale[i].to_bits(), "rms_add_scale mismatch at {i}: want {:#06x} got {:#06x}", want_scale[i].to_bits(), got_scale[i].to_bits());
+        }
+    }
+
+    /// spec/bandwidth-saturate T6.4: `kr_rms_rope_qkv` must match separate `kr_rms_rope(Q)` + `kr_rms_rope(K)` + `kr_rms(V)` bit-for-bit.
+    #[test]
+    fn rms_rope_qkv_matches_separate_passes() {
+        let Some((device, queue)) = ctx() else {
+            eprintln!("skip: no Metal device");
+            return;
+        };
+        let fuse = Fuse::new(&device, &queue).expect("pipelines");
+        let mut rng = Rng(0x9999);
+        let n_heads = 32usize;
+        let n_kv = 16usize;
+        let hd = 256usize;
+        let pos = 7usize;
+        let eps = 1e-6f32;
+
+        let q: Vec<f16> = (0..(n_heads * hd)).map(|_| rng.half()).collect();
+        let k: Vec<f16> = (0..(n_kv * hd)).map(|_| rng.half()).collect();
+        let v: Vec<f16> = (0..(n_kv * hd)).map(|_| rng.half()).collect();
+
+        let qw: Vec<f32> = (0..hd).map(|_| ((rng.next() % 2001) as f32 / 1000.0) + 0.5).collect();
+        let kw: Vec<f32> = (0..hd).map(|_| ((rng.next() % 2001) as f32 / 1000.0) + 0.5).collect();
+
+        let max_pos = 16usize;
+        let hh = hd / 2;
+        let mut cos = vec![0f32; max_pos * hh];
+        let mut sin = vec![0f32; max_pos * hh];
+        for p in 0..max_pos {
+            for k in 0..hh {
+                let f = p as f32 * (1e4f32.powf(-2.0 * k as f32 / hd as f32));
+                cos[p * hh + k] = f.cos();
+                sin[p * hh + k] = f.sin();
+            }
+        }
+
+        let q_buf = fuse.half_buffer(&q);
+        let k_buf = fuse.half_buffer(&k);
+        let v_buf = fuse.half_buffer(&v);
+        let qw_buf = fuse.f32_buffer(&qw);
+        let kw_buf = fuse.f32_buffer(&kw);
+        let cos_buf = fuse.f32_buffer(&cos);
+        let sin_buf = fuse.f32_buffer(&sin);
+
+        let want_q = fuse.buffer(n_heads * hd * 2);
+        let want_k = fuse.buffer(n_kv * hd * 2);
+        let want_v = fuse.buffer(n_kv * hd * 2);
+
+        let got_q = fuse.buffer(n_heads * hd * 2);
+        let got_k = fuse.buffer(n_kv * hd * 2);
+        let got_v = fuse.buffer(n_kv * hd * 2);
+
+        // Separate passes
+        fuse.submit(|enc| {
+            fuse.encode_rms_rope(enc, Fuse::span(&q_buf), Some(Fuse::span(&qw_buf)), Fuse::span(&cos_buf), Fuse::span(&sin_buf), Fuse::span(&want_q), n_heads, hd, pos, eps).unwrap();
+            fuse.encode_rms_rope(enc, Fuse::span(&k_buf), Some(Fuse::span(&kw_buf)), Fuse::span(&cos_buf), Fuse::span(&sin_buf), Fuse::span(&want_k), n_kv, hd, pos, eps).unwrap();
+            fuse.encode_rms(enc, Fuse::span(&v_buf), None, Fuse::span(&want_v), n_kv, hd, eps).unwrap();
+        }).expect("separate submit");
+
+        // Unified QKV pass
+        fuse.submit(|enc| {
+            fuse.encode_rms_rope_qkv(
+                enc,
+                Fuse::span(&q_buf),
+                Fuse::span(&k_buf),
+                Fuse::span(&v_buf),
+                Some(Fuse::span(&qw_buf)),
+                Some(Fuse::span(&kw_buf)),
+                Fuse::span(&cos_buf),
+                Fuse::span(&sin_buf),
+                Fuse::span(&got_q),
+                Fuse::span(&got_k),
+                Fuse::span(&got_v),
+                n_heads,
+                n_kv,
+                hd,
+                pos,
+                eps,
+            ).unwrap();
+        }).expect("unified submit");
+
+        let want_q_out = Fuse::read_half(&want_q, n_heads * hd);
+        let got_q_out = Fuse::read_half(&got_q, n_heads * hd);
+        let want_k_out = Fuse::read_half(&want_k, n_kv * hd);
+        let got_k_out = Fuse::read_half(&got_k, n_kv * hd);
+        let want_v_out = Fuse::read_half(&want_v, n_kv * hd);
+        let got_v_out = Fuse::read_half(&got_v, n_kv * hd);
+
+        for i in 0..(n_heads * hd) {
+            assert_eq!(want_q_out[i].to_bits(), got_q_out[i].to_bits(), "q mismatch at {i}");
+        }
+        for i in 0..(n_kv * hd) {
+            assert_eq!(want_k_out[i].to_bits(), got_k_out[i].to_bits(), "k mismatch at {i}");
+            assert_eq!(want_v_out[i].to_bits(), got_v_out[i].to_bits(), "v mismatch at {i}");
         }
     }
 }

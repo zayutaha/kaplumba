@@ -32,6 +32,14 @@ struct RmsRopeParams {
     float eps;
 };
 
+struct RmsRopeQkvParams {
+    uint n_heads;
+    uint n_kv;
+    uint head_dim;
+    uint pos;
+    float eps;
+};
+
 struct RmsAddScaleParams {
     uint row_len;
     float eps;
@@ -250,6 +258,89 @@ kernel void kr_rms_rope(device const half *x [[buffer(0)]],
     const float s_val = stab[(ulong)p.pos * hh + tid];
     orow[tid] = (half)(x1 * c - x2 * s_val);
     orow[tid + hh] = (half)(x1 * s_val + x2 * c);
+}
+
+// ---------------------------------------------------------------------------
+// kr_rms_rope_qkv: Unified Attention Prologue (Q, K, V Post-Processing in One Pass).
+// Eliminates 2 kernel launches per layer (120 launches/token) by processing:
+// - Q heads (0..n_heads-1): per-head RMSNorm + Neox RoPE in-place into `q_out`
+// - K heads (0..n_kv-1): per-head RMSNorm + Neox RoPE directly into `k_cache`
+// - V heads (0..n_kv-1): unweighted RMSNorm directly into `v_cache`
+// Grid: (n_heads + 2 * n_kv) threadgroups. Threadgroup: 128 threads.
+// ---------------------------------------------------------------------------
+kernel void kr_rms_rope_qkv(device const half *q_in [[buffer(0)]],
+                            device const half *k_in [[buffer(1)]],
+                            device const half *v_in [[buffer(2)]],
+                            device const float *q_norm [[buffer(3)]],
+                            device const float *k_norm [[buffer(4)]],
+                            device const float *ctab [[buffer(5)]],
+                            device const float *stab [[buffer(6)]],
+                            device half *q_out [[buffer(7)]],
+                            device half *k_cache [[buffer(8)]],
+                            device half *v_cache [[buffer(9)]],
+                            constant RmsRopeQkvParams &p [[buffer(10)]],
+                            uint tg [[threadgroup_position_in_grid]],
+                            uint tid [[thread_position_in_threadgroup]]) {
+    const uint hd = p.head_dim;
+    const uint hh = hd >> 1u;
+    device const half *xr;
+    device const float *w = nullptr;
+    device half *orow;
+    bool apply_rope = true;
+
+    if (tg < p.n_heads) {
+        xr = q_in + (ulong)tg * hd;
+        w = q_norm;
+        orow = q_out + (ulong)tg * hd;
+    } else if (tg < p.n_heads + p.n_kv) {
+        uint h = tg - p.n_heads;
+        xr = k_in + (ulong)h * hd;
+        w = k_norm;
+        orow = k_cache + (ulong)h * hd;
+    } else {
+        uint h = tg - (p.n_heads + p.n_kv);
+        xr = v_in + (ulong)h * hd;
+        w = nullptr;
+        orow = v_cache + (ulong)h * hd;
+        apply_rope = false;
+    }
+
+    float s = 0.0f;
+    for (uint i = tid; i < hd; i += 128u) {
+        const float v = float(xr[i]);
+        s += v * v;
+    }
+    for (uint m = 16u; m > 0u; m >>= 1u) {
+        s += simd_shuffle_xor(s, (ushort)m);
+    }
+    threadgroup float shw[4];
+    if ((tid & 31u) == 0u) {
+        shw[tid >> 5] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float total = shw[0] + shw[1] + shw[2] + shw[3];
+    const float ms = total / float(hd) + p.eps;
+    const float inv = 1.0f / sqrt(ms);
+
+    if (apply_rope) {
+        for (uint i = tid; i < hh; i += 128u) {
+            float x1 = float((half)(float(xr[i]) * inv * (w != nullptr ? w[i] : 1.0f)));
+            float x2 = float((half)(float(xr[i + hh]) * inv * (w != nullptr ? w[i + hh] : 1.0f)));
+
+            const float c = ctab[(ulong)p.pos * hh + i];
+            const float s_val = stab[(ulong)p.pos * hh + i];
+            orow[i] = (half)(x1 * c - x2 * s_val);
+            orow[i + hh] = (half)(x1 * s_val + x2 * c);
+        }
+    } else {
+        for (uint i = tid; i < hd; i += 128u) {
+            float v = float(xr[i]) * inv;
+            if (w != nullptr) {
+                v *= w[i];
+            }
+            orow[i] = (half)v;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

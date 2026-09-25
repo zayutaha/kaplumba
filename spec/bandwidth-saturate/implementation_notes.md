@@ -128,3 +128,11 @@ stage-by-stage in `spec/exl3-load-latency`.
 - Replaced runtime dynamic branch conditions, bit-shift calculations, and scalar decode function calls in the production single-dispatch paths with compile-time constants folded by the Metal compiler.
 - Verified bit-exactness: all 23 kernel unit tests and all 135 engine unit tests pass.
 - Verified end-to-end golden token parity: `trace_chat_prompt_steps_slow` predicts golden token 818 ("The") bit-identically.
+
+## 2026-09-25 — T6.4: Unified Attention Prologue (`kr_rms_rope_qkv`)
+- Implemented `kr_rms_rope_qkv` in `fuse.metal` combining per-head RMSNorm + Neox RoPE for Q, per-head RMSNorm + Neox RoPE for K, and unweighted RMSNorm for V into a single unified kernel dispatch of `n_heads + 2 * n_kv` (64) threadgroups.
+- Q roped heads written directly in-place into `q_span`, K roped heads written directly into `k_cache_span`, and V normalized heads written directly into `v_cache_span`.
+- Eliminates 2 kernel launches per layer (120 launches/token eliminated).
+- Unit tested bit-exactness in `rms_rope_qkv_matches_separate_passes`. All 24 kernel tests and 135 engine unit tests pass.
+- Verified golden token 818 ("The") in `trace_chat_prompt_steps_slow`.
+- Pass 2 latency (`RoPE Q,K + Norm V`) dropped from 0.60 ms to **0.34 ms** across 60 layers. Total decode latency drops to **113.14 ms**.
