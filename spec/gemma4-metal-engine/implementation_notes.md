@@ -67,6 +67,7 @@
 - Synthetic tests cover BF16 conversion, packed-byte retention, F16 spans crossing segments, vision exclusion, unsupported dtypes, allocation-limit failure, and real text-selection compatibility.
 - The real selection test passed without allocating model weights; all 14,876,563,172 text bytes classify successfully and vision tensors remain excluded.
 - With 512 MiB segments, the current text selection plans for 28 segments and 15,032,385,536 allocated bytes, below the 18 GB gate; this is a capacity calculation, not a completed model-load RSS measurement.
+- T3 commit: `391164d` (`spec/gemma4-metal-engine: T3 load Metal-owned weights`).
 
 ## Current risks
 

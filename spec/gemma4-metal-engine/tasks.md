@@ -16,7 +16,7 @@
   - Files: `crates/engine/src/weights.rs`, `crates/engine/src/metal.rs`, loader tests.
   - Intent: Mmap source shards, convert BF16 plain tensors to FP16, retain packed EXL3 data, and copy all text weights into shared Metal buffers.
   - Test: Synthetic dtypes/offsets, real text tensor count, vision exclusion, residency accounting, and explicit allocation failures.
-  - Commit: pending.
+  - Commit: `391164d`.
 
 - [ ] **T4 — Implement the CPU EXL3 reference codec and variant fixtures**
   - Files: `crates/engine/src/exl3.rs`, `crates/engine/tests/exl3_format.rs`, fixture data under the test module.
