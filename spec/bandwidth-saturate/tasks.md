@@ -35,10 +35,11 @@
   - **Intent**: Replace the 8-lane strided 2-float stores in `exl3_gemv`, `exl3_gemv_spec`, `exl3_gemv_fused2`, and `exl3_gemv_fused3` with a 16-lane contiguous 64-byte burst write via `simd_shuffle`, eliminating uncoalesced memory transactions across all GEMV partial dispatches.
   - **Testing**: All 21 kernel tests pass; all 135 engine unit tests pass; `trace_chat_prompt_steps_slow` predicts golden token 818 bit-identically.
 
-- [~] **T6: Fused Attention Post-Processing (`exl3_qkv_prep`)** — **DEFERRED 2026-09-24**
-  - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`, `crates/engine/src/metal_linear.rs`, `crates/engine/src/gpu_decode.rs`
-  - **Was**: Fuse Q/K RMS norm, RoPE rotation, and V cache write into a unified `qkv_prep` kernel, cutting 5 dispatches per layer.
-  - **Why deferred**: same reasoning as T4 — activation/dispatch overhead is not the dominant term per the `bench_stream_bw_slow` control. Revisit only if the stage-delta table implicates it.
+- [x] **T6: Fused Attention Post-Processing (`kr_rms_rope` + Direct Cache Write)**
+  - **Files**: `crates/kernels/src/fuse.metal`, `crates/kernels/src/fuse.rs`, `crates/engine/src/metal_linear.rs`, `crates/engine/src/gpu_decode.rs`
+  - **Intent**: Fuse per-head RMSNorm + Neox RoPE in registers via `kr_rms_rope` for Q and K, write K directly to KV cache, and normalize V directly into KV cache (eliminating `kr_copy`). Cuts 3 dispatches per layer (180 dispatches/token eliminated) and removes intermediate DRAM round-trips for Q/K/V.
+  - **Testing**: `rms_rope_matches_separate_passes` bit-exact across all head dimensions, positions, and weighted/unweighted modes; all 22 kernel tests and 135 engine unit tests pass; `trace_chat_prompt_steps_slow` predicts golden token 818 (6.57s); forward-only decode latency drops to 114.1 ms/token (8.77 t/s, 98.2 GB/s).
+
 
 - [ ] **T7: End-to-End Throughput Verification (≥ 20.0 t/s)** — **BAR KNOWN UNREACHABLE AT k=3 (2026-09-24)**
   - **Files**: `crates/engine/src/gemma4.rs`

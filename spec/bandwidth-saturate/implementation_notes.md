@@ -95,6 +95,15 @@ stage-by-stage in `spec/exl3-load-latency`.
 - Eliminates uncoalesced memory transactions across 320,000+ threadgroup stores per token.
 - Bit-exact parity maintained across all test suites and `trace_chat_prompt_steps_slow` (token 818).
 
+## 2026-09-25 — T6: Fused Attention Post-Processing (`kr_rms_rope` + Direct Cache Write)
+- Implemented `kr_rms_rope` in `fuse.metal` to evaluate per-head RMSNorm and Neox RoPE in threadgroup registers without DRAM round-trips.
+- Applied `kr_rms_rope` for Q (in-place in `q_span`) and K (directly targeting the KV cache row buffer).
+- Eliminated `kr_copy` by encoding weightless RMSNorm on V directly into the KV cache row buffer.
+- Cuts 3 kernel launches per layer (180 dispatches/token eliminated).
+- Bit-exact parity verified with new `rms_rope_matches_separate_passes` test across all configurations.
+- Forward-only decode latency drops to **114.1 ms/token (8.77 t/s, 98.2 GB/s)**. Bit-exact golden token 818 verified (6.57s).
+
+
 
 
 

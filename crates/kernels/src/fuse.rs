@@ -44,12 +44,21 @@ struct MslScale {
     scalar: f32,
 }
 
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct MslRmsRope {
+    head_dim: u32,
+    pos: u32,
+    eps: f32,
+}
+
 /// Pipelines + queue for the glue kernels.
 pub struct Fuse {
     device: Device,
     queue: CommandQueue,
     rms: ComputePipelineState,
     rope: ComputePipelineState,
+    rms_rope: ComputePipelineState,
     copy: ComputePipelineState,
     gelu_mul: ComputePipelineState,
     add: ComputePipelineState,
@@ -78,6 +87,7 @@ impl Fuse {
             queue: queue.clone(),
             rms: build("kr_rms")?,
             rope: build("kr_rope")?,
+            rms_rope: build("kr_rms_rope")?,
             copy: build("kr_copy")?,
             gelu_mul: build("kr_gelu_mul")?,
             add: build("kr_add")?,
@@ -181,6 +191,68 @@ impl Fuse {
             MTLSize::new(n.div_ceil(BLOCK) as u64, 1, 1),
             MTLSize::new(BLOCK as u64, 1, 1),
         );
+        Ok(())
+    }
+
+    /// Fused per-head RMSNorm + RoPE for rows=1 (decode, spec/bandwidth-saturate T6).
+    /// Normalizes each head of length `head_dim` and applies Neox RoPE in registers,
+    /// writing roped output directly to `out`. Eliminates separate kr_rms and kr_rope passes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_rms_rope(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: DeviceSpan<'_>,
+        weight: Option<DeviceSpan<'_>>,
+        cos: DeviceSpan<'_>,
+        sin: DeviceSpan<'_>,
+        out: DeviceSpan<'_>,
+        n_heads: usize,
+        head_dim: usize,
+        pos: usize,
+        eps: f32,
+    ) -> Result<(), KernelError> {
+        let total = n_heads * head_dim;
+        check_span_fits(&x, total * 2, "rms_rope x", 2)?;
+        check_span_fits(&out, total * 2, "rms_rope out", 2)?;
+        if let Some(w) = weight {
+            check_span_fits(&w, head_dim * 4, "rms_rope weight", 4)?;
+        }
+        let half = head_dim / 2;
+        if cos.byte_offset % 4 != 0 || sin.byte_offset % 4 != 0 {
+            return Err(KernelError::Unsupported(
+                "rope tables must be 4-byte aligned".into(),
+            ));
+        }
+        for (s, what) in [(cos, "cos"), (sin, "sin")] {
+            let need = (pos + 1) * half * 4;
+            if (s.buffer.length() as usize) < s.byte_offset + need {
+                return Err(KernelError::Unsupported(format!(
+                    "rope {what}: needs {need} bytes at offset {}, buffer is {}",
+                    s.byte_offset,
+                    s.buffer.length()
+                )));
+            }
+        }
+        let p = MslRmsRope {
+            head_dim: head_dim as u32,
+            pos: pos as u32,
+            eps,
+        };
+        enc.set_compute_pipeline_state(&self.rms_rope);
+        enc.set_buffer(0, Some(x.buffer), x.byte_offset as u64);
+        match weight {
+            Some(w) => enc.set_buffer(1, Some(w.buffer), w.byte_offset as u64),
+            None => enc.set_buffer(1, None, 0),
+        }
+        enc.set_buffer(2, Some(cos.buffer), cos.byte_offset as u64);
+        enc.set_buffer(3, Some(sin.buffer), sin.byte_offset as u64);
+        enc.set_buffer(4, Some(out.buffer), out.byte_offset as u64);
+        enc.set_bytes(
+            5,
+            std::mem::size_of::<MslRmsRope>() as u64,
+            &p as *const MslRmsRope as *const _,
+        );
+        enc.dispatch_thread_groups(MTLSize::new(n_heads as u64, 1, 1), MTLSize::new(128, 1, 1));
         Ok(())
     }
 
@@ -765,5 +837,108 @@ mod tests {
         })
         .expect("submit");
         assert!(err2.take().is_some(), "short table must be rejected");
+    }
+
+    /// spec/bandwidth-saturate T6: `kr_rms_rope` must match separate `kr_rms` + `kr_rope` bit-for-bit.
+    #[test]
+    fn rms_rope_matches_separate_passes() {
+        let Some((device, queue)) = ctx() else {
+            eprintln!("skip: no Metal device");
+            return;
+        };
+        let fuse = Fuse::new(&device, &queue).expect("pipelines");
+        let mut rng = Rng(0x8888);
+        let max_pos = 16usize;
+        let hd = 256usize;
+        let hh = hd / 2;
+        let mut cos = vec![0f32; max_pos * hh];
+        let mut sin = vec![0f32; max_pos * hh];
+        for p in 0..max_pos {
+            for k in 0..hh {
+                let f = p as f32 * (1e4f32.powf(-2.0 * k as f32 / hd as f32));
+                cos[p * hh + k] = f.cos();
+                sin[p * hh + k] = f.sin();
+            }
+        }
+        let cb = fuse.f32_buffer(&cos);
+        let sb = fuse.f32_buffer(&sin);
+
+        for (n_heads, pos, weighted) in [
+            (32usize, 0usize, true),
+            (32, 5, true),
+            (16, 7, true),
+            (16, 3, false),
+            (1, 10, true),
+        ] {
+            let x: Vec<f16> = (0..n_heads * hd).map(|_| rng.half()).collect();
+            let w: Vec<f32> = (0..hd).map(|_| ((rng.next() % 2001) as f32 / 1000.0) + 0.5).collect();
+            let xb = fuse.half_buffer(&x);
+            let wb = fuse.f32_buffer(&w);
+
+            let intermediate_b = fuse.buffer(n_heads * hd * 2);
+            let want_b = fuse.buffer(n_heads * hd * 2);
+            let got_b = fuse.buffer(n_heads * hd * 2);
+
+            let eps = 1e-6f32;
+
+            // Separate: rms -> rope
+            fuse.submit(|enc| {
+                fuse.encode_rms(
+                    enc,
+                    Fuse::span(&xb),
+                    weighted.then_some(Fuse::span(&wb)),
+                    Fuse::span(&intermediate_b),
+                    n_heads,
+                    hd,
+                    eps,
+                )
+                .unwrap();
+                fuse.encode_rope(
+                    enc,
+                    Fuse::span(&intermediate_b),
+                    Fuse::span(&cb),
+                    Fuse::span(&sb),
+                    Fuse::span(&want_b),
+                    n_heads,
+                    hd,
+                    pos,
+                    1,
+                )
+                .unwrap();
+            })
+            .expect("separate submit");
+
+            // Fused: rms_rope
+            fuse.submit(|enc| {
+                fuse.encode_rms_rope(
+                    enc,
+                    Fuse::span(&xb),
+                    weighted.then_some(Fuse::span(&wb)),
+                    Fuse::span(&cb),
+                    Fuse::span(&sb),
+                    Fuse::span(&got_b),
+                    n_heads,
+                    hd,
+                    pos,
+                    eps,
+                )
+                .unwrap();
+            })
+            .expect("fused submit");
+
+            let want = Fuse::read_half(&want_b, n_heads * hd);
+            let got = Fuse::read_half(&got_b, n_heads * hd);
+
+            assert_eq!(want.len(), got.len());
+            for i in 0..want.len() {
+                assert_eq!(
+                    want[i].to_bits(),
+                    got[i].to_bits(),
+                    "mismatch at index {i} for n_heads={n_heads} pos={pos} weighted={weighted}: want {:#06x} vs got {:#06x}",
+                    want[i].to_bits(),
+                    got[i].to_bits()
+                );
+            }
+        }
     }
 }

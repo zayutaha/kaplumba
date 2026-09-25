@@ -26,6 +26,12 @@ struct RopeParams {
     uint row_stride; // elements per row (n_heads * head_dim)
 };
 
+struct RmsRopeParams {
+    uint head_dim;
+    uint pos;
+    float eps;
+};
+
 // ---------------------------------------------------------------------------
 // kr_rms: RMSNorm over rows of `row_len`, optional f32 weight (length row_len).
 //
@@ -105,6 +111,53 @@ kernel void kr_rope(device const half *x [[buffer(0)]],
     const float x1 = float(x[xr + lo + kk]);
     const float x2 = float(x[xr + lo + kk + hh]);
     o[i] = (j < hh) ? (half)(x1 * c - x2 * s) : (half)(x1 * s + x2 * c);
+}
+
+// ---------------------------------------------------------------------------
+// kr_rms_rope: Fused per-head RMSNorm + RoPE for decode (spec/bandwidth-saturate T6).
+// Normalizes each head of length `head_dim` (256) and applies Neox RoPE in registers,
+// writing roped output directly to `o`. Eliminates separate kr_rms and kr_rope passes
+// and removes intermediate DRAM round-trip.
+//
+// Grid: n_heads threadgroups. Threadgroup: 128 threads (4 warps).
+// ---------------------------------------------------------------------------
+kernel void kr_rms_rope(device const half *x [[buffer(0)]],
+                        device const float *w [[buffer(1)]],
+                        device const float *ctab [[buffer(2)]],
+                        device const float *stab [[buffer(3)]],
+                        device half *o [[buffer(4)]],
+                        constant RmsRopeParams &p [[buffer(5)]],
+                        uint head [[threadgroup_position_in_grid]],
+                        uint tid [[thread_position_in_threadgroup]]) {
+    const uint hd = p.head_dim;
+    const uint hh = hd >> 1u;
+    device const half *xr = x + (ulong)head * hd;
+    device half *orow = o + (ulong)head * hd;
+
+    float s = 0.0f;
+    for (uint i = tid; i < hd; i += 128u) {
+        const float v = float(xr[i]);
+        s += v * v;
+    }
+    for (uint m = 16u; m > 0u; m >>= 1u) {
+        s += simd_shuffle_xor(s, (ushort)m);
+    }
+    threadgroup float shw[4];
+    if ((tid & 31u) == 0u) {
+        shw[tid >> 5] = s;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float total = shw[0] + shw[1] + shw[2] + shw[3];
+    const float ms = total / float(hd) + p.eps;
+    const float inv = 1.0f / sqrt(ms);
+
+    float x1 = float((half)(float(xr[tid]) * inv * (w != nullptr ? w[tid] : 1.0f)));
+    float x2 = float((half)(float(xr[tid + hh]) * inv * (w != nullptr ? w[tid + hh] : 1.0f)));
+
+    const float c = ctab[(ulong)p.pos * hh + tid];
+    const float s_val = stab[(ulong)p.pos * hh + tid];
+    orow[tid] = (half)(x1 * c - x2 * s_val);
+    orow[tid + hh] = (half)(x1 * s_val + x2 * c);
 }
 
 // ---------------------------------------------------------------------------

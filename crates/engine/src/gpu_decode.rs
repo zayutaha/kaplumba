@@ -437,22 +437,36 @@ impl GpuDecoder {
                 )?;
             }
 
-            gpu.encode_rms(
+            let (kv_pos0, kv_rows) = cache.reserve_row(&model.cfg, i, pos)?;
+            let k_cache_span = cache
+                .row_span(i, false, kv_rows - 1)
+                .ok_or_else(|| GemmaError::Config("kv k row span".into()))?;
+            let v_cache_span = cache
+                .row_span(i, true, kv_rows - 1)
+                .ok_or_else(|| GemmaError::Config("kv v row span".into()))?;
+
+            gpu.encode_rms_rope(
                 enc,
                 q_span,
                 Some(span(&lw.q_norm)),
-                span(&self.q),
+                span(cos),
+                span(sin),
+                q_span,
                 self.n_heads,
                 hd,
+                pos,
                 eps,
             )?;
-            gpu.encode_rms(
+            gpu.encode_rms_rope(
                 enc,
                 k_span,
                 Some(span(&lw.k_norm)),
-                span(&self.k_norm),
+                span(cos),
+                span(sin),
+                k_cache_span,
                 lw.n_kv,
                 hd,
+                pos,
                 eps,
             )?;
 
@@ -461,7 +475,7 @@ impl GpuDecoder {
                     enc,
                     v_span,
                     None,
-                    v_span,
+                    v_cache_span,
                     lw.n_kv,
                     hd,
                     eps,
@@ -471,48 +485,12 @@ impl GpuDecoder {
                     enc,
                     k_span,
                     None,
-                    v_span,
+                    v_cache_span,
                     lw.n_kv,
                     hd,
                     eps,
                 )?;
             }
-            gpu.encode_rope(
-                enc,
-                span(&self.q),
-                span(cos),
-                span(sin),
-                q_span,
-                self.n_heads,
-                hd,
-                pos,
-                1,
-            )?;
-
-            // Append this token's row: rotation is host-side (shared memory), the
-            // row contents are written by the passes below/above.
-            let (kv_pos0, kv_rows) = cache.reserve_row(&model.cfg, i, pos)?;
-            gpu.encode_rope(
-                enc,
-                span(&self.k_norm),
-                span(cos),
-                span(sin),
-                cache
-                    .row_span(i, false, kv_rows - 1)
-                    .ok_or_else(|| GemmaError::Config("kv k row span".into()))?,
-                lw.n_kv,
-                hd,
-                pos,
-                1,
-            )?;
-            gpu.encode_copy(
-                enc,
-                v_span,
-                cache
-                    .row_span(i, true, kv_rows - 1)
-                    .ok_or_else(|| GemmaError::Config("kv v row span".into()))?,
-                lw.n_kv * hd,
-            )?;
 
             gpu.encode_attention(
                 enc,

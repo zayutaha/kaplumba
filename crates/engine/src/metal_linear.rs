@@ -859,6 +859,28 @@ impl MetalLinear {
         Ok(())
     }
 
+    /// spec/bandwidth-saturate T6: Fused per-head RMSNorm + RoPE for decode.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_rms_rope(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        x: DeviceSpan<'_>,
+        weight: Option<DeviceSpan<'_>>,
+        cos: DeviceSpan<'_>,
+        sin: DeviceSpan<'_>,
+        out: DeviceSpan<'_>,
+        n_heads: usize,
+        head_dim: usize,
+        pos: usize,
+        eps: f32,
+    ) -> Result<(), MetalLinearError> {
+        self.fuse
+            .encode_rms_rope(enc, x, weight, cos, sin, out, n_heads, head_dim, pos, eps)?;
+        self.calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
     pub fn encode_copy(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
