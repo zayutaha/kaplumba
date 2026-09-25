@@ -159,7 +159,6 @@ Read-only reference checkouts live under `reference/` (gitignored):
 | `reference/llama.cpp` | Mainline llama.cpp |
 | `reference/ik_llama.cpp` | ik_llama.cpp fork (quantization, prefill speed) |
 | `reference/vllm` | vLLM |
-| `reference/PonyExl3` | EXL3 on Apple Silicon (converter + Metal runtime) |
 
 Do not modify `reference/` unless a task explicitly says to vendor a patch; prefer describing ports in specs.
 
@@ -171,7 +170,7 @@ Model weights and quantized checkpoints live in `~/.kaplumba/models`. Do not dow
 
 These are global restrictions; any spec that conflicts with them must call the conflict out explicitly and get user approval before implementation:
 
-- **No Python in the project** (user directive 2026-09-22) — no Python in product/engine code; engine is pure Rust + raw Metal (see `spec/rust-metal-engine/`). Known conflicts: (a) `scripts/bench.py` — temporary T0 harness, retire at T0.2/R7.4 (DE20); (b) ~~omlx engine plan~~ resolved — `spec/omlx-exl3-engine` superseded by `spec/rust-metal-engine`. PonyExl3 Python converter CLI allowed offline/build-time only (DE19).
+- **No Python in the project** (user directive 2026-09-22) — no Python in product/engine code; engine is pure Rust + raw Metal (see `spec/rust-metal-engine/`). Known conflicts: (a) `scripts/bench.py` — temporary T0 harness, retire at T0.2/R7.4 (DE20); (b) ~~omlx engine plan~~ resolved — `spec/omlx-exl3-engine` superseded by `spec/rust-metal-engine`.
 - Target: **single-user chat only** — no multi-tenant scheduling, no request batching for its own sake.
 - Hardware: Apple **M4 Pro, 20 GPU cores, 273 GB/s**.
 - Model: **Gemma 4 31B-class dense**, **EXL3 ~3.0 bpw → ~15.5 GB weights + ~1 GB SWA/KV ≈ 16.5 GB resident**.

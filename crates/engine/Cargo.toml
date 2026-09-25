@@ -3,15 +3,14 @@ name = "kaplumba-engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Pure-Rust + raw-Metal single-user Gemma 4 31B inference engine (EXL3)"
 
 [dependencies]
-metal.workspace = true
+half = { workspace = true }
 kaplumba-kernels = { path = "../kernels" }
-thiserror.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-tokenizers.workspace = true
-half = "2"
-rayon = "1"
 libc = { workspace = true }
+metal = { workspace = true }
+rayon = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokenizers = { workspace = true }

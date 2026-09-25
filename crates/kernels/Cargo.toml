@@ -3,9 +3,8 @@ name = "kaplumba-kernels"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
-description = "Raw Metal kernels for the kaplumba engine (EXL3 trellis GEMV, Hadamard)"
 
 [dependencies]
-metal.workspace = true
-thiserror.workspace = true
-half = "2"
+half = { workspace = true }
+metal = { workspace = true }
+thiserror = { workspace = true }
