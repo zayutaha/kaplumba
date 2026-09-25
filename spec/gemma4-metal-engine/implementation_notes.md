@@ -43,7 +43,7 @@
 - Added shared `half` and `rayon` workspace dependencies to match the locked dependency graph.
 - Added minimal Rust library and CLI entry points; no runtime model code or acceleration path exists yet.
 - Verified with `cargo metadata --no-deps --format-version 1`, `cargo check --workspace`, `cargo test --workspace --no-run`, and `cargo fmt --check`.
-- T1 commit hash will be recorded after the scaffold commit.
+- T1 commit: `4a263a2` (`spec/gemma4-metal-engine: T1 scaffold workspace`).
 
 ## Current risks
 

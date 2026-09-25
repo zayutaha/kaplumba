@@ -4,7 +4,7 @@
   - Files: `Cargo.toml`, `crates/engine/Cargo.toml`, `crates/kernels/Cargo.toml`, `crates/cli/Cargo.toml`, minimal `src/lib.rs`/`main.rs` files.
   - Intent: Recreate the confirmed three-crate workspace without runtime Python or forbidden acceleration dependencies.
   - Test: `cargo metadata`, `cargo check --workspace`, and `cargo test --workspace --no-run`.
-  - Commit: pending.
+  - Commit: `4a263a2`.
 
 - [ ] **T2 — Parse configuration, safetensors headers, and text-only tensor selection**
   - Files: `crates/engine/src/config.rs`, `crates/engine/src/safetensors.rs`, config/header unit tests.
