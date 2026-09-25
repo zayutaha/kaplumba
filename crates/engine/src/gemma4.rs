@@ -2135,12 +2135,108 @@ mod tests {
             2, 105, 2364, 107, 3689, 563, 506, 5279, 529, 7001, 236881, 106, 107, 105, 4368, 107, 100, 45518, 107, 101,
         ];
         let mut kv = g.new_kv_cache(64);
-        let mut last_got = 0;
+        let mut got = Vec::with_capacity(prompt_ids.len());
         for &t in &prompt_ids {
             let logits = g.forward_cached(&mut kv, &[t]).expect("step forward");
-            last_got = argmax(&logits);
+            got.push(argmax(&logits));
         }
-        assert_eq!(last_got, 818, "chat prompt must predict 'The' (token 818) after closing thought tag");
+        // Every step is asserted, not just the last. The old gate checked a
+        // single argmax at step 20, which is why a T6 regression that changed
+        // greedy decode from "SS Cer" to "SSAndre" sailed through four commits
+        // while every commit message claimed bit-exact parity. One argmax at one
+        // position cannot see drift in the 19 steps before it.
+        const EXPECTED: [usize; 20] = [
+            236773, 236773, 236773, 616, 236749, 7243, 1331, 3207, 7001, 1852, 108, 669,
+            100, 100, 100, 100, 45518, 107, 101, 818,
+        ];
+        for (i, (want, have)) in EXPECTED.iter().zip(got.iter()).enumerate() {
+            assert_eq!(
+                *have,
+                *want,
+                "step {i} (token {}) argmax drifted: want {want} got {have}",
+                prompt_ids[i]
+            );
+        }
+    }
+
+    /// Decode **coherence** gate: greedily continue a real chat prompt and
+    /// assert the exact token sequence and rendered text.
+    ///
+    /// The token-818 trace (above) checks teacher-forced argmax at each prompt
+    /// position but never runs the model in its own output. A decode loop that
+    /// diverges — wrong residual scaling, a mis-roped K, a stale KV row — can
+    /// still teacher-force correctly while generating degenerate text, which is
+    /// exactly what happened in spec/bandwidth-saturate T6 ("SS Cer own own own"
+    /// became "SSAndre own own own"). This gate closes that hole: it is the only
+    /// test in the suite that exercises generation rather than scoring.
+    ///
+    /// Greedy (`SampleParams::greedy()`) and `use_kv = true`, so it is
+    /// deterministic run to run.
+    #[test]
+    fn decode_coherence_slow() {
+        if std::env::var("KAPLUMBA_RUN_SLOW").is_err() {
+            eprintln!("skip: set KAPLUMBA_RUN_SLOW=1");
+            return;
+        }
+        let Some(dir) = artifact_dir() else {
+            eprintln!("skip: no artifact");
+            return;
+        };
+        const PROMPT: [u32; 20] = [
+            2, 105, 2364, 107, 3689, 563, 506, 5279, 529, 7001, 236881, 106, 107, 105, 4368,
+            107, 100, 45518, 107, 101,
+        ];
+        const NEW: usize = 24;
+
+        let ctx = crate::metal_ctx::MetalContext::new().expect("metal context");
+        let model = crate::load::load_exl3(&ctx, &dir).expect("load artifact");
+        let gpu = crate::metal_linear::MetalLinear::new(&ctx).expect("metal linear");
+        let g = Gemma4Model::from_model(&model)
+            .expect("gemma cfg")
+            .with_gpu(&gpu);
+        assert!(g.gpu_enabled(), "coherence gate must run the GPU decode path");
+
+        let params = crate::generate::GenParams {
+            max_new: NEW,
+            sample: crate::sampler::SampleParams::greedy(),
+            seed: 0,
+            eos: vec![],
+            layers: None,
+            use_kv: true,
+        };
+        let stats = crate::generate::generate(&g, &PROMPT, &params, |_| true)
+            .expect("coherence run");
+        assert_eq!(stats.gen_tokens, NEW, "eos=[] must generate the full length");
+
+        let tk = crate::tokenizer::GemmaTokenizer::from_dir(&dir).ok();
+        let text = tk
+            .as_ref()
+            .and_then(|t| t.decode(&stats.tokens).ok())
+            .unwrap_or_default();
+        eprintln!(
+            "[COHERENCE] {} t/s | tokens {:?}\n[COHERENCE] text {:?}",
+            stats.tg_tps(),
+            &stats.tokens[..stats.tokens.len().min(NEW)],
+            text
+        );
+
+        // Renders "The capital of France is Paris." — a real answer, not the
+        // degenerate "own own own" loop. Before this gate existed, the T6
+        // regression was invisible to the entire suite.
+        const EXPECTED: [u32; NEW] = [
+            818, 5279, 529, 7001, 563, 9079, 236761, 106, 107, 106, 107, 108, 1070, 1331,
+            992, 1966, 625, 506, 9226, 532, 5527, 3988, 529, 506,
+        ];
+        for (i, (want, have)) in EXPECTED.iter().zip(stats.tokens.iter()).enumerate() {
+            assert_eq!(
+                have, want,
+                "greedy token {i} drifted: want {want} got {have}"
+            );
+        }
+        assert!(
+            text.contains("capital of France is Paris"),
+            "decode lost coherence: {text:?}"
+        );
     }
 
     /// T3.2: batched prefill (`encode_span`) must agree with the token loop
