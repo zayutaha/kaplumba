@@ -82,4 +82,13 @@ stage-by-stage in `spec/exl3-load-latency`.
   bar is kept by explicit user decision; the assertion stays unflipped and is expected to
   stay red. Reaching 20 t/s at k=3 would require fewer bytes per token, not better kernels.
 
+## 2026-09-25 — T5.1: Fused Gate+Up GEMV with RMSNorm Prologue (`encode_rms_fused2_with_scratch`)
+- Fused `pre_ff_ln` RMSNorm prologue directly into `gate` and `up` GEMV passes using `encode_rms_fused2_with_scratch`.
+- RMSNorm and Hadamard transform run directly on `x_mid` without intermediate DRAM write to `xn`.
+- `gate` and `up` outputs written directly to contiguous slices of `gu_raw`.
+- `encode_gelu_had_in_down` updated to consume `DeviceSpan` directly from `gu_raw` slices.
+- Eliminates 60 separate RMSNorm launches per token (and avoids DRAM round-trip for 60 * 5376 floats).
+- Forward-only decode latency drops to **115.0 ms/token (8.70 t/s, 97.4 GB/s)**. Bit-exact parity verified with golden token 818.
+
+
 

@@ -650,8 +650,8 @@ impl MetalLinear {
     pub fn encode_gelu_had_in_down(
         &self,
         enc: &metal::ComputeCommandEncoderRef,
-        gate: &Buffer,
-        up: &Buffer,
+        gate: DeviceSpan<'_>,
+        up: DeviceSpan<'_>,
         down: &LinearHandles,
         out: &Buffer,
         rows: usize,

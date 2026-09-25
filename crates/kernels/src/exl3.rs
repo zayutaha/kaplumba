@@ -728,8 +728,8 @@ impl Exl3Gemv {
     pub fn encode_linear_gelu_down_with_scratch(
         &self,
         enc: &ComputeCommandEncoderRef,
-        gate: &Buffer,
-        up: &Buffer,
+        gate: DeviceSpan<'_>,
+        up: DeviceSpan<'_>,
         trellis: DeviceSpan<'_>,
         suh: DeviceSpan<'_>,
         svh: DeviceSpan<'_>,
@@ -1108,8 +1108,8 @@ impl Exl3Gemv {
     pub fn encode_gelu_had_in(
         &self,
         enc: &ComputeCommandEncoderRef,
-        gate: &Buffer,
-        up: &Buffer,
+        gate: DeviceSpan<'_>,
+        up: DeviceSpan<'_>,
         suh: DeviceSpan<'_>,
         xh: &Buffer,
         rows: usize,
@@ -1120,8 +1120,8 @@ impl Exl3Gemv {
             row_len: row_len as u32,
         };
         enc.set_compute_pipeline_state(&self.gelu_had_in);
-        enc.set_buffer(0, Some(gate), 0);
-        enc.set_buffer(1, Some(up), 0);
+        enc.set_buffer(0, Some(gate.buffer), gate.byte_offset as u64);
+        enc.set_buffer(1, Some(up.buffer), up.byte_offset as u64);
         enc.set_buffer(2, Some(suh.buffer), suh.byte_offset as u64);
         enc.set_buffer(3, Some(xh), 0);
         enc.set_bytes(4, 4, &hp as *const MslHad as *const _);
@@ -2329,7 +2329,21 @@ impl Exl3Gemv {
         );
         self.with_scratch(n, 0, 1, |sc| {
             self.submit(|enc| {
-                self.encode_gelu_had_in(enc, &gate_buf, &up_buf, suh, &sc.xh, 1, n);
+                self.encode_gelu_had_in(
+                    enc,
+                    DeviceSpan {
+                        buffer: &gate_buf,
+                        byte_offset: 0,
+                    },
+                    DeviceSpan {
+                        buffer: &up_buf,
+                        byte_offset: 0,
+                    },
+                    suh,
+                    &sc.xh,
+                    1,
+                    n,
+                );
             })?;
             unsafe {
                 std::ptr::copy_nonoverlapping(

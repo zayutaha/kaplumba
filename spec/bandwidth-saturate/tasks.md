@@ -25,6 +25,11 @@
   - **Intent**: Fuse `gelu_mul(gate, up)` into `had_in` prologue for `down_proj`, eliminating standalone `gelu_mul` dispatch and `gu` buffer.
   - **Testing**: `gpu_gelu_had_in_matches_separate_passes` passes 100% bit-exact; `trace_chat_prompt_steps_slow` predicts golden token 818; decode throughput reaches 8.53 t/s (117.3 ms).
 
+- [x] **T5.1: Fused Gate+Up GEMV with RMSNorm Prologue (`encode_rms_fused2_with_scratch`)**
+  - **Files**: `crates/kernels/src/exl3.rs`, `crates/engine/src/metal_linear.rs`, `crates/engine/src/gpu_decode.rs`
+  - **Intent**: Fuse `pre_ff_ln` RMSNorm into Gate+Up GEMV via `encode_rms_fused2_with_scratch` and update `encode_gelu_had_in_down` to read `gate` and `up` slices directly from `gu_raw`, eliminating intermediate `xn` write and separate RMSNorm dispatch per layer (60 dispatches/token eliminated).
+  - **Testing**: `gpu_gelu_had_in_matches_separate_passes` and all 135 unit tests pass; `trace_chat_prompt_steps_slow` predicts golden token 818; decode forward-only latency reaches 115.0 ms/token (8.70 t/s, 97.4 GB/s).
+
 - [~] **T6: Fused Attention Post-Processing (`exl3_qkv_prep`)** — **DEFERRED 2026-09-24**
   - **Files**: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`, `crates/engine/src/metal_linear.rs`, `crates/engine/src/gpu_decode.rs`
   - **Was**: Fuse Q/K RMS norm, RoPE rotation, and V cache write into a unified `qkv_prep` kernel, cutting 5 dispatches per layer.
