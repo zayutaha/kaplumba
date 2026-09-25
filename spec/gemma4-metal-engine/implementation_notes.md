@@ -83,7 +83,7 @@
 - Added matrix reconstruction helpers that apply row/column transforms and sign scales without changing the packed representation.
 - Integration fixtures cover all integer K/codebook combinations, all fractional rates, packed and unpacked signs, malformed layouts, transform identities, and known codebook bit patterns.
 - Real K=3 MCG tile decoding passed against the supplied checkpoint’s first q-projection trellis tile.
-- T4 commit: pending.
+- T4 commit: `5555c0a` (`spec/gemma4-metal-engine: T4 add CPU EXL3 reference`).
 
 ## Current risks
 

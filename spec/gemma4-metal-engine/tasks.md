@@ -22,7 +22,7 @@
   - Files: `crates/engine/src/exl3.rs`, `crates/engine/tests/exl3_format.rs`, fixture data under the test module.
   - Intent: Cover integer K=1–8 plain/mcg/mul1, fractional 1.5/2.5/3.5, packed/unpacked signs, tile permutation, and block Hadamards.
   - Test: Pack/unpack round trips, codebook vectors, transform identities, and every supported variant combination.
-  - Commit: pending.
+  - Commit: `5555c0a`.
 
 - [ ] **T5 — Implement Metal EXL3 decode and transform kernels**
   - Files: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`, parity tests.
