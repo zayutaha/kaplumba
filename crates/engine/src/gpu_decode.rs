@@ -1123,6 +1123,30 @@ mod tests {
             eprintln!("{name:24} (60 layers): {:6.2} ms ({:.3} ms/layer)", v[2], v[2] / 60.0);
         };
 
+        let mut qkv_bytes = 0usize;
+        let mut o_bytes = 0usize;
+        let mut gu_bytes = 0usize;
+        let mut down_bytes = 0usize;
+        for lw in &decoder.layers {
+            let k_bytes = |lin: &LinearHandles| lin.shape.in_tiles * lin.shape.out_tiles * lin.shape.words_per_tile() * 2;
+            qkv_bytes += k_bytes(&lw.q) + k_bytes(&lw.k) + lw.v.as_ref().map(|v| k_bytes(v)).unwrap_or(0);
+            o_bytes += k_bytes(&lw.o);
+            gu_bytes += k_bytes(&lw.gate) + k_bytes(&lw.up);
+            down_bytes += k_bytes(&lw.down);
+        }
+        let lm_bytes = decoder.lm.shape.in_tiles * decoder.lm.shape.out_tiles * decoder.lm.shape.words_per_tile() * 2;
+        let total_linear_bytes = qkv_bytes + o_bytes + gu_bytes + down_bytes + lm_bytes;
+        eprintln!(
+            "Linear bytes: QKV={:.2} MB, O={:.2} MB, GateUp={:.2} MB, Down={:.2} MB, LM={:.2} MB -> Total={:.2} MB ({:.3} GB)",
+            qkv_bytes as f64 / 1e6,
+            o_bytes as f64 / 1e6,
+            gu_bytes as f64 / 1e6,
+            down_bytes as f64 / 1e6,
+            lm_bytes as f64 / 1e6,
+            total_linear_bytes as f64 / 1e6,
+            total_linear_bytes as f64 / 1e9,
+        );
+
         let eps = gm.cfg.eps as f32;
         let hd_max = gm.cfg.layers.iter().map(|l| l.head_dim).max().unwrap_or(256);
         let q_span = DeviceSpan { buffer: &decoder.qkv_raw, byte_offset: 0 };
@@ -1133,13 +1157,37 @@ mod tests {
         eprintln!("--- Isolated 60-layer sub-passes ---");
 
         // 1. QKV across 60 layers
-        time_cmd("1. QKV (fused3/2)", &|enc| {
+        time_cmd("1. QKV (nsplit=1)", &|enc| {
             for i in 0..60 {
                 let lw = &decoder.layers[i];
                 if let Some(ref qkv) = lw.qkv_fused {
                     gpu.encode_rms_fused3_with_scratch(enc, qkv, span(&decoder.x[0]), Some(span(&lw.input_ln)), eps, &decoder.qkv_raw, &decoder.lin_temps).unwrap();
                 } else if let Some(ref qk) = lw.qk_fused {
                     gpu.encode_rms_fused2_with_scratch(enc, qk, span(&decoder.x[0]), Some(span(&lw.input_ln)), eps, &decoder.qkv_raw, &decoder.lin_temps).unwrap();
+                }
+            }
+        });
+        time_cmd("1a. QKV (nsplit=2)", &|enc| {
+            for i in 0..60 {
+                let lw = &decoder.layers[i];
+                if let Some(ref qkv) = lw.qkv_fused {
+                    gpu.encode_rms_fused3_split_with_scratch(enc, qkv, span(&decoder.x[0]), Some(span(&lw.input_ln)), eps, &decoder.qkv_raw, &decoder.lin_temps, 2).unwrap();
+                }
+            }
+        });
+        time_cmd("1b. QKV (nsplit=4)", &|enc| {
+            for i in 0..60 {
+                let lw = &decoder.layers[i];
+                if let Some(ref qkv) = lw.qkv_fused {
+                    gpu.encode_rms_fused3_split_with_scratch(enc, qkv, span(&decoder.x[0]), Some(span(&lw.input_ln)), eps, &decoder.qkv_raw, &decoder.lin_temps, 4).unwrap();
+                }
+            }
+        });
+        time_cmd("1c. QKV (nsplit=8)", &|enc| {
+            for i in 0..60 {
+                let lw = &decoder.layers[i];
+                if let Some(ref qkv) = lw.qkv_fused {
+                    gpu.encode_rms_fused3_split_with_scratch(enc, qkv, span(&decoder.x[0]), Some(span(&lw.input_ln)), eps, &decoder.qkv_raw, &decoder.lin_temps, 8).unwrap();
                 }
             }
         });
@@ -1192,10 +1240,28 @@ mod tests {
         });
 
         // 6. Gate + Up across 60 layers
-        time_cmd("6. Gate + Up (fused2)", &|enc| {
+        time_cmd("6. Gate + Up (nsplit=1)", &|enc| {
             for i in 0..60 {
                 let lw = &decoder.layers[i];
                 gpu.encode_rms_fused2_with_scratch(enc, &lw.gate_up_fused, span(&decoder.x[1]), Some(span(&lw.pre_ff_ln)), eps, &decoder.gu_raw, &decoder.lin_temps).unwrap();
+            }
+        });
+        time_cmd("6a. Gate + Up (nsplit=2)", &|enc| {
+            for i in 0..60 {
+                let lw = &decoder.layers[i];
+                gpu.encode_rms_fused2_split_with_scratch(enc, &lw.gate_up_fused, span(&decoder.x[1]), Some(span(&lw.pre_ff_ln)), eps, &decoder.gu_raw, &decoder.lin_temps, 2).unwrap();
+            }
+        });
+        time_cmd("6b. Gate + Up (nsplit=4)", &|enc| {
+            for i in 0..60 {
+                let lw = &decoder.layers[i];
+                gpu.encode_rms_fused2_split_with_scratch(enc, &lw.gate_up_fused, span(&decoder.x[1]), Some(span(&lw.pre_ff_ln)), eps, &decoder.gu_raw, &decoder.lin_temps, 4).unwrap();
+            }
+        });
+        time_cmd("6c. Gate + Up (nsplit=8)", &|enc| {
+            for i in 0..60 {
+                let lw = &decoder.layers[i];
+                gpu.encode_rms_fused2_split_with_scratch(enc, &lw.gate_up_fused, span(&decoder.x[1]), Some(span(&lw.pre_ff_ln)), eps, &decoder.gu_raw, &decoder.lin_temps, 8).unwrap();
             }
         });
 

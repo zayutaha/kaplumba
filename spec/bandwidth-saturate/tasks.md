@@ -50,7 +50,10 @@
   - **Intent**: Specialize `exl3_gemv_fused2` (Gate+Up) and `exl3_gemv_fused3` (QKV) with function constants `FC_ALIGNED`, `FC_MODE`, `FC_K` and vectorized `exl3_decode_quad_const`, eliminating 16 scalar decode function calls per iteration and runtime branch/bit-shift overhead across 60 layers (responsible for 61% of token decode latency).
   - **Testing**: `gpu_gemv_fused2_matches_separate_passes`, `gpu_gemv_fused3_matches_separate_passes`, and `gpu_encode_fused2_and_fused3_matches_separate_linears` bit-exact; all 23 kernel tests and 135 engine unit tests pass; `trace_chat_prompt_steps_slow` predicts golden token 818 in 5.76s.
 
-
+- [x] **T6.3: FC-Specialization and `exl3_decode_quad_const` for `exl3_gemv_post`, `exl3_gemv_post_fused2`, and `exl3_gemv_post_fused3`**
+  - **Files**: `crates/kernels/src/exl3.metal`
+  - **Intent**: Specialize `exl3_gemv_post` (LM head, single linears), `exl3_gemv_post_fused2` (Gate+Up production path), and `exl3_gemv_post_fused3` (QKV production path) with compile-time function constants `FC_ALIGNED`, `FC_MODE`, `FC_K` and vectorized `exl3_decode_quad_const`, folding branch conditions, bit-shifts, and ld_word inlines at Metal build time.
+  - **Testing**: All 23 kernel unit tests and all 135 engine unit tests pass; `trace_chat_prompt_steps_slow` passes bit-identically predicting golden token 818 ("The").
 
 - [ ] **T7: End-to-End Throughput Verification (≥ 20.0 t/s)** — **BAR KNOWN UNREACHABLE AT k=3 (2026-09-24)**
   - **Files**: `crates/engine/src/gemma4.rs`

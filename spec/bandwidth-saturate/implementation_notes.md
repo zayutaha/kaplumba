@@ -123,9 +123,8 @@ stage-by-stage in `spec/exl3-load-latency`.
   - LM Head: 5.14 ms (221.6 GB/s)
   - All non-GEMV stages (attention, rope, rms, adds): 4.17 ms total (< 4% of decode).
 - `trace_chat_prompt_steps_slow` execution time drops from 6.00s to **5.76s** with bit-exact prediction of golden token 818.
-
-
-
-
-
-
+## 2026-09-25 — T6.3: FC-Specialization and Quad Vectorization for Post-Hadamard Kernels
+- Propagated compile-time function constants `FC_ALIGNED`, `FC_MODE`, and `FC_K` alongside `exl3_decode_quad_const` to `exl3_gemv_post` (LM head & single linears), `exl3_gemv_post_fused2` (Gate+Up production path), and `exl3_gemv_post_fused3` (QKV production path).
+- Replaced runtime dynamic branch conditions, bit-shift calculations, and scalar decode function calls in the production single-dispatch paths with compile-time constants folded by the Metal compiler.
+- Verified bit-exactness: all 23 kernel unit tests and all 135 engine unit tests pass.
+- Verified end-to-end golden token parity: `trace_chat_prompt_steps_slow` predicts golden token 818 ("The") bit-identically.

@@ -1010,6 +1010,120 @@ impl Exl3Gemv {
         Ok(())
     }
 
+    /// spec/bandwidth-saturate: Fused RMSNorm + Hadamard prologue + K-split sibling GEMV (Q + K + V).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_linear_rms_fused3_split_with_scratch(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: DeviceSpan<'_>,
+        w: Option<DeviceSpan<'_>>,
+        eps: f32,
+        suh_stack: DeviceSpan<'_>,
+        trellis_a: DeviceSpan<'_>,
+        trellis_b: DeviceSpan<'_>,
+        trellis_c: DeviceSpan<'_>,
+        svh_cat: DeviceSpan<'_>,
+        out: &Buffer,
+        shape_a: Exl3Shape,
+        shape_b: Exl3Shape,
+        shape_c: Exl3Shape,
+        mode: u32,
+        scratch: &ChunkScratch,
+        nsplit: usize,
+    ) -> Result<(), KernelError> {
+        let inn = shape_a.in_features();
+        let outp = shape_a.out_features() + shape_b.out_features() + shape_c.out_features();
+        if mode > 1 {
+            return Err(KernelError::Unsupported(format!(
+                "codebook mode {mode} is CPU-only"
+            )));
+        }
+        if inn % HAD != 0 || outp % HAD != 0 {
+            return Err(KernelError::Unsupported(format!(
+                "hadamard needs multiples of {HAD}, got in={inn} out={outp}"
+            )));
+        }
+        Self::ensure_span_fits(
+            &trellis_a,
+            shape_a.in_tiles * shape_a.out_tiles * shape_a.words_per_tile() * 2,
+            "trellis_a",
+            2,
+        )?;
+        Self::ensure_span_fits(
+            &trellis_b,
+            shape_b.in_tiles * shape_b.out_tiles * shape_b.words_per_tile() * 2,
+            "trellis_b",
+            2,
+        )?;
+        Self::ensure_span_fits(
+            &trellis_c,
+            shape_c.in_tiles * shape_c.out_tiles * shape_c.words_per_tile() * 2,
+            "trellis_c",
+            2,
+        )?;
+        Self::ensure_span_fits(&suh_stack, 3 * inn * 2, "suh_stack", 2)?;
+        Self::ensure_span_fits(&svh_cat, outp * 2, "svh_cat", 2)?;
+
+        let pair_buf = self.pair_buffer(shape_a.k);
+        self.encode_rms_had_in_batched(enc, x, w, eps, suh_stack, &scratch.xh, 3, inn);
+        if nsplit <= 1 {
+            self.encode_gemv_post_fused3(
+                enc,
+                &scratch.xh,
+                trellis_a,
+                trellis_b,
+                trellis_c,
+                &pair_buf,
+                svh_cat,
+                out,
+                shape_a,
+                shape_b,
+                shape_c,
+                mode,
+            );
+        } else {
+            let out_tiles_total = shape_a.out_tiles + shape_b.out_tiles + shape_c.out_tiles;
+            let aligned = u32::from(
+                trellis_a.byte_offset % 4 == 0
+                    && trellis_b.byte_offset % 4 == 0
+                    && trellis_c.byte_offset % 4 == 0,
+            );
+            let params: [u32; 9] = [
+                shape_a.in_tiles as u32,
+                shape_a.out_tiles as u32,
+                shape_b.out_tiles as u32,
+                shape_c.out_tiles as u32,
+                shape_a.k,
+                (shape_a.words_per_tile() / 2) as u32,
+                mode,
+                aligned,
+                nsplit as u32,
+            ];
+            let pipeline = self.spec_fn_pipeline("exl3_gemv_fused3", shape_a.k, mode, aligned);
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(0, Some(&scratch.xh), 0);
+            enc.set_buffer(1, Some(trellis_a.buffer), trellis_a.byte_offset as u64);
+            enc.set_buffer(2, Some(trellis_b.buffer), trellis_b.byte_offset as u64);
+            enc.set_buffer(3, Some(trellis_c.buffer), trellis_c.byte_offset as u64);
+            enc.set_buffer(4, Some(&pair_buf), 0);
+            enc.set_buffer(5, Some(&scratch.partial), 0);
+            enc.set_bytes(6, 36, params.as_ptr() as *const _);
+            enc.dispatch_thread_groups(
+                MTLSize::new(out_tiles_total as u64, nsplit as u64, 1),
+                MTLSize::new(32, 1, 1),
+            );
+            self.encode_gemv_reduce_post(
+                enc,
+                &scratch.partial,
+                svh_cat,
+                out,
+                nsplit,
+                out_tiles_total,
+            );
+        }
+        Ok(())
+    }
+
     /// spec/bandwidth-saturate T4: Fused RMSNorm + 2-way sibling linear pass with scratch arena.
     #[allow(clippy::too_many_arguments)]
     pub fn encode_linear_rms_fused2_with_scratch(
@@ -1069,6 +1183,104 @@ impl Exl3Gemv {
             shape_b,
             mode,
         );
+        Ok(())
+    }
+
+    /// spec/bandwidth-saturate: Fused RMSNorm + Hadamard prologue + K-split sibling GEMV (Gate + Up).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_linear_rms_fused2_split_with_scratch(
+        &self,
+        enc: &ComputeCommandEncoderRef,
+        x: DeviceSpan<'_>,
+        w: Option<DeviceSpan<'_>>,
+        eps: f32,
+        suh_stack: DeviceSpan<'_>,
+        trellis_a: DeviceSpan<'_>,
+        trellis_b: DeviceSpan<'_>,
+        svh_cat: DeviceSpan<'_>,
+        out: &Buffer,
+        shape_a: Exl3Shape,
+        shape_b: Exl3Shape,
+        mode: u32,
+        scratch: &ChunkScratch,
+        nsplit: usize,
+    ) -> Result<(), KernelError> {
+        let inn = shape_a.in_features();
+        let outp = shape_a.out_features() + shape_b.out_features();
+        if mode > 1 {
+            return Err(KernelError::Unsupported(format!(
+                "codebook mode {mode} is CPU-only"
+            )));
+        }
+        if inn % HAD != 0 || outp % HAD != 0 {
+            return Err(KernelError::Unsupported(format!(
+                "hadamard needs multiples of {HAD}, got in={inn} out={outp}"
+            )));
+        }
+        Self::ensure_span_fits(
+            &trellis_a,
+            shape_a.in_tiles * shape_a.out_tiles * shape_a.words_per_tile() * 2,
+            "trellis_a",
+            2,
+        )?;
+        Self::ensure_span_fits(
+            &trellis_b,
+            shape_b.in_tiles * shape_b.out_tiles * shape_b.words_per_tile() * 2,
+            "trellis_b",
+            2,
+        )?;
+        Self::ensure_span_fits(&suh_stack, 2 * inn * 2, "suh_stack", 2)?;
+        Self::ensure_span_fits(&svh_cat, outp * 2, "svh_cat", 2)?;
+
+        let pair_buf = self.pair_buffer(shape_a.k);
+        self.encode_rms_had_in_batched(enc, x, w, eps, suh_stack, &scratch.xh, 2, inn);
+        if nsplit <= 1 {
+            self.encode_gemv_post_fused2(
+                enc,
+                &scratch.xh,
+                trellis_a,
+                trellis_b,
+                &pair_buf,
+                svh_cat,
+                out,
+                shape_a,
+                shape_b,
+                mode,
+            );
+        } else {
+            let out_tiles_total = shape_a.out_tiles + shape_b.out_tiles;
+            let aligned = u32::from(trellis_a.byte_offset % 4 == 0 && trellis_b.byte_offset % 4 == 0);
+            let params: [u32; 8] = [
+                shape_a.in_tiles as u32,
+                shape_a.out_tiles as u32,
+                shape_b.out_tiles as u32,
+                shape_a.k,
+                (shape_a.words_per_tile() / 2) as u32,
+                mode,
+                aligned,
+                nsplit as u32,
+            ];
+            let pipeline = self.spec_fn_pipeline("exl3_gemv_fused2", shape_a.k, mode, aligned);
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(0, Some(&scratch.xh), 0);
+            enc.set_buffer(1, Some(trellis_a.buffer), trellis_a.byte_offset as u64);
+            enc.set_buffer(2, Some(trellis_b.buffer), trellis_b.byte_offset as u64);
+            enc.set_buffer(3, Some(&pair_buf), 0);
+            enc.set_buffer(4, Some(&scratch.partial), 0);
+            enc.set_bytes(5, 32, params.as_ptr() as *const _);
+            enc.dispatch_thread_groups(
+                MTLSize::new(out_tiles_total as u64, nsplit as u64, 1),
+                MTLSize::new(32, 1, 1),
+            );
+            self.encode_gemv_reduce_post(
+                enc,
+                &scratch.partial,
+                svh_cat,
+                out,
+                nsplit,
+                out_tiles_total,
+            );
+        }
         Ok(())
     }
 

@@ -767,6 +767,42 @@ impl MetalLinear {
         Ok(())
     }
 
+    /// spec/bandwidth-saturate: Fused RMSNorm + Hadamard prologue + K-split sibling GEMV (Q + K + V).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_rms_fused3_split_with_scratch(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        fused: &Fused3Handles,
+        x: DeviceSpan<'_>,
+        w: Option<DeviceSpan<'_>>,
+        eps: f32,
+        out: &Buffer,
+        scratch: &ChunkScratch,
+        nsplit: usize,
+    ) -> Result<(), MetalLinearError> {
+        self.gemv.encode_linear_rms_fused3_split_with_scratch(
+            enc,
+            x,
+            w,
+            eps,
+            fused.suh_stack(),
+            fused.trellis_a(),
+            fused.trellis_b(),
+            fused.trellis_c(),
+            fused.svh_cat(),
+            out,
+            fused.shape_a,
+            fused.shape_b,
+            fused.shape_c,
+            fused.mode,
+            scratch,
+            nsplit,
+        )?;
+        self.calls
+            .fetch_add(3, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
     /// spec/bandwidth-saturate T4: Fused RMSNorm + 2-way sibling linear pass (Q + K).
     #[allow(clippy::too_many_arguments)]
     pub fn encode_rms_fused2_with_scratch(
@@ -793,6 +829,40 @@ impl MetalLinear {
             fused.shape_b,
             fused.mode,
             scratch,
+        )?;
+        self.calls
+            .fetch_add(2, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// spec/bandwidth-saturate: Fused RMSNorm + Hadamard prologue + K-split sibling GEMV (Gate + Up).
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_rms_fused2_split_with_scratch(
+        &self,
+        enc: &metal::ComputeCommandEncoderRef,
+        fused: &Fused2Handles,
+        x: DeviceSpan<'_>,
+        w: Option<DeviceSpan<'_>>,
+        eps: f32,
+        out: &Buffer,
+        scratch: &ChunkScratch,
+        nsplit: usize,
+    ) -> Result<(), MetalLinearError> {
+        self.gemv.encode_linear_rms_fused2_split_with_scratch(
+            enc,
+            x,
+            w,
+            eps,
+            fused.suh_stack(),
+            fused.trellis_a(),
+            fused.trellis_b(),
+            fused.svh_cat(),
+            out,
+            fused.shape_a,
+            fused.shape_b,
+            fused.mode,
+            scratch,
+            nsplit,
         )?;
         self.calls
             .fetch_add(2, std::sync::atomic::Ordering::Relaxed);
