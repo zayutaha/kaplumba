@@ -91,7 +91,7 @@
 - Added a retained `Exl3Kernels` context with shared input/output buffers, bounded dispatch, command completion checks, and readback helpers.
 - Metal parity passes for K=1–8 plain/MCG/mul1, fractional 1.5/2.5/3.5 mul1, and multi-vector Hadamard output.
 - Aligned the CPU mul1 reference with the upstream fused FP16 multiply-add after Metal parity exposed the intermediate-rounding difference.
-- T5 commit: pending.
+- T5 commit: `3e13ab4` (`spec/gemma4-metal-engine: T5 add Metal EXL3 kernels`).
 
 ## Current risks
 

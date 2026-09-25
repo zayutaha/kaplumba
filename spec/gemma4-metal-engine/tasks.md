@@ -28,7 +28,7 @@
   - Files: `crates/kernels/src/exl3.metal`, `crates/kernels/src/exl3.rs`, parity tests.
   - Intent: Decode packed trellis tiles and apply the exact tensor-core permutation/Hadamard path on Metal.
   - Test: Metal output against the CPU reference for every variant, including fp16/bf16 scale boundaries.
-  - Commit: pending.
+  - Commit: `3e13ab4`.
 
 - [ ] **T6 — Implement quantized batch-one decode linear kernels**
   - Files: `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`, `crates/engine/src/weights.rs` dispatch wiring.
