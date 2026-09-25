@@ -75,8 +75,9 @@ The supplied checkpoint is a Gemma 4 conditional-generation checkpoint with the 
 3. Apply top-k before top-p using FP32 probabilities and renormalization, with no repetition penalty or logit bias.
 4. Use a random runtime seed unless `--seed` is supplied; use a fixed seed for tests and benchmarks.
 5. Stop on any configured EOS ID 1, 106, or 50, or when the context-bounded generation limit is reached.
-6. Stream clean decoded text and optionally expose raw token IDs for diagnostics.
-7. Suppress protocol/special tokens from normal output.
+6. Convert every generated token ID through the loaded tokenizer into proper Unicode text; normal output must never expose packed bits, byte fragments, or tokenizer artifacts.
+7. Detokenize incrementally so multi-byte UTF-8 characters and special-token boundaries are emitted correctly, and optionally expose raw token IDs only behind an explicit diagnostic flag.
+8. Suppress protocol/special tokens from normal output.
 
 ### R5. Observability and validation
 
@@ -88,6 +89,7 @@ The supplied checkpoint is a Gemma 4 conditional-generation checkpoint with the 
 6. Test every supported EXL3 variant with synthetic codec and linear parity fixtures.
 7. Test small-model layer parity, sliding/full attention boundaries, prefill/decode equivalence, sampling determinism, and error cases.
 8. Run a strict real-checkpoint smoke test with a fixed short prompt, finite outputs, coherent nonempty text, no media-token leakage, and no Metal/runtime errors.
+9. Manually inspect the real-checkpoint streamed text after token-to-Unicode conversion and record the observed transcript/result in `implementation_notes.md`; acceptance requires coherent human-readable text, not merely finite numeric values.
 
 ## Acceptance criteria
 
@@ -96,7 +98,8 @@ The supplied checkpoint is a Gemma 4 conditional-generation checkpoint with the 
 - All required EXL3 variant combinations pass synthetic dequantization, transform, linear, and prefill/decode parity tests.
 - Chunked prefill at 1k, 2k, and 8k prompt lengths preserves the same next-token result as an unchunked reference within the documented numerical tolerance.
 - Full and sliding attention pass boundary tests, including 1024-position inclusion, cache rollover, and causal masking.
-- The real checkpoint produces coherent streamed text with finite values and no forbidden acceleration paths.
+- The real checkpoint produces coherent streamed Unicode text with finite values, no forbidden acceleration paths, and a manually inspected transcript recorded in the implementation notes.
+- Normal CLI output is tokenizer-decoded text; packed bits, byte fragments, and raw token IDs never appear unless explicitly requested for diagnostics.
 - The fixed benchmark reaches at least 20 generated tokens/sec after 8 warmup steps over 128 measured greedy tokens.
 - The 8k fully resident run stays below 18,000,000,000 bytes peak RSS under the agreed measurement method.
 - The CLI emits the agreed metrics and handles all specified boundary/error cases.

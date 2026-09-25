@@ -69,6 +69,12 @@
 - With 512 MiB segments, the current text selection plans for 28 segments and 15,032,385,536 allocated bytes, below the 18 GB gate; this is a capacity calculation, not a completed model-load RSS measurement.
 - T3 commit: `391164d` (`spec/gemma4-metal-engine: T3 load Metal-owned weights`).
 
+## Scope amendment — token-to-text verification
+
+- User requires generated token IDs to be converted through the actual tokenizer into proper Unicode text, not represented as packed bits or byte fragments.
+- T13 must use incremental detokenization with multi-byte UTF-8 and special-token handling; raw token IDs are diagnostic-only.
+- T15 must include manual inspection of real streamed text and record the observed transcript/result here before acceptance.
+
 ## Current risks
 
 - Metal-owned copies of approximately 14.88 GB of text data plus 8k KV and runtime buffers must remain below the agreed 18 GB RSS ceiling.

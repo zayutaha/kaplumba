@@ -74,7 +74,9 @@ The normal forward path keeps the trellis and scale buffers packed. The CPU code
 - `--max-new-tokens` defaults to 128 and is bounded by the remaining 8192-token context.
 - `--temperature`, `--top-k`, `--top-p`, and `--seed` control sampling; temperature 0 is greedy.
 - Default runtime seed is random; tests and benchmarks pass a fixed seed.
-- Normal output is streamed clean text; a diagnostic flag may print token IDs.
+- Normal output is streamed Unicode text produced by incremental tokenizer detokenization; it must never print packed bits, byte fragments, or raw token IDs.
+- A diagnostic flag may print raw token IDs separately without changing the text stream.
+- The real-checkpoint gate includes manual inspection of the resulting text and a recorded transcript/result in `implementation_notes.md`.
 - Metrics are emitted after the stream and include post-load TTFT, prefill tok/s, decode tok/s, token counts, and peak RSS.
 
 ## Implementation sequencing
@@ -88,7 +90,7 @@ The normal forward path keeps the trellis and scale buffers packed. The CPU code
 7. Assemble the Gemma 4 layer graph and validate it on small synthetic configurations.
 8. Add tokenizer/template, sampler, streaming, CLI, and metrics.
 9. Run the full variant matrix, actual-checkpoint integration, 1k/2k/8k prefill, memory, and throughput gates.
-10. Update notes/tasks, commit each completed task, and run final validation.
+10. Manually inspect the real streamed Unicode text, record the transcript/result, update notes/tasks, commit each completed task, and run final validation.
 
 ## Risks and fallbacks
 

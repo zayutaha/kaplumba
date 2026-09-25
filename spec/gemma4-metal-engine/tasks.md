@@ -74,8 +74,8 @@
 
 - [ ] **T13 — Implement tokenizer, template, sampler, streaming, and CLI**
   - Files: `crates/engine/src/tokenizer.rs`, `crates/engine/src/sampler.rs`, `crates/engine/src/generate.rs`, `crates/cli/src/args.rs`, `crates/cli/src/main.rs`, `crates/cli/src/report.rs`, CLI tests.
-  - Intent: Render the direct one-turn template, reject media, implement seeded sampling/top-k/top-p, stop IDs, clean streaming, and prompt sources.
-  - Test: Exact prompt IDs, special-token rejection, seed reproducibility, EOS/stop cases, empty/zero boundaries, stdin/file input, and stream formatting.
+  - Intent: Render the direct one-turn template, reject media, implement seeded sampling/top-k/top-p, stop IDs, convert token IDs to proper Unicode text, and stream prompt sources.
+  - Test: Exact prompt IDs, special-token rejection, seed reproducibility, EOS/stop cases, empty/zero boundaries, stdin/file input, incremental multi-byte detokenization, and stream formatting with no raw bits/IDs in normal output.
   - Commit: pending.
 
 - [ ] **T14 — Add metrics, memory accounting, and deterministic benchmark harness**
@@ -86,8 +86,8 @@
 
 - [ ] **T15 — Run strict real-checkpoint integration and acceptance gates**
   - Files: integration tests, benchmark command/configuration, implementation notes.
-  - Intent: Demonstrate text-only model load, prefill equivalence, streamed generation, full resident memory, and 20 tok/s decode.
-  - Test: Actual checkpoint 1k/2k/8k prefill, finite/coherent smoke output, no media leakage, RSS ceiling, and sustained greedy decode.
+  - Intent: Demonstrate text-only model load, prefill equivalence, proper token-to-Unicode text generation, full resident memory, and 20 tok/s decode.
+  - Test: Actual checkpoint 1k/2k/8k prefill, finite/coherent smoke output, no media leakage, RSS ceiling, sustained greedy decode, and manual inspection of the streamed text with the observed transcript recorded in implementation notes.
   - Commit: pending.
 
 - [ ] **T16 — Complete the full variant matrix and final validation**
