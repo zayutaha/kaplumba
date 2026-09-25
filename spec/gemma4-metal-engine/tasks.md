@@ -18,7 +18,7 @@
   - Test: Synthetic dtypes/offsets, real text tensor count, vision exclusion, residency accounting, and explicit allocation failures.
   - Commit: `391164d`.
 
-- [ ] **T4 — Implement the CPU EXL3 reference codec and variant fixtures**
+- [x] **T4 — Implement the CPU EXL3 reference codec and variant fixtures**
   - Files: `crates/engine/src/exl3.rs`, `crates/engine/tests/exl3_format.rs`, fixture data under the test module.
   - Intent: Cover integer K=1–8 plain/mcg/mul1, fractional 1.5/2.5/3.5, packed/unpacked signs, tile permutation, and block Hadamards.
   - Test: Pack/unpack round trips, codebook vectors, transform identities, and every supported variant combination.

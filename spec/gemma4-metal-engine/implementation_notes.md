@@ -75,6 +75,16 @@
 - T13 must use incremental detokenization with multi-byte UTF-8 and special-token handling; raw token IDs are diagnostic-only.
 - T15 must include manual inspection of real streamed text and record the observed transcript/result here before acceptance.
 
+## T4 — CPU EXL3 reference codec
+
+- Implemented upstream-compatible plain, MCG, and mul1 codebook decoding, including the lop3 MCG transform and FP16 mul1 affine reconstruction.
+- Implemented integer trellis window extraction for K=1–8 and the alternating 1.5/2.5/3.5 fractional ring layout for mul1.
+- Added exact tensor-core permutation/inverse helpers, packed/unpacked sign handling, and normalized blockwise 128 Hadamard transforms.
+- Added matrix reconstruction helpers that apply row/column transforms and sign scales without changing the packed representation.
+- Integration fixtures cover all integer K/codebook combinations, all fractional rates, packed and unpacked signs, malformed layouts, transform identities, and known codebook bit patterns.
+- Real K=3 MCG tile decoding passed against the supplied checkpoint’s first q-projection trellis tile.
+- T4 commit: pending.
+
 ## Current risks
 
 - Metal-owned copies of approximately 14.88 GB of text data plus 8k KV and runtime buffers must remain below the agreed 18 GB RSS ceiling.

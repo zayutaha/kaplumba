@@ -1,4 +1,5 @@
 pub mod config;
+pub mod exl3;
 pub mod metal;
 pub mod safetensors;
 pub mod weights;
