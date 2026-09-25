@@ -1,4 +1,5 @@
 pub mod exl3;
+pub mod linear;
 
 pub const KERNELS_NAME: &str = "kaplumba-kernels";
 

@@ -429,6 +429,28 @@ impl TextWeights {
             })?;
         self.arena.read(&tensor.spans)
     }
+
+    pub fn packed_u16(&self, name: &str) -> Result<Vec<u16>, WeightError> {
+        let tensor = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| WeightError::InvalidSpan {
+                name: name.to_string(),
+            })?;
+        if tensor.storage != WeightStorage::PackedExl3 {
+            return Err(WeightError::InvalidSpan {
+                name: name.to_string(),
+            });
+        }
+        let bytes = self.arena.read(&tensor.spans)?;
+        if !bytes.len().is_multiple_of(2) {
+            return Err(WeightError::ArithmeticOverflow);
+        }
+        Ok(bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect())
+    }
 }
 
 fn classify_tensor(name: &str, dtype: DType) -> Result<(WeightStorage, DType, bool), WeightError> {
@@ -742,6 +764,12 @@ mod tests {
                 .read_tensor("model.language_model.layers.0.self_attn.q_proj.trellis")
                 .unwrap(),
             vec![0x34, 0x12, 0x78, 0x56]
+        );
+        assert_eq!(
+            weights
+                .packed_u16("model.language_model.layers.0.self_attn.q_proj.trellis")
+                .unwrap(),
+            vec![0x1234, 0x5678]
         );
         fs::remove_dir_all(dir).unwrap();
     }

@@ -93,6 +93,15 @@
 - Aligned the CPU mul1 reference with the upstream fused FP16 multiply-add after Metal parity exposed the intermediate-rounding difference.
 - T5 commit: `3e13ab4` (`spec/gemma4-metal-engine: T5 add Metal EXL3 kernels`).
 
+## T6 — Packed batch-one linear
+
+- Added a three-stage raw Metal GEMV: FP16 input Hadamard/sign transform, packed trellis-tile FP32 dot products, and FP16 output Hadamard/sign finalize.
+- Added `LinearKernels` with runtime shader compilation, shared buffers, shape/rate validation, command completion checks, and readback.
+- Added `TextWeights::packed_u16` handoff for packed EXL3 tensors without dense reconstruction.
+- Parity passes for 128×128 matrices across K=1–8 plain/MCG/mul1 and fractional 1.5/2.5/3.5 mul1.
+- The current correctness-first kernel uses one output thread and serial input reduction; T7 must tile/reuse decoded weights for prefill throughput.
+- T6 commit: pending.
+
 ## Current risks
 
 - Metal-owned copies of approximately 14.88 GB of text data plus 8k KV and runtime buffers must remain below the agreed 18 GB RSS ceiling.

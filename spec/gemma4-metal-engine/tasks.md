@@ -30,7 +30,7 @@
   - Test: Metal output against the CPU reference for every variant, including fp16/bf16 scale boundaries.
   - Commit: `3e13ab4`.
 
-- [ ] **T6 — Implement quantized batch-one decode linear kernels**
+- [x] **T6 — Implement quantized batch-one decode linear kernels**
   - Files: `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`, `crates/engine/src/weights.rs` dispatch wiring.
   - Intent: Provide packed EXL3 GEMV for all model projection shapes without dense reconstruction.
   - Test: Random matrix parity, all current checkpoint shapes, K/codebook matrix, and repeated-dispatch stability.

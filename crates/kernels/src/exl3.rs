@@ -37,7 +37,7 @@ impl Exl3Rate {
         }
     }
 
-    fn encoded(self) -> u32 {
+    pub(crate) fn encoded(self) -> u32 {
         match self {
             Self::Integer(bits) => u32::from(bits),
             Self::Fractional(bits) => 16 + u32::from(bits),
@@ -53,7 +53,7 @@ pub enum Exl3Codebook {
 }
 
 impl Exl3Codebook {
-    fn encoded(self) -> u32 {
+    pub(crate) fn encoded(self) -> u32 {
         match self {
             Self::Plain => 0,
             Self::Mcg => 1,
