@@ -6,7 +6,7 @@
   - Test: `cargo metadata`, `cargo check --workspace`, and `cargo test --workspace --no-run`.
   - Commit: `4a263a2`.
 
-- [ ] **T2 — Parse configuration, safetensors headers, and text-only tensor selection**
+- [x] **T2 — Parse configuration, safetensors headers, and text-only tensor selection**
   - Files: `crates/engine/src/config.rs`, `crates/engine/src/safetensors.rs`, config/header unit tests.
   - Intent: Validate the Gemma 4 graph, locate shards/offsets/dtypes, and exclude all vision tensors.
   - Test: Synthetic headers, missing/overlap/type/shape failures, and the real checkpoint metadata without uploading vision.

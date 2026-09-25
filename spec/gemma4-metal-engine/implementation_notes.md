@@ -7,7 +7,7 @@
 - Independent EXL3 format research used the public upstream format source at `https://github.com/turboderp-org/exllamav3`; no forbidden third-party implementation was used.
 - Hardware: Apple M4 Pro, 20 GPU cores, 24 GB unified memory, Metal 4. Toolchain observed: Rust 1.95.0-nightly, Cargo 1.95.0-nightly, Xcode Metal compiler available.
 - Model path: `/Users/zayaantaha/.kaplumba/models/Gxma/Gxma`.
-- Checkpoint files: two safetensors shards totaling 16,028,050,244 indexed bytes; text tensor bytes total 14,876,563,052; vision tensor bytes total 1,151,487,072.
+- Checkpoint files: two safetensors shards totaling 16,028,050,244 indexed bytes; text tensor bytes total 14,876,563,172, including 60 BF16 layer-scalar tensors worth 120 bytes; the quantization metadata covers 14,876,563,052 bytes; vision tensor bytes total 1,151,487,072.
 - Text graph: 60 layers; full attention at 5, 11, 17, 23, 29, 35, 41, 47, 53, 59; 50 sliding layers; 10 full layers.
 - Text dimensions: hidden 5376, intermediate 21504, vocabulary 262144, query heads 32, sliding KV 16x256, full KV 4x512.
 - Current quantization: 410 three-bit mcg linear descriptors and one six-bit mcg `lm_head`; all use EXL3 packed trellises, mcg marker `0xCBAC1FED`, `suh`/`svh` scale/sign vectors, and 16x16 tiles.
@@ -44,6 +44,17 @@
 - Added minimal Rust library and CLI entry points; no runtime model code or acceleration path exists yet.
 - Verified with `cargo metadata --no-deps --format-version 1`, `cargo check --workspace`, `cargo test --workspace --no-run`, and `cargo fmt --check`.
 - T1 commit: `4a263a2` (`spec/gemma4-metal-engine: T1 scaffold workspace`).
+
+## T2 — Configuration and safetensors metadata
+
+- Added strict typed parsing for `config.json`, `generation_config.json`, and `quantization_config.json`.
+- Added structural and current-checkpoint graph validation, including the exact 60-layer full/sliding pattern, RoPE parameters, generation defaults, supported quantization rates, and MCG marker validation.
+- Added safetensors header parsing with payload-relative offsets, dtype/shape byte checks, overlap detection, index consistency, shard path safety, and total-size validation.
+- Added text-only selection that excludes `model.vision_tower.*` and `model.embed_vision.*` without reading or uploading tensor payloads.
+- Added exact text tensor inventory/projection geometry validation; full-attention layers correctly omit `v_proj` because K is reused as V.
+- Corrected the text-byte accounting: the complete text selection is 14,876,563,172 bytes; the quantization metadata sum is 14,876,563,052 bytes because 60 BF16 layer-scalar tensors add 120 bytes.
+- Synthetic tests cover valid headers, missing index entries, overlap, dtype/shape mismatches, path traversal, total-size mismatch, vision exclusion, config boundaries, and quantization failures.
+- Real metadata test passed with `KAPLUMBA_TEST_MODEL=/Users/zayaantaha/.kaplumba/models/Gxma/Gxma cargo test -p kaplumba-engine -- --ignored`; it reads headers only and reports 14,876,563,172 text bytes and 1,151,487,072 vision bytes excluded.
 
 ## Current risks
 

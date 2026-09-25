@@ -1,3 +1,6 @@
+pub mod config;
+pub mod safetensors;
+
 pub const ENGINE_NAME: &str = "kaplumba-engine";
 
 #[cfg(test)]

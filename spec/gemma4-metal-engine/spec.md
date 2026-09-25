@@ -33,7 +33,7 @@ The supplied checkpoint is a Gemma 4 conditional-generation checkpoint with the 
 - RoPE is default/theta 10000 for sliding layers and proportional/partial factor 0.25/theta 1000000 for full layers.
 - No biases, KV sharing, MoE, per-layer input embeddings, or audio weights are present in the text graph.
 - Embedding scale is the square root of 5376; final logits use `tanh(logits / 30) * 30`.
-- Text tensors total 14,876,563,052 bytes (13.85 GiB). Vision tensors total 1,151,487,072 bytes and are excluded from GPU residency.
+- Text tensors total 14,876,563,172 bytes (13.85 GiB), including 60 BF16 layer-scalar tensors worth 120 bytes. The quantization metadata covers 14,876,563,052 bytes of those text tensors. Vision tensors total 1,151,487,072 bytes and are excluded from GPU residency.
 - Current text linear tensors use 3-bit mcg EXL3; `lm_head` uses 6-bit mcg EXL3.
 - The current `generation_config.json` defaults are temperature 1.0, top-k 64, top-p 0.95, and EOS IDs 1, 106, and 50.
 
