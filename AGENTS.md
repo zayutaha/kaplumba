@@ -151,14 +151,23 @@ Tone: factual and dense. Prefer specifics (paths, numbers, commit hashes) over n
 
 ## 7. Reference material
 
+**Read the references before writing a kernel.** These projects have already solved
+the problems we are still paying for on this exact hardware. Do not start from
+first principles; start from what is known to work and port it.
+
 Read-only reference checkouts live under `reference/` (gitignored):
 
-| Path | Project |
-|------|---------|
-| `reference/omlx` | Base inference server (MLX) — primary codebase lineage |
-| `reference/llama.cpp` | Mainline llama.cpp |
-| `reference/ik_llama.cpp` | ik_llama.cpp fork (quantization, prefill speed) |
-| `reference/vllm` | vLLM |
+| Path | Project | Licence |
+|------|---------|---------|
+| `reference/omlx` | Base inference server (MLX) — primary codebase lineage. `omlx_sdpa_decode` / `omlx_sdpa_prefill` are the fastest known Apple-Silicon prefill attention. | Apache-2.0 |
+| `reference/llama.cpp` | Mainline llama.cpp | MIT |
+| `reference/ik_llama.cpp` | ik_llama.cpp fork (quantization, prefill speed) | MIT |
+| `reference/vllm` | vLLM | Apache-2.0 |
+| `https://github.com/struffl/ishizuki` | ishizuki — reports ~11 tok/s decode on M4 Pro, ~20 on M1 Max. **AGPL-3.0: read for ideas, confirm with the user (see `spec/engine-performance` Q9) before porting code.** | AGPL-3.0 |
+
+When adopting an idea from any of these, cite `path:line` in
+`implementation_notes.md`, and A/B measure it here — a reference proves a technique
+*can* work, not that it works on our shapes.
 
 Do not modify `reference/` unless a task explicitly says to vendor a patch; prefer describing ports in specs.
 
