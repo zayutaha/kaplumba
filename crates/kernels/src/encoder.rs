@@ -115,6 +115,40 @@ impl<'q> MetalEncoder<'q> {
     }
 
     /// Encode a 1D dispatch whose bindings may sit at non-zero byte offsets.
+    /// Dispatch `groups` threadgroups of `threads_per_group` threads.
+    ///
+    /// Needed by kernels that reduce across a threadgroup, which cannot use the
+    /// 1D form because the thread-to-row mapping is per-group rather than global.
+    pub fn dispatch_groups(
+        &mut self,
+        pipeline: &ComputePipelineState,
+        bindings: &[Option<&Buffer>],
+        params: &[u8],
+        groups: u64,
+        threads_per_group: u64,
+    ) -> Result<(), KernelError> {
+        if groups == 0 || threads_per_group == 0 {
+            return Err(KernelError::InvalidInput(
+                "kernel group and threadgroup counts must be non-zero".to_string(),
+            ));
+        }
+        self.encoder.set_compute_pipeline_state(pipeline);
+        for (index, binding) in bindings.iter().enumerate() {
+            self.encoder
+                .set_buffer(index as u64, binding.map(|value| &**value), 0);
+        }
+        self.encoder.set_bytes(
+            bindings.len() as u64,
+            params.len() as u64,
+            params.as_ptr() as *const c_void,
+        );
+        self.encoder.dispatch_thread_groups(
+            MTLSize::new(groups, 1, 1),
+            MTLSize::new(threads_per_group, 1, 1),
+        );
+        Ok(())
+    }
+
     pub fn dispatch_1d_offset(
         &mut self,
         pipeline: &ComputePipelineState,

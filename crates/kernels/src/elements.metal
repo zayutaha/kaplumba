@@ -89,6 +89,82 @@ kernel void embedding_scaled(
     output[gid] = half(value * params.scale);
 }
 
+// Parallel RMS reduction, one threadgroup per row.
+//
+// The kernels below are written "one thread per row", which is correct for
+// prefill (many rows) and catastrophic for decode: at `rows == 1` a single GPU
+// thread walks 5376 elements twice, serially. Measured 595.7 us against 2.4-3.1
+// us for sibling kernels of the same or larger shape -- 200x slower -- and 241
+// such dispatches per token cost 156 ms of a 776 ms step.
+//
+// This variant assigns one 256-thread group per row so the reduction is a
+// strided partial sum plus a barrier tree. Only used when `rows` is small; see
+// `encode_rms_norm` for the dispatch rule that keeps prefill on the old path.
+kernel void rms_norm_weighted_tg(
+    const device half *input [[buffer(0)]],
+    const device half *weight [[buffer(1)]],
+    device half *output [[buffer(2)]],
+    constant NormParams &params [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    if (tgid >= params.rows) {
+        return;
+    }
+    threadgroup float partial[256];
+    const uint count = params.width;
+    const uint base = tgid * count;
+    float sum = 0.0f;
+    for (uint i = lid; i < count; i += tgdim) {
+        const float value = float(input[base + i]);
+        sum += value * value;
+    }
+    partial[lid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tgdim / 2u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            partial[lid] += partial[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inverse = rsqrt(partial[0] / float(count) + params.eps);
+    for (uint i = lid; i < count; i += tgdim) {
+        output[base + i] = half(float(input[base + i]) * inverse * float(weight[i]));
+    }
+}
+
+kernel void rms_norm_unweighted_tg(
+    const device half *input [[buffer(0)]],
+    device half *output [[buffer(1)]],
+    constant NormParams &params [[buffer(2)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    if (tgid >= params.rows) {
+        return;
+    }
+    threadgroup float partial[256];
+    const uint count = params.width;
+    const uint base = tgid * count;
+    float sum = 0.0f;
+    for (uint i = lid; i < count; i += tgdim) {
+        const float value = float(input[base + i]);
+        sum += value * value;
+    }
+    partial[lid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tgdim / 2u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            partial[lid] += partial[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inverse = rsqrt(partial[0] / float(count) + params.eps);
+    for (uint i = lid; i < count; i += tgdim) {
+        output[base + i] = half(float(input[base + i]) * inverse);
+    }
+}
+
 kernel void rms_norm_weighted(
     const device half *input [[buffer(0)]],
     const device half *weight [[buffer(1)]],

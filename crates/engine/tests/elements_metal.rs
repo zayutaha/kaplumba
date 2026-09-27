@@ -267,3 +267,50 @@ fn element_rejects_invalid_inputs() {
     let error = kernels.softcap(&[0], 0.0).unwrap_err().to_string();
     assert!(error.contains("cap finite"));
 }
+
+/// The threadgroup-per-row norm must match the per-row one that it replaces.
+///
+/// The dispatch switches to the threadgroup variant below 32 rows, so both paths
+/// have to agree or decode silently changes shape depending on batch size. Note
+/// the reduction order differs (strided partials plus a tree, versus a serial
+/// sum), so this compares with a tolerance rather than exactly.
+#[test]
+fn threadgroup_norm_matches_per_row_norm() {
+    use kaplumba_kernels::elements::ElementKernels;
+    let kernels = ElementKernels::new().expect("element kernels");
+    for width in [128usize, 256, 512, 5376] {
+        for rows in [1usize, 2, 7, 31, 32, 64, 134] {
+            let count = rows * width;
+            let input: Vec<u16> = (0..count)
+                .map(|i| half::f16::from_f32(((i % 17) as f32 - 8.0) * 0.31).to_bits())
+                .collect();
+            let weight: Vec<u16> = (0..width)
+                .map(|i| half::f16::from_f32(1.0 + (i % 5) as f32 * 0.01).to_bits())
+                .collect();
+            let eps = 1e-6_f32;
+
+            let per_row = kernels
+                .rms_norm(&input, &weight, rows, width, eps)
+                .expect("per-row norm");
+            let tg = kernels
+                .rms_norm_threadgroup(&input, &weight, rows, width, eps)
+                .expect("threadgroup norm");
+
+            assert_eq!(per_row.len(), count);
+            assert_eq!(tg.len(), count);
+            let mut worst = 0.0_f32;
+            for (index, (a, b)) in per_row.iter().zip(&tg).enumerate() {
+                let a = half::f16::from_bits(*a).to_f32();
+                let b = half::f16::from_bits(*b).to_f32();
+                let scale = a.abs().max(1e-3);
+                let diff = (a - b).abs() / scale;
+                worst = worst.max(diff);
+                assert!(
+                    diff < 5e-2,
+                    "width={width} rows={rows} index={index} per_row={a} threadgroup={b} rel={diff}"
+                );
+            }
+            println!("norm width={width:>5} rows={rows:>4} worst_rel={worst:.2e}");
+        }
+    }
+}

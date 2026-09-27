@@ -99,6 +99,10 @@ pub struct ElementKernels {
     embedding_pipeline: ComputePipelineState,
     rms_norm_weighted_pipeline: ComputePipelineState,
     rms_norm_unweighted_pipeline: ComputePipelineState,
+    /// Threadgroup-per-row variants, used when `rows` is small. See the kernels
+    /// for why the per-row variants collapse at `rows == 1`.
+    rms_norm_weighted_tg_pipeline: ComputePipelineState,
+    rms_norm_unweighted_tg_pipeline: ComputePipelineState,
     residual_pipeline: ComputePipelineState,
     layer_scale_pipeline: ComputePipelineState,
     gelu_pipeline: ComputePipelineState,
@@ -112,6 +116,15 @@ pub struct ElementKernels {
 }
 
 impl ElementKernels {
+    /// Row count below which the threadgroup-per-row norm is used.
+    const THREADGROUP_NORM_MAX_ROWS: usize = 32;
+    /// Escape hatch: force the original per-row norms regardless of row count.
+    pub fn force_per_row_norms() -> bool {
+        std::env::var_os("KAPLUMBA_FORCE_PER_ROW_NORMS").is_some()
+    }
+    /// Threads per group for the threadgroup-per-row norms.
+    const NORM_GROUP_THREADS: u64 = 256;
+
     pub fn new() -> Result<Self, KernelError> {
         let device = Device::system_default().ok_or(KernelError::DeviceUnavailable)?;
         let options = CompileOptions::new();
@@ -121,6 +134,10 @@ impl ElementKernels {
         let embedding_pipeline = pipeline(&device, &library, "embedding_scaled")?;
         let rms_norm_weighted_pipeline = pipeline(&device, &library, "rms_norm_weighted")?;
         let rms_norm_unweighted_pipeline = pipeline(&device, &library, "rms_norm_unweighted")?;
+        let rms_norm_weighted_tg_pipeline =
+            pipeline(&device, &library, "rms_norm_weighted_tg")?;
+        let rms_norm_unweighted_tg_pipeline =
+            pipeline(&device, &library, "rms_norm_unweighted_tg")?;
         let residual_pipeline = pipeline(&device, &library, "residual_add")?;
         let layer_scale_pipeline = pipeline(&device, &library, "layer_scale")?;
         let gelu_pipeline = pipeline(&device, &library, "gelu_tanh")?;
@@ -139,6 +156,8 @@ impl ElementKernels {
             embedding_pipeline,
             rms_norm_weighted_pipeline,
             rms_norm_unweighted_pipeline,
+            rms_norm_weighted_tg_pipeline,
+            rms_norm_unweighted_tg_pipeline,
             residual_pipeline,
             layer_scale_pipeline,
             gelu_pipeline,
@@ -271,6 +290,37 @@ impl ElementKernels {
             &[Some(&input_buffer), Some(&weight_buffer), Some(&output)],
             params_bytes(&params),
             rows as u64,
+        )?;
+        read_u16_buffer(&output)
+    }
+
+    /// Force the threadgroup-per-row norm, regardless of the dispatch threshold.
+    ///
+    /// Exists so tests can compare the two paths directly; production code goes
+    /// through [`Self::encode_rms_norm`], which chooses between them.
+    pub fn rms_norm_threadgroup(
+        &self,
+        input: &[u16],
+        weight: &[u16],
+        rows: usize,
+        width: usize,
+        eps: f32,
+    ) -> Result<Vec<u16>, KernelError> {
+        validate_norm(input.len(), Some(weight.len()), rows, width, eps)?;
+        let input_buffer = self.make_u16_buffer(input)?;
+        let weight_buffer = self.make_u16_buffer(weight)?;
+        let output = self.make_output(checked_product(rows, width, "norm output")?)?;
+        let params = NormParams {
+            rows: to_u32(rows, "row count")?,
+            width: to_u32(width, "norm width")?,
+            eps,
+        };
+        self.run_groups(
+            &self.rms_norm_weighted_tg_pipeline,
+            &[Some(&input_buffer), Some(&weight_buffer), Some(&output)],
+            params_bytes(&params),
+            rows as u64,
+            Self::NORM_GROUP_THREADS,
         )?;
         read_u16_buffer(&output)
     }
@@ -485,6 +535,20 @@ impl ElementKernels {
             width: to_u32(width, "norm width")?,
             eps,
         };
+        // One thread per row is right when there are many rows (prefill) and
+        // catastrophic when there is one (decode): a single thread would walk the
+        // whole width serially. Below the threshold, give each row a full 256
+        // threadgroup instead. 32 is well under the point where `rows` threads
+        // already fill the machine, so prefill keeps the cheaper path.
+        if rows < Self::THREADGROUP_NORM_MAX_ROWS && !Self::force_per_row_norms() {
+            return encoder.dispatch_groups(
+                &self.rms_norm_weighted_tg_pipeline,
+                &[Some(input), Some(weight), Some(output)],
+                params_bytes(&params),
+                rows as u64,
+                Self::NORM_GROUP_THREADS,
+            );
+        }
         encoder.dispatch_1d(
             &self.rms_norm_weighted_pipeline,
             &[Some(input), Some(weight), Some(output)],
@@ -513,6 +577,15 @@ impl ElementKernels {
             width: to_u32(width, "norm width")?,
             eps,
         };
+        if rows < Self::THREADGROUP_NORM_MAX_ROWS && !Self::force_per_row_norms() {
+            return encoder.dispatch_groups(
+                &self.rms_norm_unweighted_tg_pipeline,
+                &[Some(input), Some(output)],
+                params_bytes(&params),
+                rows as u64,
+                Self::NORM_GROUP_THREADS,
+            );
+        }
         encoder.dispatch_1d(
             &self.rms_norm_unweighted_pipeline,
             &[Some(input), Some(output)],
@@ -864,6 +937,25 @@ impl ElementKernels {
         }
         let mut encoder = crate::encoder::MetalEncoder::new(&self.queue)?;
         encoder.dispatch_1d(pipeline, bindings, params, threads, 64)?;
+        encoder.commit_and_wait()
+    }
+
+    /// Like [`Self::run`] but dispatching threadgroups rather than a 1D grid.
+    fn run_groups(
+        &self,
+        pipeline: &ComputePipelineState,
+        bindings: &[Option<&Buffer>],
+        params: &[u8],
+        groups: u64,
+        threads_per_group: u64,
+    ) -> Result<(), KernelError> {
+        if groups == 0 {
+            return Err(KernelError::InvalidInput(
+                "kernel group count must be non-zero".to_string(),
+            ));
+        }
+        let mut encoder = crate::encoder::MetalEncoder::new(&self.queue)?;
+        encoder.dispatch_groups(pipeline, bindings, params, groups, threads_per_group)?;
         encoder.commit_and_wait()
     }
 }

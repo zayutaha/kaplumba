@@ -583,13 +583,14 @@ impl DecoderLayer {
         weight: &Buffer,
         input: &Buffer,
         output: &Buffer,
+        rows: usize,
         eps: f32,
     ) -> Result<(), ModelError> {
         if std::env::var_os("KAPLUMBA_SKIP_HIDDEN_NORMS").is_some() {
             return Ok(());
         }
         self.elements
-            .encode_rms_norm(encoder, input, weight, output, 1, self.config.hidden_size, eps)
+            .encode_rms_norm(encoder, input, weight, output, rows, self.config.hidden_size, eps)
             .map_err(ModelError::from)
     }
 
@@ -636,6 +637,7 @@ impl DecoderLayer {
             &self.gpu_weights.input_norm,
             input,
             &scratch.normed,
+            tokens,
             eps,
         )?;
 
@@ -790,6 +792,7 @@ impl DecoderLayer {
             &self.gpu_weights.post_attention_norm,
             &scratch.proj,
             &scratch.normed,
+            tokens,
             eps,
         )?;
         self.elements.encode_residual_add(
@@ -804,6 +807,7 @@ impl DecoderLayer {
             &self.gpu_weights.pre_ffn_norm,
             &scratch.hidden_b,
             &scratch.normed,
+            tokens,
             eps,
         )?;
 
@@ -843,6 +847,7 @@ impl DecoderLayer {
             &self.gpu_weights.post_ffn_norm,
             &scratch.proj,
             &scratch.proj,
+            tokens,
             eps,
         )?;
         self.elements.encode_residual_add(

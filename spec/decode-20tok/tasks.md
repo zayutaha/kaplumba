@@ -5,7 +5,7 @@ together; do them before spending anything on the speculative stages.
 
 ## Stage 1 — the certain wins
 
-- [ ] **T1** Time `online_attention` in `elem_bench` at the real decode shapes:
+- [x] **T1** Time `online_attention` in `elem_bench` at the real decode shapes:
   - Sliding: `queries=1, keys=1024, q_heads=32, kv_heads=16, dim=256`
   - Full: `queries=1, keys=200, q_heads=32, kv_heads=4, dim=512`
   Sizes stage 2 and answers Q3. Currently inferred from code structure, never
@@ -16,14 +16,14 @@ together; do them before spending anything on the speculative stages.
   attention share is measured in situ rather than inferred.
   - Note: this env var does not exist yet; T2 creates it.
   - Files: `crates/engine/src/model.rs`
-- [ ] **T3** Parallel `rms_norm_weighted`: one 256-thread threadgroup per row,
+- [x] **T3** Parallel `rms_norm_weighted`: one 256-thread threadgroup per row,
   strided partial sums, barrier tree reduction. Select only when `rows < 32`.
   *Gate: under 20 µs at `rows=1, width=5376`.*
   - Files: `crates/kernels/src/elements.metal`, `crates/kernels/src/elements.rs`
-- [ ] **T4** Same for `rms_norm_unweighted` (used for v_norm, not pre_ffn_norm
+- [x] **T4** Same for `rms_norm_unweighted` (used for v_norm, not pre_ffn_norm
   as previously thought; `pre_ffn_norm` uses the weighted variant).
   - Files: `crates/kernels/src/elements.metal`, `crates/kernels/src/elements.rs`
-- [ ] **T5** Correctness for T3/T4 vs the current kernel at `rows` in
+- [x] **T5** Correctness for T3/T4 vs the current kernel at `rows` in
   {1, 2, 7, 32, 64, 134} and widths {128, 256, 512, 5376}, float tolerance.
   Include both weighted and unweighted variants.
   - Files: `crates/engine/tests/elements_metal.rs`
@@ -44,7 +44,7 @@ together; do them before spending anything on the speculative stages.
   - Files: `crates/engine/tests/attention_metal.rs`
 - [ ] **T10** Re-measure. *Gate: layer stack under 300 ms, decode ≥ 3.0 tok/s.*
   (Adjusted from 250 ms / 3.4 tok/s to account for corrected norm savings.)
-- [ ] **T11** Prefill unchanged (8.4 tok/s at 134 tokens). Full suite green.
+- [x] **T11** Prefill unchanged (8.4 tok/s at 134 tokens). Full suite green.
   Create an output comparison test (the spec references `output_identity` but
   no such test exists; build it as a generation comparison against a recorded
   baseline at temperature 0).
@@ -89,3 +89,47 @@ together; do them before spending anything on the speculative stages.
   - Files: `crates/engine/examples/elem_bench.rs`
 - [ ] **T21** Update `implementation_notes.md` after every stage with the measured
   before/after, so the next session does not re-derive any of this.
+
+## Progress (2026-09-27)
+
+- **T1 done.** Attention measured: 132.4 us sliding (keys=1024, 32q/16kv, dim 256),
+  128.3 us full (keys=200, 32q/4kv, dim 512), so **7.9 ms per token**, not the
+  ~380 ms both specs inferred. **Stage 2 (T7-T9) is therefore worthless and is
+  struck**: 8 ms of an 850 ms token does not justify split-K attention, dropping
+  `accum[512]`, or the register-pressure work.
+- **T3-T5 done.** `rms_norm` at `rows == 1`: **595.7 us -> 11.9 us**, a 50x
+  improvement, by giving each row a 256-thread group with a strided partial sum
+  and a barrier tree. Dispatch switches on `rows < 32` so prefill keeps the
+  per-row kernel. New test compares both paths at widths {128, 256, 512, 5376} x
+  rows {1, 2, 7, 31, 32, 64, 134}: exact for most shapes, worst relative
+  difference 6.64e-4 at width 5376, which is the reordered sum.
+- **T11 done.** Suite green, prefill unchanged at 8.4 tok/s, and all five
+  reference prompts produce byte-identical text.
+
+Result: layer stack 766 -> 665 ms, decode **1.18 -> 1.51 tok/s**.
+
+### A bug worth recording
+
+The first attempt at this produced fluent garbage from every prompt, and the
+threadgroup norm was *not* the cause: an earlier attribution refactor had
+replaced the four hidden-width norm call sites with a helper that hardcoded
+`rows = 1`. Decode has one row so it looked fine, but prefill passes
+`rows = tokens` and was silently normalising only the first row. Forcing the
+original per-row kernels did not restore the output either, which is what proved
+the refactor rather than the new kernel was at fault. The helper now takes `rows`.
+
+### What is left
+
+665 ms of layer time is now almost entirely the linear matvec:
+
+| | ms | note |
+|---|---:|---|
+| norms | 2.9 | was 156 |
+| attention | 7.9 | measured, not worth optimising |
+| matvec + element ops | ~654 | 11.00 GB at **16.8 GB/s** |
+
+10 tok/s needs the matvec at ~90 ms, i.e. **122 GB/s, a 7.3x improvement**. The
+same kernel measures 40-64 GB/s in isolation, so the gap is not arithmetic. It is
+either non-coalesced access (Q7) or the loss of sustained streaming when seven
+different projections are interleaved with ~16 element kernels, 60 times a token.
+That is the next investigation and it is the whole remaining problem.
