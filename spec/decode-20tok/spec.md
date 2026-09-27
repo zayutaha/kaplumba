@@ -174,44 +174,109 @@ and are worth 4.4× on their own. Do them before anything else.
 
 ## Open questions
 
-These are the things I do not know, and several of them change the plan.
+Eight things I do not know. Several of them can invalidate the plan, so they are
+listed most-dangerous-first rather than in the order they came up. "Blocked by"
+names the work that must not start until the question is answered.
 
-- **Q1. Does the codebook LUT actually pay?** The A/B harness hung before
-  producing a number. A LUT replaces 4 int ops with one lookup, but Metal
-  `thread` arrays may spill to local memory, and a spilled lookup is worse than
-  the hash. **Must be measured before R4 is attempted.** If the table spills,
-  the alternative is a `constant`-address-space table in a small buffer, or
-  exploiting that the 8 codes of a lane can be decoded with shared subexpressions.
-- **Q2. Is 20 tok/s reachable at all, or is stage 6 fantasy?** 88% of peak
-  bandwidth is required. ishizuki reports ~11 tok/s on M4 Pro and ~20 on M1 Max
-  (400 GB/s), which suggests 88% is not attained in practice. **If Q1 fails and
-  stages 3–5 land short, the honest destination is 11–13 tok/s and we should say
-  so rather than chase 20.**
-- **Q3. How much of the ~380 ms is attention?** Inferred from the kernel's
-  structure, never timed. Add it to `elem_bench` first; it sizes stage 2.
-- **Q4. Does the sliding-window ring need a maintained bound?** Sliding layers
-  scan all 1024 slots every step. A running min/max position, or a compacted
-  ring, could cut that, but it changes cache semantics and must not break the
-  ring buffer.
-- **Q5. Can fp16 accumulation replace fp32 in the matvec?** The 5.10e12 `half2`
-  rate is nearly 2× the 4.35e12 fp32 FMA rate, and `half2` accumulation is one
-  op for two partial sums. Risks precision over a 5376-element dot product;
-  needs a tolerance test, and the spec forbids quality loss, so this is
-  measurement-gated.
-- **Q6. How much of the practical bandwidth is reachable for *mapped* weights?**
-  Every GEMV bench number is from an arena-resident buffer. The offloaded
-  `embed_tokens` and `lm_head` are file-backed; if those stream slower, the
-  effective roof drops below 22.6.
-- **Q7. Would a repacked trellis layout help more than any kernel work?** The
-  fundamental cost is that 8 lanes read overlapping windows of a 96-byte ring.
-  A layout where a simdgroup reads contiguous bytes would remove the
-  non-coalescing entirely. It requires rewriting the checkpoint at load time, so
-  it is a big change — but it may be the only route past ~11 tok/s. Worth a
-  design note before committing to stage 6.
-- **Q8. Is `queries`-batching worth it?** `exl3_matvec` supports up to 8 rows per
-  pass, reusing the decoded weight for several queries. Decode has one query, so
-  this only helps speculative decoding, which is out of scope. Confirm it is not
-  being left on the table for some other reason.
+| # | Question | Status | Answered by | Blocks |
+|---|---|---|---|---|
+| Q1 | Does a codebook lookup table actually beat the hash? | **unmeasured, harness hung** | T12 | R4, stage 5 |
+| Q2 | Is 20 tok/s reachable, or is stage 6 fantasy? | partially answered | T18 | stage 6 scope |
+| Q3 | How much of the ~380 ms is attention? | inferred from code, never timed | T1, T2 | stage 2 sizing |
+| Q7 | Would a repacked trellis beat any kernel work? | unexamined | T19 | everything past ~11 tok/s |
+| Q5 | Can `half2` accumulation replace fp32 in the matvec? | unmeasured | T13 | R5, stage 4 |
+| Q6 | What bandwidth do *mapped* weights actually stream at? | unmeasured | T15 | effective roof |
+| Q4 | Does the sliding ring need a maintained bound? | unexamined | after T10 | possible stage 2 extra |
+| Q8 | Is `queries`-batching being left on the table? | answered: no | — | nothing |
+
+### Q1. Does the codebook lookup table actually beat the hash?
+
+The single most promising idea in this spec and the least proven. At 3 bpw only
+the top `ka` bits of a 16-bit code carry information, so the codebook is a
+function of `2^ka` inputs — 8 values at this model's rate, 256 covering every
+integer rate 1..8. Replacing `mul / and / xor / shift` with a lookup should
+delete the dominant per-weight cost.
+
+The catch: Metal `thread` arrays can spill to local memory, and a spilled lookup
+is worse than the hash it replaces. The A/B harness (`examples/cb_bench.rs`)
+hung before producing a number — most likely the CPU-side fill of a 1 GB buffer,
+the same failure mode as the streaming probe that had to be deleted.
+
+**Decision it drives:** if a table pays, stage 5 is real and 11 tok/s is on the
+table. If it spills, the fallback is a `constant`-address-space table in a small
+buffer; if that also fails, drop the idea and record why rather than iterating.
+
+### Q2. Is 20 tok/s reachable at all?
+
+Stage 6 needs 12.06 GB at 240 GB/s, which is 88% of peak. No kernel I have
+measured gets close to that: the best projection is `lm_head` at 63.8 GB/s, 23%
+of peak. ishizuki reports ~11 tok/s on M4 Pro and ~20 on M1 Max (400 GB/s),
+which is consistent with a practical ceiling well under the naive roofline on
+both.
+
+**Decision it drives:** T18 exists solely to let this spec finish with "11 tok/s
+is the machine" as a legitimate, recorded result. Stages 1–5 are ordinary work
+and already buy 9×; stage 6 is the only part that may not be reachable, and it
+should not be allowed to hold the rest hostage.
+
+### Q3. How much of the ~380 ms is attention?
+
+`online_attention` is inferred to be the second-largest cost from its structure
+— `queries * q_heads` threads with a `float[512]` accumulator each, so 8 threads
+at decode — but it has never been timed. The 179 ms of norms is measured; the
+attention figure is arithmetic on a guess.
+
+**Decision it drives:** the size of stage 2, and whether split-K attention plus
+dropping `accum[512]` is one stage or two. If attention is much smaller than
+380 ms, the budget needs re-deriving and something else is missing.
+
+### Q7. Would a repacked trellis beat any kernel work?
+
+The structural cost is that the 8 lanes of a simdgroup read overlapping windows
+of one `256 * ka`-bit ring at varying unaligned offsets, so reads do not
+coalesce — 55% of matvec time is loads. A layout where a simdgroup reads
+contiguous bytes would remove that entirely.
+
+It requires rewriting the checkpoint at load time, so it is a large change, and
+it is also the only route I can see past roughly 11 tok/s. Deliberately deferred
+until there is evidence it is needed.
+
+**Decision it drives:** whether stage 6 is a tuning effort or a format change.
+
+### Q5. Can `half2` accumulation replace fp32 in the matvec?
+
+Measured `half2` is 5.10e12 ops/s against 4.35e12 for fp32 FMA, and a `half2`
+accumulate handles two partial sums in one op. Over a 5376-element dot product
+that risks precision, and the spec forbids quality loss, so this is
+measurement-gated rather than assumed.
+
+**Decision it drives:** whether stage 4 is worth doing at all.
+
+### Q6. What bandwidth do *mapped* weights actually stream at?
+
+Every GEMV number in this spec comes from an arena-resident buffer. The
+offloaded `embed_tokens` and `lm_head` are file-backed and page-cache-served.
+If those stream slower than arena memory, the effective roof is below 22.6 and
+every projection in the budget table is optimistic.
+
+**Decision it drives:** whether the offload that bought 15.12 → 11.51 GiB is
+costing throughput, which would be a genuine trade-off to surface rather than
+discover later.
+
+### Q4. Does the sliding-window ring need a maintained bound?
+
+Sliding layers scan all 1024 slots every step regardless of how few are live. A
+running position bound, or a compacted ring, could cut that — but it changes
+cache semantics and must not break the ring buffer.
+
+**Decision it drives:** a possible extra stage after T10, only if attention
+profiling shows the sliding scan dominating.
+
+### Q8. Is `queries`-batching being left on the table?
+
+Answered: no. `exl3_matvec` supports up to 8 rows per pass, reusing decoded
+weights across queries, but decode has exactly one query. This only helps
+speculative decoding, which is out of scope by standing restriction.
 
 ## Risks
 
