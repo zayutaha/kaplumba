@@ -2161,6 +2161,37 @@ kernel void linear_input_rows(
     }
 }
 
+// exl3_code_at's index arithmetic, reading the 16x16 tile out of threadgroup
+// memory instead of global. Kept adjacent so the two stay in step.
+static inline uint exl3_code_at_tg(
+    const threadgroup uint *tile,
+    uint word_count,
+    uint local_row,
+    uint local_column,
+    uint rate) {
+    const uint ka = rate;
+    const uint ring = 256u * ka;
+    uint p = (local_row % 8u) / 2u;
+    uint i_mod4 = (local_row % 2u) + 2u * (local_row / 8u);
+    uint q = local_column % 8u;
+    uint i_div4 = local_column / 8u;
+    uint i = i_mod4 + 4u * i_div4;
+    uint lane = p + 4u * q;
+    uint lo = (lane * 8u + 1u) * ka + ring - 16u;
+    uint i0 = lo / 32u;
+    uint sh = lo % 32u;
+    uint j0 = i0 >= word_count ? i0 - word_count : i0;
+    uint j1 = j0 + 1u >= word_count ? j0 + 1u - word_count : j0 + 1u;
+    uint j2 = j1 + 1u >= word_count ? j1 + 1u - word_count : j1 + 1u;
+    const ulong w0 = tile[j0];
+    const ulong w1 = tile[j1];
+    const ulong w2 = tile[j2];
+    const ulong a = ((w0 << 32) | w1) << sh | (sh ? (w2 >> (32 - sh)) : 0ul);
+    const ulong c = ((w1 << 32) | w2) << sh;
+    const uint r = i * ka + 16u;
+    return (r <= 64u ? uint(a >> (64u - r)) : uint(c >> (96u - r))) & 0xffffu;
+}
+
 kernel void linear_gemv_tiled(
     const device ushort *packed [[buffer(0)]],
     const device half *input [[buffer(1)]],
@@ -2168,36 +2199,53 @@ kernel void linear_gemv_tiled(
     constant LinearParams &params [[buffer(3)]],
     uint3 local_position [[thread_position_in_threadgroup]],
     uint3 grid_position [[thread_position_in_grid]]) {
-    threadgroup half weights[16][16];
+    // Changes from the original, all bit-exact (k = tile_row*16 + local_input still
+    // runs 0,1,...,K-1 in order and each output still takes one fp32 add of one
+    // product per k):
+    //   - the accumulator is a register, written once, not a global read-modify-
+    //     write per multiply;
+    //   - the trellis words for a chunk are pulled in with one coalesced pass
+    //     instead of six scattered 2-byte loads per code;
+    //   - the staged k-range is 64 rather than 16, so the same two barriers
+    //     amortise over four times as many FMAs.
+    constexpr uint KCHUNK = 64u;
+    constexpr uint TILES = KCHUNK / 16u;
+    const uint word_count = 256u * params.rate / 32u;
+    threadgroup uint tw[TILES * 64];
+    threadgroup half wstage[TILES * 256u];
     uint local_query = (grid_position.y / 16u) * 16u + local_position.y;
-    uint local_output = local_position.x;
+    uint local_output_in_tile = local_position.x;
     uint tile_column = grid_position.x / 16u;
-    uint output_index = tile_column * 16u + local_output;
-    uint local_output_in_tile = local_output;
-    uint loader = local_position.x + local_position.y * 16u;
-    float accumulator = 0.0f;
+    uint output_index = tile_column * 16u + local_output_in_tile;
+    uint tid = local_position.x + local_position.y * 16u;
+
     const bool active = local_query < params.queries;
     const uint query_base = local_query * params.in_features;
     const uint output_base = local_query * params.out_features;
-    for (uint tile_row = 0; tile_row < params.in_features / 16u; ++tile_row) {
-        uint local_row = loader / 16u;
-        uint local_column = loader & 15u;
-        uint tile_index = tile_row * params.tile_columns + tile_column;
-        uint state = packed_state(
-            packed,
-            tile_index,
-            local_row,
-            local_column,
-            params.packed_words,
-            params.rate,
-            params.perm_mode
-        );
-        weights[local_row][local_column] = half(decode_state(state, params.codebook));
+    float accumulator = 0.0f;
+
+    for (uint kbase = 0; kbase < params.in_features; kbase += KCHUNK) {
+        for (uint i = tid; i < TILES * word_count; i += 256u) {
+            uint t = i / word_count;
+            uint w = i - t * word_count;
+            uint tile_index = (kbase / 16u + t) * params.tile_columns + tile_column;
+            tw[i] = trellis_word(packed, tile_index * word_count + w);
+        }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint i = tid; i < TILES * 256u; i += 256u) {
+            uint t = i / 256u;
+            uint lr = (i & 255u) / 16u;
+            uint lc = i & 15u;
+            uint state = exl3_code_at_tg(tw + t * word_count, word_count, lr, lc, params.rate);
+            wstage[i] = half(decode_state(state, params.codebook));
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
         if (active) {
-            for (uint local_input = 0; local_input < 16u; ++local_input) {
-                uint input_index = tile_row * 16u + local_input;
-                accumulator += float(input[query_base + input_index]) * float(weights[local_input][local_output_in_tile]);
+            for (uint k_local = 0; k_local < KCHUNK; ++k_local) {
+                accumulator += float(input[query_base + kbase + k_local]) *
+                               float(wstage[k_local * 16u + local_output_in_tile]);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);

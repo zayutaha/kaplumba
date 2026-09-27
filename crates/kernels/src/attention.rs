@@ -62,6 +62,10 @@ pub struct AttentionKernels {
     online_attention_pipeline: ComputePipelineState,
     online_attention_256_pipeline: ComputePipelineState,
     online_attention_512_pipeline: ComputePipelineState,
+    attention_dim_256_pipeline: ComputePipelineState,
+    attention_dim_512_pipeline: ComputePipelineState,
+    attention_tg2_256_pipeline: ComputePipelineState,
+    attention_tg2_512_pipeline: ComputePipelineState,
     scores_pipeline: ComputePipelineState,
     scores_coalesced_pipeline: ComputePipelineState,
     row_reduce_coalesced_pipeline: ComputePipelineState,
@@ -90,6 +94,10 @@ impl AttentionKernels {
         let online_attention_pipeline = extra("online_attention")?;
         let online_attention_256_pipeline = extra("online_attention_256")?;
         let online_attention_512_pipeline = extra("online_attention_512")?;
+        let attention_dim_256_pipeline = extra("online_attention_dim_256")?;
+        let attention_dim_512_pipeline = extra("online_attention_dim_512")?;
+        let attention_tg2_256_pipeline = extra("online_attention_tg2_256")?;
+        let attention_tg2_512_pipeline = extra("online_attention_tg2_512")?;
         let queue = device.new_command_queue();
         Ok(Self {
             device,
@@ -98,6 +106,10 @@ impl AttentionKernels {
             online_attention_pipeline,
             online_attention_256_pipeline,
             online_attention_512_pipeline,
+            attention_dim_256_pipeline,
+            attention_dim_512_pipeline,
+            attention_tg2_256_pipeline,
+            attention_tg2_512_pipeline,
             scores_pipeline,
             scores_coalesced_pipeline,
             row_reduce_coalesced_pipeline,
@@ -315,11 +327,14 @@ impl AttentionKernels {
         // accumulator is register-resident. Bit-exact: the loop order and the
         // arithmetic are identical to the generic kernel.
         let pipeline = match head_dim {
-            256 => &self.online_attention_256_pipeline,
-            512 => &self.online_attention_512_pipeline,
+            256 => &self.attention_tg2_256_pipeline,
+            512 => &self.attention_tg2_512_pipeline,
             _ => &self.online_attention_pipeline,
         };
-        encoder.dispatch_1d(
+        // One 256-thread threadgroup per (query, head): phase 1 scores a key
+        // chunk into shared memory, phase 2 gives each thread one output
+        // dimension so its accumulator is a register, not local memory.
+        encoder.dispatch_groups(
             pipeline,
             &[
                 Some(queries),
@@ -331,7 +346,7 @@ impl AttentionKernels {
             ],
             params_bytes(&params),
             (queries_count * q_heads) as u64,
-            64,
+            256,
         )
     }
 

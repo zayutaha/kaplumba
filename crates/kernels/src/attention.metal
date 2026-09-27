@@ -408,3 +408,282 @@ kernel void online_attention(
         output[query_base + dimension] = half(accum[dimension] * norm);
     }
 }
+
+// Prefill attention with one thread per (query, head, DIMENSION).
+//
+// The serial kernel gave every (query, head) its own `float accum[512]`, which is
+// 1024 bytes per thread -- larger than the register file -- so it lived in
+// private local memory and every access in the inner loop paid a local-memory
+// round trip. That made prefill attention ~58% of prefill wall clock for under
+// 1% of the arithmetic.
+//
+// The fix is that the 256 accumulators are mutually independent: dimension d's
+// recurrence never reads any other dimension. So give each dimension its own
+// thread and the accumulator is one float in a register. The cost is that the
+// score dot product is recomputed once per dimension rather than shared, so it
+// runs `head_dim` times redundantly -- affordable precisely because the serial
+// version was three orders of magnitude off the arithmetic peak.
+//
+// Bit-exact: the dot product runs the identical d = 0,1,...,HEAD_DIM-1 sequence,
+// and each dimension's online-softmax recurrence sees the identical key order
+// with the identical max/total/factor updates, so every output element performs
+// the same sequence of fp32 operations as before. No score matrix, no scratch
+// beyond the kernel's own registers.
+template <int HEAD_DIM>
+static void online_attention_dim_body(
+    const device half *queries,
+    const device half *keys,
+    const device half *values,
+    const device uint *query_positions,
+    const device uint *key_positions,
+    device half *output,
+    constant AttentionParams &params,
+    uint gid) {
+    uint span = params.queries * params.q_heads * uint(HEAD_DIM);
+    if (gid >= span) {
+        return;
+    }
+    const uint dim = gid % uint(HEAD_DIM);
+    const uint head = (gid / uint(HEAD_DIM)) % params.q_heads;
+    const uint query = gid / (uint(HEAD_DIM) * params.q_heads);
+    const uint groups = params.q_heads / params.kv_heads;
+    const uint key_head = head / groups;
+    const uint query_base = (query * params.q_heads + head) * uint(HEAD_DIM);
+    const uint query_position = query_positions[query];
+
+    float maximum = -3.402823466e+38f;
+    float total = 0.0f;
+    float accumulator = 0.0f;
+
+    for (uint key_index = 0; key_index < params.key_count; ++key_index) {
+        const uint key_position = key_positions[key_index];
+        if (key_position > query_position) {
+            continue;
+        }
+        if (params.window != 0u && query_position - key_position >= params.window) {
+            continue;
+        }
+        const uint key_base = (key_index * params.kv_heads + key_head) * uint(HEAD_DIM);
+        // Recomputed per dimension rather than shared across the 256 dimensions.
+        float score = 0.0f;
+        for (int d = 0; d < HEAD_DIM; ++d) {
+            score += float(queries[query_base + uint(d)]) * float(keys[key_base + uint(d)]);
+        }
+        score *= params.scale;
+        const float value = float(values[key_base + dim]);
+        if (maximum == -3.402823466e+38f) {
+            maximum = score;
+            total = 1.0f;
+            accumulator = value;
+        } else if (score > maximum) {
+            float factor = exp(maximum - score);
+            total = total * factor + 1.0f;
+            maximum = score;
+            accumulator = accumulator * factor + value;
+        } else {
+            float factor = exp(score - maximum);
+            total += factor;
+            accumulator += factor * value;
+        }
+    }
+    const float norm = total > 0.0f ? 1.0f / total : 0.0f;
+    output[query_base + dim] = half(accumulator * norm);
+}
+
+kernel void online_attention_dim_256(
+    const device half *queries [[buffer(0)]],
+    const device half *keys [[buffer(1)]],
+    const device half *values [[buffer(2)]],
+    const device uint *query_positions [[buffer(3)]],
+    const device uint *key_positions [[buffer(4)]],
+    device half *output [[buffer(5)]],
+    constant AttentionParams &params [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]) {
+    online_attention_dim_body<256>(queries, keys, values, query_positions, key_positions, output, params, gid);
+}
+
+kernel void online_attention_dim_512(
+    const device half *queries [[buffer(0)]],
+    const device half *keys [[buffer(1)]],
+    const device half *values [[buffer(2)]],
+    const device uint *query_positions [[buffer(3)]],
+    const device uint *key_positions [[buffer(4)]],
+    device half *output [[buffer(5)]],
+    constant AttentionParams &params [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]) {
+    online_attention_dim_body<512>(queries, keys, values, query_positions, key_positions, output, params, gid);
+}
+
+// Prefill attention: one THREADGROUP per (query, head), three phases per key
+// chunk. Phase 1 computes the chunk's scores (one thread per key, the dot
+// product walked in its original d = 0..HEAD_DIM-1 order). Phase 1b walks the
+// chunk's scores in order to advance the online-softmax running max and total
+// and to emit one factor per key. Phase 2 gives each of the 256 threads a slice
+// of the output dimensions, so its accumulators are registers, and applies the
+// factor.
+//
+// Two earlier attempts were worse and both are instructive:
+//   - one thread per (query, head, DIMENSION), recomputing the score per
+//     dimension: correct, but 256x the arithmetic and the key traffic.
+//   - the same, with the online-softmax recurrence also per dimension: correct,
+//     but 256x the exp() calls, which is what dominated.
+//
+// Here exp() is called once per (query, head, key), as in the original, because
+// phase 1b does the recurrence and phase 2 only applies the factor it produced.
+//
+// Bit-exact: phase 1b performs the original's max/total/factor updates in the
+// original key order, and phase 2 applies the identical accumulator update for
+// the identical key sequence, so every output element sees the same sequence of
+// fp32 operations. Shared scratch is a fixed 256 keys' worth of score, factor
+// and rescale flags -- it does not grow with context length.
+template <int HEAD_DIM>
+static void online_attention_tg2_body(
+    const device half *queries,
+    const device half *keys,
+    const device half *values,
+    const device uint *query_positions,
+    const device uint *key_positions,
+    device half *output,
+    constant AttentionParams &params,
+    uint gid,
+    threadgroup float *sbuf,
+    threadgroup float *fbuf,
+    threadgroup float *rbuf,
+    threadgroup float *stot) {
+    uint span = params.queries * params.q_heads * 256u;
+    if (gid >= span) {
+        return;
+    }
+    const uint tid = gid & 255u;
+    const uint head = (gid / 256u) % params.q_heads;
+    const uint query = gid / (256u * params.q_heads);
+    const uint groups = params.q_heads / params.kv_heads;
+    const uint key_head = head / groups;
+    const uint query_base = (query * params.q_heads + head) * uint(HEAD_DIM);
+    const uint query_position = query_positions[query];
+
+    constexpr uint DPT = (HEAD_DIM + 255u) / 256u;
+    float maximum = -3.402823466e+38f;
+    float total = 0.0f;
+    float accumulator[DPT];
+    for (uint j = 0; j < DPT; ++j) {
+        accumulator[j] = 0.0f;
+    }
+    bool started = false;
+
+    for (uint base = 0; base < params.key_count; base += 256u) {
+        const uint n = min(256u, params.key_count - base);
+        if (tid < n) {
+            const uint key_base = ((base + tid) * params.kv_heads + key_head) * uint(HEAD_DIM);
+            float score = 0.0f;
+            for (int d = 0; d < HEAD_DIM; ++d) {
+                score += float(queries[query_base + uint(d)]) * float(keys[key_base + uint(d)]);
+            }
+            sbuf[tid] = score * params.scale;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (tid == 0u) {
+            for (uint t = 0; t < n; ++t) {
+                const uint key_position = key_positions[base + t];
+                bool live = key_position <= query_position;
+                if (live && params.window != 0u && query_position - key_position >= params.window) {
+                    live = false;
+                }
+                if (!live) {
+                    fbuf[t] = -1.0f;
+                    rbuf[t] = 0.0f;
+                    continue;
+                }
+                const float score = sbuf[t];
+                if (!started) {
+                    started = true;
+                    maximum = score;
+                    total = 1.0f;
+                    fbuf[t] = 0.0f;
+                    rbuf[t] = 2.0f;
+                } else if (score > maximum) {
+                    fbuf[t] = exp(maximum - score);
+                    total = total * fbuf[t] + 1.0f;
+                    maximum = score;
+                    rbuf[t] = 1.0f;
+                } else {
+                    fbuf[t] = exp(score - maximum);
+                    total += fbuf[t];
+                    rbuf[t] = 0.0f;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        for (uint j = 0; j < DPT; ++j) {
+            const uint d = tid + j * 256u;
+            if (d >= uint(HEAD_DIM)) {
+                continue;
+            }
+            for (uint t = 0; t < n; ++t) {
+                if (fbuf[t] < 0.0f) {
+                    continue;
+                }
+                const float value = float(values[((base + t) * params.kv_heads + key_head) * uint(HEAD_DIM) + d]);
+                if (rbuf[t] == 2.0f) {
+                    accumulator[j] = value;
+                } else if (rbuf[t] != 0.0f) {
+                    accumulator[j] = accumulator[j] * fbuf[t] + value;
+                } else {
+                    accumulator[j] += fbuf[t] * value;
+                }
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Only thread 0 advances the running total, so it has to be broadcast --
+    // otherwise every other thread normalises by its own untouched zero.
+    if (tid == 0u) {
+        *stot = total;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    const float shared_total = *stot;
+    const float norm = shared_total > 0.0f ? 1.0f / shared_total : 0.0f;
+    for (uint j = 0; j < DPT; ++j) {
+        const uint d = tid + j * 256u;
+        if (d < uint(HEAD_DIM)) {
+            output[query_base + d] = half(accumulator[j] * norm);
+        }
+    }
+}
+
+kernel void online_attention_tg2_256(
+    const device half *queries [[buffer(0)]],
+    const device half *keys [[buffer(1)]],
+    const device half *values [[buffer(2)]],
+    const device uint *query_positions [[buffer(3)]],
+    const device uint *key_positions [[buffer(4)]],
+    device half *output [[buffer(5)]],
+    constant AttentionParams &params [[buffer(6)]],
+    uint gid [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]]) {
+    threadgroup float sbuf[256];
+    threadgroup float fbuf[256];
+    threadgroup float rbuf[256];
+    threadgroup float stot;
+    online_attention_tg2_body<256>(queries, keys, values, query_positions, key_positions, output, params, tgid * 256u + gid, sbuf, fbuf, rbuf, &stot);
+}
+
+kernel void online_attention_tg2_512(
+    const device half *queries [[buffer(0)]],
+    const device half *keys [[buffer(1)]],
+    const device half *values [[buffer(2)]],
+    const device uint *query_positions [[buffer(3)]],
+    const device uint *key_positions [[buffer(4)]],
+    device half *output [[buffer(5)]],
+    constant AttentionParams &params [[buffer(6)]],
+    uint gid [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]]) {
+    threadgroup float sbuf[256];
+    threadgroup float fbuf[256];
+    threadgroup float rbuf[256];
+    threadgroup float stot;
+    online_attention_tg2_body<512>(queries, keys, values, query_positions, key_positions, output, params, tgid * 256u + gid, sbuf, fbuf, rbuf, &stot);
+}
