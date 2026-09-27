@@ -48,14 +48,14 @@ Status legend: `[ ]` pending, `[x]` done, `[~]` in progress.
 - [ ] **T9** Swap watch. Sustained generation with offload on; confirm swap does
   not grow (resolves the open question about `lm_head` page residency).
   - Depends: T8.
-- [ ] **T10** Regression test for R3. Assert layer trellis holds arena spans and
+- [x] **T10** Regression test for R3. Assert layer trellis holds arena spans and
   is therefore resident, so nobody re-enables zero-copy for the 11 GB. Test
   should check that `LoadedTensor.skip_copy == false` for layer tensors, or
   that `LoadedTensor.spans` is non-empty.
   - Files: `crates/engine/tests/memory_proof.rs` (natural home — it already
     tests weight residency) or a new test file.
   - Depends: T6.
-- [ ] **T11** Regression test for R6. Fixed prompt set, compare against recorded
+- [x] **T11** Regression test for R6. Fixed prompt set, compare against recorded
   expected output so an offset regression fails loudly instead of degrading to
   noise.
   - Files: `crates/engine/tests/real_forward_buffer.rs` (add a new test
@@ -79,6 +79,25 @@ Status legend: `[ ]` pending, `[x]` done, `[~]` in progress.
 
 T8 is the gate. If footprint does not reach <= 12 GiB **and** output stays
 identical, this spec is not done regardless of the other tasks.
+
+## Follow-up work (2026-09-27)
+
+- **T10** added `crates/engine/tests/weight_residency.rs` (4 tests, all green):
+  layer trellis must hold arena spans; `embed_tokens` and `lm_head.trellis` must
+  be mapped; the `KAPLUMBA_RESIDENT_WEIGHTS=1` escape hatch must put everything
+  back in the arena (verified by re-executing the test binary, since the flag is
+  read at load time and cannot be toggled in-process); resident weights must stay
+  under 11.5 GB.
+- **T11** added `crates/engine/tests/output_identity.rs` (2 tests): five greedy
+  prompts must produce byte-identical text with mapped weights, and the
+  all-resident path must match the same recorded baseline. Expected strings were
+  captured from the all-resident build at commit `78b3198`.
+- **T9** swap watch: the first attempt was invalid because four model-loading
+  residency tests ran concurrently, each pulling ~15 GB, so the measurement
+  reflected memory contention rather than the offload. Restarted with nothing
+  else running.
+- **T12** still open: the cost of the two-16-bit-load change versus the original
+  `uint *` cast has not been measured.
 
 ## Results (2026-09-27)
 
