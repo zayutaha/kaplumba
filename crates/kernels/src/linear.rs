@@ -141,6 +141,8 @@ pub struct LinearKernels {
     exl3_gemv_pipelines: Vec<Option<ComputePipelineState>>,
     /// Verbatim ishizuki `exl3_matvec`, for A/B only.
     ishizuki_gemv_pipelines: Vec<Option<ComputePipelineState>>,
+    /// Diagnostic-only A/B probes, selected by `KAPLUMBA_GEMV_PROBE`.
+    probe_pipelines: Vec<(String, ComputePipelineState)>,
 }
 
 impl LinearKernels {
@@ -183,6 +185,25 @@ impl LinearKernels {
                     .new_compute_pipeline_state_with_function(&function)
                     .map_err(KernelError::Pipeline)?,
             ));
+        }
+
+        // A/B probes that isolate the limiter: `nod` keeps the loads and drops
+        // decode_state, `nold` keeps decode_state and drops the loads.
+        let mut probe_pipelines: Vec<(String, metal::ComputePipelineState)> = Vec::new();
+        for name in [
+            "linear_gemv_nod_k3",
+            "linear_gemv_nold_k3",
+            "linear_gemv_unroll2_k3",
+            "linear_gemv_unroll3_k3",
+            "linear_gemv_unroll4_k3",
+            "linear_gemv_unroll6_k3",
+            "linear_gemv_unroll8_k3",
+        ] {
+            if let Ok(function) = library.get_function(&name, None) {
+                if let Ok(state) = device.new_compute_pipeline_state_with_function(&function) {
+                    probe_pipelines.push((name.to_string(), state));
+                }
+            }
         }
 
         let mut exl3_gemv_pipelines = Vec::with_capacity(18);
@@ -243,6 +264,7 @@ impl LinearKernels {
             input_pipeline,
             exl3_gemv_pipelines,
             ishizuki_gemv_pipelines,
+            probe_pipelines,
             gemv_pipeline,
             finalize_pipeline,
             input_rows_pipeline,
@@ -708,6 +730,18 @@ impl LinearKernels {
         )
     }
 
+    fn probe_pipeline(&self, rate: Exl3Rate) -> Option<&ComputePipelineState> {
+        if std::env::var_os("KAPLUMBA_GEMV_PROBE").is_none() {
+            return None;
+        }
+        let Exl3Rate::Integer(3) = rate else { return None };
+        let want = std::env::var("KAPLUMBA_GEMV_PROBE").ok()?;
+        self.probe_pipelines
+            .iter()
+            .find(|(name, _)| name == &want)
+            .map(|(_, state)| state)
+    }
+
     fn ishizuki_gemv_pipeline(
         &self,
         rate: Exl3Rate,
@@ -808,6 +842,19 @@ impl LinearKernels {
         // Integer rates go to the lane-per-thread matvec: one window setup per
         // eight codes, 256-thread groups, and enough threads to fill the GPU.
         // This is the real decode path; `gemv_buffer` routes the same way.
+        if let Some(pipeline) = self.probe_pipeline(rate) {
+            self.encode_ishizuki_gemv(
+                encoder,
+                pipeline,
+                packed,
+                packed_offset,
+                transformed,
+                raw,
+                in_features,
+                out_features,
+            )?;
+            return Ok(());
+        }
         if let Some(pipeline) = self.ishizuki_gemv_pipeline(rate, packed_offset) {
             self.encode_ishizuki_gemv(
                 encoder,

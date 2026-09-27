@@ -330,3 +330,57 @@ hoists the LUT/shift work to load time, leaving a FMA-only inner loop.
 4. Then the transcode, which is the only lever that removes ALU work rather
    than relocating it. Budget check required: 10-40% more weight memory against
    0.49 GiB of headroom.
+
+## I was wrong about the ALU: measured, not counted (2026-09-27)
+
+I claimed the matvec was ALU-bound and 14 tok/s needed 92% of logic ALU peak.
+That came from counting ~6.5 ops per weight in the source and comparing to
+`alu_peak`. Counting is not measuring, and it was wrong. Two probe kernels
+settle it (same loads, same body, one thing changed):
+
+    gate_proj, 44 MB      time      GB/s
+    baseline (load+decode) 0.363   119.5
+    loads, NO decode      0.377   115.1   <- removing all the ALU changes nothing
+    decode, NO loads      0.194   223.4   <- removing the loads is 1.87x faster
+
+The decode arithmetic is free; it hides completely under memory latency. The
+wall is the load path. 54% of streaming is not "saturated" either -- I labelled
+it that way and it was meaningless. With the loads gone the kernel runs at 223
+GB/s, ~95% of the 235 GB/s this machine actually streams, so 20 tok/s is
+genuinely on the table.
+
+### What actually fixed it
+
+Bandwidth tracked *loads in flight per lane*, not occupancy or ALU:
+
+    variant                full layer GB/s
+    baseline                  102
+    staged ring in tg mem     102   (no change -- not instruction issue)
+    unroll 2, hoisted idx     129   <- the win
+    unroll 3 / 4 / 6 / 8      128-130 (plateau)
+
+Hoisting `j0/j1/j2/sh` out of the tile loop (they depend only on the lane, not
+on the tile index) and unrolling by two so each lane keeps six weight words in
+flight is worth **+27% on the matvec**. Applied to all eight bit widths.
+
+End to end: **6.99 -> 7.43 tok/s**, suite green, all reference outputs
+byte-identical, deterministic across runs.
+
+Two things learned that cost time:
+- `cargo build --workspace` does NOT rebuild examples. `layer_bench` was stale
+  and kept reporting the old kernel until I built `--examples`, which briefly
+  looked like the rewrite had not taken effect.
+- Bash `%`-formatting in the codegen choked on `%%`, silently leaving the old
+  kernel in place. Use concatenation, not `%`, when the payload has `%` in it.
+
+### Still unexplained, and it is now the main suspect
+
+    sum of parts, unroll2 : 1.411 ms/layer x 60 =  84.7 ms
+    + attention/norm/head                        =  98 ms   predicted
+    model in situ                                 = 134.6 ms  measured
+
+A 36 ms gap that was only 18.6 ms before the rewrite -- it grew as the kernel
+got faster. `layer_bench` measures isolated kernels on a boosted GPU; the model
+runs sustained load. Next thing to test is whether the GPU downclocks under
+sustained streaming, because if it does, isolated per-kernel GB/s overstates
+the achievable rate and that changes what any further kernel work is worth.
