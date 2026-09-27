@@ -185,6 +185,34 @@ In accordance with `AGENTS.md` §2.1, every open question includes a plain-langu
 >
 > *(One of the reference repositories is licensed under AGPL. If we look at its code for ideas, does that conflict with your licensing goals for this project?)*
 
+### Q10: Q3 (attention strategy) contradicts Q1 (bit-exactness)
+> **Status:** open, unresolved. *Decision on implementation: build the bit-exact
+> option (`plan.md` §2.1, prefix-max scan) because bit-exactness was reaffirmed as
+> the hard constraint. This question is recorded rather than silently dropped.*
+>
+> **Question:** Q1 was answered "stay bit-exact" and Q2's 150 tok/s target was
+> withdrawn in favour of it, but Q3 was answered "port the oMLX multi-simdgroup
+> merge". `plan.md` §2.2 defines that merge as the *relaxed-float* option whose
+> threadgroup reduction deliberately changes the last bits of the float sums. The
+> bit-exact alternative is the prefix-max scan in `plan.md` §2.1.
+>
+> *(You chose bit-exact arithmetic and also chose the parallel attention merge whose
+> whole point is that it is not bit-exact. I cannot do both. Until you say
+> otherwise I am implementing the bit-exact prefix-max version, which is slower.)*
+
+### Q11: `attn_scores` is ~512x over-allocated (67 MB)
+> **Question:** `attn_scores` is allocated `q_heads * head_dim * 1024` floats
+> (67.11 MB) but the decode split-attention contract only needs `q_heads * key_count`
+> (1.05 MB at 8192 context). Right-sizing it frees 67 MB and would let
+> `PREFILL_CHUNK` go from 64 back to 256 (recovering per-chunk dispatch overhead),
+> but it needs the KV capacity threaded into `ForwardScratch::new` and an assertion
+> that the real requirement never exceeds the allocation.
+>
+> *(A scratch buffer is 64x bigger than it needs to be. Fixing it is a one-line
+> change once we know the exact KV capacity, but getting that wrong under-allocates
+> and corrupts memory. Do you want it fixed now, with the assertion, or left until
+> the KV capacity plumbing is in?)*
+
 ---
 
 ## 6. Acceptance Criteria
