@@ -76,12 +76,31 @@ fn main() {
         ("down     21504x5376", 21504, 5376),
         ("lm_head  5376x262144", 5376, 262144),
     ] {
+        // Cold measurement. A single copy of a 10-43 MB projection is L2-resident
+        // on this part, so timing one in isolation measures cache bandwidth, not
+        // DRAM -- which is exactly what the model does *not* get, because 60
+        // layers stream 11 GB per token and evict everything. Allocate enough
+        // copies to exceed L2 and rotate the offset so every pass is cold.
         let packed = build(in_f, out_f, bits, 7);
         let weight_bytes = (packed.len() * 2) as f64;
+        let target_bytes = 3_000_000_000u64; // ~3 GB working set
+        let copies = ((target_bytes / (packed.len() as u64 * 2)).max(2)) as usize;
+        let mut big: Vec<u16> = Vec::with_capacity(packed.len() * copies);
+        for c in 0..copies {
+            for (i, v) in packed.iter().enumerate() {
+                big.push(v ^ (c as u16).wrapping_mul(0x9E37));
+            }
+        }
         let buf = device.new_buffer_with_data(
-            packed.as_ptr() as *const std::ffi::c_void,
-            (packed.len() * 2) as u64,
+            big.as_ptr() as *const std::ffi::c_void,
+            (big.len() * 2) as u64,
             MTLResourceOptions::StorageModeShared,
+        );
+        let stride = (packed.len() * 2) as u64;
+        println!(
+            "{name}: working set {:.2} GB over {copies} copies ({:.1} MB each)",
+            big.len() as f64 * 2.0 / 1e9,
+            packed.len() as f64 * 2.0 / 1e6
         );
         let input: Vec<u16> = (0..in_f).map(|i| f16::from_f32((i as f32 * 0.01).sin()).to_bits()).collect();
         let input_b = device.new_buffer_with_data(input.as_ptr() as *const _, (in_f * 2) as u64, MTLResourceOptions::StorageModeShared);
@@ -112,9 +131,9 @@ fn main() {
         for _ in 0..5 {
             let mut enc = MetalEncoder::new(&queue).unwrap();
             let t = Instant::now();
-            for _ in 0..iters {
+            for w in 0..iters as u64 {
                 kernels.encode_gemv(&mut enc, LinearEncodeRequest {
-                    packed: &buf, packed_offset: 0, perm_mode: 0,
+                    packed: &buf, packed_offset: (w as usize % copies) as u64 * stride, perm_mode: 0,
                     input: &input_b, input_signs: &is_b, output_signs: &os_b,
                     transformed: &trans, raw: &raw, output: &outb,
                     in_features: in_f, out_features: out_f,

@@ -5,17 +5,24 @@
 One token streams 12.06 GB and decodes 32.2e9 weights. Current 850 ms:
 
 ```
-rms_norm      301 calls x 596 us   ~179 ms   measured
-attention      60 calls            ~380 ms   inferred, Q3
-linear gemvs   60 layers           ~220 ms   measured
-head            1 call              ~9 ms   measured
-embed           1 call            0.17 ms   measured
+rms_norm      241 calls x 596 us   ~143 ms   measured (4 single-thread norms/layer × 60 + 1 final)
+q/k/v norms   180 calls             ~??? ms   multi-row (32/16/4 threads), untimed
+attention      60 calls             ~380 ms   inferred, Q3
+linear gemvs  410 calls             ~220 ms   measured (7 per sliding × 50 + 6 per full × 10)
+head            1 call              ~9 ms     measured
+embed           1 call            0.17 ms     measured
                                    -------
-                                    ~790 ms   (measured total 793-850)
+                                    ~750+ ms  (measured total 793-850; gap is q/k/v norms + overhead)
 ```
 
-Stage 1 removes ~560 ms of parallelism bugs. Stage 2 attacks the 220 ms of
-gemvs. Stage 3 attacks the codebook inside the gemvs.
+Note: the q/k/v norms dispatch 32/16/4 rows respectively at head_dim width
+(256 or 512), not the catastrophic 1-row × 5376-width shape. They are still
+serial within each row but are not the dominant cost. The gap between the
+measured total (793-850 ms) and the itemised sum (~750 ms) is likely these
+norms plus command-buffer and residual-add overhead.
+
+Stage 1 removes ~143 ms of the single-threaded norm cost. Stage 2 attacks the
+~380 ms attention estimate. Stage 3 attacks the 220 ms of gemvs.
 
 ## Instrumentation to keep
 
@@ -30,6 +37,22 @@ gemvs. Stage 3 attacks the codebook inside the gemvs.
 - `examples/bench_gemv` — per-projection GB/s, global warmup plus best-of-5,
   because the first shape measured otherwise eats the GPU clock ramp and reads
   70% slow.
+
+Note: `KAPLUMBA_ATTENTION_ONLY` does not exist yet — T2 would create it.
+
+## Model architecture (decode shapes)
+
+For the budget analysis, the actual model shapes matter:
+
+- 60 layers: 50 sliding (index % 6 ≠ 5) + 10 full (index % 6 == 5)
+- `q_heads = 32`, `hidden_size = 5376`, `intermediate_size = 21504`
+- Sliding: `kv_heads = 16`, `head_dim = 256`, `sliding_window = 1024`
+- Full: `kv_heads = 4`, `head_dim = 512`, full context
+- `lm_head`: 5376 → 262144 at 6 bpw (Integer(6), MCG codebook)
+- Layer weights: all 3 bpw (Integer(3), MCG codebook)
+
+Per sliding layer at decode: 7 linears (q/k/v/o + gate/up/down)
+Per full layer at decode: 6 linears (q/k/o + gate/up/down; V reuses K buffer)
 
 ## Sequencing rationale
 

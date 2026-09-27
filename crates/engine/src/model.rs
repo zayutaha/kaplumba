@@ -569,6 +569,30 @@ impl DecoderLayer {
     /// batch and synchronised once instead of ~21 times per layer.
     #[allow(clippy::too_many_arguments)]
     #[allow(clippy::too_many_arguments)]
+    /// Dispatches the hidden-width RMS norm, or skips it under
+    /// `KAPLUMBA_SKIP_HIDDEN_NORMS`.
+    ///
+    /// Skipping makes the output wrong but keeps it finite, so the KV cache still
+    /// fills and the forward still completes. That is what makes in-situ
+    /// attribution possible: `KAPLUMBA_LINEARS_ONLY` could not produce a decode
+    /// step at all, because with attention skipped the logits come out empty.
+    #[allow(clippy::too_many_arguments)]
+    fn hidden_norm(
+        &self,
+        encoder: &mut MetalEncoder,
+        weight: &Buffer,
+        input: &Buffer,
+        output: &Buffer,
+        eps: f32,
+    ) -> Result<(), ModelError> {
+        if std::env::var_os("KAPLUMBA_SKIP_HIDDEN_NORMS").is_some() {
+            return Ok(());
+        }
+        self.elements
+            .encode_rms_norm(encoder, input, weight, output, 1, self.config.hidden_size, eps)
+            .map_err(ModelError::from)
+    }
+
     pub fn forward_buffer(
         &mut self,
         input: &Buffer,
@@ -607,13 +631,11 @@ impl DecoderLayer {
         let full = config.full_attention;
         let offset = self.gpu_cache.next_position();
 
-        self.elements.encode_rms_norm(
+        self.hidden_norm(
             encoder,
-            input,
             &self.gpu_weights.input_norm,
+            input,
             &scratch.normed,
-            tokens,
-            hidden,
             eps,
         )?;
 
@@ -763,13 +785,11 @@ impl DecoderLayer {
             tokens,
             scratch,
         )?;
-        self.elements.encode_rms_norm(
+        self.hidden_norm(
             encoder,
-            &scratch.proj,
             &self.gpu_weights.post_attention_norm,
+            &scratch.proj,
             &scratch.normed,
-            tokens,
-            hidden,
             eps,
         )?;
         self.elements.encode_residual_add(
@@ -779,13 +799,11 @@ impl DecoderLayer {
             &scratch.hidden_b,
             elements,
         )?;
-        self.elements.encode_rms_norm(
+        self.hidden_norm(
             encoder,
-            &scratch.hidden_b,
             &self.gpu_weights.pre_ffn_norm,
+            &scratch.hidden_b,
             &scratch.normed,
-            tokens,
-            hidden,
             eps,
         )?;
 
@@ -820,13 +838,11 @@ impl DecoderLayer {
             tokens,
             scratch,
         )?;
-        self.elements.encode_rms_norm(
+        self.hidden_norm(
             encoder,
-            &scratch.proj,
             &self.gpu_weights.post_ffn_norm,
             &scratch.proj,
-            tokens,
-            hidden,
+            &scratch.proj,
             eps,
         )?;
         self.elements.encode_residual_add(

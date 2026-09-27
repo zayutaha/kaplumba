@@ -46,7 +46,7 @@ physical one.
 
 ## Why it is slow, part by part
 
-### 1. `rms_norm` runs on one thread (measured, ~179 ms/token)
+### 1. `rms_norm` runs on one thread (measured, ~143 ms/token)
 
 `crates/kernels/src/elements.metal:92`:
 
@@ -69,25 +69,39 @@ Measured against its own siblings at the same shapes (`examples/elem_bench.rs`):
 | `copy_last_row` 1×5376 | 2.7 |
 | `residual_add` 1×5376 | 2.3 |
 
-200× slower than a 9× *larger* op beside it. Five norms per layer across 60
-layers plus the final norm: **301 per token ≈ 179 ms.**
+200× slower than a 4× *larger* op beside it (`gated_gelu` at 21504 elements vs
+`rms_norm` at 5376).
 
-`rms_norm_unweighted` (`pre_ffn_norm`) has the identical structure.
+Per layer, there are **7 norms** total, but only **4 run on a single thread at
+decode** (width=5376, rows=1): `input_norm`, `post_attention_norm`,
+`pre_ffn_norm`, `post_ffn_norm`. The other 3 are q/k/v norms over head
+dimensions with multiple rows (q_norm: 32 rows, k_norm: 16 or 4 rows, v_norm:
+16 or 4 rows), so they dispatch multiple threads already.
 
-### 2. `online_attention` runs on 8 threads (inferred, the rest of ~380 ms)
+The single-threaded norms: 4 per layer × 60 layers + 1 final norm = **241
+dispatches** per token ≈ **143 ms** at 596 µs each.
+
+`rms_norm_unweighted` is used for v_norm (not `pre_ffn_norm`); `pre_ffn_norm`
+uses the weighted variant.
+
+### 2. `online_attention` runs on 32 threads (inferred, the rest of ~380 ms)
 
 `crates/kernels/src/attention.metal:14`:
 
 ```metal
-if (gid >= params.queries * params.q_heads) return;   // 1 * 8 = 8 threads
+if (gid >= params.queries * params.q_heads) return;   // 1 * 32 = 32 threads
 float accum[512];                                      // 2 KB of registers each
 ```
 
-Decode therefore runs attention on **8 threads**, each holding a 512-float
-accumulator and scanning every key serially, twice. Sliding layers scan their
-whole 1024-slot ring. The 2 KB register array also caps occupancy at one or two
-threadgroups per core. This is the largest remaining slice and is **not yet
-timed** — see Q3.
+The model has **32 query heads** (not 8 — the 4/16 figures are *KV* heads, with
+GQA grouping 8/2 queries per KV head respectively). Decode therefore runs
+attention on **32 threads**, each holding a 512-float accumulator and scanning
+every key serially. Sliding layers (50 of 60) scan their whole 1024-slot ring
+with `head_dim=256`. Full-attention layers (10 of 60) scan all cached keys with
+`head_dim=512`. The 2 KB register array per thread (64 KB across 32 threads)
+caps occupancy at one or two threadgroups per core.
+
+This is the largest remaining slice and is **not yet timed** — see Q3.
 
 ### 3. The matvec is now 1.9–2.3× faster but loads still dominate it
 
@@ -125,18 +139,23 @@ Budget arithmetic. One token streams 12.06 GB and decodes 32.2e9 weights.
 | Stage | Change | Token cost | tok/s |
 |---|---|---:|---:|
 | now | — | 850 ms | 1.18 |
-| 1 | parallel `rms_norm` | 850 → 670 ms | 1.5 |
-| 2 | split-K `online_attention` | 670 → 290 ms | 3.4 |
-| 3 | matvec to ~100 GB/s (cooperative ring load) | 290 → 200 ms | 5.0 |
-| 4 | `half2` codebook packing | 200 → 130 ms | 7.7 |
-| 5 | codebook LUT | 130 → 90 ms | 11 |
-| 6 | remaining matvec efficiency | 90 → 50 ms | **20** |
+| 1 | parallel `rms_norm` | 850 → 710 ms | 1.4 |
+| 2 | split-K `online_attention` | 710 → 330 ms | 3.0 |
+| 3 | matvec to ~100 GB/s (cooperative ring load) | 330 → 240 ms | 4.2 |
+| 4 | `half2` codebook packing | 240 → 170 ms | 5.9 |
+| 5 | codebook LUT | 170 → 130 ms | 7.7 |
+| 6 | remaining matvec efficiency | 130 → 50 ms | **20** |
+
+Stage 1 saves ~143 ms (the single-threaded norm cost). Stage 2 is estimated
+from the ~380 ms attention residual. These figures need revision once Q3 is
+answered with real measurements; the budget table is arithmetic on a mix of
+measured and inferred costs.
 
 Stage 6 needs 12.06 GB at 240 GB/s, which is 88% of peak bandwidth. That is
-aggressive; stages 1–5 are ordinary work and already buy 9×.
+aggressive; stages 1–5 are ordinary work and already buy ~7×.
 
 **Order matters.** Stages 1 and 2 are certain, uncontroversial parallelism bugs
-and are worth 4.4× on their own. Do them before anything else.
+and are worth ~3× on their own. Do them before anything else.
 
 ## Requirements
 
@@ -159,18 +178,21 @@ and are worth 4.4× on their own. Do them before anything else.
   overlapping 32-bit loads per lane. Cuts global load instructions ~4×.
 - **R7** Every kernel on the decode path gets a microsecond cost measurement in
   `elem_bench`, so a future serialisation is caught in seconds, not hours.
-- **R8** Output must match within float tolerance; `output_identity` guards it.
+- **R8** Output must match within float tolerance. No `output_identity` test
+  exists yet; one must be created (a generation comparison against a recorded
+  baseline at temperature 0).
 - **R9** Prefill must not regress (8.4 tok/s at 134 tokens today).
 
 ## Acceptance criteria
 
 1. `rms_norm 1×5376` under 20 µs (from 595.7).
-2. `online_attention` at `queries=1, keys=200, 8 q-heads, 4 kv-heads, dim=512`
-   under 200 µs, scaling sub-linearly in key count.
+2. `online_attention` at `queries=1, keys=200, 32 q-heads, 16 kv-heads,
+   dim=256` (sliding shape) and `queries=1, keys=200, 32 q-heads, 4 kv-heads,
+   dim=512` (full shape) under 200 µs, scaling sub-linearly in key count.
 3. `q_proj` matvec at or above 100 GB/s (from 40.2).
 4. Decode **≥ 5 tok/s** after R1+R2 alone; **≥ 11 tok/s** after R4+R5; 20 is the
    target, not the gate.
-5. Full suite green; prefill ≥ 8 tok/s; `output_identity` within tolerance.
+5. Full suite green; prefill ≥ 8 tok/s; output comparison within tolerance.
 
 ## Open questions
 
@@ -216,15 +238,15 @@ both.
 
 **Decision it drives:** T18 exists solely to let this spec finish with "11 tok/s
 is the machine" as a legitimate, recorded result. Stages 1–5 are ordinary work
-and already buy 9×; stage 6 is the only part that may not be reachable, and it
+and already buy ~7×; stage 6 is the only part that may not be reachable, and it
 should not be allowed to hold the rest hostage.
 
 ### Q3. How much of the ~380 ms is attention?
 
 `online_attention` is inferred to be the second-largest cost from its structure
-— `queries * q_heads` threads with a `float[512]` accumulator each, so 8 threads
-at decode — but it has never been timed. The 179 ms of norms is measured; the
-attention figure is arithmetic on a guess.
+— `queries * q_heads` threads with a `float[512]` accumulator each, so 32
+threads at decode — but it has never been timed. The 143 ms of norms is
+measured; the attention figure is arithmetic on a guess.
 
 **Decision it drives:** the size of stage 2, and whether split-K attention plus
 dropping `accum[512]` is one stage or two. If attention is much smaller than
@@ -283,7 +305,7 @@ speculative decoding, which is out of scope by standing restriction.
 - **Two code paths per kernel** doubles the test matrix. Test both explicitly at
   `rows = 1` and `rows = 64`.
 - **A tree reduction reorders the sum**, so logits shift in the last bits.
-  `output_identity` will need a tolerance form. Expected, not a regression.
+  The output test will need a tolerance form. Expected, not a regression.
 - **Register pressure** in the attention combine pass: `head_dim` floats per
   partial per thread. May need chunking.
 - **Prefill regressions** are the most likely silent damage, since these kernels
