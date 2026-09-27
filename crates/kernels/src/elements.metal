@@ -387,3 +387,61 @@ kernel void copy_buffer(
     }
     output[gid] = input[gid];
 }
+
+
+// Greedy pick over the capped logits.
+//
+// Exists so the decode loop never has to bring 262,144 logits to the host and
+// sample there. With the pick on the GPU, the next step's forward can read the
+// token straight out of device memory, so steps queue back to back and the host
+// is not a stall between them. ishizuki measures this exact change at
+// 14.35 -> 22.48 tok/s, and attributes it to the serial loop "waiting on the GPU
+// twice a token, once for the step and once for the pick".
+//
+// The key packs a sortable form of the fp16 value in the high 16 bits and the
+// complement of the index in the low 16, so one unsigned max yields the largest
+// logit and, among ties, the lowest index. That makes the reduction a plain
+// atomic_max with no second pass and no comparison branching.
+static inline uint greedy_key(half value, uint index) {
+    const uint SIGN = 0x8000u;
+    uint bits = uint(as_type<ushort>(value));
+    // Negative floats compare backwards as unsigned integers; flip every
+    // non-negative one so the unsigned ordering matches the float ordering.
+    uint sortable = (bits & SIGN) != 0u ? ~bits : (bits ^ SIGN);
+    return (sortable << 16) | (0xFFFFu - index);
+}
+
+static inline half key_to_half(uint key) {
+    const uint SIGN = 0x8000u;
+    uint sortable = key >> 16;
+    uint bits = (sortable & SIGN) != 0u ? (sortable ^ SIGN) : ~sortable;
+    return as_type<half>(ushort(bits));
+}
+
+kernel void greedy_pick(const device half *logits [[buffer(0)]],
+                        device atomic_uint *best [[buffer(1)]],
+                        constant uint &count [[buffer(2)]],
+                        uint simd_lane [[thread_index_in_simdgroup]]) {
+    uint local = 0u;
+    for (uint i = simd_lane; i < count; i += 32u) {
+        local = max(local, greedy_key(logits[i], i));
+    }
+    // 32-lane max via shuffles, so the reduction is one instruction per step.
+    for (uint offset = 16u; offset > 0u; offset >>= 1u) {
+        local = max(local, simd_shuffle_xor(local, offset));
+    }
+    if (simd_lane == 0u) {
+        atomic_fetch_max_explicit(best, local, memory_order_relaxed);
+    }
+}
+
+// Turn the winning key back into a token id, for one query row.
+kernel void greedy_token(const device atomic_uint *best [[buffer(0)]],
+                         device uint *out [[buffer(1)]],
+                         constant uint &row [[buffer(2)]],
+                         uint tid [[thread_position_in_grid]]) {
+    if (tid != 0u) {
+        return;
+    }
+    out[row] = 0xFFFFu - (*(const device uint *)best) % 0x10000u;
+}

@@ -236,3 +236,30 @@ At 128 ms/token we need 100 ms. The matvec is ~115 ms of the 128. Their reported
 some of the residual gap is the rate and not the kernel. Scaling their 189 GB/s
 (M1 Max) to our bandwidth predicts ~129 GB/s against the 100.8 we measure, so
 roughly 1.3x remains and is plausibly reachable.
+
+## Pipelined decode (2026-09-27)
+
+Greedy decode now runs the pick on the GPU. `greedy_pick` reduces the capped
+logits with a single unsigned max over packed (value, index) keys -- so the fp16
+ordering is preserved by a sign flip, ties resolve to the lowest index, and the
+reduction needs no second pass and no comparison branching. The token lands in
+device memory, so the next step's embedding kernel reads it without the host.
+
+The loop queues one command buffer per step, `PIPELINE_DEPTH` = 8, submits them
+all, then waits and reads that many tokens together. Each step writes its own log
+slot and mirrors it into slot 0 for the next step; a single slot would have every
+step overwrite the last.
+
+Result: **6.77 -> 6.99 tok/s**. Correct on all reference prompts, suite green.
+
+**That is a much smaller win than the 14.35 -> 22.48 they measure, and the reason
+is arithmetic rather than a shortfall in the work.** Their serial loop stalled
+proportionally harder on the pick; ours stalls 12 ms out of a 148 ms token
+(136 ms of it GPU). Removing the host round trip entirely can therefore only
+recover that 12 ms, and it recovers most of it. The remaining 136 ms is GPU
+matvec, and that is now the whole problem.
+
+Also fixed along the way: `forward_buffer` created its Metal encoder before
+validating, so every error return dropped a command encoder that was never ended
+and Metal asserted at dealloc. The wrapper now validates first and abandons the
+encoder explicitly on the error path.

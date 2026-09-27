@@ -218,6 +218,25 @@ impl<'q> MetalEncoder<'q> {
         Ok(())
     }
 
+    /// End the encoder and drop the work without committing. Used on error paths
+    /// so the encoder is never released without `end_encoding`.
+    pub fn abandon(&mut self) {
+        self.encoder.end_encoding();
+    }
+
+    /// Commit without waiting, so several command buffers can be in flight.
+    pub fn commit_and_waitless(&mut self) -> Result<(), KernelError> {
+        self.encoder.end_encoding();
+        self.command_buffer.commit();
+        Ok(())
+    }
+
+    /// Wait for this command buffer without consuming it, so a caller that queued
+    /// several can read their results in submission order.
+    pub fn wait(&self) {
+        self.command_buffer.wait_until_completed();
+    }
+
     pub fn commit_and_wait(self) -> Result<(), KernelError> {
         self.encoder.end_encoding();
         self.command_buffer.commit();

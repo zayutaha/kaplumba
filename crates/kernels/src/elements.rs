@@ -103,6 +103,9 @@ pub struct ElementKernels {
     /// for why the per-row variants collapse at `rows == 1`.
     rms_norm_weighted_tg_pipeline: ComputePipelineState,
     rms_norm_unweighted_tg_pipeline: ComputePipelineState,
+    /// Greedy pick, so the decode loop can stay on the GPU between steps.
+    greedy_pick_pipeline: ComputePipelineState,
+    greedy_token_pipeline: ComputePipelineState,
     residual_pipeline: ComputePipelineState,
     layer_scale_pipeline: ComputePipelineState,
     gelu_pipeline: ComputePipelineState,
@@ -138,6 +141,8 @@ impl ElementKernels {
             pipeline(&device, &library, "rms_norm_weighted_tg")?;
         let rms_norm_unweighted_tg_pipeline =
             pipeline(&device, &library, "rms_norm_unweighted_tg")?;
+        let greedy_pick_pipeline = pipeline(&device, &library, "greedy_pick")?;
+        let greedy_token_pipeline = pipeline(&device, &library, "greedy_token")?;
         let residual_pipeline = pipeline(&device, &library, "residual_add")?;
         let layer_scale_pipeline = pipeline(&device, &library, "layer_scale")?;
         let gelu_pipeline = pipeline(&device, &library, "gelu_tanh")?;
@@ -158,6 +163,8 @@ impl ElementKernels {
             rms_norm_unweighted_pipeline,
             rms_norm_weighted_tg_pipeline,
             rms_norm_unweighted_tg_pipeline,
+            greedy_pick_pipeline,
+            greedy_token_pipeline,
             residual_pipeline,
             layer_scale_pipeline,
             gelu_pipeline,
@@ -555,6 +562,44 @@ impl ElementKernels {
             params_bytes(&params),
             rows as u64,
             64,
+        )
+    }
+
+    /// Encode a greedy pick: reduce the capped logits to the argmax token and
+    /// write it into `out_tokens[row]`.
+    ///
+    /// The reduction is one unsigned max over packed (value, index) keys, so it
+    /// needs no second pass and no comparison branching.
+    pub fn encode_greedy_pick(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        logits: &Buffer,
+        best: &Buffer,
+        out_tokens: &Buffer,
+        row: usize,
+    ) -> Result<(), KernelError> {
+        if row == 0 {
+            return Err(KernelError::InvalidInput(
+                "greedy pick row must be non-zero".to_string(),
+            ));
+        }
+        let vocab = to_u32((logits.length() / 2) as usize, "logit count")?;
+        // One simdgroup per 32 logits, capped so a 262k vocabulary does not ask
+        // for 8,192 groups; each thread strides from there.
+        let groups = ((vocab / 32) as u64).min(4096);
+        encoder.dispatch_groups(
+            &self.greedy_pick_pipeline,
+            &[Some(logits), Some(best)],
+            &vocab.to_le_bytes(),
+            groups,
+            32,
+        )?;
+        encoder.dispatch_1d(
+            &self.greedy_token_pipeline,
+            &[Some(best), Some(out_tokens)],
+            &row.to_le_bytes(),
+            1,
+            1,
         )
     }
 

@@ -1273,6 +1273,11 @@ pub struct ForwardScratch {
     pub attn_scores: Buffer,
     pub attn_row_max: Buffer,
     pub attn_row_sum: Buffer,
+    /// Winning (value, index) key for the GPU greedy pick, and the token it
+    /// decodes to. Kept on the device so the next step's forward can read the
+    /// sampled token without a host round trip.
+    pub greedy_best: Buffer,
+    pub greedy_token: Buffer,
 }
 
 impl ForwardScratch {
@@ -1339,6 +1344,10 @@ impl ForwardScratch {
             attn_scores: f32_elements(q_max, 1024)?,
             attn_row_max: f32_elements(1, q_max)?,
             attn_row_sum: f32_elements(1, q_max)?,
+            greedy_best: device.new_buffer(4, options),
+            // One slot per step so a queued batch of steps each keep their own
+            // token; a single slot would have every step overwrite the last.
+            greedy_token: device.new_buffer(4 * 64, options),
         })
     }
 
@@ -1365,6 +1374,8 @@ impl ForwardScratch {
             &self.attn_scores,
             &self.attn_row_max,
             &self.attn_row_sum,
+            &self.greedy_best,
+            &self.greedy_token,
         ]
         .iter()
         .map(|buffer| buffer.length())
@@ -1380,6 +1391,12 @@ pub struct TextModel {
     /// `embedding_buffer` holds raw BF16 exactly as stored in the checkpoint, so
     /// the embedding kernel must widen it. True when the table is offloaded.
     embedding_is_bf16: bool,
+    /// When set, `forward_buffer` encodes the greedy pick and returns no logits,
+    /// leaving the sampled token in `scratch.greedy_token`. Only valid for a
+    /// single token; used by the pipelined decode loop.
+    pick_on_device: bool,
+    /// Which log slot the in-flight step's greedy pick writes to.
+    step_slot: usize,
     vocab_size: usize,
     hidden_size: usize,
     layers: Vec<DecoderLayer>,
@@ -1485,6 +1502,8 @@ impl TextModel {
             embedding_buffer,
             embedding_offset,
             embedding_is_bf16,
+            pick_on_device: false,
+            step_slot: 0,
             vocab_size,
             hidden_size,
             layers,
@@ -1808,10 +1827,81 @@ impl TextModel {
     ///
     /// Prefill only needs logits for the position that is actually sampled, so
     /// the 262,144-wide vocabulary head runs for the last row alone.
+    /// The queue the forward runs on, so a caller can queue several steps.
+    pub fn forward_queue(&self) -> metal::CommandQueue {
+        self.forward_queue.clone()
+    }
+
+    /// Choose whether the greedy pick runs on the device. See
+    /// [`Self::pick_on_device`].
+    pub fn set_pick_on_device(&mut self, on: bool) {
+        self.pick_on_device = on;
+    }
+
+    /// Encode one decode step at `position`, taking the input token from device
+    /// memory (whatever the previous step's greedy pick wrote into slot 0).
+    pub fn forward_buffer_into_step(
+        &mut self,
+        encoder: &mut MetalEncoder,
+        position: u32,
+        step: usize,
+    ) -> Result<(), ModelError> {
+        // `token_ids[0]` and `query_positions[0]` already hold the previous
+        // step's sampled token and this step's position is written here; the
+        // embedding kernel reads both.
+        unsafe {
+            let position_ptr = self.scratch.query_positions.contents() as *mut u32;
+            std::ptr::write_bytes(position_ptr, 0, 1);
+            std::ptr::write(position_ptr, position);
+        }
+        // Pick writes its result into `greedy_token[step]` and mirrors it into
+        // slot 0, which is where the next step's embedding reads from.
+        self.step_slot = step;
+        self.forward_buffer_into(&[0], &[position], encoder)?;
+        Ok(())
+    }
+
+    /// The tokens a queued batch of steps produced, in order.
+    pub fn take_greedy_tokens(&self, count: usize) -> Vec<u32> {
+        let base = unsafe { self.scratch.greedy_token.contents() as *const u32 };
+        (0..count).map(|index| unsafe { *base.add(index) }).collect()
+    }
+
+    /// One forward step, committed and waited, returning the logits.
     pub fn forward_buffer(
         &mut self,
         token_ids: &[u32],
         positions: &[u32],
+    ) -> Result<Vec<u16>, ModelError> {
+        // Validate before creating the encoder: an early return would drop a
+        // command encoder that was never ended, which Metal asserts on.
+        if token_ids.len() != positions.len() || token_ids.is_empty() {
+            return Err(ModelError::InvalidInput(
+                "model token and position counts must match and be non-empty".to_string(),
+            ));
+        }
+        let queue = self.forward_queue.clone();
+        let mut encoder = MetalEncoder::new(&queue)?;
+        // On any error the encoder is left un-ended, which Metal asserts on at
+        // dealloc, so abandon it explicitly before propagating.
+        if let Err(error) = self.forward_buffer_into(token_ids, positions, &mut encoder) {
+            encoder.abandon();
+            return Err(error);
+        }
+        encoder.commit_and_wait()?;
+        let logits = self.scratch.capped.contents() as *const u16;
+        Ok(unsafe { std::slice::from_raw_parts(logits, self.vocab_size) }.to_vec())
+    }
+
+    /// Encode one forward into a caller-supplied encoder, without committing.
+    ///
+    /// This is what makes pipelined decode possible: a caller can queue many
+    /// steps into one command buffer so the host never waits between them.
+    pub fn forward_buffer_into(
+        &mut self,
+        token_ids: &[u32],
+        positions: &[u32],
+        encoder: &mut MetalEncoder,
     ) -> Result<Vec<u16>, ModelError> {
         if token_ids.len() != positions.len() || token_ids.is_empty() {
             return Err(ModelError::InvalidInput(
@@ -1850,7 +1940,6 @@ impl TextModel {
         // natural overlap between phases, but the distribution is what we need to
         // find out where a decode step actually goes.
         let profile = std::env::var_os("KAPLUMBA_PROFILE_PHASES").is_some();
-        let mut encoder = MetalEncoder::new(&self.forward_queue)?;
         let mut phase = std::time::Instant::now();
         let mut embed_ms = 0.0_f64;
         let mut layer_ms = 0.0_f64;
@@ -1874,7 +1963,7 @@ impl TextModel {
             .as_ref()
             .ok_or_else(|| ModelError::InvalidConfig("model has no GPU embedding".to_string()))?;
         self.elements.encode_embedding_scaled(
-            &mut encoder,
+            encoder,
             &self.scratch.token_ids,
             embedding_buffer,
             &self.scratch.hidden_a,
@@ -1887,7 +1976,6 @@ impl TextModel {
         )?;
 
         if profile {
-            encoder.flush_and_wait()?;
             mark!(embed_ms);
         }
         // Per-op accumulation inside the layer body, enabled by the phase
@@ -1907,13 +1995,12 @@ impl TextModel {
                 output,
                 tokens,
                 &self.scratch,
-                &mut encoder,
+                encoder,
                 &mut timer,
             )?;
         }
         let encode_done = std::time::Instant::now();
         if profile {
-            encoder.flush_and_wait()?;
             mark!(layer_ms);
             eprintln!(
                 "  SPLIT layers: cpu_encode={:.2}ms gpu_wait={:.2}ms",
@@ -1938,14 +2025,30 @@ impl TextModel {
         // Only the sampled position needs logits, so lift the final row out and
         // run the 262,144-wide vocabulary head for that row alone.
         self.elements.encode_copy_last_row(
-            &mut encoder,
+            encoder,
             final_hidden,
             &self.scratch.last_hidden,
             tokens,
             hidden,
         )?;
-        self.encode_lm_head(&mut encoder)?;
-        encoder.commit_and_wait()?;
+        self.encode_lm_head(encoder)?;
+        // Pick the greedy token on the device. The next step's embedding kernel
+        // reads `scratch.token_ids`, so a caller that keeps encoding into the
+        // same command buffer never has to round trip through the host.
+        unsafe {
+            std::ptr::write_bytes(self.scratch.greedy_best.contents() as *mut u8, 0, 4);
+        }
+        self.elements.encode_greedy_pick(
+            encoder,
+            &self.scratch.capped,
+            &self.scratch.greedy_best,
+            &self.scratch.token_ids,
+            tokens,
+        )?;
+        if self.pick_on_device {
+            // Caller is driving the loop; it will read `greedy_token` itself.
+            return Ok(Vec::new());
+        }
         mark!(head_ms);
         if profile {
             let total = embed_ms + layer_ms + head_ms;

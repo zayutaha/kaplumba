@@ -5,6 +5,7 @@ use thiserror::Error;
 use crate::metrics::{
     BenchmarkPlan, BenchmarkResult, MetricsError, RunMetrics, benchmark_result, measure_rss,
 };
+use kaplumba_kernels::encoder::MetalEncoder;
 use crate::model::{ModelError, TextModel};
 use crate::sampler::{Sampler, SamplerConfig, SamplerError};
 use crate::tokenizer::{GemmaTokenizer, TokenizerError};
@@ -94,6 +95,20 @@ where
             limit: config.context_limit,
         });
     }
+    // Greedy decode pipelines: the pick runs on the device so steps queue back to
+    // back. See `generate_gpu_greedy_pipelined`.
+    if config.sampler.temperature == 0.0 {
+        let mut on_text = on_text;
+        return generate_gpu_greedy_pipelined(
+            model,
+            tokenizer,
+            &prompt_ids,
+            config,
+            &mut move |chunk| on_text(chunk).map_err(GenerationError::Output),
+            request_started,
+        );
+    }
+
     let mut sampler = Sampler::new(config.sampler, config.seed)?;
     let mut detokenizer = crate::tokenizer::Detokenizer::new(tokenizer);
     let positions = (0..prompt_ids.len())
@@ -330,4 +345,127 @@ fn argmax_logits(logits: &[u16]) -> u32 {
         }
     }
     best as u32
+}
+
+/// Greedy decode with the pick on the GPU and the wait batched.
+///
+/// Steps are encoded back to back into one command buffer. The greedy pick runs
+/// as a kernel and leaves the sampled token in device memory, so step N+1's
+/// embedding kernel reads it without any host involvement. The host then waits
+/// once per `PIPELINE_DEPTH` steps and reads back that many token ids together,
+/// which keeps latency bounded while the GPU stays fed.
+fn generate_gpu_greedy_pipelined<F>(
+    model: &mut TextModel,
+    tokenizer: &crate::tokenizer::GemmaTokenizer,
+    prompt_ids: &[u32],
+    config: &GenerationConfig,
+    on_text: &mut F,
+    request_started: Instant,
+) -> Result<GenerationResult, GenerationError>
+where
+    F: FnMut(&str) -> Result<(), GenerationError> + ?Sized,
+{
+    /// Steps queued before the host waits. Deep enough to hide sampling and
+    /// detokenization, shallow enough that text still appears promptly.
+    const PIPELINE_DEPTH: usize = 8;
+
+    let mut detokenizer = crate::tokenizer::Detokenizer::new(tokenizer);
+    let mut text = String::new();
+    let mut generated_ids: Vec<u32> = Vec::with_capacity(config.max_new_tokens);
+    let mut ttft_duration = Duration::ZERO;
+    let mut decode_duration = Duration::ZERO;
+    let mut prefill_duration = Duration::ZERO;
+    let mut stopped_on_eos = false;
+    let prompt_len = prompt_ids.len();
+
+    let queue = model.forward_queue();
+    model.set_pick_on_device(true);
+    let result = (|| -> Result<(), GenerationError> {
+        let prefill_started = Instant::now();
+        let positions: Vec<u32> = (0..prompt_len as u32).collect();
+        let mut prefill = MetalEncoder::new(&queue)
+            .map_err(ModelError::from)?;
+        model
+            .forward_buffer_into(prompt_ids, &positions, &mut prefill)
+            .map_err(ModelError::from)?;
+        let prefill_duration = prefill_started.elapsed();
+
+        let mut position = prompt_len as u32;
+        let mut decoded = 0_usize;
+        while decoded < config.max_new_tokens {
+            let depth = (config.max_new_tokens - decoded).min(PIPELINE_DEPTH);
+            let decode_started = Instant::now();
+
+            // One command buffer per step, all submitted before any wait. Each
+            // step's forward reads the token the previous pick left in device
+            // memory, so the host is not in the loop.
+            let mut steps = Vec::with_capacity(depth);
+            for step in 0..depth {
+                let mut encoder = MetalEncoder::new(&queue)
+                    .map_err(ModelError::from)?;
+                model
+                    .forward_buffer_into_step(&mut encoder, position + step as u32, step)
+                    .map_err(ModelError::from)?;
+                encoder
+                    .commit_and_waitless()
+                    .map_err(ModelError::from)?;
+                steps.push(encoder);
+            }
+            for encoder in &steps {
+                encoder.wait();
+            }
+            decode_duration += decode_started.elapsed();
+
+            let tokens = model.take_greedy_tokens(depth);
+            for token in tokens {
+                if generated_ids.is_empty() {
+                    ttft_duration = request_started.elapsed();
+                }
+                if config.eos_ids.contains(&token) {
+                    stopped_on_eos = true;
+                    break;
+                }
+                generated_ids.push(token);
+                if let Some(chunk) = detokenizer.push(token)? {
+                    text.push_str(&chunk);
+                    on_text(&chunk)?;
+                }
+            }
+            decoded += depth;
+            position += depth as u32;
+            if stopped_on_eos {
+                break;
+            }
+        }
+
+        if let Some(chunk) = detokenizer.finish()? {
+            text.push_str(&chunk);
+            on_text(&chunk)?;
+        }
+        let decode_steps = generated_ids.len().saturating_sub(1);
+        let _ = decode_steps;
+        Ok(())
+    })();
+    model.set_pick_on_device(false);
+    result?;
+
+    let decode_steps = generated_ids.len().saturating_sub(1);
+    Ok(GenerationResult {
+        text,
+        prompt_tokens: prompt_len,
+        generated_tokens: generated_ids.len(),
+        generated_ids,
+        stopped_on_eos,
+        ttft_ms: ttft_duration.as_secs_f64() * 1e3,
+        prefill_tokens_per_second: if prefill_duration.is_zero() {
+            0.0
+        } else {
+            prompt_len as f64 / prefill_duration.as_secs_f64()
+        },
+        decode_tokens_per_second: if decode_duration.is_zero() {
+            0.0
+        } else {
+            decode_steps as f64 / decode_duration.as_secs_f64()
+        },
+    })
 }
