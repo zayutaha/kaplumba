@@ -136,6 +136,9 @@ pub struct LinearKernels {
     zero_raw_pipeline: ComputePipelineState,
     /// `linear_gemv_fast` specialised on (bits, MCG codebook) for integer rates.
     fast_gemv_pipelines: Vec<Option<ComputePipelineState>>,
+    /// Lane-per-thread EXL3 matvec, one per integer rate so `KA` folds to a
+    /// constant; see `linear_gemv_exl3_k*` in linear.metal. Index 0 is unused.
+    exl3_gemv_pipelines: Vec<Option<ComputePipelineState>>,
 }
 
 impl LinearKernels {
@@ -166,6 +169,23 @@ impl LinearKernels {
         let input_pipeline = device
             .new_compute_pipeline_state_with_function(&input_function)
             .map_err(KernelError::Pipeline)?;
+        let mut exl3_gemv_pipelines = Vec::with_capacity(18);
+        exl3_gemv_pipelines.push(None); // index 0 unused
+        // Index by [aligned][bits]: 0 = unaligned, 1 = 4-byte aligned.
+        for aligned in [false, true] {
+            for bits in 1..=8_u32 {
+                let suffix = if aligned { "" } else { "_u" };
+                let name = format!("linear_gemv_exl3_k{bits}{suffix}");
+                let function = library
+                    .get_function(&name, None)
+                    .map_err(KernelError::Pipeline)?;
+                let pipeline = device
+                    .new_compute_pipeline_state_with_function(&function)
+                    .map_err(KernelError::Pipeline)?;
+                exl3_gemv_pipelines.push(Some(pipeline));
+            }
+        }
+
         let gemv_pipeline = device
             .new_compute_pipeline_state_with_function(&gemv_function)
             .map_err(KernelError::Pipeline)?;
@@ -205,6 +225,7 @@ impl LinearKernels {
             queue,
             _library: library,
             input_pipeline,
+            exl3_gemv_pipelines,
             gemv_pipeline,
             finalize_pipeline,
             input_rows_pipeline,
@@ -363,18 +384,35 @@ impl LinearKernels {
             &input_blocks.to_le_bytes(),
             u64::from(input_blocks),
         );
-        self.encode_offset(
-            encoder,
-            self.fast_gemv_pipeline(rate, codebook)
-                .unwrap_or(&self.gemv_pipeline),
-            &[
-                TensorRef::new(packed, packed_offset),
-                TensorRef::new(&transformed, 0),
-                TensorRef::new(&raw, 0),
-            ],
-            params_bytes(&params),
-            out_features as u64,
-        );
+        // Integer rates go to the lane-per-thread matvec: one window setup per
+        // eight codes, 256-thread groups, and enough threads to fill the GPU.
+        // Grid is (out_features / 16) column-tiles x 256 threads.
+        if let Some(pipeline) = self.exl3_gemv_pipeline(rate, packed_offset) {
+            self.encode_offset_256(
+                encoder,
+                pipeline,
+                &[
+                    TensorRef::new(packed, packed_offset),
+                    TensorRef::new(&transformed, 0),
+                    TensorRef::new(&raw, 0),
+                ],
+                params_bytes(&params),
+                (out_features / 16 * 256) as u64,
+            );
+        } else {
+            self.encode_offset(
+                encoder,
+                self.fast_gemv_pipeline(rate, codebook)
+                    .unwrap_or(&self.gemv_pipeline),
+                &[
+                    TensorRef::new(packed, packed_offset),
+                    TensorRef::new(&transformed, 0),
+                    TensorRef::new(&raw, 0),
+                ],
+                params_bytes(&params),
+                out_features as u64,
+            );
+        }
         self.encode(
             encoder,
             &self.finalize_pipeline,
@@ -609,6 +647,32 @@ impl LinearKernels {
     }
 
     /// Pick the specialised decode kernel when the rate and codebook allow it.
+    /// Lane-per-thread matvec specialised on rate and on whether `packed` is
+    /// 4-byte aligned at `packed_offset`.
+    ///
+    /// Arena-resident tensors always are (offset 0 of a page-aligned buffer).
+    /// Mapped checkpoint tensors are not -- `lm_head.trellis` starts at a file
+    /// offset of % 4 == 2 -- and reading those as `uint *` is what made every
+    /// earlier zero-copy build decode to noise.
+    fn exl3_gemv_pipeline(
+        &self,
+        rate: Exl3Rate,
+        packed_offset: u64,
+    ) -> Option<&ComputePipelineState> {
+        if std::env::var_os("KAPLUMBA_LEGACY_GEMV").is_some() {
+            return None; // A/B switch against the pre-lane-per-thread kernels
+        }
+        let Exl3Rate::Integer(bits) = rate else {
+            return None;
+        };
+        if bits == 0 || bits > 8 {
+            return None;
+        }
+        let aligned = packed_offset % 4 == 0;
+        let index = if aligned { 8 + bits as usize } else { bits as usize };
+        self.exl3_gemv_pipelines.get(index)?.as_ref()
+    }
+
     fn fast_gemv_pipeline(
         &self,
         rate: Exl3Rate,
@@ -670,20 +734,37 @@ impl LinearKernels {
             u64::from(input_blocks),
             64,
         )?;
-        let gemv_pipeline = self
-            .fast_gemv_pipeline(rate, codebook)
-            .unwrap_or(&self.gemv_pipeline);
-        encoder.dispatch_1d_offset(
-            gemv_pipeline,
-            &[
-                TensorRef::new(packed, packed_offset),
-                TensorRef::new(transformed, 0),
-                TensorRef::new(raw, 0),
-            ],
-            params_bytes(&params),
-            out_features as u64,
-            64,
-        )?;
+        // Integer rates go to the lane-per-thread matvec: one window setup per
+        // eight codes, 256-thread groups, and enough threads to fill the GPU.
+        // This is the real decode path; `gemv_buffer` routes the same way.
+        if let Some(pipeline) = self.exl3_gemv_pipeline(rate, packed_offset) {
+            encoder.dispatch_1d_offset(
+                pipeline,
+                &[
+                    TensorRef::new(packed, packed_offset),
+                    TensorRef::new(transformed, 0),
+                    TensorRef::new(raw, 0),
+                ],
+                params_bytes(&params),
+                (out_features / 16 * 256) as u64,
+                256,
+            )?;
+        } else {
+            let gemv_pipeline = self
+                .fast_gemv_pipeline(rate, codebook)
+                .unwrap_or(&self.gemv_pipeline);
+            encoder.dispatch_1d_offset(
+                gemv_pipeline,
+                &[
+                    TensorRef::new(packed, packed_offset),
+                    TensorRef::new(transformed, 0),
+                    TensorRef::new(raw, 0),
+                ],
+                params_bytes(&params),
+                out_features as u64,
+                64,
+            )?;
+        }
         encoder.dispatch_1d(
             &self.finalize_pipeline,
             &[Some(raw), Some(output_signs), Some(output)],
@@ -794,6 +875,30 @@ impl LinearKernels {
             params.as_ptr() as *const c_void,
         );
         encoder.dispatch_threads(MTLSize::new(threads, 1, 1), MTLSize::new(64, 1, 1));
+    }
+
+    /// Like [`Self::encode_offset`] but with 256-thread groups.
+    ///
+    /// `linear_gemv_exl3` needs 256 (8 simdgroups) because it reduces across
+    /// simdgroups through threadgroup memory; the older kernels use 64.
+    fn encode_offset_256(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        pipeline: &ComputePipelineState,
+        bindings: &[TensorRef<'_>],
+        params: &[u8],
+        threads: u64,
+    ) {
+        encoder.set_compute_pipeline_state(pipeline);
+        for (index, binding) in bindings.iter().enumerate() {
+            encoder.set_buffer(index as u64, Some(&**binding.buffer), binding.offset);
+        }
+        encoder.set_bytes(
+            bindings.len() as u64,
+            params.len() as u64,
+            params.as_ptr() as *const c_void,
+        );
+        encoder.dispatch_threads(MTLSize::new(threads, 1, 1), MTLSize::new(256, 1, 1));
     }
 
     fn encode_offset(

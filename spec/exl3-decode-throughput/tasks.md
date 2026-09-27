@@ -1,6 +1,6 @@
 # Tasks: EXL3 decode throughput 1.4 -> 20 tok/s
 
-- [~] **T1** Establish the practical bandwidth ceiling. A synthetic streaming
+- [x] **T1** Establish the practical bandwidth ceiling. A synthetic streaming
   probe was written and abandoned: its kernel hung in `wait_until_completed`
   while the GPU was demonstrably healthy (the CLI ran fine in the same state), so
   the probe was buggy, not the hardware. **Resolved empirically instead** — T8
@@ -9,36 +9,36 @@
   the remaining bottleneck is the strided trellis access pattern, not arithmetic
   (see T13).
 
-- [ ] **T2** Add `exl3_decode8` to `linear.metal`: eight decoded values from one
+- [x] **T2** Add `exl3_decode8` to `linear.metal`: eight decoded values from one
   window setup, sharing the `lo` / `a` / `c` arithmetic already in
   `exl3_code_at`.
   - Files: `crates/kernels/src/linear.metal`
   - Test: unit test against the CPU decoder for rates 1..8, all 8 values each
 
-- [ ] **T3** Add `linear_gemv_exl3` with the reference thread mapping: one thread
+- [x] **T3** Add `linear_gemv_exl3` with the reference thread mapping: one thread
   per trellis lane, threadgroup = 256 (8 simdgroups), grid =
   `(out_features/16)*256`, simdgroups striding tile-rows.
   - Files: `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`
   - Test: correctness on a small matrix before wiring the pipeline
 
-- [ ] **T4** Reuse the 4 `x` values (`r0`, `r0+1`, `r0+8`, `r0+9`) for both
+- [x] **T4** Reuse the 4 `x` values (`r0`, `r0+1`, `r0+8`, `r0+9`) for both
   column groups instead of reading 16 values once each.
 
-- [ ] **T5** Reduction via `simd_shuffle_xor` (1, then 2) within the simdgroup,
+- [x] **T5** Reduction via `simd_shuffle_xor` (1, then 2) within the simdgroup,
   then a `threadgroup float red[8][vecs][16]` sum across simdgroups. No atomics.
 
-- [ ] **T6** Wire the new kernel into `LinearKernels`: route integer rates with
+- [x] **T6** Wire the new kernel into `LinearKernels`: route integer rates with
   the MCG codebook to it; leave fractional/mul1 on the old path.
 
-- [ ] **T7** Correctness matrix: rates 1..8 × {Plain, Mcg}, square and
+- [x] **T7** Correctness matrix: rates 1..8 × {Plain, Mcg}, square and
   non-square, several `out_features/16` values, compare against the CPU reference
   within float tolerance.
   - Files: `crates/engine/tests/linear_metal.rs`
 
-- [ ] **T8** Measure. `bench_gemv` old vs new on all four real shapes. Target
+- [x] **T8** Measure. `bench_gemv` old vs new on all four real shapes. Target
   ≥ 40% of 273 GB/s on `q_proj` and `up_proj` (from 6–9%).
 
-- [ ] **T9** End-to-end: decode tok/s at a 512-token prompt, greedy. Gate: 10
+- [x] **T9** (1.18 tok/s at 134 tok; see notes) End-to-end: decode tok/s at a 512-token prompt, greedy. Gate: 10
   tok/s. Stretch: 20.
 
 - [ ] **T10** Confirm prefill did not regress (10 tok/s at 418 tokens today).
@@ -54,3 +54,17 @@
   access pattern, not arithmetic. Write the follow-up spec for a tile-swizzled
   layout that lets a simdgroup read contiguous bytes. This requires repacking the
   checkpoint, so it is out of scope here.
+
+## Outcome
+
+GEMV work is done and measured: 1.9-2.3x on the layer projections, 1.2x on
+`lm_head`, output unchanged, suite green.
+
+**It did not move end-to-end decode much, and that is the real finding.** The
+GEMVs are only ~240 ms of an ~850 ms token. About 600 ms is element kernels,
+attention, and dispatch overhead. T9's 20 tok/s target is not reachable by
+optimising the GEMV further.
+
+Next investigation, not yet specified: where the 600 ms goes. Candidates, in
+order of suspicion: per-kernel dispatch overhead across ~600 launches per token,
+the attention kernel's cost as context grows, and the five RMS norms per layer.

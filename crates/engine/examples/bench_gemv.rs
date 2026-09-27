@@ -37,6 +37,39 @@ fn main() {
     let kernels = LinearKernels::new().expect("kernels");
     let bits = 3u8;
     // Real Gemma 4 shapes.
+    // Global warmup: the first shape measured eats the GPU clock ramp, which made
+    // q_proj vary by 70% between runs and produced bogus before/after comparisons.
+    {
+        let in_f = 5376usize;
+        let out_f = 5376usize;
+        let packed = build(in_f, out_f, bits, 3);
+        let buf = device.new_buffer_with_data(
+            packed.as_ptr() as *const std::ffi::c_void,
+            (packed.len() * 2) as u64,
+            MTLResourceOptions::StorageModeShared);
+        let input: Vec<u16> = (0..in_f).map(|i| f16::from_f32((i as f32 * 0.01).sin()).to_bits()).collect();
+        let input_b = device.new_buffer_with_data(input.as_ptr() as *const std::ffi::c_void, (in_f * 2) as u64, MTLResourceOptions::StorageModeShared);
+        let is: Vec<u16> = vec![0; (in_f + 127) / 128 * 8];
+        let is_b = device.new_buffer_with_data(is.as_ptr() as *const std::ffi::c_void, (is.len() * 2) as u64, MTLResourceOptions::StorageModeShared);
+        let os: Vec<u16> = vec![0; out_f / 8];
+        let os_b = device.new_buffer_with_data(os.as_ptr() as *const std::ffi::c_void, (os.len() * 2) as u64, MTLResourceOptions::StorageModeShared);
+        let trans = device.new_buffer((in_f * 2) as u64, MTLResourceOptions::StorageModeShared);
+        let raw = device.new_buffer((out_f * 2) as u64, MTLResourceOptions::StorageModeShared);
+        let outb = device.new_buffer((out_f * 2) as u64, MTLResourceOptions::StorageModeShared);
+        for _ in 0..40 {
+            let mut e = MetalEncoder::new(&queue).unwrap();
+            kernels.encode_gemv(&mut e, LinearEncodeRequest {
+                packed: &buf, packed_offset: 0, perm_mode: 0,
+                input: &input_b, input_signs: &is_b, output_signs: &os_b,
+                transformed: &trans, raw: &raw, output: &outb,
+                in_features: in_f, out_features: out_f,
+                rate: Exl3Rate::Integer(bits), codebook: Exl3Codebook::Mcg,
+            }).unwrap();
+            e.commit_and_wait().unwrap();
+        }
+        println!("(warmed)");
+    }
+
     for (name, in_f, out_f) in [
         ("q_proj   5376x5376", 5376usize, 5376usize),
         ("up_proj  5376x21504", 5376, 21504),
@@ -73,19 +106,25 @@ fn main() {
             }).unwrap();
             e.commit_and_wait().unwrap();
         }
-        let mut enc = MetalEncoder::new(&queue).unwrap();
-        let t = Instant::now();
-        for _ in 0..iters {
-            kernels.encode_gemv(&mut enc, LinearEncodeRequest {
-                packed: &buf, packed_offset: 0, perm_mode: 0,
-                input: &input_b, input_signs: &is_b, output_signs: &os_b,
-                transformed: &trans, raw: &raw, output: &outb,
-                in_features: in_f, out_features: out_f,
-                rate: Exl3Rate::Integer(bits), codebook: Exl3Codebook::Mcg,
-            }).unwrap();
+        // Best of several batches: the minimum is the least contaminated by
+        // scheduling noise and clock ramping.
+        let mut best = f64::MAX;
+        for _ in 0..5 {
+            let mut enc = MetalEncoder::new(&queue).unwrap();
+            let t = Instant::now();
+            for _ in 0..iters {
+                kernels.encode_gemv(&mut enc, LinearEncodeRequest {
+                    packed: &buf, packed_offset: 0, perm_mode: 0,
+                    input: &input_b, input_signs: &is_b, output_signs: &os_b,
+                    transformed: &trans, raw: &raw, output: &outb,
+                    in_features: in_f, out_features: out_f,
+                    rate: Exl3Rate::Integer(bits), codebook: Exl3Codebook::Mcg,
+                }).unwrap();
+            }
+            enc.commit_and_wait().unwrap();
+            best = best.min(t.elapsed().as_secs_f64() / iters as f64);
         }
-        enc.commit_and_wait().unwrap();
-        let secs = t.elapsed().as_secs_f64() / iters as f64;
+        let secs = best;
         let gbps = weight_bytes / secs / 1e9;
         let weights = (in_f * out_f) as f64;
         println!(
