@@ -384,3 +384,59 @@ got faster. `layer_bench` measures isolated kernels on a boosted GPU; the model
 runs sustained load. Next thing to test is whether the GPU downclocks under
 sustained streaming, because if it does, isolated per-kernel GB/s overstates
 the achievable rate and that changes what any further kernel work is worth.
+
+## What the four probes actually prove (2026-09-27, second pass)
+
+The first probe sweep said unroll2 was worth +27%. **That was wrong and did not
+reproduce.** A controlled A/B of the rolled-out default against a byte-identical
+probe kernel gave 108.9 vs 107.3 GB/s -- i.e. the real matvec gain is **+6%**
+(101.7 -> 107.2), which matches the end-to-end 6.99 -> 7.43 (+6.3%) exactly.
+The 129 reading came from a build that had seven extra kernels appended to the
+library; it never came back. Do not trust a probe number without re-running it as
+a byte-identical A/B in the same binary.
+
+The real findings, all reproduced:
+
+    gate_proj 44 MB        time      GB/s
+    baseline                 0.347    124.7
+    no decode (nod)          0.376    115.1   ALU work: free
+    no x loads (nox)         0.348    124.6   activation loads: free
+    no weight loads (nold)   0.194    223.4   <- the entire cost, 1.87x
+
+So the decode arithmetic *and* the activation loads are both entirely hidden.
+The one and only cost is reading the 44 MB of trellis weights, and it runs at
+53% of the 235 GB/s this machine actually streams. Everything else in the
+kernel is free.
+
+Why the weight loads only reach 53%: the three words each lane needs (j0, j0+1,
+j0+2) are a sliding window over a 24-word ring, so 32 lanes issue 96 lane-loads
+to touch only 24 distinct words -- **4x redundant L1 traffic**. Staging the ring
+through threadgroup memory was the obvious fix and it did nothing (118.8 vs
+119.5) on its own; it is still untested *combined* with the unroll, and that is
+the next thing to try.
+
+### The arithmetic ceiling, now that compute is free
+
+    all weights 11.47 GB at 235 GB/s (measured peak)  = 48.8 ms  = 20.5 tok/s
+
+That is the absolute floor for one token, and it is 20.5 tok/s *only if every
+byte streams at measured peak and attention, norms and the head cost nothing*.
+The real budget has 24.5 ms of non-matvec work in it:
+
+    attention 13.0 ms   (960 KB of KV -- this is latency, not bandwidth)
+    lm_head    8.5 ms   (536 MB at 63 GB/s, vs 125 GB/s for a normal matvec)
+    norms     ~3.0 ms
+
+    14 tok/s = 71 ms  ->  matvec gets ~47 ms  ->  11.47 GB / 0.047 = 244 GB/s
+                                              -> above measured peak. NOT possible.
+    20 tok/s = 50 ms  ->  matvec gets ~25 ms  ->  458 GB/s. Not remotely possible.
+
+So 20 tok/s is not reachable at 3.04 bpw by any amount of kernel work: it needs
+458 GB/s where the machine streams 235. **The binding constraint is bpw, not the
+engine** -- and the arithmetic says ~14-15 tok/s is the real ceiling, which
+requires 100% of peak streaming on the matvec alone.
+
+The highest-value remaining work is therefore *not* the matvec. It is the 24.5 ms
+of non-matvec time, where lm_head at 63 GB/s and attention at 13 ms for 960 KB
+are both far off what the hardware should do. Cutting that to ~5 ms is worth more
+than every matvec idea above combined, because it comes straight off the budget.
