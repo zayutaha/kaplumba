@@ -654,6 +654,161 @@ static void online_attention_tg2_body(
     }
 }
 
+// Prefill attention, one 256-thread threadgroup per (query, head), with a fully
+// parallel softmax.
+//
+// The serial version ran the online-softmax bookkeeping on thread 0 alone: one
+// serial `exp()` per key while the other 255 threads waited. That was ~25 ms of
+// the ~44.7 ms prefill attention cost at 600 tokens (notes §3.1).
+//
+// Per 256-key chunk, with `n = min(256, remaining)`:
+//   1. thread `t < n` scores key `t` (parallel dot product) and masks it to
+//      -inf if it is stale or outside the sliding window;
+//   2. a simdgroup-shuffle plus 8-way tree reduction finds the chunk maximum;
+//   3. the running maximum advances ONCE PER CHUNK:
+//      `m' = max(m, cmax)`, `alpha = exp(m - m')`;
+//   4. every thread evaluates its own `exp(score - m')` in parallel -- this is
+//      the step that used to be serial;
+//   5. another reduction sums the weights: `l' = l * alpha + csum`;
+//   6. each thread folds its dimensions: `acc = acc * alpha + sum_t w_t * v_t`.
+//
+// This is the standard flash-attention rescale: the running max advances once
+// per 256-key chunk instead of at every key. That is not bit-identical to the
+// old serial recurrence, but it is the same mathematics in a different
+// association order, and it is *more* numerically stable (every weight is <= 1
+// and the rescale is applied once per chunk instead of once per key).
+//
+// Shared memory is 1 KB (`sbuf[256]`) plus 32 bytes (`red[8]`).
+//
+// Reductions are simdgroup-shuffle first so only one 32-bit word per simdgroup
+// crosses the barrier. `simd_shuffle_xor` is safe because the early return
+// above it is threadgroup-uniform: either every lane of the threadgroup is in
+// or none is.
+template <int HEAD_DIM>
+static void online_attention_parallel_body(
+    const device half *queries,
+    const device half *keys,
+    const device half *values,
+    const device uint *query_positions,
+    const device uint *key_positions,
+    device half *output,
+    constant AttentionParams &params,
+    uint gid,
+    threadgroup float *sbuf,
+    threadgroup float *red) {
+    constexpr float NEG_INF = -3.402823466e+38f;
+    const uint span = params.queries * params.q_heads * 256u;
+    if (gid >= span) {
+        return;
+    }
+    const uint tid = gid & 255u;
+    const uint lane = tid & 31u;
+    const uint sg = tid >> 5u;
+    const uint head = (gid / 256u) % params.q_heads;
+    const uint query = gid / (256u * params.q_heads);
+    const uint groups = params.q_heads / params.kv_heads;
+    const uint key_head = head / groups;
+    const uint query_base = (query * params.q_heads + head) * uint(HEAD_DIM);
+    const uint query_position = query_positions[query];
+
+    constexpr uint DPT = (HEAD_DIM + 255u) / 256u;
+    float accumulator[DPT];
+    for (uint j = 0; j < DPT; ++j) {
+        accumulator[j] = 0.0f;
+    }
+    float running_max = NEG_INF;
+    float running_total = 0.0f;
+
+    for (uint base = 0; base < params.key_count; base += 256u) {
+        const uint n = min(256u, params.key_count - base);
+
+        // 1. score and mask, in parallel.
+        float score = NEG_INF;
+        if (tid < n) {
+            const uint key_position = key_positions[base + tid];
+            bool live = key_position <= query_position;
+            if (live && params.window != 0u && query_position - key_position >= params.window) {
+                live = false;
+            }
+            if (live) {
+                const uint key_base = ((base + tid) * params.kv_heads + key_head) * uint(HEAD_DIM);
+                float dot = 0.0f;
+                for (int d = 0; d < HEAD_DIM; ++d) {
+                    dot += float(queries[query_base + uint(d)]) * float(keys[key_base + uint(d)]);
+                }
+                score = dot * params.scale;
+            }
+        }
+        sbuf[tid] = score;
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 2. chunk maximum: simdgroup shuffle, then an 8-way tree over `red`.
+        float v = score;
+        for (uint o = 16u; o > 0u; o >>= 1u) {
+            v = max(v, simd_shuffle_xor(v, o));
+        }
+        if (lane == 0u) {
+            red[sg] = v;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float chunk_max = red[0];
+        for (uint i = 1u; i < 8u; ++i) {
+            chunk_max = max(chunk_max, red[i]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 3. advance the running maximum once per chunk.
+        const float next_max = max(running_max, chunk_max);
+        const float alpha = (running_max > NEG_INF) ? exp(running_max - next_max) : 0.0f;
+
+        // 4. weights: every thread evaluates its own exp, in parallel.
+        const float weight =
+            (tid < n && score > NEG_INF && next_max > NEG_INF) ? exp(score - next_max) : 0.0f;
+        sbuf[tid] = weight;
+
+        // 5. chunk weight sum, same reduction shape.
+        float s = weight;
+        for (uint o = 16u; o > 0u; o >>= 1u) {
+            s += simd_shuffle_xor(s, o);
+        }
+        if (lane == 0u) {
+            red[sg] = s;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        float chunk_sum = 0.0f;
+        for (uint i = 0u; i < 8u; ++i) {
+            chunk_sum += red[i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        running_total = running_total * alpha + chunk_sum;
+        running_max = next_max;
+
+        // 6. fold this chunk into the dimension accumulators.
+        for (uint j = 0; j < DPT; ++j) {
+            const uint d = tid + j * 256u;
+            if (d >= uint(HEAD_DIM)) {
+                continue;
+            }
+            float acc = accumulator[j] * alpha;
+            for (uint t = 0; t < n; ++t) {
+                acc += sbuf[t] * float(values[((base + t) * params.kv_heads + key_head) * uint(HEAD_DIM) + d]);
+            }
+            accumulator[j] = acc;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Every thread computed an identical `running_total`, so no broadcast needed.
+    const float norm = running_total > 0.0f ? 1.0f / running_total : 0.0f;
+    for (uint j = 0; j < DPT; ++j) {
+        const uint d = tid + j * 256u;
+        if (d < uint(HEAD_DIM)) {
+            output[query_base + d] = half(accumulator[j] * norm);
+        }
+    }
+}
+
 kernel void online_attention_tg2_256(
     const device half *queries [[buffer(0)]],
     const device half *keys [[buffer(1)]],
@@ -665,10 +820,8 @@ kernel void online_attention_tg2_256(
     uint gid [[thread_position_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]]) {
     threadgroup float sbuf[256];
-    threadgroup float fbuf[256];
-    threadgroup float rbuf[256];
-    threadgroup float stot;
-    online_attention_tg2_body<256>(queries, keys, values, query_positions, key_positions, output, params, tgid * 256u + gid, sbuf, fbuf, rbuf, &stot);
+    threadgroup float red[8];
+    online_attention_parallel_body<256>(queries, keys, values, query_positions, key_positions, output, params, tgid * 256u + gid, sbuf, red);
 }
 
 kernel void online_attention_tg2_512(
@@ -682,8 +835,6 @@ kernel void online_attention_tg2_512(
     uint gid [[thread_position_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]]) {
     threadgroup float sbuf[256];
-    threadgroup float fbuf[256];
-    threadgroup float rbuf[256];
-    threadgroup float stot;
-    online_attention_tg2_body<512>(queries, keys, values, query_positions, key_positions, output, params, tgid * 256u + gid, sbuf, fbuf, rbuf, &stot);
+    threadgroup float red[8];
+    online_attention_parallel_body<512>(queries, keys, values, query_positions, key_positions, output, params, tgid * 256u + gid, sbuf, red);
 }

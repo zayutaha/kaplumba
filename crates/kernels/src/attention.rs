@@ -156,15 +156,19 @@ impl AttentionKernels {
             scale,
             window: to_u32(window, "attention window")?,
         };
-        let command_buffer = self.queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
-        encoder.set_compute_pipeline_state(match head_dim {
+        // Resolve the pipeline before opening an encoder. Returning early from
+        // inside `set_compute_pipeline_state` used to drop a live compute
+        // encoder, which Metal reports as
+        // "Command encoder released without endEncoding". The generic kernel is
+        // the documented fallback for any other head_dim up to MAX_HEAD_DIM.
+        let pipeline = match head_dim {
             256 => &self.online_attention_256_pipeline,
             512 => &self.online_attention_512_pipeline,
-            _ => return Err(KernelError::InvalidInput(
-                format!("prefill attention head_dim must be 256 or 512, got {head_dim}"),
-            )),
-        });
+            _ => &self.online_attention_pipeline,
+        };
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(pipeline);
         encoder.set_buffer(0, Some(&query_buffer), 0);
         encoder.set_buffer(1, Some(&key_buffer), 0);
         encoder.set_buffer(2, Some(&value_buffer), 0);
@@ -235,6 +239,23 @@ impl AttentionKernels {
             return Err(KernelError::InvalidInput(
                 "split-key attention is for a single query with valid dimensions".to_string(),
             ));
+        }
+        // `attention_scores` writes `q_heads * key_count` floats into `scores`.
+        // The host sizes that buffer from the widest cache any layer scans, and
+        // this is the check that the two agree. It matters because the old
+        // allocation was 512x oversized, so an undersized buffer would have gone
+        // unnoticed until it silently corrupted memory.
+        let required = q_heads
+            .checked_mul(key_count)
+            .and_then(|count| count.checked_mul(size_of::<f32>()))
+            .ok_or_else(|| {
+                KernelError::InvalidInput("attention score shape overflows".to_string())
+            })?;
+        if scores.length() < required as u64 {
+            return Err(KernelError::InvalidInput(format!(
+                "attention score buffer is {} bytes, needs {required} for {q_heads} heads x {key_count} keys",
+                scores.length()
+            )));
         }
         let params = AttentionParams {
             queries: 1,
