@@ -97,3 +97,39 @@ correct baseline, rather than first on a broken one.
   `(out_features/16, queries.div_ceil(16))`.
 - The sliding-window memory arithmetic: 50 of 60 layers stop growing past 1024
   context, so KV at 8192 is 1.41 GiB, not ~1.9.
+
+## 2026-09-27 — the 64x64 tile did not pay, and the reason matters
+
+The tile-size argument is arithmetically sound: a QxN output tile has arithmetic
+intensity `1 / (0.19/Q + 1/N)`, so 16x16 caps at 13.4 FLOP/byte (3.2 TF) and
+64x64 at 53.8 FLOP/byte (12.6 TF). A 4x better ceiling should have shown up.
+
+It did not. Measured, all bit-exact (every reference prompt byte-identical):
+
+    16x16 tile, KCHUNK=64      11.44 tok/s
+    64x64 tile, KCHUNK=64       8.27 tok/s
+    64x64 tile, KCHUNK=16       2.58 tok/s
+    64x64, KCHUNK=16, unrolled  6.90 tok/s
+    16x16 reverted              11.38 tok/s
+
+Two things learned, both about me rather than about the hardware:
+
+1. **I reintroduced the exact bug I had just fixed in attention.** The 64x64
+   kernel accumulates 16 outputs per thread, and the tail guard was a runtime
+   `nvalid`. A runtime trip count sends `accumulator[]` to local memory, which is
+   precisely the failure the whole rewrite exists to remove. That is the 2.58
+   reading. `#pragma unroll` with a compile-time 16 and `if (i < nvalid)` inside
+   recovered it to 6.90 -- and it is still worse than doing nothing.
+
+2. **So the tile is not the GEMM's limit.** Three theories have now been
+   measured and rejected for this kernel: the global accumulator (worth ~2%, and
+   the RMWs were L1-resident not DRAM), the barrier rate (worth nothing), and
+   the tile size (worse). The kernel is at ~0.5 TF against a 3.2 TF ceiling from
+   its own shape, so something else is ~6x off, and I do not yet know what. The
+   remaining candidate is the weight decode: at 64x64 the decode count per FMA
+   is not lower, and the decode is ~10 ALU ops with a divide and a modulo per
+   code, done out of threadgroup memory. That is the next thing to measure, not
+   another guess at the tiling.
+
+Reverted to 12fa4d8 (11.38-11.44 tok/s). The spec's T3 rewrite of the prefill
+GEMM is **not** complete and the tile-size claim in it should not be trusted.
