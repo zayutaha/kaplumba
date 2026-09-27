@@ -607,17 +607,17 @@ impl DecoderLayer {
         // decode step can be measured directly. Output is meaningless with this
         // on; it exists only to answer "where does the 793 ms go".
         if std::env::var_os("KAPLUMBA_LINEARS_ONLY").is_some() {
-            self.encode_linear(encoder, &self.weights.q_proj, input, &scratch.q, tokens, scratch)?;
-            self.encode_linear(encoder, &self.weights.k_proj, input, &scratch.k, tokens, scratch)?;
+            self.encode_linear(encoder, &self.weights.q_proj, input, &scratch.q, tokens, scratch, false)?;
+            self.encode_linear(encoder, &self.weights.k_proj, input, &scratch.k, tokens, scratch, false)?;
             if let Some(v) = &self.weights.v_proj {
-                self.encode_linear(encoder, v, input, &scratch.v, tokens, scratch)?;
+                self.encode_linear(encoder, v, input, &scratch.v, tokens, scratch, false)?;
             }
-            self.encode_linear(encoder, &self.weights.o_proj, &scratch.q, output, tokens, scratch)?;
+            self.encode_linear(encoder, &self.weights.o_proj, &scratch.q, output, tokens, scratch, false)?;
             let gate = &scratch.gate;
             let up = &scratch.up;
-            self.encode_linear(encoder, &self.weights.gate_proj, input, gate, tokens, scratch)?;
-            self.encode_linear(encoder, &self.weights.up_proj, input, up, tokens, scratch)?;
-            self.encode_linear(encoder, &self.weights.down_proj, up, output, tokens, scratch)?;
+            self.encode_linear(encoder, &self.weights.gate_proj, input, gate, tokens, scratch, false)?;
+            self.encode_linear(encoder, &self.weights.up_proj, input, up, tokens, scratch, false)?;
+            self.encode_linear(encoder, &self.weights.down_proj, up, output, tokens, scratch, false)?;
             return Ok(());
         }
         let config = &self.config;
@@ -641,6 +641,10 @@ impl DecoderLayer {
             eps,
         )?;
 
+        // q, k and v all read `scratch.normed`, so transform it once and let the
+        // three matvecs share it. That was 3 of the 7 input transforms a layer
+        // issued, each a tiny dependent dispatch in front of a large one.
+        self.encode_input_transform(encoder, &self.weights.q_proj, &scratch.normed, scratch)?;
         self.encode_linear(
             encoder,
             &self.weights.q_proj,
@@ -648,6 +652,7 @@ impl DecoderLayer {
             &scratch.q,
             tokens,
             scratch,
+            true,
         )?;
         self.encode_linear(
             encoder,
@@ -656,6 +661,7 @@ impl DecoderLayer {
             &scratch.k,
             tokens,
             scratch,
+            true,
         )?;
         if let Some(v_proj) = &self.weights.v_proj {
             self.encode_linear(
@@ -665,6 +671,7 @@ impl DecoderLayer {
                 &scratch.v,
                 tokens,
                 scratch,
+                true,
             )?;
         } else {
             // Full attention reuses the raw K projection as V, before K is
@@ -823,6 +830,7 @@ impl DecoderLayer {
             &scratch.proj,
             tokens,
             scratch,
+            false,
         )?;
         self.hidden_norm(
             encoder,
@@ -848,6 +856,8 @@ impl DecoderLayer {
             eps,
         )?;
 
+        // gate and up read the same activation too.
+        self.encode_input_transform(encoder, &self.weights.gate_proj, &scratch.normed, scratch)?;
         self.encode_linear(
             encoder,
             &self.weights.gate_proj,
@@ -855,6 +865,7 @@ impl DecoderLayer {
             &scratch.gate,
             tokens,
             scratch,
+            true,
         )?;
         self.encode_linear(
             encoder,
@@ -863,6 +874,7 @@ impl DecoderLayer {
             &scratch.up,
             tokens,
             scratch,
+            true,
         )?;
         self.elements.encode_gated_gelu(
             encoder,
@@ -878,6 +890,7 @@ impl DecoderLayer {
             &scratch.proj,
             tokens,
             scratch,
+            false,
         )?;
         self.hidden_norm(
             encoder,
@@ -904,6 +917,29 @@ impl DecoderLayer {
         Ok(())
     }
 
+    /// Dispatch just the input transform for `linear`, so the matvecs that share
+    /// this activation can pass `pretransformed: true`.
+    fn encode_input_transform(
+        &self,
+        encoder: &mut MetalEncoder,
+        linear: &QuantizedLinear,
+        input: &Buffer,
+        scratch: &ForwardScratch,
+    ) -> Result<(), ModelError> {
+        let input_signs = linear.input_signs_buffer.as_ref().ok_or_else(|| {
+            ModelError::InvalidWeights("linear input signs are not resident".to_string())
+        })?;
+        self.linear
+            .encode_input_transform(
+                encoder,
+                input,
+                input_signs,
+                &scratch.transformed,
+                linear.in_features,
+            )
+            .map_err(ModelError::Kernel)
+    }
+
     fn encode_linear(
         &self,
         encoder: &mut MetalEncoder,
@@ -912,6 +948,7 @@ impl DecoderLayer {
         output: &Buffer,
         tokens: usize,
         scratch: &ForwardScratch,
+        pretransformed: bool,
     ) -> Result<(), ModelError> {
         let packed = linear.metal_buffer.as_ref().ok_or_else(|| {
             ModelError::InvalidWeights("linear has no GPU-resident weights".to_string())
@@ -939,6 +976,7 @@ impl DecoderLayer {
                     out_features: linear.out_features,
                     rate: linear.rate,
                     codebook: linear.codebook,
+                    pretransformed,
                 },
             )?;
         } else {
@@ -2102,6 +2140,7 @@ impl TextModel {
                 out_features: vocab,
                 rate: self.lm_head.rate,
                 codebook: self.lm_head.codebook,
+                pretransformed: false,
             },
         )?;
         self.elements.encode_softcap(

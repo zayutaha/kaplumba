@@ -506,3 +506,47 @@ The clearest target inside that: `encode_gemv` dispatches `input_pipeline` befor
 *every* matvec, but q/k/v share one input, and gate/up share another. That is 7
 transforms per layer where 4 suffice -- 180 redundant tiny dispatches per token.
 Hoisting those is the next thing to try.
+
+## Hoist the input transform: 7.52 -> 7.87 tok/s
+
+`encode_gemv` dispatched `input_pipeline` before *every* matvec. All projections
+share one `scratch.transformed`, so each transform overwrote the last and they
+could not be reordered -- but q/k/v all read `scratch.normed`, and gate/up both
+read `scratch.normed` too. That is 7 transforms per layer where 4 suffice, and
+each one is a tiny dispatch (in_features/128 groups of 64 threads) sitting in
+front of a large dependent one, so its latency is fully exposed.
+
+`LinearEncodeRequest` gained `pretransformed: bool`; when set, the input
+transform dispatch is skipped. `TextModel::encode_input_transform` dispatches it
+once per shared activation. Order is safe: each transform is followed by all of
+its consumers before the next transform overwrites the buffer.
+
+qkv share (1 transform), o (1), gate/up share (1), down (1) = 4 per layer,
+180 fewer dependent dispatches per token. **+4.7%.**
+
+Lesson: a scripted brace-matcher that rewrites struct initialisers ate a closing
+brace in two files and a destructuring pattern in a third. Struct-literal
+rewrites need to be done with targeted replaces, not brace counting.
+
+### Where the token goes now, measured
+
+    layer matvec   1.700 ms x 60   = 102.0 ms   (4 transforms + 7 matvecs)
+    attention (ctx 200)                        7.6 ms
+    lm_head                                   3.1 ms   (528 MB @ 168.8 GB/s)
+    norms                                    ~3.0 ms
+    other dispatches                                    ~14 ms
+                                              ----------
+    measured                                       ~127 ms   = 7.87 tok/s
+
+The residual is still dispatch latency, not bandwidth: per layer there are
+4 transforms, 7 matvecs, 1 KV cache append, 2 RoPE, 2 head RMS norms, 3 hidden
+norms, 1 gated GELU, 1 layer scale and 2 residual adds -- ~23 strictly dependent
+dispatches, x60 layers.
+
+Next candidates, in order of size:
+1. k_proj and v_proj run at ~35 GB/s on 8.4 MB matrices because N=4096 gives
+   only 256 threadgroups (12.8 per core). Fusing q/k/v into a single batched
+   matvec would give 1024 threadgroups and one transform. They are 9% of layer
+   bytes but take 14% of layer matvec time.
+2. `encode_cache_append`, RoPE and the head RMS norms are all small fixed-cost
+   dispatches that could be folded into their producers.

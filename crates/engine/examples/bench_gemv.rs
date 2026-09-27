@@ -64,7 +64,8 @@ fn main() {
                 transformed: &trans, raw: &raw, output: &outb,
                 in_features: in_f, out_features: out_f,
                 rate: Exl3Rate::Integer(bits), codebook: Exl3Codebook::Mcg,
-            }).unwrap();
+            pretransformed: false,
+        }).unwrap();
             e.commit_and_wait().unwrap();
         }
         println!("(warmed)");
@@ -122,7 +123,8 @@ fn main() {
                 transformed: &trans, raw: &raw, output: &outb,
                 in_features: in_f, out_features: out_f,
                 rate: Exl3Rate::Integer(bits), codebook: Exl3Codebook::Mcg,
-            }).unwrap();
+            pretransformed: false,
+        }).unwrap();
             e.commit_and_wait().unwrap();
         }
         // Best of several batches: the minimum is the least contaminated by
@@ -138,7 +140,8 @@ fn main() {
                     transformed: &trans, raw: &raw, output: &outb,
                     in_features: in_f, out_features: out_f,
                     rate: Exl3Rate::Integer(bits), codebook: Exl3Codebook::Mcg,
-                }).unwrap();
+            pretransformed: false,
+        }).unwrap();
             }
             enc.commit_and_wait().unwrap();
             best = best.min(t.elapsed().as_secs_f64() / iters as f64);

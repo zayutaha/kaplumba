@@ -103,6 +103,11 @@ pub struct LinearEncodeRequest<'a> {
     pub out_features: usize,
     pub rate: Exl3Rate,
     pub codebook: Exl3Codebook,
+    /// Set when `transformed` already holds this request's input transform, so
+    /// the dispatch can be hoisted out and shared by matvecs that read the same
+    /// activation. q/k/v and gate/up each share one input, which turns 7
+    /// transforms per layer into 4.
+    pub pretransformed: bool,
 }
 
 /// Fully GPU-resident multi-query (prefill) linear request.
@@ -765,6 +770,26 @@ impl LinearKernels {
     /// Nothing is committed or read back here: the caller owns the command
     /// buffer, so a full 60-layer forward can be encoded as one batch and
     /// synchronised once.
+    /// Dispatch only the input transform, so several matvecs that read the same
+    /// activation can share it instead of each recomputing it.
+    pub fn encode_input_transform(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        input: &Buffer,
+        input_signs: &Buffer,
+        transformed: &Buffer,
+        in_features: usize,
+    ) -> Result<(), KernelError> {
+        let input_blocks = to_u32(in_features / 128, "input dimension")?;
+        encoder.dispatch_1d(
+            &self.input_pipeline,
+            &[Some(input), Some(input_signs), Some(transformed)],
+            &input_blocks.to_le_bytes(),
+            u64::from(input_blocks),
+            64,
+        )
+    }
+
     pub fn encode_gemv(
         &self,
         encoder: &mut crate::encoder::MetalEncoder,
@@ -784,6 +809,7 @@ impl LinearKernels {
             out_features,
             rate,
             codebook,
+            pretransformed,
         } = request;
         validate_encode(in_features, out_features, rate, codebook)?;
         let input_blocks = to_u32(in_features / 128, "input dimension")?;
@@ -798,13 +824,15 @@ impl LinearKernels {
             queries: 1,
             perm_mode,
         };
-        encoder.dispatch_1d(
-            &self.input_pipeline,
-            &[Some(input), Some(input_signs), Some(transformed)],
-            &input_blocks.to_le_bytes(),
-            u64::from(input_blocks),
-            64,
-        )?;
+        if !pretransformed {
+            encoder.dispatch_1d(
+                &self.input_pipeline,
+                &[Some(input), Some(input_signs), Some(transformed)],
+                &input_blocks.to_le_bytes(),
+                u64::from(input_blocks),
+                64,
+            )?;
+        }
         // Integer rates go to the lane-per-thread matvec: one window setup per
         // eight codes, 256-thread groups, and enough threads to fill the GPU.
         // This is the real decode path; `gemv_buffer` routes the same way.

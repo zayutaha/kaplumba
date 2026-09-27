@@ -76,6 +76,7 @@ fn fire(kernels: &LinearKernels, e: &mut MetalEncoder, p: &Proj) {
         transformed: &p.transformed, raw: &p.raw, output: &p.output,
         in_features: p.in_f, out_features: p.out_f,
         rate: Exl3Rate::Integer(3), codebook: Exl3Codebook::Mcg,
+        pretransformed: false,
     }).unwrap();
 }
 
