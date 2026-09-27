@@ -942,7 +942,7 @@ impl LinearKernels {
             queries: to_u32(queries, "query count")?,
             perm_mode,
         };
-        // The tiled kernel accumulates across query tiles, so start clean.
+        // The tiled kernel accumulates with += across query tiles, so start clean.
         encoder.dispatch_1d(
             &self.zero_raw_pipeline,
             &[Some(raw)],

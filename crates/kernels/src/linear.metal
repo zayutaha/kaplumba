@@ -2175,6 +2175,10 @@ kernel void linear_gemv_tiled(
     uint output_index = tile_column * 16u + local_output;
     uint local_output_in_tile = local_output;
     uint loader = local_position.x + local_position.y * 16u;
+    float accumulator = 0.0f;
+    const bool active = local_query < params.queries;
+    const uint query_base = local_query * params.in_features;
+    const uint output_base = local_query * params.out_features;
     for (uint tile_row = 0; tile_row < params.in_features / 16u; ++tile_row) {
         uint local_row = loader / 16u;
         uint local_column = loader & 15u;
@@ -2190,15 +2194,16 @@ kernel void linear_gemv_tiled(
         );
         weights[local_row][local_column] = half(decode_state(state, params.codebook));
         threadgroup_barrier(mem_flags::mem_threadgroup);
-        if (local_query < params.queries) {
-            uint query_base = local_query * params.in_features;
-            uint output_base = local_query * params.out_features;
+        if (active) {
             for (uint local_input = 0; local_input < 16u; ++local_input) {
                 uint input_index = tile_row * 16u + local_input;
-                output[output_base + output_index] += float(input[query_base + input_index]) * float(weights[local_input][local_output_in_tile]);
+                accumulator += float(input[query_base + input_index]) * float(weights[local_input][local_output_in_tile]);
             }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (active) {
+        output[output_base + output_index] = accumulator;
     }
 }
 
