@@ -550,3 +550,47 @@ Next candidates, in order of size:
    bytes but take 14% of layer matvec time.
 2. `encode_cache_append`, RoPE and the head RMS norms are all small fixed-cost
    dispatches that could be folded into their producers.
+
+## The per-projection numbers in this bench are not trustworthy (2026-09-27)
+
+Before fusing q/k/v I checked whether the 35 GB/s on k/v was real, and it is
+not. `time()` divides elapsed by the iteration count, and `commit_and_wait`
+carries a **fixed 0.18-0.35 ms sync cost** on this machine. At the 10-20
+iterations the bench uses, that overhead is charged to every dispatch and is the
+same order as the entire cost of a small projection. Every per-shape figure this
+file prints is inflated by roughly that much at the small end, so they cannot be
+compared against one another.
+
+Measured directly: the marginal cost of an input-transform dispatch is ~0
+(a two-point slope across iters 1/20/100 comes out at or below zero), and the
+fixed cost is 0.18-0.35 ms. CPU-side encoding is 300 ns and is not a factor.
+
+A slope-based replacement was tried and is worse. The marginal cost is small
+enough relative to run-to-run noise that slopes disagree between consecutive
+runs -- k_proj measured 0.132 ms and 0.106 ms back to back. Reverted, and the
+caveat is now documented on `time()` so the next person does not trust the small
+projections.
+
+**What this invalidates:** the per-projection table used to pick targets. The
+"k/v at 15% of streaming because only 256 threadgroups" story was reading
+harness overhead as kernel slowness.
+
+**What survives, and it is what I have been optimising all along:** end-to-end
+decode tok/s. It is wall clock over 64 tokens with no microbenchmark artefacts,
+and every committed change was validated against it.
+
+**What is genuinely reliable**, because it is large enough to dominate its own
+overhead and reproduces every run:
+
+    lm_head  528 MB  3.13 ms  168.7 GB/s  (72% of streaming)
+
+So q/k/v fusion, which I was about to build on the strength of the bad table, is
+not justified by the evidence. The honest next step is to attribute the token
+budget by ablation -- change one thing in the model, measure end-to-end -- rather
+than by reading per-kernel numbers out of a contaminated microbenchmark.
+
+The input-transform result is a good example of why: its marginal cost in
+isolation is ~0, yet hoisting it in the model was worth a measured 5%
+(7.49 -> 7.87 tok/s, 6 ms/token) because in the model each one sits between two
+large dependent kernels and its latency is fully exposed. Isolation said "free",
+end-to-end said "6 ms". Only the second one counts.

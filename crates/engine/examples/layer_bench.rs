@@ -80,6 +80,22 @@ fn fire(kernels: &LinearKernels, e: &mut MetalEncoder, p: &Proj) {
     }).unwrap();
 }
 
+/// CAVEAT on every per-projection number this file prints.
+///
+/// `time` divides total elapsed by the iteration count, and `commit_and_wait`
+/// carries a fixed 0.18-0.35 ms sync cost on this machine. At the 10-20
+/// iterations these use, that overhead is charged to every dispatch and is
+/// comparable to the whole cost of a small projection, so the per-projection
+/// figures understate the real kernel and cannot be compared against each other
+/// at the small end. A slope-based version was tried and is worse: the marginal
+/// cost is small enough relative to the noise that two-point slopes disagree
+/// between runs (k_proj measured 0.132 ms and 0.106 ms on consecutive runs).
+///
+/// Treat the per-shape numbers here as indicative only. The trustworthy figure
+/// is end-to-end decode tok/s, which is wall clock over many tokens and has none
+/// of these artefacts. lm_head is the exception that survives, because it is
+/// large enough (3.1 ms) to dominate its own overhead and reproduces at
+/// 168-169 GB/s every run.
 fn time<F: Fn(&mut MetalEncoder)>(queue: &metal::CommandQueue, iters: u64, f: F) -> f64 {
     for _ in 0..3 { let mut e = MetalEncoder::new(queue).unwrap(); f(&mut e); e.commit_and_wait().unwrap(); }
     let mut best = f64::MAX;
@@ -113,6 +129,7 @@ fn main() {
     let queue = device.new_command_queue();
     let kernels = LinearKernels::new().expect("kernels");
 
+    bench_head(&device, &kernels, &queue);
     bench_head(&device, &kernels, &queue);
     for (label, kv, q) in [("sliding layer", KV_SLIDING, Q_SLIDING), ("full layer", KV_FULL, Q_FULL)] {
         let projs = vec![
