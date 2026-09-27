@@ -141,6 +141,12 @@ static uint permutation_index(uint linear, uint mode) {
     return linear;
 }
 
+// One big-endian 32-bit trellis word, read as two 16-bit loads so it works at any
+// 2-byte-aligned address. See the alignment note in `exl3_code_at`.
+static inline uint trellis_word(const device ushort *packed, uint index) {
+    return uint(packed[index * 2u]) | (uint(packed[index * 2u + 1u]) << 16);
+}
+
 // Read one 16-bit EXL3 code for logical (local_row, local_column) of a 16x16 tile.
 //
 // The reference producer lays the 256 codes out as eight-per-lane out of a
@@ -168,10 +174,15 @@ static uint exl3_code_at(
     uint j0 = i0 >= word_count ? i0 - word_count : i0;
     uint j1 = j0 + 1u >= word_count ? j0 + 1u - word_count : j0 + 1u;
     uint j2 = j1 + 1u >= word_count ? j1 + 1u - word_count : j1 + 1u;
-    const device uint *tile = (const device uint *)(packed + tile_index * (word_count * 2u));
-    ulong w0 = tile[j0];
-    ulong w1 = tile[j1];
-    ulong w2 = tile[j2];
+    // Combine two 16-bit loads rather than casting to `uint *`. Trellis data is
+    // not 4-byte aligned in the checkpoint (lm_head.trellis starts at offset
+    // % 4 == 2), so a `uint *` cast reads every word at the wrong address. The
+    // arena copy hid this by re-aligning the data as a side effect; mapping the
+    // file does not, which is why every zero-copy build decoded to noise.
+    uint base = tile_index * word_count;
+    ulong w0 = ulong(trellis_word(packed, base + j0));
+    ulong w1 = ulong(trellis_word(packed, base + j1));
+    ulong w2 = ulong(trellis_word(packed, base + j2));
     ulong a = ((w0 << 32) | w1) << sh | (sh ? (w2 >> (32 - sh)) : 0);
     ulong c = ((w1 << 32) | w2) << sh;
     uint r = i * ka + 16u;

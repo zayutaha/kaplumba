@@ -16,6 +16,12 @@ struct EmbeddingParams {
     hidden: u32,
     vocab: u32,
     scale: f32,
+    /// Byte offset of the embedding rows inside the bound buffer. Non-zero when
+    /// the table is offloaded, since the view is a page-aligned window over the
+    /// shard mapping and the rows do not begin at its first byte.
+    offset: u32,
+    /// Table is BF16 in the checkpoint and must be widened in the kernel.
+    bf16: u32,
 }
 
 #[repr(C)]
@@ -185,6 +191,8 @@ impl ElementKernels {
             hidden: to_u32(hidden_size, "hidden size")?,
             vocab: to_u32(vocab_size, "vocabulary size")?,
             scale,
+            offset: 0,
+            bf16: 0,
         };
         self.run(
             &self.embedding_pipeline,
@@ -229,6 +237,8 @@ impl ElementKernels {
             hidden: to_u32(hidden_size, "hidden size")?,
             vocab: to_u32(vocab_size, "vocabulary size")?,
             scale,
+            offset: 0,
+            bf16: 0,
         };
         self.run(
             &self.embedding_pipeline,
@@ -727,6 +737,8 @@ impl ElementKernels {
         hidden: usize,
         vocab: usize,
         scale: f32,
+        embedding_offset: u64,
+        embedding_is_bf16: bool,
     ) -> Result<(), KernelError> {
         if tokens == 0 || hidden == 0 || vocab == 0 || !scale.is_finite() {
             return Err(KernelError::InvalidInput(
@@ -738,6 +750,11 @@ impl ElementKernels {
             hidden: to_u32(hidden, "embedding hidden size")?,
             vocab: to_u32(vocab, "embedding vocabulary")?,
             scale,
+            offset: to_u32(
+                usize::try_from(embedding_offset).unwrap_or(u32::MAX as usize),
+                "embedding offset",
+            )?,
+            bf16: u32::from(embedding_is_bf16),
         };
         let threads = checked_product(tokens, hidden, "embedding element count")?;
         encoder.dispatch_1d(

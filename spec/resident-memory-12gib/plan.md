@@ -1,31 +1,50 @@
 # Plan: resident memory 15.1 GiB to 12 GiB
 
-## Current state (as of commit `78b3198`)
+## Current state (as of commit `78b3198` + uncommitted working-tree changes)
 
-Already done and committed:
+Already done and committed (all in `78b3198`):
 
 - Model is coherent; `phys_footprint` measured at 15.12 GiB.
-- Vision excluded: `is_vision_tensor_name` filters
-  `model.vision_tower.*` and `model.embed_vision.*`. Verified against the full
-  2422-tensor index: 356 tensors / 1.151 GB filtered, **0 vision-named tensors
-  leak into the text set**.
+- Vision excluded: `is_vision_tensor_name` in `crates/engine/src/safetensors.rs`
+  filters `model.vision_tower.*` and `model.embed_vision.*`. Verified against
+  the full 2422-tensor index: 356 tensors / 1.151 GB filtered, **0
+  vision-named tensors leak into the text set**.
 - Layer trellis bound from the arena (`load_internal` `skip_copy` logic), which
   fixed both coherence and the 3.9 GiB swap thrash.
 - `GpuKvCache::ensure_capacity`: full-attention caches start at 512 and double on
   demand. KV 1.41 -> 0.82 GiB.
 - `tests/memory_proof.rs` measures `phys_footprint` via `/usr/bin/time -l` and
   cross-checks the engine's allocation breakdown.
-- `exl3_code_at` alignment fix in `linear.metal` (two 16-bit loads instead of a
-  `uint *` cast). Committed in the working tree, suite green.
+- `metrics.rs`: `measure_rss()` exists and is documented as `ru_maxrss`-only;
+  `measure_footprint_note()` directs callers to `/usr/bin/time -l`. The
+  `RunMetrics.peak_rss_bytes` field is correctly labeled `ru_maxrss`, not
+  presented as total memory.
 
-In progress, uncommitted, building cleanly:
+Uncommitted, in the working tree, building cleanly (5 files modified):
 
-- `EmbeddingParams.offset` plumbed through `elements.metal`,
-  `encode_embedding_scaled`, and `TextModel::embedding_offset`.
-- `TextModel::from_metal_parts_with_len` so vocabulary size derives from the
-  tensor length rather than the page-aligned window length.
-- `load_internal` offload set = `embed_tokens.weight` + `lm_head.*`, gated on
-  `KAPLUMBA_OFFLOAD_LARGE`.
+- **`crates/kernels/src/linear.metal`**: `trellis_word` helper; `exl3_code_at`
+  uses two 16-bit loads instead of `uint *` cast. Alignment fix is complete.
+- **`crates/kernels/src/elements.metal`**: `EmbeddingParams.offset` field added;
+  both `embedding_scaled` and `embedding_scaled_buffer` apply it. Complete.
+- **`crates/kernels/src/elements.rs`**: `encode_embedding_scaled(.., embedding_offset: u64)` added. Complete.
+- **`crates/engine/src/model.rs`**:
+  - `TextModel.embedding_offset: u64` field exists.
+  - `from_metal_parts_with_len` exists and derives vocab size from the
+    caller-provided `embedding_bytes` (not the buffer length). Complete.
+  - **INCOMPLETE**: `finish_construction` hardcodes `embedding_offset: 0`
+    (line 1355). `from_metal_parts_with_len` does not accept an offset
+    parameter, so even though `load_from_dir` calls
+    `zero_copy_tensor_buffer(EMBED_NAME)` which returns `(buffer, offset)`,
+    the offset is **discarded** (`_offset` on line 1467). The offset is never
+    threaded into the `TextModel` struct. This must be fixed before T5 is done.
+  - Both the GPU path (`forward_buffer_inner` line 1720) and the CPU path
+    (`embedding()` line 1884) read `self.embedding_offset`, so once the
+    constructor sets it correctly, both paths will apply it.
+- **`crates/engine/src/weights.rs`**: `KAPLUMBA_OFFLOAD_LARGE` env var gates
+  the offload set (`embed_tokens.weight` + `lm_head.*`). `skip_copy` logic
+  skips the arena allocation for offloaded tensors. `no_copy_view` returns
+  a page-aligned buffer + byte offset. `zero_copy_tensor_buffer` is the
+  public API. Logic appears complete.
 
 ## Data flow
 
@@ -63,28 +82,34 @@ is what makes it correct.
 
 | File | Change | Status |
 |---|---|---|
-| `crates/kernels/src/linear.metal` | `trellis_word` helper; `exl3_code_at` uses it | done |
-| `crates/kernels/src/elements.metal` | `EmbeddingParams.offset`; both embedding kernels apply it | done |
-| `crates/kernels/src/elements.rs` | `encode_embedding_scaled(.., embedding_offset)` | done |
-| `crates/engine/src/model.rs` | `embedding_offset` field; `from_metal_parts_with_len`; offload-aware binding | done |
-| `crates/engine/src/weights.rs` | offload set + `skip_copy` | done |
+| `crates/kernels/src/linear.metal` | `trellis_word` helper; `exl3_code_at` uses it | done (uncommitted) |
+| `crates/kernels/src/elements.metal` | `EmbeddingParams.offset`; both embedding kernels apply it | done (uncommitted) |
+| `crates/kernels/src/elements.rs` | `encode_embedding_scaled(.., embedding_offset)` | done (uncommitted) |
+| `crates/engine/src/model.rs` | `embedding_offset` field; `from_metal_parts_with_len`; offload-aware binding | **partial** — offset not threaded from `load_from_dir` into `finish_construction` |
+| `crates/engine/src/weights.rs` | offload set + `skip_copy` + `zero_copy_tensor_buffer` | done (uncommitted) |
 | `crates/engine/src/gpu_cache.rs` | `ensure_capacity` (KV) | done, committed |
 | `crates/engine/tests/memory_proof.rs` | footprint assertion | done, committed |
-| `crates/engine/tests/exl3_format.rs` | new test: layer trellis is not zero-copy (R3) | **todo** |
-| `crates/engine/tests/real_forward_buffer.rs` | before/after output comparison (R6) | **todo** |
+| `crates/engine/tests/memory_proof.rs` or new test | R3: layer trellis is not zero-copy | **todo** |
+| `crates/engine/tests/real_forward_buffer.rs` | R6: before/after output comparison | **todo** — file exists with correctness probes but no fixed-output comparison |
 
 ## Sequencing
 
-1. Verify the current uncommitted work builds and the suite is green. (in progress)
-2. Run with offload **off**; record footprint + output as the baseline.
-3. Run with `KAPLUMBA_OFFLOAD_LARGE=1`; confirm output is byte-identical and
+1. **Fix T5**: Thread the embedding offset from `zero_copy_tensor_buffer`
+   through `from_metal_parts_with_len` → `finish_construction` → set
+   `self.embedding_offset`. Stop discarding `_offset` in `load_from_dir`.
+2. Verify the full uncommitted work builds and the suite is green.
+3. Run with offload **off**; record footprint + output as the baseline.
+4. Run with `KAPLUMBA_OFFLOAD_LARGE=1`; confirm output is byte-identical and
    footprint drops to ~11.2 GiB.
-4. Watch swap over a sustained run (R4 / open question).
-5. Add the R3 regression test and the R6 output-comparison test.
-6. Flip the default to offload-on once step 3-4 pass; keep the env var to force
+5. Watch swap over a sustained run (R4 / open question).
+6. Add the R3 regression test and the R6 output-comparison test.
+7. Flip the default to offload-on once step 4-5 pass; keep the env var to force
    resident.
-7. Update `metrics.rs` doc so no code path reports `ru_maxrss` as total memory (R5).
-8. Update `tasks.md` + `implementation_notes.md`, commit.
+8. Update `metrics.rs` doc so no code path reports `ru_maxrss` as total memory
+   (R5). **Status**: already mostly done — `RunMetrics.peak_rss_bytes` is
+   documented as `ru_maxrss` only, `measure_footprint_note()` points to
+   `/usr/bin/time -l`. Just need to audit CLI output formatting.
+9. Update `tasks.md` + `implementation_notes.md`, commit.
 
 ## Risks and fallbacks
 
@@ -95,8 +120,8 @@ is what makes it correct.
 - **Kernel slowdown from two 16-bit loads.** The alignment fix replaces one
   32-bit load with two 16-bit loads on the hot path. Adjacent 16-bit loads
   normally coalesce, but this must be measured against the pre-fix decode rate
-  (currently ~1.5 tok/s) and reverted to a `uint *` fast path if the arena is
-  detected to be 4-byte aligned.
+  and reverted to a `uint *` fast path if the arena is detected to be 4-byte
+  aligned.
 - **Silent wrongness.** If an offset is dropped, output degrades to noise rather
   than erroring. R6's byte-identical comparison is the guard; it must run in CI
   or at least be run before flipping any default.

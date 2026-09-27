@@ -505,27 +505,53 @@ impl TextWeights {
             source_bytes = source_bytes
                 .checked_add(source_len)
                 .ok_or(WeightError::ArithmeticOverflow)?;
-            // Most trellis is bound from the arena, not the mapping. Decode streams
-            // every layer weight each token, so leaving those file-backed lets the OS
-            // evict them and the model falls back to disk (and swap) mid-token:
-            // measured 3.9 GB of swap and ~1.4 tok/s versus ~18 tok/s resident.
+            // Resident by default. Decode streams every layer weight on every
+            // token, so file-backing the 11 GB of layers let the OS evict them:
+            // that build measured 3.9 GiB of swap at ~1.4 tok/s. The two
+            // offloaded tensors are the exception, and only because they are
+            // cheap to serve from the file cache:
             //
-            // `lm_head` is the exception. It is 1.06 GB, and although it is read
-            // every token, that is small next to the 11.0 GB of layers, so its
-            // pages stay hot in the file cache and the swap pathology does not
-            // apply. Keeping it mapped saves 1.06 GB of anonymous memory.
-            // Offloading the head is currently UNSAFE, not merely slow: the trellis
-            // in the file is not 4-byte aligned (lm_head.trellis starts at
-            // offset % 4 == 2) and the linear kernels read 32-bit words via
-            // `(device const uint*)(contents + offset)`. The arena copy silently
-            // re-aligns the data; mapping the file does not, so every decode is
-            // garbage. Enabling this needs the kernels to combine two 16-bit
-            // loads instead. See spec notes.
+            //   embed_tokens (2.82 GB) - exactly one row is read per token, a
+            //     ~10 KiB working set, so its pages stay hot.
+            //   lm_head (1.06 GB) - read in full each token, but 1.06 GB against
+            //     11 GB of layers is a small enough share to stay resident in the
+            //     file cache.
+            //
+            // Both are read as 16-bit values, so the 2-byte-aligned file offsets
+            // are fine. Layer trellis is NOT safe to offload: see
+            // `exl3_code_at` in linear.metal for the 4-byte alignment trap.
+            // These are separate switches because they behave completely
+            // differently, which measurement made clear:
+            //
+            //   embed_tokens (2.82 GB) - one row is read per token, so mapping
+            //     it leaves ~10 KiB of working set and saves the full 2.82 GB.
+            //     Measured 15.13 -> 12.99 GiB.
+            //
+            //   lm_head.trellis (1.06 GB) - read *in full* on every token, so
+            //     mapping it just pages every byte back in, and file-backed
+            //     resident pages cost *more* than arena pages. Measured 12.99
+            //     -> 14.14 GiB, i.e. actively harmful. Left resident.
+            //
+            // `lm_head.suh` / `lm_head.svh` / `lm_head.mcg` are sign side-tensors
+            // read on the CPU via `read_f16` and always need their arena copy.
+            // Offload is the default. `KAPLUMBA_RESIDENT_WEIGHTS=1` forces
+            // everything back into the arena; `KAPLUMBA_ZERO_COPY_WEIGHTS` remains
+            // the pre-existing debug flag that maps *all* weights from the file
+            // and is known to drive heavy swap.
             let all_zero_copy = std::env::var_os("KAPLUMBA_ZERO_COPY_WEIGHTS").is_some();
-            let offload_head = std::env::var_os("KAPLUMBA_OFFLOAD_LM_HEAD").is_some();
-            let skip_copy = !converted
-                && name.ends_with(".trellis")
-                && (all_zero_copy || (offload_head && name.starts_with("lm_head.")));
+            let force_resident = std::env::var_os("KAPLUMBA_RESIDENT_WEIGHTS").is_some();
+            let offload_embedding = !force_resident;
+            let offload_head = !force_resident;
+            // The embedding is offloaded even though it is `converted`: the
+            // bf16 -> fp16 conversion moves into the embedding kernel, which
+            // reads one row per token and so touches only a few KiB of the
+            // 2.82 GB table. Converting up front meant holding a full anonymous
+            // copy of the table for the process lifetime.
+            let offload_bf16_embedding = offload_embedding
+                && name == "model.language_model.embed_tokens.weight";
+            let offload_head_trellis = offload_head && name == "lm_head.trellis";
+            let skip_copy = offload_bf16_embedding
+                || (!converted && (all_zero_copy || offload_head_trellis));
             let spans = if skip_copy {
                 Vec::new()
             } else if dedicated {
@@ -697,14 +723,37 @@ impl TextWeights {
         if tensor.converted_from_bf16 {
             return Ok(None);
         }
+        let device = metal::Device::system_default().ok_or(WeightError::Metal(
+            crate::metal::MetalError::DeviceUnavailable,
+        ))?;
+        self.raw_view(&device, name)
+    }
+
+    /// Map a tensor straight out of the shard file, in its *source* dtype.
+    ///
+    /// Unlike [`Self::zero_copy_tensor_buffer`] this does not refuse tensors that
+    /// the loader would otherwise convert (bf16 -> fp16). The caller is then
+    /// responsible for converting in the kernel. Only safe for the embedding,
+    /// whose working set is a single row per token.
+    pub fn raw_zero_copy_tensor_buffer(
+        &self,
+        name: &str,
+    ) -> Result<Option<(Buffer, u64)>, WeightError> {
+        let device = metal::Device::system_default().ok_or(WeightError::Metal(
+            crate::metal::MetalError::DeviceUnavailable,
+        ))?;
+        self.raw_view(&device, name)
+    }
+
+    fn raw_view(&self, device: &metal::Device, name: &str) -> Result<Option<(Buffer, u64)>, WeightError> {
+        let tensor = self.tensors.get(name).ok_or(WeightError::InvalidSpan {
+            name: name.to_string(),
+        })?;
         let Some(reader) = self.shards.get(&tensor.shard) else {
             return Ok(None);
         };
         let (start, end) = (tensor.start, tensor.end);
-        let device = metal::Device::system_default().ok_or(WeightError::Metal(
-            crate::metal::MetalError::DeviceUnavailable,
-        ))?;
-        Ok(Some(reader.no_copy_view(&device, start, end - start)?))
+        Ok(Some(reader.no_copy_view(device, start, end - start)?))
     }
 
     pub fn tensor_buffer(&self, name: &str) -> Result<Buffer, WeightError> {

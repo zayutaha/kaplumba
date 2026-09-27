@@ -6,6 +6,18 @@ struct EmbeddingParams {
     uint hidden;
     uint vocab;
     float scale;
+    // Byte offset of the embedding rows inside the bound buffer. Non-zero when
+    // the table is offloaded: the view is page-aligned *downward*, so the rows do
+    // not begin at its first byte. Expressed in bytes and always odd or even as
+    // the file dictates: `embed_tokens` begins at shard offset 133127, giving a
+    // window offset of 2055, which is not even 2-byte aligned. Dividing by two to
+    // get an element index silently truncates and reads garbage.
+    uint offset;
+    // When set, the table is BF16 as stored in the checkpoint and must be
+    // widened to fp16 here. Doing the conversion per element lets the 2.82 GB
+    // table stay mapped instead of being copied into the arena, because only one
+    // row per token is ever read.
+    uint bf16;
 };
 
 struct NormParams {
@@ -42,6 +54,12 @@ static float gelu_tanh_value(float value) {
     return 0.5f * value * (1.0f + tanh(argument));
 }
 
+// BF16 -> FP16. A bf16 is the top half of an fp32, so widening is exact and the
+// narrowing back to fp16 rounds exactly as a load-time conversion would.
+static inline half bf16_to_half(ushort raw) {
+    return half(as_type<float>(uint(raw) << 16));
+}
+
 kernel void embedding_scaled(
     const device uint *tokens_data [[buffer(0)]],
     const device half *embedding [[buffer(1)]],
@@ -57,7 +75,18 @@ kernel void embedding_scaled(
     if (token_id >= params.vocab) {
         return;
     }
-    output[gid] = half(float(embedding[token_id * params.hidden + column]) * params.scale);
+    float value;
+    if (params.bf16 != 0u) {
+        // Offloaded BF16: read the raw bytes so an odd window offset is safe.
+        const device uchar *raw = (const device uchar *)embedding;
+        uint at = params.offset + (token_id * params.hidden + column) * 2u;
+        ushort bits = ushort(raw[at]) | (ushort(raw[at + 1u]) << 8);
+        value = float(bf16_to_half(bits));
+    } else {
+        // Arena copy: already FP16 at a 2-byte-aligned base, offset in elements.
+        value = float(embedding[params.offset / 2u + token_id * params.hidden + column]);
+    }
+    output[gid] = half(value * params.scale);
 }
 
 kernel void rms_norm_weighted(
@@ -242,7 +271,18 @@ kernel void embedding_scaled_buffer(
     if (token_id >= params.vocab) {
         return;
     }
-    output[gid] = half(float(embedding[token_id * params.hidden + column]) * params.scale);
+    float value;
+    if (params.bf16 != 0u) {
+        // Offloaded BF16: read the raw bytes so an odd window offset is safe.
+        const device uchar *raw = (const device uchar *)embedding;
+        uint at = params.offset + (token_id * params.hidden + column) * 2u;
+        ushort bits = ushort(raw[at]) | (ushort(raw[at + 1u]) << 8);
+        value = float(bf16_to_half(bits));
+    } else {
+        // Arena copy: already FP16 at a 2-byte-aligned base, offset in elements.
+        value = float(embedding[params.offset / 2u + token_id * params.hidden + column]);
+    }
+    output[gid] = half(value * params.scale);
 }
 
 // Copies the final row of a [rows, width] activation into a [width] buffer so

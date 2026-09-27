@@ -21,8 +21,7 @@ breakdown:
 |---|---:|---:|---|---|
 | `model.language_model.layers.*` | 11.000 GB | 2060 | yes | **no** (see R3) |
 | `model.language_model.embed_tokens.weight` | 2.819 GB | 1 | yes | **yes** |
-| `model.vision_tower.*` | 1.139 GB | 353 | **no** (already excluded) | n/a |
-| `model.embed_vision.embedding_projection` | 0.012 GB | 1 | **no** (already excluded) | n/a |
+| `model.vision_tower.*` + `model.embed_vision.*` | 1.151 GB | 356 | **no** (already excluded) | n/a |
 | `lm_head.*` | 1.057 GB | 4 | yes | **yes** |
 | `model.language_model.norm` | ~0 GB | 1 | yes | no |
 
@@ -66,17 +65,19 @@ incoherent output, and the cause was not obvious:
 
 This has been fixed: the kernel now combines two 16-bit loads
 (`trellis_word`) instead of casting to `uint *`. That fix is a prerequisite for
-this spec and is already committed.
+this spec and is already in the working tree (uncommitted).
 
 ## Requirements
 
 - **R1** `embed_tokens` and `lm_head` are bound from the shard mapping and are
   not copied into the resident arena when offload is enabled.
-- **R2** The embedding view is page-aligned, so its byte offset is non-zero.
-  Both the GPU kernel (`embedding_scaled`, `embedding_scaled_buffer`) and the
-  CPU path (`TextModel::embedding`) must apply that offset. The vocabulary size
-  must be derived from the tensor's true byte length, never from the
-  page-aligned window length.
+- **R2** The embedding view is page-aligned *downward*, so the Metal buffer
+  starts at a page boundary before the tensor and the tensor's byte offset
+  *within* the buffer is non-zero. Both the GPU kernel (`embedding_scaled`,
+  `embedding_scaled_buffer` via `EmbeddingParams.offset`) and the CPU path
+  (`TextModel::embedding`) must apply that offset. The vocabulary size must be
+  derived from the tensor's true byte length, never from the page-aligned
+  window length.
 - **R3** The 11.000 GB of layer trellis stays resident. Offloading it is
   measurably catastrophic (3.9 GiB swap, ~1.4 tok/s) because every byte is
   streamed on every token. This must be asserted by a test, not just a comment.

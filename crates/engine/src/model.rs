@@ -1251,6 +1251,11 @@ impl ForwardScratch {
 pub struct TextModel {
     embedding: Vec<u16>,
     embedding_buffer: Option<Buffer>,
+    /// Byte offset of the embedding rows within `embedding_buffer`.
+    embedding_offset: u64,
+    /// `embedding_buffer` holds raw BF16 exactly as stored in the checkpoint, so
+    /// the embedding kernel must widen it. True when the table is offloaded.
+    embedding_is_bf16: bool,
     vocab_size: usize,
     hidden_size: usize,
     layers: Vec<DecoderLayer>,
@@ -1311,6 +1316,8 @@ impl TextModel {
         Self::finish_construction(
             embedding,
             None,
+            0,
+            false,
             vocab_size,
             hidden_size,
             layers,
@@ -1327,6 +1334,8 @@ impl TextModel {
     fn finish_construction(
         embedding: Vec<u16>,
         embedding_buffer: Option<Buffer>,
+        embedding_offset: u64,
+        embedding_is_bf16: bool,
         vocab_size: usize,
         hidden_size: usize,
         layers: Vec<DecoderLayer>,
@@ -1350,6 +1359,8 @@ impl TextModel {
         Ok(Self {
             embedding,
             embedding_buffer,
+            embedding_offset,
+            embedding_is_bf16,
             vocab_size,
             hidden_size,
             layers,
@@ -1366,8 +1377,35 @@ impl TextModel {
         })
     }
 
+    /// Convenience wrapper for callers that pass an exactly-sized buffer.
     pub fn from_metal_parts(
         embedding_buffer: Buffer,
+        layers: Vec<DecoderLayer>,
+        final_norm: Vec<u16>,
+        lm_head: QuantizedLinear,
+        final_softcap: f32,
+        checkpoint_weights: Option<TextWeights>,
+    ) -> Result<Self, ModelError> {
+        let bytes = embedding_buffer.length();
+        Self::from_metal_parts_with_len(
+            embedding_buffer,
+            bytes,
+            0,
+            false,
+            layers,
+            final_norm,
+            lm_head,
+            final_softcap,
+            checkpoint_weights,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_metal_parts_with_len(
+        embedding_buffer: Buffer,
+        embedding_bytes: u64,
+        embedding_offset: u64,
+        embedding_is_bf16: bool,
         layers: Vec<DecoderLayer>,
         final_norm: Vec<u16>,
         lm_head: QuantizedLinear,
@@ -1380,7 +1418,10 @@ impl TextModel {
             ));
         }
         let hidden_size = layers[0].config.hidden_size;
-        let embedding_bytes = usize::try_from(embedding_buffer.length())
+        // Use the caller's length, not the buffer's: an offloaded embedding is a
+        // page-aligned window over the shard mapping and is therefore longer than
+        // the tensor, which would inflate the derived vocabulary size.
+        let embedding_bytes = usize::try_from(embedding_bytes)
             .map_err(|_| ModelError::InvalidConfig("embedding buffer is too large".to_string()))?;
         let embedding_elements = embedding_bytes
             .checked_div(2)
@@ -1402,6 +1443,8 @@ impl TextModel {
         Self::finish_construction(
             Vec::new(),
             Some(embedding_buffer),
+            embedding_offset,
+            embedding_is_bf16,
             vocab_size,
             hidden_size,
             layers,
@@ -1426,7 +1469,25 @@ impl TextModel {
             context,
             DEFAULT_RESIDENT_LIMIT_BYTES,
         )?;
-        let embedding_buffer = weights.tensor_buffer("model.language_model.embed_tokens.weight")?;
+        // The embedding is offloaded when the loader mapped it instead of copying
+        // it, in which case the view is a page-aligned window and its length
+        // exceeds the tensor, so the real byte length is passed separately.
+        const EMBED_NAME: &str = "model.language_model.embed_tokens.weight";
+        let embedding_bytes = weights
+            .tensors()
+            .get(EMBED_NAME)
+            .map_or(0, |tensor| tensor.end - tensor.start);
+        // `no_copy_view` page-aligns downward, so the tensor's rows start at a
+        // non-zero offset inside the returned window. That offset has to reach
+        // both the GPU kernel and the CPU reader, or every embedding row is read
+        // from the wrong place.
+        // Prefer a raw BF16 view so the 2.82 GB table stays mapped rather than
+        // copied; the kernel widens each element as it reads it.
+        let (embedding_buffer, embedding_offset, embedding_is_bf16) =
+            match weights.raw_zero_copy_tensor_buffer(EMBED_NAME)? {
+                Some((buffer, offset)) => (buffer, offset, true),
+                None => (weights.tensor_buffer(EMBED_NAME)?, 0, false),
+            };
         let mut layers = Vec::with_capacity(metadata.config.num_hidden_layers);
         for index in 0..metadata.config.num_hidden_layers {
             let full = metadata.config.layer_types[index].is_full();
@@ -1564,8 +1625,11 @@ impl TextModel {
             Exl3Rate::Integer(6),
             Exl3Codebook::Mcg,
         )?;
-        let model = Self::from_metal_parts(
+        let model = Self::from_metal_parts_with_len(
             embedding_buffer,
+            embedding_bytes,
+            embedding_offset,
+            embedding_is_bf16,
             layers,
             final_norm,
             lm_head,
@@ -1676,6 +1740,8 @@ impl TextModel {
             hidden,
             vocab,
             scale,
+            self.embedding_offset,
+            self.embedding_is_bf16,
         )?;
 
         let layers = self.layers.len();
@@ -1838,7 +1904,9 @@ impl TextModel {
     pub fn embedding(&self, token_ids: &[u32]) -> Vec<u16> {
         let mut output = vec![0_u16; token_ids.len() * self.hidden_size];
         let source_ptr: *const u16 = if let Some(buffer) = &self.embedding_buffer {
-            buffer.contents() as *const u16
+            unsafe {
+                (buffer.contents() as *const u16).add(self.embedding_offset as usize / 2)
+            }
         } else {
             self.embedding.as_ptr()
         };
