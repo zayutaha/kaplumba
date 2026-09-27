@@ -22,6 +22,17 @@ that must be known before T3 is built.
 - [ ] **T0.2** Report achieved TFLOPS and compare against the SIMT `alu_peak`
       numbers. State plainly in `implementation_notes.md` whether 11.5 TFLOPS is
       comfortably inside the tensor envelope.
+- [ ] **T0.3 — GATING. Can a tensor-core multiply be bit-exact against the
+      current prefill path?** Bit-exactness is a hard requirement (R9), and
+      scalar fp32 tops out at 8.76 TFLOPS = 152 tok/s, short of 200. So the
+      target is only reachable if `simdgroup_multiply` can reproduce the current
+      accumulation order bit-for-bit. Establish the current prefill kernel's
+      exact summation order from the source, then test `simdgroup_float8x8`
+      against it on a case with a known answer. Report one of:
+        * bit-exact  -> the design proceeds, R9 satisfied
+        * not exact  -> 200 tok/s and bit-exactness are mutually exclusive here,
+          which is a decision for the user, not an engineering problem
+      **Do not begin T3 before this is answered.**
 - **Files:** `crates/engine/examples/metal_probe.rs`
 - **Test:** the printed TFLOPS figure; cross-checked by making the loop
   arithmetic-only and confirming it is compute-bound (doubling the tile count
@@ -143,7 +154,10 @@ there is an unresolved conflict (OQ1) that this task is meant to surface.
 ## Sequencing
 
 ```
-T0 ──► (decides whether T3 is worth building at all)
+T0 ──► T0.3 gates everything: bit-exactness vs the tensor path
+     ├─ bit-exact ──► T3/T4 proceed
+     └─ not exact ──► stop; 200 tok/s conflicts with R9, escalate
+
 T1 ──► T3, T4          (T1 says which of T3/T4 matters more)
 T2 ──► T3, T4          (layout must be right before it is built on)
 T3, T4 ──► T5 ──► T6
