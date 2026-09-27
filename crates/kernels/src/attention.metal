@@ -191,3 +191,119 @@ kernel void attention_combine(
     }
     output[head * params.head_dim + dimension] = half(accumulator);
 }
+
+// Decode attention, one threadgroup per (key, kv_head). The previous mapping put
+// key_index on the lane, but keys are stored [key][kv_head][head_dim], so
+// neighbouring lanes landed `kv_heads * head_dim` elements apart and every warp
+// fetch touched 32 distinct sectors to deliver 64 useful bytes. Here the lane
+// owns a dimension instead, so the key row is read once, fully coalesced, and
+// the threadgroup reduces the dot products.
+kernel void attention_scores_coalesced(
+    const device half *queries [[buffer(0)]],
+    const device half *keys [[buffer(1)]],
+    const device uint *query_positions [[buffer(2)]],
+    const device uint *key_positions [[buffer(3)]],
+    device float *scores [[buffer(4)]],
+    constant AttentionParams &params [[buffer(5)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint gt [[threadgroup_position_in_grid]]) {
+    const uint kv_heads = params.kv_heads;
+    const uint key_index = gt / kv_heads;
+    const uint key_head = gt - key_index * kv_heads;
+    const uint ratio = params.q_heads / kv_heads;
+    const uint q_head = key_head * ratio;
+
+    const uint query_position = query_positions[0];
+    const uint key_position = key_positions[key_index];
+    bool live = key_position <= query_position;
+    if (live && params.window != 0u && query_position - key_position >= params.window) {
+        live = false;
+    }
+    if (!live) {
+        if (tid < ratio) {
+            scores[(q_head + tid) * params.key_count + key_index] = -3.402823466e38f;
+        }
+        return;
+    }
+
+    const uint key_base = (key_index * kv_heads + key_head) * params.head_dim;
+    const uint query_base = q_head * params.head_dim;
+    // Each q head sharing this kv head has its own query vector, so the key is
+    // read once and dotted against all of them. `ratio` is 2 on the sliding
+    // layers and 8 on the global ones.
+    float partial[8];
+    for (uint r = 0; r < ratio; ++r) {
+        partial[r] = 0.0f;
+    }
+    for (uint d = tid; d < params.head_dim; d += 256u) {
+        const float k = float(keys[key_base + d]);
+        for (uint r = 0; r < ratio; ++r) {
+            partial[r] += float(queries[query_base + r * params.head_dim + d]) * k;
+        }
+    }
+
+    threadgroup float partials[8][256];
+    for (uint r = 0; r < ratio; ++r) {
+        partials[r][tid] = partial[r];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (tid == 0u) {
+        for (uint r = 0; r < ratio; ++r) {
+            float total = 0.0f;
+            for (uint t = 0; t < 256u; ++t) {
+                total += partials[r][t];
+            }
+            scores[(q_head + r) * params.key_count + key_index] = total * params.scale;
+        }
+    }
+}
+
+// One threadgroup per query head. The previous version dispatched a single
+// thread per head -- 32 threads for the whole GPU -- and each walked key_count
+// scores twice.
+kernel void attention_row_reduce_coalesced(
+    const device float *scores [[buffer(0)]],
+    device float *row_max [[buffer(1)]],
+    device float *row_sum [[buffer(2)]],
+    constant AttentionParams &params [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint head [[threadgroup_position_in_grid]]) {
+    if (head >= params.q_heads) {
+        return;
+    }
+    const device float *row = scores + head * params.key_count;
+    float maximum = -3.402823466e38f;
+    for (uint k = tid; k < params.key_count; k += 256u) {
+        maximum = max(maximum, row[k]);
+    }
+    threadgroup float shared_max[256];
+    shared_max[tid] = maximum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float all_max = shared_max[0];
+    if (tid == 0u) {
+        row_max[head] = all_max;
+    }
+
+    float total = 0.0f;
+    for (uint k = tid; k < params.key_count; k += 256u) {
+        total += exp(row[k] - all_max);
+    }
+    threadgroup float shared_sum[256];
+    shared_sum[tid] = total;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128u; stride > 0u; stride >>= 1) {
+        if (tid < stride) {
+            shared_sum[tid] += shared_sum[tid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (tid == 0u) {
+        row_sum[head] = shared_sum[0];
+    }
+}

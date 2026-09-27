@@ -440,3 +440,69 @@ The highest-value remaining work is therefore *not* the matvec. It is the 24.5 m
 of non-matvec time, where lm_head at 63 GB/s and attention at 13 ms for 960 KB
 are both far off what the hardware should do. Cutting that to ~5 ms is worth more
 than every matvec idea above combined, because it comes straight off the budget.
+
+## Attention: coalesced mapping, and the head was never the problem (2026-09-27)
+
+### Attention decode, 7.44 -> 7.52 tok/s
+
+`attention_scores` put `key_index` on the lane. But keys are stored
+`[key][kv_head][head_dim]`, so consecutive lanes landed `kv_heads * head_dim`
+elements apart -- with kv_heads=16 and head_dim=256 that is 8192 elements, and
+every warp fetch touched 32 distinct sectors to deliver 64 useful bytes. The
+whole 3.2 MB key read was running at a fraction of its coalesced rate.
+
+New mapping: one threadgroup per (key, kv_head), 256 threads, lane owns a
+dimension. The key row is read once, fully coalesced, and the threadgroup reduces
+the dot products. Each q head sharing a kv head has its *own* query vector, so
+the key is dotted against all `ratio` of them separately -- ratio is 2 on the
+sliding layers and 8 on the global ones. Getting that wrong the first time
+produced garbled output ("The capital of France is a city."), which is how it was
+caught.
+
+`attention_row_reduce` dispatched **one thread per head -- 32 threads for the
+whole GPU** -- and each walked key_count scores twice. Now one threadgroup per
+head with a tree reduction.
+
+### Two notes that were simply wrong, now measured
+
+**lm_head is not slow.** The "8.5 ms, 63 GB/s" figure in earlier notes was never
+measured. Measured directly at 5376 -> 262144:
+
+    lm_head  528 MB  3.130 ms  168.8 GB/s  (72% of streaming)
+
+It is *faster* than the layer matvecs (125 GB/s), because at 16384 threadgroups
+it saturates in a way the 256-threadgroup k/v projections never do. 3.1 ms, not
+8.5.
+
+**Attention is 7.6 ms, not 13.** Measured by varying context length rather than
+assumed:
+
+    ctx    6   24   96  192   (decode tok/s)
+          7.75 7.69 7.57 7.31  ->  129.1 .. 136.7 ms/token
+
+    +7.6 ms over 186 extra positions => ~41 us per context position
+
+So at a 200-token context attention is 7.6 ms, and the context-independent floor
+is ~128 ms.
+
+### The budget, corrected
+
+    layer matvec   1.700 ms x 60  = 102.0 ms   (incl. the 7 input transforms)
+    attention (ctx 200)                       7.6 ms
+    lm_head                                  3.1 ms
+    norms                                    ~3.0 ms
+                                          ----------
+                                           115.7 ms
+    measured at ctx 200                      136.7 ms
+    unexplained                              ~21 ms
+
+That ~21 ms is now the single biggest item, and it is not bandwidth. The model
+issues ~840 strictly *dependent* dispatches per token (7 matvecs + 7 input
+transforms + 3 attention + KV scatter + 3 norms per layer, x60). Their latencies
+cannot overlap because each depends on the last. 21 ms / 840 = ~25 us of exposed
+latency per dispatch.
+
+The clearest target inside that: `encode_gemv` dispatches `input_pipeline` before
+*every* matvec, but q/k/v share one input, and gate/up share another. That is 7
+transforms per layer where 4 suffice -- 180 redundant tiny dispatches per token.
+Hoisting those is the next thing to try.

@@ -92,11 +92,27 @@ fn time<F: Fn(&mut MetalEncoder)>(queue: &metal::CommandQueue, iters: u64, f: F)
     best
 }
 
+/// The lm_head is the same kernel at a very different shape: 5376 -> 262144,
+/// 536 MB, 4.7% of the bytes but a fixed 8.5 ms of the token in earlier notes.
+/// Measuring it directly is the only way to know whether that is real.
+fn bench_head(device: &Device, kernels: &LinearKernels, queue: &metal::CommandQueue) {
+    const VOCAB: usize = 262144;
+    let head = build(device, "lm_head", HIDDEN, VOCAB, 909);
+    let s = time(queue, 10, |e| fire(kernels, e, &head));
+    println!(
+        "\nlm_head: {} MB, {:.3} ms, {:.1} GB/s ({:.0}% of 235 GB/s streaming)",
+        head.bytes as f64 / 1e6, s * 1e3, head.bytes as f64 / s / 1e9,
+        head.bytes as f64 / s / 235e9 * 100.0
+    );
+    println!("   ideal at 125 GB/s (what a layer matvec achieves): {:.3} ms", head.bytes as f64 / 125e9 * 1e3);
+}
+
 fn main() {
     let device = Device::system_default().expect("Metal device");
     let queue = device.new_command_queue();
     let kernels = LinearKernels::new().expect("kernels");
 
+    bench_head(&device, &kernels, &queue);
     for (label, kv, q) in [("sliding layer", KV_SLIDING, Q_SLIDING), ("full layer", KV_FULL, Q_FULL)] {
         let projs = vec![
             build(&device, "q_proj",   HIDDEN, HIDDEN, 7),

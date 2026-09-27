@@ -61,6 +61,8 @@ pub struct AttentionKernels {
     _library: Library,
     online_attention_pipeline: ComputePipelineState,
     scores_pipeline: ComputePipelineState,
+    scores_coalesced_pipeline: ComputePipelineState,
+    row_reduce_coalesced_pipeline: ComputePipelineState,
     row_reduce_pipeline: ComputePipelineState,
     combine_pipeline: ComputePipelineState,
 }
@@ -87,6 +89,8 @@ impl AttentionKernels {
         let scores_pipeline = extra("attention_scores")?;
         let row_reduce_pipeline = extra("attention_row_reduce")?;
         let combine_pipeline = extra("attention_combine")?;
+        let scores_coalesced_pipeline = extra("attention_scores_coalesced")?;
+        let row_reduce_coalesced_pipeline = extra("attention_row_reduce_coalesced")?;
         let queue = device.new_command_queue();
         Ok(Self {
             device,
@@ -94,6 +98,8 @@ impl AttentionKernels {
             _library: library,
             online_attention_pipeline,
             scores_pipeline,
+            scores_coalesced_pipeline,
+            row_reduce_coalesced_pipeline,
             row_reduce_pipeline,
             combine_pipeline,
         })
@@ -222,8 +228,9 @@ impl AttentionKernels {
         };
         let bytes = params_bytes(&params);
 
-        encoder.dispatch_1d(
-            &self.scores_pipeline,
+        let kv_groups = to_u32(kv_heads, "kv head count")?;
+        encoder.dispatch_groups(
+            &self.scores_coalesced_pipeline,
             &[
                 Some(queries),
                 Some(keys),
@@ -231,16 +238,16 @@ impl AttentionKernels {
                 Some(key_positions),
                 Some(scores),
             ],
-            bytes,
-            (q_heads * key_count) as u64,
-            64,
+            &bytes,
+            (key_count as u64) * u64::from(kv_groups),
+            256,
         )?;
-        encoder.dispatch_1d(
-            &self.row_reduce_pipeline,
+        encoder.dispatch_groups(
+            &self.row_reduce_coalesced_pipeline,
             &[Some(scores), Some(row_max), Some(row_sum)],
-            bytes,
+            &bytes,
             q_heads as u64,
-            64,
+            256,
         )?;
         encoder.dispatch_1d(
             &self.combine_pipeline,
