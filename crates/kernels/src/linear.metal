@@ -66,6 +66,21 @@ static uint fractional_window(const device ushort *packed, uint index, uint bits
     return uint((merged >> (48u - offset)) & 0xffffu);
 }
 
+// Threadgroup-resident twin of `fractional_window`, for the tiled prefill
+// kernel, which stages a tile's 32-bit words in shared memory. `word_count` is
+// in 32-bit words (== rate.packed_words() / 2, i.e. 8*bits + 4 for a fractional
+// rate) and `index` is the plain row-major tile position `row * 16 + column`,
+// matching `decode_tile`'s `tile[row * 16 + column]`. Bit-exact with
+// `unpack_fractional`: same ring, same window start, same 16 bits, same order.
+static uint fractional_window_tg(const threadgroup uint *tile, uint word_count, uint index, uint bits) {
+    uint depth = 16u * bits + 8u;
+    int start = normalize_ring(int(fractional_end(index, bits)) - 16, depth * 16u);
+    uint word_index = uint(start) / 32u;
+    uint offset = uint(start) & 31u;
+    ulong merged = (ulong(tile[word_index]) << 32) | ulong(tile[(word_index + 1u) % word_count]);
+    return uint((merged >> (48u - offset)) & 0xffffu);
+}
+
 static float decode_state(uint state, uint codebook) {
     uint value = state;
     if (codebook == 0u) {
@@ -2210,7 +2225,14 @@ kernel void linear_gemv_tiled(
     //     amortise over four times as many FMAs.
     constexpr uint KCHUNK = 64u;
     constexpr uint TILES = KCHUNK / 16u;
-    const uint word_count = 256u * params.rate / 32u;
+    // `params.rate` encodes a fractional rate as 16 + bits (`Exl3Rate::encoded`).
+    // A fractional tile holds `16*bits + 8` 16-bit words == `8*bits + 4` 32-bit
+    // words, NOT `256 * rate / 32`. Before this branch the tiled prefill kernel
+    // decoded fractional tiles with the integer ring arithmetic and produced
+    // wrong numbers (the model is integer-only, so nothing caught it).
+    const bool fractional = params.rate >= 16u;
+    const uint fractional_bits = params.rate - 16u;
+    const uint word_count = fractional ? (8u * fractional_bits + 4u) : (256u * params.rate / 32u);
     threadgroup uint tw[TILES * 64];
     threadgroup half wstage[TILES * 256u];
     uint local_query = (grid_position.y / 16u) * 16u + local_position.y;
@@ -2237,7 +2259,9 @@ kernel void linear_gemv_tiled(
             uint t = i / 256u;
             uint lr = (i & 255u) / 16u;
             uint lc = i & 15u;
-            uint state = exl3_code_at_tg(tw + t * word_count, word_count, lr, lc, params.rate);
+            uint state = fractional
+                ? fractional_window_tg(tw + t * word_count, word_count, lr * 16u + lc, fractional_bits)
+                : exl3_code_at_tg(tw + t * word_count, word_count, lr, lc, params.rate);
             wstage[i] = half(decode_state(state, params.codebook));
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
