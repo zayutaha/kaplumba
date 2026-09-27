@@ -139,6 +139,8 @@ pub struct LinearKernels {
     /// Lane-per-thread EXL3 matvec, one per integer rate so `KA` folds to a
     /// constant; see `linear_gemv_exl3_k*` in linear.metal. Index 0 is unused.
     exl3_gemv_pipelines: Vec<Option<ComputePipelineState>>,
+    /// Verbatim ishizuki `exl3_matvec`, for A/B only.
+    ishizuki_gemv_pipelines: Vec<Option<ComputePipelineState>>,
 }
 
 impl LinearKernels {
@@ -169,6 +171,20 @@ impl LinearKernels {
         let input_pipeline = device
             .new_compute_pipeline_state_with_function(&input_function)
             .map_err(KernelError::Pipeline)?;
+        let mut ishizuki_gemv_pipelines = Vec::with_capacity(9);
+        ishizuki_gemv_pipelines.push(None);
+        for bits in 1..=8_u32 {
+            let name = format!("linear_gemv_ishizuki_k{bits}");
+            let function = library
+                .get_function(&name, None)
+                .map_err(KernelError::Pipeline)?;
+            ishizuki_gemv_pipelines.push(Some(
+                device
+                    .new_compute_pipeline_state_with_function(&function)
+                    .map_err(KernelError::Pipeline)?,
+            ));
+        }
+
         let mut exl3_gemv_pipelines = Vec::with_capacity(18);
         exl3_gemv_pipelines.push(None); // index 0 unused
         // Index by [aligned][bits]: 0 = unaligned, 1 = 4-byte aligned.
@@ -226,6 +242,7 @@ impl LinearKernels {
             _library: library,
             input_pipeline,
             exl3_gemv_pipelines,
+            ishizuki_gemv_pipelines,
             gemv_pipeline,
             finalize_pipeline,
             input_rows_pipeline,
@@ -654,6 +671,60 @@ impl LinearKernels {
     /// Mapped checkpoint tensors are not -- `lm_head.trellis` starts at a file
     /// offset of % 4 == 2 -- and reading those as `uint *` is what made every
     /// earlier zero-copy build decode to noise.
+    /// Dispatch the A/B ishizuki kernel, which needs K and N in addition to the
+    /// usual three buffers. They ride in the params slot, which the encoder binds
+    /// immediately after the tensor bindings.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_ishizuki_gemv(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        pipeline: &ComputePipelineState,
+        packed: &Buffer,
+        packed_offset: u64,
+        transformed: &Buffer,
+        raw: &Buffer,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<(), KernelError> {
+        let k = to_u32(in_features, "input dimension")?;
+        let n = to_u32(out_features, "output dimension")?;
+        let shape_values = [k, n];
+        let shape = self.device.new_buffer_with_data(
+            shape_values.as_ptr() as *const std::ffi::c_void,
+            8,
+            MTLResourceOptions::StorageModeShared,
+        );
+        encoder.dispatch_1d_offset(
+            pipeline,
+            &[
+                TensorRef::new(packed, packed_offset),
+                TensorRef::new(transformed, 0),
+                TensorRef::new(raw, 0),
+                TensorRef::new(&shape, 0),
+            ],
+            &[],
+            (out_features / 16 * 256) as u64,
+            256,
+        )
+    }
+
+    fn ishizuki_gemv_pipeline(
+        &self,
+        rate: Exl3Rate,
+        packed_offset: u64,
+    ) -> Option<&ComputePipelineState> {
+        if std::env::var_os("KAPLUMBA_OWN_GEMV").is_some() {
+            return None; // A/B against the pre-port kernel
+        }
+        let Exl3Rate::Integer(bits) = rate else {
+            return None;
+        };
+        if bits < 1 || bits > 8 || packed_offset % 4 != 0 {
+            return None;
+        }
+        self.ishizuki_gemv_pipelines[bits as usize].as_ref()
+    }
+
     fn exl3_gemv_pipeline(
         &self,
         rate: Exl3Rate,
@@ -737,7 +808,18 @@ impl LinearKernels {
         // Integer rates go to the lane-per-thread matvec: one window setup per
         // eight codes, 256-thread groups, and enough threads to fill the GPU.
         // This is the real decode path; `gemv_buffer` routes the same way.
-        if let Some(pipeline) = self.exl3_gemv_pipeline(rate, packed_offset) {
+        if let Some(pipeline) = self.ishizuki_gemv_pipeline(rate, packed_offset) {
+            self.encode_ishizuki_gemv(
+                encoder,
+                pipeline,
+                packed,
+                packed_offset,
+                transformed,
+                raw,
+                in_features,
+                out_features,
+            )?;
+        } else if let Some(pipeline) = self.exl3_gemv_pipeline(rate, packed_offset) {
             encoder.dispatch_1d_offset(
                 pipeline,
                 &[

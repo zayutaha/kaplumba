@@ -183,3 +183,56 @@ measured speed, so the isolation gap is closed and what remains is genuine matve
 efficiency. 10 tok/s needs 100 ms, i.e. ~130 GB/s, which is 2.7x from here. That
 is stages 3-5 of this spec: cooperative ring load (the loads are 55% of the
 kernel and do not coalesce, Q7), `half2` codebook packing, and the codebook LUT.
+
+## ishizuki's matvec, ported verbatim (2026-09-27)
+
+You were right that the format was not the ceiling. ishizuki's `exl3_matvec`
+(EXL3.swift:286) is now ported line for line into `linear_gemv_ishizuki_k*` and
+is the **default** for integer rates. `KAPLUMBA_OWN_GEMV=1` selects the old kernel.
+
+| | GB/s |
+|---|---:|
+| our previous kernel | 50.9 |
+| ishizuki, verbatim | **100.8** |
+
+End to end: layer stack 242 -> 128 ms, decode **3.84 -> 6.77 tok/s**, prefill
+unchanged at 8.4, all five reference prompts byte-identical, suite green.
+Cumulative: 1.18 -> 6.77 tok/s, 5.7x.
+
+### Three bugs I made while porting, all of which faked a result
+
+Worth recording, because two of them produced *convincing* numbers:
+
+1. **Unbound K and N.** My kernel read `K` and `N` from buffers 3 and 4, but the
+   dispatch bound only three buffers, so `tiles_n` and `tiles_k` were garbage and
+   the loop ran zero iterations. That measured **304 GB/s -- 6x "faster" than
+   ours** while emitting pure noise. I reported that 6x before checking
+   correctness. It was my bug, and it also exceeded DRAM peak, which was the tell.
+2. **Swapped bindings.** The kernel signature was `(x, trellis, y)` while the
+   dispatch provides `(packed, transformed, raw)`.
+3. **The main loop was missing.** My template-extraction slice came out empty, so
+   the kernel had no `for` loop and `acc0`/`acc1` were always zero.
+
+Every one of these produced fast-and-wrong. The rule I should have applied from
+the start: **an A/B that gets faster must be validated on output before the
+number is believed.** Three of this project's benchmarks have now misled me --
+clock ramp, L2 residency, and this -- and in all three the check that would have
+caught it was cheap.
+
+### What is actually different, now that both run correctly
+
+Ours recomputes `tile_index * ring_words` and `input[xbase + r0 + N]` inside the
+loop; theirs hoists `column` and `xr` as pointers so the addresses are affine in
+`tk` and the compiler can strength-reduce them. Everything else -- one window per
+eight codes, four `x` values for eight codes, 8-simdgroup striding, the
+`simd_shuffle_xor` tree -- was already identical, and those changes account for
+2.0x. Pointer hoisting and address strength reduction, nothing exotic.
+
+### Where the remaining gap to 10 tok/s is
+
+At 128 ms/token we need 100 ms. The matvec is ~115 ms of the 128. Their reported
+28 tok/s is on a **2 bpw** model streaming 6.75 GB/token; ours is **3 bpw** at
+12.06 GB/token. 3 bpw is ~1.5x more codes per byte, hence more ALU per byte, so
+some of the residual gap is the rate and not the kernel. Scaling their 189 GB/s
+(M1 Max) to our bandwidth predicts ~129 GB/s against the 100.8 we measure, so
+roughly 1.3x remains and is plausibly reachable.
