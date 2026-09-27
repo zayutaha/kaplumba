@@ -137,6 +137,10 @@ pub struct LinearKernels {
     finalize_pipeline: ComputePipelineState,
     input_rows_pipeline: ComputePipelineState,
     gemv_tiled_pipeline: ComputePipelineState,
+    /// Tensor-core prefill GEMM (`linear_gemm_mma`): dequantize to tgmem half,
+    /// simdgroup MMA with four named accumulator chains. Needs in_features and
+    /// out_features to be multiples of 32 (the engine's are multiples of 128).
+    gemm_mma_pipeline: ComputePipelineState,
     finalize_rows_pipeline: ComputePipelineState,
     zero_raw_pipeline: ComputePipelineState,
     /// `linear_gemv_fast` specialised on (bits, MCG codebook) for integer rates.
@@ -219,6 +223,12 @@ impl LinearKernels {
         let gemv_tiled_pipeline = device
             .new_compute_pipeline_state_with_function(&gemv_tiled_function)
             .map_err(KernelError::Pipeline)?;
+        let gemm_mma_function = library
+            .get_function("linear_gemm_mma", None)
+            .map_err(KernelError::Shader)?;
+        let gemm_mma_pipeline = device
+            .new_compute_pipeline_state_with_function(&gemm_mma_function)
+            .map_err(KernelError::Pipeline)?;
         let finalize_rows_pipeline = device
             .new_compute_pipeline_state_with_function(&finalize_rows_function)
             .map_err(KernelError::Pipeline)?;
@@ -252,6 +262,7 @@ impl LinearKernels {
             finalize_pipeline,
             input_rows_pipeline,
             gemv_tiled_pipeline,
+            gemm_mma_pipeline,
             finalize_rows_pipeline,
             zero_raw_pipeline,
             fast_gemv_pipelines,
@@ -942,6 +953,42 @@ impl LinearKernels {
             queries: to_u32(queries, "query count")?,
             perm_mode,
         };
+        // Tensor-core path: the mma kernel reads the signed+transformed input
+        // and STORES (not accumulates) every output block as f32, so it skips
+        // the raw zeroing the tiled kernel needs. Output signs are still
+        // applied by the shared finalize below, exactly as the other paths do.
+        if in_features % 32 == 0
+            && out_features % 32 == 0
+            && self.gemm_mma_pipeline.thread_execution_width() == 32
+        {
+            encoder.dispatch_1d(
+                &self.input_rows_pipeline,
+                &[Some(input), Some(input_signs), Some(transformed)],
+                params_bytes(&row_params),
+                (input_elements / 128) as u64,
+                64,
+            )?;
+            encoder.dispatch_2d(
+                &self.gemm_mma_pipeline,
+                &[
+                    TensorRef::new(packed, packed_offset),
+                    TensorRef::new(transformed, 0),
+                    TensorRef::new(raw, 0),
+                ],
+                params_bytes(&linear_params),
+                (out_features / 32) as u64,
+                queries.div_ceil(32) as u64,
+                128,
+                1,
+            )?;
+            return encoder.dispatch_1d(
+                &self.finalize_rows_pipeline,
+                &[Some(raw), Some(output_signs), Some(output)],
+                params_bytes(&row_params),
+                (output_elements / 128) as u64,
+                64,
+            );
+        }
         // The tiled kernel accumulates with += across query tiles, so start clean.
         encoder.dispatch_1d(
             &self.zero_raw_pipeline,

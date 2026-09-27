@@ -2279,6 +2279,134 @@ kernel void linear_gemv_tiled(
     }
 }
 
+// Tensor-core prefill GEMM: dequantize EXL3 tiles to half in threadgroup
+// memory, then run simdgroup_multiply_accumulate. Motivation (session notes
+// SS8.4): linear_gemv_tiled spends its inner loop in one serial fp32 FMA
+// chain per thread and re-decodes the same weight tile in every query-block
+// threadgroup; measured in situ it runs a 256-token chunk at ~228 GFLOPS,
+// ~3% of the 8.76 TFLOPS SIMT roofline and ~1.5% of the 15.64 TFLOPS tensor
+// roofline measured by examples/mma_peak.rs.
+//
+// Geometry: one 128-thread threadgroup (4 simdgroups) computes a 32-query x
+// 32-output block. Simdgroup s owns output rows [s*8, s*8+8) and keeps FOUR
+// NAMED 8x8 f32 accumulators, one per 8-column chunk. Named locals are not a
+// style choice: mma_peak.rs measured an ARRAY of chains spilling to threadgroup
+// memory and collapsing from 15.49 to 0.74 TFLOPS.
+//
+// Per 64-wide K chunk the group (1) stages the 8 trellis tiles' 32-bit words,
+// (2) dequantizes them to 64x32 halves (2 tile columns x 4 tile rows -- the
+// same decode helpers, same bit-exact codes as linear_gemv_tiled), (3) stages
+// the 32x64 activation block, then (4) each simdgroup runs 8 steps x 4 MMAs.
+// Products are half x half accumulated in f32; the summation order differs
+// from linear_gemv_tiled so outputs are close but not bit-identical (Q10:
+// tensor path accepted by user decision 2026-09-27).
+//
+// Weight decode is still repeated per query block (ceil(queries/32) times per
+// output column vs ceil(queries/16) before); a dequant-once scheme would need
+// weights resident outside the streaming budget, so it is not attempted here.
+// Stores bounce through tgacc so partial query blocks can be row-guarded
+// (simdgroup_store has no per-row mask).
+kernel void linear_gemm_mma(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]]) {
+    constexpr uint KCHUNK = 64u;
+    constexpr uint KTILES = KCHUNK / 16u; // 4 k-tiles per chunk
+    constexpr uint NTILES = 2u;           // 2 output tile columns
+    constexpr uint QTILE = 32u;
+    constexpr uint OUTS = 32u;
+    const uint sgid = tid / 32u;
+
+    // `params.rate` encodes a fractional rate as 16 + bits; see
+    // linear_gemv_tiled for the word_count derivation.
+    const bool fractional = params.rate >= 16u;
+    const uint fractional_bits = params.rate - 16u;
+    const uint word_count = fractional ? (8u * fractional_bits + 4u) : (256u * params.rate / 32u);
+
+    threadgroup uint tw[KTILES * NTILES * 64u]; // 8 tiles, <=64 words each
+    threadgroup half bstage[QTILE * OUTS];      // 64 x 32 weight halfs
+    threadgroup half astage[QTILE * KCHUNK];    // 32 x 64 activations
+    threadgroup float tgacc[QTILE * OUTS];
+
+    const uint q_base = group.y * QTILE;
+    simdgroup_float8x8 acc0, acc1, acc2, acc3;
+    acc0.thread_elements()[0] = 0.0f; acc0.thread_elements()[1] = 0.0f;
+    acc1.thread_elements()[0] = 0.0f; acc1.thread_elements()[1] = 0.0f;
+    acc2.thread_elements()[0] = 0.0f; acc2.thread_elements()[1] = 0.0f;
+    acc3.thread_elements()[0] = 0.0f; acc3.thread_elements()[1] = 0.0f;
+
+    for (uint kbase = 0; kbase < params.in_features; kbase += KCHUNK) {
+        // Stage the chunk's trellis words: tiles are laid out k-major,
+        // n-minor, matching tile_index = (ktile)*tile_columns + (gx*2 + nt).
+        for (uint i = tid; i < KTILES * NTILES * word_count; i += 128u) {
+            uint t = i / word_count;
+            uint w = i - t * word_count;
+            uint tile_index = (kbase / 16u + t / NTILES) * params.tile_columns + group.x * NTILES + (t % NTILES);
+            tw[i] = trellis_word(packed, tile_index * word_count + w);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Dequantize to 64 x 32 halves. Element (kk, n): tile (kk/16, n/16),
+        // in-tile position (kk%16, n%16).
+        for (uint i = tid; i < KCHUNK * OUTS; i += 128u) {
+            uint kk = i / OUTS;
+            uint n = i % OUTS;
+            uint t = (kk / 16u) * NTILES + (n / 16u);
+            uint state = fractional
+                ? fractional_window_tg(tw + t * word_count, word_count, (kk & 15u) * 16u + (n & 15u), fractional_bits)
+                : exl3_code_at_tg(tw + t * word_count, word_count, kk & 15u, n & 15u, params.rate);
+            bstage[i] = half(decode_state(state, params.codebook));
+        }
+        // Stage activations; inactive rows read as zero so their accumulators
+        // stay finite and are simply never stored.
+        for (uint i = tid; i < QTILE * KCHUNK; i += 128u) {
+            uint r = i / KCHUNK;
+            uint kk = i % KCHUNK;
+            uint q = q_base + r;
+            astage[i] = q < params.queries ? input[q * params.in_features + kbase + kk] : half(0);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 8 MMA steps: acc[c] += A(8x64) x B(64x8). The four accumulators are
+        // independent chains within each step, which is what keeps the tensor
+        // units fed (one chain measures 5.75 TFLOPS, four keep most of peak).
+        for (uint step = 0; step < KCHUNK / 8u; ++step) {
+            const uint k8 = step * 8u;
+            simdgroup_half8x8 a;
+            simdgroup_half8x8 b0, b1, b2, b3;
+            simdgroup_load(a, astage + sgid * 8u * KCHUNK + k8, KCHUNK);
+            simdgroup_load(b0, bstage + k8 * OUTS + 0u, OUTS);
+            simdgroup_load(b1, bstage + k8 * OUTS + 8u, OUTS);
+            simdgroup_load(b2, bstage + k8 * OUTS + 16u, OUTS);
+            simdgroup_load(b3, bstage + k8 * OUTS + 24u, OUTS);
+            simdgroup_multiply_accumulate(acc0, a, b0, acc0);
+            simdgroup_multiply_accumulate(acc1, a, b1, acc1);
+            simdgroup_multiply_accumulate(acc2, a, b2, acc2);
+            simdgroup_multiply_accumulate(acc3, a, b3, acc3);
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Bounce through tgacc: every lane's output element is then written with a
+    // plain guarded store, so partial query blocks never touch other rows.
+    simdgroup_store(acc0, tgacc + sgid * 8u * OUTS + 0u, OUTS);
+    simdgroup_store(acc1, tgacc + sgid * 8u * OUTS + 8u, OUTS);
+    simdgroup_store(acc2, tgacc + sgid * 8u * OUTS + 16u, OUTS);
+    simdgroup_store(acc3, tgacc + sgid * 8u * OUTS + 24u, OUTS);
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint i = tid; i < QTILE * OUTS; i += 128u) {
+        uint r = i / OUTS;
+        uint c = i % OUTS;
+        uint q = q_base + r;
+        if (q < params.queries) {
+            output[q * params.out_features + group.x * OUTS + c] = tgacc[i];
+        }
+    }
+}
+
 kernel void linear_finalize_rows(
     const device float *input [[buffer(0)]],
     const device half *output_signs [[buffer(1)]],

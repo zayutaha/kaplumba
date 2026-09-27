@@ -397,11 +397,13 @@ impl DecoderLayerWeights {
 
 /// Per-operation wall-clock accumulator for the phase profiler.
 ///
-/// Encoding is not free, so timing individual operations means reading the CPU
-/// clock around each dispatch. That includes host-side encode cost, not just GPU
-/// execution, which is exactly what we want here: a decode step taking 812 ms
-/// for work that should take 4 ms is either a slow kernel or a slow submit, and
-/// this distinguishes them.
+/// The laps measure CPU-side encode cost around each dispatch, NOT GPU
+/// execution: dispatches into one command buffer run asynchronously, so a lap
+/// is only the host time to submit the work. Relative encode-cost shares can
+/// still be useful (a 1000-dispatch phase has proportionally more submit
+/// overhead), but GPU time attribution must come from the flush-boundary
+/// phases or the attribution env switches (KAPLUMBA_LINEARS_ONLY,
+/// KAPLUMBA_SKIP_ATTENTION), which move real GPU work.
 pub struct OpTimer<'t> {
     map: &'t mut std::collections::BTreeMap<&'static str, f64>,
     last: std::time::Instant,
@@ -2039,7 +2041,14 @@ impl TextModel {
             ));
         }
         let tokens = token_ids.len();
-        if positions[0] as usize != self.gpu_next_position() {
+        // Chunks resume at an absolute position past the cache cursor when
+        // their cache append is skipped by an attribution switch
+        // (KAPLUMBA_LINEARS_ONLY / KAPLUMBA_SKIP_ATTENTION); any other gap is
+        // still an error.
+        if positions[0] as usize != self.gpu_next_position()
+            && !(std::env::var_os("KAPLUMBA_LINEARS_ONLY").is_some()
+                || std::env::var_os("KAPLUMBA_SKIP_ATTENTION").is_some())
+        {
             return Err(ModelError::InvalidInput(
                 "positions must begin at the current cache position".to_string(),
             ));
@@ -2070,6 +2079,18 @@ impl TextModel {
         // natural overlap between phases, but the distribution is what we need to
         // find out where a decode step actually goes.
         let profile = std::env::var_os("KAPLUMBA_PROFILE_PHASES").is_some();
+        // GPU-true phase accounting: wall-clock timing of CPU encode calls is
+        // useless when the queue runs asynchronously (notes §8.3: it reported
+        // 12.5 ms of chunks against a 58.7 s ttft). Under the profiler each
+        // phase boundary ends the command buffer and waits, so elapsed host
+        // time IS GPU execution time for everything encoded so far.
+        macro_rules! gpu_flush {
+            () => {
+                if profile {
+                    encoder.flush_and_wait().map_err(ModelError::from)?;
+                }
+            };
+        }
         let mut phase = std::time::Instant::now();
         let mut embed_ms = 0.0_f64;
         let mut layer_ms = 0.0_f64;
@@ -2104,6 +2125,7 @@ impl TextModel {
             self.embedding_offset,
             self.embedding_is_bf16,
         )?;
+        gpu_flush!();
 
         if profile {
             mark!(embed_ms);
@@ -2128,22 +2150,31 @@ impl TextModel {
                 encoder,
                 &mut timer,
             )?;
+            if profile {
+                // Per-layer GPU-true cost: the flush makes the host wait for
+                // this layer's kernels, so the printed delta is execution time.
+                gpu_flush!();
+                let now = std::time::Instant::now();
+                eprintln!(
+                    "  LAYER {index:>2} {:>8.2} ms",
+                    now.duration_since(phase).as_secs_f64() * 1e3
+                );
+                phase = now;
+            }
         }
         let encode_done = std::time::Instant::now();
         if profile {
-            mark!(layer_ms);
-            eprintln!(
-                "  SPLIT layers: cpu_encode={:.2}ms gpu_wait={:.2}ms",
-                encode_done.duration_since(phase).as_secs_f64() * 1e3,
-                layer_ms - encode_done.duration_since(phase).as_secs_f64() * 1e3
-            );
             let mut total_us = 0.0;
             for (name, us) in &op_us {
                 eprintln!("  OP {name:<22} {:>9.2} ms", us / 1e3);
                 total_us += *us;
             }
-            eprintln!("  OP {:<22} {:>9.2} ms of {layer_ms:.2} ms", "(unattributed)", (layer_ms * 1e3 - total_us) / 1e3);
+            eprintln!(
+                "  OP (encode-submit cost only, layers sum {:.2} ms; per-layer GPU times above)",
+                encode_done.duration_since(phase).as_secs_f64() * 1e3 + total_us / 1e3
+            );
         }
+        gpu_flush!();
         // Layer k writes into hidden_b when k is even and hidden_a when k is odd,
         // so the final hidden state lives in hidden_a for an even layer count.
         let final_hidden = if layers.is_multiple_of(2) {
@@ -2162,6 +2193,7 @@ impl TextModel {
             hidden,
         )?;
         self.encode_lm_head(encoder)?;
+        gpu_flush!();
         // Pick the greedy token on the device. The next step's embedding kernel
         // reads `scratch.token_ids`, so a caller that keeps encoding into the
         // same command buffer never has to round trip through the host.
@@ -2175,16 +2207,21 @@ impl TextModel {
             &self.scratch.token_ids,
             tokens,
         )?;
-        if self.pick_on_device {
-            // Caller is driving the loop; it will read `greedy_token` itself.
-            return Ok(Vec::new());
-        }
+        gpu_flush!();
         mark!(head_ms);
         if profile {
             let total = embed_ms + layer_ms + head_ms;
             eprintln!(
-                "PHASE tokens={tokens} embed={embed_ms:.2}ms layers={layer_ms:.2}ms                  head={head_ms:.2}ms total={total:.2}ms"
+                "PHASE tokens={tokens} embed={embed_ms:.2}ms layers={layer_ms:.2}ms head={head_ms:.2}ms total={total:.2}ms"
             );
+            eprintln!(
+                "  (phase ms = CPU encode + GPU exec measured at flush boundaries; \
+                  an ms-scale phase is GPU-bound, a microsecond-scale one is encode-only)"
+            );
+        }
+        if self.pick_on_device {
+            // Caller is driving the loop; it will read `greedy_token` itself.
+            return Ok(Vec::new());
         }
 
         let logits = self.scratch.capped.contents() as *const u16;
