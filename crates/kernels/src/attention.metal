@@ -11,7 +11,8 @@ struct AttentionParams {
     uint window;
 };
 
-kernel void online_attention(
+template <int HEAD_DIM>
+static void online_attention_body(
     const device half *queries [[buffer(0)]],
     const device half *keys [[buffer(1)]],
     const device half *values [[buffer(2)]],
@@ -29,8 +30,13 @@ kernel void online_attention(
     uint key_head = query_head / groups;
     uint query_base = (query * params.q_heads + query_head) * params.head_dim;
     uint query_position = query_positions[query];
-    float accum[512];
-    for (uint i = 0; i < params.head_dim; ++i) {
+    // Compile-time bound, so the loops below unroll and these become registers.
+    // With the previous runtime bound this array spilled to local memory and
+    // every access in the inner loop paid a local-memory round trip -- which is
+    // why prefill attention was ~58% of prefill wall clock for under 1% of the
+    // arithmetic.
+    float accum[HEAD_DIM];
+    for (int i = 0; i < HEAD_DIM; ++i) {
         accum[i] = 0.0f;
     }
     float maximum = -3.402823466e+38f;
@@ -45,7 +51,7 @@ kernel void online_attention(
         }
         uint key_base = (key_index * params.kv_heads + key_head) * params.head_dim;
         float score = 0.0f;
-        for (uint dimension = 0; dimension < params.head_dim; ++dimension) {
+        for (int dimension = 0; dimension < HEAD_DIM; ++dimension) {
             score += float(queries[query_base + dimension]) * float(keys[key_base + dimension]);
         }
         score *= params.scale;
@@ -306,4 +312,30 @@ kernel void attention_row_reduce_coalesced(
     if (tid == 0u) {
         row_sum[head] = shared_sum[0];
     }
+}
+
+// Instantiations for the two head dims this model uses: 256 on the 50 sliding
+// layers, 512 on the 10 full-attention layers.
+kernel void online_attention_256(
+    const device half *queries [[buffer(0)]],
+    const device half *keys [[buffer(1)]],
+    const device half *values [[buffer(2)]],
+    const device uint *query_positions [[buffer(3)]],
+    const device uint *key_positions [[buffer(4)]],
+    device half *output [[buffer(5)]],
+    constant AttentionParams &params [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]) {
+    online_attention_body<256>(queries, keys, values, query_positions, key_positions, output, params, gid);
+}
+
+kernel void online_attention_512(
+    const device half *queries [[buffer(0)]],
+    const device half *keys [[buffer(1)]],
+    const device half *values [[buffer(2)]],
+    const device uint *query_positions [[buffer(3)]],
+    const device uint *key_positions [[buffer(4)]],
+    device half *output [[buffer(5)]],
+    constant AttentionParams &params [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]) {
+    online_attention_body<512>(queries, keys, values, query_positions, key_positions, output, params, gid);
 }

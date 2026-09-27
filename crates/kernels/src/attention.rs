@@ -59,7 +59,8 @@ pub struct AttentionKernels {
     device: Device,
     queue: CommandQueue,
     _library: Library,
-    online_attention_pipeline: ComputePipelineState,
+    online_attention_256_pipeline: ComputePipelineState,
+    online_attention_512_pipeline: ComputePipelineState,
     scores_pipeline: ComputePipelineState,
     scores_coalesced_pipeline: ComputePipelineState,
     row_reduce_coalesced_pipeline: ComputePipelineState,
@@ -74,12 +75,6 @@ impl AttentionKernels {
         let library = device
             .new_library_with_source(SOURCE, &options)
             .map_err(KernelError::Shader)?;
-        let function = library
-            .get_function("online_attention", None)
-            .map_err(KernelError::Shader)?;
-        let online_attention_pipeline = device
-            .new_compute_pipeline_state_with_function(&function)
-            .map_err(KernelError::Pipeline)?;
         let mut extra = |name: &str| -> Result<ComputePipelineState, KernelError> {
             let f = library.get_function(name, None).map_err(KernelError::Shader)?;
             device
@@ -91,12 +86,15 @@ impl AttentionKernels {
         let combine_pipeline = extra("attention_combine")?;
         let scores_coalesced_pipeline = extra("attention_scores_coalesced")?;
         let row_reduce_coalesced_pipeline = extra("attention_row_reduce_coalesced")?;
+        let online_attention_256_pipeline = extra("online_attention_256")?;
+        let online_attention_512_pipeline = extra("online_attention_512")?;
         let queue = device.new_command_queue();
         Ok(Self {
             device,
             queue,
             _library: library,
-            online_attention_pipeline,
+            online_attention_256_pipeline,
+            online_attention_512_pipeline,
             scores_pipeline,
             scores_coalesced_pipeline,
             row_reduce_coalesced_pipeline,
@@ -145,7 +143,13 @@ impl AttentionKernels {
         };
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
-        encoder.set_compute_pipeline_state(&self.online_attention_pipeline);
+        encoder.set_compute_pipeline_state(match head_dim {
+            256 => &self.online_attention_256_pipeline,
+            512 => &self.online_attention_512_pipeline,
+            _ => return Err(KernelError::InvalidInput(
+                format!("prefill attention head_dim must be 256 or 512, got {head_dim}"),
+            )),
+        });
         encoder.set_buffer(0, Some(&query_buffer), 0);
         encoder.set_buffer(1, Some(&key_buffer), 0);
         encoder.set_buffer(2, Some(&value_buffer), 0);
@@ -304,8 +308,20 @@ impl AttentionKernels {
             scale,
             window: to_u32(window, "attention window")?,
         };
+        // Route to the head_dim-specialised instantiation so the output
+        // accumulator is register-resident. Bit-exact: the loop order and the
+        // arithmetic are identical to the generic kernel.
+        let pipeline = match head_dim {
+            256 => &self.online_attention_256_pipeline,
+            512 => &self.online_attention_512_pipeline,
+            _ => {
+                return Err(KernelError::InvalidInput(format!(
+                    "prefill attention head_dim must be 256 or 512, got {head_dim}"
+                )))
+            }
+        };
         encoder.dispatch_1d(
-            &self.online_attention_pipeline,
+            pipeline,
             &[
                 Some(queries),
                 Some(keys),
