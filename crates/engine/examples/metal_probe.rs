@@ -14,11 +14,16 @@ using namespace metal;
 kernel void mma8(const device half *a [[buffer(0)]],
                  const device half *b [[buffer(1)]],
                  device half *c [[buffer(2)]]) {
+    // The third argument is the leading dimension: elements per row, NOT the
+    // number of rows, an element stride, or a row stride. Passing 0 made every
+    // row of every fragment load from the same base address, which is why the
+    // identity check used to match only 8 of 64 elements.
+    constexpr int LD = 8;
     simdgroup_half8x8 ta, tb, tc;
-    simdgroup_load(ta, a, 0);
-    simdgroup_load(tb, b, 0);
+    simdgroup_load(ta, a, LD);
+    simdgroup_load(tb, b, LD);
     simdgroup_multiply(tc, ta, tb);
-    simdgroup_store(tc, c, 0);
+    simdgroup_store(tc, c, LD);
 }
 "#;
 
