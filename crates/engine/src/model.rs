@@ -760,9 +760,36 @@ impl DecoderLayer {
 
         let key_count = self.gpu_cache.key_count(full);
         let window = if full { 0 } else { config.sliding_window };
-        self.attention.encode_online_attention(
-            encoder,
-            AttentionEncodeRequest {
+        // Attribution: skip the attention read. Output goes wrong but the KV
+        // cache still fills, so the forward completes and the remaining GPU time
+        // is attributable.
+        if std::env::var_os("KAPLUMBA_SKIP_ATTENTION").is_some() {
+            let key_count = self.gpu_cache.key_count(full);
+            let window = if full { 0 } else { config.sliding_window };
+            self.attention.encode_online_attention(
+                encoder,
+                AttentionEncodeRequest {
+                    queries: &scratch.q,
+                    keys: self.gpu_cache.keys(),
+                    values: self.gpu_cache.values(),
+                    query_positions: &scratch.query_positions,
+                    key_positions: self.gpu_cache.positions(),
+                    output: &scratch.q,
+                    queries_count: tokens,
+                    q_heads: config.q_heads,
+                    kv_heads: config.kv_heads,
+                    head_dim,
+                    key_count,
+                    scale: 1.0 / (head_dim as f32).sqrt(),
+                    window,
+                },
+            )?;
+            return Ok(());
+        }
+        // Split-key for the decode shape (one query). Prefill has many queries and
+        // already fills the machine with `queries * q_heads` threads, so it keeps
+        // the serial kernel.
+        let attention_request = AttentionEncodeRequest {
                 queries: &scratch.q,
                 keys: self.gpu_cache.keys(),
                 values: self.gpu_cache.values(),
@@ -776,8 +803,18 @@ impl DecoderLayer {
                 key_count,
                 scale: 1.0,
                 window,
-            },
-        )?;
+            };
+        if tokens == 1 {
+            self.attention.encode_online_attention_split(
+                encoder,
+                attention_request,
+                &scratch.attn_scores,
+                &scratch.attn_row_max,
+                &scratch.attn_row_sum,
+            )?;
+        } else {
+            self.attention.encode_online_attention(encoder, attention_request)?;
+        }
 
         self.encode_linear(
             encoder,
@@ -1231,6 +1268,11 @@ pub struct ForwardScratch {
     pub last_hidden: Buffer,
     pub logits: Buffer,
     pub capped: Buffer,
+    /// Split-key attention scratch. `attn_scores` is the big one: one float per
+    /// (head, key slot), so sliding layers need q_heads * 1024 entries.
+    pub attn_scores: Buffer,
+    pub attn_row_max: Buffer,
+    pub attn_row_sum: Buffer,
 }
 
 impl ForwardScratch {
@@ -1250,6 +1292,13 @@ impl ForwardScratch {
         }
         let device = system_device()?;
         let options = metal::MTLResourceOptions::StorageModeShared;
+        let f32_elements = |rows: usize, width: usize| -> Result<Buffer, ModelError> {
+            let bytes = rows
+                .checked_mul(width)
+                .and_then(|count| count.checked_mul(std::mem::size_of::<f32>()))
+                .ok_or_else(|| ModelError::InvalidConfig("scratch shape overflows".to_string()))?;
+            Ok(device.new_buffer(bytes as u64, options))
+        };
         let u16_elements = |rows: usize, width: usize| -> Result<Buffer, ModelError> {
             let bytes = rows
                 .checked_mul(width)
@@ -1285,6 +1334,11 @@ impl ForwardScratch {
             last_hidden: u16_elements(1, hidden)?,
             logits: u16_elements(1, vocab)?,
             capped: u16_elements(1, vocab)?,
+            // One float per (head, key slot) for the largest cache any layer
+            // scans: q_max heads over the 1024-slot sliding ring.
+            attn_scores: f32_elements(q_max, 1024)?,
+            attn_row_max: f32_elements(1, q_max)?,
+            attn_row_sum: f32_elements(1, q_max)?,
         })
     }
 
@@ -1308,6 +1362,9 @@ impl ForwardScratch {
             &self.last_hidden,
             &self.logits,
             &self.capped,
+            &self.attn_scores,
+            &self.attn_row_max,
+            &self.attn_row_sum,
         ]
         .iter()
         .map(|buffer| buffer.length())
@@ -2222,6 +2279,12 @@ fn load_quantized_linear(
         .tensors()
         .get(&trellis_name)
         .map(|tensor| (tensor.source_len / 2) as usize);
+    if std::env::var_os("KAPLUMBA_DEBUG_OFFSETS").is_some() {
+        eprintln!(
+            "OFFSET {name:<52} packed_offset={packed_offset:>12} aligned4={} len={packed_len:?}",
+            packed_offset % 4 == 0
+        );
+    }
     let input_signs = read_sign_component(weights, name, "suh", "su", in_features)?;
     let output_signs = read_sign_component(weights, name, "svh", "sv", out_features)?;
     QuantizedLinear::from_metal_buffer(

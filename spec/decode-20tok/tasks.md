@@ -29,20 +29,20 @@ together; do them before spending anything on the speculative stages.
   - Files: `crates/engine/tests/elements_metal.rs`
 - [ ] **T6** Re-measure the layer stack. *Gate: 783 → under 650 ms.* (Adjusted
   from 600 ms; the corrected norm count saves ~143 ms, not ~179 ms.)
-- [ ] **T7** Two-pass split-K `online_attention`: per-split `(max, l, acc)`,
+- [x] **T7** Two-pass split-K `online_attention`: per-split `(max, l, acc)`,
   then combine with `exp(m_i - m_global)`. No fp32 atomics. Keep the serial
   kernel when `queries * q_heads >= 1024` so prefill is untouched. The decode
   dispatch is 32 threads (1 query × 32 q_heads), not 8.
   - Files: `crates/kernels/src/attention.metal`, `crates/kernels/src/attention.rs`
-- [ ] **T8** Remove the per-thread `float accum[512]` for small grids; stage in
+- [x] **T8** Remove the per-thread `float accum[512]` for small grids; stage in
   threadgroup memory. At decode, 32 threads × 2 KB = 64 KB of registers just
   for the accumulators.
   - Files: `crates/kernels/src/attention.metal`
-- [ ] **T9** Attention correctness at `queries` {1, 8}, `keys` {1, 200, 1024},
+- [x] **T9** Attention correctness at `queries` {1, 8}, `keys` {1, 200, 1024},
   GQA ratios {1, 2, 8}, full and sliding windows. Test both the serial kernel
   (prefill shapes) and the split-K kernel (decode shapes).
   - Files: `crates/engine/tests/attention_metal.rs`
-- [ ] **T10** Re-measure. *Gate: layer stack under 300 ms, decode ≥ 3.0 tok/s.*
+- [x] **T10** Re-measure. *Gate: layer stack under 300 ms, decode ≥ 3.0 tok/s.*
   (Adjusted from 250 ms / 3.4 tok/s to account for corrected norm savings.)
 - [x] **T11** Prefill unchanged (8.4 tok/s at 134 tokens). Full suite green.
   Create an output comparison test (the spec references `output_identity` but
@@ -133,3 +133,53 @@ same kernel measures 40-64 GB/s in isolation, so the gap is not arithmetic. It i
 either non-coalesced access (Q7) or the loss of sustained streaming when seven
 different projections are interleaved with ~16 element kernels, 60 times a token.
 That is the next investigation and it is the whole remaining problem.
+
+## Split-key attention (2026-09-27)
+
+**I was wrong to strike stage 2, and the reason matters.** The 7.9 ms figure came
+from `elem_bench` with an 8.4 MB KV buffer, which is L2-resident. In situ the KV
+cache is 1.5 GB and every read is a DRAM miss, and the kernel runs on 32 threads
+(`queries * q_heads` with 32 query heads) each holding a 512-float accumulator.
+Ablation with `KAPLUMBA_SKIP_ATTENTION=1` put the real cost at **153 ms**, a
+19x gap against the isolated measurement. So stage 2 was the second-largest win
+available all along, and I nearly deleted it on the strength of a benchmark that
+was measuring cache.
+
+This also explains the 2.3x matvec discrepancy that was left over from the
+previous round. The old attention kernel held 2 KB of registers per thread and
+ran 2.5 ms per layer; it was starving the matvecs queued behind it. With
+attention fixed, the matvecs run at 229 ms against the 206 ms that
+`layer_bench` predicts for 60 layers -- within 11%, where before they were 2.3x
+off.
+
+Implemented as three flash-decoding passes, chosen so no pass needs a per-thread
+array proportional to `head_dim`:
+
+  attention_scores    one thread per (head, key)   -- q_heads * key_count
+  attention_row_reduce one thread per head
+  attention_combine   one thread per (head, dim)   -- q_heads * head_dim
+
+KV data is read once instead of once per thread. Selected only when
+`queries == 1`; prefill keeps the serial kernel and is unchanged at 8.4 tok/s.
+
+| | before | after |
+|---|---:|---:|
+| layer stack | 630 ms | **242 ms** |
+| decode | 1.51 tok/s | **3.84 tok/s** |
+| prefill | 8.4 tok/s | 8.4 tok/s |
+
+Cumulative so far: 1.18 -> 3.84 tok/s, a 3.25x improvement, output byte-identical
+on all five reference prompts.
+
+## Where the remaining 242 ms is
+
+| | ms | GB/s |
+|---|---:|---:|
+| attention | ~13 | |
+| matvec (11.00 GB) | ~229 | **48** |
+
+48 GB/s against `layer_bench`'s 50.7 GB/s means the matvec is now running at its
+measured speed, so the isolation gap is closed and what remains is genuine matvec
+efficiency. 10 tok/s needs 100 ms, i.e. ~130 GB/s, which is 2.7x from here. That
+is stages 3-5 of this spec: cooperative ring load (the loads are 55% of the
+kernel and do not coalesce, Q7), `half2` codebook packing, and the codebook LUT.

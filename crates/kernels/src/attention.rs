@@ -60,6 +60,9 @@ pub struct AttentionKernels {
     queue: CommandQueue,
     _library: Library,
     online_attention_pipeline: ComputePipelineState,
+    scores_pipeline: ComputePipelineState,
+    row_reduce_pipeline: ComputePipelineState,
+    combine_pipeline: ComputePipelineState,
 }
 
 impl AttentionKernels {
@@ -75,12 +78,24 @@ impl AttentionKernels {
         let online_attention_pipeline = device
             .new_compute_pipeline_state_with_function(&function)
             .map_err(KernelError::Pipeline)?;
+        let mut extra = |name: &str| -> Result<ComputePipelineState, KernelError> {
+            let f = library.get_function(name, None).map_err(KernelError::Shader)?;
+            device
+                .new_compute_pipeline_state_with_function(&f)
+                .map_err(KernelError::Pipeline)
+        };
+        let scores_pipeline = extra("attention_scores")?;
+        let row_reduce_pipeline = extra("attention_row_reduce")?;
+        let combine_pipeline = extra("attention_combine")?;
         let queue = device.new_command_queue();
         Ok(Self {
             device,
             queue,
             _library: library,
             online_attention_pipeline,
+            scores_pipeline,
+            row_reduce_pipeline,
+            combine_pipeline,
         })
     }
 
@@ -151,6 +166,91 @@ impl AttentionKernels {
 
     /// Encode the online-softmax attention kernel into a caller-owned command
     /// buffer, reading keys/values straight out of the GPU-resident cache.
+    /// Split-key attention for the decode shape: one query, few tokens.
+    ///
+    /// The serial kernel dispatches `queries * q_heads` threads, so decode runs
+    /// on 32 threads while streaming the whole KV cache. Measured 153 ms per
+    /// token in situ against 132 us for the same shape on an L2-resident buffer,
+    /// so the serialisation dominates. This runs three passes with
+    /// `q_heads * key_count` and `q_heads * head_dim` threads instead, and reads
+    /// the KV data once rather than once per thread.
+    ///
+    /// `scores` must hold `q_heads * key_count` floats.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_online_attention_split(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        request: AttentionEncodeRequest<'_>,
+        scores: &Buffer,
+        row_max: &Buffer,
+        row_sum: &Buffer,
+    ) -> Result<(), KernelError> {
+        let AttentionEncodeRequest {
+            queries,
+            keys,
+            values,
+            query_positions,
+            key_positions,
+            output,
+            queries_count,
+            q_heads,
+            kv_heads,
+            head_dim,
+            key_count,
+            scale,
+            window,
+        } = request;
+        if queries_count != 1
+            || q_heads == 0
+            || kv_heads == 0
+            || head_dim == 0
+            || key_count == 0
+            || q_heads % kv_heads != 0
+        {
+            return Err(KernelError::InvalidInput(
+                "split-key attention is for a single query with valid dimensions".to_string(),
+            ));
+        }
+        let params = AttentionParams {
+            queries: 1,
+            q_heads: to_u32(q_heads, "query heads")?,
+            kv_heads: to_u32(kv_heads, "KV heads")?,
+            head_dim: to_u32(head_dim, "head dimension")?,
+            key_count: to_u32(key_count, "key count")?,
+            scale,
+            window: to_u32(window, "window")?,
+        };
+        let bytes = params_bytes(&params);
+
+        encoder.dispatch_1d(
+            &self.scores_pipeline,
+            &[
+                Some(queries),
+                Some(keys),
+                Some(query_positions),
+                Some(key_positions),
+                Some(scores),
+            ],
+            bytes,
+            (q_heads * key_count) as u64,
+            64,
+        )?;
+        encoder.dispatch_1d(
+            &self.row_reduce_pipeline,
+            &[Some(scores), Some(row_max), Some(row_sum)],
+            bytes,
+            q_heads as u64,
+            64,
+        )?;
+        encoder.dispatch_1d(
+            &self.combine_pipeline,
+            &[Some(values), Some(scores), Some(row_max), Some(row_sum), Some(output)],
+            bytes,
+            (q_heads * head_dim) as u64,
+            64,
+        )
+    }
+
     pub fn encode_online_attention(
         &self,
         encoder: &mut crate::encoder::MetalEncoder,
