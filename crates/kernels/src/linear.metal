@@ -345,7 +345,8 @@ kernel void linear_gemv_ishizuki_k1(
     uint lid [[thread_position_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
-    uint tn [[threadgroup_position_in_grid]]) {
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
     constexpr uint KA = 1u;
     constexpr int CB = 1;
     constexpr uint RING = 256u * KA;
@@ -364,6 +365,9 @@ kernel void linear_gemv_ishizuki_k1(
     // j0/j1/j2 and sh depend only on the lane, not on the tile index, so they
     // hoist out of the tile loop. Unrolling by two then keeps six weight words
     // in flight per lane, which is worth ~27% on the full layer.
+    for (uint tn = tgid; tn < tiles_n; tn += ntg) {
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
     const uint lo0 = (lane * 8u + 1u) * 1u + RING - 16u;
     const uint sh0 = lo0 % 32u;
     const uint hi0 = lo0 / 32u;
@@ -440,6 +444,9 @@ kernel void linear_gemv_ishizuki_k1(
         }
         y[tn * 16u + lid] = sum;
     }
+        // `red` is reused by the next output tile, so it must be drained first.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 }
 
 kernel void linear_gemv_ishizuki_k2(
@@ -450,7 +457,8 @@ kernel void linear_gemv_ishizuki_k2(
     uint lid [[thread_position_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
-    uint tn [[threadgroup_position_in_grid]]) {
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
     constexpr uint KA = 2u;
     constexpr int CB = 1;
     constexpr uint RING = 256u * KA;
@@ -469,6 +477,9 @@ kernel void linear_gemv_ishizuki_k2(
     // j0/j1/j2 and sh depend only on the lane, not on the tile index, so they
     // hoist out of the tile loop. Unrolling by two then keeps six weight words
     // in flight per lane, which is worth ~27% on the full layer.
+    for (uint tn = tgid; tn < tiles_n; tn += ntg) {
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
     const uint lo0 = (lane * 8u + 1u) * 2u + RING - 16u;
     const uint sh0 = lo0 % 32u;
     const uint hi0 = lo0 / 32u;
@@ -545,6 +556,9 @@ kernel void linear_gemv_ishizuki_k2(
         }
         y[tn * 16u + lid] = sum;
     }
+        // `red` is reused by the next output tile, so it must be drained first.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 }
 
 kernel void linear_gemv_ishizuki_k3(
@@ -555,7 +569,8 @@ kernel void linear_gemv_ishizuki_k3(
     uint lid [[thread_position_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
-    uint tn [[threadgroup_position_in_grid]]) {
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
     constexpr uint KA = 3u;
     constexpr int CB = 1;
     constexpr uint RING = 256u * KA;
@@ -574,6 +589,9 @@ kernel void linear_gemv_ishizuki_k3(
     // j0/j1/j2 and sh depend only on the lane, not on the tile index, so they
     // hoist out of the tile loop. Unrolling by two then keeps six weight words
     // in flight per lane, which is worth ~27% on the full layer.
+    for (uint tn = tgid; tn < tiles_n; tn += ntg) {
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
     const uint lo0 = (lane * 8u + 1u) * 3u + RING - 16u;
     const uint sh0 = lo0 % 32u;
     const uint hi0 = lo0 / 32u;
@@ -650,6 +668,9 @@ kernel void linear_gemv_ishizuki_k3(
         }
         y[tn * 16u + lid] = sum;
     }
+        // `red` is reused by the next output tile, so it must be drained first.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 }
 
 kernel void linear_gemv_ishizuki_k4(
@@ -660,7 +681,8 @@ kernel void linear_gemv_ishizuki_k4(
     uint lid [[thread_position_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
-    uint tn [[threadgroup_position_in_grid]]) {
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
     constexpr uint KA = 4u;
     constexpr int CB = 1;
     constexpr uint RING = 256u * KA;
@@ -679,6 +701,9 @@ kernel void linear_gemv_ishizuki_k4(
     // j0/j1/j2 and sh depend only on the lane, not on the tile index, so they
     // hoist out of the tile loop. Unrolling by two then keeps six weight words
     // in flight per lane, which is worth ~27% on the full layer.
+    for (uint tn = tgid; tn < tiles_n; tn += ntg) {
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
     const uint lo0 = (lane * 8u + 1u) * 4u + RING - 16u;
     const uint sh0 = lo0 % 32u;
     const uint hi0 = lo0 / 32u;
@@ -755,6 +780,9 @@ kernel void linear_gemv_ishizuki_k4(
         }
         y[tn * 16u + lid] = sum;
     }
+        // `red` is reused by the next output tile, so it must be drained first.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 }
 
 kernel void linear_gemv_ishizuki_k5(
@@ -765,7 +793,8 @@ kernel void linear_gemv_ishizuki_k5(
     uint lid [[thread_position_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
-    uint tn [[threadgroup_position_in_grid]]) {
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
     constexpr uint KA = 5u;
     constexpr int CB = 1;
     constexpr uint RING = 256u * KA;
@@ -784,6 +813,9 @@ kernel void linear_gemv_ishizuki_k5(
     // j0/j1/j2 and sh depend only on the lane, not on the tile index, so they
     // hoist out of the tile loop. Unrolling by two then keeps six weight words
     // in flight per lane, which is worth ~27% on the full layer.
+    for (uint tn = tgid; tn < tiles_n; tn += ntg) {
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
     const uint lo0 = (lane * 8u + 1u) * 5u + RING - 16u;
     const uint sh0 = lo0 % 32u;
     const uint hi0 = lo0 / 32u;
@@ -860,6 +892,9 @@ kernel void linear_gemv_ishizuki_k5(
         }
         y[tn * 16u + lid] = sum;
     }
+        // `red` is reused by the next output tile, so it must be drained first.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 }
 
 kernel void linear_gemv_ishizuki_k6(
@@ -870,7 +905,8 @@ kernel void linear_gemv_ishizuki_k6(
     uint lid [[thread_position_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
-    uint tn [[threadgroup_position_in_grid]]) {
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
     constexpr uint KA = 6u;
     constexpr int CB = 1;
     constexpr uint RING = 256u * KA;
@@ -889,6 +925,9 @@ kernel void linear_gemv_ishizuki_k6(
     // j0/j1/j2 and sh depend only on the lane, not on the tile index, so they
     // hoist out of the tile loop. Unrolling by two then keeps six weight words
     // in flight per lane, which is worth ~27% on the full layer.
+    for (uint tn = tgid; tn < tiles_n; tn += ntg) {
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
     const uint lo0 = (lane * 8u + 1u) * 6u + RING - 16u;
     const uint sh0 = lo0 % 32u;
     const uint hi0 = lo0 / 32u;
@@ -965,6 +1004,9 @@ kernel void linear_gemv_ishizuki_k6(
         }
         y[tn * 16u + lid] = sum;
     }
+        // `red` is reused by the next output tile, so it must be drained first.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 }
 
 kernel void linear_gemv_ishizuki_k7(
@@ -975,7 +1017,8 @@ kernel void linear_gemv_ishizuki_k7(
     uint lid [[thread_position_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
-    uint tn [[threadgroup_position_in_grid]]) {
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
     constexpr uint KA = 7u;
     constexpr int CB = 1;
     constexpr uint RING = 256u * KA;
@@ -994,6 +1037,9 @@ kernel void linear_gemv_ishizuki_k7(
     // j0/j1/j2 and sh depend only on the lane, not on the tile index, so they
     // hoist out of the tile loop. Unrolling by two then keeps six weight words
     // in flight per lane, which is worth ~27% on the full layer.
+    for (uint tn = tgid; tn < tiles_n; tn += ntg) {
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
     const uint lo0 = (lane * 8u + 1u) * 7u + RING - 16u;
     const uint sh0 = lo0 % 32u;
     const uint hi0 = lo0 / 32u;
@@ -1070,6 +1116,9 @@ kernel void linear_gemv_ishizuki_k7(
         }
         y[tn * 16u + lid] = sum;
     }
+        // `red` is reused by the next output tile, so it must be drained first.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
 }
 
 kernel void linear_gemv_ishizuki_k8(
@@ -1080,7 +1129,8 @@ kernel void linear_gemv_ishizuki_k8(
     uint lid [[thread_position_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]],
-    uint tn [[threadgroup_position_in_grid]]) {
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
     constexpr uint KA = 8u;
     constexpr int CB = 1;
     constexpr uint RING = 256u * KA;
@@ -1099,6 +1149,9 @@ kernel void linear_gemv_ishizuki_k8(
     // j0/j1/j2 and sh depend only on the lane, not on the tile index, so they
     // hoist out of the tile loop. Unrolling by two then keeps six weight words
     // in flight per lane, which is worth ~27% on the full layer.
+    for (uint tn = tgid; tn < tiles_n; tn += ntg) {
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
     const uint lo0 = (lane * 8u + 1u) * 8u + RING - 16u;
     const uint sh0 = lo0 % 32u;
     const uint hi0 = lo0 / 32u;
@@ -1174,6 +1227,9 @@ kernel void linear_gemv_ishizuki_k8(
             sum += red[g][lid];
         }
         y[tn * 16u + lid] = sum;
+    }
+        // `red` is reused by the next output tile, so it must be drained first.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
 

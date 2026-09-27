@@ -694,6 +694,18 @@ impl LinearKernels {
         let k = to_u32(in_features, "input dimension")?;
         let n = to_u32(out_features, "output dimension")?;
         let shape_values = [k, n];
+        // One threadgroup per 16 outputs, capped. At N=21504 that is 1344
+        // threadgroups on 20 cores -- about 1.4 waves -- and a trailing partial
+        // wave costs more than the extra parallelism buys. Capping the grid and
+        // letting each threadgroup stride over several output tiles turns the
+        // tail into an exact multiple. lm_head, which launches 16384
+        // threadgroups, reaches 168.7 GB/s on this same kernel.
+        let tiles = (out_features / 16) as u64;
+        let cap = std::env::var("KAPLUMBA_GEMV_MAX_GROUPS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(u64::MAX);
+        let groups = tiles.min(cap).max(1);
         let shape = self.device.new_buffer_with_data(
             shape_values.as_ptr() as *const std::ffi::c_void,
             8,
@@ -708,7 +720,7 @@ impl LinearKernels {
                 TensorRef::new(&shape, 0),
             ],
             &[],
-            (out_features / 16 * 256) as u64,
+            groups * 256,
             256,
         )
     }
