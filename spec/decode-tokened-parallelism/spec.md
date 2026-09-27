@@ -65,30 +65,55 @@ This is the second large slice of the unexplained 560 ms, and it gets worse with
 context length, which matches the observation that decode slows as a conversation
 grows.
 
-### Finding 3: the roofline we have been using is the wrong one
+### Finding 3: the roofline, measured rather than assumed
 
-`273 GB/s ÷ 12.06 GB = 22.6 tok/s` assumes decode is bandwidth-bound. It is not.
-At 3 bpw, one token requires decoding **32.2e9 weights**, and each weight costs
-roughly 10 integer ops (two shifts for the sliding window, a multiply, an xor,
-two fp16 adds, one fma). M4 Pro's integer throughput is about 6.1e12 int32
-ops/s (20 cores × 4 SIMD × 32 lanes × ~2.4 GHz), so the ALU roofline is
-**~19 tok/s at 10 ops/weight and ~13.6 at 14** — and 22.6 tok/s would need
-1.2× the machine's entire integer throughput.
+`273 GB/s / 12.06 GB = 22.6 tok/s` is the **bandwidth** roofline. It is not the
+binding limit, because at 3 bpw a token must decode 32.2e9 weights and each
+weight costs real integer and fp16 work.
 
-The reference implementation agrees: ishizuki's `BENCHMARKS.md` reports
-**~11 tok/s on M4 Pro** and ~20 on M1 Max, i.e. it tracks memory bandwidth but
-sits well under the naive roofline on both. So:
+The first version of this analysis guessed a 2.4 GHz clock and concluded 19
+tok/s. That was a guess. `examples/alu_peak.rs` now measures this machine
+directly, with four independent accumulator chains so the loop is issue-bound
+rather than latency-bound, at 80k threads:
 
-- 22.6 tok/s is **not** physically available for a 3 bpw model on this machine.
-- ~11–13 tok/s is the credible target, and matching ishizuki is a reasonable
-  definition of success.
-- We are at 1.18, so the gap to close is roughly **9×**, and the two kernels
-  above are worth ~560 ms of the 850 ms.
+| Workload | Measured peak |
+|---|---:|
+| int32 chain, 8 ops/iter | 2.36e12 ops/s |
+| EXL3 codebook shape (mul, mask, xor, 2 fp16 extracts, 2 adds) | 3.63e12 ops/s |
+
+The MCG codebook is ~6 ops and dominates: one multiply, one mask, one xor, one
+shift, two fp16 bit-pattern extractions and an add, producing one weight. That
+caps the machine at roughly `3.63e12 / 6 = 605e9 weights/s`, and:
+
+| Limit | tok/s |
+|---|---:|
+| Bandwidth roofline (273 GB/s) | 22.6 |
+| **ALU roofline (measured, 100% efficiency)** | **~18.8** |
+| Practical (70-80% ALU efficiency) | 13-15 |
+
+So the binding constraint is the ALU, at **~19 tok/s absolute and 13-15
+realistically**. 20 tok/s is above the ALU roofline: it would need more integer
+throughput than this GPU has. This agrees with ishizuki, whose `BENCHMARKS.md`
+reports **~11 tok/s on M4 Pro** and ~20 on M1 Max, tracking memory bandwidth but
+sitting well under the naive roofline on both.
+
+We are at 1.18 tok/s, so the gap is ~11x to the ALU roofline and ~9x to a
+realistic target. Two things follow:
+
+- The two serial kernels above are worth ~560 ms of the 850 ms and are the whole
+  of the cheap part of this gap. Fix them first.
+- After that the codebook itself becomes the wall. There is a known way out: at
+  3 bpw only the top `ka` bits of each 16-bit code carry information, so the
+  codebook is a function of `2^ka` distinct inputs and can be a small lookup
+  table instead of a hash. That is a separate spec, and it is the only route I
+  can see to exceeding ~19 tok/s.
 
 ## Goal
 
 Fix the token-1 parallelism collapse. Gate: **≥ 5 tok/s**, which needs the layer
-stack under ~200 ms. Stretch: 10 tok/s, ishizuki-class.
+stack under ~200 ms. Stretch: 10 tok/s, ishizuki-class. The 20 tok/s target is
+above this machine's measured ALU roofline and is not reachable by any amount of
+kernel work; see Finding 3.
 
 ## Non-goals
 
