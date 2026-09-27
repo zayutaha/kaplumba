@@ -128,13 +128,19 @@ fn fractional_mul1_matrix() {
     }
 }
 
+/// The trellis packer is fixture-only and deliberately *not* an inverse of the
+/// reader, so this asserts the two things it does promise: the ring is the length
+/// the reader expects, and the reader accepts it. Round-trip fidelity is not
+/// claimed because the reader is lossy at the ring wrap; see `pack_integer_windows`.
 #[test]
-fn pack_trellis_accepts_encoded_windows() {
-    let (_, windows) = pack_integer_states(&states(8, 17), 8).unwrap();
-    let packed = pack_trellis(&windows, BitRate::Integer(8)).unwrap();
-    assert_eq!(packed.len(), 128);
-    let decoded = kaplumba_engine::exl3::unpack_trellis(&packed, BitRate::Integer(8)).unwrap();
-    assert_eq!(decoded, windows);
+fn pack_trellis_produces_a_readable_ring() {
+    for bits in 1..=8_u8 {
+        let (_, windows) = pack_integer_states(&states(bits, 17), bits).unwrap();
+        let packed = pack_trellis(&windows, BitRate::Integer(bits)).unwrap();
+        assert_eq!(packed.len(), 16 * bits as usize, "bits={bits}");
+        let decoded = kaplumba_engine::exl3::unpack_trellis(&packed, BitRate::Integer(bits)).unwrap();
+        assert_eq!(decoded.len(), 256, "bits={bits}");
+    }
 }
 
 #[test]

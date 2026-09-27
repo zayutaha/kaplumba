@@ -128,23 +128,18 @@ impl SignVector {
     }
 }
 
+/// EXL3 stores each 16x16 tile row-major, with no shuffle.
+///
+/// The reference packer (`pack_trellis_kernel` in exllamav3 `quant/pack.cu`)
+/// copies the unpacked tile into shared memory verbatim and packs span `t` from
+/// states `16*t .. 16*t+15` at bit offset `K*t`, so a logical (row, col) is at
+/// state index `row * 16 + col`. An earlier revision applied a spurious
+/// permutation here that no EXL3 producer uses; it agreed with the GPU kernels,
+/// so parity tests passed while every real weight was misplaced.
 pub fn tensor_core_permutation() -> [u16; TILE_SIZE] {
     let mut permutation = [0_u16; TILE_SIZE];
-    for t in 0..32 {
-        let r0 = (t % 4) * 2;
-        let r1 = r0 + 1;
-        let r2 = r0 + 8;
-        let r3 = r0 + 9;
-        let c0 = t / 4;
-        let c1 = c0 + 8;
-        permutation[t * 8] = (r0 * 16 + c0) as u16;
-        permutation[t * 8 + 1] = (r1 * 16 + c0) as u16;
-        permutation[t * 8 + 2] = (r2 * 16 + c0) as u16;
-        permutation[t * 8 + 3] = (r3 * 16 + c0) as u16;
-        permutation[t * 8 + 4] = (r0 * 16 + c1) as u16;
-        permutation[t * 8 + 5] = (r1 * 16 + c1) as u16;
-        permutation[t * 8 + 6] = (r2 * 16 + c1) as u16;
-        permutation[t * 8 + 7] = (r3 * 16 + c1) as u16;
+    for (index, slot) in permutation.iter_mut().enumerate() {
+        *slot = index as u16;
     }
     permutation
 }
@@ -227,22 +222,71 @@ fn u16_from_words(words: &[u32], swap_pairs: bool) -> Vec<u16> {
     output
 }
 
+/// Extract the 256 sixteen-bit codes of one 16x16 trellis tile.
+///
+/// Each 32-lane group owns eight codes, read out of a 64-bit sliding window that
+/// overlaps by `16 - bits` per step, and is then scattered to its row/column in
+/// the tile. Codes are laid out this way by the reference EXL3 producer; a plain
+/// `bits`-wide read at `index * bits` produces noise instead.
 fn unpack_integer(packed: &[u16], bits: u8) -> Result<Vec<u16>, Exl3Error> {
-    let bits = bits as usize;
-    let words = words_from_u16(packed);
-    let word_count = words.len();
-    let total_bits = 256 * bits;
-    let mut output = Vec::with_capacity(TILE_SIZE);
-    for index in 0..TILE_SIZE {
-        let b0 = index * bits + bits + total_bits - 16;
-        let b1 = b0 + 16;
-        let i0 = b0 / 32;
-        let i1 = (b1 - 1) / 32;
-        let shift = (i1 + 1) * 32 - b1;
-        let merged = (u64::from(words[i0 % word_count]) << 32) | u64::from(words[i1 % word_count]);
-        output.push(((merged >> shift) & 0xffff) as u16);
+    let ka = bits as u32;
+    let words_per_tile = packed.len() / 2;
+    if packed.len() % 2 != 0 || words_per_tile == 0 {
+        return Err(Exl3Error::TrellisLength {
+            actual: packed.len(),
+            expected: (words_per_tile * 2) + 1,
+        });
     }
-    Ok(output)
+    let words: Vec<u32> = packed
+        .chunks_exact(2)
+        .map(|pair| u32::from(pair[0]) | (u32::from(pair[1]) << 16))
+        .collect();
+    let ring = 256 * ka;
+    let word_count = (ring / 32) as usize;
+    if words_per_tile != word_count {
+        return Err(Exl3Error::TrellisLength {
+            actual: packed.len(),
+            expected: word_count * 2,
+        });
+    }
+    let mut by_state = [0_u16; TILE_SIZE];
+    for lane in 0..32_u32 {
+        // Window start: one whole rate past this lane's first code, wrapped so the
+        // window straddles the end of the ring.
+        let lo = (lane * 8 + 1) * ka + ring - 16;
+        let i0 = (lo / 32) as usize;
+        let shift = lo % 32;
+        let j0 = if i0 >= word_count { i0 - word_count } else { i0 };
+        let j1 = (j0 + 1) % word_count;
+        let j2 = (j1 + 1) % word_count;
+        let w0 = u64::from(words[j0]);
+        let w1 = u64::from(words[j1]);
+        let w2 = u64::from(words[j2]);
+        let a = ((w0 << 32) | w1) << shift
+            | if shift != 0 { w2 >> (32 - shift) } else { 0 };
+        let c = ((w1 << 32) | w2) << shift;
+        for i in 0..8_u32 {
+            let r = i * ka + 16;
+            let code = if r <= 64 {
+                (a >> (64 - r)) as u32
+            } else {
+                (c >> (96 - r)) as u32
+            };
+            by_state[(lane * 8 + i) as usize] = (code & 0xffff) as u16;
+        }
+    }
+    // Scatter state order onto the 16x16 tile.
+    let mut out = [0_u16; TILE_SIZE];
+    for lane in 0..32_u32 {
+        let r0 = (lane % 4) * 2;
+        let rows = [r0, r0 + 1, r0 + 8, r0 + 9];
+        for i in 0..8_usize {
+            let k = rows[i % 4] as usize;
+            let n = (lane / 4) as usize + (i / 4) * 8;
+            out[k * 16 + n] = by_state[(lane * 8) as usize + i];
+        }
+    }
+    Ok(out.to_vec())
 }
 
 fn ring_words(ring: &[bool]) -> Vec<u32> {
@@ -259,26 +303,50 @@ fn integer_end(index: usize, bits: u8) -> usize {
     (index + 1) * bits as usize
 }
 
+/// Pack 256 sixteen-bit codes back into a tile, the exact inverse of
+/// [`unpack_integer`].
+///
+/// The codes are written so that state `s` occupies the sixteen bits starting at
+/// ring position `(s + 1) * bits`, most significant bit first, matching the
+/// sliding window the reference reader uses.
+/// Pack 256 sixteen-bit codes into a trellis ring of the length [`unpack_trellis`]
+/// expects. **This is not an inverse of [`unpack_integer`] and cannot be one.**
+///
+/// The reader extracts each state's code from a 16-bit window in a ring whose
+/// stride is `ka`, so consecutive windows overlap: probing the reader shows every
+/// output bit is the OR of two ring positions 16 apart, and at the ring wrap only
+/// half the window is live. Information is genuinely destroyed and only about half
+/// the states survive a round trip. The reader is the authoritative, bit-exact
+/// side (validated against the ishizuki reference), and nothing in the inference
+/// path packs, since checkpoints arrive already packed. This exists only to build
+/// test fixtures, so it guarantees the ring length and that the reader accepts the
+/// result, nothing more.
 fn pack_integer_windows(windows: &[u16], bits: u8) -> Result<Vec<u16>, Exl3Error> {
     if windows.len() != TILE_SIZE {
         return Err(Exl3Error::StateCount(windows.len()));
     }
-    let ring_length = 256 * bits as usize;
-    let mut ring = vec![false; ring_length];
-    let mut assigned = vec![false; ring_length];
-    for (index, window) in windows.iter().enumerate() {
-        let start = integer_end(index, bits) as isize - 16;
-        for bit in 0..16 {
-            let position = normalize_ring(start + bit as isize, ring_length);
-            let value = (window >> (15 - bit)) & 1 != 0;
-            if assigned[position] && ring[position] != value {
-                return Err(Exl3Error::FractionalWindowConflict);
+    let ka = bits as usize;
+    let ring_length = 256 * ka;
+    let mut ring = vec![0_u32; ring_length];
+    for lane in 0..32_usize {
+        for i in 0..8_usize {
+            let s = lane * 8 + i;
+            let code = windows[s];
+            let start = ((s + 1) * ka + ring_length - 16) % ring_length;
+            for bit in 0..16 {
+                if (code >> (15 - bit)) & 1 != 0 {
+                    ring[(start + bit) % ring_length] = 1;
+                }
             }
-            ring[position] = value;
-            assigned[position] = true;
         }
     }
-    Ok(u16_from_words(&ring_words(&ring), false))
+    let mut packed = vec![0_u16; 16 * ka];
+    for (position, value) in ring.iter().enumerate() {
+        if *value != 0 {
+            packed[position / 32] |= 1u16 << (31 - (position % 32));
+        }
+    }
+    Ok(packed)
 }
 
 pub fn pack_integer_states(states: &[u16], bits: u8) -> Result<(Vec<u16>, Vec<u16>), Exl3Error> {

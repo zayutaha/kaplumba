@@ -1,3 +1,6 @@
+pub mod attention;
+pub mod elements;
+pub mod encoder;
 pub mod exl3;
 pub mod linear;
 

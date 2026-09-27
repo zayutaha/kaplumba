@@ -1,13 +1,13 @@
 use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
-use std::ops::Range;
 use std::os::fd::AsRawFd;
-use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
+use std::os::unix::fs::FileExt;
+use std::path::{Path, PathBuf};
 
-use half::bf16;
 use metal::Buffer;
+use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::metal::{DEFAULT_RESIDENT_LIMIT_BYTES, DEFAULT_SEGMENT_BYTES, MetalContext, MetalError};
@@ -60,6 +60,12 @@ pub struct LoadedTensor {
     pub spans: Vec<ArenaSpan>,
     pub storage: WeightStorage,
     pub converted_from_bf16: bool,
+    /// Shard this tensor's bytes live in, and their `[start, end)` range.
+    pub shard: String,
+    pub start: u64,
+    pub end: u64,
+    /// Source byte length, recorded because zero-copy tensors have no arena spans.
+    pub source_len: u64,
 }
 
 impl LoadedTensor {
@@ -191,6 +197,43 @@ impl WeightArena {
         Ok(spans)
     }
 
+    pub fn allocate_dedicated(&mut self, length: u64) -> Result<Vec<ArenaSpan>, WeightError> {
+        if length == 0 {
+            return Ok(Vec::new());
+        }
+        if length > self.context.max_buffer_length() {
+            return Err(WeightError::InvalidSegmentSize(length));
+        }
+        let required = self
+            .capacity_bytes
+            .checked_add(length)
+            .ok_or(WeightError::ArithmeticOverflow)?;
+        if required > self.limit_bytes {
+            return Err(WeightError::AllocationLimit {
+                required,
+                limit: self.limit_bytes,
+            });
+        }
+        let buffer = self.context.allocate_shared(length)?;
+        let segment = self.segments.len();
+        self.segments.push(BufferSegment {
+            buffer,
+            len: length,
+        });
+        self.capacity_bytes = required;
+        self.logical_bytes = self
+            .logical_bytes
+            .checked_add(length)
+            .ok_or(WeightError::ArithmeticOverflow)?;
+        self.current_segment = None;
+        self.current_used = 0;
+        Ok(vec![ArenaSpan {
+            segment,
+            offset: 0,
+            len: length,
+        }])
+    }
+
     pub fn write_at(
         &self,
         spans: &[ArenaSpan],
@@ -211,8 +254,9 @@ impl WeightArena {
                 span_offset = span_end;
                 continue;
             }
-            let start = data_offset.saturating_sub(span_offset) as usize;
-            let end = data_end.min(span_end).saturating_sub(span_offset) as usize;
+            let copy_start = data_offset.max(span_offset) - data_offset;
+            let copy_end = data_end.min(span_end) - data_offset;
+            let destination_offset = data_offset.max(span_offset) - span_offset;
             let segment = self
                 .segments
                 .get(span.segment)
@@ -226,11 +270,67 @@ impl WeightArena {
                 return Err(WeightError::ArithmeticOverflow);
             }
             let contents = crate::metal::shared_contents(&segment.buffer)?;
+            let copy_start =
+                usize::try_from(copy_start).map_err(|_| WeightError::ArithmeticOverflow)?;
+            let copy_end =
+                usize::try_from(copy_end).map_err(|_| WeightError::ArithmeticOverflow)?;
+            let destination_offset =
+                usize::try_from(destination_offset).map_err(|_| WeightError::ArithmeticOverflow)?;
             unsafe {
-                let destination = (contents as *mut u8).add((span.offset + start as u64) as usize);
-                std::ptr::copy_nonoverlapping(data[start..end].as_ptr(), destination, end - start);
+                let destination =
+                    (contents as *mut u8).add((span.offset as usize) + destination_offset);
+                std::ptr::copy_nonoverlapping(
+                    data[copy_start..copy_end].as_ptr(),
+                    destination,
+                    copy_end - copy_start,
+                );
             }
             span_offset = span_end;
+        }
+        Ok(())
+    }
+
+    /// Read `len` bytes starting at `file_offset` directly into the destination
+    /// window covered by `spans`.
+    ///
+    /// A tensor may straddle several arena segments; each intersecting piece is
+    /// read straight into its own buffer, so no staging copy of the tensor is
+    /// ever materialised in host memory.
+    pub fn read_into(
+        &self,
+        file: &File,
+        spans: &[ArenaSpan],
+        file_offset: u64,
+        len: u64,
+    ) -> Result<(), WeightError> {
+        let total = span_total(spans)?;
+        if len > total {
+            return Err(WeightError::ArithmeticOverflow);
+        }
+        let mut remaining = len;
+        let mut file_position = file_offset;
+        for span in spans {
+            if remaining == 0 {
+                break;
+            }
+            let take = u64::min(span.len, remaining);
+            let segment = self
+                .segments
+                .get(span.segment)
+                .ok_or(WeightError::ArithmeticOverflow)?;
+            if span
+                .offset
+                .checked_add(span.len)
+                .ok_or(WeightError::ArithmeticOverflow)?
+                > segment.len
+            {
+                return Err(WeightError::ArithmeticOverflow);
+            }
+            let contents = crate::metal::shared_contents(&segment.buffer)?;
+            let destination = unsafe { (contents as *mut u8).add(span.offset as usize) };
+            read_exact_at(file, destination, take, file_position)?;
+            file_position += take;
+            remaining -= take;
         }
         Ok(())
     }
@@ -303,6 +403,10 @@ pub struct TextWeights {
     arena: WeightArena,
     tensors: BTreeMap<String, LoadedTensor>,
     source_bytes: u64,
+    /// Shard mappings stay resident for the lifetime of the weights because
+    /// zero-copy Metal buffers alias these pages; dropping them would leave the
+    /// GPU reading freed memory.
+    shards: BTreeMap<String, ShardReader>,
 }
 
 impl TextWeights {
@@ -328,28 +432,111 @@ impl TextWeights {
         limit_bytes: u64,
         segment_bytes: u64,
     ) -> Result<Self, WeightError> {
-        let mut maps = BTreeMap::new();
+        Self::load_internal(
+            model_dir,
+            selection,
+            context,
+            limit_bytes,
+            segment_bytes,
+            false,
+        )
+    }
+
+    pub fn load_dedicated(
+        model_dir: &Path,
+        selection: &TextTensorSelection,
+        context: MetalContext,
+        limit_bytes: u64,
+    ) -> Result<Self, WeightError> {
+        Self::load_internal(
+            model_dir,
+            selection,
+            context,
+            limit_bytes,
+            DEFAULT_SEGMENT_BYTES,
+            true,
+        )
+    }
+
+    fn load_internal(
+        model_dir: &Path,
+        selection: &TextTensorSelection,
+        context: MetalContext,
+        limit_bytes: u64,
+        segment_bytes: u64,
+        dedicated: bool,
+    ) -> Result<Self, WeightError> {
+        let mut shards = BTreeMap::new();
         for (shard_name, shard) in &selection.shards {
             if shard.tensors.is_empty() {
                 continue;
             }
             let path = model_dir.join(shard_name);
-            maps.insert(shard_name.clone(), Mmap::open(&path)?);
+            shards.insert(shard_name.clone(), ShardReader::open(&path)?);
         }
+        let phase_start = std::time::Instant::now();
         let mut arena = WeightArena::new(context, limit_bytes, segment_bytes)?;
-        let mut tensors = BTreeMap::new();
         let mut source_bytes = 0_u64;
+
+        // Phase 1: allocate every destination up front (sequential, because the
+        // arena needs `&mut`). Allocation is pure bookkeeping plus Metal buffer
+        // creation; the expensive part is the data copy, which happens in
+        // parallel in phase 2.
+        struct PendingCopy {
+            name: String,
+            shard: String,
+            file_offset: u64,
+            len: u64,
+            spans: Vec<ArenaSpan>,
+            storage: WeightStorage,
+            storage_dtype: DType,
+            source_dtype: DType,
+            shape: Vec<usize>,
+            converted: bool,
+            /// EXL3 trellis bytes are consumed straight from the shard mapping,
+            /// so they never enter the arena and cost no anonymous memory.
+            skip_copy: bool,
+        }
+
+        let mut pending = Vec::with_capacity(selection.tensors.len());
         for (name, info) in &selection.tensors {
             let (storage, storage_dtype, converted) = classify_tensor(name, info.dtype)?;
             let source_len = info.byte_len();
             source_bytes = source_bytes
                 .checked_add(source_len)
                 .ok_or(WeightError::ArithmeticOverflow)?;
-            let spans = arena.allocate(source_len)?;
+            // Most trellis is bound from the arena, not the mapping. Decode streams
+            // every layer weight each token, so leaving those file-backed lets the OS
+            // evict them and the model falls back to disk (and swap) mid-token:
+            // measured 3.9 GB of swap and ~1.4 tok/s versus ~18 tok/s resident.
+            //
+            // `lm_head` is the exception. It is 1.06 GB, and although it is read
+            // every token, that is small next to the 11.0 GB of layers, so its
+            // pages stay hot in the file cache and the swap pathology does not
+            // apply. Keeping it mapped saves 1.06 GB of anonymous memory.
+            // Offloading the head is currently UNSAFE, not merely slow: the trellis
+            // in the file is not 4-byte aligned (lm_head.trellis starts at
+            // offset % 4 == 2) and the linear kernels read 32-bit words via
+            // `(device const uint*)(contents + offset)`. The arena copy silently
+            // re-aligns the data; mapping the file does not, so every decode is
+            // garbage. Enabling this needs the kernels to combine two 16-bit
+            // loads instead. See spec notes.
+            let all_zero_copy = std::env::var_os("KAPLUMBA_ZERO_COPY_WEIGHTS").is_some();
+            let offload_head = std::env::var_os("KAPLUMBA_OFFLOAD_LM_HEAD").is_some();
+            let skip_copy = !converted
+                && name.ends_with(".trellis")
+                && (all_zero_copy || (offload_head && name.starts_with("lm_head.")));
+            let spans = if skip_copy {
+                Vec::new()
+            } else if dedicated {
+                arena.allocate_dedicated(source_len)?
+            } else {
+                arena.allocate(source_len)?
+            };
             let shard_name = selection
                 .shard_for(name)
                 .ok_or_else(|| WeightError::Range {
-                    shard: name.clone(),
+                    shard: name.to_string(),
                 })?;
             let shard = selection
                 .shards
@@ -362,22 +549,85 @@ impl TextWeights {
                 .ok_or_else(|| WeightError::Range {
                     shard: shard_name.to_string(),
                 })?;
-            let map = maps.get(shard_name).ok_or_else(|| WeightError::Range {
+            let reader = shards.get(shard_name).ok_or_else(|| WeightError::Range {
                 shard: shard_name.to_string(),
             })?;
             let (start, end) = range;
-            let source = map.slice(start..end)?;
-            copy_tensor(&arena, &spans, source, converted)?;
+            reader.check_range(start, end - start)?;
+            pending.push(PendingCopy {
+                name: name.clone(),
+                shard: shard_name.to_string(),
+                file_offset: start,
+                len: end - start,
+                spans,
+                storage,
+                storage_dtype,
+                source_dtype: info.dtype,
+                shape: info.shape.clone(),
+                converted,
+                skip_copy,
+            });
+        }
+
+        // Phase 2: copy shard bytes into the arena in parallel. Each tensor owns
+        // a disjoint destination range, and `copy_tensor` only ever writes the
+        // slice of that range it was given, so the writes never overlap and the
+        // conversion of one tensor never observes another.
+        let alloc_ms = phase_start.elapsed().as_millis();
+        let copy_start = std::time::Instant::now();
+        // Read in ascending file order so concurrent readers stay close to
+        // sequential within each shard and the drive keeps full readahead.
+        pending.sort_by(|left, right| {
+            left.shard
+                .cmp(&right.shard)
+                .then(left.file_offset.cmp(&right.file_offset))
+        });
+        let arena_ref = &arena;
+        let shards_ref = &shards;
+        pending.par_iter().try_for_each(|item| {
+            if item.skip_copy {
+                return Ok(());
+            }
+            let reader = shards_ref
+                .get(&item.shard)
+                .ok_or_else(|| WeightError::Range {
+                    shard: item.shard.clone(),
+                })?;
+            copy_tensor(
+                arena_ref,
+                &reader.file,
+                &item.spans,
+                item.file_offset,
+                item.len,
+                item.converted,
+            )
+        })?;
+        let copy_ms = copy_start.elapsed().as_millis();
+        if std::env::var_os("KAPLUMBA_LOAD_PROFILE").is_some() {
+            eprintln!(
+                "load profile: alloc={alloc_ms}ms read+convert={copy_ms}ms tensors={} bytes={}",
+                pending.len(),
+                source_bytes
+            );
+        }
+
+        // Phase 3: register the loaded tensors in deterministic name order.
+        let mut tensors = BTreeMap::new();
+        for item in pending {
             tensors.insert(
-                name.clone(),
+                item.name.clone(),
                 LoadedTensor {
-                    name: name.clone(),
-                    source_dtype: info.dtype,
-                    storage_dtype,
-                    shape: info.shape.clone(),
-                    spans,
-                    storage,
-                    converted_from_bf16: converted,
+                    name: item.name,
+                    source_dtype: item.source_dtype,
+                    storage_dtype: item.storage_dtype,
+                    shape: item.shape,
+                    spans: item.spans,
+                    storage: item.storage,
+                    converted_from_bf16: item.converted,
+                    shard: item.shard,
+                    start: item.file_offset,
+                    end: item.file_offset + item.len,
+                    source_len: item.len,
                 },
             );
         }
@@ -385,6 +635,7 @@ impl TextWeights {
             arena,
             tensors,
             source_bytes,
+            shards,
         })
     }
 
@@ -428,6 +679,74 @@ impl TextWeights {
                 name: name.to_string(),
             })?;
         self.arena.read(&tensor.spans)
+    }
+
+    /// Zero-copy Metal view of a tensor that needs no dtype conversion.
+    ///
+    /// EXL3 trellis and sign tensors are already stored in the layout the
+    /// kernels read, so they are bound directly from the shard mapping instead
+    /// of being copied into anonymous memory. Returns `None` for tensors that
+    /// were converted at load time (BF16 to FP16), which do live in the arena.
+    pub fn zero_copy_tensor_buffer(
+        &self,
+        name: &str,
+    ) -> Result<Option<(Buffer, u64)>, WeightError> {
+        let tensor = self.tensors.get(name).ok_or_else(|| WeightError::InvalidSpan {
+            name: name.to_string(),
+        })?;
+        if tensor.converted_from_bf16 {
+            return Ok(None);
+        }
+        let Some(reader) = self.shards.get(&tensor.shard) else {
+            return Ok(None);
+        };
+        let (start, end) = (tensor.start, tensor.end);
+        let device = metal::Device::system_default().ok_or(WeightError::Metal(
+            crate::metal::MetalError::DeviceUnavailable,
+        ))?;
+        Ok(Some(reader.no_copy_view(&device, start, end - start)?))
+    }
+
+    pub fn tensor_buffer(&self, name: &str) -> Result<Buffer, WeightError> {
+        let tensor = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| WeightError::InvalidSpan {
+                name: name.to_string(),
+            })?;
+        if tensor.spans.len() != 1 || tensor.spans[0].offset != 0 {
+            return Err(WeightError::InvalidSpan {
+                name: name.to_string(),
+            });
+        }
+        self.arena
+            .buffer(tensor.spans[0].segment)
+            .cloned()
+            .ok_or_else(|| WeightError::InvalidSpan {
+                name: name.to_string(),
+            })
+    }
+
+    pub fn read_f16(&self, name: &str) -> Result<Vec<u16>, WeightError> {
+        let tensor = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| WeightError::InvalidSpan {
+                name: name.to_string(),
+            })?;
+        if tensor.storage == WeightStorage::Raw || tensor.storage_dtype != DType::F16 {
+            return Err(WeightError::InvalidSpan {
+                name: name.to_string(),
+            });
+        }
+        let bytes = self.arena.read(&tensor.spans)?;
+        if !bytes.len().is_multiple_of(2) {
+            return Err(WeightError::ArithmeticOverflow);
+        }
+        Ok(bytes
+            .chunks_exact(2)
+            .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+            .collect())
     }
 
     pub fn packed_u16(&self, name: &str) -> Result<Vec<u16>, WeightError> {
@@ -492,48 +811,94 @@ fn is_exl3_component(name: &str) -> bool {
         .any(|suffix| name.ends_with(suffix))
 }
 
+/// Load one tensor's shard bytes into its arena spans.
+///
+/// Chunks are independent and run in parallel: each reads a disjoint file range
+/// and writes a disjoint destination range, so no locking is needed and the work
+/// spreads across all cores. Destination spans are fixed before this runs, so the
+/// arena is only ever read here.
 fn copy_tensor(
     arena: &WeightArena,
+    file: &File,
     spans: &[ArenaSpan],
-    source: &[u8],
+    file_offset: u64,
+    len: u64,
     convert_bf16: bool,
 ) -> Result<(), WeightError> {
+    let len = usize::try_from(len).map_err(|_| WeightError::ArithmeticOverflow)?;
     if !convert_bf16 {
-        for (offset, chunk) in source.chunks(COPY_CHUNK_BYTES).enumerate() {
-            let data_offset = (offset * COPY_CHUNK_BYTES) as u64;
-            arena.write_at(spans, data_offset, chunk)?;
-        }
-        return Ok(());
+        return arena.read_into(file, spans, file_offset, len as u64);
     }
-    if !source.len().is_multiple_of(2) {
+    if !len.is_multiple_of(2) {
         return Err(WeightError::ArithmeticOverflow);
     }
-    let mut converted = Vec::new();
-    for (offset, chunk) in source.chunks(COPY_CHUNK_BYTES).enumerate() {
-        if chunk.len() % 2 != 0 {
-            return Err(WeightError::ArithmeticOverflow);
+    // bfloat16 needs rewriting to f16, so stage one chunk at a time and convert
+    // in place: bfloat16 is the top 16 bits of an f32, so each step is a shift
+    // plus f32 -> f16 rounding.
+    let mut scratch = vec![0_u8; COPY_CHUNK_BYTES];
+    let mut offset = 0_usize;
+    while offset < len {
+        let take = COPY_CHUNK_BYTES.min(len - offset);
+        read_exact_at(
+            file,
+            scratch.as_mut_ptr(),
+            take as u64,
+            file_offset + offset as u64,
+        )?;
+        for pair in scratch[..take].chunks_exact_mut(2) {
+            let bits = u16::from_le_bytes([pair[0], pair[1]]);
+            let value = half::f16::from_f32(f32::from_bits(u32::from(bits) << 16)).to_bits();
+            pair.copy_from_slice(&value.to_le_bytes());
         }
-        converted.clear();
-        converted.resize(chunk.len(), 0);
-        for (source_bytes, destination_bytes) in
-            chunk.chunks_exact(2).zip(converted.chunks_exact_mut(2))
-        {
-            let bits = u16::from_le_bytes([source_bytes[0], source_bytes[1]]);
-            let value = half::f16::from_f32(bf16::from_bits(bits).to_f32()).to_bits();
-            destination_bytes.copy_from_slice(&value.to_le_bytes());
-        }
-        arena.write_at(spans, (offset * COPY_CHUNK_BYTES) as u64, &converted)?;
+        arena.write_at(spans, offset as u64, &scratch[..take])?;
+        offset += take;
     }
     Ok(())
 }
 
-struct Mmap {
+/// `pread` exactly `len` bytes into `destination`, retrying short reads.
+fn read_exact_at(
+    file: &File,
+    destination: *mut u8,
+    len: u64,
+    offset: u64,
+) -> Result<(), WeightError> {
+    let total = usize::try_from(len).map_err(|_| WeightError::ArithmeticOverflow)?;
+    let mut filled = 0_usize;
+    while filled < total {
+        let slice =
+            unsafe { std::slice::from_raw_parts_mut(destination.add(filled), total - filled) };
+        let read = file
+            .read_at(slice, offset + filled as u64)
+            .map_err(|source| WeightError::Io {
+                path: PathBuf::from("<shard>"),
+                source,
+            })?;
+        if read == 0 {
+            return Err(WeightError::ArithmeticOverflow);
+        }
+        filled += read;
+    }
+    Ok(())
+}
+
+/// A safetensors shard opened for positional reads.
+///
+/// Bulk tensor bytes are pulled with `read_at` straight into their destination
+/// Metal buffers. Reading through an mmap instead costs one minor fault per page;
+/// with several threads faulting unrelated file offsets at once the kernel's
+/// readahead collapses and a full text load drops to roughly a quarter of the
+/// drive's sequential rate, while `read_at` keeps the same data moving at full
+/// sequential speed.
+struct ShardReader {
+    file: File,
     pointer: NonNull<u8>,
     length: usize,
+    length_u64: u64,
     path: PathBuf,
 }
 
-impl Mmap {
+impl ShardReader {
     fn open(path: &Path) -> Result<Self, WeightError> {
         let file = File::open(path).map_err(|source| WeightError::Io {
             path: path.to_path_buf(),
@@ -546,16 +911,18 @@ impl Mmap {
                 source,
             })?
             .len();
-        let length = usize::try_from(length).map_err(|_| WeightError::Mmap {
-            path: path.to_path_buf(),
-            message: "file does not fit in process address space".to_string(),
-        })?;
         if length == 0 {
             return Err(WeightError::Mmap {
                 path: path.to_path_buf(),
-                message: "cannot map an empty shard".to_string(),
+                message: "cannot read an empty shard".to_string(),
             });
         }
+        let length = usize::try_from(length).map_err(|_| WeightError::Mmap {
+            path: path.to_path_buf(),
+            message: "shard does not fit in the address space".to_string(),
+        })?;
+        // Map the shard read-only so large tensors can be bound straight from the
+        // page cache instead of being copied into anonymous memory.
         let pointer = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
@@ -572,39 +939,80 @@ impl Mmap {
                 message: "mmap failed".to_string(),
             });
         }
+        let pointer = NonNull::new(pointer.cast::<u8>()).ok_or_else(|| WeightError::Mmap {
+            path: path.to_path_buf(),
+            message: "mmap returned null".to_string(),
+        })?;
         Ok(Self {
-            pointer: NonNull::new(pointer.cast::<u8>()).ok_or_else(|| WeightError::Mmap {
-                path: path.to_path_buf(),
-                message: "mmap returned null".to_string(),
-            })?,
+            file,
+            pointer,
             length,
+            length_u64: length as u64,
             path: path.to_path_buf(),
         })
     }
 
-    fn slice(&self, range: Range<u64>) -> Result<&[u8], WeightError> {
-        let start = usize::try_from(range.start).map_err(|_| WeightError::Range {
-            shard: self.path.display().to_string(),
-        })?;
-        let end = usize::try_from(range.end).map_err(|_| WeightError::Range {
-            shard: self.path.display().to_string(),
-        })?;
-        if start > end || end > self.length {
+    /// Wrap `[offset, offset+len)` of this shard in a Metal buffer without
+    /// copying, returning the buffer and the tensor's byte offset inside it.
+    ///
+    /// The mapping is page aligned, but a safetensors tensor offset is not, so
+    /// the buffer starts at the page-aligned address below the tensor and the
+    /// caller binds at the returned offset.
+    fn no_copy_view(
+        &self,
+        device: &metal::Device,
+        offset: u64,
+        len: u64,
+    ) -> Result<(Buffer, u64), WeightError> {
+        self.check_range(offset, len)?;
+        let base = self.pointer.as_ptr() as usize;
+        let start = base
+            .checked_add(offset as usize)
+            .ok_or(WeightError::ArithmeticOverflow)?;
+        let aligned = start & !(PAGE_ALIGN - 1);
+        let delta = start - aligned;
+        let end = start
+            .checked_add(len as usize)
+            .ok_or(WeightError::ArithmeticOverflow)?;
+        if end > base + self.length {
+            return Err(WeightError::ArithmeticOverflow);
+        }
+        let buffer = device.new_buffer_with_bytes_no_copy(
+            aligned as *const std::ffi::c_void,
+            (end - aligned) as u64,
+            metal::MTLResourceOptions::StorageModeShared,
+            None,
+        );
+        Ok((buffer, delta as u64))
+    }
+
+    fn check_range(&self, offset: u64, len: u64) -> Result<(), WeightError> {
+        let end = offset
+            .checked_add(len)
+            .ok_or(WeightError::ArithmeticOverflow)?;
+        if end > self.length_u64 {
             return Err(WeightError::Range {
                 shard: self.path.display().to_string(),
             });
         }
-        Ok(unsafe { std::slice::from_raw_parts(self.pointer.as_ptr().add(start), end - start) })
+        Ok(())
     }
 }
 
-impl Drop for Mmap {
+// The mapping is PROT_READ/MAP_PRIVATE and never written, so sharing the reader
+// across threads (and handing those pages to the GPU) is sound.
+unsafe impl Sync for ShardReader {}
+unsafe impl Send for ShardReader {}
+
+impl Drop for ShardReader {
     fn drop(&mut self) {
         unsafe {
             libc::munmap(self.pointer.as_ptr().cast(), self.length);
         }
     }
 }
+
+const PAGE_ALIGN: usize = 4096;
 
 #[cfg(test)]
 mod tests {
@@ -759,18 +1167,41 @@ mod tests {
             .tensor("model.language_model.layers.0.self_attn.q_proj.trellis")
             .unwrap();
         assert_eq!(tensor.storage, WeightStorage::PackedExl3);
-        assert_eq!(
-            weights
-                .read_tensor("model.language_model.layers.0.self_attn.q_proj.trellis")
-                .unwrap(),
-            vec![0x34, 0x12, 0x78, 0x56]
-        );
-        assert_eq!(
-            weights
-                .packed_u16("model.language_model.layers.0.self_attn.q_proj.trellis")
-                .unwrap(),
-            vec![0x1234, 0x5678]
-        );
+        // By default trellis is copied into the arena so the whole 14.9 GiB of
+        // weights stays resident: decode streams every weight each token, and
+        // file-backed pages get evicted, which measured 3.9 GiB of swap and
+        // ~1.4 tok/s. Only KAPLUMBA_ZERO_COPY_WEIGHTS opts back into mapping.
+        let zero_copy = std::env::var_os("KAPLUMBA_ZERO_COPY_WEIGHTS").is_some();
+        if zero_copy {
+            assert!(
+                tensor.spans.is_empty(),
+                "zero-copy trellis should not occupy arena space"
+            );
+        } else {
+            assert!(
+                !tensor.spans.is_empty(),
+                "default trellis must be resident in the arena"
+            );
+            let buffer = weights
+                .tensor_buffer("model.language_model.layers.0.self_attn.q_proj.trellis")
+                .unwrap();
+            let byte_len = (tensor.end - tensor.start) as usize;
+            let mapped =
+                unsafe { std::slice::from_raw_parts(buffer.contents() as *const u8, byte_len) };
+            assert_eq!(mapped, &[0x34, 0x12, 0x78, 0x56]);
+        }
+        let view = weights
+            .zero_copy_tensor_buffer("model.language_model.layers.0.self_attn.q_proj.trellis")
+            .unwrap()
+            .expect("trellis must expose a zero-copy view");
+        let (buffer, offset) = view;
+        let mapped = unsafe {
+            std::slice::from_raw_parts(
+                (buffer.contents() as *const u8).add(offset as usize),
+                4,
+            )
+        };
+        assert_eq!(mapped.to_vec(), vec![0x34, 0x12, 0x78, 0x56]);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -826,6 +1257,38 @@ mod tests {
             TextWeights::load_with_segment_size(&dir, &selection, context, 1024, 64).unwrap();
         let tensor = weights.tensor("model.language_model.norm.weight").unwrap();
         assert_eq!(tensor.spans.len(), 3);
+        assert_eq!(weights.read_tensor(tensor.name.as_str()).unwrap(), bytes);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dedicated_tensors_are_single_addressable_buffers() {
+        let Some(context) = context_or_skip() else {
+            return;
+        };
+        let dir = temp_dir("dedicated");
+        let bytes = vec![0x5A_u8; 8 * 1024 * 1024 + 2];
+        let selection = selection_for(
+            &dir,
+            vec![(
+                "model.language_model.norm.weight",
+                DType::F16,
+                vec![bytes.len() / 2],
+                bytes.clone(),
+            )],
+        );
+        let weights =
+            TextWeights::load_dedicated(&dir, &selection, context, bytes.len() as u64).unwrap();
+        let tensor = weights.tensor("model.language_model.norm.weight").unwrap();
+        assert_eq!(tensor.spans.len(), 1);
+        assert_eq!(tensor.spans[0].offset, 0);
+        assert_eq!(
+            weights
+                .tensor_buffer(tensor.name.as_str())
+                .unwrap()
+                .length(),
+            bytes.len() as u64
+        );
         assert_eq!(weights.read_tensor(tensor.name.as_str()).unwrap(), bytes);
         fs::remove_dir_all(dir).unwrap();
     }

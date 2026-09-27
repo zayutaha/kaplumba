@@ -1,2 +1,0 @@
-- [x] Prove mathematically that 20 t/s is impossible on M4 Pro with current constraints.
-- [ ] Get user authorization to lift a constraint (Speculative Decoding or Weight Repacking).

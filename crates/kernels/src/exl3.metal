@@ -10,16 +10,47 @@ static uint read_word(const device ushort *packed, uint index) {
     return uint(packed[index * 2]) | (uint(packed[index * 2 + 1]) << 16);
 }
 
-static uint integer_window(const device ushort *packed, uint index, uint bits) {
+// Extract the 16-bit code for state `state` from the trellis ring.
+//
+// Each 32-lane group owns eight codes, read out of a 64-bit sliding window that
+// advances by one whole rate per code and overlaps by `16 - bits`. A plain
+// `bits`-wide read at `state * bits` is wrong: the codes are not stored at their
+// own offsets, which is what made the original decoder produce noise.
+static uint integer_code_at(const device ushort *packed, uint state, uint bits) {
     uint total = 256u * bits;
-    uint b0 = index * bits + bits + total - 16u;
-    uint b1 = b0 + 16u;
-    uint i0 = b0 / 32u;
-    uint i1 = (b1 - 1u) / 32u;
-    uint shift = (i1 + 1u) * 32u - b1;
     uint word_count = total / 32u;
-    ulong merged = (ulong(read_word(packed, i0 % word_count)) << 32) | ulong(read_word(packed, i1 % word_count));
-    return uint((merged >> shift) & 0xffffu);
+    uint lane = state / 8u;
+    uint i = state % 8u;
+    // Window start: one whole rate past this lane's first code, wrapped so the
+    // window straddles the end of the ring.
+    uint lo = (lane * 8u + 1u) * bits + total - 16u;
+    uint w0i = (lo / 32u) % word_count;
+    uint w1i = (w0i + 1u) % word_count;
+    uint w2i = (w1i + 1u) % word_count;
+    uint shift = lo % 32u;
+    uint w0 = read_word(packed, w0i);
+    uint w1 = read_word(packed, w1i);
+    uint w2 = read_word(packed, w2i);
+    ulong a = (ulong(w0) << 32) | ulong(w1);
+    a = (a << shift) | (shift != 0u ? ulong(w2 >> (32u - shift)) : 0ul);
+    ulong c = ((ulong(w1) << 32) | ulong(w2)) << shift;
+    uint r = i * bits + 16u;
+    uint code = (r <= 64u) ? uint(a >> (64u - r)) : uint(c >> (96u - r));
+    return code & 0xffffu;
+}
+
+// Inverse of the CPU scatter `out[k * 16 + n] = by_state[lane * 8 + i]`, so a
+// thread indexed by tile position can find its own state.
+static uint state_for_tile(uint k, uint n) {
+    // rows = [r0, r0 + 1, r0 + 8, r0 + 9] with r0 = (lane % 4) * 2 in {0,2,4,6},
+    // so r0 = k & 6 and the row within the group is k - r0. lane % 4 == r0 / 2,
+    // and n carries lane / 4 in its low three bits and i / 4 above them.
+    uint r0 = k & 6u;
+    uint delta = k - r0;              // one of 0, 1, 8, 9
+    uint low = delta < 8u ? delta : delta - 6u;  // -> i % 4 in 0..3
+    uint i = (n / 8u) * 4u + low;
+    uint lane = (n % 8u) * 4u + (r0 / 2u);
+    return lane * 8u + i;
 }
 
 static uint fractional_width(uint index, uint bits) {
@@ -78,14 +109,9 @@ static float decode_state(uint state, uint codebook) {
     return float(byte_value * inverse + bias);
 }
 
-static uint permutation_index(uint row) {
-    uint t = row / 8u;
-    uint j = row & 7u;
-    uint r0 = (t & 3u) * 2u;
-    uint r = r0 + ((j & 1u) != 0u ? 1u : 0u) + ((j & 2u) != 0u ? 8u : 0u);
-    uint c0 = t >> 2u;
-    uint c = c0 + ((j & 4u) != 0u ? 8u : 0u);
-    return r * 16u + c;
+// EXL3 tiles are stored row-major; see the note in linear.metal.
+static uint permutation_index(uint row, uint mode) {
+    return row;
 }
 
 kernel void exl3_decode_tile(
@@ -96,12 +122,11 @@ kernel void exl3_decode_tile(
     if (gid >= 256u) {
         return;
     }
-    uint lane = permutation_index(gid);
     uint state;
     if (params.rate < 16u) {
-        state = integer_window(packed, lane, params.rate);
+        state = integer_code_at(packed, state_for_tile(gid / 16u, gid % 16u), params.rate);
     } else {
-        state = fractional_window(packed, lane, params.rate - 16u);
+        state = fractional_window(packed, permutation_index(gid, 0u), params.rate - 16u);
     }
     output[gid] = decode_state(state, params.codebook);
 }

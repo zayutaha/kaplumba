@@ -1,7 +1,14 @@
 pub mod config;
 pub mod exl3;
+pub mod generate;
+pub mod gpu_cache;
+pub mod kv_cache;
 pub mod metal;
+pub mod metrics;
+pub mod model;
 pub mod safetensors;
+pub mod sampler;
+pub mod tokenizer;
 pub mod weights;
 
 pub const ENGINE_NAME: &str = "kaplumba-engine";
