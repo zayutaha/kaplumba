@@ -59,6 +59,7 @@ pub struct AttentionKernels {
     device: Device,
     queue: CommandQueue,
     _library: Library,
+    online_attention_pipeline: ComputePipelineState,
     online_attention_256_pipeline: ComputePipelineState,
     online_attention_512_pipeline: ComputePipelineState,
     scores_pipeline: ComputePipelineState,
@@ -86,6 +87,7 @@ impl AttentionKernels {
         let combine_pipeline = extra("attention_combine")?;
         let scores_coalesced_pipeline = extra("attention_scores_coalesced")?;
         let row_reduce_coalesced_pipeline = extra("attention_row_reduce_coalesced")?;
+        let online_attention_pipeline = extra("online_attention")?;
         let online_attention_256_pipeline = extra("online_attention_256")?;
         let online_attention_512_pipeline = extra("online_attention_512")?;
         let queue = device.new_command_queue();
@@ -93,6 +95,7 @@ impl AttentionKernels {
             device,
             queue,
             _library: library,
+            online_attention_pipeline,
             online_attention_256_pipeline,
             online_attention_512_pipeline,
             scores_pipeline,
@@ -314,11 +317,7 @@ impl AttentionKernels {
         let pipeline = match head_dim {
             256 => &self.online_attention_256_pipeline,
             512 => &self.online_attention_512_pipeline,
-            _ => {
-                return Err(KernelError::InvalidInput(format!(
-                    "prefill attention head_dim must be 256 or 512, got {head_dim}"
-                )))
-            }
+            _ => &self.online_attention_pipeline,
         };
         encoder.dispatch_1d(
             pipeline,

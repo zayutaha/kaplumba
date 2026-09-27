@@ -339,3 +339,72 @@ kernel void online_attention_512(
     uint gid [[thread_position_in_grid]]) {
     online_attention_body<512>(queries, keys, values, query_positions, key_positions, output, params, gid);
 }
+
+// Generic fallback for a head_dim with no specialisation. Kept because the
+// kernel's public contract accepts any head_dim up to 512, and the engine tests
+// exercise small ones. Slow (runtime bound => the accumulator spills) but
+// correct; the model itself only ever hits the 256 and 512 instantiations.
+kernel void online_attention(
+    const device half *queries [[buffer(0)]],
+    const device half *keys [[buffer(1)]],
+    const device half *values [[buffer(2)]],
+    const device uint *query_positions [[buffer(3)]],
+    const device uint *key_positions [[buffer(4)]],
+    device half *output [[buffer(5)]],
+    constant AttentionParams &params [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= params.queries * params.q_heads) {
+        return;
+    }
+    uint query = gid / params.q_heads;
+    uint query_head = gid % params.q_heads;
+    uint groups = params.q_heads / params.kv_heads;
+    uint key_head = query_head / groups;
+    uint query_base = (query * params.q_heads + query_head) * params.head_dim;
+    uint query_position = query_positions[query];
+    float accum[512];
+    for (uint i = 0; i < params.head_dim; ++i) {
+        accum[i] = 0.0f;
+    }
+    float maximum = -3.402823466e+38f;
+    float total = 0.0f;
+    for (uint key_index = 0; key_index < params.key_count; ++key_index) {
+        uint key_position = key_positions[key_index];
+        if (key_position > query_position) {
+            continue;
+        }
+        if (params.window != 0u && query_position - key_position >= params.window) {
+            continue;
+        }
+        uint key_base = (key_index * params.kv_heads + key_head) * params.head_dim;
+        float score = 0.0f;
+        for (uint dimension = 0; dimension < params.head_dim; ++dimension) {
+            score += float(queries[query_base + dimension]) * float(keys[key_base + dimension]);
+        }
+        score *= params.scale;
+        if (maximum == -3.402823466e+38f) {
+            maximum = score;
+            total = 1.0f;
+            for (uint dimension = 0; dimension < params.head_dim; ++dimension) {
+                accum[dimension] = float(values[key_base + dimension]);
+            }
+        } else if (score > maximum) {
+            float factor = exp(maximum - score);
+            total = total * factor + 1.0f;
+            maximum = score;
+            for (uint dimension = 0; dimension < params.head_dim; ++dimension) {
+                accum[dimension] = accum[dimension] * factor + float(values[key_base + dimension]);
+            }
+        } else {
+            float factor = exp(score - maximum);
+            total += factor;
+            for (uint dimension = 0; dimension < params.head_dim; ++dimension) {
+                accum[dimension] += factor * float(values[key_base + dimension]);
+            }
+        }
+    }
+    float norm = total > 0.0f ? 1.0f / total : 0.0f;
+    for (uint dimension = 0; dimension < params.head_dim; ++dimension) {
+        output[query_base + dimension] = half(accum[dimension] * norm);
+    }
+}
