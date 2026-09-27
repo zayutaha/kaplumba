@@ -369,6 +369,33 @@ impl DecoderLayerWeights {
     }
 }
 
+/// Per-operation wall-clock accumulator for the phase profiler.
+///
+/// Encoding is not free, so timing individual operations means reading the CPU
+/// clock around each dispatch. That includes host-side encode cost, not just GPU
+/// execution, which is exactly what we want here: a decode step taking 812 ms
+/// for work that should take 4 ms is either a slow kernel or a slow submit, and
+/// this distinguishes them.
+pub struct OpTimer<'t> {
+    map: &'t mut std::collections::BTreeMap<&'static str, f64>,
+    last: std::time::Instant,
+    on: bool,
+}
+
+impl<'t> OpTimer<'t> {
+    fn new(map: &'t mut std::collections::BTreeMap<&'static str, f64>, on: bool) -> Self {
+        Self { map, last: std::time::Instant::now(), on }
+    }
+
+    pub fn lap(&mut self, name: &'static str) {
+        if self.on {
+            let now = std::time::Instant::now();
+            *self.map.entry(name).or_default() += now.duration_since(self.last).as_secs_f64() * 1e6;
+            self.last = now;
+        }
+    }
+}
+
 pub struct DecoderLayer {
     pub config: LayerConfig,
     pub weights: DecoderLayerWeights,
@@ -541,6 +568,7 @@ impl DecoderLayer {
     /// and the scratch buffers, so a whole forward can be encoded as a single
     /// batch and synchronised once instead of ~21 times per layer.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_buffer(
         &mut self,
         input: &Buffer,
@@ -548,7 +576,25 @@ impl DecoderLayer {
         tokens: usize,
         scratch: &ForwardScratch,
         encoder: &mut MetalEncoder,
+        timer: &mut OpTimer,
     ) -> Result<(), ModelError> {
+        // Attribution switch: skip every non-linear op so the GEMV share of a
+        // decode step can be measured directly. Output is meaningless with this
+        // on; it exists only to answer "where does the 793 ms go".
+        if std::env::var_os("KAPLUMBA_LINEARS_ONLY").is_some() {
+            self.encode_linear(encoder, &self.weights.q_proj, input, &scratch.q, tokens, scratch)?;
+            self.encode_linear(encoder, &self.weights.k_proj, input, &scratch.k, tokens, scratch)?;
+            if let Some(v) = &self.weights.v_proj {
+                self.encode_linear(encoder, v, input, &scratch.v, tokens, scratch)?;
+            }
+            self.encode_linear(encoder, &self.weights.o_proj, &scratch.q, output, tokens, scratch)?;
+            let gate = &scratch.gate;
+            let up = &scratch.up;
+            self.encode_linear(encoder, &self.weights.gate_proj, input, gate, tokens, scratch)?;
+            self.encode_linear(encoder, &self.weights.up_proj, input, up, tokens, scratch)?;
+            self.encode_linear(encoder, &self.weights.down_proj, up, output, tokens, scratch)?;
+            return Ok(());
+        }
         let config = &self.config;
         let hidden = config.hidden_size;
         let inter = config.intermediate_size;
@@ -1720,7 +1766,25 @@ impl TextModel {
             std::ptr::copy_nonoverlapping(token_ids.as_ptr(), token_ptr, tokens);
         }
 
+        // KAPLUMBA_PROFILE_PHASES=1 commits and waits at each phase boundary
+        // instead of batching the whole forward into one command buffer. The
+        // absolute numbers are slightly pessimistic because it removes the
+        // natural overlap between phases, but the distribution is what we need to
+        // find out where a decode step actually goes.
+        let profile = std::env::var_os("KAPLUMBA_PROFILE_PHASES").is_some();
         let mut encoder = MetalEncoder::new(&self.forward_queue)?;
+        let mut phase = std::time::Instant::now();
+        let mut embed_ms = 0.0_f64;
+        let mut layer_ms = 0.0_f64;
+        let mut head_ms = 0.0_f64;
+        macro_rules! mark {
+            ($acc:ident) => {
+                if profile {
+                    $acc += phase.elapsed().as_secs_f64() * 1e3;
+                    phase = std::time::Instant::now();
+                }
+            };
+        }
         let hidden = self.hidden_size;
         let vocab = self.vocab_size;
         let scale = (hidden as f32).sqrt();
@@ -1744,6 +1808,15 @@ impl TextModel {
             self.embedding_is_bf16,
         )?;
 
+        if profile {
+            encoder.flush_and_wait()?;
+            mark!(embed_ms);
+        }
+        // Per-op accumulation inside the layer body, enabled by the phase
+        // profiler. Sums microseconds across all layers.
+        let mut op_us: std::collections::BTreeMap<&'static str, f64> =
+            std::collections::BTreeMap::new();
+        let mut timer = OpTimer::new(&mut op_us, profile);
         let layers = self.layers.len();
         for index in 0..layers {
             let (input, output) = if index % 2 == 0 {
@@ -1757,7 +1830,24 @@ impl TextModel {
                 tokens,
                 &self.scratch,
                 &mut encoder,
+                &mut timer,
             )?;
+        }
+        let encode_done = std::time::Instant::now();
+        if profile {
+            encoder.flush_and_wait()?;
+            mark!(layer_ms);
+            eprintln!(
+                "  SPLIT layers: cpu_encode={:.2}ms gpu_wait={:.2}ms",
+                encode_done.duration_since(phase).as_secs_f64() * 1e3,
+                layer_ms - encode_done.duration_since(phase).as_secs_f64() * 1e3
+            );
+            let mut total_us = 0.0;
+            for (name, us) in &op_us {
+                eprintln!("  OP {name:<22} {:>9.2} ms", us / 1e3);
+                total_us += *us;
+            }
+            eprintln!("  OP {:<22} {:>9.2} ms of {layer_ms:.2} ms", "(unattributed)", (layer_ms * 1e3 - total_us) / 1e3);
         }
         // Layer k writes into hidden_b when k is even and hidden_a when k is odd,
         // so the final hidden state lives in hidden_a for an even layer count.
@@ -1778,6 +1868,13 @@ impl TextModel {
         )?;
         self.encode_lm_head(&mut encoder)?;
         encoder.commit_and_wait()?;
+        mark!(head_ms);
+        if profile {
+            let total = embed_ms + layer_ms + head_ms;
+            eprintln!(
+                "PHASE tokens={tokens} embed={embed_ms:.2}ms layers={layer_ms:.2}ms                  head={head_ms:.2}ms total={total:.2}ms"
+            );
+        }
 
         let logits = self.scratch.capped.contents() as *const u16;
         Ok(unsafe { std::slice::from_raw_parts(logits, vocab) }.to_vec())

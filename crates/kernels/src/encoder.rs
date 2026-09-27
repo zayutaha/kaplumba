@@ -38,7 +38,9 @@ impl<'a> TensorRef<'a> {
 pub struct MetalEncoder<'q> {
     command_buffer: &'q CommandBufferRef,
     encoder: &'q ComputeCommandEncoderRef,
-    _queue: PhantomData<&'q CommandQueue>,
+    /// Kept so `flush_and_wait` can start a fresh command buffer; a compute
+    /// encoder cannot be used after `end_encoding`.
+    queue: &'q CommandQueue,
 }
 
 impl<'q> MetalEncoder<'q> {
@@ -48,7 +50,7 @@ impl<'q> MetalEncoder<'q> {
         Ok(Self {
             command_buffer,
             encoder,
-            _queue: PhantomData,
+            queue,
         })
     }
 
@@ -166,6 +168,22 @@ impl<'q> MetalEncoder<'q> {
     }
 
     /// End encoding, commit, and block until the batch has completed.
+    /// End the current compute encoder, commit, and wait, without consuming self.
+    ///
+    /// Lets a caller profile phases of one logical forward pass by splitting it
+    /// across several command buffers. `KAPLUMBA_PROFILE_PHASES` uses this.
+    pub fn flush_and_wait(&mut self) -> Result<(), KernelError> {
+        self.encoder.end_encoding();
+        self.command_buffer.commit();
+        self.command_buffer.wait_until_completed();
+        // A compute encoder is single-use, so continue on a fresh buffer. The
+        // previous one stays alive until this struct drops, which is what keeps
+        // the reference valid.
+        self.command_buffer = self.queue.new_command_buffer();
+        self.encoder = self.command_buffer.new_compute_command_encoder();
+        Ok(())
+    }
+
     pub fn commit_and_wait(self) -> Result<(), KernelError> {
         self.encoder.end_encoding();
         self.command_buffer.commit();
