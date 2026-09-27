@@ -263,3 +263,70 @@ Also fixed along the way: `forward_buffer` created its Metal encoder before
 validating, so every error return dropped a command encoder that was never ended
 and Metal asserted at dealloc. The wrapper now validates first and abandons the
 encoder explicitly on the error path.
+
+## Correction: the roofline, recomputed properly (2026-09-27)
+
+I previously claimed 14 tok/s needed ~234 GB/s, above this machine's streaming
+ceiling, and was therefore unreachable. That was wrong -- I undercounted the
+per-layer ideal by 2x. The real arithmetic, from the actual config
+(hidden 5376, intermediate 21504, 60 layers, 3.04 bpw measured):
+
+    layer stack   10.93 GB
+    lm_head        0.54 GB
+    TOTAL/token   11.47 GB
+
+    absolute ceiling @ 222 GB/s   19.4 tok/s
+    14 tok/s needs  160.6 GB/s  =  72% of streaming
+
+So 14 tok/s is demanding but reachable. Correcting the record here because the
+wrong number would have justified giving up on a target that is in range.
+
+### Where the time actually goes (136.35 ms/token)
+
+    matvec (sum of parts)   109.0 ms   80%
+    attention                13.0 ms   10%
+    lm_head                   8.5 ms    6%
+    norms                    ~3.0 ms    2%
+
+### The matvec is ALU-bound, not bandwidth-bound
+
+Bandwidth per projection tracks threadgroup count, not matrix size -- the same
+kernel at the same K:
+
+    proj        N     tgroups  tg/core   GB/s   %stream
+    k_proj   4096       256      12.8    34.0     15%
+    v_proj   4096       256      12.8    33.9     15%
+    o_proj   5376       336      16.8   105.9     48%
+    q_proj   8192       512      25.6    69.0     31%
+    gate    21504      1344      67.2   119.3     54%
+    up      21504      1344      67.2   120.1     54%
+    down    21504      1344      67.2   113.9     51%
+
+k/v at 15% of streaming with 44 MB matrices is not a bandwidth problem. It is
+too few threadgroups to hide memory latency. Separately, per weight the kernel
+spends ~6.5 ALU ops (cmp+select+shift, mask, codebook LUT, FMA) and measured
+`alu_peak` gives 2.84e12 logic ops/s, so:
+
+     7 tok/s = 46% of logic ALU peak     (we are here)
+    10 tok/s = 66%
+    12 tok/s = 79%
+    14 tok/s = 92%   <- requires near-perfect ALU efficiency
+    18 tok/s = 118%  <- provably impossible at 3.04 bpw
+
+Best projection sits at 54% of streaming and 45% of logic peak simultaneously.
+Both saturating together is the signature of an ALU-bound kernel, and it means
+**bandwidth work alone cannot reach 14**: the decode arithmetic is the wall.
+That is also exactly why ishizuki's load-time transcode is worth 1.25x -- it
+hoists the LUT/shift work to load time, leaving a FMA-only inner loop.
+
+### Next, in order
+
+1. Fuse q/k/v into one dispatch (N=16384, 1024 tgroups instead of 256/256/512).
+   One pass over x instead of three. ~0.12 ms/layer -> ~7 ms/token.
+2. Give o_proj more parallelism (336 tgroups, 48% of streaming). ~1 ms/token.
+3. Attack the ALU inner loop directly: the `(r <= 64u) ? a >> (64u-r) : c >> (96u-r)`
+   select is resolved per weight per iteration and should be hoisted, since for a
+   fixed 8-weight group the branch is uniform across the unrolled body.
+4. Then the transcode, which is the only lever that removes ALU work rather
+   than relocating it. Budget check required: 10-40% more weight memory against
+   0.49 GiB of headroom.
