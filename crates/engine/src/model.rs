@@ -19,6 +19,32 @@ use crate::metal::{DEFAULT_RESIDENT_LIMIT_BYTES, MetalContext, MetalError};
 use crate::safetensors::inspect_model_dir;
 use crate::weights::{TextWeights, WeightError};
 
+/// Rows of prompt fed through one pass of the network.
+///
+/// Caps the activation scratch independently of prompt length, per AGENTS.md §8.
+/// 256 rows is the largest power of two whose total `ForwardScratch` fits the
+/// 100 MiB budget. Measured, not estimated — the breakdown at 256 rows:
+///
+/// | buffer | bytes | scales with chunk |
+/// |---|---|---|
+/// | `raw` (f32, `chunk * inter`) | 22.02 MB | yes |
+/// | `transformed` (u16, `chunk * inter`) | 11.01 MB | yes |
+/// | `gate` + `up` + `activated` (u16, `chunk * inter`) | 33.03 MB | yes |
+/// | `q` (u16, `chunk * q_max`, q_max = 16384) | 8.39 MB | yes |
+/// | `k` + `v` (u16, `chunk * kv_max`, kv_max = 4096) | 4.19 MB | yes |
+/// | `hidden_a/b/normed/attended/proj` (u16, `chunk * hidden`) | 13.76 MB | yes |
+/// | `attn_scores` (f32, `q_heads * capacity` = 32 * 8192) | 1.05 MB | no |
+/// | `logits` + `capped` + fixed | 1.20 MB | no |
+/// | **total** | **~90 MB** | |
+///
+/// This was 64 rows until `attn_scores` was right-sized. It had been allocated
+/// `q_max * 1024` = `q_heads * head_dim * 1024` floats, but the buffer is indexed
+/// by *head*, so the real requirement is `q_heads * key_count`. That was one
+/// `head_dim` too many — 67.11 MB, which alone pushed a 256-row chunk to
+/// 160.7 MB and forced the chunk down to 64. Fixing it buys back the 4x larger
+/// chunk (fewer, fatter dispatches) *and* trims the minimum footprint.
+pub const PREFILL_CHUNK: usize = 256;
+
 #[derive(Debug, Error)]
 pub enum ModelError {
     #[error(transparent)]
@@ -1327,6 +1353,7 @@ impl ForwardScratch {
         kv_max: usize,
         inter: usize,
         vocab: usize,
+        attn_scores: usize,
     ) -> Result<Self, ModelError> {
         if max_tokens == 0 || hidden == 0 || vocab == 0 {
             return Err(ModelError::InvalidConfig(
@@ -1377,9 +1404,29 @@ impl ForwardScratch {
             last_hidden: u16_elements(1, hidden)?,
             logits: u16_elements(1, vocab)?,
             capped: u16_elements(1, vocab)?,
-            // One float per (head, key slot) for the largest cache any layer
-            // scans: q_max heads over the 1024-slot sliding ring.
-            attn_scores: f32_elements(q_max, 1024)?,
+            // One float per (query head, key slot) for the widest key scan any
+            // layer performs, i.e. `max(q_heads * capacity)`.
+            //
+            // This used to be `q_max * 1024`, which is one `head_dim` too many:
+            // `q_max` is `q_heads * head_dim` (16384), but the buffer is indexed
+            // by head alone, so the real requirement is `q_heads * key_count`
+            // (32 * 8192 = 262,144). That made it 512x oversized -- 67.11 MB of
+            // a 160.7 MB total. The oversizing is why it never overflowed.
+            attn_scores: device.new_buffer(
+                u64::try_from(
+                    attn_scores
+                        .checked_mul(std::mem::size_of::<f32>())
+                        .ok_or_else(|| {
+                            ModelError::InvalidConfig(
+                                "attention score scratch overflows".to_string(),
+                            )
+                        })?,
+                )
+                .map_err(|_| {
+                    ModelError::InvalidConfig("attention score scratch is too large".to_string())
+                })?,
+                options,
+            ),
             attn_row_max: f32_elements(1, q_max)?,
             attn_row_sum: f32_elements(1, q_max)?,
             greedy_best: device.new_buffer(4, options),
@@ -1529,12 +1576,15 @@ impl TextModel {
         let mut q_max = 0;
         let mut kv_max = 0;
         let mut inter = 0;
+        let mut attn_scores = 1;
         for layer in &layers {
             q_max = q_max.max(layer.config.q_heads * layer.config.head_dim);
             kv_max = kv_max.max(layer.config.kv_heads * layer.config.head_dim);
             inter = inter.max(layer.config.intermediate_size);
+            attn_scores = attn_scores.max(layer.config.q_heads * layer.gpu_cache.capacity());
         }
-        let scratch = ForwardScratch::new(1, hidden_size, q_max, kv_max, inter, vocab_size)?;
+        let scratch =
+            ForwardScratch::new(1, hidden_size, q_max, kv_max, inter, vocab_size, attn_scores)?;
         Ok(Self {
             embedding,
             embedding_buffer,
@@ -1935,7 +1985,49 @@ impl TextModel {
     ///
     /// This is what makes pipelined decode possible: a caller can queue many
     /// steps into one command buffer so the host never waits between them.
+    /// Feed `token_ids` through the model, splitting long prompts into bounded
+    /// chunks so the activation scratch is sized by the chunk and not by the
+    /// prompt length.
+    ///
+    /// AGENTS.md §8 requires the scratch to be explicitly owned, fixed-size and
+    /// independent of context length. A single-shot pass over an 8192-token
+    /// prompt made `ForwardScratch` about 2.5 GiB -- `raw` alone is
+    /// `tokens * inter * 4` bytes (672 MiB at 8192 tokens, `inter = 21504`).
+    /// Chunking keeps the whole scratch under the 100 MB budget.
+    ///
+    /// Chunking is semantically inert: positions are absolute, the KV cache
+    /// accumulates across chunks (`GPUKeyValueCache::advance` runs during each
+    /// chunk's encode, so `next_position` is correct for the next chunk), and
+    /// every row attends to exactly the keys it would have seen in one pass. The
+    /// LM head already runs on the last row only, so only the final chunk's
+    /// logits are returned.
     pub fn forward_buffer_into(
+        &mut self,
+        token_ids: &[u32],
+        positions: &[u32],
+        encoder: &mut MetalEncoder,
+    ) -> Result<Vec<u16>, ModelError> {
+        if token_ids.len() != positions.len() || token_ids.is_empty() {
+            return Err(ModelError::InvalidInput(
+                "model token and position counts must match and be non-empty".to_string(),
+            ));
+        }
+        if token_ids.len() <= PREFILL_CHUNK {
+            return self.forward_chunk(token_ids, positions, encoder);
+        }
+        let mut logits = Vec::new();
+        for (chunk_ids, chunk_positions) in token_ids
+            .chunks(PREFILL_CHUNK)
+            .zip(positions.chunks(PREFILL_CHUNK))
+        {
+            logits = self.forward_chunk(chunk_ids, chunk_positions, encoder)?;
+        }
+        Ok(logits)
+    }
+
+    /// One chunk of the forward pass. `token_ids` must be at most
+    /// [`PREFILL_CHUNK`] long; every buffer it touches is sized from that.
+    fn forward_chunk(
         &mut self,
         token_ids: &[u32],
         positions: &[u32],
@@ -2162,10 +2254,12 @@ impl TextModel {
         let mut q_max = 0;
         let mut kv_max = 0;
         let mut inter = 0;
+        let mut attn_scores = 1;
         for layer in &self.layers {
             q_max = q_max.max(layer.config.q_heads * layer.config.head_dim);
             kv_max = kv_max.max(layer.config.kv_heads * layer.config.head_dim);
             inter = inter.max(layer.config.intermediate_size);
+            attn_scores = attn_scores.max(layer.config.q_heads * layer.gpu_cache.capacity());
         }
         self.scratch = ForwardScratch::new(
             tokens,
@@ -2174,6 +2268,7 @@ impl TextModel {
             kv_max,
             inter,
             self.vocab_size,
+            attn_scores,
         )?;
         self.scratch_tokens = tokens;
         Ok(())
@@ -2203,6 +2298,15 @@ impl TextModel {
 
     pub fn scratch_resident_bytes(&self) -> u64 {
         self.scratch.resident_bytes()
+    }
+
+    /// Rows the activation scratch is currently sized for.
+    ///
+    /// Must never exceed [`PREFILL_CHUNK`]: AGENTS.md §8 requires the scratch to
+    /// be fixed-size and independent of context length, so this is an assertion
+    /// surface for "did a long prompt sneak past the chunking".
+    pub fn scratch_max_tokens(&self) -> usize {
+        self.scratch.max_tokens
     }
 
     pub fn gpu_next_position(&self) -> usize {

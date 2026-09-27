@@ -3,7 +3,7 @@
 //! Isolated and ignored by default so a crash here points at `forward_buffer`
 //! rather than at generation, sampling, or detokenisation.
 
-use kaplumba_engine::model::TextModel;
+use kaplumba_engine::model::{PREFILL_CHUNK, TextModel};
 
 fn model_path() -> String {
     std::env::var("KAPLUMBA_TEST_MODEL").expect("KAPLUMBA_TEST_MODEL is required")
@@ -363,4 +363,43 @@ fn real_model_path_bisect() {
             arg(&g)
         );
     }
+}
+
+/// AGENTS.md §8: the activation scratch must be explicitly owned, fixed-size and
+/// independent of context length.
+///
+/// Before chunked prefill, a prompt of N tokens made `ForwardScratch` N rows
+/// deep -- `raw` alone is `tokens * inter * 4` bytes, 672 MiB at 8192 tokens.
+/// Now the pass runs in `PREFILL_CHUNK`-row chunks, so the scratch is capped no
+/// matter how long the prompt is and only the pre-allocated KV cache grows.
+///
+/// PROMPT is deliberately greater than one chunk, so the assertion is that the
+/// scratch did *not* scale to 300 rows.
+#[test]
+#[ignore = "requires KAPLUMBA_TEST_MODEL; asserts scratch does not scale with prompt length"]
+fn real_model_prefill_scratch_is_independent_of_prompt_length() {
+    let mut model = TextModel::load_from_dir(std::path::Path::new(&model_path())).unwrap();
+    model.reset_gpu_caches();
+
+    const PROMPT: usize = 300;
+    assert!(PROMPT > PREFILL_CHUNK, "test must span more than one chunk");
+    let tokens = vec![2_u32; PROMPT];
+    let positions: Vec<u32> = (0..PROMPT as u32).collect();
+
+    let logits = model.forward_buffer(&tokens, &positions).unwrap();
+    assert_eq!(logits.len(), model.vocab_size());
+
+    assert_eq!(
+        model.scratch_max_tokens(),
+        PREFILL_CHUNK,
+        "scratch grew to {} rows for a {PROMPT}-token prompt; chunking regressed",
+        model.scratch_max_tokens()
+    );
+    let scratch = model.scratch_resident_bytes();
+    assert!(
+        scratch <= 100 * 1024 * 1024,
+        "scratch is {scratch} bytes, over the 100 MB budget"
+    );
+    let (weights, kv, scratch) = model.allocation_breakdown();
+    println!("weights={weights} kv={kv} scratch={scratch}");
 }
