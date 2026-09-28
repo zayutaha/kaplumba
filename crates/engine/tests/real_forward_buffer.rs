@@ -374,14 +374,18 @@ fn real_model_path_bisect() {
 /// matter how long the prompt is and only the pre-allocated KV cache grows.
 ///
 /// PROMPT is deliberately greater than one chunk, so the assertion is that the
-/// scratch did *not* scale to 300 rows.
+/// scratch did *not* scale to the prompt's full length. It is written relative
+/// to `PREFILL_CHUNK` because that constant is a measured performance choice
+/// that has moved before (64 -> 256 -> 1024) and a hardcoded 300 would have
+/// silently stopped spanning a chunk the day it crossed 300.
 #[test]
 #[ignore = "requires KAPLUMBA_TEST_MODEL; asserts scratch does not scale with prompt length"]
 fn real_model_prefill_scratch_is_independent_of_prompt_length() {
     let mut model = TextModel::load_from_dir(std::path::Path::new(&model_path())).unwrap();
     model.reset_gpu_caches();
 
-    const PROMPT: usize = 300;
+    const SLACK: usize = 44;
+    let PROMPT: usize = PREFILL_CHUNK + SLACK;
     assert!(PROMPT > PREFILL_CHUNK, "test must span more than one chunk");
     let tokens = vec![2_u32; PROMPT];
     let positions: Vec<u32> = (0..PROMPT as u32).collect();
@@ -395,10 +399,19 @@ fn real_model_prefill_scratch_is_independent_of_prompt_length() {
         "scratch grew to {} rows for a {PROMPT}-token prompt; chunking regressed",
         model.scratch_max_tokens()
     );
+    // The point of the check is that the scratch is a function of PREFILL_CHUNK
+    // and not of PROMPT, so the budget is per row rather than a fixed 100 MB.
+    // The scratch is ~366 KB/row and barely changes per row (93.7 MB at 256,
+    // 372 MB at 1024), so 400 KB/row is 1.09x the real figure -- tight enough
+    // to catch a new buffer, and still 22x below what a prompt-sized scratch
+    // (raw alone is 672 MiB at 8192 tokens) would need. At 1024 rows that
+    // 372 MB is a deliberate, measured trade; see PREFILL_CHUNK.
+    const BUDGET_PER_ROW: u64 = 400 * 1024;
     let scratch = model.scratch_resident_bytes();
     assert!(
-        scratch <= 100 * 1024 * 1024,
-        "scratch is {scratch} bytes, over the 100 MB budget"
+        scratch <= BUDGET_PER_ROW * PREFILL_CHUNK as u64,
+        "scratch is {scratch} bytes, over the {} byte budget for {PREFILL_CHUNK} rows",
+        BUDGET_PER_ROW * PREFILL_CHUNK as u64
     );
     let (weights, kv, scratch) = model.allocation_breakdown();
     println!("weights={weights} kv={kv} scratch={scratch}");

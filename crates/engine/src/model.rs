@@ -24,8 +24,75 @@ use crate::weights::{TextWeights, WeightError};
 /// Rows of prompt fed through one pass of the network.
 ///
 /// Caps the activation scratch independently of prompt length, per AGENTS.md §8.
-/// 256 rows is the largest power of two whose total `ForwardScratch` fits the
-/// 100 MiB budget. Measured, not estimated — the breakdown at 256 rows:
+/// 1024 rows: measured, not chosen for tidiness. The breakdown at 1024 rows:
+///
+/// | buffer | bytes | scales with chunk |
+/// |---|---|---|
+/// | `raw` (f32, `chunk * inter`) | 88.08 MB | yes |
+/// | `transformed` (u16, `chunk * inter`) | 44.04 MB | yes |
+/// | `gate` + `up` + `activated` (u16, `chunk * inter`) | 132.12 MB | yes |
+/// | `q` (u16, `chunk * q_max`, q_max = 16384) | 33.55 MB | yes |
+/// | `k` + `v` (u16, `chunk * kv_max`, kv_max = 4096) | 16.78 MB | yes |
+/// | `hidden_a/b/normed/attended/proj` (u16, `chunk * hidden`) | 55.05 MB | yes |
+/// | `attn_partials` (f32, `16 splits * q_heads * (head_dim + 2)`) | 1.05 MB | no |
+/// | `logits` + `capped` + fixed | 1.20 MB | no |
+/// | **total** | **~372 MB** | |
+///
+/// That is 4x the 93 MB it was at 256 rows, and the standing budget is 12 GiB
+/// of a 24 GiB box, so it has to be paid for out of measured RSS. It is:
+/// interleaved A/B on the real checkpoint, `--max-new-tokens 1 --metrics`,
+/// `peak_rss_bytes` median of 5 at 614 tokens and 5 at 7814:
+///
+/// | chunk | 614 tok/s | rss @614 | 7814 tok/s | rss @7814 |
+/// |---|---:|---:|---:|---:|
+/// | 256 | 70.62 (69.75-70.93) | 7.85 GiB | 69.34 (69.08-69.42) | 8.15 GiB |
+/// | 512 | 71.97 (71.52-72.21) | 7.90 GiB | -- | -- |
+/// | **1024** | **77.79 (77.55-78.23)** | **8.01 GiB** | **74.57 (74.30-74.59)** | **7.91 GiB** |
+///
+/// +160 MB at 614 and nothing measurable at 7814 -- the extra scratch displaces
+/// file cache, not the 15.5 GB of weights. Budget headroom is unchanged.
+///
+/// ### Why the chunk size is what it is
+///
+/// The premise for raising it was that a 614-token prompt's last 102-token
+/// chunk is only 40% of a 512-row tile. **That premise is false, and the
+/// measurement says so.** `linear_gemm_mma` dispatches
+/// `ceil(queries / 128)` threadgroups along y, so the number of 128-query tiles
+/// is a property of the TOKEN count, not of the chunk count: 614 tokens is
+/// `ceil(614/128) = 5` tiles whether they arrive as 256+256+102, as 512+102, or
+/// as one 614-row chunk. Measured per-chunk GEMM own_ms at 614 tokens, from the
+/// `KAPLUMBA_GPU_PROFILE=1` per-chunk table:
+///
+/// | chunk | tiles/dispatch | ms per 128-row tile | GEMM total |
+/// |---|---:|---:|---:|
+/// | 128 | 1 | 1354.0 | 6783.5 |
+/// | 256 | 2, 2, 1 | 1271.7 | 6429.6 |
+/// | 512 | 4, 1 | 1222.8 | 6235.9 |
+/// | 1024 | 5 | 1204.1 | 6020.7 |
+///
+/// All four issue the same 5 tiles and waste the same 26 of 640 rows (4.06%);
+/// what improves monotonically is the ms *per tile* as the grid grows, because a
+/// small grid does not fill 20 GPU cores. So the loss was never the partial
+/// tail -- that part is irreducible without sub-128-row tiles, which the 8x8 MMA
+/// shape cannot use -- it was that splitting 5 tiles across 3 dispatches cost
+/// 6.4% of GEMM versus issuing them as one. 256 -> 1024 is 4x the scratch for
+/// 10.2% at 614 tokens and 7.5% at 7814.
+///
+/// 2048 was not adopted: it needs 743 MB of scratch for no measured gain once
+/// the grid is already 1344 threadgroups, and it pushes a 7814-token prompt to
+/// four chunks rather than eight. The knob stays at 1024, the largest power of
+/// two that still covers a 614-token prompt in ONE dispatch.
+///
+/// The `128`-row entry is the control that proves the story: it issues the same
+/// 5 tiles in 5 dispatches of 1 and is the slowest of all four.
+///
+/// ### What is NOT in this table
+///
+/// Per-element accumulation order. A chunk boundary splits QUERY rows, never K,
+/// so every output element is still produced by exactly one threadgroup running
+/// the identical K loop: outputs are bit-identical at 256 and at 1024 rows, and
+/// `linear_metal`'s 2.1603336e-3 worst error is untouched. Only the dispatch
+/// grid changes.
 ///
 /// | buffer | bytes | scales with chunk |
 /// |---|---|---|
@@ -49,7 +116,27 @@ use crate::weights::{TextWeights, WeightError};
 /// capacity instead of the live key count broke decode outright past 1024 keys.
 /// It is now split-KV flash decoding: `ATTENTION_SPLITS_MAX * q_heads *
 /// (head_dim + 2)` floats, fixed, with no dependence on context length.
-pub const PREFILL_CHUNK: usize = 256;
+pub const PREFILL_CHUNK: usize = 1024;
+
+/// MEASUREMENT OVERRIDE: `KAPLUMBA_PREFILL_CHUNK=N` replaces [`PREFILL_CHUNK`]
+/// for this process so one binary can A/B chunk sizes without a rebuild per
+/// value. Falls back to the constant unless the variable names a power of two
+/// of at least 32. Not a product setting — nothing reads it in the shipped
+/// path, and it can push `scratch_max_tokens()` past [`PREFILL_CHUNK`], which
+/// the doc comment there forbids. It exists so the next agent does not have to
+/// rebuild five times to re-measure the table above.
+pub fn prefill_chunk() -> usize {
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        match std::env::var("KAPLUMBA_PREFILL_CHUNK")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+        {
+            Some(value) if value >= 32 && value.is_power_of_two() => value,
+            _ => PREFILL_CHUNK,
+        }
+    })
+}
 
 #[derive(Debug, Error)]
 pub enum ModelError {
@@ -532,7 +619,7 @@ fn env_flag(name: &str) -> bool {
 /// the forward stamps, so every number is GPU-clock time.
 ///
 /// One instance spans the whole `forward_buffer_into`, so a 614-token prefill
-/// (three 256-token chunks) produces one table, not three.
+/// (one 614-row chunk, since [`PREFILL_CHUNK`] is 1024) produces one table.
 pub struct GpuProfile {
     /// `KAPLUMBA_GPU_PROFILE=1`. When false every method is a no-op and
     /// [`Self::stamp`] returns without touching the encoder, so the non-profiling
@@ -543,6 +630,13 @@ pub struct GpuProfile {
     by_kernel: std::collections::BTreeMap<String, (u64, f64)>,
     /// `layer07` -> (invocations, total own ms), for the per-layer view.
     by_layer: std::collections::BTreeMap<String, (u64, f64)>,
+    /// MEASUREMENT AID: `"<rows>:<kernel>"` -> (invocations, total own ms), so a
+    /// multi-chunk prefill can be split per chunk. `rows` is the row count of the
+    /// chunk in flight when the stamp was ingested, which is the only place the
+    /// chunk length is known without threading it through every label.
+    by_chunk: std::collections::BTreeMap<String, (u64, f64)>,
+    /// Row count of the chunk currently being encoded.
+    chunk_rows: usize,
     /// Stamped buffers committed since the last drain.
     pending: usize,
     boundaries: u64,
@@ -571,6 +665,8 @@ impl GpuProfile {
             enabled,
             by_kernel: std::collections::BTreeMap::new(),
             by_layer: std::collections::BTreeMap::new(),
+            by_chunk: std::collections::BTreeMap::new(),
+            chunk_rows: 0,
             pending: 0,
             boundaries: 0,
             stamps_ingested: 0,
@@ -635,6 +731,7 @@ impl GpuProfile {
                 }
                 _ => (None, stamp.label.clone()),
             };
+            let kernel_name = kernel.clone();
             let kernel_slot = self.by_kernel.entry(kernel).or_default();
             kernel_slot.0 += 1;
             kernel_slot.1 += stamp.own_ms;
@@ -642,6 +739,12 @@ impl GpuProfile {
                 let layer_slot = self.by_layer.entry(layer).or_default();
                 layer_slot.0 += 1;
                 layer_slot.1 += stamp.own_ms;
+                let chunk_slot = self
+                    .by_chunk
+                    .entry(format!("{}r/{}", self.chunk_rows, kernel_name))
+                    .or_default();
+                chunk_slot.0 += 1;
+                chunk_slot.1 += stamp.own_ms;
             }
             self.total_own_ms += stamp.own_ms;
             self.total_gap_ms += stamp.gap_ms;
@@ -796,6 +899,12 @@ impl GpuProfile {
                 out.push_str(&format!("{name}={total:.1} "));
             }
             out.push('\n');
+        }
+        if !self.by_chunk.is_empty() {
+            out.push_str("  MEASUREMENT per-chunk (rowcount/kernel, count, total_ms):\n");
+            for (key, (count, total)) in &self.by_chunk {
+                out.push_str(&format!("    {key:<28} {count:>6} {total:>11.3}\n"));
+            }
         }
         out
     }
@@ -2456,8 +2565,8 @@ impl TextModel {
     ///
     /// Under `KAPLUMBA_GPU_PROFILE=1` this is also the scope of one profile
     /// report: the [`GpuProfile`] is created here, spans every chunk, and prints
-    /// one table when the last chunk is done. A 614-token prompt is three
-    /// chunks and one table, not three.
+    /// one table when the last chunk is done. A 614-token prompt is one
+    /// chunk and one table; an 8192-token prompt is eight and one table.
     /// Returns nothing: the softcapped logits row is read separately, through
     /// [`Self::last_logits`], once the caller's encoder has completed.
     pub fn forward_buffer_into(
@@ -2481,8 +2590,10 @@ impl TextModel {
         let mut gpu = GpuProfile::new(profile);
         gpu.tokens = token_ids.len();
         gpu.layers = self.layers.len();
-        let result: Result<(), ModelError> = if token_ids.len() <= PREFILL_CHUNK {
+        let chunk = prefill_chunk();
+        let result: Result<(), ModelError> = if token_ids.len() <= chunk {
             gpu.chunks += 1;
+            gpu.chunk_rows = token_ids.len();
             self.forward_chunk(token_ids, positions, encoder, &mut gpu, true)
         } else {
             // Only the last chunk's logits survive this loop, so only the last
@@ -2490,12 +2601,13 @@ impl TextModel {
             // chunk iterator is deterministic, so "no next chunk" is exactly
             // "last", and it costs no second pass over the token ids.
             let mut chunks = token_ids
-                .chunks(PREFILL_CHUNK)
-                .zip(positions.chunks(PREFILL_CHUNK))
+                .chunks(chunk)
+                .zip(positions.chunks(chunk))
                 .peekable();
             let mut outcome = Ok(());
             while let Some((chunk_ids, chunk_positions)) = chunks.next() {
                 gpu.chunks += 1;
+                gpu.chunk_rows = chunk_ids.len();
                 let last = chunks.peek().is_none();
                 if let Err(error) =
                     self.forward_chunk(chunk_ids, chunk_positions, encoder, &mut gpu, last)
@@ -2579,6 +2691,15 @@ impl TextModel {
         }
 
         // Shared-memory staging for the two small host-side arrays.
+        //
+        // These are HOST writes into SHARED memory, so every command buffer
+        // already committed must have finished reading them. With the rolling
+        // scheme up to MAX_IN_FLIGHT are outstanding, and skipping this made
+        // greedy output depend on scheduling: six runs of one 614-token prompt
+        // produced two different answers. The wait costs nothing measurable --
+        // the previous chunk's scratch is reused by this one regardless, so the
+        // GPU had to reach that point before this chunk could start anyway.
+        encoder.flush_and_wait()?;
         unsafe {
             let position_ptr = self.scratch.query_positions.contents() as *mut u32;
             std::ptr::copy_nonoverlapping(positions.as_ptr(), position_ptr, tokens);

@@ -167,7 +167,7 @@ impl ElementKernels {
     ///
     /// — 30x, because 256 threads is one or two threadgroups on a 20-core GPU
     /// while threadgroup-per-row launches 256 x 256. The old threshold of 32
-    /// therefore sent the *prefill* path (PREFILL_CHUNK = 256 rows) down the
+    /// therefore sent the *prefill* path (PREFILL_CHUNK = 1024 rows) down the
     /// 256-thread kernel, which is the worst of both. Kept as a constant so
     /// `KAPLUMBA_FORCE_PER_ROW_NORMS` can still A/B the two.
     const THREADGROUP_NORM_MAX_ROWS: usize = 8192;

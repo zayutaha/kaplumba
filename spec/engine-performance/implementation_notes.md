@@ -983,3 +983,121 @@ work rather than cut overhead. The load-bearing number to re-verify is that
 ~7.8 TFLOPS ceiling: `examples/mma_peak` prints 15.49 for the same instruction
 and cannot be reproduced, and one agent's own 8x8 probe printed 111 TFLOPS
 before `loop_ratio=0.359` showed the compiler had folded the loop away.
+
+## 14. `PREFILL_CHUNK` 256 -> 1024: the tail is not the problem, dispatch
+## fragmentation is. Plus a pre-existing nondeterminism bug in chunked prefill
+
+### 14.1 The premise was wrong, and the profile says so in one line
+
+The idea under test was "a 614-token prompt ends in a 102-token chunk that is
+only 40% of a 512-row tile, so raise `PREFILL_CHUNK`". The tile count refutes it:
+`linear_gemm_mma` dispatches `ceil(queries / 128)` threadgroups along y
+(`linear.rs:1043`), so **the number of 128-row tiles is a function of the token
+count, not the chunk count**. 614 tokens is `ceil(614/128) = 5` tiles whether the
+host slices it 256+256+102, 512+102, or 614. All four chunk sizes below issue
+the same 5 tiles and waste the same 26 of 640 rows (4.06%).
+
+`KAPLUMBA_GPU_PROFILE=1` was extended with a per-chunk row count
+(`by_chunk`, keyed `<rows>:<kernel>`) so a multi-chunk prefill can be split;
+counts come out exactly 60 per chunk per kernel, no drain smear, at
+`DRAIN_EVERY = 15`. GEMM own_ms at 614 tokens, grouped by tiles per dispatch:
+
+| `PREFILL_CHUNK` | tiles/dispatch | ms per 128-row tile | GEMM total |
+|---|---:|---:|---:|
+| 128 | 1 | 1354.0 | 6783.5 |
+| 256 | 2, 2, 1 | 1271.7 | 6429.6 |
+| 512 | 4, 1 | 1222.8 | 6235.9 |
+| 1024 | 5 | 1204.1 | 6020.7 |
+
+**The loss is 6.4% of GEMM, and it is grid size, not tail occupancy.** A small
+grid does not fill 20 GPU cores. The 128 row is the control that proves it: same
+5 tiles, five dispatches of one, slowest of all four. Sub-128-row tiles cannot
+help either -- 8x8 is the only MMA the hardware header instantiates (notes §13),
+and at 128-row granularity the waste is `(-tokens) mod 128` by construction.
+
+### 14.2 What shipped, and what it costs
+
+`PREFILL_CHUNK = 1024`. Interleaved A/B, real checkpoint,
+`--max-new-tokens 1 --metrics`, medians of 5, spreads 0.0-1.7%:
+
+| | 614 tok/s | rss @614 | 7814 tok/s | rss @7814 |
+|---|---:|---:|---:|---:|
+| 256 (before) | 70.62 (69.75-70.93) | 7.85 GiB | 69.34 (69.08-69.42) | 8.15 GiB |
+| 512 | 71.97 (71.52-72.21) | 7.90 GiB | -- | -- |
+| **1024 (after)** | **77.79 (77.55-78.23)** | **8.01 GiB** | **74.57 (74.30-74.59)** | **7.91 GiB** |
+
++10.2% at 614, +7.5% at 7814. Scratch 93 MB -> 372 MB, and `peak_rss_bytes` is
+flat-to-+160 MB, so the 12 GiB budget is untouched: the extra scratch displaces
+file cache, not the 15.5 GB of weights. 2048 was rejected -- 743 MB of scratch
+for no measured gain once the grid is already 1344 threadgroups.
+
+Per-element accumulation order is untouched (a chunk boundary splits QUERY rows,
+never K), `linear_metal` is 7/7 and its worst error is still 2.1603336e-3, and
+all five reference prompts are correct. **Sabotage check, as §3.4 demands**:
+retargeting `y7` to the wrong column chunk makes only
+`mma_prefill_gemm_matches_cpu_reference` fail, with `worst normalised error
+8.416497e-2 exceeds 2e-2`; removing the `if (r < params.queries)` store guard
+fails 7/7. So the suite really does cover the MMA path -- and note that only
+ONE of the seven tests does; the other six exercise `linear_gemv_tiled`.
+
+### 14.3 BUG FOUND, pre-existing and worse than the thing I was measuring
+
+Greedy output on a 614-token prompt is **nondeterministic at HEAD**, at either
+chunk size. Same binary, same prompt, three runs at `PREFILL_CHUNK=256`:
+
+```
+The theory of relativity is not
+Albert Einstein's theory of
+Since you asked many times,
+```
+
+and at 1024 two samples differed too. A short prompt that is 2 chunks at 256 and
+1 at 1024 flipped the other way (256 -> "Albert Einstein's", 1024 -> "Since you
+asked"), so it is not a function of chunk size. One-chunk prompts are always
+stable and correct.
+
+Cause: `forward_chunk` memcpys `scratch.token_ids` and `scratch.query_positions`
+from the host once per chunk, into `StorageModeShared` buffers, with **no
+barrier between chunks**, while `MetalEncoder::roll` keeps up to
+`MAX_IN_FLIGHT + 1 = 9` command buffers outstanding -- 450 dispatches of slack.
+A 256-row chunk is ~900 dispatches, and attention is stamp 8 of ~15 per layer, so
+the host reaches chunk N+1's write while the GPU is still in chunk N's middle
+layers, and the remaining layers attend non-causally (`q_abs` reads as
+256+query while only 256 keys exist). The hazard is documented for the *decode*
+path (`forward_buffer_into_step`, "The caller must hold a barrier across the
+next call") and was never applied to the prefill chunk loop.
+
+Repro, GPU-free to check, decisive -- any of these serialises and all four chunk
+sizes then agree on "Albert Einstein's theory of":
+
+```bash
+KAPLUMBA_MAX_IN_FLIGHT=1 KAPLUMBA_PREFILL_CHUNK=256 ...   # 128/256/1024 identical
+KAPLUMBA_PROFILE_PHASES=1 ...
+KAPLUMBA_GPU_PROFILE=1 ...
+```
+
+`KAPLUMBA_MAX_IN_FLIGHT` is a new measurement override in
+`crates/kernels/src/encoder.rs` (1 = wait on every rolled buffer). It exists
+because a 9-deep window is a licence to race, and without it there is no way to
+tell a real numerical difference between two chunk sizes from scheduling noise.
+
+Consequences: AGENTS.md §8's "no quality loss / greedy-identical" does not
+currently hold for any prompt longer than `PREFILL_CHUNK`, and every prefill
+benchmark on a multi-chunk prompt has been measuring a model whose output is a
+function of scheduling. **Not fixed here** -- it is a separate change with its
+own performance cost, and it deserves its own spec. What `PREFILL_CHUNK = 1024`
+does buy is exposure: 2 chunk boundaries at 614 tokens instead of 2 (0), 30
+instead of 7 at 7814, and 0 for any prompt up to 1024 tokens.
+
+### 14.4 Environment facts worth keeping
+
+- The engine's `flock` is what makes measurements trustworthy under contention:
+  every sample that appears in a table above ran with the GPU to itself, and
+  every sample lost to another agent's run was exit 75 and discarded. A second
+  agent was interleaving 8k benchmarks in `/tmp/wt-fuse-target` throughout; the
+  A/B interleaving absorbed it, but roughly a third of attempted runs were 75.
+- `scripts/ab.sh` / `scripts/dec.sh` / `scripts/prof.sh` / `scripts/bisect.sh` in
+  the throwaway worktree implement "on 75, discard the cell and carry on".
+  `scripts/prof.sh <chunk> <reps> <size>` is the one to reuse: it prints
+  `chunks=`, `prefill_tok_s`, `peak_rss_bytes`, summed GEMM ms, and the per-chunk
+  GEMM breakdown in one line per run.

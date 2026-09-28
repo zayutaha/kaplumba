@@ -178,6 +178,27 @@ pub const MAX_DISPATCHES_PER_BUFFER: u32 = 50;
 /// so staying well under that is deliberate.
 pub const MAX_IN_FLIGHT: usize = 8;
 
+/// MEASUREMENT OVERRIDE: `KAPLUMBA_MAX_IN_FLIGHT=N` shrinks the in-flight
+/// window, and 1 serialises completely (every rolled command buffer is waited
+/// on before the next is encoded).
+///
+/// This exists because a window of 9 is a *licence to race*: `forward_chunk`
+/// writes `scratch.token_ids` and `scratch.query_positions` from the host once
+/// per chunk, and with 9 buffers outstanding the GPU may still be hundreds of
+/// dispatches into the previous chunk when that happens. Setting this to 1 is
+/// how to tell a genuine numerical difference between two chunk sizes apart
+/// from the shared-memory race. Not a product setting.
+fn max_in_flight() -> usize {
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("KAPLUMBA_MAX_IN_FLIGHT")
+            .ok()
+            .and_then(|value| value.trim().parse::<usize>().ok())
+            .filter(|value| (1..=MAX_IN_FLIGHT).contains(value))
+            .unwrap_or(MAX_IN_FLIGHT)
+    })
+}
+
 impl<'q> MetalEncoder<'q> {
     pub fn new(queue: &'q CommandQueue) -> Result<Self, KernelError> {
         let (command_buffer, encoder) = Self::pair(queue);
@@ -424,7 +445,7 @@ impl<'q> MetalEncoder<'q> {
         self.end();
         self.command_buffer.commit();
         self.in_flight.push(self.command_buffer.clone());
-        if self.in_flight.len() > MAX_IN_FLIGHT {
+        if self.in_flight.len() > max_in_flight() {
             let oldest = self.in_flight.remove(0);
             oldest.wait_until_completed();
         }

@@ -2351,6 +2351,21 @@ kernel void linear_gemv_tiled(
 // x 4 tile rows -- the same decode helpers, the same bit-exact codes as
 // linear_gemv_tiled), (3) runs 8 steps x 16 MMAs, and repeats.
 //
+//  8. The y-grid is `ceil(queries / 128)` and NOTHING else. A prompt's tile
+//     count is therefore a function of its TOKEN count, not of how the host
+//     chose to slice it: 614 tokens is five 128-row tiles whether they arrive
+//     as 256+256+102 or as one 614-row dispatch, and the partial last tile
+//     costs a full tile because the MMAs are unconditional and only the store
+//     is row-guarded. What the host's chunk size does control is how many
+//     DISPATCHES those tiles arrive in, and that is worth 6.4% of GEMM on this
+//     box: measured per 128-row tile at 614 tokens, one dispatch per tile costs
+//     1354.0 ms, two per dispatch 1271.7, four 1222.8, five 1204.1 -- a small
+//     grid does not fill 20 GPU cores. Hence PREFILL_CHUNK = 1024 rather than
+//     256 (crates/engine/src/model.rs). Do not read "the tail chunk is
+//     partially occupied" as a defect to fix with a smaller tile: at 128-row
+//     granularity the waste is `(-tokens) mod 128` and cannot be removed, and
+//     sub-128-row tiles cannot use the 8x8 MMA shape at all.
+//
 // Products are half x half accumulated in f32; the summation order differs from
 // linear_gemv_tiled so outputs are close but not bit-identical (Q10: tensor
 // path accepted by user decision 2026-09-27). The tile shape does not change
