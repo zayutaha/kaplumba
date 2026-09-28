@@ -1,108 +1,67 @@
 #!/usr/bin/env bash
-# gpuq -- queue discipline for the single 24 GiB GPU box.
+# gpuq -- report on, and gently wrap, the single 24 GiB GPU box.
 #
 # WHY THIS EXISTS
 # The engine needs 11.5-15 GiB of unified memory. Two instances at once exceed
-# physical memory and start evicting and swapping, which this repo has already
-# measured at 3.9 GiB of swap and a collapse to ~1.4 tok/s (weights.rs:1217).
-# The in-binary flock (gpu_lock.rs) makes that impossible, but a 30-minute
-# blocking wait is its own failure: an agent that calls a benchmark and sits in
-# `flock` for twenty minutes has wasted twenty minutes, cannot report, and
-# cannot do the analysis that would have been useful meanwhile.
+# physical memory and were measured swapping 3.9 GiB and collapsing to ~1.4
+# tok/s (weights.rs:1217), and they also fight for bandwidth, which invalidates
+# every benchmark taken alongside.
 #
-# So: never block by default. Ask, get an instant answer, do something else,
-# ask again.
+# THIS SCRIPT TAKES NO LOCK. The engine is the only lock owner
+# (crates/engine/src/gpu_lock.rs, called from load_from_dir). An earlier version
+# of this script took the same lock and then ran the engine, which DEADLOCKED:
 #
-#   gpuq status          instant. Who holds it, who is waiting, free memory.
-#   gpuq try [-- cmd...] instant. Run only if free; exit 75 if busy.
-#   gpuq run [-- cmd...]  blocks until free, then runs. Long timeout, and it
-#                         prints a heartbeat so a stuck call is visible.
-#   gpuq exec -- cmd...   same as `run` but the command is mandatory.
+#   #!/bin/bash
+#   exec flock "$1" -c "flock '$1' -c 'echo CHILD-ACQUIRED'"
+#   # hangs forever
+#
+# A lock held by a parent is not inherited as held by the child. The child's
+# open() is a different open file description, so flock(LOCK_EX) conflicts with
+# the parent's and blocks; the parent waits for the child and the child waits
+# for the parent. It showed up as "gpuq try -- kaplumba" hanging forever while
+# "gpuq try -- echo" worked, because echo does not lock and kaplumba does. If
+# you are tempted to make this script lock anything, do not: the kernel lock in
+# the engine is the only thing that cannot be bypassed, and a stray direct run
+# from a worktree is exactly the case that silently held 11 GiB for 20 minutes.
+#
+# USAGE
+#   gpuq status          instant. Holder, queue depth, available memory.
+#   gpuq try  -- cmd...  run cmd; the engine decides. Exits 75 if the GPU is busy.
+#   gpuq run  -- cmd...  same, but sets KAPLUMBA_GPU_LOCK=wait for the engine.
 #
 # EXIT CODES
-#   0  ran, or lock was free
-#   75 lock was held (EX_TEMPFAIL -- "try again later", per sysexits)
+#   0  ran cleanly
+#   75 EX_TEMPFAIL: the GPU was busy and the engine declined. "Not now" --
+#      do other work and retry. Do NOT sleep and retry; that is how an agent
+#      ends up in a 20-minute call that looks like a hang.
 #   1  usage or runtime error
 #
-# Fairness: waiters are served in arrival order via a ticket file, so a long
-# benchmark cannot be starved by a stream of short ones.
+# Fairness is the engine's ticket queue, not this script's concern.
 
 set -uo pipefail
 
-LOCK="${KAPLUMBA_GPU_LOCK:-$HOME/.kaplumba/gpu.lock}"
-QUEUE="${KAPLUMBA_GPU_QUEUE:-${LOCK}.queue}"
-HEARTBEAT="${KAPLUMBA_GPU_HEARTBEAT:-5}"
+LOCK="${KAPLUMBA_GPU_LOCK_FILE:-$HOME/.kaplumba/gpu.lock}"
+QUEUE="${LOCK}.queue"
 
-# flock(1) is not on the default PATH on macOS (util-linux is a Homebrew keg),
-# and `lockf` does not take the same options. Prefer a real flock(1); fall back
-# to perl, which is always present and can call flock(2) directly. Getting this
-# wrong is silent -- a missing flock looks exactly like a free GPU -- so the
-# lookup is explicit and we fail loudly if neither works.
-FLOCK=""
-for candidate in "$(command -v flock 2>/dev/null)" \
-                 /opt/homebrew/bin/flock \
-                 "$(ls -1 /opt/homebrew/Cellar/util-linux/*/bin/flock 2>/dev/null | tail -1)"; do
-  if [ -n "$candidate" ] && [ -x "$candidate" ]; then FLOCK="$candidate"; break; fi
-done
-
-# try_lock: exit 0 if the lock is free. Must be safe to call at any time.
-try_lock() {
-  if [ -n "$FLOCK" ]; then
-    "$FLOCK" -n "$LOCK" -c true 2>/dev/null
-  else
-    perl -e '
-      use Fcntl qw(:flock);
-      open(my $fh, "+>>", $ARGV[0]) or exit 1;
-      exit(flock($fh, LOCK_EX | LOCK_NB) ? 0 : 1);
-    ' "$LOCK" 2>/dev/null
-  fi
+usage() {
+  sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
 }
 
-# run_locked: hold the lock while running "$@". Blocks until free.
-run_locked() {
-  # Stamp the lock file with the holder so `status` can name it, then exec under
-  # the lock. Writing before taking the lock is fine: the content is advisory.
-  printf '%s %s\n' "$$" "$*" > "$LOCK" 2>/dev/null
-  if [ -n "$FLOCK" ]; then
-    exec "$FLOCK" "$LOCK" -c "$(printf '%q ' "$@")"
-  fi
-  perl -e '
-    use Fcntl qw(:flock);
-    open(my $fh, "+>>", $ARGV[0]) or die "open $ARGV[0]: $!";
-    flock($fh, LOCK_EX) or die "flock: $!";
-    exec @ARGV;
-  ' "$LOCK" "$@"
-}
-
-# Memory available for a new model load, in GiB.
+# Available memory in GiB, as top reports it.
 #
-# This must NOT be "Pages free". On macOS that counter only counts pages that
-# have never been touched, so a machine with 11 GiB sitting in the file cache
-# reports under 1 GiB free -- which is how this script came to warn "below the
-# ~16 GiB a load needs" on a box that could load comfortably. File cache is
-# reclaimable at exactly the moment a load needs it.
+# Do NOT use vm_stat "Pages free" for this. It counts only pages that have never
+# been touched, so it ignores the file cache entirely: on an idle box it read
+# 1.47 GiB while top said 14 GiB unused, and a model loaded in 10.8 s. That bug
+# made this script warn on a perfectly healthy box, which told agents not to run.
 #
-# What a load can actually get is: untouched pages, plus inactive and
-# speculative pages (the file cache, reclaimable on demand), plus purgeable.
-# Verified empirically on this box: with the weight file's pages in the cache,
-# vm_stat said 1.5 GiB "free" while top said 15 GiB unused, and the load took
-# 10.8 s and succeeded. A load reclaims the file cache rather than needing it
-# free, so top's "unused" figure is the one that predicts success.
+# Do not use top's figure without parsing the unit either. top switches between
+# K/M/G/T and drops the decimal below 10, so "554M unused" is 0.55 GiB, and
+# taking the last comma-separated field yields "unused." rather than a number.
+# Both of those were shipped here before being caught.
 available_gib() {
-  # Verified against `top` on this box: with the weight file's pages sitting in
-  # the file cache, vm_stat reported 1.5 GiB "free" while top reported 15 GiB
-  # unused, and a load succeeded in 10.8 s. So the honest measure of "can a load
-  # proceed" is top's own figure, which already accounts for reclaimable pages.
-  # vm_stat is kept as a fallback for when top is unavailable.
   local t
-  t="$(top -l 1 -n 0 2>/dev/null | awk '
+  t="$(top -l 1 -n 0 2>/dev/null | awk '''
         /PhysMem/ {
-          # "23G used (2924M wired, 863M compressor), 554M unused."
-          # Two traps, both hit: taking the last comma-field yields "unused."
-          # rather than a number, and top switches units and drops a decimal
-          # below 10 ("554M", not "0.55G") -- an earlier version read that as
-          # 554 GiB. So isolate the tail after the final comma, then match the
-          # number with its optional unit explicitly.
           n = split($0, a, ",")
           tail = a[n]
           if (match(tail, /[0-9]+(\.[0-9]+)?[KMGT]?/)) {
@@ -116,89 +75,55 @@ available_gib() {
             printf "%.1f", (tok + 0) * mul / 1073741824
             exit
           }
-        }')"
+        }''')"
   case "$t" in
-    "" | "." | 0|0.0)
-      awk '
-        /Pages free:/        { gsub(/\./,"",$NF); t += $NF }
-        /Pages inactive:/    { gsub(/\./,"",$NF); t += $NF }
-        /Pages speculative:/ { gsub(/\./,"",$NF); t += $NF }
-        /Pages purgeable:/   { gsub(/\./,"",$NF); t += $NF }
-        END { printf "%.1f", t * 16384 / 1073741824 }
-      ' < <(vm_stat 2>/dev/null) 2>/dev/null || echo "?"
+    "" | "." | 0 | 0.0)
+      awk '''
+        /Pages free:/        { gsub(/\./,"",$NF); s += $NF }
+        /Pages inactive:/    { gsub(/\./,"",$NF); s += $NF }
+        /Pages speculative:/ { gsub(/\./,"",$NF); s += $NF }
+        /Pages purgeable:/   { gsub(/\./,"",$NF); s += $NF }
+        END { printf "%.1f", s * 16384 / 1073741824 }
+      ''' < <(vm_stat 2>/dev/null) 2>/dev/null || echo "?"
       ;;
     *) echo "$t" ;;
   esac
 }
 
-# Anonymous memory already faulted in by running processes, in GiB. This is the
-# part a new load genuinely competes with.
 anon_gib() {
   awk '/Pages active:/ { gsub(/\./,"",$NF); printf "%.1f", $NF * 16384 / 1073741824 }' \
     < <(vm_stat 2>/dev/null) 2>/dev/null || echo "?"
 }
-
-# Kept as a name callers already use; now means "available", not "untouched".
-free_gib() { available_gib; }
 
 swap_used_mb() {
   sysctl -n vm.swapusage 2>/dev/null |
     awk -F'[= ]+' '/used/ { printf "%.0f", $2 / 1048576; exit }' || echo "?"
 }
 
-# Who holds the lock right now. flock -n succeeds only if nobody holds it, so
-# this is a non-destructive probe: we take and immediately drop the lock.
+# Read the holder out of the lock file. ADVISORY ONLY and possibly stale: the
+# kernel lock is the real state. This is a momentary read, never a lock, so it
+# can never block behind an 8k benchmark -- which is the entire point of having
+# a status command. It can be a second out of date; that is acceptable, because
+# the engine re-checks for real.
 holder() {
-  if try_lock; then
-    echo "free"
+  if [ -s "$LOCK" ]; then
+    head -1 "$LOCK" 2>/dev/null | tr -d '\n'
   else
-    head -c 200 "$LOCK" 2>/dev/null | tr -d '\n' || echo "unknown"
+    echo "unknown"
   fi
 }
 
+# Live waiters, in arrival order. Dead pids are pruned on read so a crashed
+# agent cannot make the queue look busy forever.
 waiters() {
   [ -f "$QUEUE" ] || { echo 0; return; }
-  # Drop entries whose owning pid is gone, so a crashed agent cannot wedge the
-  # queue. Tickets are "pid seconds label".
   awk '{ pid = $1
-          if (system("kill -0 " pid " 2>/dev/null") != 0) next
+          if (pid != '"$$"' && system("kill -0 " pid " 2>/dev/null") != 0) next
           print }' "$QUEUE" 2>/dev/null | wc -l | tr -d ' '
 }
 
-# Drop dead pids from the queue file, then append this one.
-enqueue() {
-  local label="${1:-gpuq}"
-  mkdir -p "$(dirname "$QUEUE")" 2>/dev/null
-  local tmp="${QUEUE}.$$"
-  : > "$tmp"
-  [ -f "$QUEUE" ] && awk '{ pid = $1
-      if (system("kill -0 " pid " 2>/dev/null") == 0) print }' "$QUEUE" \
-    >> "$tmp" 2>/dev/null
-  printf '%s %s %s\n' "$$" "$(date +%s)" "$label" >> "$tmp"
-  mv "$tmp" "$QUEUE" 2>/dev/null
-}
-
-dequeue() {
-  [ -f "$QUEUE" ] || return 0
-  local tmp="${QUEUE}.$$"
-  awk -v me="$$" '$1 != me' "$QUEUE" > "$tmp" 2>/dev/null
-  mv "$tmp" "$QUEUE" 2>/dev/null
-  rm -f "$tmp" 2>/dev/null
-}
-
-# Position among live waiters, 1-based. 1 means "next in line".
-position() {
-  [ -f "$QUEUE" ] || { echo 1; return; }
-  awk -v me="$$" '
-    { pid = $1
-      if (system("kill -0 " pid " 2>/dev/null") != 0) next
-      n++
-      if (pid == me) { found = n } }
-    END { print (found ? found : n + 1) }' "$QUEUE" 2>/dev/null
-}
-
 usage() {
-  sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '/^# gpuq/,/^set -/p' "$0" | sed 's/^# \{0,1\}//' | sed '/^set -/d'
 }
 
 cmd="${1:-status}"
@@ -208,21 +133,11 @@ shift 2>/dev/null || true
 
 case "$cmd" in
   status)
-    if [ -z "$FLOCK" ] && ! command -v perl >/dev/null 2>&1; then
-      echo "FATAL: neither flock(1) nor perl found; cannot serialise GPU access" >&2
-      exit 1
-    fi
-    h="$(holder)"
-    n="$(waiters)"
-    f="$(free_gib)"
-    s="$(swap_used_mb)"
-    printf 'gpu: %s\n' "$h"
-    printf 'queue: %s waiting\n' "$n"
+    f="$(available_gib)"
+    printf 'gpu: %s\n' "$(holder)"
+    printf 'queue: %s waiting\n' "$(waiters)"
     printf 'memory: %s GiB available (reclaimable), %s GiB in use by processes, %s MiB swap\n' \
-      "$f" "$(anon_gib)" "$s"
-    # A load needs ~12 GiB of resident weights plus scratch. Available memory is
-    # the right thing to compare against, NOT "Pages free": the weight file's
-    # own pages are file cache and come straight back when a load faults them in.
+      "$f" "$(anon_gib)" "$(swap_used_mb)"
     if [ "$f" != "?" ] && awk "BEGIN{exit !($f < 11)}" 2>/dev/null; then
       printf 'warning: only %s GiB available; a model load needs ~12 GiB and will swap\n' "$f"
     else
@@ -231,62 +146,18 @@ case "$cmd" in
     ;;
 
   try)
-    if try_lock; then
-      [ $# -eq 0 ] && { echo "free"; exit 0; }
-      mkdir -p "$(dirname "$QUEUE")" 2>/dev/null
-      run_locked "$@"
-      exit $?
-    fi
-    printf 'gpu: busy (%s)\n' "$(holder)"
-    printf 'queue: %s waiting\n' "$(waiters)"
-    echo "do other work and retry, or use: gpuq run -- $*" >&2
-    exit 75
+    [ $# -eq 0 ] && { echo "usage: gpuq try -- cmd [args...]" >&2; exit 1; }
+    # The engine owns the lock. KAPLUMBA_GPU_LOCK=try makes it decline with 75
+    # rather than block; without this a second agent waits silently, which is
+    # the "looks like a hang" failure this whole script exists to prevent.
+    KAPLUMBA_GPU_LOCK=try exec "$@"
     ;;
 
-  run | exec)
-    if [ $# -eq 0 ]; then
-      echo "usage: gpuq $cmd -- cmd [args...]" >&2
-      exit 1
-    fi
-    label="$*"
-    enqueue "$label"
-    # shellcheck disable=SC2064
-    trap "dequeue; rm -f \"\${QUEUE}.hb\" 2>/dev/null" EXIT
-    pos="$(position)"
-    printf 'gpuq: queued as #%s (%s waiting); holder: %s\n' \
-      "$pos" "$(( $(waiters) - 1 ))" "$(holder)" >&2
-
-    # Announce progress while blocked so a long wait is visibly a long wait and
-    # not a hung tool call. The announcement is throttled: printing every second
-    # would flood an agent's transcript.
-    (
-      while :; do
-        sleep "$HEARTBEAT"
-        h="$(holder)"
-        [ "$h" = "free" ] && break
-        printf 'gpuq: still waiting (#%s), %s GiB available, holder: %s\n' \
-          "$(position)" "$(available_gib)" "$h" >&2
-      done
-    ) &
-    hb=$!
-
-    # flock is the whole synchronisation mechanism: it returns the instant the
-    # holder's fd closes, so a waiter is woken by the kernel rather than by
-    # polling, and there is no lost-wakeup window.
-    run_locked "$@"
-    rc=$?
-    kill "$hb" 2>/dev/null
-    wait "$hb" 2>/dev/null
-    exit $rc
+  run)
+    [ $# -eq 0 ] && { echo "usage: gpuq run -- cmd [args...]" >&2; exit 1; }
+    KAPLUMBA_GPU_LOCK=wait exec "$@"
     ;;
 
-  -h | --help | help)
-    usage
-    ;;
-
-  *)
-    echo "unknown command: $cmd" >&2
-    usage >&2
-    exit 1
-    ;;
+  -h | --help | help) usage ;;
+  *) echo "unknown command: $cmd" >&2; usage >&2; exit 1 ;;
 esac

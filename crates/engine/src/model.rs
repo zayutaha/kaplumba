@@ -61,6 +61,13 @@ pub enum ModelError {
     GpuCache(#[from] GpuCacheError),
     #[error("invalid layer configuration: {0}")]
     InvalidConfig(String),
+    /// Another process holds the GPU. Not a fault of this run: the caller should
+    /// treat it as "not now" and retry later, which is why it is a distinct
+    /// variant rather than an `InvalidConfig` string. Two instances on this
+    /// 24 GiB box swap and collapse to ~1.4 tok/s, so this is load-bearing
+    /// protection, not a nicety.
+    #[error("{0}")]
+    GpuBusy(String),
     #[error("invalid layer weights: {0}")]
     InvalidWeights(String),
     #[error("invalid layer input: {0}")]
@@ -2113,7 +2120,7 @@ impl TextModel {
         // and invalidates every measurement taken alongside it. A second process
         // waits here rather than failing, so a fleet of agents queues up.
         crate::gpu_lock::acquire(&format!("load {}", model_dir.display()))
-            .map_err(|error| ModelError::InvalidConfig(format!("GPU lock: {error}")))?;
+            .map_err(|error| ModelError::GpuBusy(error.to_string()))?;
         let metadata = inspect_model_dir(model_dir)
             .map_err(|error| ModelError::Checkpoint(error.to_string()))?;
         metadata

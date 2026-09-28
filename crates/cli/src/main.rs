@@ -17,8 +17,21 @@ fn main() -> ExitCode {
     match run() {
         Ok(()) => ExitCode::SUCCESS,
         Err(message) => {
-            eprintln!("{message}");
-            ExitCode::FAILURE
+            // The engine already explained itself on stderr when it declined;
+            // repeating the whole thing here is noise. One line, then the code.
+            if kaplumba_engine::gpu_lock::is_busy_message(&message) {
+                eprintln!("kaplumba: GPU busy, nothing was run. Try again later.");
+            } else {
+                eprintln!("{message}");
+            }
+            // "GPU is busy" is not a failure of this run, it is a scheduling
+            // outcome, and an agent needs to tell them apart to retry instead of
+            // debugging. EX_TEMPFAIL (75) is the conventional code for that.
+            if kaplumba_engine::gpu_lock::is_busy_message(&message) {
+                ExitCode::from(kaplumba_engine::gpu_lock::EXIT_BUSY as u8)
+            } else {
+                ExitCode::FAILURE
+            }
         }
     }
 }

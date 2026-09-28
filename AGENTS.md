@@ -236,9 +236,18 @@ residency.
 
 | command | behaviour | when to use it |
 |---|---|---|
-| `scripts/gpuq status` | instant; prints holder, queue depth, free memory, and warns below the ~16 GiB a load needs | before anything that will load the model |
-| `scripts/gpuq try -- <cmd>` | runs only if free; exits **75** immediately if busy | **the default.** Do analysis, then retry |
-| `scripts/gpuq run -- <cmd>` | blocks until free, printing a heartbeat every 5 s | only when there is genuinely nothing else to do |
+| `scripts/gpuq status` | instant; prints holder, queue depth, available memory, and warns below the ~11 GiB a load needs | before anything that will load the model |
+| `scripts/gpuq try -- <cmd>` | runs the command; **the engine** decides. Exits **75** immediately if the GPU is busy | **the default.** Do analysis, then retry |
+| `scripts/gpuq run -- <cmd>` | same, but the engine blocks until free (use only when there is nothing else to do) | deliberate queueing |
+
+**`gpuq` takes no lock, and never may.** The engine is the sole lock owner
+(`crates/engine/src/gpu_lock.rs`, called from `load_from_dir`). An earlier
+`gpuq` took the same lock *and* ran the engine, which deadlocked: a lock held by
+a parent is not inherited as held by the child, so the child's `flock(LOCK_EX)`
+conflicts with the parent's and blocks — parent waits for child, child waits for
+parent. It presented as "gpuq try -- kaplumba hangs forever while gpuq try --
+echo works", because `echo` does not lock and `kaplumba` does. If you are
+tempted to add a lock here, do not.
 
 **Never sit in a 30-minute blocking call.** A `run` that blocks for twenty
 minutes has wasted twenty minutes: it cannot report, and it cannot do the work
@@ -248,14 +257,14 @@ that would have been useful meanwhile. Prefer `try` in a loop around
 ### 10.2 The rules
 
 1. **Check `gpuq status` before every model run.** Only act on its warning if it
-   reports under 11 GiB *available*; it reads `top`, not `vm_stat`. Firefox plus
-   a few editor processes have been seen holding the box down to 2-4 GiB
-   genuinely unused, and a load then thrashes.
-2. **One model process at a time.** `gpuq` enforces this, and so does the
-   in-binary `flock` at `~/.kaplumba/gpu.lock` (`crates/engine/src/gpu_lock.rs`),
-   which makes bypass impossible even if a wrapper is skipped.
-3. **Do not run a second model instance "just to check" while a measurement is
-   in flight.** This has happened and it destroyed the numbers.
+   reports under 11 GiB *available*; it reads `top`, not `vm_stat` (see §10.3).
+2. **One model process at a time, always.** The engine enforces this with a
+   kernel `flock`, so it holds even when `gpuq` is bypassed — a stray direct run
+   from a worktree is exactly the case that once held 11 GiB invisibly. A second
+   process gets exit code 75 (`EX_TEMPFAIL`), which is a scheduling outcome, not
+   a failure.
+3. **Do not run a second model instance "just to check".** This has happened and
+   it destroyed the numbers.
 4. **In a worktree, use a separate `CARGO_TARGET_DIR`.** A worktree sharing the
    main `target/` can rebuild the binary mid-benchmark of another agent.
 5. **Interleave A/B measurements** (A B A B …) and report medians with spread.
@@ -266,15 +275,29 @@ that would have been useful meanwhile. Prefer `try` in a loop around
    <path> --force` and delete any `crates/engine/examples/*.rs` you added; a
    stray benchmark binary left running holds the GPU and is invisible to the
    next agent.
+7. **A missing output is not a hang.** Before concluding the model did not load,
+   re-run with `2>&1 | head -5` and check the token count. The test sentence is
+   **6.01 tokens**, so a prompt over 8192 tokens is rejected *before* loading with
+   "prompt plus generation exceeds context limit 8192" — which looks exactly
+   like a silent failure if you are only reading the tail of a pipe.
 
 ### 10.3 Measuring this box
 
-**Do not use `vm_stat`'s `Pages free` as a memory-pressure signal.** It counts
-only pages that have never been touched, so it ignores the file cache entirely.
-Measured here with no model loaded: `Pages free` said 1.47 GiB while `top` said
-14 GiB unused and a model loaded in 10.8 s. An earlier version of `scripts/gpuq`
-used that counter, printed a warning on an idle box, and thereby stopped agents
-from running at all. Use `scripts/gpuq status`, which reads `top`:
+**Do not use `vm_stat`'s `Pages free` as a memory-pressure signal**, and do not
+parse `top`'s figure without handling units. Both mistakes were made here and
+both shipped before being caught:
+
+- `Pages free` counts only pages that have never been touched, so it ignores the
+  file cache. With no model loaded it said 1.47 GiB while `top` said 14 GiB
+  unused, and a model loaded in 10.8 s. An earlier `scripts/gpuq` used that
+  counter, warned on a healthy box, and thereby stopped agents from running.
+- `top` switches between K/M/G/T and drops the decimal below 10, so `554M
+  unused` is 0.55 GiB. Stripping non-digits turned that into **554 GiB** — a
+  1100x overstatement — and taking the last comma-separated field yields
+  `unused.` rather than a number. Both were in `gpuq` before the unit test
+  caught them.
+
+Use `scripts/gpuq status`, which parses both correctly, or:
 
 ```bash
 top -l 1 -n 0 | grep PhysMem     # "unused" is the number that matters
