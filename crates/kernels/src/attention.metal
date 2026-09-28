@@ -9,6 +9,11 @@ struct AttentionParams {
     uint key_count;
     float scale;
     uint window;
+    // Decode only (`splits > 0`): the KV axis is cut into `splits` contiguous
+    // ranges of `keys_per_split` keys, one workgroup per (split, kv head).
+    // Prefill passes 0 and scans `0 .. key_count`.
+    uint splits;
+    uint keys_per_split;
 };
 
 template <int HEAD_DIM>
@@ -90,229 +95,21 @@ static void online_attention_body(
 
 
 // ---------------------------------------------------------------------------
-// Split-key attention, for the decode shape.
+// Decode attention: flash-decoding over the KV axis.
 //
-// The kernel above dispatches one thread per (query, head), so a decode step
-// runs on 32 threads while pulling ~67 MB of cold KV cache per token. Measured
-// 153 ms in situ against 132 us for the same shape with an L2-resident buffer,
-// so the serialisation, not the arithmetic, is the cost.
+// There is no separate decode kernel. The transposed prefill body at the bottom
+// of this file runs unchanged for a single query, except that its key range
+// comes from `splits`/`keys_per_split` instead of `0 .. key_count` and it emits
+// an unnormalised (m, l, O) partial per split instead of a normalised output
+// row. `attention_decode_combine_*` then merges the partials.
 //
-// This is ordinary flash-decoding in three passes, chosen so that no pass needs
-// a per-thread array proportional to head_dim:
-//
-//   1. scores  : one thread per (head, key). Reads the keys once.
-//   2. reduce  : one thread per head. Finds the row max and sum of exp.
-//   3. combine : one thread per (head, dimension). Reads the values once.
-//
-// Peak parallelism is q_heads * key_count and q_heads * head_dim instead of
-// q_heads, and the KV data is read once rather than being re-read by a
-// single thread.
-kernel void attention_scores(
-    const device half *queries [[buffer(0)]],
-    const device half *keys [[buffer(1)]],
-    const device uint *query_positions [[buffer(2)]],
-    const device uint *key_positions [[buffer(3)]],
-    device float *scores [[buffer(4)]],
-    constant AttentionParams &params [[buffer(5)]],
-    uint gid [[thread_position_in_grid]]) {
-    uint key_index = gid % params.key_count;
-    uint head = gid / params.key_count;
-    if (head >= params.q_heads) {
-        return;
-    }
-    // Stale and future slots score nothing; the window check must precede the
-    // key load, as in the serial kernel.
-    const uint query_position = query_positions[0];
-    const uint key_position = key_positions[key_index];
-    if (key_position > query_position) {
-        scores[gid] = -3.402823466e38f;
-        return;
-    }
-    if (params.window != 0u && query_position - key_position >= params.window) {
-        scores[gid] = -3.402823466e38f;
-        return;
-    }
-    const uint kv_heads = params.kv_heads;
-    const uint key_head = head / (params.q_heads / kv_heads);
-    const uint key_base = (key_index * kv_heads + key_head) * params.head_dim;
-    const uint query_base = head * params.head_dim;
-    float score = 0.0f;
-    for (uint d = 0; d < params.head_dim; ++d) {
-        score += float(queries[query_base + d]) * float(keys[key_base + d]);
-    }
-    scores[gid] = score * params.scale;
-}
-
-kernel void attention_row_reduce(
-    const device float *scores [[buffer(0)]],
-    device float *row_max [[buffer(1)]],
-    device float *row_sum [[buffer(2)]],
-    constant AttentionParams &params [[buffer(3)]],
-    uint head [[thread_position_in_grid]]) {
-    if (head >= params.q_heads) {
-        return;
-    }
-    const device float *row = scores + head * params.key_count;
-    float maximum = -3.402823466e38f;
-    for (uint k = 0; k < params.key_count; ++k) {
-        maximum = max(maximum, row[k]);
-    }
-    float total = 0.0f;
-    for (uint k = 0; k < params.key_count; ++k) {
-        total += exp(row[k] - maximum);
-    }
-    row_max[head] = maximum;
-    row_sum[head] = total;
-}
-
-kernel void attention_combine(
-    const device half *values [[buffer(0)]],
-    const device float *scores [[buffer(1)]],
-    const device float *row_max [[buffer(2)]],
-    const device float *row_sum [[buffer(3)]],
-    device half *output [[buffer(4)]],
-    constant AttentionParams &params [[buffer(5)]],
-    uint gid [[thread_position_in_grid]]) {
-    uint dimension = gid % params.head_dim;
-    uint head = gid / params.head_dim;
-    if (head >= params.q_heads) {
-        return;
-    }
-    const device float *row = scores + head * params.key_count;
-    const float maximum = row_max[head];
-    const float total = row_sum[head];
-    const uint kv_heads = params.kv_heads;
-    const uint key_head = head / (params.q_heads / kv_heads);
-    float accumulator = 0.0f;
-    if (total > 0.0f) {
-        for (uint k = 0; k < params.key_count; ++k) {
-            const float score = row[k];
-            if (score <= -3.402823466e38f) {
-                continue;
-            }
-            const uint value_base = (k * kv_heads + key_head) * params.head_dim + dimension;
-            accumulator += exp(score - maximum) * float(values[value_base]);
-        }
-        accumulator /= total;
-    }
-    output[head * params.head_dim + dimension] = half(accumulator);
-}
-
-// Decode attention, one threadgroup per (key, kv_head). The previous mapping put
-// key_index on the lane, but keys are stored [key][kv_head][head_dim], so
-// neighbouring lanes landed `kv_heads * head_dim` elements apart and every warp
-// fetch touched 32 distinct sectors to deliver 64 useful bytes. Here the lane
-// owns a dimension instead, so the key row is read once, fully coalesced, and
-// the threadgroup reduces the dot products.
-kernel void attention_scores_coalesced(
-    const device half *queries [[buffer(0)]],
-    const device half *keys [[buffer(1)]],
-    const device uint *query_positions [[buffer(2)]],
-    const device uint *key_positions [[buffer(3)]],
-    device float *scores [[buffer(4)]],
-    constant AttentionParams &params [[buffer(5)]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint gt [[threadgroup_position_in_grid]]) {
-    const uint kv_heads = params.kv_heads;
-    const uint key_index = gt / kv_heads;
-    const uint key_head = gt - key_index * kv_heads;
-    const uint ratio = params.q_heads / kv_heads;
-    const uint q_head = key_head * ratio;
-
-    const uint query_position = query_positions[0];
-    const uint key_position = key_positions[key_index];
-    bool live = key_position <= query_position;
-    if (live && params.window != 0u && query_position - key_position >= params.window) {
-        live = false;
-    }
-    if (!live) {
-        if (tid < ratio) {
-            scores[(q_head + tid) * params.key_count + key_index] = -3.402823466e38f;
-        }
-        return;
-    }
-
-    const uint key_base = (key_index * kv_heads + key_head) * params.head_dim;
-    const uint query_base = q_head * params.head_dim;
-    // Each q head sharing this kv head has its own query vector, so the key is
-    // read once and dotted against all of them. `ratio` is 2 on the sliding
-    // layers and 8 on the global ones.
-    float partial[8];
-    for (uint r = 0; r < ratio; ++r) {
-        partial[r] = 0.0f;
-    }
-    for (uint d = tid; d < params.head_dim; d += 256u) {
-        const float k = float(keys[key_base + d]);
-        for (uint r = 0; r < ratio; ++r) {
-            partial[r] += float(queries[query_base + r * params.head_dim + d]) * k;
-        }
-    }
-
-    threadgroup float partials[8][256];
-    for (uint r = 0; r < ratio; ++r) {
-        partials[r][tid] = partial[r];
-    }
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (tid == 0u) {
-        for (uint r = 0; r < ratio; ++r) {
-            float total = 0.0f;
-            for (uint t = 0; t < 256u; ++t) {
-                total += partials[r][t];
-            }
-            scores[(q_head + r) * params.key_count + key_index] = total * params.scale;
-        }
-    }
-}
-
-// One threadgroup per query head. The previous version dispatched a single
-// thread per head -- 32 threads for the whole GPU -- and each walked key_count
-// scores twice.
-kernel void attention_row_reduce_coalesced(
-    const device float *scores [[buffer(0)]],
-    device float *row_max [[buffer(1)]],
-    device float *row_sum [[buffer(2)]],
-    constant AttentionParams &params [[buffer(3)]],
-    uint tid [[thread_index_in_threadgroup]],
-    uint head [[threadgroup_position_in_grid]]) {
-    if (head >= params.q_heads) {
-        return;
-    }
-    const device float *row = scores + head * params.key_count;
-    float maximum = -3.402823466e38f;
-    for (uint k = tid; k < params.key_count; k += 256u) {
-        maximum = max(maximum, row[k]);
-    }
-    threadgroup float shared_max[256];
-    shared_max[tid] = maximum;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = 128u; stride > 0u; stride >>= 1) {
-        if (tid < stride) {
-            shared_max[tid] = max(shared_max[tid], shared_max[tid + stride]);
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    const float all_max = shared_max[0];
-    if (tid == 0u) {
-        row_max[head] = all_max;
-    }
-
-    float total = 0.0f;
-    for (uint k = tid; k < params.key_count; k += 256u) {
-        total += exp(row[k] - all_max);
-    }
-    threadgroup float shared_sum[256];
-    shared_sum[tid] = total;
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = 128u; stride > 0u; stride >>= 1) {
-        if (tid < stride) {
-            shared_sum[tid] += shared_sum[tid + stride];
-        }
-        threadgroup_barrier(mem_flags::mem_threadgroup);
-    }
-    if (tid == 0u) {
-        row_sum[head] = shared_sum[0];
-    }
-}
+// What it replaces: a three-pass softmax over a materialised
+// `q_heads * key_count` fp32 score matrix. That matrix is O(L^2) in the worst
+// case, was sized from the cache capacity measured at construction rather than
+// from the live key count, and hard-failed the moment a full-attention layer
+// outgrew it -- `attention score buffer is 131072 bytes, needs 155520 for 32
+// heads x 1215 keys`, i.e. decode died between 914 and 1215 tokens of context.
+// AGENTS.md §8 forbids exactly that scratch.
 
 // Instantiations for the two head dims this model uses: 256 on the 50 sliding
 // layers, 512 on the 10 full-attention layers.
@@ -906,7 +703,25 @@ static inline float2 unpack_half2(uint packed) {
 
 // HEAD_DIM must be a multiple of 32 * VPT so that every lane owns VPT
 // consecutive dims and a warp's V read is one contiguous 32*VPT*2-byte run.
-template <int HEAD_DIM, int NSG>
+//
+// `PARTIALS` turns the same body into the decode kernel (flash-decoding over a
+// split KV axis). The online softmax, the dot product and the PV fold are
+// literally the same code, so prefill and decode cannot drift apart; only the
+// key range and the write-out differ:
+//
+//   key range   PARTIALS: `[split * keys_per_split, min(key_count, +keys_per_split))`
+//               prefill: `[0, key_count)`   (identical loop, `splits == 0`)
+//   tgid        PARTIALS: `key_head = tgid % kv_heads`, `split = tgid / kv_heads`
+//               prefill: `query = tgid / kv_heads`, `key_head = tgid % kv_heads`
+//   output      PARTIALS: one unnormalised (m, l, O) row per split in `partials`
+//               prefill: the normalised output row
+//
+// Splitting must not change the scan: the host derives `key_count` from
+// `GpuKvCache::key_count(full_attention)`, which for the sliding rings is
+// `min(next_position, capacity)` -- exactly the live window -- and each split
+// stops at `key_count`, so no split ever reads past the live window and the
+// `key_position` / `window` tests still drop anything stale.
+template <int HEAD_DIM, int NSG, bool PARTIALS>
 static void attention_gqa_body(
     const device half *queries,
     const device half *keys,
@@ -914,6 +729,7 @@ static void attention_gqa_body(
     const device uint *query_positions,
     const device uint *key_positions,
     device half *output,
+    device float *partials,
     constant AttentionParams &params,
     uint tid,
     uint tgid,
@@ -936,14 +752,22 @@ static void attention_gqa_body(
     const bool active = sg < groups;
     const uint head_in_kv = active ? sg : 0u;
 
-    const uint query = tgid / params.kv_heads;
-    const uint key_head = tgid - query * params.kv_heads;
+    const uint query = PARTIALS ? 0u : tgid / params.kv_heads;
+    const uint key_head = PARTIALS ? tgid - (tgid / params.kv_heads) * params.kv_heads
+                                   : tgid - query * params.kv_heads;
+    const uint split = PARTIALS ? tgid / params.kv_heads : 0u;
     const uint head = key_head * groups + head_in_kv;
     const uint query_base = (query * params.q_heads + head) * uint(HEAD_DIM);
     const uint q_abs = query_positions[query];
     const uint kv_stride = params.kv_heads * uint(HEAD_DIM);
     const uint head_base = key_head * uint(HEAD_DIM);
     const device half *qrow = queries + query_base;
+    // This split's slice of the live window. `min(key_count, ...)` is what keeps
+    // a split from running off the end of the cache when `key_count` is not a
+    // multiple of `keys_per_split`.
+    const uint range_begin = PARTIALS ? split * params.keys_per_split : 0u;
+    const uint range_end = PARTIALS ? min(params.key_count, range_begin + params.keys_per_split)
+                                    : params.key_count;
 
     // This lane's slice of its own row: VPT consecutive dims, BLOCKS of them.
     const uint lane_dim = lane * uint(VPT);
@@ -959,14 +783,14 @@ static void attention_gqa_body(
     threadgroup float *my_weights = wbuf + sg * 32u;
 
     uint phase = 0u;
-    for (uint base = 0; base < params.key_count; base += 32u) {
-        const uint n = min(32u, params.key_count - base);
+    for (uint base = range_begin; base < range_end; base += 32u) {
+        const uint n = min(32u, range_end - base);
         const uint k = base + lane;
 
         // 1. score this lane's key. The window test is arithmetic, not a
         //    materialised mask, and a dead key never touches `keys` at all.
         float score = NEG;
-        bool live = active && (k < params.key_count);
+        bool live = active && (k < range_end);
         if (live) {
             const uint k_abs = key_positions[k];
             live = (k_abs <= q_abs)
@@ -1041,6 +865,27 @@ static void attention_gqa_body(
     if (!active) {
         return;
     }
+    if (PARTIALS) {
+        // Unnormalised partial for this split, laid out as
+        //   [m, l, O[head_dim]] at (split * q_heads + head) * (head_dim + 2)
+        // so the combine reads a warp's 32 dimensions as 128 contiguous bytes.
+        // An empty slice falls out of the loop above with m = NEG, s = 0 and a
+        // zero accumulator, which the combine weights to zero. Nothing else has
+        // to clear the buffer: every split that is read is a split that wrote.
+        device float *row = partials + (split * params.q_heads + head) * (params.head_dim + 2u);
+        if (lane == 0u) {
+            row[0] = m;
+            row[1] = s;
+        }
+        for (int b = 0; b < BLOCKS; ++b) {
+            const uint d = lane_dim + uint(b) * 32u * uint(VPT);
+            const float4 lo = acc[2 * b + 0];
+            const float4 hi = acc[2 * b + 1];
+            *reinterpret_cast<device float4 *>(row + 2u + d + 0u) = lo;
+            *reinterpret_cast<device float4 *>(row + 2u + d + 4u) = hi;
+        }
+        return;
+    }
     const float norm = s > 0.0f ? 1.0f / s : 0.0f;
     for (int b = 0; b < BLOCKS; ++b) {
         const uint d = query_base + lane_dim + uint(b) * 32u * uint(VPT);
@@ -1052,6 +897,46 @@ static void attention_gqa_body(
         *reinterpret_cast<device half2 *>(orow + 4) = half2(half(hi.x), half(hi.y));
         *reinterpret_cast<device half2 *>(orow + 6) = half2(half(hi.z), half(hi.w));
     }
+}
+
+// Merge the per-split (m, l, O) partials. This is llama.cpp's second pass
+// (`ggml-metal` reads `dst1[rid*(2*NWG) + 2*iwg]` back for exactly this):
+//
+//     M     = max_s m_s
+//     den   = sum_s exp(m_s - M) * l_s
+//     out[d]= sum_s exp(m_s - M) * O_s[d] / den
+//
+// `m_s <= M`, so every factor is in [0, 1] and an empty split (m_s = NEG) weighs
+// nothing. One thread per (head, dimension) and no threadgroup memory at all.
+//
+// HEAD_DIM only names the two entry points (the host picks by head_dim); the
+// indexing is driven by `params.head_dim`, so one body serves both.
+template <int HEAD_DIM>
+static void attention_decode_combine_body(
+    const device float *partials,
+    device half *output,
+    constant AttentionParams &params,
+    uint gid) {
+    const uint dimension = gid % params.head_dim;
+    const uint head = gid / params.head_dim;
+    if (head >= params.q_heads) {
+        return;
+    }
+    const uint stride = params.head_dim + 2u;
+    float global_max = -1.701411733864e+38f;
+    for (uint i = 0; i < params.splits; ++i) {
+        global_max = max(global_max, partials[(i * params.q_heads + head) * stride]);
+    }
+    float numerator = 0.0f;
+    float denominator = 0.0f;
+    for (uint i = 0; i < params.splits; ++i) {
+        const device float *row = partials + (i * params.q_heads + head) * stride;
+        const float factor = exp(row[0] - global_max);
+        denominator += factor * row[1];
+        numerator += factor * row[2u + dimension];
+    }
+    const float value = denominator > 0.0f ? numerator / denominator : 0.0f;
+    output[head * params.head_dim + dimension] = half(value);
 }
 
 #define KAPLUMBA_FA_GQA(NAME, HEAD_DIM, NSG)                                   \
@@ -1066,12 +951,42 @@ static void attention_gqa_body(
         uint tid [[thread_position_in_threadgroup]],                           \
         uint tgid [[threadgroup_position_in_grid]]) {                          \
         threadgroup float wbuf[2 * (NSG) * 32];                                \
-        attention_gqa_body<HEAD_DIM, NSG>(queries, keys, values,               \
-            query_positions, key_positions, output, params, tid, tgid, wbuf); \
+        attention_gqa_body<HEAD_DIM, NSG, false>(queries, keys, values,        \
+            query_positions, key_positions, output, (device float *)output,    \
+            params, tid, tgid, wbuf);                                          \
+    }
+
+// Decode: same body, one workgroup per (split, kv head), partial output. The
+// partial buffer takes the output slot's index because the kernel has no
+// normalised output to write.
+#define KAPLUMBA_FA_DECODE(NAME, HEAD_DIM, NSG)                                \
+    kernel void NAME(                                                          \
+        const device half *queries [[buffer(0)]],                              \
+        const device half *keys [[buffer(1)]],                                 \
+        const device half *values [[buffer(2)]],                               \
+        const device uint *query_positions [[buffer(3)]],                      \
+        const device uint *key_positions [[buffer(4)]],                        \
+        device float *partials [[buffer(5)]],                                  \
+        constant AttentionParams &params [[buffer(6)]],                        \
+        uint tid [[thread_position_in_threadgroup]],                           \
+        uint tgid [[threadgroup_position_in_grid]]) {                          \
+        threadgroup float wbuf[2 * (NSG) * 32];                                \
+        attention_gqa_body<HEAD_DIM, NSG, true>(queries, keys, values,         \
+            query_positions, key_positions, (device half *)partials, partials, \
+            params, tid, tgid, wbuf);                                          \
+    }
+
+#define KAPLUMBA_FA_COMBINE(NAME, HEAD_DIM)                                    \
+    kernel void NAME(                                                          \
+        const device float *partials [[buffer(0)]],                            \
+        device half *output [[buffer(1)]],                                     \
+        constant AttentionParams &params [[buffer(2)]],                        \
+        uint gid [[thread_position_in_grid]]) {                                \
+        attention_decode_combine_body<HEAD_DIM>(partials, output, params, gid); \
     }
 
 // NSG must equal `q_heads / kv_heads` for the model's two layer shapes, so no
-// simdgroup idles: 2 on the sliding layers (32/16), 8 on the full layers (32/4).
+// simdgroup idles: 2 on the sliding layers (32/16) and 8 on the full layers (32/4).
 // 1 and 4 are the other GQA ratios in the wild (Llama-3 8B is 32/8 = 4).
 KAPLUMBA_FA_GQA(online_attention_gqa_256_1, 256, 1)
 KAPLUMBA_FA_GQA(online_attention_gqa_256_2, 256, 2)
@@ -1081,3 +996,13 @@ KAPLUMBA_FA_GQA(online_attention_gqa_512_1, 512, 1)
 KAPLUMBA_FA_GQA(online_attention_gqa_512_2, 512, 2)
 KAPLUMBA_FA_GQA(online_attention_gqa_512_4, 512, 4)
 KAPLUMBA_FA_GQA(online_attention_gqa_512_8, 512, 8)
+KAPLUMBA_FA_DECODE(attention_decode_split_256_1, 256, 1)
+KAPLUMBA_FA_DECODE(attention_decode_split_256_2, 256, 2)
+KAPLUMBA_FA_DECODE(attention_decode_split_256_4, 256, 4)
+KAPLUMBA_FA_DECODE(attention_decode_split_256_8, 256, 8)
+KAPLUMBA_FA_DECODE(attention_decode_split_512_1, 512, 1)
+KAPLUMBA_FA_DECODE(attention_decode_split_512_2, 512, 2)
+KAPLUMBA_FA_DECODE(attention_decode_split_512_4, 512, 4)
+KAPLUMBA_FA_DECODE(attention_decode_split_512_8, 512, 8)
+KAPLUMBA_FA_COMBINE(attention_decode_combine_256, 256)
+KAPLUMBA_FA_COMBINE(attention_decode_combine_512, 512)

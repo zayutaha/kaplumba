@@ -779,9 +779,26 @@ fn mma_gemm_rows(
     let input_buffer = halfs(input);
     let input_sign_buffer = halfs(input_signs);
     let output_sign_buffer = halfs(output_signs);
+    // One canary row past the end of both output buffers. `linear_gemm_mma`
+    // processes a whole 128-row tile whatever `queries` is and must NOT store the
+    // rows it does not own -- there is no `simdgroup_store` row mask, so that
+    // guard is the only thing between a partial tile and a write outside the
+    // buffer. Reading `queries * out_features` elements back would never see
+    // such a write, so the canary is what makes the guard testable.
+    let canary = out_features;
     let transformed = scratch(queries * in_features * size_of::<u16>());
-    let raw = scratch(queries * out_features * size_of::<f32>());
-    let output = scratch(queries * out_features * size_of::<u16>());
+    let raw = scratch((queries + 1) * out_features * size_of::<f32>());
+    let output = scratch((queries + 1) * out_features * size_of::<u16>());
+    {
+        let raw_words = raw.contents() as *mut u32;
+        for index in 0..canary {
+            unsafe { *raw_words.add(queries * out_features + index) = 0xDEAD_BEEFu32 };
+        }
+        let out_words = output.contents() as *mut u16;
+        for index in 0..canary {
+            unsafe { *out_words.add(queries * out_features + index) = 0x7E7Eu16 };
+        }
+    }
     // `linear_gemm_mma` stores (not accumulates) every output block, so `raw`
     // does not strictly need clearing. Zero it anyway so the comparison stays
     // meaningful if the gate ever falls back to the tiled kernel, which
@@ -810,6 +827,24 @@ fn mma_gemm_rows(
         )
         .expect("encode MMA prefill GEMM");
     encoder.commit_and_wait().expect("commit MMA GEMM");
+    {
+        let raw_words = raw.contents() as *const u32;
+        for index in 0..canary {
+            assert_eq!(
+                unsafe { *raw_words.add(queries * out_features + index) },
+                0xDEAD_BEEFu32,
+                "the MMA kernel stored output row {queries}, past the end of `raw`"
+            );
+        }
+        let out_words = output.contents() as *const u16;
+        for index in 0..canary {
+            assert_eq!(
+                unsafe { *out_words.add(queries * out_features + index) },
+                0x7E7Eu16,
+                "the MMA kernel overwrote the canary row of `output`"
+            );
+        }
+    }
     let values = output.contents() as *const u16;
     (0..queries * out_features)
         .map(|index| f16::from_bits(unsafe { *values.add(index) }).to_f32())
@@ -867,13 +902,13 @@ fn mma_prefill_gemm_matches_cpu_reference() {
     let mut worst = 0.0_f32;
 
     // Every rate the engine can load: integer 1..=8 and fractional 1..=3. The
-    // integer path exercises `exl3_code_at_tg` + `trellis_word`, the fractional
-    // path `fractional_window_tg`, and the word-count derivations differ.
-    // 33 queries = two simdgroup-row blocks with a partial second block.
-    // 65 queries = a FULL 64-row block plus one row of the second block, so the
-    // multi-block path in `linear_gemm_mma` (QTILE = 64) is exercised. The
-    // earlier 33 covered only a single partial block.
-    let (queries, in_features, out_features) = (65, 128, 128);
+    // integer path exercises the lane-parallel trellis window arithmetic, the
+    // fractional path `fractional_window`, and the word-count derivations
+    // differ. 129 queries = one FULL 128-row tile plus one row of the second, so
+    // both the multi-tile dispatch and the row-guarded store of a partial tile
+    // are exercised; 129 is also the smallest count that proves the dispatch
+    // grid, not just the kernel, grew with the tile.
+    let (queries, in_features, out_features) = (129, 128, 128);
     let input = shape_input(queries, in_features);
     let input_signs = shape_signs(in_features, 3);
     let output_signs = shape_signs(out_features, 5);
@@ -952,14 +987,18 @@ fn mma_prefill_gemm_matches_cpu_reference() {
         );
     }
 
-    // Non-square shapes and query counts that straddle the 32-row MMA block
-    // boundary: 1 (one partial block), 31 (partial), 32 (exactly one), 33 and
-    // 48 (partial second block), 64 (exactly two). 256x384 is the real
-    // gate_proj geometry class; 384x256 covers out_features < in_features.
+    // Non-square shapes and query counts that straddle the 128-row MMA tile
+    // boundary: 1 (one partial tile), 127 (partial), 128 (exactly one), 129
+    // (one row of a second tile), 255 and 256 (two tiles, the second exactly
+    // full then one row over), 257 (three tiles). 256x384 is the real gate_proj
+    // geometry class; 384x256 covers out_features < in_features; 128x512 covers
+    // out_features > 2 tiles so the x grid is exercised too. Every count below
+    // 128 wastes most of a tile, which is the tail the row-guarded store exists
+    // for: a tile that stored unconditionally would scribble past the output.
     for (in_features, out_features) in [(128, 256), (256, 384), (384, 256), (128, 512)] {
         let input_signs = shape_signs(in_features, 3);
         let output_signs = shape_signs(out_features, 5);
-        for queries in [1, 31, 32, 33, 48, 64] {
+        for queries in [1, 127, 128, 129, 255, 256, 257] {
             let input = shape_input(queries, in_features);
             let packed = matrix_packed_integer_shape(
                 3,

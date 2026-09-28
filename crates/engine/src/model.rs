@@ -3,7 +3,9 @@ use std::path::Path;
 use metal::Buffer;
 use thiserror::Error;
 
-use kaplumba_kernels::attention::{AttentionEncodeRequest, AttentionKernels, AttentionRequest};
+use kaplumba_kernels::attention::{
+    decode_partial_elements, AttentionEncodeRequest, AttentionKernels, AttentionRequest,
+};
 use kaplumba_kernels::elements::{ElementKernels, RopeBufferRequest, RopeRequest};
 use kaplumba_kernels::encoder::MetalEncoder;
 use kaplumba_kernels::exl3::{Exl3Codebook, Exl3Rate, KernelError};
@@ -33,16 +35,20 @@ use crate::weights::{TextWeights, WeightError};
 /// | `q` (u16, `chunk * q_max`, q_max = 16384) | 8.39 MB | yes |
 /// | `k` + `v` (u16, `chunk * kv_max`, kv_max = 4096) | 4.19 MB | yes |
 /// | `hidden_a/b/normed/attended/proj` (u16, `chunk * hidden`) | 13.76 MB | yes |
-/// | `attn_scores` (f32, `q_heads * capacity` = 32 * 8192) | 1.05 MB | no |
+/// | `attn_partials` (f32, `16 splits * q_heads * (head_dim + 2)`) | 1.05 MB | no |
 /// | `logits` + `capped` + fixed | 1.20 MB | no |
 /// | **total** | **~90 MB** | |
 ///
-/// This was 64 rows until `attn_scores` was right-sized. It had been allocated
-/// `q_max * 1024` = `q_heads * head_dim * 1024` floats, but the buffer is indexed
-/// by *head*, so the real requirement is `q_heads * key_count`. That was one
-/// `head_dim` too many — 67.11 MB, which alone pushed a 256-row chunk to
-/// 160.7 MB and forced the chunk down to 64. Fixing it buys back the 4x larger
-/// chunk (fewer, fatter dispatches) *and* trims the minimum footprint.
+/// This was 64 rows until the attention scratch was right-sized. It had been
+/// allocated `q_max * 1024` = `q_heads * head_dim * 1024` floats, but the old
+/// split-key buffer was indexed by *head*, so the real requirement was
+/// `q_heads * key_count`. That made it 67.11 MB, which alone pushed a 256-row
+/// chunk to 160.7 MB and forced the chunk down to 64. Right-sizing it bought
+/// back the 4x larger chunk (fewer, fatter dispatches) *and* trimmed the
+/// minimum footprint — and then sizing it from a construction-time cache
+/// capacity instead of the live key count broke decode outright past 1024 keys.
+/// It is now split-KV flash decoding: `ATTENTION_SPLITS_MAX * q_heads *
+/// (head_dim + 2)` floats, fixed, with no dependence on context length.
 pub const PREFILL_CHUNK: usize = 256;
 
 #[derive(Debug, Error)]
@@ -1208,9 +1214,7 @@ impl DecoderLayer {
             self.attention.encode_online_attention_split(
                 encoder,
                 attention_request,
-                &scratch.attn_scores,
-                &scratch.attn_row_max,
-                &scratch.attn_row_sum,
+                &scratch.attn_partials,
             )?;
         } else {
             self.attention.encode_online_attention(encoder, attention_request)?;
@@ -1722,11 +1726,10 @@ pub struct ForwardScratch {
     pub last_hidden: Buffer,
     pub logits: Buffer,
     pub capped: Buffer,
-    /// Split-key attention scratch. `attn_scores` is the big one: one float per
-    /// (head, key slot), so sliding layers need q_heads * 1024 entries.
-    pub attn_scores: Buffer,
-    pub attn_row_max: Buffer,
-    pub attn_row_sum: Buffer,
+    /// Split-KV decode scratch: one unnormalised `(m, l, O)` partial per
+    /// (split, query head), so `splits * q_heads * (head_dim + 2)` floats. Sized
+    /// once from the layer shapes, never from a key count.
+    pub attn_partials: Buffer,
     /// Winning (value, index) key for the GPU greedy pick, and the token it
     /// decodes to. Kept on the device so the next step's forward can read the
     /// sampled token without a host round trip.
@@ -1743,7 +1746,7 @@ impl ForwardScratch {
         kv_max: usize,
         inter: usize,
         vocab: usize,
-        attn_scores: usize,
+        attn_partials: usize,
     ) -> Result<Self, ModelError> {
         if max_tokens == 0 || hidden == 0 || vocab == 0 {
             return Err(ModelError::InvalidConfig(
@@ -1794,31 +1797,14 @@ impl ForwardScratch {
             last_hidden: u16_elements(1, hidden)?,
             logits: u16_elements(1, vocab)?,
             capped: u16_elements(1, vocab)?,
-            // One float per (query head, key slot) for the widest key scan any
-            // layer performs, i.e. `max(q_heads * capacity)`.
-            //
-            // This used to be `q_max * 1024`, which is one `head_dim` too many:
-            // `q_max` is `q_heads * head_dim` (16384), but the buffer is indexed
-            // by head alone, so the real requirement is `q_heads * key_count`
-            // (32 * 8192 = 262,144). That made it 512x oversized -- 67.11 MB of
-            // a 160.7 MB total. The oversizing is why it never overflowed.
-            attn_scores: device.new_buffer(
-                u64::try_from(
-                    attn_scores
-                        .checked_mul(std::mem::size_of::<f32>())
-                        .ok_or_else(|| {
-                            ModelError::InvalidConfig(
-                                "attention score scratch overflows".to_string(),
-                            )
-                        })?,
-                )
-                .map_err(|_| {
-                    ModelError::InvalidConfig("attention score scratch is too large".to_string())
-                })?,
-                options,
-            ),
-            attn_row_max: f32_elements(1, q_max)?,
-            attn_row_sum: f32_elements(1, q_max)?,
+            // One (m, l, O[head_dim]) partial per (KV split, query head) for the
+            // widest layer shape. This replaces a `q_heads * key_count` fp32
+            // score matrix, which was O(L^2), sized from the cache capacity seen
+            // at construction, and hard-failed decode at 1215 keys of context:
+            // `attention score buffer is 131072 bytes, needs 155520`. The
+            // replacement is fixed-size and independent of context length, per
+            // AGENTS.md §8; 1.05 MB at 16 splits x 32 heads x 512 dims.
+            attn_partials: f32_elements(1, attn_partials)?,
             greedy_best: device.new_buffer(4, options),
             // One slot per step so a queued batch of steps each keep their own
             // token; a single slot would have every step overwrite the last.
@@ -1846,9 +1832,7 @@ impl ForwardScratch {
             &self.last_hidden,
             &self.logits,
             &self.capped,
-            &self.attn_scores,
-            &self.attn_row_max,
-            &self.attn_row_sum,
+            &self.attn_partials,
             &self.greedy_best,
             &self.greedy_token,
         ]
@@ -1966,15 +1950,23 @@ impl TextModel {
         let mut q_max = 0;
         let mut kv_max = 0;
         let mut inter = 0;
-        let mut attn_scores = 1;
+        let mut attn_partials = 1;
         for layer in &layers {
             q_max = q_max.max(layer.config.q_heads * layer.config.head_dim);
             kv_max = kv_max.max(layer.config.kv_heads * layer.config.head_dim);
             inter = inter.max(layer.config.intermediate_size);
-            attn_scores = attn_scores.max(layer.config.q_heads * layer.gpu_cache.capacity());
+            attn_partials = attn_partials
+                .max(decode_partial_elements(layer.config.q_heads, layer.config.head_dim));
         }
-        let scratch =
-            ForwardScratch::new(1, hidden_size, q_max, kv_max, inter, vocab_size, attn_scores)?;
+        let scratch = ForwardScratch::new(
+            1,
+            hidden_size,
+            q_max,
+            kv_max,
+            inter,
+            vocab_size,
+            attn_partials,
+        )?;
         Ok(Self {
             embedding,
             embedding_buffer,
@@ -2846,12 +2838,13 @@ impl TextModel {
         let mut q_max = 0;
         let mut kv_max = 0;
         let mut inter = 0;
-        let mut attn_scores = 1;
+        let mut attn_partials = 1;
         for layer in &self.layers {
             q_max = q_max.max(layer.config.q_heads * layer.config.head_dim);
             kv_max = kv_max.max(layer.config.kv_heads * layer.config.head_dim);
             inter = inter.max(layer.config.intermediate_size);
-            attn_scores = attn_scores.max(layer.config.q_heads * layer.gpu_cache.capacity());
+            attn_partials = attn_partials
+                .max(decode_partial_elements(layer.config.q_heads, layer.config.head_dim));
         }
         self.scratch = ForwardScratch::new(
             tokens,
@@ -2860,7 +2853,7 @@ impl TextModel {
             kv_max,
             inter,
             self.vocab_size,
-            attn_scores,
+            attn_partials,
         )?;
         self.scratch_tokens = tokens;
         Ok(())

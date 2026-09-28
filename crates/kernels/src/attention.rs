@@ -11,6 +11,46 @@ pub use crate::exl3::KernelError;
 const SOURCE: &str = include_str!("attention.metal");
 const MAX_HEAD_DIM: usize = 512;
 
+/// Most splits of the KV axis the decode path ever takes.
+///
+/// This is a hard cap, and it is what makes the decode scratch *fixed-size*: the
+/// engine allocates `ATTENTION_SPLITS_MAX * q_heads * (head_dim + 2)` floats
+/// once, at construction, and no prompt length can change it. 16 is what fills
+/// the GPU at Gxma's 32 query heads -- `16 * 32 * 32` = 16,384 threads, ~6 waves
+/// over a 20-core M4 Pro's resident thread capacity.
+pub const ATTENTION_SPLITS_MAX: usize = 16;
+
+/// Fewest keys a split may be given. Below this the combine pass's extra read
+/// of the partials costs more than the parallelism buys.
+const ATTENTION_MIN_KEYS_PER_SPLIT: usize = 64;
+
+/// Threads the decode partial kernel aims to run, before the per-split cap.
+const ATTENTION_DECODE_THREADS_TARGET: usize = 16_384;
+
+/// Floats the decode partial buffer holds for a layer: two softmax statistics
+/// and one unnormalised accumulator per (split, query head).
+pub fn decode_partial_elements(q_heads: usize, head_dim: usize) -> usize {
+    let rows = ATTENTION_SPLITS_MAX.saturating_mul(q_heads);
+    rows.saturating_mul(head_dim)
+        .saturating_add(rows.saturating_mul(2))
+}
+
+/// How many ways to cut `key_count` keys for the decode path.
+///
+/// Aiming at a fixed *thread* count (not a fixed workgroup count) matters
+/// because a threadgroup is `32 * (q_heads / kv_heads)` threads, so a layer with
+/// a small GQA ratio would otherwise get a quarter of the threads at the same
+/// split count. The result is always in `1 ..= ATTENTION_SPLITS_MAX`, which is
+/// what lets the scratch stay fixed-size.
+pub fn decode_splits(q_heads: usize, key_count: usize) -> usize {
+    if q_heads == 0 || key_count == 0 {
+        return 1;
+    }
+    let wanted = ATTENTION_DECODE_THREADS_TARGET / (32 * q_heads.max(1));
+    let affordable = key_count.div_ceil(ATTENTION_MIN_KEYS_PER_SPLIT);
+    wanted.clamp(1, ATTENTION_SPLITS_MAX).min(affordable).max(1)
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct AttentionParams {
@@ -21,6 +61,10 @@ struct AttentionParams {
     key_count: u32,
     scale: f32,
     window: u32,
+    /// Decode only: KV splits and keys per split. Zero means "scan every key",
+    /// which is what the prefill kernels get.
+    splits: u32,
+    keys_per_split: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -70,11 +114,10 @@ pub struct AttentionKernels {
     /// `head_dim` is 256 or 512; `nsg` is the GQA ratio `q_heads / kv_heads`,
     /// which the kernel needs verbatim because it sizes the threadgroup.
     attention_gqa_pipelines: [ComputePipelineState; GQA_PIPELINES],
-    scores_pipeline: ComputePipelineState,
-    scores_coalesced_pipeline: ComputePipelineState,
-    row_reduce_coalesced_pipeline: ComputePipelineState,
-    row_reduce_pipeline: ComputePipelineState,
-    combine_pipeline: ComputePipelineState,
+    /// The same body run over one split of the KV axis (flash-decoding).
+    decode_split_pipelines: [ComputePipelineState; GQA_PIPELINES],
+    decode_combine_256_pipeline: ComputePipelineState,
+    decode_combine_512_pipeline: ComputePipelineState,
 }
 
 /// `q_heads / kv_heads` values the transposed kernel is instantiated for, and
@@ -96,6 +139,10 @@ fn gqa_pipeline_name(head_dim: usize, nsg: usize) -> String {
     format!("online_attention_gqa_{head_dim}_{nsg}")
 }
 
+fn decode_split_pipeline_name(head_dim: usize, nsg: usize) -> String {
+    format!("attention_decode_split_{head_dim}_{nsg}")
+}
+
 /// Threadgroups of `per_group` threads needed to cover `threads`, at least one.
 /// The kernels that index the grid themselves early-return on the surplus.
 fn threads_for(threads: usize, per_group: usize) -> u64 {
@@ -115,11 +162,6 @@ impl AttentionKernels {
                 .new_compute_pipeline_state_with_function(&f)
                 .map_err(KernelError::Pipeline)
         };
-        let scores_pipeline = extra("attention_scores")?;
-        let row_reduce_pipeline = extra("attention_row_reduce")?;
-        let combine_pipeline = extra("attention_combine")?;
-        let scores_coalesced_pipeline = extra("attention_scores_coalesced")?;
-        let row_reduce_coalesced_pipeline = extra("attention_row_reduce_coalesced")?;
         let online_attention_pipeline = extra("online_attention")?;
         let online_attention_256_pipeline = extra("online_attention_256")?;
         let online_attention_512_pipeline = extra("online_attention_512")?;
@@ -128,9 +170,11 @@ impl AttentionKernels {
         let attention_tg2_256_pipeline = extra("online_attention_tg2_256")?;
         let attention_tg2_512_pipeline = extra("online_attention_tg2_512")?;
         let mut attention_gqa_pipelines = Vec::with_capacity(GQA_PIPELINES);
+        let mut decode_split_pipelines = Vec::with_capacity(GQA_PIPELINES);
         for head_dim in GQA_HEAD_DIMS {
             for nsg in GQA_RATIOS {
                 attention_gqa_pipelines.push(extra(&gqa_pipeline_name(head_dim, nsg))?);
+                decode_split_pipelines.push(extra(&decode_split_pipeline_name(head_dim, nsg))?);
             }
         }
         let attention_gqa_pipelines: [ComputePipelineState; GQA_PIPELINES] = attention_gqa_pipelines
@@ -138,6 +182,12 @@ impl AttentionKernels {
             .map_err(|_| {
                 KernelError::Pipeline("unexpected transposed attention pipeline count".to_string())
             })?;
+        let decode_split_pipelines: [ComputePipelineState; GQA_PIPELINES] =
+            decode_split_pipelines.try_into().map_err(|_| {
+                KernelError::Pipeline("unexpected decode split pipeline count".to_string())
+            })?;
+        let decode_combine_256_pipeline = extra("attention_decode_combine_256")?;
+        let decode_combine_512_pipeline = extra("attention_decode_combine_512")?;
         let queue = device.new_command_queue();
         Ok(Self {
             device,
@@ -151,11 +201,9 @@ impl AttentionKernels {
             attention_tg2_256_pipeline,
             attention_tg2_512_pipeline,
             attention_gqa_pipelines,
-            scores_pipeline,
-            scores_coalesced_pipeline,
-            row_reduce_coalesced_pipeline,
-            row_reduce_pipeline,
-            combine_pipeline,
+            decode_split_pipelines,
+            decode_combine_256_pipeline,
+            decode_combine_512_pipeline,
         })
     }
 
@@ -196,6 +244,8 @@ impl AttentionKernels {
             key_count: to_u32(key_count, "attention key count")?,
             scale,
             window: to_u32(window, "attention window")?,
+            splits: 0,
+            keys_per_split: 0,
         };
         // Resolve the pipeline before opening an encoder. Returning early from
         // inside `set_compute_pipeline_state` used to drop a live compute
@@ -234,41 +284,42 @@ impl AttentionKernels {
         read_u16_buffer(&output)
     }
 
-    /// Encode the online-softmax attention kernel into a caller-owned command
-    /// buffer, reading keys/values straight out of the GPU-resident cache.
-    /// Split-key attention for the decode shape: one query, few tokens.
+    /// Encode the split-KV decode kernel and its combine pass into a caller-owned
+    /// command buffer, reading keys/values straight out of the GPU-resident cache.
+    /// Single query, any number of keys.
     ///
-    /// The serial kernel dispatches `queries * q_heads` threads, so decode runs
-    /// on 32 threads while streaming the whole KV cache. Measured 153 ms per
-    /// token in situ against 132 us for the same shape on an L2-resident buffer,
-    /// so the serialisation dominates. This runs three passes with
-    /// `q_heads * key_count` and `q_heads * head_dim` threads instead, and reads
-    /// the KV data once rather than once per thread.
+    /// Two dispatches, both fixed-size:
     ///
-    /// `scores` must hold `q_heads * key_count` floats.
-    #[allow(clippy::too_many_arguments)]
+    /// 1. `attention_decode_split_{head_dim,ratio}` on `splits * kv_heads`
+    ///    workgroups of `32 * (q_heads / kv_heads)` threads. Each owns a
+    ///    contiguous `ceil(key_count / splits)` slice of the live window and
+    ///    runs the *prefill* online softmax over it, writing an unnormalised
+    ///    `(m, l, O)` partial of `head_dim + 2` floats. No score matrix: the
+    ///    only scratch is the double-buffered weight tile in threadgroup memory
+    ///    (`2 * ratio * 32` floats), the same as prefill.
+    /// 2. `attention_decode_combine_{head_dim}` on `q_heads * head_dim` threads,
+    ///    merging the partials with `exp(m_s - M)` rescaling and no threadgroup
+    ///    memory at all.
+    ///
+    /// `partials` must hold `splits * q_heads * (head_dim + 2)` floats, and
+    /// `splits <= ATTENTION_SPLITS_MAX`, so a buffer sized by
+    /// [`decode_partial_elements`] serves every prompt length forever. The check
+    /// below is what proves the caller did that: the old buffer was sized from
+    /// the cache capacity captured at construction and silently ran out at 1215
+    /// keys of context.
     pub fn encode_online_attention_split(
         &self,
         encoder: &mut crate::encoder::MetalEncoder,
         request: AttentionEncodeRequest<'_>,
-        scores: &Buffer,
-        row_max: &Buffer,
-        row_sum: &Buffer,
+        partials: &Buffer,
     ) -> Result<(), KernelError> {
         let AttentionEncodeRequest {
-            queries,
-            keys,
-            values,
-            query_positions,
-            key_positions,
-            output,
             queries_count,
             q_heads,
             kv_heads,
             head_dim,
             key_count,
-            scale,
-            window,
+            ..
         } = request;
         if queries_count != 1
             || q_heads == 0
@@ -281,21 +332,29 @@ impl AttentionKernels {
                 "split-key attention is for a single query with valid dimensions".to_string(),
             ));
         }
-        // `attention_scores` writes `q_heads * key_count` floats into `scores`.
-        // The host sizes that buffer from the widest cache any layer scans, and
-        // this is the check that the two agree. It matters because the old
-        // allocation was 512x oversized, so an undersized buffer would have gone
-        // unnoticed until it silently corrupted memory.
-        let required = q_heads
-            .checked_mul(key_count)
+        let groups = q_heads / kv_heads;
+        // No decode specialisation for this shape (an unusual head_dim or GQA
+        // ratio). The prefill kernels are correct for a single query and need no
+        // scratch, so fall back to them rather than refuse to decode.
+        let Some(index) = gqa_index(head_dim, groups) else {
+            return self.encode_online_attention(encoder, request);
+        };
+        let splits = decode_splits(q_heads, key_count);
+        let keys_per_split = key_count.div_ceil(splits);
+        // Repointed at the new buffer: the same "host and kernel must agree"
+        // guard as before, but the requirement is now a function of the layer's
+        // head count alone and never of how many keys are live.
+        let required = splits
+            .checked_mul(q_heads)
+            .and_then(|rows| rows.checked_mul(head_dim + 2))
             .and_then(|count| count.checked_mul(size_of::<f32>()))
             .ok_or_else(|| {
-                KernelError::InvalidInput("attention score shape overflows".to_string())
+                KernelError::InvalidInput("attention partial shape overflows".to_string())
             })?;
-        if scores.length() < required as u64 {
+        if partials.length() < required as u64 {
             return Err(KernelError::InvalidInput(format!(
-                "attention score buffer is {} bytes, needs {required} for {q_heads} heads x {key_count} keys",
-                scores.length()
+                "attention partial buffer is {} bytes, needs {required} for {splits} splits x {q_heads} heads x {head_dim} dims",
+                partials.length()
             )));
         }
         let params = AttentionParams {
@@ -304,35 +363,35 @@ impl AttentionKernels {
             kv_heads: to_u32(kv_heads, "KV heads")?,
             head_dim: to_u32(head_dim, "head dimension")?,
             key_count: to_u32(key_count, "key count")?,
-            scale,
-            window: to_u32(window, "window")?,
+            scale: request.scale,
+            window: to_u32(request.window, "window")?,
+            splits: to_u32(splits, "split count")?,
+            keys_per_split: to_u32(keys_per_split, "keys per split")?,
         };
         let bytes = params_bytes(&params);
-
         let kv_groups = to_u32(kv_heads, "kv head count")?;
         encoder.dispatch_groups(
-            &self.scores_coalesced_pipeline,
+            &self.decode_split_pipelines[index],
             &[
-                Some(queries),
-                Some(keys),
-                Some(query_positions),
-                Some(key_positions),
-                Some(scores),
+                Some(request.queries),
+                Some(request.keys),
+                Some(request.values),
+                Some(request.query_positions),
+                Some(request.key_positions),
+                Some(partials),
             ],
-            &bytes,
-            (key_count as u64) * u64::from(kv_groups),
-            256,
+            bytes,
+            (splits as u64) * u64::from(kv_groups),
+            (32 * groups) as u64,
         )?;
-        encoder.dispatch_groups(
-            &self.row_reduce_coalesced_pipeline,
-            &[Some(scores), Some(row_max), Some(row_sum)],
-            &bytes,
-            q_heads as u64,
-            256,
-        )?;
+        let combine = if head_dim == 256 {
+            &self.decode_combine_256_pipeline
+        } else {
+            &self.decode_combine_512_pipeline
+        };
         encoder.dispatch_1d(
-            &self.combine_pipeline,
-            &[Some(values), Some(scores), Some(row_max), Some(row_sum), Some(output)],
+            combine,
+            &[Some(partials), Some(request.output)],
             bytes,
             (q_heads * head_dim) as u64,
             64,
@@ -384,6 +443,8 @@ impl AttentionKernels {
             key_count: to_u32(key_count, "attention key count")?,
             scale,
             window: to_u32(window, "attention window")?,
+            splits: 0,
+            keys_per_split: 0,
         };
         // Prefill: one threadgroup per (query, KV HEAD), holding one simdgroup
         // per query head that shares that KV head. `groups` query heads read the

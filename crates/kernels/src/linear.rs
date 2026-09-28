@@ -137,9 +137,11 @@ pub struct LinearKernels {
     finalize_pipeline: ComputePipelineState,
     input_rows_pipeline: ComputePipelineState,
     gemv_tiled_pipeline: ComputePipelineState,
-    /// Tensor-core prefill GEMM (`linear_gemm_mma`): dequantize to tgmem half,
-    /// simdgroup MMA with four named accumulator chains. Needs in_features and
-    /// out_features to be multiples of 32 (the engine's are multiples of 128).
+    /// Tensor-core prefill GEMM (`linear_gemm_mma`): dequantize the EXL3 weights
+    /// of a 64-wide k chunk to threadgroup halfs, then run 128 queries x 64
+    /// outputs through 256 threads with sixteen named accumulator chains per
+    /// simdgroup. Needs `in_features` a multiple of 64 and `out_features` a
+    /// multiple of 64; the engine's are multiples of 128.
     gemm_mma_pipeline: ComputePipelineState,
     finalize_rows_pipeline: ComputePipelineState,
     zero_raw_pipeline: ComputePipelineState,
@@ -971,37 +973,46 @@ impl LinearKernels {
         // now actually covers it. Set KAPLUMBA_DISABLE_MMA_PREFILL=1 to fall
         // back to the scalar tiled kernel for A/B.
         if std::env::var_os("KAPLUMBA_DISABLE_MMA_PREFILL").is_none()
-            && in_features % 32 == 0
-            && out_features % 32 == 0
+            && in_features % 64 == 0
             && self.gemm_mma_pipeline.thread_execution_width() == 32
         {
-            encoder.dispatch_1d(
-                &self.input_rows_pipeline,
-                &[Some(input), Some(input_signs), Some(transformed)],
-                params_bytes(&row_params),
-                (input_elements / 128) as u64,
-                64,
-            )?;
-            encoder.dispatch_2d(
-                &self.gemm_mma_pipeline,
-                &[
-                    TensorRef::new(packed, packed_offset),
-                    TensorRef::new(transformed, 0),
-                    TensorRef::new(raw, 0),
-                ],
-                params_bytes(&linear_params),
-                (out_features / 32) as u64,
-                queries.div_ceil(64) as u64,
-                128,
-                1,
-            )?;
-            return encoder.dispatch_1d(
-                &self.finalize_rows_pipeline,
-                &[Some(raw), Some(output_signs), Some(output)],
-                params_bytes(&row_params),
-                (output_elements / 128) as u64,
-                64,
-            );
+            // `linear_gemm_mma` is a 128-query x 64-output tile on 256 threads
+            // (see its header). It needs both dimensions to be multiples of 64
+            // and the device to allow 256 threads per threadgroup; otherwise the
+            // scalar tiled kernel below runs instead. `validate_encode` demands
+            // multiples of 128, so in practice the guard only ever fires on a
+            // hypothetical small device.
+            if out_features % 64 == 0
+                && self.gemm_mma_pipeline.max_total_threads_per_threadgroup() >= 256
+            {
+                encoder.dispatch_1d(
+                    &self.input_rows_pipeline,
+                    &[Some(input), Some(input_signs), Some(transformed)],
+                    params_bytes(&row_params),
+                    (input_elements / 128) as u64,
+                    64,
+                )?;
+                encoder.dispatch_2d(
+                    &self.gemm_mma_pipeline,
+                    &[
+                        TensorRef::new(packed, packed_offset),
+                        TensorRef::new(transformed, 0),
+                        TensorRef::new(raw, 0),
+                    ],
+                    params_bytes(&linear_params),
+                    (out_features / 64) as u64,
+                    queries.div_ceil(128) as u64,
+                    256,
+                    1,
+                )?;
+                return encoder.dispatch_1d(
+                    &self.finalize_rows_pipeline,
+                    &[Some(raw), Some(output_signs), Some(output)],
+                    params_bytes(&row_params),
+                    (output_elements / 128) as u64,
+                    64,
+                );
+            }
         }
         encoder.dispatch_1d(
             &self.input_rows_pipeline,
