@@ -12,6 +12,32 @@ use crate::tokenizer::{GemmaTokenizer, TokenizerError};
 
 pub const DEFAULT_CONTEXT_LIMIT: usize = 8192;
 
+/// Set `AGX_RELAX_CDM_CTXSTORE_TIMEOUT=1` once, before the first command buffer.
+///
+/// llama.cpp does exactly this at process start
+/// (`ggml/src/ggml-metal/ggml-metal.cpp:1025-1029`) as a documented workaround
+/// for the AGX driver stalling on a very large command-buffer context store,
+/// reported upstream as an interactivity hang (ggml-org/llama.cpp#20141). Our
+/// prefill is the same shape of problem: hundreds of dispatches submitted back
+/// to back with no host wait, so the driver can be asked to store a context far
+/// larger than it is tuned for. It has to be set before the driver reads it, so
+/// it is done at the earliest point in a generation, which is before any
+/// `MetalEncoder` in this process has been constructed.
+///
+/// `overwrite = 1`, matching llama.cpp, so an operator can still override it.
+fn ensure_agx_relax_ctxstore_timeout() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let name = std::ffi::CString::new("AGX_RELAX_CDM_CTXSTORE_TIMEOUT").expect("no NUL");
+        let value = std::ffi::CString::new("1").expect("no NUL");
+        // SAFETY: both pointers are NUL-terminated and outlive the call.
+        let result = unsafe { libc::setenv(name.as_ptr(), value.as_ptr(), 1) };
+        if result != 0 {
+            eprintln!("kaplumba: could not set AGX_RELAX_CDM_CTXSTORE_TIMEOUT");
+        }
+    });
+}
+
 #[derive(Debug, Clone)]
 pub struct GenerationConfig {
     pub max_new_tokens: usize,
@@ -83,6 +109,7 @@ where
     if config.context_limit == 0 {
         return Err(GenerationError::InvalidContextLimit);
     }
+    ensure_agx_relax_ctxstore_timeout();
     let request_started = Instant::now();
     let prompt_ids = tokenizer.encode_prompt(prompt)?;
     let total_limit = prompt_ids.len().checked_add(config.max_new_tokens).ok_or(
@@ -203,6 +230,7 @@ where
     if config.context_limit == 0 {
         return Err(GenerationError::InvalidContextLimit);
     }
+    ensure_agx_relax_ctxstore_timeout();
     let request_started = Instant::now();
     let prompt_ids = tokenizer.encode_prompt(prompt)?;
     let total_limit = prompt_ids.len().checked_add(config.max_new_tokens).ok_or(
@@ -293,6 +321,7 @@ pub fn run_benchmark(
     plan: BenchmarkPlan,
 ) -> Result<BenchmarkResult, GenerationError> {
     plan.validate()?;
+    ensure_agx_relax_ctxstore_timeout();
     if prompt_ids.is_empty() || prompt_ids.len() != plan.prompt_tokens {
         return Err(GenerationError::InvalidInput(
             "benchmark prompt length does not match the plan".to_string(),
@@ -349,11 +378,20 @@ fn argmax_logits(logits: &[u16]) -> u32 {
 
 /// Greedy decode with the pick on the GPU and the wait batched.
 ///
-/// Steps are encoded back to back into one command buffer. The greedy pick runs
-/// as a kernel and leaves the sampled token in device memory, so step N+1's
-/// embedding kernel reads it without any host involvement. The host then waits
-/// once per `PIPELINE_DEPTH` steps and reads back that many token ids together,
-/// which keeps latency bounded while the GPU stays fed.
+/// Steps are encoded back to back, each into its own `MetalEncoder`. The greedy
+/// pick runs as a kernel and leaves the sampled token in device memory, so step
+/// N+1's embedding kernel reads it without any host involvement. The host then
+/// waits once per `PIPELINE_DEPTH` steps and reads back that many token ids
+/// together, which keeps latency bounded while the GPU stays fed.
+///
+/// Each step's encoder rolls on its own: `MetalEncoder::tick` counts every
+/// dispatch, so a step's ~2100 dispatches are committed in
+/// `MAX_DISPATCHES_PER_BUFFER` slices — 42 command buffers per step, measured
+/// with `MetalEncoder::command_buffers_created` — and the encoder only holds the
+/// trailing partial slice when it is committed. Rolling inside a step is safe
+/// for the pipeline because the slice boundaries are invisible to it: a single
+/// Metal queue runs committed buffers in commit order, and the wait is
+/// unchanged.
 fn generate_gpu_greedy_pipelined<F>(
     model: &mut TextModel,
     tokenizer: &crate::tokenizer::GemmaTokenizer,
@@ -393,7 +431,7 @@ where
         // steps that follow run against an empty cache. It also makes
         // `prefill_duration` honest -- it now covers the GPU, not just the host.
         prefill.commit_and_wait().map_err(ModelError::from)?;
-        let prefill_duration = prefill_started.elapsed();
+        prefill_duration = prefill_started.elapsed();
 
         let mut position = prompt_len as u32;
         let mut decoded = 0_usize;
@@ -403,7 +441,11 @@ where
 
             // One command buffer per step, all submitted before any wait. Each
             // step's forward reads the token the previous pick left in device
-            // memory, so the host is not in the loop.
+            // memory, so the host is not in the loop. Inside a step the
+            // `MetalEncoder` rolling scheme applies as usual -- it counts every
+            // dispatch -- so a step is committed in slices of
+            // `MAX_DISPATCHES_PER_BUFFER`, not as one giant encoder;
+            // `commit_terminal` then ends the trailing partial slice.
             let mut steps = Vec::with_capacity(depth);
             for step in 0..depth {
                 let mut encoder = MetalEncoder::new(&queue)
@@ -411,9 +453,11 @@ where
                 model
                     .forward_buffer_into_step(&mut encoder, position + step as u32, step)
                     .map_err(ModelError::from)?;
-                encoder
-                    .commit_and_waitless()
-                    .map_err(ModelError::from)?;
+                // Terminal: the encoder is dead after this, and `wait()` below is
+                // the only thing left that may be called on it. `Drop` ends an
+                // encoder that is still open, so the `?` on the encode above is
+                // an error return rather than a Metal trap.
+                encoder.commit_terminal().map_err(ModelError::from)?;
                 steps.push(encoder);
             }
             for encoder in &steps {

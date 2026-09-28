@@ -2,7 +2,7 @@ use std::ffi::c_void;
 use std::marker::PhantomData;
 
 use metal::{
-    Buffer, CommandBufferRef, CommandQueue, ComputeCommandEncoderRef, ComputePipelineState,
+    Buffer, CommandBuffer, CommandQueue, ComputeCommandEncoder, ComputePipelineState,
     MTLCommandBufferStatus, MTLSize,
 };
 
@@ -35,9 +35,31 @@ impl<'a> TensorRef<'a> {
 /// Dispatches encoded into one encoder execute in order and their memory writes
 /// are visible to subsequent dispatches, so buffers may be reused as ping-pong
 /// scratch within a single batch.
+///
+/// # Command buffers and encoders are owned handles
+///
+/// `-[MTLCommandQueue commandBuffer]` and `-[MTLCommandBuffer
+/// computeCommandEncoder]` are *not* `new`-prefixed in Objective-C: they hand
+/// back an object already added to the autorelease pool
+/// (<https://github.com/gfx-rs/metal-rs/issues/128>, and the doc comments
+/// metal-rs puts on those two methods). The `&CommandBufferRef` metal-rs returns
+/// therefore owns nothing — the only thing keeping the object alive is that this
+/// process never drains a pool. Storing the borrowed reference is a promise that
+/// nothing ever will, so this type stores the *owned* handles instead
+/// (`metal::CommandBuffer` / `metal::ComputeCommandEncoder`). metal-rs builds
+/// those with `foreign_type! { fn clone = obj_clone }`, i.e. `Clone`/`ToOwned`
+/// send `retain` and `Drop` sends `release` (`metal-0.33.0/src/lib.rs:180-182,
+/// 620-627`), so the retain/release pair is the crate's own mechanism rather
+/// than hand-rolled FFI. The `From<$owned> for $parent` impls do *not* retain,
+/// correctly: they move a reference, they do not copy one.
+///
+/// Retaining is a precondition for ever draining the pool, not a substitute for
+/// it: the pool still holds a pending release, so the bytes are only returned
+/// when the pool is drained. What owning the handle buys is that draining can
+/// no longer dangle a `&CommandBufferRef` this type is still using.
 pub struct MetalEncoder<'q> {
-    command_buffer: &'q CommandBufferRef,
-    encoder: &'q ComputeCommandEncoderRef,
+    command_buffer: CommandBuffer,
+    encoder: ComputeCommandEncoder,
     /// Kept so `flush_and_wait` can start a fresh command buffer; a compute
     /// encoder cannot be used after `end_encoding`.
     queue: &'q CommandQueue,
@@ -45,10 +67,19 @@ pub struct MetalEncoder<'q> {
     /// `MAX_IN_FLIGHT`. Waiting on the oldest when the window overflows is what
     /// applies back-pressure: the GPU is never starved, and the host is never
     /// allowed to queue without limit.
-    in_flight: Vec<&'q CommandBufferRef>,
+    in_flight: Vec<CommandBuffer>,
     /// Encoded dispatches in the current command buffer. A buffer is committed
     /// once it reaches `MAX_DISPATCHES_PER_BUFFER`.
     dispatches: u32,
+    /// Whether `encoder` has been ended. Every path that ends it goes through
+    /// [`Self::end`], so this cannot drift from reality, and [`Drop`] uses it to
+    /// end an encoder that an error path left open — which Metal traps on.
+    ended: bool,
+    /// Command buffers created over this encoder's lifetime, including the one
+    /// currently being encoded into. Rolling bounds this at
+    /// `dispatches_total / MAX_DISPATCHES_PER_BUFFER` regardless of how much
+    /// work the caller encodes; [`Self::command_buffers_created`] exposes it.
+    command_buffers: usize,
     /// Committed, un-waited, labelled buffers kept only to read their GPU
     /// timestamps, in commit order. Populated by [`Self::commit_stamped`] and
     /// drained by [`Self::take_gpu_stamps`]. It is deliberately *not* bounded
@@ -56,7 +87,7 @@ pub struct MetalEncoder<'q> {
     /// boundaries per forward and reads them all at the end, and an unbounded
     /// list of already-committed buffers costs no GPU memory (a finished
     /// buffer releases its resources).
-    stamped: Vec<(String, &'q CommandBufferRef)>,
+    stamped: Vec<(String, CommandBuffer)>,
 }
 
 /// `MTLCommandBuffer` GPU timestamps, which metal-rs 0.33 does not bind even
@@ -149,16 +180,72 @@ pub const MAX_IN_FLIGHT: usize = 8;
 
 impl<'q> MetalEncoder<'q> {
     pub fn new(queue: &'q CommandQueue) -> Result<Self, KernelError> {
-        let command_buffer = queue.new_command_buffer();
-        let encoder = command_buffer.new_compute_command_encoder();
+        let (command_buffer, encoder) = Self::pair(queue);
         Ok(Self {
             command_buffer,
             encoder,
             queue,
             in_flight: Vec::new(),
             dispatches: 0,
+            ended: false,
+            command_buffers: 1,
             stamped: Vec::new(),
         })
+    }
+
+    /// A fresh command buffer and the compute encoder on it, both retained.
+    fn pair(queue: &CommandQueue) -> (CommandBuffer, ComputeCommandEncoder) {
+        let command_buffer: CommandBuffer = queue.new_command_buffer().to_owned();
+        let encoder: ComputeCommandEncoder =
+            command_buffer.new_compute_command_encoder().to_owned();
+        (command_buffer, encoder)
+    }
+
+    /// Move to a fresh command buffer and encoder, which re-arms dispatching
+    /// after anything that ended the old pair.
+    fn rearm(&mut self) {
+        let (command_buffer, encoder) = Self::pair(self.queue);
+        self.command_buffers += 1;
+        self.command_buffer = command_buffer;
+        self.encoder = encoder;
+        self.dispatches = 0;
+        self.ended = false;
+    }
+
+    /// `end_encoding` on the current encoder, exactly once.
+    ///
+    /// Metal raises an Objective-C exception — an abort, not an error return —
+    /// both for a second `end_encoding` and for dropping an encoder that was
+    /// never ended, so the single choke point here is what keeps either from
+    /// being reachable.
+    fn end(&mut self) {
+        if !self.ended {
+            self.encoder.end_encoding();
+            self.ended = true;
+        }
+    }
+
+    /// Encoding into an ended encoder is the same abort, and a silent one in
+    /// release builds, so the misuse is caught wherever debug assertions are on.
+    fn assert_live(&self) {
+        debug_assert!(
+            !self.ended,
+            "dispatching into a MetalEncoder that has already been ended; \
+             commit_terminal is terminal and flush_and_wait/commit_stamped are not, \
+             so this is a use-after-terminal",
+        );
+    }
+
+    /// Command buffers this encoder has created over its lifetime, including
+    /// the one it is encoding into right now.
+    ///
+    /// The rolling scheme in [`Self::tick`] is unconditional: it applies to every
+    /// `dispatch_*`, so a decode step that encodes thousands of dispatches
+    /// commits them in `MAX_DISPATCHES_PER_BUFFER` slices exactly like a
+    /// prefill. This counter is the evidence, and a decode step is expected to
+    /// report tens, not one.
+    pub fn command_buffers_created(&self) -> usize {
+        self.command_buffers
     }
 
     /// Encode a 1D dispatch of `threads` threads into the current command buffer.
@@ -170,6 +257,7 @@ impl<'q> MetalEncoder<'q> {
         threads: u64,
         threads_per_group: u64,
     ) -> Result<(), KernelError> {
+        self.assert_live();
         if threads == 0 || threads_per_group == 0 {
             return Err(KernelError::InvalidInput(
                 "kernel thread and threadgroup counts must be non-zero".to_string(),
@@ -196,6 +284,7 @@ impl<'q> MetalEncoder<'q> {
         threads_per_group_x: u64,
         threads_per_group_y: u64,
     ) -> Result<(), KernelError> {
+        self.assert_live();
         if groups_x == 0 || groups_y == 0 || threads_per_group_x == 0 || threads_per_group_y == 0 {
             return Err(KernelError::InvalidInput(
                 "dispatch group and threadgroup sizes must be non-zero".to_string(),
@@ -235,6 +324,7 @@ impl<'q> MetalEncoder<'q> {
         groups: u64,
         threads_per_group: u64,
     ) -> Result<(), KernelError> {
+        self.assert_live();
         if groups == 0 || threads_per_group == 0 {
             return Err(KernelError::InvalidInput(
                 "kernel group and threadgroup counts must be non-zero".to_string(),
@@ -266,6 +356,7 @@ impl<'q> MetalEncoder<'q> {
         threads: u64,
         threads_per_group: u64,
     ) -> Result<(), KernelError> {
+        self.assert_live();
         if threads == 0 || threads_per_group == 0 {
             return Err(KernelError::InvalidInput(
                 "kernel thread and threadgroup counts must be non-zero".to_string(),
@@ -298,6 +389,7 @@ impl<'q> MetalEncoder<'q> {
         threads: MTLSize,
         threads_per_group: MTLSize,
     ) -> Result<(), KernelError> {
+        self.assert_live();
         self.encoder.set_compute_pipeline_state(pipeline);
         for (index, binding) in bindings.iter().enumerate() {
             self.encoder.set_buffer(index as u64, binding.map(|value| &**value), 0);
@@ -329,16 +421,14 @@ impl<'q> MetalEncoder<'q> {
     /// behind. Ordering between buffers is implicit: a single Metal command
     /// queue executes them in commit order.
     fn roll(&mut self) -> Result<(), KernelError> {
-        self.encoder.end_encoding();
+        self.end();
         self.command_buffer.commit();
-        self.in_flight.push(self.command_buffer);
+        self.in_flight.push(self.command_buffer.clone());
         if self.in_flight.len() > MAX_IN_FLIGHT {
             let oldest = self.in_flight.remove(0);
             oldest.wait_until_completed();
         }
-        self.command_buffer = self.queue.new_command_buffer();
-        self.encoder = self.command_buffer.new_compute_command_encoder();
-        self.dispatches = 0;
+        self.rearm();
         Ok(())
     }
 
@@ -360,25 +450,27 @@ impl<'q> MetalEncoder<'q> {
     /// also applies back-pressure in submission order, and taking the buffers
     /// out of the vector means a panic mid-drain cannot drop the tail.
     pub fn flush_and_wait(&mut self) -> Result<(), KernelError> {
-        self.encoder.end_encoding();
+        self.end();
         self.command_buffer.commit();
         for buffer in std::mem::take(&mut self.in_flight) {
             buffer.wait_until_completed();
         }
         self.command_buffer.wait_until_completed();
         // A compute encoder is single-use, so continue on a fresh buffer. The
-        // old reference is borrowed from `queue`, so it stays valid for `'q`;
-        // dropping our pointer to it is not what keeps the object alive.
-        self.command_buffer = self.queue.new_command_buffer();
-        self.encoder = self.command_buffer.new_compute_command_encoder();
-        self.dispatches = 0;
+        // pair is owned, so dropping the old one is what returns its memory.
+        self.rearm();
         Ok(())
     }
 
-    /// End the encoder and drop the work without committing. Used on error paths
-    /// so the encoder is never released without `end_encoding`.
+    /// End the encoder and drop the work without committing.
+    ///
+    /// The automatic path is [`Drop`], which ends any encoder still open, so an
+    /// error unwinding out of a caller no longer needs this. It stays because
+    /// `model.rs` calls it to end the encoder *before* returning an error, and
+    /// because ending at the failure point rather than at the end of the scope
+    /// releases the bound resources sooner.
     pub fn abandon(&mut self) {
-        self.encoder.end_encoding();
+        self.end();
     }
 
     /// Commit without waiting, so several command buffers can be in flight.
@@ -386,22 +478,27 @@ impl<'q> MetalEncoder<'q> {
     /// # This is a terminal operation
     ///
     /// Unlike [`Self::flush_and_wait`] and [`Self::commit_stamped`] it does
-    /// *not* start a fresh command buffer and does *not* reset `dispatches`,
-    /// because the only current caller (`generate.rs`, the pipelined decode
-    /// loop) drops the encoder into a list and calls [`Self::wait`] on it —
-    /// which takes `&self` and so cannot re-arm. Encoding anything else after
-    /// this call is a use-after-`end_encoding` bug and Metal will raise an
-    /// Objective-C exception, i.e. abort the process, rather than return an
-    /// error: the `encoder` field still points at the encoder this call just
-    /// ended, so the next `dispatch_*` would encode into it, and a second
-    /// `commit_and_waitless` would end and commit the same buffer twice. The
-    /// stale `dispatches` counter is a second, quieter symptom — it stays at
-    /// whatever the last roll left it at, so a subsequent dispatch can roll an
-    /// empty buffer.
-    pub fn commit_and_waitless(&mut self) -> Result<(), KernelError> {
-        self.encoder.end_encoding();
+    /// *not* start a fresh command buffer, so the value is dead for dispatching
+    /// afterwards: the `encoder` field still points at the encoder this call just
+    /// ended, and the next `dispatch_*` would encode into it and abort on an
+    /// Objective-C exception. The only things still legal on the returned value
+    /// are [`Self::wait`] (which takes `&self` and so cannot re-arm) and
+    /// dropping it, which thanks to [`Drop`] is now safe rather than a trap.
+    ///
+    /// Reachability of the misuse: the only caller is the pipelined decode loop
+    /// in `generate.rs`, which calls `wait()` on the value and then lets it go
+    /// out of scope. `dispatches` is deliberately left stale for the same
+    /// reason — a fresh buffer would invite another commit. `debug_assert`s on
+    /// every `dispatch_*` and here turn a future caller into a debug-build
+    /// failure instead of a release-build abort.
+    pub fn commit_terminal(&mut self) -> Result<(), KernelError> {
+        debug_assert!(
+            !self.ended,
+            "commit_terminal is terminal: this encoder has already been ended",
+        );
+        self.end();
         self.command_buffer.commit();
-        self.in_flight.push(self.command_buffer);
+        self.in_flight.push(self.command_buffer.clone());
         Ok(())
     }
 
@@ -425,7 +522,7 @@ impl<'q> MetalEncoder<'q> {
     }
 
     pub fn commit_and_wait(mut self) -> Result<(), KernelError> {
-        self.encoder.end_encoding();
+        self.end();
         self.command_buffer.commit();
         self.command_buffer.wait_until_completed();
         // Buffers rolled out mid-forward are committed but unfinished. On one
@@ -443,8 +540,9 @@ impl<'q> MetalEncoder<'q> {
     /// Commit the work encoded so far under `label` and continue on a fresh
     /// command buffer, without waiting.
     ///
-    /// This is [`Self::commit_and_waitless`] plus two things: the buffer is
-    /// labelled, and it is parked in `stamped` so [`Self::take_gpu_ms`] can
+    /// This is [`Self::commit_terminal`] without the terminality -- the encoder
+    /// is re-armed -- plus two things: the buffer is labelled, and it is parked
+    /// in `stamped` so [`Self::take_gpu_ms`] can
     /// read `GPUStartTime` / `GPUEndTime` off it later. Because the queue
     /// serialises command buffers, the retained buffers form an ordered
     /// timeline even though none of them is waited on here.
@@ -455,13 +553,12 @@ impl<'q> MetalEncoder<'q> {
     /// bound; drain it periodically (it is also what bounds GPU work in
     /// flight, since nothing here waits).
     pub fn commit_stamped(&mut self, label: &str) -> Result<(), KernelError> {
-        self.encoder.end_encoding();
+        self.end();
         self.command_buffer.set_label(label);
         self.command_buffer.commit();
-        self.stamped.push((label.to_string(), self.command_buffer));
-        self.command_buffer = self.queue.new_command_buffer();
-        self.encoder = self.command_buffer.new_compute_command_encoder();
-        self.dispatches = 0;
+        self.stamped
+            .push((label.to_string(), self.command_buffer.clone()));
+        self.rearm();
         Ok(())
     }
 
@@ -475,8 +572,8 @@ impl<'q> MetalEncoder<'q> {
     ///
     /// This does not touch the current command buffer, so the encoder left open
     /// by the last [`Self::commit_stamped`] is still open afterwards: end it
-    /// with a commit or [`Self::abandon`] before dropping `self`, exactly as
-    /// for every other path, or Metal traps on the un-ended encoder's dealloc.
+    /// with a commit or [`Self::abandon`] before dropping `self`, or let
+    /// [`Drop`] do it.
     pub fn take_gpu_stamps(&mut self) -> Vec<GpuStamp> {
         let retained = std::mem::take(&mut self.stamped);
         let mut stamps = Vec::with_capacity(retained.len());
@@ -510,6 +607,24 @@ impl<'q> MetalEncoder<'q> {
             .into_iter()
             .map(|stamp| (stamp.label, stamp.own_ms))
             .collect()
+    }
+}
+
+impl Drop for MetalEncoder<'_> {
+    /// End the encoder if it is still open, so dropping an encoder on an error
+    /// path cannot raise.
+    ///
+    /// Metal traps (`SIGTRAP` in a debug build, an Objective-C exception that
+    /// aborts otherwise) when a compute encoder is deallocated without
+    /// `endEncoding`. Before this existed, that meant every `?` in a caller that
+    /// encoded into a `MetalEncoder` — `generate.rs`'s prefill, for one — was a
+    /// process abort on any error, not a returned `Err`, which is why callers had
+    /// to hand-place `abandon()` on each path and one missed path was enough.
+    /// `ended` is the only thing this consults, and every method that ends the
+    /// encoder goes through [`MetalEncoder::end`], so a second `end_encoding`
+    /// here is impossible — which matters, because Metal traps on that too.
+    fn drop(&mut self) {
+        self.end();
     }
 }
 
@@ -586,7 +701,7 @@ kernel void burn(device float* out [[buffer(0)]],
         for _ in 0..(MAX_DISPATCHES_PER_BUFFER as usize + 5) {
             burn(&mut encoder, &pipeline, &out, CHEAP_ITERS);
         }
-        let rolled: Vec<&CommandBufferRef> = encoder.in_flight.clone();
+        let rolled: Vec<CommandBuffer> = encoder.in_flight.clone();
         assert_eq!(
             rolled.len(),
             1,
@@ -607,7 +722,7 @@ kernel void burn(device float* out [[buffer(0)]],
     }
 
     #[test]
-    fn commit_and_waitless_then_wait_completes_every_buffer() {
+    fn commit_terminal_then_wait_completes_every_buffer() {
         let Some((_device, queue, pipeline, out)) = burn_context() else {
             return;
         };
@@ -615,13 +730,84 @@ kernel void burn(device float* out [[buffer(0)]],
         for _ in 0..(MAX_DISPATCHES_PER_BUFFER as usize + 5) {
             burn(&mut encoder, &pipeline, &out, CHEAP_ITERS);
         }
-        encoder.commit_and_waitless().expect("commit");
+        encoder.commit_terminal().expect("commit");
 
         encoder.wait();
 
         for buffer in &encoder.in_flight {
             assert_eq!(buffer.status(), MTLCommandBufferStatus::Completed);
         }
+    }
+
+    /// The rolling scheme is not a prefill-only optimisation: every `dispatch_*`
+    /// ticks, so a decode-sized step lands in tens of small command buffers
+    /// rather than one giant one. This is the check that `tick` keeps applying
+    /// after the per-call scheme was added.
+    #[test]
+    fn a_decode_sized_step_rolls_rather_than_using_one_buffer() {
+        let Some((_device, queue, pipeline, out)) = burn_context() else {
+            return;
+        };
+        // One decode step of a 31B-class model at 1 query encodes ~2100
+        // dispatches (measured: 42 command buffers per step in
+        // `forward_buffer_into_step`).
+        const DECODE_DISPATCHES: usize = 2100;
+        let mut encoder = MetalEncoder::new(&queue).expect("encoder");
+        for _ in 0..DECODE_DISPATCHES {
+            burn(&mut encoder, &pipeline, &out, CHEAP_ITERS);
+        }
+
+        let expected = 1 + DECODE_DISPATCHES / MAX_DISPATCHES_PER_BUFFER as usize;
+        assert_eq!(
+            encoder.command_buffers_created(),
+            expected,
+            "a decode-sized step should roll every {MAX_DISPATCHES_PER_BUFFER} dispatches, \
+             not encode into a single command buffer",
+        );
+        assert_eq!(
+            encoder.dispatches,
+            (DECODE_DISPATCHES % MAX_DISPATCHES_PER_BUFFER as usize) as u32,
+            "the trailing partial slice is the only work left in the current buffer",
+        );
+        encoder.commit_and_wait().expect("wait");
+    }
+
+    /// Dropping without ending used to be a Metal trap, which is why callers had
+    /// to place `abandon()` on every error path. This is the regression check:
+    /// if `Drop` stops ending the encoder, this test aborts the process instead
+    /// of failing.
+    #[test]
+    fn dropping_an_unfinished_encoder_does_not_trap() {
+        let Some((_device, queue, pipeline, out)) = burn_context() else {
+            return;
+        };
+        let mut encoder = MetalEncoder::new(&queue).expect("encoder");
+        burn(&mut encoder, &pipeline, &out, CHEAP_ITERS);
+        drop(encoder);
+
+        // Same again with nothing encoded at all: an encoder created and dropped
+        // is the cheapest way to hit a missing `endEncoding`.
+        let encoder = MetalEncoder::new(&queue).expect("encoder");
+        drop(encoder);
+    }
+
+    /// `commit_terminal` leaves nothing dispatchable, and ending must not
+    /// double-fire: the flag it leaves behind is what keeps `Drop` from calling
+    /// `endEncoding` a second time, and a double `endEncoding` traps.
+    #[test]
+    fn terminal_commit_leaves_the_encoder_ended() {
+        let Some((_device, queue, pipeline, out)) = burn_context() else {
+            return;
+        };
+        let mut encoder = MetalEncoder::new(&queue).expect("encoder");
+        burn(&mut encoder, &pipeline, &out, CHEAP_ITERS);
+        encoder.commit_terminal().expect("commit");
+        assert!(
+            encoder.ended,
+            "commit_terminal must leave the encoder ended"
+        );
+        // Dropping here is the double-end check: without the flag it would trap.
+        drop(encoder);
     }
 
     #[test]

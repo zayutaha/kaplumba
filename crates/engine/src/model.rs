@@ -990,6 +990,9 @@ impl DecoderLayer {
         let inter_elements = tokens * inter;
         let full = config.full_attention;
         let offset = self.gpu_cache.next_position();
+        // `encode_linear` routes on exactly this predicate, so one flag says
+        // whether the shared input transform below is worth issuing.
+        let decode = tokens == 1;
 
         self.hidden_norm(
             encoder,
@@ -1003,13 +1006,22 @@ impl DecoderLayer {
         // q, k and v all read `scratch.normed`, so transform it once and let the
         // three matvecs share it. That was 3 of the 7 input transforms a layer
         // issued, each a tiny dependent dispatch in front of a large one.
-        self.encode_input_transform(encoder, &self.weights.q_proj, &scratch.normed, scratch)?;
-        // Boundary 1 of 15. The input norm and the shared transform are both
-        // elementwise over `tokens * hidden` and both cheaper than the boundary
-        // that separates them, so they share one stamp: splitting them would buy
-        // a number below the measured overhead floor for 60 extra command
-        // buffers per chunk. The same reasoning folds the trailing
-        // norm/residual pairs below.
+        //
+        // Decode only. The prefill matmul runs `linear_input_rows` first, which
+        // rewrites all `queries * in_features` elements of `transformed` from the
+        // input and its signs (linear.metal, `linear_input_rows`), so whatever
+        // this left there is overwritten before anything reads it: 2 dispatches
+        // per layer per chunk of pure waste. `PrefillEncodeRequest` has no
+        // `pretransformed` field precisely because the prefill never reuses it.
+        if decode {
+            self.encode_input_transform(encoder, &self.weights.q_proj, &scratch.normed, scratch)?;
+        }
+        // Boundary 1 of 15. The input norm -- and, in decode, the shared
+        // transform it precedes -- is elementwise over `tokens * hidden` and
+        // cheaper than the boundary that separates them, so they share one
+        // stamp: splitting them would buy a number below the measured overhead
+        // floor for 60 extra command buffers per chunk. The same reasoning folds
+        // the trailing norm/residual pairs below.
         profile.stamp(encoder, &format!("{}norm_transform", prefix()))?;
         timer.lap("norm_transform");
         self.encode_linear(
@@ -1019,7 +1031,7 @@ impl DecoderLayer {
             &scratch.q,
             tokens,
             scratch,
-            true,
+            decode,
         )?;
         profile.stamp(encoder, &format!("{}q_proj", prefix()))?;
         timer.lap("q_proj");
@@ -1030,7 +1042,7 @@ impl DecoderLayer {
             &scratch.k,
             tokens,
             scratch,
-            true,
+            decode,
         )?;
         profile.stamp(encoder, &format!("{}k_proj", prefix()))?;
         timer.lap("k_proj");
@@ -1243,8 +1255,11 @@ impl DecoderLayer {
             eps,
         )?;
 
-        // gate and up read the same activation too.
-        self.encode_input_transform(encoder, &self.weights.gate_proj, &scratch.normed, scratch)?;
+        // gate and up read the same activation too -- decode only, for the
+        // reason given above the q/k/v transform.
+        if decode {
+            self.encode_input_transform(encoder, &self.weights.gate_proj, &scratch.normed, scratch)?;
+        }
         profile.stamp(encoder, &format!("{}pre_ffn_norm_transform", prefix()))?;
         timer.lap("pre_ffn_norm_transform");
         self.encode_linear(
@@ -1254,7 +1269,7 @@ impl DecoderLayer {
             &scratch.gate,
             tokens,
             scratch,
-            true,
+            decode,
         )?;
         profile.stamp(encoder, &format!("{}gate_proj", prefix()))?;
         timer.lap("gate_proj");
@@ -1265,7 +1280,7 @@ impl DecoderLayer {
             &scratch.up,
             tokens,
             scratch,
-            true,
+            decode,
         )?;
         profile.stamp(encoder, &format!("{}up_proj", prefix()))?;
         timer.lap("up_proj");
@@ -2410,16 +2425,22 @@ impl TextModel {
         gpu.layers = self.layers.len();
         let result = if token_ids.len() <= PREFILL_CHUNK {
             gpu.chunks += 1;
-            self.forward_chunk(token_ids, positions, encoder, &mut gpu)
+            self.forward_chunk(token_ids, positions, encoder, &mut gpu, true)
         } else {
-            let mut logits = Vec::new();
-            let mut outcome = Ok(());
-            for (chunk_ids, chunk_positions) in token_ids
+            // Only the last chunk's logits survive this loop, so only the last
+            // chunk may run the vocabulary head. `peek` is the whole test: the
+            // chunk iterator is deterministic, so "no next chunk" is exactly
+            // "last", and it costs no second pass over the token ids.
+            let mut chunks = token_ids
                 .chunks(PREFILL_CHUNK)
                 .zip(positions.chunks(PREFILL_CHUNK))
-            {
+                .peekable();
+            let mut logits = Vec::new();
+            let mut outcome = Ok(());
+            while let Some((chunk_ids, chunk_positions)) = chunks.next() {
                 gpu.chunks += 1;
-                match self.forward_chunk(chunk_ids, chunk_positions, encoder, &mut gpu) {
+                let last = chunks.peek().is_none();
+                match self.forward_chunk(chunk_ids, chunk_positions, encoder, &mut gpu, last) {
                     Ok(chunk) => logits = chunk,
                     Err(error) => {
                         // Report what ran before the failure rather than throwing
@@ -2442,12 +2463,28 @@ impl TextModel {
 
     /// One chunk of the forward pass. `token_ids` must be at most
     /// [`PREFILL_CHUNK`] long; every buffer it touches is sized from that.
+    ///
+    /// `run_head` is false for every chunk but the last of a multi-chunk prefill.
+    /// Those chunks' logits are dropped by [`Self::forward_buffer_into`], so the
+    /// row lift, the 262,144-wide vocabulary head and the greedy pick are dead
+    /// work for them: the head alone is 262,144 x 5,376 weights at 6 bpw =
+    /// 1.06 GB read per invocation, and a three-chunk prefill was paying it
+    /// three times to keep one row.
+    ///
+    /// Nothing downstream of the head can notice. `forward_buffer_into` returns
+    /// the last chunk's logits and no other chunk's, the next chunk overwrites
+    /// `scratch.token_ids` from the host before the first dispatch that reads it,
+    /// and the pipelined decode loop (`generate.rs`) reads `greedy_token[0..]`
+    /// only after its own first step has written slot 0. A single-chunk prefill
+    /// -- every decode step, and any prompt up to [`PREFILL_CHUNK`] tokens --
+    /// takes the `true` branch and is bit-for-bit unchanged.
     fn forward_chunk(
         &mut self,
         token_ids: &[u32],
         positions: &[u32],
         encoder: &mut MetalEncoder,
         gpu: &mut GpuProfile,
+        run_head: bool,
     ) -> Result<Vec<u16>, ModelError> {
         if token_ids.len() != positions.len() || token_ids.is_empty() {
             return Err(ModelError::InvalidInput(
@@ -2617,6 +2654,14 @@ impl TextModel {
         } else {
             &self.scratch.hidden_b
         };
+
+        if !run_head {
+            // The head block is skipped whole, not partially: `last_hidden` keeps
+            // whatever the calibration self-copy left in it and `capped` is never
+            // written, so returning no logits here is what keeps the caller from
+            // reading a buffer this chunk never filled. See `run_head` above.
+            return Ok(Vec::new());
+        }
 
         // Only the sampled position needs logits, so lift the final row out and
         // run the 262,144-wide vocabulary head for that row alone.
