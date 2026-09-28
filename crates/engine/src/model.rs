@@ -475,6 +475,48 @@ fn median_floor_ms(samples: Vec<f64>) -> Option<f64> {
 /// (own_ms per kernel) is unaffected; total wall time is not.
 const DRAIN_EVERY: usize = 15;
 
+/// The process-wide [`AttentionKernels`] instance.
+///
+/// `AttentionKernels::new()` recompiles `attention.metal` and rebuilds every
+/// pipeline, and all sixty `DecoderLayer`s used to call it, so a load ran the
+/// same shader compilation sixty-one times. This lives here rather than in
+/// `attention.rs` because the accessor belongs next to the type it caches;
+/// `ElementKernels::shared` and `LinearKernels::shared` are the same change in
+/// the crates that own those types. The type has no `&mut self` method.
+fn shared_attention_kernels() -> Result<&'static AttentionKernels, ModelError> {
+    static INSTANCE: std::sync::OnceLock<Result<AttentionKernels, KernelError>> =
+        std::sync::OnceLock::new();
+    match INSTANCE.get_or_init(AttentionKernels::new) {
+        Ok(kernels) => Ok(kernels),
+        // `get_or_init` borrows the cell, so a stored `KernelError` cannot be
+        // moved out of it and it is not `Clone`. Construction failed at startup,
+        // so this path is not hot; the message is what a caller needs.
+        Err(error) => Err(ModelError::Kernel(KernelError::Shader(error.to_string()))),
+    }
+}
+
+/// Cached "is this attribution switch set?" lookup.
+///
+/// These used to be live `std::env::var_os` calls evaluated inside the forward
+/// pass -- `KAPLUMBA_LINEARS_ONLY` and `KAPLUMBA_SKIP_ATTENTION` once per layer
+/// each, so ~120 environment-lock acquisitions and `environ` scans per generated
+/// token. A switch is set before the process starts or not at all, so reading it
+/// once is behaviour-preserving.
+fn env_flag(name: &str) -> bool {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    // A poisoned lock only means some other thread panicked during a lookup; the
+    // values in the map are still correct.
+    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(value) = cache.get(name) {
+        return *value;
+    }
+    let value = std::env::var_os(name).is_some();
+    cache.insert(name.to_string(), value);
+    value
+}
+
 /// Per-kernel GPU time, accumulated across every chunk of one forward pass.
 ///
 /// This is the real profiler. `KAPLUMBA_PROFILE_PHASES` (and [`OpTimer`]) measure
@@ -761,9 +803,15 @@ pub struct DecoderLayer {
     /// second full copy here would add ~1.5 GB of duplicated KV at 8k context
     /// and can push the real checkpoint past the Metal allocation ceiling.
     cache: Option<KvCache>,
-    elements: ElementKernels,
-    linear: LinearKernels,
-    attention: AttentionKernels,
+    // Shared, process-wide kernel sets rather than per-layer copies. Every
+    // `DecoderLayer` used to construct its own, which meant 61
+    // `new_library_with_source` calls on the same `include_str!`'d source and 61
+    // distinct `MTLComputePipelineState` objects for identical code -- a large
+    // one-off load cost, and a blocker on any future binding dedup. The kernel
+    // types have no `&mut self` method, so sharing is sound.
+    elements: &'static ElementKernels,
+    linear: &'static LinearKernels,
+    attention: &'static AttentionKernels,
     /// GPU-resident mirror of the host cache, used by the buffer forward path.
     pub gpu_cache: GpuKvCache,
     gpu_weights: LayerGpuWeights,
@@ -813,9 +861,9 @@ impl DecoderLayer {
         upload_sign_buffers(&mut weights.up_proj)?;
         upload_sign_buffers(&mut weights.down_proj)?;
         Ok(Self {
-            elements: ElementKernels::new()?,
-            linear: LinearKernels::new()?,
-            attention: AttentionKernels::new()?,
+            elements: ElementKernels::shared()?,
+            linear: LinearKernels::shared()?,
+            attention: shared_attention_kernels()?,
             config,
             weights,
             cache: None,
@@ -942,7 +990,7 @@ impl DecoderLayer {
         rows: usize,
         eps: f32,
     ) -> Result<(), ModelError> {
-        if std::env::var_os("KAPLUMBA_SKIP_HIDDEN_NORMS").is_some() {
+        if env_flag("KAPLUMBA_SKIP_HIDDEN_NORMS") {
             return Ok(());
         }
         self.elements
@@ -968,7 +1016,7 @@ impl DecoderLayer {
         // Attribution switch: skip every non-linear op so the GEMV share of a
         // decode step can be measured directly. Output is meaningless with this
         // on; it exists only to answer "where does the 793 ms go".
-        if std::env::var_os("KAPLUMBA_LINEARS_ONLY").is_some() {
+        if env_flag("KAPLUMBA_LINEARS_ONLY") {
             self.encode_linear(encoder, &self.weights.q_proj, input, &scratch.q, tokens, scratch, false)?;
             self.encode_linear(encoder, &self.weights.k_proj, input, &scratch.k, tokens, scratch, false)?;
             if let Some(v) = &self.weights.v_proj {
@@ -1168,7 +1216,7 @@ impl DecoderLayer {
         // Attribution: skip the attention read. Output goes wrong but the KV
         // cache still fills, so the forward completes and the remaining GPU time
         // is attributable.
-        if std::env::var_os("KAPLUMBA_SKIP_ATTENTION").is_some() {
+        if env_flag("KAPLUMBA_SKIP_ATTENTION") {
             let key_count = self.gpu_cache.key_count(full);
             let window = if full { 0 } else { config.sliding_window };
             self.attention.encode_online_attention(
@@ -1863,8 +1911,8 @@ pub struct TextModel {
     lm_head: QuantizedLinear,
     final_softcap: f32,
     _checkpoint_weights: Option<TextWeights>,
-    elements: ElementKernels,
-    linear: LinearKernels,
+    elements: &'static ElementKernels,
+    linear: &'static LinearKernels,
     /// Queue used for the single command buffer that carries a whole forward.
     forward_queue: metal::CommandQueue,
     final_norm_buffer: Buffer,
@@ -1981,8 +2029,8 @@ impl TextModel {
             lm_head,
             final_softcap,
             _checkpoint_weights: checkpoint_weights,
-            elements: ElementKernels::new()?,
-            linear: LinearKernels::new()?,
+            elements: ElementKernels::shared()?,
+            linear: LinearKernels::shared()?,
             forward_queue: device.new_command_queue(),
             final_norm_buffer,
             scratch,
@@ -2227,11 +2275,11 @@ impl TextModel {
                 )
                 .to_f32(),
             };
-            if std::env::var_os("KAPLUMBA_LOAD_TRACE").is_some() {
+            if env_flag("KAPLUMBA_LOAD_TRACE") {
                 eprintln!("layer {index} building...");
             }
             layers.push(DecoderLayer::new(layer_config, layer_weights)?);
-            if std::env::var_os("KAPLUMBA_LOAD_TRACE").is_some() {
+            if env_flag("KAPLUMBA_LOAD_TRACE") {
                 eprintln!("layer {index} done");
             }
         }
@@ -2410,8 +2458,8 @@ impl TextModel {
         // generated token, so it takes the second switch: with that unset, a
         // decode step does no profiling work at all rather than paying for
         // measurements nobody reads.
-        let profile = std::env::var_os("KAPLUMBA_GPU_PROFILE").is_some()
-            && (token_ids.len() > 1 || std::env::var_os("KAPLUMBA_GPU_PROFILE_DECODE").is_some());
+        let profile = env_flag("KAPLUMBA_GPU_PROFILE")
+            && (token_ids.len() > 1 || env_flag("KAPLUMBA_GPU_PROFILE_DECODE"));
         let mut gpu = GpuProfile::new(profile);
         gpu.tokens = token_ids.len();
         gpu.layers = self.layers.len();
@@ -2489,8 +2537,8 @@ impl TextModel {
         // (KAPLUMBA_LINEARS_ONLY / KAPLUMBA_SKIP_ATTENTION); any other gap is
         // still an error.
         if positions[0] as usize != self.gpu_next_position()
-            && !(std::env::var_os("KAPLUMBA_LINEARS_ONLY").is_some()
-                || std::env::var_os("KAPLUMBA_SKIP_ATTENTION").is_some())
+            && !(env_flag("KAPLUMBA_LINEARS_ONLY")
+                || env_flag("KAPLUMBA_SKIP_ATTENTION"))
         {
             return Err(ModelError::InvalidInput(
                 "positions must begin at the current cache position".to_string(),
@@ -2533,7 +2581,7 @@ impl TextModel {
         // (KAPLUMBA_GPU_PROFILE) for exactly that reason, and kept because the
         // flush boundaries are the only way to see the coarse split without
         // paying for a command buffer per op.
-        let profile = std::env::var_os("KAPLUMBA_PROFILE_PHASES").is_some();
+        let profile = env_flag("KAPLUMBA_PROFILE_PHASES");
         macro_rules! gpu_flush {
             () => {
                 if profile {
@@ -3110,7 +3158,7 @@ fn load_quantized_linear(
         .tensors()
         .get(&trellis_name)
         .map(|tensor| (tensor.source_len / 2) as usize);
-    if std::env::var_os("KAPLUMBA_DEBUG_OFFSETS").is_some() {
+    if env_flag("KAPLUMBA_DEBUG_OFFSETS") {
         eprintln!(
             "OFFSET {name:<52} packed_offset={packed_offset:>12} aligned4={} len={packed_len:?}",
             packed_offset % 4 == 0

@@ -1,5 +1,24 @@
 # Prefill at 200 tok/s
 
+> **SUPERSEDED — read `spec/engine-performance/` first.** As of `1dd4da9`
+> (2026-09-28) prefill is **68.8 tok/s**, not 9.67, and the live goal,
+> rooflines, rejected experiments and open questions are in
+> `spec/engine-performance/spec.md` and its `implementation_notes.md` §9–§16.
+>
+> What this spec got wrong, and it is load-bearing: **200 tok/s is not
+> reachable and 152 tok/s is not reachable either.** Measured tensor peak on
+> this machine is 15.18 TFLOPS (`examples/mma_peak.rs`), not the "30–50+"
+> figure assumed here, so the tensor route is ~1.7x the SIMT ceiling, not
+> 4–6x. We are now on the tensor path and it is a GEMM-efficiency problem:
+> 5.31 TFLOPS achieved, 35% of peak, with a staging-stripped diagnostic
+> capping the *current tile shape* at 76.7 tok/s. The R9 claim that
+> bit-exactness blocks the target was **rejected by the user on 2026-09-27** —
+> the tensor GEMM is not bit-exact and does not need to be. See
+> `spec/engine-performance/spec.md` §2.1.
+>
+> Kept below for provenance: the OQ1 KV table, the OQ3 bit-exactness record,
+> and the arithmetic in R9, all of which are still correct as arithmetic.
+
 ## Goal
 
 Sustained **200 tokens/s of prefill on an 8192-token prompt**, measured as the

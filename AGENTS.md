@@ -90,6 +90,21 @@ Must contain:
 4. `tasks.md`.
 5. Implementation begins only after all three exist.
 
+**A test-coverage claim is not a claim until you have broken the code and seen
+it fail.** Before reporting "N/N tests cover X" (or writing it into
+`spec.md`, `tasks.md` or `implementation_notes.md`), sabotage X, run the test,
+and confirm it fails with a diagnosable message. Then revert the sabotage.
+Record the failure mode you observed.
+
+This is not hypothetical. This project shipped a kernel that read activations
+instead of weights past `k >= 32`, under a "6/6 against a CPU reference" claim —
+because the test called an entry point that hardcoded a *different* kernel. The
+same test later set an env flag that **disabled the path under test**, and a
+deliberately sabotaged kernel still passed it
+(`crates/engine/tests/linear_metal.rs:900`). Two false coverage claims, one root
+cause: nobody checked that the failing branch could fail. See
+`spec/engine-performance` Q11.
+
 ---
 
 ## 4. Implementation discipline
@@ -155,19 +170,25 @@ Tone: factual and dense. Prefer specifics (paths, numbers, commit hashes) over n
 the problems we are still paying for on this exact hardware. Do not start from
 first principles; start from what is known to work and port it.
 
-Read-only reference checkouts live under `reference/` (gitignored):
+Read-only reference checkouts. **Only `reference/omlx` is actually present; the
+rest live in scratch directories that macOS clears.** Verify a path exists
+before citing it, and re-clone if it is gone.
 
-| Path | Project | Licence |
-|------|---------|---------|
-| `reference/omlx` | Base inference server (MLX) — primary codebase lineage. `omlx_sdpa_decode` / `omlx_sdpa_prefill` are the fastest known Apple-Silicon prefill attention. | Apache-2.0 |
-| `reference/llama.cpp` | Mainline llama.cpp | MIT |
-| `reference/ik_llama.cpp` | ik_llama.cpp fork (quantization, prefill speed) | MIT |
-| `reference/vllm` | vLLM | Apache-2.0 |
-| `https://github.com/struffl/ishizuki` | ishizuki — reports ~11 tok/s decode on M4 Pro, ~20 on M1 Max. **AGPL-3.0: read for ideas, confirm with the user (see `spec/engine-performance` Q9) before porting code.** | AGPL-3.0 |
+| Path | Project | Licence | State |
+|------|---------|---------|-------|
+| `reference/omlx` (gitignored) | Base inference server (MLX) — primary codebase lineage. `omlx_sdpa_decode` / `omlx_sdpa_prefill`; the verified simdgroup fragment layout in `omlx/custom_kernels/bonsai/csrc/quantized.h`; 32×32 tile and no-barrier-in-K-loop shape in `omlx/patches/qwen35_verify_qmm.py`. | Apache-2.0 | **present** — the only durable one |
+| `/tmp/kaplumba-refs/llama.cpp` | Mainline llama.cpp. Source of the prefill-attention structural transpose we ported (`fa_common.metal`). | MIT | ephemeral, `/tmp` is cleared on reboot |
+| `/tmp/kaplumba-refs/ik_llama.cpp`, `/tmp/kaplumba-refs/vllm` | ik_llama.cpp fork (quantization, prefill speed); vLLM. | MIT / Apache-2.0 | **not cloned** — secondary, clone only for a specific question |
+| `/var/folders/tp/wz3877_s1z756p1kcsz3_d4h0000gn/T/opencode/ishizuki` | ishizuki — reports ~11 tok/s decode on M4 Pro, ~20 on M1 Max. **AGPL-3.0: read for ideas, confirm with the user (see `spec/engine-performance` Q9) before porting code.** <https://github.com/struffl/ishizuki> | AGPL-3.0 | ephemeral |
+| `/var/folders/tp/wz3877_s1z756p1kcsz3_d4h0000gn/T/opencode/exllamav3` | Source of the EXL3 format and its `cp.async`/`int4` staging (`exl3_gemm_inner.cuh`). | MIT | ephemeral |
 
 When adopting an idea from any of these, cite `path:line` in
 `implementation_notes.md`, and A/B measure it here — a reference proves a technique
-*can* work, not that it works on our shapes.
+*can* work, not that it works on our shapes. **Record the negative results too.**
+Six of the nine reference techniques mined in `spec/engine-performance` did not
+pay off here (concat fusion −2.3%, trellis staging 15% slower, `extract_bits`
+inapplicable, `AGX_RELAX_CDM_CTXSTORE_TIMEOUT=1` null, and two others); that
+list is only useful because it is written down with the numbers.
 
 Do not modify `reference/` unless a task explicitly says to vendor a patch; prefer describing ports in specs.
 

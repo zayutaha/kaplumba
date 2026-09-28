@@ -1,5 +1,14 @@
 # Tasks
 
+> **SUPERSEDED by `spec/engine-performance/tasks.md` (2026-09-28).** Do not work
+> from this list. T0/T0.2/T0.3, T3 and T7 all landed; prefill is **68.8
+> tok/s**, and the 200 tok/s target has been shown to be out of reach. The
+> remaining work (T7' — a different tile shape past the 76.7 tok/s diagnostic
+> ceiling; and the 8192-token run) is tracked in
+> `spec/engine-performance/tasks.md` §Open. The items below are kept for
+> provenance only, and their reasoning about *tensor peak ~40 TFLOPS* is
+> **wrong** — the machine's measured peak is 15.18 TFLOPS.
+
 Ordered smallest-first. Each names files touched, intent, and how it is tested.
 **Update this file immediately after each completed task**, with status and
 commit hash. If scope changes, amend `spec.md` / `plan.md` first.

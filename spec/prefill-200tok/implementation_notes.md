@@ -133,3 +133,32 @@ Two things learned, both about me rather than about the hardware:
 
 Reverted to 12fa4d8 (11.38-11.44 tok/s). The spec's T3 rewrite of the prefill
 GEMM is **not** complete and the tile-size claim in it should not be trusted.
+
+## 2026-09-28 — SUPERSEDED by `spec/engine-performance` (68.8 tok/s)
+
+The 64x64 post-mortem above is correct and was the right diagnosis: the tile
+shape was not the lever, the weight **re-read** amortisation was, and it had to
+move on **Q** (query rows), not N. That is what `1dd4da9` did — 128q x 64n.
+
+Consequences for the list below, so nobody reopens a dead item:
+
+- **T3 (hoist the accumulator, retile) — done**, and then some: the register
+  accumulator landed in `11aef59` for +2% only, because the real problem was
+  that `linear_gemv_tiled` gave every thread ONE accumulator, so each weight
+  tile was fetched and dequantised again for every 16-query block. The fix was
+  register blocking on Q via the tensor cores, not a bigger output tile.
+- **T7 (tensor-core GEMM) — done**, and it is the whole story now: 68.8 tok/s,
+  5.31 TFLOPS, 35% of the 15.18 TFLOPS measured peak.
+- **"The register accumulator is bit-exact by construction" — that was right
+  about `linear_gemv_tiled` and it is the only reason we could adopt the tensor
+  path at all**, but the tensor path is *not* bit-exact (fp16 weights,
+  different accumulation order, worst error 2.1603336e-3). The user approved
+  that on 2026-09-27; see `spec/engine-performance/spec.md` §2.1. Do not
+  re-argue it either way.
+- **The 200 tok/s / 11.5 TFLOPS target is dead.** Peak tensor is 15.18 TFLOPS,
+  so 11.5 TFLOPS is 76% of the measured machine peak for the GEMM *plus zero
+  time for everything else*. 152 tok/s needs >86% GEMM efficiency. We are at
+  35% and the diagnostic ceiling for this tile shape is 76.7 tok/s.
+
+Live state, open items and every rejected experiment with its number:
+`spec/engine-performance/implementation_notes.md` §9–§16.

@@ -11,6 +11,40 @@ use crate::exl3::{Exl3Codebook, Exl3Rate, KernelError};
 
 const SOURCE: &str = include_str!("linear.metal");
 
+/// Cached "is this switch set?" lookups.
+///
+/// These used to be live `std::env::var_os` calls on the hot path. `var_os` takes
+/// the environment lock and linear-scans `environ`, and decode read several of
+/// them once per matvec: seven matvecs x sixty layers is 420 calls per generated
+/// token, ~840 including the element and model layers. A switch is set before the
+/// process starts or not at all, so reading it once is behaviour-preserving; no
+/// test mutates `env::set_var` mid-process.
+fn env_flag(name: &str) -> bool {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, bool>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    // A poisoned lock only means some other thread panicked during a lookup; the
+    // values in the map are still correct.
+    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(value) = cache.get(name) {
+        return *value;
+    }
+    let value = std::env::var_os(name).is_some();
+    cache.insert(name.to_string(), value);
+    value
+}
+
+/// `KAPLUMBA_GEMV_MAX_GROUPS`, read once. `u64::MAX` (no cap) when unset.
+fn gemv_max_groups() -> u64 {
+    static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("KAPLUMBA_GEMV_MAX_GROUPS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .unwrap_or(u64::MAX)
+    })
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct LinearParams {
@@ -155,6 +189,25 @@ pub struct LinearKernels {
 }
 
 impl LinearKernels {
+    /// The process-wide instance, built on first use.
+    ///
+    /// Every `DecoderLayer` used to call [`Self::new`], so a 60-layer model ran
+    /// 61 `new_library_with_source` calls on the same `include_str!`'d source and
+    /// rebuilt the same ~70 pipeline states 61 times over -- a large one-off load
+    /// cost, and a reason every layer's pipeline object was a *distinct*
+    /// `MTLComputePipelineState` for identical code. No method on this type takes
+    /// `&mut self`, so one shared instance is safe for every layer.
+    pub fn shared() -> Result<&'static Self, KernelError> {
+        static INSTANCE: std::sync::OnceLock<Result<LinearKernels, KernelError>> =
+            std::sync::OnceLock::new();
+        match INSTANCE.get_or_init(Self::new) {
+            Ok(kernels) => Ok(kernels),
+            // A `&'static Self` cannot be produced from an `Err`, and
+            // `KernelError` is not `Clone`, so re-derive it.
+            Err(error) => Err(crate::elements::clone_kernel_error(error)),
+        }
+    }
+
     pub fn new() -> Result<Self, KernelError> {
         let device = Device::system_default().ok_or(KernelError::DeviceUnavailable)?;
         let options = CompileOptions::new();
@@ -704,9 +757,12 @@ impl LinearKernels {
         in_features: usize,
         out_features: usize,
     ) -> Result<(), KernelError> {
-        let k = to_u32(in_features, "input dimension")?;
-        let n = to_u32(out_features, "output dimension")?;
-        let shape_values = [k, n];
+        // Same two u32s, now in the params slot: see the `shape` binding note on
+        // `linear_gemv_ishizuki_k*`. Numerically inert.
+        let shape_values = [
+            to_u32(in_features, "input dimension")?,
+            to_u32(out_features, "output dimension")?,
+        ];
         // One threadgroup per 16 outputs, capped. At N=21504 that is 1344
         // threadgroups on 20 cores -- about 1.4 waves -- and a trailing partial
         // wave costs more than the extra parallelism buys. Capping the grid and
@@ -714,25 +770,15 @@ impl LinearKernels {
         // tail into an exact multiple. lm_head, which launches 16384
         // threadgroups, reaches 168.7 GB/s on this same kernel.
         let tiles = (out_features / 16) as u64;
-        let cap = std::env::var("KAPLUMBA_GEMV_MAX_GROUPS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .unwrap_or(u64::MAX);
-        let groups = tiles.min(cap).max(1);
-        let shape = self.device.new_buffer_with_data(
-            shape_values.as_ptr() as *const std::ffi::c_void,
-            8,
-            MTLResourceOptions::StorageModeShared,
-        );
+        let groups = tiles.min(gemv_max_groups()).max(1);
         encoder.dispatch_1d_offset(
             pipeline,
             &[
                 TensorRef::new(packed, packed_offset),
                 TensorRef::new(transformed, 0),
                 TensorRef::new(raw, 0),
-                TensorRef::new(&shape, 0),
             ],
-            &[],
+            params_bytes(&shape_values),
             groups * 256,
             256,
         )
@@ -743,7 +789,7 @@ impl LinearKernels {
         rate: Exl3Rate,
         packed_offset: u64,
     ) -> Option<&ComputePipelineState> {
-        if std::env::var_os("KAPLUMBA_OWN_GEMV").is_some() {
+        if env_flag("KAPLUMBA_OWN_GEMV") {
             return None; // A/B against the pre-port kernel
         }
         let Exl3Rate::Integer(bits) = rate else {
@@ -760,7 +806,7 @@ impl LinearKernels {
         rate: Exl3Rate,
         packed_offset: u64,
     ) -> Option<&ComputePipelineState> {
-        if std::env::var_os("KAPLUMBA_LEGACY_GEMV").is_some() {
+        if env_flag("KAPLUMBA_LEGACY_GEMV") {
             return None; // A/B switch against the pre-lane-per-thread kernels
         }
         let Exl3Rate::Integer(bits) = rate else {
@@ -972,7 +1018,7 @@ impl LinearKernels {
         // garbage (8f1a863) is fixed, and `mma_prefill_gemm_matches_cpu_reference`
         // now actually covers it. Set KAPLUMBA_DISABLE_MMA_PREFILL=1 to fall
         // back to the scalar tiled kernel for A/B.
-        if std::env::var_os("KAPLUMBA_DISABLE_MMA_PREFILL").is_none()
+        if !env_flag("KAPLUMBA_DISABLE_MMA_PREFILL")
             && in_features % 64 == 0
             && self.gemm_mma_pipeline.thread_execution_width() == 32
         {

@@ -7,6 +7,20 @@ use metal::{
 
 pub use crate::exl3::KernelError;
 
+/// Copy a [`KernelError`] that lives behind a `&'static` reference.
+///
+/// `KernelError` is not `Clone` (it holds a `String`), so the shared-instance
+/// cache below cannot store a failure and hand it back by reference. This keeps
+/// the variant and its message.
+pub(crate) fn clone_kernel_error(error: &KernelError) -> KernelError {
+    match error {
+        KernelError::DeviceUnavailable => KernelError::DeviceUnavailable,
+        KernelError::Shader(message) => KernelError::Shader(message.clone()),
+        KernelError::Pipeline(message) => KernelError::Pipeline(message.clone()),
+        KernelError::InvalidInput(message) => KernelError::InvalidInput(message.clone()),
+        KernelError::CommandFailed => KernelError::CommandFailed,
+    }
+}
 const SOURCE: &str = include_str!("elements.metal");
 
 #[repr(C)]
@@ -119,6 +133,26 @@ pub struct ElementKernels {
 }
 
 impl ElementKernels {
+    /// The process-wide instance, built on first use.
+    ///
+    /// Every `DecoderLayer` used to call [`Self::new`], so a 60-layer model ran
+    /// 61 `new_library_with_source` calls on the same `include_str!`'d source and
+    /// rebuilt the same pipeline states 61 times over. That is a large one-off
+    /// load cost, and it also made every layer's pipeline object a *distinct*
+    /// `MTLComputePipelineState` for identical code, which blocks any future
+    /// binding deduplication. The pipelines are immutable after construction (no
+    /// `&mut self` method exists on this type), so one shared instance is safe.
+    pub fn shared() -> Result<&'static Self, KernelError> {
+        static INSTANCE: std::sync::OnceLock<Result<ElementKernels, KernelError>> =
+            std::sync::OnceLock::new();
+        match INSTANCE.get_or_init(Self::new) {
+            Ok(kernels) => Ok(kernels),
+            // A `&'static Self` cannot be produced from an `Err`, and
+            // `KernelError` is not `Clone`, so re-derive it.
+            Err(error) => Err(clone_kernel_error(&error)),
+        }
+    }
+
     /// Row count below which the threadgroup-per-row norm is used.
     ///
     /// The per-row kernel gives one thread to each row, so the entire machine
@@ -138,8 +172,14 @@ impl ElementKernels {
     /// `KAPLUMBA_FORCE_PER_ROW_NORMS` can still A/B the two.
     const THREADGROUP_NORM_MAX_ROWS: usize = 8192;
     /// Escape hatch: force the original per-row norms regardless of row count.
+    ///
+    /// Cached: this used to be a live `std::env::var_os`, and every norm dispatch
+    /// consults it -- five per decoder layer, so ~300 environment-lock
+    /// acquisitions and `environ` scans per generated token. A switch is set
+    /// before the process starts or not at all, so once is behaviour-preserving.
     pub fn force_per_row_norms() -> bool {
-        std::env::var_os("KAPLUMBA_FORCE_PER_ROW_NORMS").is_some()
+        static FLAG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *FLAG.get_or_init(|| std::env::var_os("KAPLUMBA_FORCE_PER_ROW_NORMS").is_some())
     }
     /// Threads per group for the threadgroup-per-row norms.
     const NORM_GROUP_THREADS: u64 = 256;

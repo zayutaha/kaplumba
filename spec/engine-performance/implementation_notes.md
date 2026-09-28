@@ -552,3 +552,383 @@ string being present in the binary — the same failure as the earlier session's
 `ApiTimer`. That instrumentation approach is untrustworthy here and needs a
 different method (external `sample`/DTrace, or a timing harness that cannot be
 defeated by the same bug).
+
+---
+
+# HANDOVER — 2026-09-28: prefill 9.67 → 68.8 tok/s, and everything that was wrong on the way
+
+Commits in order: `ff46bdd`, `4d55bbf`, `60ae014`, `d678a79`, `c056b48`, `cb0cde5`, `1dd4da9`.
+State: **68.8 tok/s** at 614 prompt tokens (was 9.67). 20 suites / 81 tests green,
+5/5 reference prompts byte-identical.
+
+## 9. Dead work removed (three separate faults, all in the prefill dispatch list)
+
+| removed | was | why it was dead | cost it was burning |
+|---|---|---|---|
+| `linear_zero_raw` dispatch | 410 dispatches / 256-token chunk | `linear_gemv_tiled` ends in a plain **store**, not an accumulate, and its grid covers every (query, output) pair, so every element of `raw` is written before `finalize` reads it. The justifying comment stopped being true in `11aef59`, when the accumulator became a register. | **4.77 GB** of writes per chunk |
+| `linear_input_transform` in prefill | 120 dispatches / chunk | `encode_gemm` first runs `linear_input_rows`, which rewrites all `queries × in_features` of `transformed` from the input and its signs. `PrefillEncodeRequest` has **no** `pretransformed` field precisely because prefill never reuses it. | 2 dependent tiny dispatches per layer per chunk |
+| LM head on every chunk | 1.06 GB of weights read per invocation | only the last chunk's logits survive | **2.1 GB dead per 614-token prefill** |
+
+- `linear_zero_raw` dispatch removed from `LinearKernels::encode_gemm`
+  (`crates/kernels/src/linear.rs:913`; the old call site was `:999`). The kernel
+  (`crates/kernels/src/linear.metal:2616`) and its `zero_raw_pipeline`
+  (`crates/kernels/src/linear.rs:147`, loaded at `:237-241`) are still there and
+  are still needed by the scalar tiled path — only the prefill dispatch went.
+- `linear_input_transform` now gated on `let decode = tokens == 1;`
+  `crates/engine/src/model.rs:1001`, applied at `model.rs:1022` and
+  `model.rs:1265`. **Decode genuinely benefits** (7 transforms per layer → 4) and
+  keeps them, so this is not a "prefill was slow" fix.
+- `run_head: bool` added to the chunk entry point
+  (`crates/engine/src/model.rs:2479`), documented at `:2459`; the whole head
+  block is skipped at `model.rs:2650-2656`, returning `Ok(Vec::new())`. The
+  non-final `greedy_pick` is **not** load-bearing: `take_greedy_tokens` runs
+  after decode step 0 has rewritten slot 0, and the next chunk rewrites
+  `token_ids` from the host.
+- Net: **−374 dispatches per 614-token prefill, −5.5%**. head/gemv 35.4 → 20.6 ms,
+  greedy_pick 14.3 → 4.1 ms.
+
+**Also in this window, and load-bearing:** the greedy path **never committed its
+prefill**. `forward_buffer_into` encoded it and the encoder was dropped
+un-ended, so the work was never submitted, the KV cache was never populated, and
+`prefill_tokens_per_second` was reporting *host encode time*, not GPU time. Every
+prefill number in notes §1–§8 before `ff46bdd` is suspect for this reason.
+Command buffers now roll at 50 dispatches with 8 in flight (MLX uses
+`max_ops_per_buffer_ = 50` for arch `s`, `mlx/backend/metal/device.cpp`;
+`MAX_ACTIVE_TASKS = 10`, `mlx/transforms.cpp`; omlx ships 16,
+`omlx/cluster/deployment.py`).
+
+## 10. The profiler was lying, and why that wasted three paths
+
+`KAPLUMBA_PROFILE_PHASES=1` had three independent defects:
+
+1. `OpTimer::lap` had **zero call sites**.
+2. `layer_ms` was **never marked**, so the PHASE table omitted every layer —
+   hence `layers=0.00ms`.
+3. It measured **host encode time**, not GPU time.
+
+It reported `layers=0.00ms` and 12.5 ms total against a 58.7 s wall — a 4700x
+disagreement. Notes §3.1 and §8.1's cost attribution derive from it and are
+**invalid**.
+
+Replaced by `KAPLUMBA_GPU_PROFILE=1` (`crates/engine/src/model.rs:2413`), which
+uses `MTLCommandBuffer` `GPUStartTime`/`GPUEndTime`. Attribution agrees with wall
+clock to **91.8%** (17468 ms instrumented + 1168 ms inter-boundary gap vs
+`ttft_ms` 20291 ms). Report rendered by `GpuProfile::render`,
+`crates/engine/src/model.rs:667`.
+
+- **The Objective-C selectors are CAPITALISED.** `GPUStartTime` / `GPUEndTime`.
+  The Swift lowercase spelling (`gpuStartTime`) **aborts**. Documented at
+  `crates/kernels/src/encoder.rs:94-100`; bindings at `encoder.rs:131-141`.
+- Both values are **undefined until the command buffer has completed** — Metal
+  returns garbage, not zero. Read only via `take_gpu_ms()`
+  (`encoder.rs:605`) after `take_gpu_stamps` has waited.
+- `commit_stamped(label)` at `encoder.rs:555`. Row-level mechanics tested in
+  `crates/engine/tests/gpu_profile_table.rs`; the encoder's own regression test
+  is `encoder.rs:814`.
+- The profiler prints an **overhead floor** (empty commit / one trivial
+  dispatch) and warns when `stamps_ingested != boundaries`. Both exist because
+  a profiler that silently drops work is worse than no profiler.
+- Profiling costs **1.15 s of wall** (32.11 → 30.31 tok/s) and reports 0.99 s of
+  it. **Never A/B a production change against a profiled run.**
+
+**The "inter-boundary gap" of 1168 ms was an artefact of this**, not hidden GPU
+work. Unprofiled, `tick()` rolls at 50 dispatches with 8 in flight: ~45 rolls
+per chunk, not 906.
+
+## 11. I was wrong twice. Both recorded.
+
+**(a) The attention "phase 1b" bottleneck does not exist.**
+I claimed the serial online-softmax on one thread was ~half of prefill cost and
+queued "parallelise it" as the top item. `online_attention_tg2_body`
+(`crates/kernels/src/attention.metal:539-655`) is **dead code with no entry
+point**. The live kernel already reduces the chunk max and chunk sum in parallel
+via `simd_shuffle_xor` plus an 8-way tree. The recorded A/B was 10.394 (serial)
+vs 10.373 (parallel) — within noise. The prefix-max scan in `plan.md` §2.1 is
+**not worth building**. The real attention win came from somewhere else
+(§12), a structural transpose from llama.cpp.
+
+**(b) The 58 s prefill was not host-side paging.**
+My argument: a per-layer byte count divided by a per-layer time matched mmap read
+speed. That is a **numerology fit**, not a measurement. `KAPLUMBA_RESIDENT_WEIGHTS=1`
+puts every weight back in the arena and was **13% SLOWER** — which disproves
+paging as the cause, because genuine paging pressure would be *reduced* by
+residency. The real cause was the tensor GEMM. No production change was made on
+the basis of the fit.
+
+## 12. The wins, each with its mechanism
+
+**12.1 `bstage` array overflow → MMA path correct → 11.3 → 24.5 tok/s** (`60ae014`)
+
+`crates/kernels/src/linear.metal:2337` (at the time) declared
+`threadgroup half bstage[QTILE * OUTS]` = 32×32 = 1024 halfs, but the dequant
+loop wrote **64×32** and the fragment loads address `bstage + k8*OUTS` with `k8`
+up to 56. The upper half **aliased `astage`**, which activation staging then
+overwrote. Every `k >= 32` weight read activations. Not a wrong fragment layout —
+an array-sized-too-small.
+
+Why it shipped: `8f1a863` claimed "`linear_metal` 6/6 against a CPU reference",
+but `gemm_chunk` (`crates/kernels/src/linear.rs:579`) **hardcodes
+`gemv_tiled`**, so the MMA path had **zero** test coverage and the 6/6 was
+counting the other kernel. Same failure mode as Q11 below.
+
+Also in that commit, from two parallel audits:
+- `key_count` returned `capacity` (1024) for every sliding layer forever, so
+  attention scanned and accumulated over 1024 keys regardless of live count. Now
+  `next_position.min(capacity)`, which collapses back to `capacity` once the ring
+  wraps, so no separate wrapped path is needed. +3.8%.
+  `crates/engine/src/gpu_cache.rs`.
+- Latent NaN in the PV loop: masked keys had weight 0 but their **value was
+  still loaded**, and `0.0f * NaN` is NaN, so unwritten cache slots could poison
+  the accumulator. The load is now skipped, matching `attention.metal:624`.
+  Live-key arithmetic and order untouched.
+
+**12.2 64-query MMA tile, output tile aliased onto `astage` → 32.0 tok/s** (`c056b48`)
+
+Each weight fragment now feeds 16 query rows per simdgroup instead of 8, so
+multiplies-per-fragment-load went 0.80 → 1.33. Fitting that in the same 14336 B
+required noticing the fp32 output tile does not need to exist: the accumulators
+live in `simdgroup_matrix` registers for the whole K loop, so `astage` is dead by
+the time outputs are staged, and the two blocks are the same size by
+construction. **Aliasing the output tile onto `astage` holds the budget flat
+instead of pushing to 22 KB.** Worst error bit-identical to the 32-row kernel at
+2.16e-3 — the per-element accumulation order is unchanged.
+
+**12.3 GQA-batched attention: attention 1324 → 338 ms, 3.9x** (`c056b48`)
+
+llama.cpp puts one threadgroup per **query** head, so each of our 32 query heads
+re-reads the same K/V — a re-read factor of **512**. Every query head sharing a
+KV head now sits in **one** threadgroup and reads K/V out of one L1: re-read
+factor **1**. Threadgroups 19648 → 9824 (sliding) / 2456 (full).
+
+`attention_gqa_body<HEAD_DIM, NSG, PARTIALS>`,
+`crates/kernels/src/attention.metal:725`; the transposed mapping is at
+`attention.metal:755-762` (lane → KV index, simdgroup → query row) and follows
+llama.cpp `fa_common.metal:411-454`. Threads became `32*NSG` with `NSG` = the GQA
+ratio, so the online softmax is `simd_max`/`simd_sum` with **1 barrier per 32
+keys** instead of two five-step shuffle ladders and 5 barriers per 256 keys.
+Threadgroup memory fell 1056 → 512 B (sliding) / 2048 B (full). The SWA mask
+stays **arithmetic** on `(k_abs, q_abs, window)` — llama.cpp materialises a
+128 MiB f16 mask at L=8192, which would violate the §8 fixed-scratch rule.
+Pipelines: `online_attention_gqa_{256,512}_{1,2,4,8}`, indexed by
+`gqa_index(head_dim, nsg)` at `crates/kernels/src/attention.rs:132`.
+
+**12.4 128×64 tile + lane-parallel dequant + two buffers deleted → 32.2 → 68.8 tok/s** (`1dd4da9`)
+
+`linear_gemm_mma`, `crates/kernels/src/linear.metal:2360`, header commentary at
+`linear.metal:2290-2359`. The dominant cost was **never** the
+multiplies-per-load ratio — it was the **dequant**.
+
+1. **Lane-parallel dequant.** `exl3_code_at_tg` derived the trellis window per
+   weight, so 16 weights/thread cost three threadgroup loads and a 64-bit window
+   setup **each**: ~400 instructions against 64 multiplies, and the kernel ran at
+   13% of tensor roofline. One thread now decodes the **eight** codes a trellis
+   lane owns from **one** window setup, exactly as `exl3_decode8`
+   (`linear.metal:234`) does in the decode path: 16 weights/thread cost ~40
+   instructions. Window setup at `linear.metal:2424-2442`, decode at
+   `linear.metal:2468-2493`. **The codes are bit-identical** — same window, same
+   two overlapping 64-bit windows, same 16-bit slices. Pure instruction-count
+   win, zero numerical change.
+2. **Tile 128q × 64n** on 256 threads (8 simdgroups, `QTILE=128`, `OUTS=64`,
+   `KCHUNK=64`, `BSTRIDE=72`), `linear.metal:2367-2375`. Sixteen accumulators
+   share ten fragment loads per step = 16 multiplies per load, against 8 per 6.
+   Weights are streamed `ceil(queries/128)` times per output block instead of
+   `ceil(queries/64)`, halving both weight DMA and activation re-reads. Eight MMA
+   steps at `linear.metal:2521-2552`. Sixteen **named** accumulators at
+   `linear.metal:2400-2417` — an array of chains spills to threadgroup memory
+   and collapses 15.49 → 0.74 TFLOPS (`examples/mma_peak.rs`).
+3. **`BSTRIDE = OUTS + 8 = 72`** (`linear.metal:2372`). The lane-parallel dequant
+   scatters one 16-byte piece into each of eight rows; at a 128-byte stride all
+   eight land on threadgroup bank 0 — an 8-way conflict on every store. At 144
+   bytes the row bases fall on banks 0,4,…,28 and the eight pieces are
+   conflict-free.
+4. **`astage` DELETED.** Each simdgroup owns a disjoint set of query rows, so a
+   staged `astage` was read exactly once by exactly one simdgroup: 32 global
+   loads plus 32 threadgroup stores per thread per chunk bought coalescing and
+   nothing else. A fragments now load straight from the activation buffer
+   (`linear.metal:2390-2391`, row pointers clamped with `min(..., queries-1)`
+   because rows past the query count would read past the buffer).
+5. **`tw` DELETED**, replaced by a software-pipelined global→register prefetch
+   one chunk ahead (`linear.metal:2500-2517`). A staged 1.5 KB trellis block
+   needs a barrier whose only job is to publish that copy, and it measured
+   **15%** — more than the dequant arithmetic it fed.
+6. **Outputs leave the accumulators directly** via a row-guarded 4-byte store
+   (`KAPLUMBA_MMA_STORE`, `linear.metal:2560-2568`). A 128×64 f32 staging tile is
+   32 KB, far past the 16 KB ceiling, and `simdgroup_store` has no per-row mask,
+   so each lane recomputes its own (row, column) from its lane id
+   (`linear.metal:2394-2396`).
+
+**Threadgroup memory therefore FELL 14336 → 9216 B**: 64×72 halfs of dequantised
+weights and nothing else.
+
+Result: **5.31 TFLOPS** on the projections (was 2.11), **35% of the 15.18 TFLOPS
+`mma_peak`** measured on this machine today. down/gate/up GPU time
+4447/3725/3708 → 1665/1514/1512 ms. **A staging-stripped diagnostic caps this
+tile shape at 76.7 tok/s**, so the remaining dequant is ~11% of headroom and the
+rest needs a different tile.
+
+**12.5 Decode: deleted the O(L²) fp32 score matrix** (`1dd4da9`)
+
+`attn_scores`, `attn_row_max`, `attn_row_sum` and the **five kernels** that used
+them are **deleted**. Decode now runs the **same** online-softmax body as prefill
+via a `PARTIALS` template parameter (`attention.metal:724`, contract documented
+at `attention.metal:707-724`, threadgroup mapping at `:755-769`, partial
+write-out at `:868`), emitting an unnormalised `(m, l, O)` per split;
+`attention_decode_combine_{256,512}` merges with `exp(m_s − M)`
+(`crates/kernels/src/attention.rs:189-190`, dispatch at `:387`, partials length
+assert at `:354`).
+
+Partial buffer: `16 splits × 32 heads × 514 × 4 B = 1,052,672 B`, **fixed size
+and independent of context** (`crates/engine/src/model.rs:38`, sized at
+`model.rs:1953-1968`). Scratch is now sized from **layer shapes**, never from
+`gpu_cache.capacity()`. Threadgroup memory 2 KB worst case.
+
+This fixed a **hard failure**: `attention score buffer is 131072 bytes, needs
+508800 for 32 heads x 3975 keys` — 131072/32/4 = exactly 1024 keys, so decode
+worked at 914 and died at 1215. It was exactly the O(L²) scratch `AGENTS.md` §8
+forbids; prefill was already tiled, decode was not. **2414 tokens of context,
+which previously died, now prefills at 75.1 tok/s and decodes at 4.96 tok/s.**
+
+## 13. The test that lied (Q11 in `spec.md`)
+
+`mma_prefill_gemm_matches_cpu_reference` set `KAPLUMBA_DISABLE_MMA_PREFILL=1`,
+which **DISABLES the path under test**, so a deliberately sabotaged
+`linear_gemm_mma` still passed. Identical failure mode to the original "6/6"
+claim in `8f1a863` (§12.1). Two false coverage claims in one project.
+
+Fixed: `crates/engine/tests/linear_metal.rs:900` now calls
+`remove_var("KAPLUMBA_DISABLE_MMA_PREFILL")`; query count raised 33 → 65 to
+exercise a full 64-row block plus a partial one. The test now has **teeth**:
+sabotaging the kernel makes it fail with `worst normalised error inf`. The
+128×64 kernel added query counts 1/127/128/129/255/256/257 for the 128-row tail
+plus a canary row past the output buffer, and a sabotaged row guard was verified
+to fail the test. Worst error is 2.1603336e-3, **bit-identical to the 32.2
+tok/s kernel** — same weight bits, same `KCHUNK`, same per-element accumulation
+order.
+
+**Still open, not fixed because it is a comment in a source file:**
+`crates/engine/tests/linear_metal.rs:745-753` says `mma_gemm_rows` is called
+"with `KAPLUMBA_DISABLE_MMA_PREFILL=1` set by the caller so the dispatch selects
+`linear_gemm_mma`" — backwards — and that the gate requires
+`in_features % 32 == 0` / `out_features % 32 == 0` when
+`crates/kernels/src/linear.rs:976-987` actually gates on `% 64`. Anyone relying
+on that comment will be misled.
+
+## 14. Rejected experiments — do not retry
+
+| experiment | measured | why |
+|---|---|---|
+| 64×64 output tile | 8.27 tok/s (2.58 with a dynamic loop bound) | widened **N**, left Q=16, so the weight-reuse amortisation factor never moved; plus a 20 KB threadgroup. `ba9263f` |
+| `KCHUNK=32` (128×64 shape) | −2% |
+| staged `astage` (128×64 shape) | −5% | simdgroups own disjoint query rows; see §12.4.4 |
+| 32 accumulators/simdgroup (32q row block) | ratio 2.67 but **10% slower** | 64 accumulator registers per thread |
+| 8→4 simdgroups with `KCHUNK=32` | no change | |
+| 18 KB threadgroup (padded) | 21.1 tok/s | the 16 KB occupancy cliff is real and binding |
+| 256-entry float codebook LUT | worse | **our codebook has only 8 distinct values**, so a `select` chain needs 7 selects and beats `decode_state`'s ~6 ops. And oMLX explicitly rejects dynamically-indexed tables on Apple: `omlx/custom_kernels/bonsai/csrc/quantized.h:612-613`, "no dynamic array index which would spill to device memory on Apple GPU" |
+| `metal::extract_bits` (one instr vs shift+mask) | n/a | **our `0x8fff8fff` window is non-contiguous**, so extract_bits cannot express it |
+| oMLX gate/up concat fusion (`qwen35_packed_linear.py` `project()`) | **−2.3%** | |
+| `AGX_RELAX_CDM_CTXSTORE_TIMEOUT=1` (llama.cpp `ggml-metal.cpp:1025-1029`, issue #20141) | **null** | no command buffer is giant any more |
+| fusing `gated_gelu` into the `up_proj` epilogue | rejected pre-measurement | removes a 21504-wide intermediate worth ~0.2% of runtime; gate+up's 7.4 s is arithmetic that only a better inner loop moves |
+| `KAPLUMBA_RESIDENT_WEIGHTS=1` | **13% slower** | killed the host-paging theory (§11b) |
+
+## 15. Open, with numbers
+
+- **152 tok/s at 8192 is not reached and, on this tile shape, is not reachable.**
+  The measured scaling fit (164–3974 tokens, free memory held 15.1–15.4 GiB) is
+  `t = 1567 + 27.93·L + 0.000533·L²` ms, log-log exponent **+0.066** — nearly
+  flat. Context is **not** the constraint; GEMM efficiency is. Attention's
+  quadratic term is only 7% of per-token cost at 3974 and ~14% at 8192. The fit
+  was taken at 32.2 tok/s and **predates `1dd4da9`**; re-measure before quoting.
+- Peak RSS is flat at 7.81–8.06 GiB (projected 8.20 at 8192) because KV is
+  preallocated. **8192 was not run** — free memory fell below the 16 GiB gate.
+- **A staging-stripped diagnostic caps the current tile shape at 76.7 tok/s**, so
+  ~11% remains in staging/dequant and the rest needs a different tile. This is
+  now the whole remaining project.
+- **`lm_head.trellis` (1.06 GB) is mapped by default despite a code comment
+  saying that is "actively harmful."** `crates/engine/src/weights.rs:530-533`
+  records the measurement (12.99 → 14.14 GiB, "actively harmful. Left
+  resident"), and `weights.rs:552` computes
+  `let offload_head_trellis = offload_head && name == "lm_head.trellis";`
+  which **maps it**, because `offload_head = !force_resident`
+  (`weights.rs:544`). **Known contradiction. Needs an A/B and a decision, not a
+  guess.** (See `spec.md` Q12.)
+- **Decode is 5.3–6.9 tok/s at 614**, degrading to 1.6–2.1 at 4814. The
+  degradation is the expected cost of rescanning a long context, not a failure —
+  but it is below the 7.87 tok/s in notes §1–§3 and the difference is not
+  explained. Notes §8.3 already warned that the 7.87 baseline is not
+  reproducible; a ~10% machine-level shift (thermal, background load, differing
+  resident set) is present. **Any A/B must run back-to-back in one session.**
+
+## 16. Process and environment
+
+- **A `flock` on `~/.kaplumba/gpu.lock` now serialises model loads inside the
+  binary** (`d678a79`). Two concurrent loads exceed unified memory; this repo
+  has already measured that cost — `crates/engine/src/weights.rs:508-511`:
+  "file-backed pages get evicted, which measured 3.9 GiB of swap and ~1.4
+  tok/s". A wrapper script is not sufficient, because a parallel agent fleet
+  runs the binary directly.
+  Implementation `crates/engine/src/gpu_lock.rs`: `acquire()` at `:63`,
+  `acquire_lock_file()` at `:81`, `libc::flock(fd, LOCK_EX|LOCK_NB)` at `:105`,
+  static `HELD: OnceLock<File>` at `:34`. Called from
+  `crates/engine/src/model.rs:2076`. Released by the kernel when the fd closes,
+  so normal exit, abort and `kill -9` all release it — a crashed holder cannot
+  wedge it. The `File` lives in a `OnceLock` that is never dropped; threads
+  inside one process serialise on a `Mutex` first, because `OnceLock::get_or_init`
+  cannot propagate an error. A second process **waits** and prints who it is
+  waiting for plus current free memory — waiting, not failing, is deliberate.
+  Verified: second instance printed `GPU is busy, waiting for the lock. Free
+  memory now 1.4 GiB…`, then produced 9.873 tok/s against the first's 9.836.
+- **`MetalEncoder` has a `Drop` behind an `ended` flag with a single private
+  `end()` choke point**, so a double `end_encoding` is impossible. Without it
+  any error path propagating out of `forward_buffer_into` dropped an un-ended
+  encoder and Metal SIGTRAPped. Verified the test has teeth: with `Drop`
+  neutered it dies with `Command encoder released without endEncoding`.
+- `commit_and_waitless` → **`commit_terminal`**, with `debug_assert!` on every
+  `dispatch_*`. It previously left a dead encoder and a stale dispatch counter.
+- **metal-rs returns unretained autoreleased pointers and the process has no
+  autorelease pool**, so every command buffer leaked. Switched to the crate's own
+  owned handles (`foreign_type` `ToOwned=retain`, `Drop=release`). Measured
+  1896 B leaked per buffer/encoder pair before, 0 after: 260 KB per prefill,
+  79.6 KB per decode token. **Draining the pool is still open** and is the
+  correct follow-up.
+- `prefill_tok_s` always reported 0.000 on the pipelined path — a shadowed
+  `prefill_duration` hid the real value.
+- In-process timer instrumentation is **untrustworthy here**. Two separate
+  approaches (per-dispatch timers, then `new_command_buffer` counters) produced
+  **no output at all** despite the format string being present in the binary —
+  the same failure as the earlier session's `ApiTimer`. Use
+  `KAPLUMBA_GPU_PROFILE=1`, or external `sample`/DTrace.
+
+### Commands
+
+```bash
+# shaders are include_str!'d into the CLI; --workspace does NOT rebuild it
+cargo build --release -p kaplumba-cli
+
+# end-to-end, 614 prompt tokens
+M=/Users/zayaantaha/.kaplumba/models/Gxma/Gxma
+PP=$(python3 -c "print('Explain the theory of relativity. '*100)")
+./target/release/kaplumba --model "$M" --prompt "$PP" --max-new-tokens 4 --temperature 0 --metrics
+
+# real per-kernel GPU time. Selectors inside are CAPITALISED; the env var is not.
+KAPLUMBA_GPU_PROFILE=1 ./target/release/kaplumba --model "$M" --prompt "$PP" ...
+
+# A/B the tensor path against the scalar tiled kernel
+KAPLUMBA_DISABLE_MMA_PREFILL=1 ./target/release/kaplumba ...
+
+# 5 reference prompts; expected: Paris / 1,2,3,4,5 / red, blue, and yellow /
+# "Hello! How can I help you today?" / "17 times 23 is 391"
+for q in "What is the capital of France?" "Count from one to five." \
+         "Name three primary colors." "Hi" "What is 17 times 23?"; do
+    ./target/release/kaplumba --model "$M" --prompt "$q" --max-new-tokens 24 --temperature 0
+done
+
+# cheapest test that exercises BOTH prefill and decode on the real checkpoint
+export KAPLUMBA_TEST_MODEL=$M
+cargo test --release -p kaplumba-engine --test real_forward_buffer \
+  -- --ignored --exact real_model_buffer_forward_prefill_then_decode   # ~10 s
+```
+
+**Reference-prompt caveat, recorded so it is not re-investigated:** 4/5 are
+byte-identical across repeated runs. #5 ("What is 17 times 23?") is fluent but
+reworded, and it diverges **identically on the pre-change binary**, so the
+divergence predates this work. Worst GEMM error is unchanged at 2.16e-3.
