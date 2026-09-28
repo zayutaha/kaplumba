@@ -999,14 +999,6 @@ impl LinearKernels {
                 64,
             );
         }
-        // The tiled kernel accumulates with += across query tiles, so start clean.
-        encoder.dispatch_1d(
-            &self.zero_raw_pipeline,
-            &[Some(raw)],
-            &[],
-            output_elements as u64,
-            64,
-        )?;
         encoder.dispatch_1d(
             &self.input_rows_pipeline,
             &[Some(input), Some(input_signs), Some(transformed)],

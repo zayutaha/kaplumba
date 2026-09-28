@@ -414,3 +414,141 @@ PP=$(python3 -c "print('Explain the theory of relativity. '*100)")
 ./target/release/kaplumba --model "$M" --prompt "$PP" --max-new-tokens 4 --temperature 0 --metrics
 # 614 prompt tokens; prefill ~10.4 tok/s, decode ~7.1 tok/s
 ```
+
+## 2026-09-28 — reference mining (omlx + llama.cpp) and the first three fixes
+
+Ten research agents read `/tmp/kaplumba-refs/omlx` (Apache-2.0) and
+`/tmp/kaplumba-refs/llama.cpp` (MIT) plus our own prefill path. Everything
+below is cited; nothing is inferred.
+
+### Fixes landed in this commit
+
+| change | why | effect |
+|---|---|---|
+| removed `linear_zero_raw` (410 dispatches/chunk) | `linear_gemv_tiled` ends in a plain store (`linear.metal`), not an accumulate, and its grid covers every (query,output) pair. The zeroing outlived its reason when 11aef59 made the accumulator a register. 4.77 GB of dead writes per 256-token chunk. | 10.55 → 10.58 tok/s |
+| rolling command buffers: 50 dispatches/buffer, 8 in flight | MLX uses `max_ops_per_buffer_ = 50` on this arch class (`mlx/backend/metal/device.cpp`) and `MAX_ACTIVE_TASKS = 10` (`mlx/transforms.cpp`); omlx ships 16 (`omlx/cluster/deployment.py`). Our one-buffer prefill carried ~8000 dispatches. | 10.58 → 10.98 tok/s |
+| commit the prefill in the greedy path | `forward_buffer_into` encoded the prefill and the encoder was **dropped un-ended** — never submitted. `prefill_tokens_per_second` therefore measured host encode, not the GPU. | measurement now honest |
+| rms_norm threshold 32 → 8192 rows | prefill (256 rows) was taking the one-thread-per-row kernel, handing a 20-core GPU 256 threads. `examples/norm_sweep.rs`: 0.7595 → 0.0253 ms, 30x. | (in 4d55bbf) |
+
+Verified: all five reference prompts byte-correct; `cargo test --release
+-p kaplumba-engine` all green. Prefill 10.98 tok/s at 614 tokens.
+
+### The finding that invalidates my own earlier diagnosis
+
+I had spent this session claiming prefill attention's "phase 1b runs the
+online-softmax recurrence on one thread while 255 wait" was ~half the cost,
+and had queued "parallelise it" as the top item. **That premise is wrong for
+the current kernel.** `online_attention_tg2_body` (`attention.metal:539-655`)
+is dead code with no entry point; the live kernel is
+`online_attention_tg2_256/512` → `online_attention_parallel_body`, which
+already reduces the chunk max and chunk sum in parallel via `simd_shuffle_xor`
+plus an 8-way tree, and advances `running_max` once per 256-key chunk on all
+256 threads. The recorded A/B was 10.394 (serial) vs 10.373 (parallel) —
+within noise. Lesson: I optimised the "phase 1b" bottleneck for a code path
+that does not run.
+
+### What the references actually say, ranked
+
+**1. The GEMM re-reads the whole weight matrix once per 16-query block.**
+`linear_gemv_tiled` gives every thread exactly one accumulator, so each weight
+tile is fetched from DRAM and dequantised again for each 16-query block:
+~16x weight-traffic amplification, ~204 GB per 256-token chunk. **This is the
+mechanical reason the 64x64 tile experiment failed** — it widened N while
+leaving Q=16, so the amortisation factor did not move. The lever is register
+blocking on Q, not a bigger output tile.
+omlx's answer (`bonsai/csrc/quantized.h:1595`): 32x32 tile, 128 threads, one
+decode feeding 32 MACs; and `qwen35_verify_qmm.py:403-413` is the shape to
+copy — 8 simdgroups each own one K chunk and dequantise into a *private*
+threadgroup buffer, so **there is no barrier in the K loop at all** and the
+partials reduce once at the end.
+
+**2. The correct simdgroup fragment layout** — the missing piece that made our
+MMA kernel emit garbage. Five independent implementations in omlx agree
+(`glm_moe_dsa/.../mma_dsa_indexer_score.h:68-75`, `bonsai/.../quantized.h:1636`,
+`deepseek_v41/kernels.py:97`):
+
+    qid = lane >> 2
+    fm  = (qid & 4) + ((lane >> 1) & 3)          // M offset, 0..7
+    fn  = ((qid & 2) << 1) + ((lane & 1) << 1)   // N offset, in {0,2,4,6}
+    // element[0] at (fm, fn), element[1] at (fm, fn+1)
+
+The trap: **A's pair is (row m, adjacent k) and B's pair is (fixed k, adjacent
+n)** — the shared index is the row in both, but it means a different axis. Copy
+the NVIDIA m8n8 assumption and you are off by a transpose *and* an axis swap.
+Cross-lane reductions use masks **2, 4, 16** (`kernels.py:263-268`), not 32/64.
+Accumulator is always `simdgroup_matrix<float,8,8>`; operands half; one
+multiply covers 8 k. omlx stages dequantised weights as **[k][n] (n
+contiguous)** so each lane's B fragment is one `vec2` load
+(`mma_dsa_indexer_score.h:18-23`).
+
+**3. llama.cpp has the attention fix I was groping for**, and it is a
+structural transpose, not a tuning knob (`kernels/fa_common.metal:411-454`):
+lane index -> KV index, simdgroup index -> query row, `M`/`S` as per-lane
+replicated registers, and the recurrence is two shuffles:
+
+    M[jj] = simd_max(max(M[jj], max(s2[0], s2[1])));
+    S[jj] = S[jj]*ms + simd_sum(vs2[0] + vs2[1]);
+
+Result is uniform across 32 lanes, so the O rescale `so4[...] *= ms` is a
+disjoint per-lane write with no barrier (`:447`). The O accumulator *must* live
+in threadgroup memory (`so`, `:98`) because the simdgroup holding `ms` does not
+own that row's O columns. 3 threadgroup barriers per 64-key tile, none of them
+a softmax reduction. `Q=8` queries, `C=64` keys, `nsg = 4` for dk=256 / 8 for
+dk=512.
+**Do not port the mask** — llama.cpp materialises a 128 MiB f16 mask at L=8192
+(`src/llama-graph.cpp:977`), which violates our §8 fixed-scratch rule. Derive
+the SWA bound arithmetically from `(q_abs, k_abs, window)`; it is two scalar
+comparisons on values already in registers.
+Also: llama.cpp is structurally *weak* at GQA — one threadgroup per query head
+re-reads the same K/V (`fa_common.metal:131-132`). We re-read 512x. Batching
+q-heads per KV head is a place we can beat them.
+
+**4. Command buffers — llama.cpp's own workaround is one line.**
+`ggml-metal.cpp:1025-1029` sets `AGX_RELAX_CDM_CTXSTORE_TIMEOUT=1` as a
+documented workaround for giant-command-buffer interactivity stalls (issue
+#20141). Cheap to try. Note also omlx measured that **blocking waits beat
+completion-handler pipelining by 22%** (`docs/experimental/qwen35_ane_prefill.md:372`),
+so the instinct to make submission async is wrong.
+llama.cpp's whole design is the counter-example: 1 global queue, `n_cb=1`
+(2 buffers per graph), and `n_ubatch=512` (`common/common.h:453`) so no buffer
+is ever large. Our equivalent of `n_ubatch` is our prefill chunk size.
+
+**5. Weight decode: kill the divide and the modulo.** omlx has zero in any hot
+path. For small alphabets it uses a `select()` chain over hoisted register
+constants, explicitly *rejecting* a dynamically-indexed table:
+`quantized.h:612-613` "no dynamic array index which would spill to device
+memory on Apple GPU". So the plan to add a 256-entry float LUT for our EXL3
+codebook is probably wrong on this hardware; a 2-3 `select()` mux is likely
+faster. Where a LUT *is* right, omlx keeps it in `constant` address space and
+only for radix conversion, not for the float value (`quantized.h:1301-1311`).
+Also `dq_a8_decode.h:86-91`: `metal::extract_bits` is one instruction where a
+shift+mask is two.
+
+**6. Threadgroup memory cliff, measured.** omlx: 27 KB collapses occupancy to
+1 threadgroup/core and costs **-18%** (`dsa_indexer.metal:48-50`); their own
+t5 GEMM sits at 16.9 KB. Our 64x64 attempt used 20 KB and lost — consistent.
+llama.cpp's entire prefill GEMM budget is 6 KB (`ggml-metal-device.cpp:844-851`).
+
+**7. Dead work in our prefill, still to remove** (from the code audit, all
+cited in the audit agent's report): 120 dead `linear_input_transform`
+dispatches (prefill overwrites the buffer with `linear_input_rows`); the
+262144-wide LM head + softcap + greedy pick encoded for *every* chunk
+(~2.1 GB dead per 614-token prefill); `key_count` returning `capacity` (1024)
+for every sliding layer so PV loads masked keys — 87.5% of PV work wasted at
+256 tokens; `q_norm` at exactly 8192 rows falling off the coalesced path
+because the guard is `rows < 8192`; `float values[128]` in all four FWHT
+kernels spilling to local memory; `rope` evaluating `powf` 2,097,152 times for
+32,768 distinct values.
+
+### Still unsolved
+
+Prefill is 10.98 tok/s, not 100. The 614-token prefill is ~56 s wall of which
+the GPU is busy only a few seconds, so **the host still dominates and I still
+cannot account for it**: encode-only was 58.06 s and encode+commit+wait 57.86 s,
+which says the cost is in encoding, yet 8000 dispatches cannot cost 7 ms each
+on the CPU. Two rounds of in-process instrumentation (per-dispatch timers, then
+`new_command_buffer` counters) produced no output at all, despite the format
+string being present in the binary — the same failure as the earlier session's
+`ApiTimer`. That instrumentation approach is untrustworthy here and needs a
+different method (external `sample`/DTrace, or a timing harness that cannot be
+defeated by the same bug).

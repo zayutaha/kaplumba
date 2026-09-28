@@ -41,7 +41,30 @@ pub struct MetalEncoder<'q> {
     /// Kept so `flush_and_wait` can start a fresh command buffer; a compute
     /// encoder cannot be used after `end_encoding`.
     queue: &'q CommandQueue,
+    /// Committed-but-unfinished command buffers, oldest first, bounded by
+    /// `MAX_IN_FLIGHT`. Waiting on the oldest when the window overflows is what
+    /// applies back-pressure: the GPU is never starved, and the host is never
+    /// allowed to queue without limit.
+    in_flight: Vec<&'q CommandBufferRef>,
+    /// Encoded dispatches in the current command buffer. A buffer is committed
+    /// once it reaches `MAX_DISPATCHES_PER_BUFFER`.
+    dispatches: u32,
 }
+
+/// Dispatches per command buffer. MLX uses 50 on this hardware class
+/// (`mlx/backend/metal/device.cpp`, arch `'s'` -> `max_ops_per_buffer_ = 50`,
+/// alongside a 50 MB cap) and omlx ships 16 for its multi-rank default
+/// (`omlx/cluster/deployment.py`). Those are measured values on an M4-class
+/// part, not guesses, and they are the direct fix for our symptom: one buffer
+/// holding a whole prefill (~8k dispatches) is what made the host spend 58 s
+/// wall on work whose GPU time is a few seconds.
+pub const MAX_DISPATCHES_PER_BUFFER: u32 = 50;
+
+/// Command buffers allowed in flight. MLX's `MAX_ACTIVE_TASKS = 10`
+/// (`mlx/transforms.cpp`); past it the host blocks on a condvar. We measured
+/// `new_command_buffer()` blocking ~175 ms once ~64 buffers were outstanding,
+/// so staying well under that is deliberate.
+pub const MAX_IN_FLIGHT: usize = 8;
 
 impl<'q> MetalEncoder<'q> {
     pub fn new(queue: &'q CommandQueue) -> Result<Self, KernelError> {
@@ -51,6 +74,8 @@ impl<'q> MetalEncoder<'q> {
             command_buffer,
             encoder,
             queue,
+            in_flight: Vec::new(),
+            dispatches: 0,
         })
     }
 
@@ -111,6 +136,7 @@ impl<'q> MetalEncoder<'q> {
             MTLSize::new(groups_x, groups_y, 1),
             MTLSize::new(threads_per_group_x, threads_per_group_y, 1),
         );
+        self.tick()?;
         Ok(())
     }
 
@@ -146,6 +172,7 @@ impl<'q> MetalEncoder<'q> {
             MTLSize::new(groups, 1, 1),
             MTLSize::new(threads_per_group, 1, 1),
         );
+        self.tick()?;
         Ok(())
     }
 
@@ -177,6 +204,7 @@ impl<'q> MetalEncoder<'q> {
         );
         self.encoder
             .dispatch_threads(MTLSize::new(threads, 1, 1), MTLSize::new(threads_per_group, 1, 1));
+        self.tick()?;
         Ok(())
     }
 
@@ -198,6 +226,37 @@ impl<'q> MetalEncoder<'q> {
             params.as_ptr() as *const c_void,
         );
         self.encoder.dispatch_threads(threads, threads_per_group);
+        self.tick()?;
+        Ok(())
+    }
+
+    /// Count one dispatch and roll to a fresh command buffer once the buffer is
+    /// full, bounding how much work any single buffer carries.
+    fn tick(&mut self) -> Result<(), KernelError> {
+        self.dispatches += 1;
+        if self.dispatches >= MAX_DISPATCHES_PER_BUFFER {
+            self.roll()?;
+        }
+        Ok(())
+    }
+
+    /// Commit the current buffer without waiting and continue on a fresh one,
+    /// keeping at most `MAX_IN_FLIGHT` buffers outstanding. When the window is
+    /// full the oldest is waited on; by then it has almost always already
+    /// finished, so this throttles submission only when the GPU is genuinely
+    /// behind. Ordering between buffers is implicit: a single Metal command
+    /// queue executes them in commit order.
+    fn roll(&mut self) -> Result<(), KernelError> {
+        self.encoder.end_encoding();
+        self.command_buffer.commit();
+        self.in_flight.push(self.command_buffer);
+        if self.in_flight.len() > MAX_IN_FLIGHT {
+            let oldest = self.in_flight.remove(0);
+            oldest.wait_until_completed();
+        }
+        self.command_buffer = self.queue.new_command_buffer();
+        self.encoder = self.command_buffer.new_compute_command_encoder();
+        self.dispatches = 0;
         Ok(())
     }
 
@@ -210,11 +269,13 @@ impl<'q> MetalEncoder<'q> {
         self.encoder.end_encoding();
         self.command_buffer.commit();
         self.command_buffer.wait_until_completed();
+        self.in_flight.clear();
         // A compute encoder is single-use, so continue on a fresh buffer. The
         // previous one stays alive until this struct drops, which is what keeps
         // the reference valid.
         self.command_buffer = self.queue.new_command_buffer();
         self.encoder = self.command_buffer.new_compute_command_encoder();
+        self.dispatches = 0;
         Ok(())
     }
 
@@ -228,6 +289,7 @@ impl<'q> MetalEncoder<'q> {
     pub fn commit_and_waitless(&mut self) -> Result<(), KernelError> {
         self.encoder.end_encoding();
         self.command_buffer.commit();
+        self.in_flight.push(self.command_buffer);
         Ok(())
     }
 
@@ -235,12 +297,21 @@ impl<'q> MetalEncoder<'q> {
     /// several can read their results in submission order.
     pub fn wait(&self) {
         self.command_buffer.wait_until_completed();
+        for buffer in &self.in_flight {
+            buffer.wait_until_completed();
+        }
     }
 
-    pub fn commit_and_wait(self) -> Result<(), KernelError> {
+    pub fn commit_and_wait(mut self) -> Result<(), KernelError> {
         self.encoder.end_encoding();
         self.command_buffer.commit();
         self.command_buffer.wait_until_completed();
+        // Buffers rolled out mid-forward are committed but unfinished; waiting
+        // only on `command_buffer` would return before the GPU had actually run
+        // the earlier part of this forward pass.
+        for buffer in std::mem::take(&mut self.in_flight) {
+            buffer.wait_until_completed();
+        }
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(KernelError::CommandFailed);
         }

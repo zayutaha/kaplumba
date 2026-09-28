@@ -388,6 +388,11 @@ where
         model
             .forward_buffer_into(prompt_ids, &positions, &mut prefill)
             .map_err(ModelError::from)?;
+        // Commit the prefill. Encoding is not execution: without this the buffer
+        // is dropped un-ended, the KV cache is never populated, and the decode
+        // steps that follow run against an empty cache. It also makes
+        // `prefill_duration` honest -- it now covers the GPU, not just the host.
+        prefill.commit_and_wait().map_err(ModelError::from)?;
         let prefill_duration = prefill_started.elapsed();
 
         let mut position = prompt_len as u32;
