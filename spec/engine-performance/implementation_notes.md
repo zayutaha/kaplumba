@@ -932,3 +932,54 @@ cargo test --release -p kaplumba-engine --test real_forward_buffer \
 byte-identical across repeated runs. #5 ("What is 17 times 23?") is fluent but
 reworded, and it diverges **identically on the pre-change binary**, so the
 divergence predates this work. Worst GEMM error is unchanged at 2.16e-3.
+
+## 2026-09-28 — 8k context measured: 69.7 tok/s, and the "model won't load" red herring
+
+**8k result, the number the whole spec has been targeting:**
+
+| context | prefill tok/s | TTFT | peak RSS |
+|---|---|---|---|
+| 614 | 71.5 | 8.6 s | 8.6 GB |
+| **7814** | **69.7** | **112.1 s** | **7.7 GB** |
+
+Only 2.5% slower than 614, so throughput is essentially context-independent and
+the flat scaling law holds. RSS is flat because the KV cache is preallocated.
+Reproduce with `*1300` repetitions of the test sentence = 7814 tokens, i.e.
+**6.01 tokens per repetition** — get that constant wrong and the prompt is
+silently rejected:
+
+    PP=$(python3 -c "print('Explain the theory of relativity. '*1300)")
+
+At 1365 repetitions the prompt is 8656 tokens, over the 8192 limit, and the
+binary prints "prompt plus generation exceeds context limit 8192" and exits
+WITHOUT LOADING. This cost three separate debugging detours in one session:
+the error went to a pipe whose head was not being read, so it looked exactly
+like a silent hang, a stuck queue, and a broken model load. Before concluding
+"the model is not loading", run the binary with `2>&1 | head -5` and a short
+prompt, and confirm the token count first.
+
+**Still open at 69.7, and it is not context.** Two independent kernel-level
+analyses converged on the same conclusion:
+
+- `linear_gemm_mma` is **~90% tensor-pipe bound** (deleting all 16 MMAs leaves
+  2.34 ms of 23.82), and the dequant is now **free** (deleting the entire EXL3
+  decode arithmetic moves 23.91 -> 23.84 ms, ranges overlapping) after the
+  `ka==3 && codebook==1` arm folded MCG to 4 instructions.
+- Wider MMA fragments **do not exist on this hardware**: the compiler header
+  `/System/Library/PrivateFrameworks/GPUCompiler.framework/Versions/32023/.../metal_simdgroup_matrix`
+  carries `static_assert(Cols == 8 && Rows == 8)`, and 8x8 is the only
+  instantiation. 16x8/8x16/32x32 all fail to compile.
+- Exhausted and reverted, do not retry: 32 accumulators/simdgroup (64 registers,
+  spills, 0.82x), 256 rows over 16 simdgroups/512 threads (0.64x), 512q (0.54x),
+  128q x 128n 4x4 fragments (0.993x), register staging of B (B is shared by all
+  8 simdgroups), persistent threadgroup across query blocks (0.53% ceiling, and
+  it needs 160 regs/lane), split-K (re-associates the k-sum, reduces zero MMA
+  work), #pragma unroll, fragment prefetch, unpad BSTRIDE 64, KCHUNK=128.
+
+So the honest position: the prefill GEMM is at ~90% of a hardware pipe that has
+no wider form, and the remaining headroom is small. Reaching 120 tok/s from here
+requires either a warm ceiling above the measured ~7.8 TFLOPS, or a way to cut
+work rather than cut overhead. The load-bearing number to re-verify is that
+~7.8 TFLOPS ceiling: `examples/mma_peak` prints 15.49 for the same instruction
+and cannot be reproduced, and one agent's own 8x8 probe printed 111 TFLOPS
+before `loop_ratio=0.359` showed the compiler had folded the loop away.
