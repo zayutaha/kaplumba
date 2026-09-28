@@ -2326,8 +2326,15 @@ kernel void linear_gemm_mma(
     const uint fractional_bits = params.rate - 16u;
     const uint word_count = fractional ? (8u * fractional_bits + 4u) : (256u * params.rate / 32u);
 
+    // Threadgroup budget: 512 words of trellis (2 KB) + 64x32 weight halfs
+    // (4 KB) + 32x64 activation halfs (4 KB) + 32x32 fp32 accumulators (4 KB)
+    // = 14 KB per group. Note bstage MUST be KCHUNK * OUTS: the dequant loop
+    // writes KCHUNK * OUTS elements and the fragment loads address
+    // bstage + k8 * OUTS with k8 up to KCHUNK - 8, i.e. the top half of a
+    // QTILE-sized array would alias astage (8f1a863: every k >= 32 weight read
+    // activations instead, hence garbage on every prompt).
     threadgroup uint tw[KTILES * NTILES * 64u]; // 8 tiles, <=64 words each
-    threadgroup half bstage[QTILE * OUTS];      // 64 x 32 weight halfs
+    threadgroup half bstage[KCHUNK * OUTS];      // 64 x 32 weight halfs
     threadgroup half astage[QTILE * KCHUNK];    // 32 x 64 activations
     threadgroup float tgacc[QTILE * OUTS];
 

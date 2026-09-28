@@ -118,14 +118,25 @@ impl GpuKvCache {
     /// Number of key slots the attention kernel should scan.
     ///
     /// Full caches only ever hold valid entries in the low slots, so the scan can
-    /// stop at the write position. Sliding caches ring, so every slot can hold a
-    /// live entry and the whole buffer is scanned; the kernel's window check
-    /// discards anything stale or empty.
+    /// stop at the write position.
+    ///
+    /// Sliding caches ring, so returning `capacity` unconditionally made every
+    /// sliding layer scan (and accumulate) all 1024 slots at every step, even at
+    /// position 10. `min` is enough because the two regimes collapse on their own:
+    ///
+    /// * Before the ring wraps (`next_position < capacity`) the only live slots
+    ///   are `[0, next_position)`. Skipping the tail is safe because unwritten
+    ///   slots are still `EMPTY_POSITION` (zeroed in [`Self::new`], refilled on
+    ///   [`Self::ensure_capacity`], cleared on [`Self::reset`]), so the kernel's
+    ///   window check would have masked them to weight 0 anyway.
+    /// * Once the ring wraps (`next_position >= capacity`) `min` yields
+    ///   `capacity` and every slot is live again, so no separate wrapped path is
+    ///   needed -- the same expression is correct in both regimes.
     pub fn key_count(&self, full_attention: bool) -> usize {
         if full_attention {
             self.next_position
         } else {
-            self.capacity
+            self.next_position.min(self.capacity)
         }
     }
 

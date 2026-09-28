@@ -965,8 +965,12 @@ impl LinearKernels {
         // the finalize contract — not in the standalone kernel. Its arithmetic
         // speed is real (10.2 -> 22.6 tok/s, ~9.4 TFLOPS) and worth fixing, but
         // a fast wrong answer is worth nothing. Set
-        // KAPLUMBA_ENABLE_MMA_PREFILL=1 to A/B it while debugging.
-        if std::env::var_os("KAPLUMBA_ENABLE_MMA_PREFILL").is_some()
+        // KAPLUMBA_DISABLE_MMA_PREFILL=1 to A/B it while debugging.
+        // Enabled by default: the bstage overflow that made this path emit
+        // garbage (8f1a863) is fixed, and `mma_prefill_gemm_matches_cpu_reference`
+        // now actually covers it. Set KAPLUMBA_DISABLE_MMA_PREFILL=1 to fall
+        // back to the scalar tiled kernel for A/B.
+        if std::env::var_os("KAPLUMBA_DISABLE_MMA_PREFILL").is_none()
             && in_features % 32 == 0
             && out_features % 32 == 0
             && self.gemm_mma_pipeline.thread_execution_width() == 32

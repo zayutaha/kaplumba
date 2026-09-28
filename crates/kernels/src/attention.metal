@@ -785,6 +785,14 @@ static void online_attention_parallel_body(
         running_max = next_max;
 
         // 6. fold this chunk into the dimension accumulators.
+        //
+        // `sbuf[t] == 0` for masked keys, but `values` is not zeroed for
+        // unwritten slots (only `positions` is), so an unwritten slot can hold
+        // NaN and `0.0f * NaN` poisons the accumulator. Skip the load entirely
+        // instead: `weight == 0` makes the term exactly `+0.0` for every finite
+        // value, so skipping leaves the sum bit-identical for live keys while
+        // also removing the load and the multiply. Masking after the load
+        // (`0.0f * loaded`) would still be a NaN and would keep the bandwidth.
         for (uint j = 0; j < DPT; ++j) {
             const uint d = tid + j * 256u;
             if (d >= uint(HEAD_DIM)) {
@@ -792,7 +800,11 @@ static void online_attention_parallel_body(
             }
             float acc = accumulator[j] * alpha;
             for (uint t = 0; t < n; ++t) {
-                acc += sbuf[t] * float(values[((base + t) * params.kv_heads + key_head) * uint(HEAD_DIM) + d]);
+                const float w = sbuf[t];
+                if (w == 0.0f) {
+                    continue;
+                }
+                acc += w * float(values[((base + t) * params.kv_heads + key_head) * uint(HEAD_DIM) + d]);
             }
             accumulator[j] = acc;
         }

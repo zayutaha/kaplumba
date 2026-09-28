@@ -1,12 +1,16 @@
 use std::ffi::c_void;
-use std::mem::size_of;
+use std::mem::{size_of, size_of_val};
 
 use half::f16;
 use kaplumba_engine::exl3::{
-    BitRate, Codebook, SignVector, pack_fractional_states, pack_integer_states, reconstruct_matrix,
+    BitRate, Codebook, SignVector, apply_hadamard_matrix, decode_state, pack_fractional_states,
+    pack_integer_states, reconstruct_matrix, unpack_trellis, unpermute_tile,
 };
+use kaplumba_kernels::encoder::MetalEncoder;
 use kaplumba_kernels::exl3::{Exl3Codebook, Exl3Rate};
-use kaplumba_kernels::linear::{LinearBufferRequest, LinearKernels, LinearRequest, PrefillRequest};
+use kaplumba_kernels::linear::{
+    LinearBufferRequest, LinearKernels, LinearRequest, PrefillEncodeRequest, PrefillRequest,
+};
 use metal::{Device, MTLResourceOptions};
 
 fn integer_states(bits: u8, seed: u32) -> Vec<u16> {
@@ -628,4 +632,363 @@ fn linear_rejects_invalid_shapes() {
         .unwrap_err()
         .to_string();
     assert!(mismatch_error.contains("prefill input or sign length"));
+}
+
+/// `reconstruct_matrix` without `BitRate::validate_codebook`, so the fractional
+/// rates can be checked against the MCG codebook that `encode_gemm` insists on
+/// (`validate_encode`). Same helpers, same order, same arithmetic as the
+/// production reference: `unpack_trellis` -> `decode_state` -> `unpermute_tile`
+/// per 16x16 tile, then the Hadamard matrix, then the sign scaling.
+fn reference_matrix(
+    packed: &[u16],
+    tile_rows: usize,
+    tile_columns: usize,
+    rate: BitRate,
+    codebook: Codebook,
+    input_signs: &SignVector,
+    output_signs: &SignVector,
+) -> Vec<f32> {
+    let rows = tile_rows * 16;
+    let columns = tile_columns * 16;
+    assert_eq!(
+        packed.len(),
+        tile_rows * tile_columns * rate.packed_words(),
+        "packed length for {tile_rows}x{tile_columns} tiles at {rate:?}"
+    );
+    let input = input_signs.decode(rows).unwrap();
+    let output = output_signs.decode(columns).unwrap();
+    let mut values = vec![0.0; rows * columns];
+    for tile_row in 0..tile_rows {
+        for tile_column in 0..tile_columns {
+            let offset = (tile_row * tile_columns + tile_column) * rate.packed_words();
+            let words = rate.packed_words();
+            let states =
+                unpack_trellis(&packed[offset..offset + words], rate).expect("unpack trellis");
+            let mut lanes = [0.0_f32; 256];
+            for (index, state) in states.iter().enumerate() {
+                lanes[index] = decode_state(*state, codebook);
+            }
+            let tile = unpermute_tile(&lanes);
+            for row in 0..16 {
+                for column in 0..16 {
+                    values[(tile_row * 16 + row) * columns + tile_column * 16 + column] =
+                        tile[row * 16 + column];
+                }
+            }
+        }
+    }
+    if rows.is_multiple_of(128) && columns.is_multiple_of(128) {
+        apply_hadamard_matrix(&mut values, rows, columns).unwrap();
+    }
+    for row in 0..rows {
+        for column in 0..columns {
+            values[row * columns + column] *= input[row] * output[column];
+        }
+    }
+    values
+}
+
+#[allow(clippy::too_many_arguments)]
+fn expected_mma_rows(
+    packed: &[u16],
+    input: &[u16],
+    input_signs: &[u16],
+    output_signs: &[u16],
+    queries: usize,
+    in_features: usize,
+    out_features: usize,
+    rate: BitRate,
+    codebook: Codebook,
+) -> Vec<f32> {
+    let matrix = reference_matrix(
+        packed,
+        in_features / 16,
+        out_features / 16,
+        rate,
+        codebook,
+        &SignVector::from_half_bits(input_signs.to_vec()),
+        &SignVector::from_half_bits(output_signs.to_vec()),
+    );
+    let mut output = vec![0.0; queries * out_features];
+    for query in 0..queries {
+        for out in 0..out_features {
+            for value in 0..in_features {
+                output[query * out_features + out] +=
+                    f16::from_bits(input[query * in_features + value]).to_f32()
+                        * matrix[value * out_features + out];
+            }
+        }
+    }
+    output
+}
+
+fn shape_input(queries: usize, in_features: usize) -> Vec<u16> {
+    let mut input = Vec::with_capacity(queries * in_features);
+    for query in 0..queries {
+        for value in 0..in_features {
+            input.push(
+                f16::from_f32(((query * in_features + value) as f32 * 0.017).sin()).to_bits(),
+            );
+        }
+    }
+    input
+}
+
+fn shape_signs(len: usize, modulus: usize) -> Vec<u16> {
+    (0..len)
+        .map(|index| f16::from_f32(if index % modulus == 0 { -1.0 } else { 1.0 }).to_bits())
+        .collect()
+}
+
+/// Run one prefill GEMM through the production entry point
+/// (`LinearKernels::encode_gemm`, i.e. exactly what `model.rs` calls), with
+/// `KAPLUMBA_DISABLE_MMA_PREFILL=1` set by the caller so the dispatch selects
+/// `linear_gemm_mma` rather than the tiled kernel.
+///
+/// `encode_gemm` is the only public surface that reaches the MMA path:
+/// `gemm_chunk` / `gemm_chunk_buffer` hardcode `gemv_tiled_pipeline`, which is
+/// why 8f1a863 could claim "6/6" while shipping a kernel with no test coverage
+/// at all. The gate also requires `in_features % 32 == 0` and
+/// `out_features % 32 == 0`, which every shape below satisfies with room to
+/// spare (`validate_encode` demands multiples of 128 and the MCG codebook).
+#[allow(clippy::too_many_arguments)]
+fn mma_gemm_rows(
+    kernels: &LinearKernels,
+    packed: &[u16],
+    input: &[u16],
+    input_signs: &[u16],
+    output_signs: &[u16],
+    queries: usize,
+    in_features: usize,
+    out_features: usize,
+    rate: Exl3Rate,
+    codebook: Exl3Codebook,
+) -> Vec<f32> {
+    let device = Device::system_default().expect("Metal device");
+    let queue = device.new_command_queue();
+    let halfs = |values: &[u16]| {
+        device.new_buffer_with_data(
+            values.as_ptr() as *const c_void,
+            size_of_val(values) as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    };
+    let scratch =
+        |bytes: usize| device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared);
+    let packed_buffer = halfs(packed);
+    let input_buffer = halfs(input);
+    let input_sign_buffer = halfs(input_signs);
+    let output_sign_buffer = halfs(output_signs);
+    let transformed = scratch(queries * in_features * size_of::<u16>());
+    let raw = scratch(queries * out_features * size_of::<f32>());
+    let output = scratch(queries * out_features * size_of::<u16>());
+    // `linear_gemm_mma` stores (not accumulates) every output block, so `raw`
+    // does not strictly need clearing. Zero it anyway so the comparison stays
+    // meaningful if the gate ever falls back to the tiled kernel, which
+    // accumulates into `raw`.
+    unsafe { std::ptr::write_bytes(raw.contents() as *mut f32, 0, queries * out_features) };
+    let mut encoder = MetalEncoder::new(&queue).expect("Metal encoder");
+    kernels
+        .encode_gemm(
+            &mut encoder,
+            PrefillEncodeRequest {
+                packed: &packed_buffer,
+                packed_offset: 0,
+                perm_mode: 0,
+                input: &input_buffer,
+                input_signs: &input_sign_buffer,
+                output_signs: &output_sign_buffer,
+                transformed: &transformed,
+                raw: &raw,
+                output: &output,
+                queries,
+                in_features,
+                out_features,
+                rate,
+                codebook,
+            },
+        )
+        .expect("encode MMA prefill GEMM");
+    encoder.commit_and_wait().expect("commit MMA GEMM");
+    let values = output.contents() as *const u16;
+    (0..queries * out_features)
+        .map(|index| f16::from_bits(unsafe { *values.add(index) }).to_f32())
+        .collect()
+}
+
+/// Compare one MMA GEMM result against the CPU reference built from the same
+/// EXL3 decode helpers (`reconstruct_matrix`, which is what packs the trellis
+/// the kernel dequantizes) and report the worst normalised error.
+///
+/// Metric: `max|actual - expected| / max|expected|`, i.e. the largest absolute
+/// deviation anywhere in the result as a fraction of the largest magnitude the
+/// reference produces. A per-element relative test is useless here because
+/// dot products of K signed terms cross zero, so single elements carry no
+/// meaningful scale; the reference's peak magnitude is the one stable scale
+/// available.
+fn assert_mma_close(label: &str, actual: &[f32], expected: &[f32], worst_so_far: &mut f32) {
+    assert_eq!(actual.len(), expected.len(), "{label}: length mismatch");
+    let scale = expected
+        .iter()
+        .fold(0.0_f32, |peak, value| peak.max(value.abs()));
+    assert!(scale > 0.0, "{label}: degenerate reference");
+    let mut worst = 0.0_f32;
+    for (index, value) in actual.iter().enumerate() {
+        worst = worst.max((value - expected[index]).abs() / scale);
+    }
+    *worst_so_far = worst_so_far.max(worst);
+    assert!(
+        worst < MMA_TOLERANCE,
+        "{label}: worst normalised error {worst:e} exceeds {MMA_TOLERANCE:e}"
+    );
+}
+
+/// Bit-exactness is NOT achievable and is NOT claimed: the tensor path rounds
+/// every dequantized weight to fp16 (`half(decode_state(...))`, and
+/// `decode_three_inst` sums two fp16 values, so the sum need not be fp16), and
+/// accumulates 8x8 half products in a different order than the fp32 reference
+/// (64-wide chunks, four accumulator chains vs. one ascending loop). Both are
+/// documented in the kernel header (Q10, user decision 2026-09-27).
+const MMA_TOLERANCE: f32 = 0.02;
+
+#[test]
+fn mma_prefill_gemm_matches_cpu_reference() {
+    // The gate is process-global, but `encode_gemm` is the only reader and only
+    // this test calls it, so there is no concurrent `getenv` to race with. Set
+    // it before any dispatch; it is read per `encode_gemm` call, not cached.
+    unsafe { std::env::set_var("KAPLUMBA_DISABLE_MMA_PREFILL", "1") };
+    let kernels = LinearKernels::new().expect("Metal linear kernels should compile");
+    let mut worst = 0.0_f32;
+
+    // Every rate the engine can load: integer 1..=8 and fractional 1..=3. The
+    // integer path exercises `exl3_code_at_tg` + `trellis_word`, the fractional
+    // path `fractional_window_tg`, and the word-count derivations differ.
+    // 33 queries = two simdgroup-row blocks with a partial second block.
+    let (queries, in_features, out_features) = (33, 128, 128);
+    let input = shape_input(queries, in_features);
+    let input_signs = shape_signs(in_features, 3);
+    let output_signs = shape_signs(out_features, 5);
+    for bits in 1..=8 {
+        let packed = matrix_packed_integer_shape(
+            bits,
+            bits as u32 * 1301,
+            in_features / 16,
+            out_features / 16,
+        );
+        let expected = expected_mma_rows(
+            &packed,
+            &input,
+            &input_signs,
+            &output_signs,
+            queries,
+            in_features,
+            out_features,
+            BitRate::Integer(bits),
+            Codebook::Mcg,
+        );
+        let actual = mma_gemm_rows(
+            &kernels,
+            &packed,
+            &input,
+            &input_signs,
+            &output_signs,
+            queries,
+            in_features,
+            out_features,
+            Exl3Rate::Integer(bits),
+            Exl3Codebook::Mcg,
+        );
+        assert_mma_close(
+            &format!("integer bits={bits}"),
+            &actual,
+            &expected,
+            &mut worst,
+        );
+    }
+    for bits in 1..=3 {
+        let packed = matrix_packed_fractional_shape(
+            bits,
+            bits as u32 * 1303,
+            in_features / 16,
+            out_features / 16,
+        );
+        let expected = expected_mma_rows(
+            &packed,
+            &input,
+            &input_signs,
+            &output_signs,
+            queries,
+            in_features,
+            out_features,
+            BitRate::Fractional(bits),
+            Codebook::Mcg,
+        );
+        let actual = mma_gemm_rows(
+            &kernels,
+            &packed,
+            &input,
+            &input_signs,
+            &output_signs,
+            queries,
+            in_features,
+            out_features,
+            Exl3Rate::Fractional(bits),
+            Exl3Codebook::Mcg,
+        );
+        assert_mma_close(
+            &format!("fractional bits={bits}"),
+            &actual,
+            &expected,
+            &mut worst,
+        );
+    }
+
+    // Non-square shapes and query counts that straddle the 32-row MMA block
+    // boundary: 1 (one partial block), 31 (partial), 32 (exactly one), 33 and
+    // 48 (partial second block), 64 (exactly two). 256x384 is the real
+    // gate_proj geometry class; 384x256 covers out_features < in_features.
+    for (in_features, out_features) in [(128, 256), (256, 384), (384, 256), (128, 512)] {
+        let input_signs = shape_signs(in_features, 3);
+        let output_signs = shape_signs(out_features, 5);
+        for queries in [1, 31, 32, 33, 48, 64] {
+            let input = shape_input(queries, in_features);
+            let packed = matrix_packed_integer_shape(
+                3,
+                queries as u32 * 31 + in_features as u32 + out_features as u32,
+                in_features / 16,
+                out_features / 16,
+            );
+            let expected = expected_mma_rows(
+                &packed,
+                &input,
+                &input_signs,
+                &output_signs,
+                queries,
+                in_features,
+                out_features,
+                BitRate::Integer(3),
+                Codebook::Mcg,
+            );
+            let actual = mma_gemm_rows(
+                &kernels,
+                &packed,
+                &input,
+                &input_signs,
+                &output_signs,
+                queries,
+                in_features,
+                out_features,
+                Exl3Rate::Integer(3),
+                Exl3Codebook::Mcg,
+            );
+            assert_mma_close(
+                &format!("shape {in_features}x{out_features} queries={queries}"),
+                &actual,
+                &expected,
+                &mut worst,
+            );
+        }
+    }
+
+    println!("mma_prefill_gemm_matches_cpu_reference: worst normalised error {worst:e}");
 }
