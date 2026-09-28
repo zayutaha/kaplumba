@@ -66,11 +66,40 @@ pub struct AttentionKernels {
     attention_dim_512_pipeline: ComputePipelineState,
     attention_tg2_256_pipeline: ComputePipelineState,
     attention_tg2_512_pipeline: ComputePipelineState,
+    /// Transposed prefill kernel, indexed by `gqa_index(head_dim, nsg)`.
+    /// `head_dim` is 256 or 512; `nsg` is the GQA ratio `q_heads / kv_heads`,
+    /// which the kernel needs verbatim because it sizes the threadgroup.
+    attention_gqa_pipelines: [ComputePipelineState; GQA_PIPELINES],
     scores_pipeline: ComputePipelineState,
     scores_coalesced_pipeline: ComputePipelineState,
     row_reduce_coalesced_pipeline: ComputePipelineState,
     row_reduce_pipeline: ComputePipelineState,
     combine_pipeline: ComputePipelineState,
+}
+
+/// `q_heads / kv_heads` values the transposed kernel is instantiated for, and
+/// therefore also the simdgroup counts. Anything else falls back to the
+/// 256-thread `online_attention_tg2_*` kernel, which makes no such assumption.
+const GQA_RATIOS: [usize; 4] = [1, 2, 4, 8];
+const GQA_HEAD_DIMS: [usize; 2] = [256, 512];
+const GQA_PIPELINES: usize = GQA_RATIOS.len() * GQA_HEAD_DIMS.len();
+
+/// Position of a (head_dim, nsg) pair in `attention_gqa_pipelines`, or `None`
+/// when the shape has no specialisation.
+fn gqa_index(head_dim: usize, nsg: usize) -> Option<usize> {
+    let dim = GQA_HEAD_DIMS.iter().position(|d| *d == head_dim)?;
+    let ratio = GQA_RATIOS.iter().position(|r| *r == nsg)?;
+    Some(dim * GQA_RATIOS.len() + ratio)
+}
+
+fn gqa_pipeline_name(head_dim: usize, nsg: usize) -> String {
+    format!("online_attention_gqa_{head_dim}_{nsg}")
+}
+
+/// Threadgroups of `per_group` threads needed to cover `threads`, at least one.
+/// The kernels that index the grid themselves early-return on the surplus.
+fn threads_for(threads: usize, per_group: usize) -> u64 {
+    threads.div_ceil(per_group).max(1) as u64
 }
 
 impl AttentionKernels {
@@ -98,6 +127,17 @@ impl AttentionKernels {
         let attention_dim_512_pipeline = extra("online_attention_dim_512")?;
         let attention_tg2_256_pipeline = extra("online_attention_tg2_256")?;
         let attention_tg2_512_pipeline = extra("online_attention_tg2_512")?;
+        let mut attention_gqa_pipelines = Vec::with_capacity(GQA_PIPELINES);
+        for head_dim in GQA_HEAD_DIMS {
+            for nsg in GQA_RATIOS {
+                attention_gqa_pipelines.push(extra(&gqa_pipeline_name(head_dim, nsg))?);
+            }
+        }
+        let attention_gqa_pipelines: [ComputePipelineState; GQA_PIPELINES] = attention_gqa_pipelines
+            .try_into()
+            .map_err(|_| {
+                KernelError::Pipeline("unexpected transposed attention pipeline count".to_string())
+            })?;
         let queue = device.new_command_queue();
         Ok(Self {
             device,
@@ -110,6 +150,7 @@ impl AttentionKernels {
             attention_dim_512_pipeline,
             attention_tg2_256_pipeline,
             attention_tg2_512_pipeline,
+            attention_gqa_pipelines,
             scores_pipeline,
             scores_coalesced_pipeline,
             row_reduce_coalesced_pipeline,
@@ -344,17 +385,41 @@ impl AttentionKernels {
             scale,
             window: to_u32(window, "attention window")?,
         };
-        // Route to the head_dim-specialised instantiation so the output
-        // accumulator is register-resident. Bit-exact: the loop order and the
-        // arithmetic are identical to the generic kernel.
-        let pipeline = match head_dim {
-            256 => &self.attention_tg2_256_pipeline,
-            512 => &self.attention_tg2_512_pipeline,
-            _ => &self.online_attention_pipeline,
+        // Prefill: one threadgroup per (query, KV HEAD), holding one simdgroup
+        // per query head that shares that KV head. `groups` query heads read the
+        // same K and V out of one threadgroup's L1, so the cache is re-read
+        // `q_heads / groups` = 1 times instead of `q_heads` times -- on Gxma,
+        // 2x fewer kv reads on the 50 sliding layers and 8x on the 10 full ones.
+        // A `groups` with no specialisation falls back to the 256-thread kernel,
+        // which is dimension-partitioned and makes no GQA assumption.
+        let groups = q_heads / kv_heads;
+        // The generic kernel indexes a flat `queries * q_heads` thread range, so
+        // it needs its own group count; both specialised kernels index the grid
+        // themselves and discard the surplus threads on an early return.
+        let (pipeline, grid_groups, group_threads) = match gqa_index(head_dim, groups) {
+            Some(index) => (
+                &self.attention_gqa_pipelines[index],
+                (queries_count * kv_heads) as u64,
+                (32 * groups) as u64,
+            ),
+            None => match head_dim {
+                256 => (
+                    &self.attention_tg2_256_pipeline,
+                    (queries_count * q_heads) as u64,
+                    256,
+                ),
+                512 => (
+                    &self.attention_tg2_512_pipeline,
+                    (queries_count * q_heads) as u64,
+                    256,
+                ),
+                _ => (
+                    &self.online_attention_pipeline,
+                    threads_for(queries_count * q_heads, 64),
+                    64,
+                ),
+            },
         };
-        // One 256-thread threadgroup per (query, head): phase 1 scores a key
-        // chunk into shared memory, phase 2 gives each thread one output
-        // dimension so its accumulator is a register, not local memory.
         encoder.dispatch_groups(
             pipeline,
             &[
@@ -366,8 +431,8 @@ impl AttentionKernels {
                 Some(output),
             ],
             params_bytes(&params),
-            (queries_count * q_heads) as u64,
-            256,
+            grid_groups,
+            group_threads,
         )
     }
 

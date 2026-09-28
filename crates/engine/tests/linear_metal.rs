@@ -856,7 +856,13 @@ fn mma_prefill_gemm_matches_cpu_reference() {
     // The gate is process-global, but `encode_gemm` is the only reader and only
     // this test calls it, so there is no concurrent `getenv` to race with. Set
     // it before any dispatch; it is read per `encode_gemm` call, not cached.
-    unsafe { std::env::set_var("KAPLUMBA_DISABLE_MMA_PREFILL", "1") };
+    //
+    // This must be *removed* rather than set: the flag DISABLES the MMA path,
+    // and the variable default is to USE it. Setting it here made this test
+    // silently cover the scalar tiled kernel instead, which is how the original
+    // bstage overflow shipped with a "6/6" claim. With the flag cleared, a
+    // deliberately sabotaged `linear_gemm_mma` fails this test.
+    unsafe { std::env::remove_var("KAPLUMBA_DISABLE_MMA_PREFILL") };
     let kernels = LinearKernels::new().expect("Metal linear kernels should compile");
     let mut worst = 0.0_f32;
 
@@ -864,7 +870,10 @@ fn mma_prefill_gemm_matches_cpu_reference() {
     // integer path exercises `exl3_code_at_tg` + `trellis_word`, the fractional
     // path `fractional_window_tg`, and the word-count derivations differ.
     // 33 queries = two simdgroup-row blocks with a partial second block.
-    let (queries, in_features, out_features) = (33, 128, 128);
+    // 65 queries = a FULL 64-row block plus one row of the second block, so the
+    // multi-block path in `linear_gemm_mma` (QTILE = 64) is exercised. The
+    // earlier 33 covered only a single partial block.
+    let (queries, in_features, out_features) = (65, 128, 128);
     let input = shape_input(queries, in_features);
     let input_signs = shape_signs(in_features, 3);
     let output_signs = shape_signs(out_features, 5);

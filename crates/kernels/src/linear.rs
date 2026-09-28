@@ -991,7 +991,7 @@ impl LinearKernels {
                 ],
                 params_bytes(&linear_params),
                 (out_features / 32) as u64,
-                queries.div_ceil(32) as u64,
+                queries.div_ceil(64) as u64,
                 128,
                 1,
             )?;

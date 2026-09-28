@@ -402,9 +402,17 @@ impl DecoderLayerWeights {
 /// is only the host time to submit the work. Relative encode-cost shares can
 /// still be useful (a 1000-dispatch phase has proportionally more submit
 /// overhead), but GPU time attribution must come from the flush-boundary
-/// phases or the attribution env switches (KAPLUMBA_LINEARS_ONLY,
-/// KAPLUMBA_SKIP_ATTENTION), which move real GPU work.
+/// phases, from [`GpuProfile`] (the real one), or from the attribution env
+/// switches (KAPLUMBA_LINEARS_ONLY, KAPLUMBA_SKIP_ATTENTION), which move real
+/// GPU work.
+///
+/// Lap call sites live at the same boundaries [`GpuProfile`] stamps, so the two
+/// tables line up row for row and the difference between them is the
+/// submit-versus-execute gap. Under the phase profiler the first lap of a layer
+/// also absorbs that layer's `flush_and_wait`, so it reads far larger than its
+/// neighbours; that is a host-timing artefact, not a hotspot.
 pub struct OpTimer<'t> {
+
     map: &'t mut std::collections::BTreeMap<&'static str, f64>,
     last: std::time::Instant,
     on: bool,
@@ -421,6 +429,320 @@ impl<'t> OpTimer<'t> {
             *self.map.entry(name).or_default() += now.duration_since(self.last).as_secs_f64() * 1e6;
             self.last = now;
         }
+    }
+}
+
+/// Median of the plausible samples, or `None` if the GPU clock gave us nothing
+/// usable.
+///
+/// `GPUStartTime` / `GPUEndTime` are documented as undefined before completion,
+/// and a command buffer with no dispatches can legitimately read back as exactly
+/// zero (start == end). So a floor is only reported when at least one sample came
+/// back in a believable range.
+fn median_floor_ms(samples: Vec<f64>) -> Option<f64> {
+    let mut samples: Vec<f64> = samples
+        .into_iter()
+        .filter(|ms| *ms > 0.0 && *ms < 1.0)
+        .collect();
+    if samples.is_empty() {
+        return None;
+    }
+    samples.sort_by(f64::total_cmp);
+    Some(samples[samples.len() / 2])
+}
+
+/// Stamped command buffers waiting to be turned into [`GpuStamp`]s, and the
+/// cadence at which they are drained.
+///
+/// `commit_stamped` deliberately does *not* apply `MAX_IN_FLIGHT` back-pressure
+/// (it is a diagnostic path), but `new_command_buffer` still blocks once too many
+/// buffers are outstanding on a queue — the encoder module measured ~175 ms of
+/// blocking past ~64 outstanding. A 60-layer forward has 15 boundaries per layer,
+/// so 900 retained buffers per chunk would stall the host mid-forward. Draining
+/// every 15 boundaries (one layer's worth) keeps the window at a quarter of that
+/// and costs at most one wait per layer.
+///
+/// The wait is also the profiler's main distortion: it serialises host encoding
+/// against GPU execution, so the *gaps* between buffers are an artefact of the
+/// profiler, not of the model. That is why [`GpuStamp::gap_ms`] exists and why the
+/// table reports own-time and gap-time as separate columns. Attribution
+/// (own_ms per kernel) is unaffected; total wall time is not.
+const DRAIN_EVERY: usize = 15;
+
+/// Per-kernel GPU time, accumulated across every chunk of one forward pass.
+///
+/// This is the real profiler. `KAPLUMBA_PROFILE_PHASES` (and [`OpTimer`]) measure
+/// host encode time plus flush boundaries, which is why the old numbers were
+/// useless; this one reads `GPUStartTime` / `GPUEndTime` off every command buffer
+/// the forward stamps, so every number is GPU-clock time.
+///
+/// One instance spans the whole `forward_buffer_into`, so a 614-token prefill
+/// (three 256-token chunks) produces one table, not three.
+pub struct GpuProfile {
+    /// `KAPLUMBA_GPU_PROFILE=1`. When false every method is a no-op and
+    /// [`Self::stamp`] returns without touching the encoder, so the non-profiling
+    /// path is unchanged.
+    enabled: bool,
+    /// kernel name -> (invocations, total own ms), summed over all layers and
+    /// chunks. The key is the part of a stamped label after the `/`.
+    by_kernel: std::collections::BTreeMap<String, (u64, f64)>,
+    /// `layer07` -> (invocations, total own ms), for the per-layer view.
+    by_layer: std::collections::BTreeMap<String, (u64, f64)>,
+    /// Stamped buffers committed since the last drain.
+    pending: usize,
+    boundaries: u64,
+    stamps_ingested: u64,
+    chunks: u64,
+    tokens: usize,
+    layers: usize,
+    /// Sum of every buffer's own GPU time: the cost of the instrumented work.
+    total_own_ms: f64,
+    /// Sum of the idle intervals between consecutive buffers. Under this profiler
+    /// that is submission latency plus the drain waits, i.e. mostly overhead.
+    total_gap_ms: f64,
+    first_start_s: Option<f64>,
+    last_end_s: Option<f64>,
+    /// Median own_ms of a committed buffer with no dispatches in it: the floor
+    /// every row in the table sits on.
+    empty_commit_ms: Option<f64>,
+    /// Median own_ms of a buffer holding exactly one trivial dispatch: the floor
+    /// for a one-kernel row.
+    one_dispatch_ms: Option<f64>,
+}
+
+impl GpuProfile {
+    pub fn new(enabled: bool) -> Self {
+        Self {
+            enabled,
+            by_kernel: std::collections::BTreeMap::new(),
+            by_layer: std::collections::BTreeMap::new(),
+            pending: 0,
+            boundaries: 0,
+            stamps_ingested: 0,
+            chunks: 0,
+            tokens: 0,
+            layers: 0,
+            total_own_ms: 0.0,
+            total_gap_ms: 0.0,
+            first_start_s: None,
+            last_end_s: None,
+            empty_commit_ms: None,
+            one_dispatch_ms: None,
+        }
+    }
+
+    pub fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// End the current command buffer under `label` and continue on a fresh one,
+    /// so the label's GPU duration can be read back later.
+    ///
+    /// The boundary is the distortion: work that a single command buffer would
+    /// have overlapped across the boundary is now split into two buffers, and a
+    /// Metal command queue executes them one after the other. That is why the
+    /// table reports own-time per boundary (still correct) and treats the
+    /// inter-boundary gap as profiler overhead.
+    pub fn stamp(
+        &mut self,
+        encoder: &mut MetalEncoder,
+        label: &str,
+    ) -> Result<(), ModelError> {
+        if !self.enabled {
+            return Ok(());
+        }
+        encoder.commit_stamped(label).map_err(ModelError::from)?;
+        self.pending += 1;
+        self.boundaries += 1;
+        if self.pending >= DRAIN_EVERY {
+            self.drain(encoder)?;
+        }
+        Ok(())
+    }
+
+    /// Fold the retained stamps into the totals. Public so the table can be unit
+    /// tested without a model; see `tests/gpu_profile_table.rs`.
+    ///
+    /// A disabled profile absorbs nothing, so the non-profiling path cannot
+    /// accumulate by accident even if a caller gets this far.
+    pub fn ingest(&mut self, stamps: &[kaplumba_kernels::encoder::GpuStamp]) {
+        if !self.enabled {
+            return;
+        }
+        self.stamps_ingested += stamps.len() as u64;
+        for stamp in stamps {
+            // `layer07/q_proj` splits into a per-layer row and a per-kernel row;
+            // anything else (`chunk/embedding`, `head/gemv`) is per-chunk work and
+            // keeps its qualified name, so the two never collide in the table.
+            let (layer, kernel) = match stamp.label.split_once('/') {
+                Some((layer, kernel)) if layer.starts_with("layer") => {
+                    (Some(layer.to_string()), kernel.to_string())
+                }
+                _ => (None, stamp.label.clone()),
+            };
+            let kernel_slot = self.by_kernel.entry(kernel).or_default();
+            kernel_slot.0 += 1;
+            kernel_slot.1 += stamp.own_ms;
+            if let Some(layer) = layer {
+                let layer_slot = self.by_layer.entry(layer).or_default();
+                layer_slot.0 += 1;
+                layer_slot.1 += stamp.own_ms;
+            }
+            self.total_own_ms += stamp.own_ms;
+            self.total_gap_ms += stamp.gap_ms;
+            self.first_start_s = Some(self.first_start_s.map_or(stamp.start_s, |s: f64| s.min(stamp.start_s)));
+            self.last_end_s = Some(self.last_end_s.map_or(stamp.end_s, |e: f64| e.max(stamp.end_s)));
+        }
+    }
+
+    /// Wait for the retained buffers and fold them in. This is the back-pressure
+    /// that keeps the queue from blocking, and the serialisation that inflates
+    /// wall time; see [`DRAIN_EVERY`].
+    pub fn drain(&mut self, encoder: &mut MetalEncoder) -> Result<(), ModelError> {
+        if !self.enabled || self.pending == 0 {
+            return Ok(());
+        }
+        let stamps = encoder.take_gpu_stamps();
+        self.pending = 0;
+        self.ingest(&stamps);
+        Ok(())
+    }
+
+    /// Record the measured per-boundary floors. The first calibration wins, so a
+    /// later chunk cannot move a floor a reader has already seen quoted.
+    pub fn set_calibration(&mut self, empty_commit_ms: Option<f64>, one_dispatch_ms: Option<f64>) {
+        if self.empty_commit_ms.is_none() {
+            self.empty_commit_ms = empty_commit_ms;
+        }
+        if self.one_dispatch_ms.is_none() {
+            self.one_dispatch_ms = one_dispatch_ms;
+        }
+    }
+
+    /// Fold a calibration batch: the `cal/*` stamps become the measured floor,
+    /// and anything else in the batch is real work that was still pending, so it
+    /// is ingested rather than discarded.
+    ///
+    /// This is why the classifier looks at the label rather than at the batch's
+    /// contents by position: calibration runs at the top of a chunk, and the
+    /// previous chunk's tail boundaries can still be retained. Taking them here
+    /// and throwing them into the calibration sample pool silently lost them from
+    /// the table -- 10 of 2718 stamps in the first working run, and every one of
+    /// the previous chunk's `head/*` and `chunk/*` rows with it.
+    pub fn ingest_calibration(
+        &mut self,
+        stamps: &[kaplumba_kernels::encoder::GpuStamp],
+    ) -> (Vec<f64>, Vec<f64>) {
+        let mut empty = Vec::new();
+        let mut one = Vec::new();
+        let mut real = Vec::new();
+        for stamp in stamps {
+            match stamp.label.strip_prefix("cal/") {
+                Some("empty") => empty.push(stamp.own_ms),
+                Some(_) => one.push(stamp.own_ms),
+                None => real.push(stamp.clone()),
+            }
+        }
+        self.ingest(&real);
+        // The batch emptied the encoder's retained list, so `pending` is exactly
+        // what was taken; re-derive it instead of leaving a stale count that would
+        // desynchronise the drain cadence for the rest of the forward.
+        self.pending = real.len();
+        (empty, one)
+    }
+
+    /// The report. Kernel table sorted by total descending, then the layer
+    /// subtotal, then the overhead and the gap/own split.
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!(
+            "\n=== GPU PROFILE (KAPLUMBA_GPU_PROFILE=1) ===\n\
+             tokens={} chunks={} layers={} boundaries={} stamps_ingested={}\n\
+             sum of per-kernel GPU own_ms = {:.3} ms   inter-boundary gap = {:.3} ms   \
+             wall span = {:.3} ms\n",
+            self.tokens,
+            self.chunks,
+            self.layers,
+            self.boundaries,
+            self.stamps_ingested,
+            self.total_own_ms,
+            self.total_gap_ms,
+            self.last_end_s
+                .zip(self.first_start_s)
+                .map_or(0.0, |(end, start)| (end - start) * 1e3),
+        ));
+        match (self.empty_commit_ms, self.one_dispatch_ms) {
+            (None, None) => out.push_str(
+                "overhead: unavailable (GPU clock returned no plausible sample)\n",
+            ),
+            (empty, one) => {
+                let ms = |value: Option<f64>| match value {
+                    Some(value) => format!("{value:.4} ms"),
+                    None => "unavailable".to_string(),
+                };
+                out.push_str(&format!(
+                    "overhead floor: empty commit {} | one trivial dispatch {} \
+                     (discount rows below this)\n",
+                    ms(empty),
+                    ms(one)
+                ));
+            }
+        }
+        // A profiler that silently drops boundaries is worse than no profiler, so
+        // say so. `boundaries > 0` because a profile fed directly through
+        // `ingest` (tests) never committed anything to compare against.
+        if self.boundaries > 0 && self.stamps_ingested != self.boundaries {
+            out.push_str(&format!(
+                "WARNING: {} of {} stamped boundaries were not read back; this table under-counts\n",
+                self.boundaries.saturating_sub(self.stamps_ingested),
+                self.boundaries
+            ));
+        }
+        out.push_str(&format!(
+            "  {:<26} {:>7} {:>11} {:>11}\n",
+            "kernel", "count", "total_ms", "mean_ms"
+        ));
+        let mut rows: Vec<(&String, &u64, &f64)> = self
+            .by_kernel
+            .iter()
+            .map(|(name, (count, total))| (name, count, total))
+            .collect();
+        rows.sort_by(|a, b| b.2.total_cmp(a.2).then_with(|| a.0.cmp(b.0)));
+        for (name, count, total) in rows {
+            out.push_str(&format!(
+                "  {name:<26} {count:>7} {total:>11.3} {:>11.4}\n",
+                total / *count as f64
+            ));
+        }
+        // Per-layer subtotal: which layers are expensive regardless of which
+        // kernel inside them is.
+        let mut layer_rows: Vec<(&String, &u64, &f64)> = self
+            .by_layer
+            .iter()
+            .map(|(name, (count, total))| (name, count, total))
+            .collect();
+        layer_rows.sort_by(|a, b| b.2.total_cmp(a.2).then_with(|| a.0.cmp(b.0)));
+        if !layer_rows.is_empty() {
+            let layer_total: f64 = layer_rows.iter().map(|row| row.2).sum();
+            let fastest = layer_rows
+                .last()
+                .map_or(0.0, |row| *row.2);
+            out.push_str(&format!(
+                "  per-layer: {} layers, sum {:.3} ms, slowest {} {:.3} ms, fastest {} {:.3} ms\n",
+                layer_rows.len(),
+                layer_total,
+                layer_rows.first().map_or("", |row| row.0.as_str()),
+                layer_rows.first().map_or(0.0, |row| *row.2),
+                layer_rows.last().map_or("", |row| row.0.as_str()),
+                fastest,
+            ));
+            out.push_str("  per-layer totals (slowest first): ");
+            for (name, _, total) in &layer_rows {
+                out.push_str(&format!("{name}={total:.1} "));
+            }
+            out.push('\n');
+        }
+        out
     }
 }
 
@@ -624,13 +946,19 @@ impl DecoderLayer {
 
     pub fn forward_buffer(
         &mut self,
+        index: usize,
         input: &Buffer,
         output: &Buffer,
         tokens: usize,
         scratch: &ForwardScratch,
         encoder: &mut MetalEncoder,
         timer: &mut OpTimer,
+        profile: &mut GpuProfile,
     ) -> Result<(), ModelError> {
+        // The label prefix makes the per-layer view work: `ingest` splits
+        // `layer07/q_proj` into a per-layer row and a per-kernel row, so one
+        // table answers both "which kernel" and "which layer".
+        let prefix = || format!("layer{index:02}/");
         // Attribution switch: skip every non-linear op so the GEMV share of a
         // decode step can be measured directly. Output is meaningless with this
         // on; it exists only to answer "where does the 793 ms go".
@@ -646,6 +974,9 @@ impl DecoderLayer {
             self.encode_linear(encoder, &self.weights.gate_proj, input, gate, tokens, scratch, false)?;
             self.encode_linear(encoder, &self.weights.up_proj, input, up, tokens, scratch, false)?;
             self.encode_linear(encoder, &self.weights.down_proj, up, output, tokens, scratch, false)?;
+            // Stamp the bypassed layers too, or their GPU time would silently
+            // vanish from the totals and the table would under-report.
+            profile.stamp(encoder, &format!("{}linears_only", prefix()))?;
             return Ok(());
         }
         let config = &self.config;
@@ -673,6 +1004,14 @@ impl DecoderLayer {
         // three matvecs share it. That was 3 of the 7 input transforms a layer
         // issued, each a tiny dependent dispatch in front of a large one.
         self.encode_input_transform(encoder, &self.weights.q_proj, &scratch.normed, scratch)?;
+        // Boundary 1 of 15. The input norm and the shared transform are both
+        // elementwise over `tokens * hidden` and both cheaper than the boundary
+        // that separates them, so they share one stamp: splitting them would buy
+        // a number below the measured overhead floor for 60 extra command
+        // buffers per chunk. The same reasoning folds the trailing
+        // norm/residual pairs below.
+        profile.stamp(encoder, &format!("{}norm_transform", prefix()))?;
+        timer.lap("norm_transform");
         self.encode_linear(
             encoder,
             &self.weights.q_proj,
@@ -682,6 +1021,8 @@ impl DecoderLayer {
             scratch,
             true,
         )?;
+        profile.stamp(encoder, &format!("{}q_proj", prefix()))?;
+        timer.lap("q_proj");
         self.encode_linear(
             encoder,
             &self.weights.k_proj,
@@ -691,6 +1032,8 @@ impl DecoderLayer {
             scratch,
             true,
         )?;
+        profile.stamp(encoder, &format!("{}k_proj", prefix()))?;
+        timer.lap("k_proj");
         if let Some(v_proj) = &self.weights.v_proj {
             self.encode_linear(
                 encoder,
@@ -707,6 +1050,8 @@ impl DecoderLayer {
             self.elements
                 .encode_copy(encoder, &scratch.k, &scratch.v, kv_elements)?;
         }
+        profile.stamp(encoder, &format!("{}v_proj", prefix()))?;
+        timer.lap("v_proj");
 
         self.elements.encode_rms_norm(
             encoder,
@@ -763,6 +1108,11 @@ impl DecoderLayer {
                 proportional: config.rope_mode == RopeMode::Proportional,
             },
         )?;
+        // Boundary 5: three head-width norms and two ropes, five dispatches, all
+        // elementwise over `tokens * head_dim * heads`. Too small to be worth a
+        // boundary each.
+        profile.stamp(encoder, &format!("{}kv_norm_rope", prefix()))?;
+        timer.lap("kv_norm_rope");
 
         // Full-attention caches start small and grow on demand (see
         // `GpuKvCache::ensure_capacity`); the 10 full layers at 8192 positions
@@ -792,6 +1142,8 @@ impl DecoderLayer {
             offset,
         )?;
         self.gpu_cache.advance(tokens);
+        profile.stamp(encoder, &format!("{}cache_append", prefix()))?;
+        timer.lap("cache_append");
 
         let key_count = self.gpu_cache.key_count(full);
         let window = if full { 0 } else { config.sliding_window };
@@ -819,6 +1171,7 @@ impl DecoderLayer {
                     window,
                 },
             )?;
+            profile.stamp(encoder, &format!("{}skip_attention_tail", prefix()))?;
             return Ok(());
         }
         // Split-key for the decode shape (one query). Prefill has many queries and
@@ -850,6 +1203,8 @@ impl DecoderLayer {
         } else {
             self.attention.encode_online_attention(encoder, attention_request)?;
         }
+        profile.stamp(encoder, &format!("{}attention", prefix()))?;
+        timer.lap("attention");
 
         self.encode_linear(
             encoder,
@@ -860,6 +1215,8 @@ impl DecoderLayer {
             scratch,
             false,
         )?;
+        profile.stamp(encoder, &format!("{}o_proj", prefix()))?;
+        timer.lap("o_proj");
         self.hidden_norm(
             encoder,
             &self.gpu_weights.post_attention_norm,
@@ -875,6 +1232,8 @@ impl DecoderLayer {
             &scratch.hidden_b,
             elements,
         )?;
+        profile.stamp(encoder, &format!("{}post_attn_norm_res", prefix()))?;
+        timer.lap("post_attn_norm_res");
         self.hidden_norm(
             encoder,
             &self.gpu_weights.pre_ffn_norm,
@@ -886,6 +1245,8 @@ impl DecoderLayer {
 
         // gate and up read the same activation too.
         self.encode_input_transform(encoder, &self.weights.gate_proj, &scratch.normed, scratch)?;
+        profile.stamp(encoder, &format!("{}pre_ffn_norm_transform", prefix()))?;
+        timer.lap("pre_ffn_norm_transform");
         self.encode_linear(
             encoder,
             &self.weights.gate_proj,
@@ -895,6 +1256,8 @@ impl DecoderLayer {
             scratch,
             true,
         )?;
+        profile.stamp(encoder, &format!("{}gate_proj", prefix()))?;
+        timer.lap("gate_proj");
         self.encode_linear(
             encoder,
             &self.weights.up_proj,
@@ -904,6 +1267,8 @@ impl DecoderLayer {
             scratch,
             true,
         )?;
+        profile.stamp(encoder, &format!("{}up_proj", prefix()))?;
+        timer.lap("up_proj");
         self.elements.encode_gated_gelu(
             encoder,
             &scratch.gate,
@@ -911,6 +1276,10 @@ impl DecoderLayer {
             &scratch.activated,
             inter_elements,
         )?;
+        // 1.3M elements at a 256-row chunk: the biggest non-GEMM dispatch in the
+        // layer, so it keeps its own boundary.
+        profile.stamp(encoder, &format!("{}gated_gelu", prefix()))?;
+        timer.lap("gated_gelu");
         self.encode_linear(
             encoder,
             &self.weights.down_proj,
@@ -920,6 +1289,8 @@ impl DecoderLayer {
             scratch,
             false,
         )?;
+        profile.stamp(encoder, &format!("{}down_proj", prefix()))?;
+        timer.lap("down_proj");
         self.hidden_norm(
             encoder,
             &self.gpu_weights.post_ffn_norm,
@@ -942,6 +1313,8 @@ impl DecoderLayer {
             elements,
             self.weights.layer_scalar,
         )?;
+        profile.stamp(encoder, &format!("{}post_ffn_out", prefix()))?;
+        timer.lap("post_ffn_out");
         Ok(())
     }
 
@@ -2009,6 +2382,11 @@ impl TextModel {
     /// every row attends to exactly the keys it would have seen in one pass. The
     /// LM head already runs on the last row only, so only the final chunk's
     /// logits are returned.
+    ///
+    /// Under `KAPLUMBA_GPU_PROFILE=1` this is also the scope of one profile
+    /// report: the [`GpuProfile`] is created here, spans every chunk, and prints
+    /// one table when the last chunk is done. A 614-token prompt is three
+    /// chunks and one table, not three.
     pub fn forward_buffer_into(
         &mut self,
         token_ids: &[u32],
@@ -2020,17 +2398,46 @@ impl TextModel {
                 "model token and position counts must match and be non-empty".to_string(),
             ));
         }
-        if token_ids.len() <= PREFILL_CHUNK {
-            return self.forward_chunk(token_ids, positions, encoder);
+        // Prefill (many tokens) is profiled whenever the switch is on. A decode
+        // step is one token, and stamping it would print a whole table per
+        // generated token, so it takes the second switch: with that unset, a
+        // decode step does no profiling work at all rather than paying for
+        // measurements nobody reads.
+        let profile = std::env::var_os("KAPLUMBA_GPU_PROFILE").is_some()
+            && (token_ids.len() > 1 || std::env::var_os("KAPLUMBA_GPU_PROFILE_DECODE").is_some());
+        let mut gpu = GpuProfile::new(profile);
+        gpu.tokens = token_ids.len();
+        gpu.layers = self.layers.len();
+        let result = if token_ids.len() <= PREFILL_CHUNK {
+            gpu.chunks += 1;
+            self.forward_chunk(token_ids, positions, encoder, &mut gpu)
+        } else {
+            let mut logits = Vec::new();
+            let mut outcome = Ok(());
+            for (chunk_ids, chunk_positions) in token_ids
+                .chunks(PREFILL_CHUNK)
+                .zip(positions.chunks(PREFILL_CHUNK))
+            {
+                gpu.chunks += 1;
+                match self.forward_chunk(chunk_ids, chunk_positions, encoder, &mut gpu) {
+                    Ok(chunk) => logits = chunk,
+                    Err(error) => {
+                        // Report what ran before the failure rather than throwing
+                        // the measurements away; then propagate.
+                        outcome = Err(error);
+                        break;
+                    }
+                }
+            }
+            outcome.map(|()| logits)
+        };
+        if profile {
+            // Drain the tail before printing: the last boundaries are still
+            // retained, and a partial report would under-count.
+            gpu.drain(encoder)?;
+            self.report_gpu_profile(&gpu);
         }
-        let mut logits = Vec::new();
-        for (chunk_ids, chunk_positions) in token_ids
-            .chunks(PREFILL_CHUNK)
-            .zip(positions.chunks(PREFILL_CHUNK))
-        {
-            logits = self.forward_chunk(chunk_ids, chunk_positions, encoder)?;
-        }
-        Ok(logits)
+        result
     }
 
     /// One chunk of the forward pass. `token_ids` must be at most
@@ -2040,6 +2447,7 @@ impl TextModel {
         token_ids: &[u32],
         positions: &[u32],
         encoder: &mut MetalEncoder,
+        gpu: &mut GpuProfile,
     ) -> Result<Vec<u16>, ModelError> {
         if token_ids.len() != positions.len() || token_ids.is_empty() {
             return Err(ModelError::InvalidInput(
@@ -2070,6 +2478,11 @@ impl TextModel {
             )));
         }
         self.ensure_scratch(tokens)?;
+        if gpu.enabled() {
+            // Price the boundary before the real work, on the same queue, so the
+            // table can say what a sub-microsecond row is actually made of.
+            self.calibrate_gpu_profile(encoder, gpu)?;
+        }
 
         // Shared-memory staging for the two small host-side arrays.
         unsafe {
@@ -2084,12 +2497,14 @@ impl TextModel {
         // absolute numbers are slightly pessimistic because it removes the
         // natural overlap between phases, but the distribution is what we need to
         // find out where a decode step actually goes.
+        //
+        // This is the *host* profiler: `phase` measures the CPU, and the flushes
+        // make the host wait for the GPU so the number is "GPU time plus
+        // submission latency". It is demoted below the GPU-clock table
+        // (KAPLUMBA_GPU_PROFILE) for exactly that reason, and kept because the
+        // flush boundaries are the only way to see the coarse split without
+        // paying for a command buffer per op.
         let profile = std::env::var_os("KAPLUMBA_PROFILE_PHASES").is_some();
-        // GPU-true phase accounting: wall-clock timing of CPU encode calls is
-        // useless when the queue runs asynchronously (notes §8.3: it reported
-        // 12.5 ms of chunks against a 58.7 s ttft). Under the profiler each
-        // phase boundary ends the command buffer and waits, so elapsed host
-        // time IS GPU execution time for everything encoded so far.
         macro_rules! gpu_flush {
             () => {
                 if profile {
@@ -2132,12 +2547,15 @@ impl TextModel {
             self.embedding_is_bf16,
         )?;
         gpu_flush!();
+        gpu.stamp(encoder, "chunk/embedding")?;
 
         if profile {
             mark!(embed_ms);
         }
-        // Per-op accumulation inside the layer body, enabled by the phase
-        // profiler. Sums microseconds across all layers.
+        // Host encode cost per op, summed over every layer. Printed *below* the
+        // GPU-clock table and labelled as submit cost: a dispatch handed to an
+        // asynchronous queue has not executed when the encode call returns, so
+        // this measures the CPU, not the GPU. Useful only as a share.
         let mut op_us: std::collections::BTreeMap<&'static str, f64> =
             std::collections::BTreeMap::new();
         let mut timer = OpTimer::new(&mut op_us, profile);
@@ -2149,34 +2567,45 @@ impl TextModel {
                 (&self.scratch.hidden_b, &self.scratch.hidden_a)
             };
             self.layers[index].forward_buffer(
+                index,
                 input,
                 output,
                 tokens,
                 &self.scratch,
                 encoder,
                 &mut timer,
+                gpu,
             )?;
             if profile {
-                // Per-layer GPU-true cost: the flush makes the host wait for
-                // this layer's kernels, so the printed delta is execution time.
+                // Per-layer host-flush cost. `phase` is read but not reset here:
+                // it is the start of this layer, and resetting per layer would
+                // leave the loop's last assignment dead. `mark!(layer_ms)` below
+                // closes the whole layer region once.
                 gpu_flush!();
                 let now = std::time::Instant::now();
                 eprintln!(
                     "  LAYER {index:>2} {:>8.2} ms",
                     now.duration_since(phase).as_secs_f64() * 1e3
                 );
-                phase = now;
             }
+        }
+        // Close the layer region so it is counted in the phase total. Without
+        // this the sum omits every layer -- the defect that made the old
+        // `PHASE` line useless.
+        if profile {
+            mark!(layer_ms);
         }
         let encode_done = std::time::Instant::now();
         if profile {
             let mut total_us = 0.0;
             for (name, us) in &op_us {
-                eprintln!("  OP {name:<22} {:>9.2} ms", us / 1e3);
+                eprintln!("  ENCODE {name:<22} {:>9.2} ms  (host submit, not GPU)", us / 1e3);
                 total_us += *us;
             }
             eprintln!(
-                "  OP (encode-submit cost only, layers sum {:.2} ms; per-layer GPU times above)",
+                "  ENCODE (all layers' host encode-submit cost {:.2} ms; the first lap of each \
+                  layer also absorbs that layer's flush wait, so it is not comparable to the \
+                  others. For GPU-clock per-kernel time use KAPLUMBA_GPU_PROFILE=1.)",
                 encode_done.duration_since(phase).as_secs_f64() * 1e3 + total_us / 1e3
             );
         }
@@ -2198,7 +2627,10 @@ impl TextModel {
             tokens,
             hidden,
         )?;
-        self.encode_lm_head(encoder)?;
+        gpu.stamp(encoder, "chunk/copy_last_row")?;
+        // `encode_lm_head` stamps its own sub-steps (head/final_norm, head/gemv,
+        // head/softcap).
+        self.encode_lm_head(encoder, gpu)?;
         gpu_flush!();
         // Pick the greedy token on the device. The next step's embedding kernel
         // reads `scratch.token_ids`, so a caller that keeps encoding into the
@@ -2213,6 +2645,7 @@ impl TextModel {
             &self.scratch.token_ids,
             tokens,
         )?;
+        gpu.stamp(encoder, "chunk/greedy_pick")?;
         gpu_flush!();
         mark!(head_ms);
         if profile {
@@ -2221,8 +2654,9 @@ impl TextModel {
                 "PHASE tokens={tokens} embed={embed_ms:.2}ms layers={layer_ms:.2}ms head={head_ms:.2}ms total={total:.2}ms"
             );
             eprintln!(
-                "  (phase ms = CPU encode + GPU exec measured at flush boundaries; \
-                  an ms-scale phase is GPU-bound, a microsecond-scale one is encode-only)"
+                "  (host flush-boundary phases, NOT GPU-clock time: this is CPU encode plus \
+                  submission latency, and each boundary is a serialisation point. For per-kernel \
+                  GPU time use KAPLUMBA_GPU_PROFILE=1.)"
             );
         }
         if self.pick_on_device {
@@ -2234,7 +2668,71 @@ impl TextModel {
         Ok(unsafe { std::slice::from_raw_parts(logits, vocab) }.to_vec())
     }
 
-    fn encode_lm_head(&self, encoder: &mut MetalEncoder) -> Result<(), ModelError> {
+    /// One trivial dispatch for the `cal/one` calibration sample: a one-element
+    /// copy of the row buffer onto itself, which is the cheapest real kernel
+    /// available without a scratch buffer of its own. Source and destination are
+    /// the same address, so the calibration cannot perturb any data the forward
+    /// goes on to read.
+    fn calibration_dispatch(&self, encoder: &mut MetalEncoder) -> Result<(), ModelError> {
+        self.elements
+            .encode_copy(
+                encoder,
+                &self.scratch.last_hidden,
+                &self.scratch.last_hidden,
+                1,
+            )
+            .map_err(ModelError::from)
+    }
+
+    /// Price the boundary itself, so a reader can discount sub-microsecond rows:
+    /// a committed buffer with nothing in it, and one holding a single trivial
+    /// dispatch. Both are stamped and read back exactly like a real boundary, so
+    /// these are measured floors, not estimates.
+    ///
+    /// Runs on the caller's encoder and therefore on the same queue, ahead of the
+    /// real work, so it is part of the same prefill the caller then times. The
+    /// previous chunk's tail boundaries may still be retained at this point;
+    /// [`GpuProfile::ingest_calibration`] keeps them.
+    fn calibrate_gpu_profile(
+        &self,
+        encoder: &mut MetalEncoder,
+        profile: &mut GpuProfile,
+    ) -> Result<(), ModelError> {
+        const SAMPLES: usize = 32;
+        /// Well under the ~64-outstanding point where `new_command_buffer`
+        /// blocks: nothing waits until a batch is committed.
+        const BATCH: usize = 8;
+        let mut empty = Vec::with_capacity(SAMPLES);
+        let mut one = Vec::with_capacity(SAMPLES);
+        for index in 0..SAMPLES {
+            // Nothing encoded: pure command-buffer overhead. Stamping an empty
+            // encoder is legal (end_encoding on an encoder with no dispatches),
+            // and that is exactly the boundary cost we want to price.
+            encoder.commit_stamped("cal/empty").map_err(ModelError::from)?;
+            self.calibration_dispatch(encoder)?;
+            encoder.commit_stamped("cal/one").map_err(ModelError::from)?;
+            if (index + 1) % BATCH == 0 {
+                let stamps = encoder.take_gpu_stamps();
+                let (batch_empty, batch_one) = profile.ingest_calibration(&stamps);
+                empty.extend(batch_empty);
+                one.extend(batch_one);
+            }
+        }
+        profile.set_calibration(median_floor_ms(empty), median_floor_ms(one));
+        Ok(())
+    }
+
+    /// Print the accumulated GPU profile. One call covers every chunk of the
+    /// forward, so a 614-token prefill is one table.
+    fn report_gpu_profile(&self, profile: &GpuProfile) {
+        eprint!("{}", profile.render());
+    }
+
+    fn encode_lm_head(
+        &self,
+        encoder: &mut MetalEncoder,
+        profile: &mut GpuProfile,
+    ) -> Result<(), ModelError> {
         let hidden = self.hidden_size;
         let vocab = self.vocab_size;
         // In-place: each thread owns one row, so normalising last_hidden onto
@@ -2248,6 +2746,7 @@ impl TextModel {
             hidden,
             self.layers[0].config.rms_norm_eps,
         )?;
+        profile.stamp(encoder, "head/final_norm")?;
         let packed = self.lm_head.metal_buffer.as_ref().ok_or_else(|| {
             ModelError::InvalidWeights("lm head has no GPU-resident weights".to_string())
         })?;
@@ -2278,6 +2777,10 @@ impl TextModel {
                 pretransformed: false,
             },
         )?;
+        // The 262,144-wide vocabulary projection is the single largest kernel in
+        // the chunk after the layer GEMMs, so it gets its own boundary rather
+        // than hiding inside the head's phase total.
+        profile.stamp(encoder, "head/gemv")?;
         self.elements.encode_softcap(
             encoder,
             &self.scratch.logits,
@@ -2285,6 +2788,7 @@ impl TextModel {
             vocab,
             self.final_softcap,
         )?;
+        profile.stamp(encoder, "head/softcap")?;
         Ok(())
     }
 

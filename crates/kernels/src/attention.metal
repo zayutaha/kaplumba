@@ -850,3 +850,234 @@ kernel void online_attention_tg2_512(
     threadgroup float red[8];
     online_attention_parallel_body<512>(queries, keys, values, query_positions, key_positions, output, params, tgid * 256u + gid, sbuf, red);
 }
+
+// ---------------------------------------------------------------------------
+// Prefill attention, transposed: lane -> key, simdgroup -> query row.
+//
+// Geometry (the transposed one from llama.cpp's flash-attention kernel,
+// `ggml/src/ggml-metal/kernels/fa_common.metal:411-454`, plus a GQA
+// batching step llama.cpp does not do):
+//
+//   threadgroup   32 * NSG threads, NSG simdgroups.
+//   simdgroup sg  owns ONE (query, query-head) row. Query heads are taken as
+//                 `head = key_head * GROUPS + sg`, so all NSG rows of a
+//                 threadgroup share ONE kv head and therefore read the same K
+//                 and V. This is the win over llama.cpp, which puts one
+//                 threadgroup per *query* head (`fa_common.metal:131-132`) and
+//                 so re-reads the kv cache once per query head. Here the re-read
+//                 factor drops from `q_heads` to `q_heads / (32*NSG)` = 1.
+//                 Gxma: 2 query heads per kv head on the 50 sliding layers
+//                 (H=256, NSG=2) and 8 on the 10 full layers (H=512, NSG=8).
+//   lane          owns exactly one key inside a TILE-sized key tile, and
+//                 VPT=8 consecutive output dimensions of its row.
+//
+// Because the simdgroup -- not the threadgroup -- holds `m`/`s` for its row, and
+// every lane of that simdgroup shares them, the online-softmax recurrence is
+// two hardware cross-lane reductions and nothing else:
+//
+//     m = simd_max(m, score_lane);
+//     s = s * exp(m_old - m) + simd_sum(exp(score_lane - m));
+//
+// `m` and `s` come out uniform across the 32 lanes, so the O rescale is
+// register-local and the score never crosses a simdgroup. The ONLY thing the
+// threadgroup has to agree on is the weight vector: the PV phase wants
+// lane -> dimension (that is the coalesced V read), while the QK phase produced
+// lane -> key, so the weights have to be broadcast. That is a double-buffered
+// `wbuf` plus ONE barrier per key tile, against five per 256 keys before.
+//
+// Scratch is 2 * NSG * 32 floats = 256 * NSG bytes (256 B .. 2 KB) and is
+// independent of `key_count`: there is no mask buffer and no score matrix. The
+// sliding-window test is arithmetic on values already in registers
+// (`k_abs <= q_abs && (window == 0 || q_abs - k_abs < window)`), where
+// llama.cpp materialises a 128 MiB f16 mask at L=8192
+// (`src/llama-graph.cpp:977`) -- which the project forbids.
+//
+// A masked key is SKIPPED, never multiplied by zero: `values` is only written
+// for live slots, so an unwritten slot can hold NaN and `0.0f * NaN` is NaN.
+// The skip is warp-uniform (the weight is a broadcast), so it costs a branch and
+// not divergence.
+//
+// Widen the two `half`s packed in one 32-bit word to a `float2`. `half2` is a
+// 4-byte load, so four of them are one 16-byte `uint4` per lane per key.
+static inline float2 unpack_half2(uint packed) {
+    const half2 pair = as_type<half2>(packed);
+    return float2(float(pair.x), float(pair.y));
+}
+
+// HEAD_DIM must be a multiple of 32 * VPT so that every lane owns VPT
+// consecutive dims and a warp's V read is one contiguous 32*VPT*2-byte run.
+template <int HEAD_DIM, int NSG>
+static void attention_gqa_body(
+    const device half *queries,
+    const device half *keys,
+    const device half *values,
+    const device uint *query_positions,
+    const device uint *key_positions,
+    device half *output,
+    constant AttentionParams &params,
+    uint tid,
+    uint tgid,
+    threadgroup float *wbuf) {
+    static_assert(HEAD_DIM % 256 == 0, "HEAD_DIM must be a multiple of 32 * 8");
+    // -FLT_MAX/2 rather than -inf, exactly as llama.cpp does: it keeps
+    // `m_old - m` finite for a fully dead tile, so `exp()` can never return NaN
+    // and a live key always has a finite reference point.
+    constexpr float NEG = -1.701411733864e+38f;
+    constexpr int VPT = 8;
+    constexpr int BLOCKS = HEAD_DIM / (32 * VPT);
+
+    const uint lane = tid & 31u;
+    const uint sg = tid >> 5u;
+    // `groups` is `q_heads / kv_heads`; the dispatch picks NSG >= groups and
+    // sizes the threadgroup at 32 * NSG, so this is false for every simdgroup.
+    // It must stay a *barrier-safe* test: a simdgroup that returned early would
+    // strand the threads still waiting at `wbuf`'s barrier.
+    const uint groups = params.q_heads / params.kv_heads;
+    const bool active = sg < groups;
+    const uint head_in_kv = active ? sg : 0u;
+
+    const uint query = tgid / params.kv_heads;
+    const uint key_head = tgid - query * params.kv_heads;
+    const uint head = key_head * groups + head_in_kv;
+    const uint query_base = (query * params.q_heads + head) * uint(HEAD_DIM);
+    const uint q_abs = query_positions[query];
+    const uint kv_stride = params.kv_heads * uint(HEAD_DIM);
+    const uint head_base = key_head * uint(HEAD_DIM);
+    const device half *qrow = queries + query_base;
+
+    // This lane's slice of its own row: VPT consecutive dims, BLOCKS of them.
+    const uint lane_dim = lane * uint(VPT);
+    float4 acc[2 * BLOCKS];
+    for (int b = 0; b < BLOCKS; ++b) {
+        acc[2 * b + 0] = float4(0.0f);
+        acc[2 * b + 1] = float4(0.0f);
+    }
+    // Replicated across the 32 lanes of the simdgroup and uniform over the
+    // whole threadgroup column: no lane ever needs another's copy.
+    float m = NEG;
+    float s = 0.0f;
+    threadgroup float *my_weights = wbuf + sg * 32u;
+
+    uint phase = 0u;
+    for (uint base = 0; base < params.key_count; base += 32u) {
+        const uint n = min(32u, params.key_count - base);
+        const uint k = base + lane;
+
+        // 1. score this lane's key. The window test is arithmetic, not a
+        //    materialised mask, and a dead key never touches `keys` at all.
+        float score = NEG;
+        bool live = active && (k < params.key_count);
+        if (live) {
+            const uint k_abs = key_positions[k];
+            live = (k_abs <= q_abs)
+                && (params.window == 0u || (q_abs - k_abs) < params.window);
+        }
+        if (live) {
+            const device half *krow = keys + k * kv_stride + head_base;
+            float dot = 0.0f;
+            for (int i = 0; i < HEAD_DIM / 4; ++i) {
+                const uint2 kraw = *reinterpret_cast<const device uint2 *>(krow + 4 * i);
+                const uint2 qraw = *reinterpret_cast<const device uint2 *>(qrow + 4 * i);
+                const float2 kh0 = unpack_half2(kraw.x);
+                const float2 kh1 = unpack_half2(kraw.y);
+                const float2 qh0 = unpack_half2(qraw.x);
+                const float2 qh1 = unpack_half2(qraw.y);
+                // Accumulated in d order, so this dot product is bit-identical
+                // to the 256-wide scalar loop it replaces.
+                dot += qh0.x * kh0.x;
+                dot += qh0.y * kh0.y;
+                dot += qh1.x * kh1.x;
+                dot += qh1.y * kh1.y;
+            }
+            score = dot * params.scale;
+        }
+
+        // 2. online softmax, two hardware reductions, no threadgroup traffic.
+        const float m_old = m;
+        // `simd_max` is a unary cross-lane reduction; `m` is already uniform
+        // across the simdgroup, so folding it in first is exact.
+        m = simd_max(max(m, score));
+        const float ms = exp(m_old - m);
+        const float w = live ? exp(score - m) : 0.0f;
+        s = s * ms + simd_sum(w);
+        my_weights[phase * (NSG * 32u) + lane] = w;
+
+        // 3. one barrier per tile. Double buffering is what makes a single
+        //    barrier sufficient: the next tile writes the OTHER buffer, so no
+        //    lane can overwrite a slot a peer is still reading, and the barrier
+        //    that publishes tile t+1 orders every lane's reads of tile t before
+        //    tile t+2 reuses the buffer.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 4. PV. Lane owns VPT consecutive dims, so a warp's read of one key is
+        //    32*VPT contiguous halves. `w` is warp-uniform: the branch never
+        //    diverges, and skipping is what keeps `0.0f * NaN` out of `acc`.
+        const threadgroup float *tile = my_weights + phase * (NSG * 32u);
+        for (int b = 0; b < BLOCKS; ++b) {
+            const uint d = lane_dim + uint(b) * 32u * uint(VPT);
+            float4 lo = acc[2 * b + 0] * ms;
+            float4 hi = acc[2 * b + 1] * ms;
+            for (uint t = 0; t < n; ++t) {
+                const float wt = tile[t];
+                if (wt == 0.0f) {
+                    continue;
+                }
+                const device half *vrow =
+                    values + (base + t) * kv_stride + head_base + d;
+                const uint4 raw = *reinterpret_cast<const device uint4 *>(vrow);
+                const float2 vlo0 = unpack_half2(raw.x);
+                const float2 vlo1 = unpack_half2(raw.y);
+                const float2 vhi0 = unpack_half2(raw.z);
+                const float2 vhi1 = unpack_half2(raw.w);
+                lo += wt * float4(vlo0, vlo1);
+                hi += wt * float4(vhi0, vhi1);
+            }
+            acc[2 * b + 0] = lo;
+            acc[2 * b + 1] = hi;
+        }
+        phase ^= 1u;
+    }
+
+    if (!active) {
+        return;
+    }
+    const float norm = s > 0.0f ? 1.0f / s : 0.0f;
+    for (int b = 0; b < BLOCKS; ++b) {
+        const uint d = query_base + lane_dim + uint(b) * 32u * uint(VPT);
+        device half *orow = output + d;
+        const float4 lo = acc[2 * b + 0] * norm;
+        const float4 hi = acc[2 * b + 1] * norm;
+        *reinterpret_cast<device half2 *>(orow + 0) = half2(half(lo.x), half(lo.y));
+        *reinterpret_cast<device half2 *>(orow + 2) = half2(half(lo.z), half(lo.w));
+        *reinterpret_cast<device half2 *>(orow + 4) = half2(half(hi.x), half(hi.y));
+        *reinterpret_cast<device half2 *>(orow + 6) = half2(half(hi.z), half(hi.w));
+    }
+}
+
+#define KAPLUMBA_FA_GQA(NAME, HEAD_DIM, NSG)                                   \
+    kernel void NAME(                                                          \
+        const device half *queries [[buffer(0)]],                              \
+        const device half *keys [[buffer(1)]],                                 \
+        const device half *values [[buffer(2)]],                               \
+        const device uint *query_positions [[buffer(3)]],                      \
+        const device uint *key_positions [[buffer(4)]],                         \
+        device half *output [[buffer(5)]],                                     \
+        constant AttentionParams &params [[buffer(6)]],                        \
+        uint tid [[thread_position_in_threadgroup]],                           \
+        uint tgid [[threadgroup_position_in_grid]]) {                          \
+        threadgroup float wbuf[2 * (NSG) * 32];                                \
+        attention_gqa_body<HEAD_DIM, NSG>(queries, keys, values,               \
+            query_positions, key_positions, output, params, tid, tgid, wbuf); \
+    }
+
+// NSG must equal `q_heads / kv_heads` for the model's two layer shapes, so no
+// simdgroup idles: 2 on the sliding layers (32/16), 8 on the full layers (32/4).
+// 1 and 4 are the other GQA ratios in the wild (Llama-3 8B is 32/8 = 4).
+KAPLUMBA_FA_GQA(online_attention_gqa_256_1, 256, 1)
+KAPLUMBA_FA_GQA(online_attention_gqa_256_2, 256, 2)
+KAPLUMBA_FA_GQA(online_attention_gqa_256_4, 256, 4)
+KAPLUMBA_FA_GQA(online_attention_gqa_256_8, 256, 8)
+KAPLUMBA_FA_GQA(online_attention_gqa_512_1, 512, 1)
+KAPLUMBA_FA_GQA(online_attention_gqa_512_2, 512, 2)
+KAPLUMBA_FA_GQA(online_attention_gqa_512_4, 512, 4)
+KAPLUMBA_FA_GQA(online_attention_gqa_512_8, 512, 8)
