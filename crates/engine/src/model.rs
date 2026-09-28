@@ -1689,6 +1689,12 @@ impl TextModel {
     }
 
     pub fn load_from_dir(model_dir: &Path) -> Result<Self, ModelError> {
+        // Serialise GPU access before anything is mapped. The model needs
+        // 11.5-14 GiB; a second concurrent instance pushes the machine into swap
+        // and invalidates every measurement taken alongside it. A second process
+        // waits here rather than failing, so a fleet of agents queues up.
+        crate::gpu_lock::acquire(&format!("load {}", model_dir.display()))
+            .map_err(|error| ModelError::InvalidConfig(format!("GPU lock: {error}")))?;
         let metadata = inspect_model_dir(model_dir)
             .map_err(|error| ModelError::Checkpoint(error.to_string()))?;
         metadata
