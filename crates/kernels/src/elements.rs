@@ -120,7 +120,23 @@ pub struct ElementKernels {
 
 impl ElementKernels {
     /// Row count below which the threadgroup-per-row norm is used.
-    const THREADGROUP_NORM_MAX_ROWS: usize = 32;
+    ///
+    /// The per-row kernel gives one thread to each row, so the entire machine
+    /// sees only `rows` threads. That saturates the GPU somewhere in the
+    /// thousands of rows, not at 32. Measured at width 5376
+    /// (`examples/norm_sweep.rs`, 256 rows):
+    ///
+    /// | kernel | time |
+    /// |---|---:|
+    /// | per-row (256 threads) | 0.7595 ms |
+    /// | threadgroup-per-row, G=256 | 0.0253 ms |
+    ///
+    /// — 30x, because 256 threads is one or two threadgroups on a 20-core GPU
+    /// while threadgroup-per-row launches 256 x 256. The old threshold of 32
+    /// therefore sent the *prefill* path (PREFILL_CHUNK = 256 rows) down the
+    /// 256-thread kernel, which is the worst of both. Kept as a constant so
+    /// `KAPLUMBA_FORCE_PER_ROW_NORMS` can still A/B the two.
+    const THREADGROUP_NORM_MAX_ROWS: usize = 8192;
     /// Escape hatch: force the original per-row norms regardless of row count.
     pub fn force_per_row_norms() -> bool {
         std::env::var_os("KAPLUMBA_FORCE_PER_ROW_NORMS").is_some()
@@ -542,11 +558,12 @@ impl ElementKernels {
             width: to_u32(width, "norm width")?,
             eps,
         };
-        // One thread per row is right when there are many rows (prefill) and
-        // catastrophic when there is one (decode): a single thread would walk the
-        // whole width serially. Below the threshold, give each row a full 256
-        // threadgroup instead. 32 is well under the point where `rows` threads
-        // already fill the machine, so prefill keeps the cheaper path.
+        // One thread per row only makes sense when `rows` alone saturates the
+        // GPU. It does not: at prefill's 256 rows the whole machine gets 256
+        // threads, and the threadgroup-per-row kernel is ~30x faster (see
+        // THREADGROUP_NORM_MAX_ROWS and examples/norm_sweep.rs). This is
+        // numerically identical work — same sum of squares, same rsqrt — only
+        // the reduction tree differs.
         if rows < Self::THREADGROUP_NORM_MAX_ROWS && !Self::force_per_row_norms() {
             return encoder.dispatch_groups(
                 &self.rms_norm_weighted_tg_pipeline,

@@ -957,7 +957,17 @@ impl LinearKernels {
         // and STORES (not accumulates) every output block as f32, so it skips
         // the raw zeroing the tiled kernel needs. Output signs are still
         // applied by the shared finalize below, exactly as the other paths do.
-        if in_features % 32 == 0
+        //
+        // DISABLED by default (8f1a863 shipped it enabled and it is numerically
+        // wrong in situ: the CLI emits garbage on every reference prompt, even
+        // though `linear_metal` passes 6/6 against a CPU reference, so the bug
+        // is in the integration — raw buffer type / the input_rows transform /
+        // the finalize contract — not in the standalone kernel. Its arithmetic
+        // speed is real (10.2 -> 22.6 tok/s, ~9.4 TFLOPS) and worth fixing, but
+        // a fast wrong answer is worth nothing. Set
+        // KAPLUMBA_ENABLE_MMA_PREFILL=1 to A/B it while debugging.
+        if std::env::var_os("KAPLUMBA_ENABLE_MMA_PREFILL").is_some()
+            && in_features % 32 == 0
             && out_features % 32 == 0
             && self.gemm_mma_pipeline.thread_execution_width() == 32
         {
