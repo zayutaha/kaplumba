@@ -2657,6 +2657,250 @@ kernel void linear_gemm_mma(
 #undef KAPLUMBA_MMA_STORE
 }
 
+// ---------------------------------------------------------------------------
+// RESEARCH VARIANT `linear_gemm_mma_regpipe`: the same 128x64 tile, the same
+// sixteen accumulators, the same accumulation order and the same bit-identical
+// MCG decode as `linear_gemm_mma`, with ONE structural change -- where the
+// dequantised weights live while the MMAs run.
+//
+// `linear_gemm_mma` alternates phases inside one threadgroup:
+//   dequant -> threadgroup_barrier (2567) -> MMA -> threadgroup_barrier (2625)
+// Both barriers are load-bearing for the single 9216 B `bstage`, so the ALU
+// phase and the tensor phase never coexist in time, and a second buffer cannot
+// fix that inside a threadgroup because `simdgroup_multiply_accumulate` is a
+// 32-lane collective: all 8 simdgroups must be in the MMA together.
+//
+// Registers break the tie because they are disjoint from `bstage`. Each thread
+// decodes its OWN 16 weights per chunk (2 jw x 4 j x 2 dc), so those 16 halfs
+// fit in 16 registers. Writing them to `nxt[]` instead of `bstage` means:
+//   publish nxt -> bstage; barrier; prefetch; { MMAs; dequant into nxt }
+// There is exactly ONE barrier per chunk instead of two, `bstage` is unchanged
+// at 64x72 halfs = 9216 B (no occupancy cost), and the dequant for chunk N+1 is
+// in the same basic block as the MMAs for chunk N with no memory dependency
+// between them -- which is the only arrangement in which the ALU pipe and the
+// tensor pipe can actually be busy at the same time.
+//
+// Host-gated to `rate == Integer(3) && codebook == Mcg` (the folded MCG arm),
+// so every other rate keeps the original kernel.
+// ---------------------------------------------------------------------------
+kernel void linear_gemm_mma_regpipe(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint tid [[thread_index_in_threadgroup]],
+    uint2 group [[threadgroup_position_in_grid]]) {
+    constexpr uint KCHUNK = 64u;
+    constexpr uint NTILES = 4u;
+    constexpr uint QTILE = 128u;
+    constexpr uint OUTS = 64u;
+    constexpr uint BSTRIDE = OUTS + 8u;
+    constexpr uint SGROUPS = 8u;
+    constexpr uint ROWS_SG = QTILE / SGROUPS;
+    const uint sgid = tid / 32u;
+
+    const uint ka = params.rate; // 3: host-gated
+    const uint word_count = 256u * ka / 32u;
+
+    threadgroup half bstage[KCHUNK * BSTRIDE];
+
+    const uint rbase = group.y * QTILE + sgid * ROWS_SG;
+    const device half *ab0 = input + min(rbase, params.queries - 1u) * params.in_features;
+    const device half *ab1 = input + min(rbase + 8u, params.queries - 1u) * params.in_features;
+    const uint lane = tid & 31u;
+    const uint lane_fm = (lane >> 2 & 4u) + (lane >> 1 & 3u);
+    const uint lane_fn = (lane >> 2 & 2u) << 1 | (lane & 1u) << 1;
+
+    simdgroup_float8x8 acc0, acc1, acc2, acc3, acc4, acc5, acc6, acc7;
+    simdgroup_float8x8 acc8, acc9, acc10, acc11, acc12, acc13, acc14, acc15;
+    acc0.thread_elements()[0] = 0.0f; acc0.thread_elements()[1] = 0.0f;
+    acc1.thread_elements()[0] = 0.0f; acc1.thread_elements()[1] = 0.0f;
+    acc2.thread_elements()[0] = 0.0f; acc2.thread_elements()[1] = 0.0f;
+    acc3.thread_elements()[0] = 0.0f; acc3.thread_elements()[1] = 0.0f;
+    acc4.thread_elements()[0] = 0.0f; acc4.thread_elements()[1] = 0.0f;
+    acc5.thread_elements()[0] = 0.0f; acc5.thread_elements()[1] = 0.0f;
+    acc6.thread_elements()[0] = 0.0f; acc6.thread_elements()[1] = 0.0f;
+    acc7.thread_elements()[0] = 0.0f; acc7.thread_elements()[1] = 0.0f;
+    acc8.thread_elements()[0] = 0.0f; acc8.thread_elements()[1] = 0.0f;
+    acc9.thread_elements()[0] = 0.0f; acc9.thread_elements()[1] = 0.0f;
+    acc10.thread_elements()[0] = 0.0f; acc10.thread_elements()[1] = 0.0f;
+    acc11.thread_elements()[0] = 0.0f; acc11.thread_elements()[1] = 0.0f;
+    acc12.thread_elements()[0] = 0.0f; acc12.thread_elements()[1] = 0.0f;
+    acc13.thread_elements()[0] = 0.0f; acc13.thread_elements()[1] = 0.0f;
+    acc14.thread_elements()[0] = 0.0f; acc14.thread_elements()[1] = 0.0f;
+    acc15.thread_elements()[0] = 0.0f; acc15.thread_elements()[1] = 0.0f;
+
+    // This thread's dequant slot, loop-invariant: which 16x16 weight tile, which
+    // trellis lane, and therefore which four rows and two columns it owns.
+    const uint t0 = tid / 32u;
+    const uint l0 = tid & 31u;
+    const uint rr0 = (l0 & 3u) * 2u;
+    const uint cc0 = l0 >> 2;
+    const uint lo0 = (l0 * 8u + 1u) * 3u + 256u * 3u - 16u;
+    const uint i00 = lo0 / 32u;
+    const uint sh0 = lo0 % 32u;
+    const uint col0 = (t0 % NTILES) * 16u;
+    const uint row0 = (t0 / NTILES) * 16u;
+    // k-tile of the chunk currently being decoded (clamped, see the loop).
+    const uint ktiles = params.in_features / 16u;
+
+    thread uint pre[6];
+    half nxt[16];
+
+    // Trellis window words for a k-tile index, into `pre`.
+#define KAPLUMBA_REGPIPE_PREFETCH(kt)                                             \
+    {                                                                             \
+        _Pragma("unroll") for (uint jw = 0u; jw < 2u; ++jw) {                      \
+            const uint t = (jw == 0u) ? t0 : (t0 + SGROUPS);                       \
+            const uint j0 = i00 >= word_count ? i00 - word_count : i00;            \
+            const uint j1 = j0 + 1u >= word_count ? j0 + 1u - word_count : j0 + 1u; \
+            const uint j2 = j1 + 1u >= word_count ? j1 + 1u - word_count : j1 + 1u; \
+            const uint gbase =                                                     \
+                2u * (((kt) + t / NTILES) * params.tile_columns +                  \
+                     (group.x * NTILES + (t % NTILES))) *                           \
+                word_count;                                                        \
+            pre[3u * jw + 0u] = trellis_word(packed + gbase, j0);                   \
+            pre[3u * jw + 1u] = trellis_word(packed + gbase, j1);                   \
+            pre[3u * jw + 2u] = trellis_word(packed + gbase, j2);                   \
+        }                                                                          \
+    }
+
+    // The MCG decode of one weight, identical to `linear_gemm_mma`: same window,
+    // same 16-bit slice, same hash, same fp16 rounding of the pair sum. `r` is a
+    // compile-time literal here exactly as it is there, which is what folds
+    // `r <= 64` and the second window away.
+#define KAPLUMBA_REGPIPE_DECODE(wa, j, dc, slot)                                  \
+    {                                                                             \
+        const uint r = ((j) + 4u * (dc)) * 3u + 16u;                               \
+        const uint s = uint((wa) >> (64u - r)) & 0xffffu;                          \
+        uint v = s * 0xCBAC1FEDu;                                                  \
+        v = 0x3b603b60u ^ (v & 0x8fff8fffu);                                       \
+        (slot) = half(float(as_type<half>((ushort)v) +                             \
+                            as_type<half>((ushort)(v >> 16))));                     \
+    }
+
+    KAPLUMBA_REGPIPE_PREFETCH(0u)
+    #pragma unroll
+    for (uint jw = 0u; jw < 2u; ++jw) {
+        const uint g0 = pre[3u * jw + 0u];
+        const uint g1 = pre[3u * jw + 1u];
+        const uint g2 = pre[3u * jw + 2u];
+        const ulong wa = ((ulong(g0) << 32) | g1) << sh0 |
+                         (sh0 ? (ulong(g2) >> (32 - sh0)) : 0ul);
+        #pragma unroll
+        for (uint j = 0u; j < 4u; ++j) {
+            KAPLUMBA_REGPIPE_DECODE(wa, j, 0u, nxt[jw * 8u + j * 2u + 0u])
+            KAPLUMBA_REGPIPE_DECODE(wa, j, 1u, nxt[jw * 8u + j * 2u + 1u])
+        }
+    }
+
+    for (uint kbase = 0; kbase < params.in_features; kbase += KCHUNK) {
+        // Publish this chunk's weights. This is the ONLY barrier per chunk, and
+        // it is the same publish-then-MMA handoff the original had, so a reader
+        // of `bstage` still sees a complete tile.
+        #pragma unroll
+        for (uint jw = 0u; jw < 2u; ++jw) {
+            const uint t = (jw == 0u) ? t0 : (t0 + SGROUPS);
+            const uint tcol = (t % NTILES) * 16u;
+            const uint trow = (t / NTILES) * 16u;
+            #pragma unroll
+            for (uint j = 0u; j < 4u; ++j) {
+                const uint rr = trow + rr0 + (j & 1u) + ((j >> 1u) << 3u);
+                bstage[rr * BSTRIDE + tcol + cc0 + 0u] = nxt[jw * 8u + j * 2u + 0u];
+                bstage[rr * BSTRIDE + tcol + cc0 + 8u] = nxt[jw * 8u + j * 2u + 1u];
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // Next chunk's window words, in flight across the whole MMA block below.
+        const uint knext = min(kbase + KCHUNK, params.in_features - KCHUNK);
+        KAPLUMBA_REGPIPE_PREFETCH((knext / 16u))
+
+        for (uint step = 0; step < KCHUNK / 8u; ++step) {
+            const uint k8 = step * 8u;
+            simdgroup_half8x8 x0, x1;
+            simdgroup_load(x0, ab0 + kbase + k8, params.in_features);
+            simdgroup_load(x1, ab1 + kbase + k8, params.in_features);
+            simdgroup_half8x8 y0, y1, y2, y3, y4, y5, y6, y7;
+            const threadgroup half *bs = bstage + k8 * BSTRIDE;
+            simdgroup_load(y0, bs + 0u, BSTRIDE);
+            simdgroup_load(y1, bs + 8u, BSTRIDE);
+            simdgroup_load(y2, bs + 16u, BSTRIDE);
+            simdgroup_load(y3, bs + 24u, BSTRIDE);
+            simdgroup_load(y4, bs + 32u, BSTRIDE);
+            simdgroup_load(y5, bs + 40u, BSTRIDE);
+            simdgroup_load(y6, bs + 48u, BSTRIDE);
+            simdgroup_load(y7, bs + 56u, BSTRIDE);
+            simdgroup_multiply_accumulate(acc0, x0, y0, acc0);
+            simdgroup_multiply_accumulate(acc1, x0, y1, acc1);
+            simdgroup_multiply_accumulate(acc2, x0, y2, acc2);
+            simdgroup_multiply_accumulate(acc3, x0, y3, acc3);
+            simdgroup_multiply_accumulate(acc4, x0, y4, acc4);
+            simdgroup_multiply_accumulate(acc5, x0, y5, acc5);
+            simdgroup_multiply_accumulate(acc6, x0, y6, acc6);
+            simdgroup_multiply_accumulate(acc7, x0, y7, acc7);
+            simdgroup_multiply_accumulate(acc8, x1, y0, acc8);
+            simdgroup_multiply_accumulate(acc9, x1, y1, acc9);
+            simdgroup_multiply_accumulate(acc10, x1, y2, acc10);
+            simdgroup_multiply_accumulate(acc11, x1, y3, acc11);
+            simdgroup_multiply_accumulate(acc12, x1, y4, acc12);
+            simdgroup_multiply_accumulate(acc13, x1, y5, acc13);
+            simdgroup_multiply_accumulate(acc14, x1, y6, acc14);
+            simdgroup_multiply_accumulate(acc15, x1, y7, acc15);
+
+            // The same chunk's next-step decode, in the same basic block as the
+            // MMAs and touching only `nxt` and `pre`. Two of this thread's 16
+            // weights per step, eight steps, sixteen weights -- the identical
+            // work the original performed before its first barrier.
+            const uint jw = step >> 2u;
+            const uint j = step & 3u;
+            const uint g0 = pre[3u * jw + 0u];
+            const uint g1 = pre[3u * jw + 1u];
+            const uint g2 = pre[3u * jw + 2u];
+            const ulong wa = ((ulong(g0) << 32) | g1) << sh0 |
+                             (sh0 ? (ulong(g2) >> (32 - sh0)) : 0ul);
+            KAPLUMBA_REGPIPE_DECODE(wa, j, 0u, nxt[jw * 8u + j * 2u + 0u])
+            KAPLUMBA_REGPIPE_DECODE(wa, j, 1u, nxt[jw * 8u + j * 2u + 1u])
+        }
+        // The closing barrier of `linear_gemm_mma:2625` is load-bearing and is
+        // NOT removable: a single `bstage` means the next iteration's publish
+        // must not begin while any simdgroup is still reading this one. So V5
+        // carries the same two barriers as the original; what it changes is that
+        // the dequant sits BETWEEN them, in the MMAs' basic block, instead of
+        // before the first one.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+#undef KAPLUMBA_REGPIPE_DECODE
+
+    const uint colbase = group.x * OUTS;
+#define KAPLUMBA_MMA_STORE(acc, rowoffset, chunk)                                  \
+    {                                                                             \
+        const uint r = rbase + (rowoffset) + lane_fm;                              \
+        if (r < params.queries) {                                                 \
+            const uint c = colbase + 8u * (chunk) + lane_fn;                      \
+            output[r * params.out_features + c] = (acc).thread_elements()[0];     \
+            output[r * params.out_features + c + 1u] = (acc).thread_elements()[1]; \
+        }                                                                         \
+    }
+    KAPLUMBA_MMA_STORE(acc0, 0u, 0u);
+    KAPLUMBA_MMA_STORE(acc1, 0u, 1u);
+    KAPLUMBA_MMA_STORE(acc2, 0u, 2u);
+    KAPLUMBA_MMA_STORE(acc3, 0u, 3u);
+    KAPLUMBA_MMA_STORE(acc4, 0u, 4u);
+    KAPLUMBA_MMA_STORE(acc5, 0u, 5u);
+    KAPLUMBA_MMA_STORE(acc6, 0u, 6u);
+    KAPLUMBA_MMA_STORE(acc7, 0u, 7u);
+    KAPLUMBA_MMA_STORE(acc8, 8u, 0u);
+    KAPLUMBA_MMA_STORE(acc9, 8u, 1u);
+    KAPLUMBA_MMA_STORE(acc10, 8u, 2u);
+    KAPLUMBA_MMA_STORE(acc11, 8u, 3u);
+    KAPLUMBA_MMA_STORE(acc12, 8u, 4u);
+    KAPLUMBA_MMA_STORE(acc13, 8u, 5u);
+    KAPLUMBA_MMA_STORE(acc14, 8u, 6u);
+    KAPLUMBA_MMA_STORE(acc15, 8u, 7u);
+#undef KAPLUMBA_MMA_STORE
+}
+
 kernel void linear_finalize_rows(
     const device float *input [[buffer(0)]],
     const device half *output_signs [[buffer(1)]],

@@ -177,6 +177,14 @@ pub struct LinearKernels {
     /// simdgroup. Needs `in_features` a multiple of 64 and `out_features` a
     /// multiple of 64; the engine's are multiples of 128.
     gemm_mma_pipeline: ComputePipelineState,
+    /// RESEARCH VARIANT of `gemm_mma_pipeline` (`linear_gemm_mma_regpipe`):
+    /// same tile, same accumulators, same bit-identical MCG decode, but the
+    /// dequantised weights go to PER-THREAD REGISTERS for the next k chunk while
+    /// the current chunk's MMAs run, then get published through the same
+    /// `bstage`. One barrier per chunk instead of two, `bstage` unchanged at
+    /// 9216 B. Only valid for `rate == Integer(3) && codebook == Mcg`, the
+    /// folded-MCG arm; every other rate keeps `gemm_mma_pipeline`.
+    gemm_mma_regpipe_pipeline: ComputePipelineState,
     finalize_rows_pipeline: ComputePipelineState,
     zero_raw_pipeline: ComputePipelineState,
     /// `linear_gemv_fast` specialised on (bits, MCG codebook) for integer rates.
@@ -284,6 +292,12 @@ impl LinearKernels {
         let gemm_mma_pipeline = device
             .new_compute_pipeline_state_with_function(&gemm_mma_function)
             .map_err(KernelError::Pipeline)?;
+        let gemm_mma_regpipe_function = library
+            .get_function("linear_gemm_mma_regpipe", None)
+            .map_err(KernelError::Shader)?;
+        let gemm_mma_regpipe_pipeline = device
+            .new_compute_pipeline_state_with_function(&gemm_mma_regpipe_function)
+            .map_err(KernelError::Pipeline)?;
         let finalize_rows_pipeline = device
             .new_compute_pipeline_state_with_function(&finalize_rows_function)
             .map_err(KernelError::Pipeline)?;
@@ -318,6 +332,7 @@ impl LinearKernels {
             input_rows_pipeline,
             gemv_tiled_pipeline,
             gemm_mma_pipeline,
+            gemm_mma_regpipe_pipeline,
             finalize_rows_pipeline,
             zero_raw_pipeline,
             fast_gemv_pipelines,
@@ -1031,6 +1046,16 @@ impl LinearKernels {
             if out_features % 64 == 0
                 && self.gemm_mma_pipeline.max_total_threads_per_threadgroup() >= 256
             {
+                // The register-pipelined variant is the folded-MCG case only;
+                // everything else dispatches the original kernel below.
+                let regpipe = !env_flag("KAPLUMBA_NO_REGPIPE")
+                    && rate == Exl3Rate::Integer(3)
+                    && codebook == Exl3Codebook::Mcg;
+                let gemm = if regpipe {
+                    &self.gemm_mma_regpipe_pipeline
+                } else {
+                    &self.gemm_mma_pipeline
+                };
                 encoder.dispatch_1d(
                     &self.input_rows_pipeline,
                     &[Some(input), Some(input_signs), Some(transformed)],
@@ -1039,7 +1064,7 @@ impl LinearKernels {
                     64,
                 )?;
                 encoder.dispatch_2d(
-                    &self.gemm_mma_pipeline,
+                    gemm,
                     &[
                         TensorRef::new(packed, packed_offset),
                         TensorRef::new(transformed, 0),
