@@ -220,3 +220,78 @@ These are global restrictions; any spec that conflicts with them must call the c
 4. [ ] Create `spec/<name>/tasks.md` (small ordered tasks).
 5. [ ] Implement task → test all conceivable cases → update `tasks.md` → update `implementation_notes.md` → commit.
 6. [ ] Repeat step 5 until done; prove acceptance criteria; final notes.
+
+---
+
+## 10. GPU access discipline (mandatory)
+
+**This box has 24 GiB of unified memory and the model needs 11.5-15 GiB. Two
+concurrent model instances exceed physical memory.** That has already been
+measured in this repo: file-backed pages get evicted, which cost 3.9 GiB of swap
+and a collapse to ~1.4 tok/s (`crates/engine/src/weights.rs:1217`). It also
+invalidates every benchmark, because two instances fight for bandwidth and page
+residency.
+
+### 10.1 Use `scripts/gpuq`, and do not block by default
+
+| command | behaviour | when to use it |
+|---|---|---|
+| `scripts/gpuq status` | instant; prints holder, queue depth, free memory, and warns below the ~16 GiB a load needs | before anything that will load the model |
+| `scripts/gpuq try -- <cmd>` | runs only if free; exits **75** immediately if busy | **the default.** Do analysis, then retry |
+| `scripts/gpuq run -- <cmd>` | blocks until free, printing a heartbeat every 5 s | only when there is genuinely nothing else to do |
+
+**Never sit in a 30-minute blocking call.** A `run` that blocks for twenty
+minutes has wasted twenty minutes: it cannot report, and it cannot do the work
+that would have been useful meanwhile. Prefer `try` in a loop around
+*productive* work, not around `sleep`.
+
+### 10.2 The rules
+
+1. **Check `gpuq status` before every model run.** If free memory is below
+   ~16 GiB, wait — do not load. Firefox plus a few editor processes have been
+   seen holding the box down to 2-4 GiB free, and a load then thrashes.
+2. **One model process at a time.** `gpuq` enforces this, and so does the
+   in-binary `flock` at `~/.kaplumba/gpu.lock` (`crates/engine/src/gpu_lock.rs`),
+   which makes bypass impossible even if a wrapper is skipped.
+3. **Do not run a second model instance "just to check" while a measurement is
+   in flight.** This has happened and it destroyed the numbers.
+4. **In a worktree, use a separate `CARGO_TARGET_DIR`.** A worktree sharing the
+   main `target/` can rebuild the binary mid-benchmark of another agent.
+5. **Interleave A/B measurements** (A B A B …) and report medians with spread.
+   Decode on this box has been measured at 3.7, 3.9, 4.3, 4.8, 6.0 and 6.4
+   tok/s from the *same binary* minutes apart, so a single reading is not a
+   result and a difference smaller than the spread is noise.
+6. **Clean up worktrees and temporary harnesses.** `git worktree remove
+   <path> --force` and delete any `crates/engine/examples/*.rs` you added; a
+   stray benchmark binary left running holds the GPU and is invisible to the
+   next agent.
+
+### 10.3 Measuring this box
+
+There are 24 GiB of RAM and no discrete GPU: `vm.memsize` is not a memory
+pressure signal the way a used counter is, and the earlier 32 GiB figure
+recorded in some notes is wrong. Check with:
+
+```bash
+vm_stat | awk '/Pages free/ { printf "%.1f GiB free\n", $3 * 16384 / 1073741824 }'
+sysctl -n vm.swapusage
+```
+
+Prefill is the throughput metric that matters most and it is measured
+end-to-end:
+
+```bash
+M=~/.kaplumba/models/Gxma/Gxma
+PP=$(python3 -c "print('Explain the theory of relativity. '*100)")
+scripts/gpuq run -- ./target/release/kaplumba --model "$M" --prompt "$PP" \
+    --max-new-tokens 1 --temperature 0 --metrics
+```
+
+Per-kernel GPU attribution (the working profiler; `KAPLUMBA_PROFILE_PHASES` is
+dead, see the implementation notes):
+
+```bash
+KAPLUMBA_GPU_PROFILE=1 ./target/release/kaplumba --model "$M" --prompt "$PP" \
+    --max-new-tokens 1 --temperature 0 --metrics
+```
+
