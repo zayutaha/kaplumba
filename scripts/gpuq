@@ -97,12 +97,25 @@ available_gib() {
   local t
   t="$(top -l 1 -n 0 2>/dev/null | awk '
         /PhysMem/ {
-          # "23G used (2807M wired, 536M compressor), 502M unused"
-          n = split($0, a, /, +/)
-          u = a[n]
-          gsub(/[^0-9.]/, "", u)
-          printf "%.1f", u
-          exit
+          # "23G used (2924M wired, 863M compressor), 554M unused."
+          # Two traps, both hit: taking the last comma-field yields "unused."
+          # rather than a number, and top switches units and drops a decimal
+          # below 10 ("554M", not "0.55G") -- an earlier version read that as
+          # 554 GiB. So isolate the tail after the final comma, then match the
+          # number with its optional unit explicitly.
+          n = split($0, a, ",")
+          tail = a[n]
+          if (match(tail, /[0-9]+(\.[0-9]+)?[KMGT]?/)) {
+            tok = substr(tail, RSTART, RLENGTH)
+            mul = 1
+            if (tok ~ /[Tt]$/) mul = 1099511627776
+            else if (tok ~ /[Gg]$/) mul = 1073741824
+            else if (tok ~ /[Mm]$/) mul = 1048576
+            else if (tok ~ /[Kk]$/) mul = 1024
+            gsub(/[KMGT]$/, "", tok)
+            printf "%.1f", (tok + 0) * mul / 1073741824
+            exit
+          }
         }')"
   case "$t" in
     "" | "." | 0|0.0)
