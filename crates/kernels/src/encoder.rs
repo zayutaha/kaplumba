@@ -485,9 +485,9 @@ impl<'q> MetalEncoder<'q> {
     /// are [`Self::wait`] (which takes `&self` and so cannot re-arm) and
     /// dropping it, which thanks to [`Drop`] is now safe rather than a trap.
     ///
-    /// Reachability of the misuse: the only caller is the pipelined decode loop
-    /// in `generate.rs`, which calls `wait()` on the value and then lets it go
-    /// out of scope. `dispatches` is deliberately left stale for the same
+    /// Reachability of the misuse: the only caller is the device-pick decode
+    /// loop in `generate.rs`, which calls `wait()` on the value and then lets it
+    /// go out of scope. `dispatches` is deliberately left stale for the same
     /// reason — a fresh buffer would invite another commit. `debug_assert`s on
     /// every `dispatch_*` and here turn a future caller into a debug-build
     /// failure instead of a release-build abort.

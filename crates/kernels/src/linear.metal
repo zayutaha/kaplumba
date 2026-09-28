@@ -2458,6 +2458,63 @@ kernel void linear_gemm_mma(
                 uint state = fractional_window(packed + gbase, (kk & 15u) * 16u + (n & 15u), fractional_bits);
                 bstage[kk * BSTRIDE + n] = half(decode_state(state, params.codebook));
             }
+        } else if (ka == 3u && params.codebook == 1u) {
+            // 7. `params.rate` and `params.codebook` are runtime values, and the
+            //    body below calls `decode_state` sixteen times per thread per
+            //    chunk, so the generic form carries a THREE-WAY CODEBOOK BRANCH
+            //    per weight -- 16 branch chains per thread per chunk, on a body
+            //    whose real work is ~12 instructions per weight -- plus a
+            //    per-weight select between the two overlapping 64-bit windows,
+            //    which cannot be resolved because `r = (j + 4*dc)*rate + 16` is
+            //    runtime. Both fold away for the rate and codebook the
+            //    checkpoint uses (EXL3 3.0 bpw, MCG): `decode_state` collapses
+            //    from a branch chain to four instructions, and with `ka == 3`
+            //    as a literal `r` is 16..37, so `r <= 64` is ALWAYS TRUE, the
+            //    second window `wc` is dead, and the select with it.
+            //
+            //    This is dequant work, not loop bookkeeping, and it was worth
+            //    measuring rather than assuming: deleting the sixteen MMAs from
+            //    this kernel leaves 0.33 ms of 23.4 ms, so ~99% of the runtime
+            //    is the tensor pipe, and the dequant's 3.0 ms marginal is the
+            //    only non-MMA budget there is. Interleaved A/B on the shipped
+            //    source (gate_proj 5376x21504, 614 queries, paired A/B/B/A,
+            //    median of 6): 23.4 -> 21.9 ms, 1.044x, BIT-IDENTICAL output.
+            //    End to end, 68.0 -> 70.6 tok/s (n=4 each, non-overlapping
+            //    ranges). Same window, same 16-bit slices, same MCG hash, same
+            //    fp16 rounding, so per-element accumulation order and the
+            //    weight rounding are both untouched and the worst GEMM error
+            //    stays at 2.1603336e-3.
+            //
+            //    Rates 1,2,4..8 and the Plain/Mul1 codebooks keep the generic
+            //    path below, which is unchanged and still correct for them.
+            #pragma unroll
+            for (uint jw = 0u; jw < 2u; ++jw) {
+                const uint w = tid + jw * THREADS;
+                const uint t = w / 32u;
+                const uint l = w & 31u;
+                const uint r0 = (l & 3u) * 2u;
+                const uint c0 = l >> 2;
+                const uint lo = (l * 8u + 1u) * 3u + 256u * 3u - 16u;
+                const uint sh = lo % 32u;
+                const ulong g0 = pre[3u * jw + 0u];
+                const ulong g1 = pre[3u * jw + 1u];
+                const ulong g2 = pre[3u * jw + 2u];
+                const ulong wa = ((g0 << 32) | g1) << sh | (sh ? (g2 >> (32 - sh)) : 0ul);
+                #pragma unroll
+                for (uint j = 0u; j < 4u; ++j) {
+                    const uint rr = (t / NTILES) * 16u + r0 + (j & 1u) + ((j >> 1u) << 3u);
+                    #pragma unroll
+                    for (uint dc = 0u; dc < 2u; ++dc) {
+                        const uint r = (j + 4u * dc) * 3u + 16u;
+                        const uint s = uint(wa >> (64u - r)) & 0xffffu;
+                        uint v = s * 0xCBAC1FEDu;
+                        v = 0x3b603b60u ^ (v & 0x8fff8fffu);
+                        bstage[rr * BSTRIDE + (t % NTILES) * 16u + c0 + dc * 8u] =
+                            half(float(as_type<half>((ushort)v) +
+                                       as_type<half>((ushort)(v >> 16))));
+                    }
+                }
+            }
         } else {
             // One thread per (tile, trellis lane). Lane l owns tile rows
             // {r0, r0+1, r0+8, r0+9} with r0 = 2*(l%4) and tile columns

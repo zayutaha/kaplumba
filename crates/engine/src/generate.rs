@@ -122,11 +122,12 @@ where
             limit: config.context_limit,
         });
     }
-    // Greedy decode pipelines: the pick runs on the device so steps queue back to
-    // back. See `generate_gpu_greedy_pipelined`.
+    // Greedy decode has its own loop because the token is the argmax rather than
+    // a sample, and because it is timed from the prefill's pick. See
+    // `generate_gpu_greedy`.
     if config.sampler.temperature == 0.0 {
         let mut on_text = on_text;
-        return generate_gpu_greedy_pipelined(
+        return generate_gpu_greedy(
             model,
             tokenizer,
             &prompt_ids,
@@ -376,23 +377,58 @@ fn argmax_logits(logits: &[u16]) -> u32 {
     best as u32
 }
 
-/// Greedy decode with the pick on the GPU and the wait batched.
+/// Greedy decode over the fully GPU-resident forward path.
 ///
-/// Steps are encoded back to back, each into its own `MetalEncoder`. The greedy
-/// pick runs as a kernel and leaves the sampled token in device memory, so step
-/// N+1's embedding kernel reads it without any host involvement. The host then
-/// waits once per `PIPELINE_DEPTH` steps and reads back that many token ids
-/// together, which keeps latency bounded while the GPU stays fed.
+/// One step per barrier: the argmax is taken on the host off the single softcapped
+/// logits row the forward returns, exactly as [`generate_gpu`] does, and the
+/// sampled token goes back into the next step's `token_ids` on the host. That is
+/// the only correct shape available, and the reasons the previous shape was not
+/// are worth keeping, because every one of them looks like a scheduling bug from
+/// the outside and none of them is:
 ///
-/// Each step's encoder rolls on its own: `MetalEncoder::tick` counts every
-/// dispatch, so a step's ~2100 dispatches are committed in
-/// `MAX_DISPATCHES_PER_BUFFER` slices — 42 command buffers per step, measured
-/// with `MetalEncoder::command_buffers_created` — and the encoder only holds the
-/// trailing partial slice when it is committed. Rolling inside a step is safe
-/// for the pipeline because the slice boundaries are invisible to it: a single
-/// Metal queue runs committed buffers in commit order, and the wait is
-/// unchanged.
-fn generate_gpu_greedy_pipelined<F>(
+/// *The device-side token hand-off cannot be expressed.* Step N+1's embedding
+/// reads `tokens_data[0]` (`crates/kernels/src/elements.metal`), so step N's
+/// pick would have to write `scratch.token_ids[0]` to keep the host out of the
+/// loop. The only host-visible entry point for that write,
+/// `ElementKernels::encode_greedy_pick`, refuses a destination index of 0. The
+/// loop queued its steps with `token_ids = [0]`, so every step after the first
+/// was fed token 0.
+///
+/// *The device-side pick is wrong for this vocabulary anyway.* `greedy_key`
+/// packs `0xFFFF - index` into 16 bits, which underflows at and past index
+/// 65,536 — most of a 262,144-entry vocabulary — so the packed key is no longer
+/// ordered and the "winner" is an arbitrary low token id. Measured on the real
+/// checkpoint: the host argmax over the same buffer is index 9,259 at 28.5, the
+/// device reduction returns 0xFFFFFFFF, i.e. index 0.
+///
+/// *The overlapping encodes raced.* Steps were encoded back to back and waited
+/// once, but `forward_buffer_into_step` stages `token_ids[0]` and
+/// `query_positions[0]` into the shared scratch *from the host*, so those writes
+/// landed while the previous step's kernels could still be reading them, and
+/// which way that landed depended on how far the GPU got while the host encoded.
+///
+/// *The bookkeeping was off by one.* Each step overwrote log slot `step`, so the
+/// prefill's own pick was clobbered by the first step and the loop read `depth`
+/// tokens for a batch that had produced `depth + 1`.
+///
+/// Verified consequence: `--legacy-path --show-ids` printed 24 zeros for every
+/// reference prompt, while the commit that introduced this loop claimed "correct
+/// on all reference prompts, suite green" — no test reaches it, because
+/// `SamplerConfig::default()` has `temperature: 1.0` and only the `--temperature 0`
+/// CLI flag enters it.
+///
+/// # What the metrics mean
+///
+/// `ttft` is stamped when the first token is sampled, which is right after the
+/// prefill's wait: no decode step is included, so it does not move with
+/// `max_new_tokens`. The previous version stamped it after the first *batch's*
+/// wait, so it carried up to 7 decode steps of extra GPU time (~1.9 s measured at
+/// 614 tokens of context) and grew with `max_new_tokens`. `decode_duration` is
+/// the sum of the per-step waits and `decode_tokens_per_second` divides the
+/// generated-minus-one steps by it; the previous version divided steps it never
+/// ran by the wall time of a whole batch, which is where `decode_tok_s=0.24` at
+/// `--max-new-tokens 2` came from.
+fn generate_gpu_greedy<F>(
     model: &mut TextModel,
     tokenizer: &crate::tokenizer::GemmaTokenizer,
     prompt_ids: &[u32],
@@ -403,10 +439,6 @@ fn generate_gpu_greedy_pipelined<F>(
 where
     F: FnMut(&str) -> Result<(), GenerationError> + ?Sized,
 {
-    /// Steps queued before the host waits. Deep enough to hide sampling and
-    /// detokenization, shallow enough that text still appears promptly.
-    const PIPELINE_DEPTH: usize = 8;
-
     let mut detokenizer = crate::tokenizer::Detokenizer::new(tokenizer);
     let mut text = String::new();
     let mut generated_ids: Vec<u32> = Vec::with_capacity(config.max_new_tokens);
@@ -415,14 +447,12 @@ where
     let mut prefill_duration = Duration::ZERO;
     let mut stopped_on_eos = false;
     let prompt_len = prompt_ids.len();
-
     let queue = model.forward_queue();
-    model.set_pick_on_device(true);
+
     let result = (|| -> Result<(), GenerationError> {
         let prefill_started = Instant::now();
         let positions: Vec<u32> = (0..prompt_len as u32).collect();
-        let mut prefill = MetalEncoder::new(&queue)
-            .map_err(ModelError::from)?;
+        let mut prefill = MetalEncoder::new(&queue).map_err(ModelError::from)?;
         model
             .forward_buffer_into(prompt_ids, &positions, &mut prefill)
             .map_err(ModelError::from)?;
@@ -433,69 +463,50 @@ where
         prefill.commit_and_wait().map_err(ModelError::from)?;
         prefill_duration = prefill_started.elapsed();
 
-        let mut position = prompt_len as u32;
-        let mut decoded = 0_usize;
-        while decoded < config.max_new_tokens {
-            let depth = (config.max_new_tokens - decoded).min(PIPELINE_DEPTH);
-            let decode_started = Instant::now();
-
-            // One command buffer per step, all submitted before any wait. Each
-            // step's forward reads the token the previous pick left in device
-            // memory, so the host is not in the loop. Inside a step the
-            // `MetalEncoder` rolling scheme applies as usual -- it counts every
-            // dispatch -- so a step is committed in slices of
-            // `MAX_DISPATCHES_PER_BUFFER`, not as one giant encoder;
-            // `commit_terminal` then ends the trailing partial slice.
-            let mut steps = Vec::with_capacity(depth);
-            for step in 0..depth {
-                let mut encoder = MetalEncoder::new(&queue)
-                    .map_err(ModelError::from)?;
-                model
-                    .forward_buffer_into_step(&mut encoder, position + step as u32, step)
-                    .map_err(ModelError::from)?;
-                // Terminal: the encoder is dead after this, and `wait()` below is
-                // the only thing left that may be called on it. `Drop` ends an
-                // encoder that is still open, so the `?` on the encode above is
-                // an error return rather than a Metal trap.
-                encoder.commit_terminal().map_err(ModelError::from)?;
-                steps.push(encoder);
+        // Read after the wait: the prefill's last row is the first generated
+        // token's logits, and reading it earlier returns the previous row.
+        let mut logits = model.last_logits();
+        loop {
+            let token = argmax_logits(&logits);
+            if generated_ids.is_empty() {
+                ttft_duration = request_started.elapsed();
             }
-            for encoder in &steps {
-                encoder.wait();
-            }
-            decode_duration += decode_started.elapsed();
-
-            let tokens = model.take_greedy_tokens(depth);
-            for token in tokens {
-                if generated_ids.is_empty() {
-                    ttft_duration = request_started.elapsed();
-                }
-                if config.eos_ids.contains(&token) {
-                    stopped_on_eos = true;
-                    break;
-                }
-                generated_ids.push(token);
-                if let Some(chunk) = detokenizer.push(token)? {
-                    text.push_str(&chunk);
-                    on_text(&chunk)?;
-                }
-            }
-            decoded += depth;
-            position += depth as u32;
-            if stopped_on_eos {
+            if config.eos_ids.contains(&token) {
+                stopped_on_eos = true;
                 break;
             }
+            generated_ids.push(token);
+            if let Some(chunk) = detokenizer.push(token)? {
+                text.push_str(&chunk);
+                on_text(&chunk)?;
+            }
+            if generated_ids.len() == config.max_new_tokens {
+                break;
+            }
+            let position = prompt_len + generated_ids.len() - 1;
+            let position = u32::try_from(position).map_err(|_| GenerationError::ContextExceeded {
+                limit: config.context_limit,
+            })?;
+            let step_started = Instant::now();
+            let mut encoder = MetalEncoder::new(&queue).map_err(ModelError::from)?;
+            model
+                .forward_buffer_into_step(&mut encoder, position, token)
+                .map_err(ModelError::from)?;
+            // `commit_terminal` ends the step's trailing partial slice of rolled
+            // command buffers; `wait` covers all of them, in commit order, which
+            // is the barrier the next step's host-side staging needs.
+            encoder.commit_terminal().map_err(ModelError::from)?;
+            encoder.wait();
+            decode_duration += step_started.elapsed();
+            logits = model.last_logits();
         }
 
         if let Some(chunk) = detokenizer.finish()? {
             text.push_str(&chunk);
             on_text(&chunk)?;
         }
-        let decode_steps = generated_ids.len().saturating_sub(1);
-        let _ = decode_steps;
         Ok(())
     })();
-    model.set_pick_on_device(false);
     result?;
 
     let decode_steps = generated_ids.len().saturating_sub(1);
@@ -517,4 +528,58 @@ where
             decode_steps as f64 / decode_duration.as_secs_f64()
         },
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use half::f16;
+
+    use super::argmax_logits;
+
+    fn row(values: &[f32]) -> Vec<u16> {
+        values.iter().map(|v| f16::from_f32(*v).to_bits()).collect()
+    }
+
+    /// Greedy decode is exactly this function applied to one row of softcapped
+    /// logits, so it is the whole of the sampling decision.
+    ///
+    /// This test exists because the greedy path had *no* coverage at all: with
+    /// `argmax_logits` sabotaged to `0u32` the engine's 20 suites / 81 tests
+    /// still passed, since `SamplerConfig::default()` has `temperature: 1.0` and
+    /// only `--temperature 0` reaches greedy decode, and every test that loads the
+    /// real checkpoint is `#[ignore]`d. A fix that fed the model token 0 on every
+    /// step was indistinguishable from a correct one to `cargo test`.
+    #[test]
+    fn argmax_picks_the_largest_logit() {
+        assert_eq!(argmax_logits(&row(&[-5.0, 3.0, -1.0, 12.5, 2.0])), 3);
+        assert_eq!(argmax_logits(&row(&[1.0, 2.0])), 1);
+    }
+
+    /// A tie must resolve to the lowest index, and an all-negative row must not
+    /// fall through to index 0 by accident: both are properties of the order the
+    /// tokens are scanned in, and both are what makes the pick reproducible.
+    #[test]
+    fn argmax_breaks_ties_toward_the_lowest_index() {
+        assert_eq!(argmax_logits(&row(&[7.0, 7.0, 7.0])), 0);
+        assert_eq!(argmax_logits(&row(&[0.0, 0.0])), 0);
+        assert_eq!(argmax_logits(&row(&[-4.0, -9.0, -4.0, -1.0])), 3);
+        // Every logit negative, and the first is the largest.
+        assert_eq!(argmax_logits(&row(&[-0.5, -30.0, -2.0])), 0);
+    }
+
+    /// One-element and fp16-precision boundaries: the argmax runs over a `u16`
+    /// row, so values that are equal in `f32` can differ in fp16 and vice versa.
+    #[test]
+    fn argmax_handles_single_element_and_fp16_precision() {
+        assert_eq!(argmax_logits(&row(&[42.0])), 0);
+        // Two distinct f32 values that round to the same fp16 must tie, and the
+        // scan order then decides.
+        let a = f16::from_f32(1.0000001);
+        let b = f16::from_f32(1.0);
+        assert_eq!(a.to_bits(), b.to_bits());
+        assert_eq!(argmax_logits(&[a.to_bits(), b.to_bits()]), 0);
+        // The softcap's 30.0 ceiling is exactly representable and is the largest
+        // value the head can produce.
+        assert_eq!(argmax_logits(&row(&[30.0, 29.999, 30.0])), 0);
+    }
 }

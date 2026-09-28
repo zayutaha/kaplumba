@@ -1778,11 +1778,16 @@ pub struct ForwardScratch {
     /// (split, query head), so `splits * q_heads * (head_dim + 2)` floats. Sized
     /// once from the layer shapes, never from a key count.
     pub attn_partials: Buffer,
-    /// Winning (value, index) key for the GPU greedy pick, and the token it
-    /// decodes to. Kept on the device so the next step's forward can read the
-    /// sampled token without a host round trip.
-    pub greedy_best: Buffer,
-    pub greedy_token: Buffer,
+    // There is deliberately no greedy-pick scratch here. The device-side pick
+    // it fed (`ElementKernels::encode_greedy_pick`, whose `greedy_key` packs
+    // `0xFFFF - index` into 16 bits) is wrong for this model's 262,144-entry
+    // vocabulary: every index at or past 65,536 underflows that subtraction, the
+    // packed key stops being ordered, and the "winner" is a low token id rather
+    // than the largest logit. Measured on the real checkpoint: the host's argmax
+    // over the same `capped` buffer is index 9,259 at 28.5, while the device's
+    // reduction returns key 0xFFFFFFFF, i.e. index 0. Greedy decode therefore
+    // takes the argmax on the host, off `capped`, which is the only path that has
+    // ever produced correct text.
 }
 
 impl ForwardScratch {
@@ -1853,10 +1858,6 @@ impl ForwardScratch {
             // replacement is fixed-size and independent of context length, per
             // AGENTS.md §8; 1.05 MB at 16 splits x 32 heads x 512 dims.
             attn_partials: f32_elements(1, attn_partials)?,
-            greedy_best: device.new_buffer(4, options),
-            // One slot per step so a queued batch of steps each keep their own
-            // token; a single slot would have every step overwrite the last.
-            greedy_token: device.new_buffer(4 * 64, options),
         })
     }
 
@@ -1881,8 +1882,6 @@ impl ForwardScratch {
             &self.logits,
             &self.capped,
             &self.attn_partials,
-            &self.greedy_best,
-            &self.greedy_token,
         ]
         .iter()
         .map(|buffer| buffer.length())
@@ -1898,12 +1897,6 @@ pub struct TextModel {
     /// `embedding_buffer` holds raw BF16 exactly as stored in the checkpoint, so
     /// the embedding kernel must widen it. True when the table is offloaded.
     embedding_is_bf16: bool,
-    /// When set, `forward_buffer` encodes the greedy pick and returns no logits,
-    /// leaving the sampled token in `scratch.greedy_token`. Only valid for a
-    /// single token; used by the pipelined decode loop.
-    pick_on_device: bool,
-    /// Which log slot the in-flight step's greedy pick writes to.
-    step_slot: usize,
     vocab_size: usize,
     hidden_size: usize,
     layers: Vec<DecoderLayer>,
@@ -2020,8 +2013,6 @@ impl TextModel {
             embedding_buffer,
             embedding_offset,
             embedding_is_bf16,
-            pick_on_device: false,
-            step_slot: 0,
             vocab_size,
             hidden_size,
             layers,
@@ -2356,39 +2347,56 @@ impl TextModel {
         self.forward_queue.clone()
     }
 
-    /// Choose whether the greedy pick runs on the device. See
-    /// [`Self::pick_on_device`].
-    pub fn set_pick_on_device(&mut self, on: bool) {
-        self.pick_on_device = on;
-    }
-
-    /// Encode one decode step at `position`, taking the input token from device
-    /// memory (whatever the previous step's greedy pick wrote into slot 0).
+    /// Encode one decode step at `position` on the device, taking its input
+    /// token from the host.
+    ///
+    /// `token` is the previous step's sample, staged into `scratch.token_ids[0]`,
+    /// which is what `embedding_scaled` reads for a single-token step
+    /// (`crates/kernels/src/elements.metal`).
+    ///
+    /// # The caller must hold a barrier across the next call
+    ///
+    /// This stages `token_ids[0]` and `query_positions[0]` into the *shared*
+    /// scratch from the host, and every layer reuses those buffers. So it is
+    /// only correct when nothing that reads them is still in flight: commit this
+    /// step's encoder and wait before starting the next one. A caller that
+    /// queues several steps and waits once at the end races those writes against
+    /// the previous step's kernels, and which way the race lands is a function of
+    /// how far the GPU got while the host encoded — that is, of scheduling. The
+    /// same applies to `GpuCache::ensure_capacity`, which copies the live KV
+    /// prefix on the host from inside a forward.
+    ///
+    /// There is no device-side token hand-off to overlap the steps with, and
+    /// there cannot be one at present: the pick's only host-visible output entry
+    /// point, `ElementKernels::encode_greedy_pick`, refuses a destination index
+    /// of 0, which is the index the next step's embedding reads. See
+    /// [`ForwardScratch`] for why the pick cannot be used at all on this
+    /// vocabulary.
     pub fn forward_buffer_into_step(
         &mut self,
         encoder: &mut MetalEncoder,
         position: u32,
-        step: usize,
+        token: u32,
     ) -> Result<(), ModelError> {
-        // `token_ids[0]` and `query_positions[0]` already hold the previous
-        // step's sampled token and this step's position is written here; the
-        // embedding kernel reads both.
-        unsafe {
-            let position_ptr = self.scratch.query_positions.contents() as *mut u32;
-            std::ptr::write_bytes(position_ptr, 0, 1);
-            std::ptr::write(position_ptr, position);
+        if token as usize >= self.vocab_size {
+            return Err(ModelError::InvalidInput(format!(
+                "token id {token} is outside the vocabulary"
+            )));
         }
-        // Pick writes its result into `greedy_token[step]` and mirrors it into
-        // slot 0, which is where the next step's embedding reads from.
-        self.step_slot = step;
-        self.forward_buffer_into(&[0], &[position], encoder)?;
+        self.forward_buffer_into(&[token], &[position], encoder)?;
         Ok(())
     }
 
-    /// The tokens a queued batch of steps produced, in order.
-    pub fn take_greedy_tokens(&self, count: usize) -> Vec<u32> {
-        let base = unsafe { self.scratch.greedy_token.contents() as *const u32 };
-        (0..count).map(|index| unsafe { *base.add(index) }).collect()
+    /// The softcapped logits row of the last forward, as the host sees it.
+    ///
+    /// This is a read of `scratch.capped`, and `capped` is written by the
+    /// forward's last kernels, so it is only meaningful once the encoder that
+    /// ran the forward has completed. Reading it earlier returns whatever the
+    /// previous forward left there: a freshly allocated buffer reads as all
+    /// zeros, which an argmax turns into token 0.
+    pub fn last_logits(&self) -> Vec<u16> {
+        let logits = self.scratch.capped.contents() as *const u16;
+        unsafe { std::slice::from_raw_parts(logits, self.vocab_size) }.to_vec()
     }
 
     /// One forward step, committed and waited, returning the logits.
@@ -2413,14 +2421,15 @@ impl TextModel {
             return Err(error);
         }
         encoder.commit_and_wait()?;
-        let logits = self.scratch.capped.contents() as *const u16;
-        Ok(unsafe { std::slice::from_raw_parts(logits, self.vocab_size) }.to_vec())
+        Ok(self.last_logits())
     }
 
     /// Encode one forward into a caller-supplied encoder, without committing.
     ///
-    /// This is what makes pipelined decode possible: a caller can queue many
-    /// steps into one command buffer so the host never waits between them.
+    /// The encoder is committed and waited by the caller, which must hold that
+    /// barrier across the next call: `forward_chunk` stages `token_ids` and
+    /// `query_positions` into the shared scratch from the host. See
+    /// [`Self::forward_buffer_into_step`].
     /// Feed `token_ids` through the model, splitting long prompts into bounded
     /// chunks so the activation scratch is sized by the chunk and not by the
     /// prompt length.
@@ -2442,12 +2451,14 @@ impl TextModel {
     /// report: the [`GpuProfile`] is created here, spans every chunk, and prints
     /// one table when the last chunk is done. A 614-token prompt is three
     /// chunks and one table, not three.
+    /// Returns nothing: the softcapped logits row is read separately, through
+    /// [`Self::last_logits`], once the caller's encoder has completed.
     pub fn forward_buffer_into(
         &mut self,
         token_ids: &[u32],
         positions: &[u32],
         encoder: &mut MetalEncoder,
-    ) -> Result<Vec<u16>, ModelError> {
+    ) -> Result<(), ModelError> {
         if token_ids.len() != positions.len() || token_ids.is_empty() {
             return Err(ModelError::InvalidInput(
                 "model token and position counts must match and be non-empty".to_string(),
@@ -2463,7 +2474,7 @@ impl TextModel {
         let mut gpu = GpuProfile::new(profile);
         gpu.tokens = token_ids.len();
         gpu.layers = self.layers.len();
-        let result = if token_ids.len() <= PREFILL_CHUNK {
+        let result: Result<(), ModelError> = if token_ids.len() <= PREFILL_CHUNK {
             gpu.chunks += 1;
             self.forward_chunk(token_ids, positions, encoder, &mut gpu, true)
         } else {
@@ -2475,22 +2486,20 @@ impl TextModel {
                 .chunks(PREFILL_CHUNK)
                 .zip(positions.chunks(PREFILL_CHUNK))
                 .peekable();
-            let mut logits = Vec::new();
             let mut outcome = Ok(());
             while let Some((chunk_ids, chunk_positions)) = chunks.next() {
                 gpu.chunks += 1;
                 let last = chunks.peek().is_none();
-                match self.forward_chunk(chunk_ids, chunk_positions, encoder, &mut gpu, last) {
-                    Ok(chunk) => logits = chunk,
-                    Err(error) => {
-                        // Report what ran before the failure rather than throwing
-                        // the measurements away; then propagate.
-                        outcome = Err(error);
-                        break;
-                    }
+                if let Err(error) =
+                    self.forward_chunk(chunk_ids, chunk_positions, encoder, &mut gpu, last)
+                {
+                    // Report what ran before the failure rather than throwing
+                    // the measurements away; then propagate.
+                    outcome = Err(error);
+                    break;
                 }
             }
-            outcome.map(|()| logits)
+            outcome
         };
         if profile {
             // Drain the tail before printing: the last boundaries are still
@@ -2512,10 +2521,11 @@ impl TextModel {
     /// three times to keep one row.
     ///
     /// Nothing downstream of the head can notice. `forward_buffer_into` returns
-    /// the last chunk's logits and no other chunk's, the next chunk overwrites
-    /// `scratch.token_ids` from the host before the first dispatch that reads it,
-    /// and the pipelined decode loop (`generate.rs`) reads `greedy_token[0..]`
-    /// only after its own first step has written slot 0. A single-chunk prefill
+    /// the last chunk's logits and no other chunk's, and the next chunk
+    /// overwrites `scratch.token_ids` from the host before the first dispatch
+    /// that reads it — which is only safe because the caller holds a barrier
+    /// between chunks, i.e. because the prefill below is committed and waited
+    /// before the first decode step. A single-chunk prefill
     /// -- every decode step, and any prompt up to [`PREFILL_CHUNK`] tokens --
     /// takes the `true` branch and is bit-for-bit unchanged.
     fn forward_chunk(
@@ -2525,7 +2535,7 @@ impl TextModel {
         encoder: &mut MetalEncoder,
         gpu: &mut GpuProfile,
         run_head: bool,
-    ) -> Result<Vec<u16>, ModelError> {
+    ) -> Result<(), ModelError> {
         if token_ids.len() != positions.len() || token_ids.is_empty() {
             return Err(ModelError::InvalidInput(
                 "model token and position counts must match and be non-empty".to_string(),
@@ -2698,9 +2708,9 @@ impl TextModel {
         if !run_head {
             // The head block is skipped whole, not partially: `last_hidden` keeps
             // whatever the calibration self-copy left in it and `capped` is never
-            // written, so returning no logits here is what keeps the caller from
-            // reading a buffer this chunk never filled. See `run_head` above.
-            return Ok(Vec::new());
+            // written, so the caller must not read a buffer this chunk never
+            // filled. See `run_head` above.
+            return Ok(());
         }
 
         // Only the sampled position needs logits, so lift the final row out and
@@ -2717,21 +2727,20 @@ impl TextModel {
         // head/softcap).
         self.encode_lm_head(encoder, gpu)?;
         gpu_flush!();
-        // Pick the greedy token on the device. The next step's embedding kernel
-        // reads `scratch.token_ids`, so a caller that keeps encoding into the
-        // same command buffer never has to round trip through the host.
-        unsafe {
-            std::ptr::write_bytes(self.scratch.greedy_best.contents() as *mut u8, 0, 4);
-        }
-        self.elements.encode_greedy_pick(
-            encoder,
-            &self.scratch.capped,
-            &self.scratch.greedy_best,
-            &self.scratch.token_ids,
-            tokens,
-        )?;
-        gpu.stamp(encoder, "chunk/greedy_pick")?;
-        gpu_flush!();
+        // No greedy pick is encoded here. It used to be, into
+        // `scratch.token_ids[tokens]` — one element past the end of that buffer
+        // whenever a chunk filled it, into the very buffer the next step's
+        // embedding reads, while the decode loop read back a
+        // `scratch.greedy_token` that no kernel ever wrote. It is also wrong on
+        // its own terms: `greedy_key` packs `0xFFFF - index` into 16 bits, which
+        // underflows for every index at or past 65,536 and so for most of this
+        // model's 262,144-entry vocabulary, making the packed key unordered and
+        // the winner an arbitrary low token id. Measured on the real checkpoint,
+        // the host argmax over this same `capped` buffer was index 9,259 at
+        // 28.5 while the device reduction returned 0xFFFFFFFF, i.e. index 0 —
+        // which is why the decode loop that used it emitted `max_new_tokens`
+        // copies of token 0 for every prompt. The argmax is taken on the host
+        // below instead.
         mark!(head_ms);
         if profile {
             let total = embed_ms + layer_ms + head_ms;
@@ -2744,13 +2753,13 @@ impl TextModel {
                   GPU time use KAPLUMBA_GPU_PROFILE=1.)"
             );
         }
-        if self.pick_on_device {
-            // Caller is driving the loop; it will read `greedy_token` itself.
-            return Ok(Vec::new());
-        }
-
-        let logits = self.scratch.capped.contents() as *const u16;
-        Ok(unsafe { std::slice::from_raw_parts(logits, vocab) }.to_vec())
+        // The logits are deliberately *not* returned: `capped` is written by the
+        // kernels encoded just above, so a host read here is a read-before-write
+        // that returns the previous forward's row (all zeros on a fresh buffer,
+        // which an argmax turns into token 0). A caller reads it through
+        // `last_logits` after its barrier instead.
+        let _ = vocab;
+        Ok(())
     }
 
     /// One trivial dispatch for the `cal/one` calibration sample: a one-element
