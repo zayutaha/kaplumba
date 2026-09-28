@@ -247,9 +247,10 @@ that would have been useful meanwhile. Prefer `try` in a loop around
 
 ### 10.2 The rules
 
-1. **Check `gpuq status` before every model run.** If free memory is below
-   ~16 GiB, wait — do not load. Firefox plus a few editor processes have been
-   seen holding the box down to 2-4 GiB free, and a load then thrashes.
+1. **Check `gpuq status` before every model run.** Only act on its warning if it
+   reports under 11 GiB *available*; it reads `top`, not `vm_stat`. Firefox plus
+   a few editor processes have been seen holding the box down to 2-4 GiB
+   genuinely unused, and a load then thrashes.
 2. **One model process at a time.** `gpuq` enforces this, and so does the
    in-binary `flock` at `~/.kaplumba/gpu.lock` (`crates/engine/src/gpu_lock.rs`),
    which makes bypass impossible even if a wrapper is skipped.
@@ -268,14 +269,20 @@ that would have been useful meanwhile. Prefer `try` in a loop around
 
 ### 10.3 Measuring this box
 
-There are 24 GiB of RAM and no discrete GPU: `vm.memsize` is not a memory
-pressure signal the way a used counter is, and the earlier 32 GiB figure
-recorded in some notes is wrong. Check with:
+**Do not use `vm_stat`'s `Pages free` as a memory-pressure signal.** It counts
+only pages that have never been touched, so it ignores the file cache entirely.
+Measured here with no model loaded: `Pages free` said 1.47 GiB while `top` said
+14 GiB unused and a model loaded in 10.8 s. An earlier version of `scripts/gpuq`
+used that counter, printed a warning on an idle box, and thereby stopped agents
+from running at all. Use `scripts/gpuq status`, which reads `top`:
 
 ```bash
-vm_stat | awk '/Pages free/ { printf "%.1f GiB free\n", $3 * 16384 / 1073741824 }'
+top -l 1 -n 0 | grep PhysMem     # "unused" is the number that matters
 sysctl -n vm.swapusage
 ```
+
+There are 24 GiB of RAM and no discrete GPU. The earlier 32 GiB figure recorded
+in some notes is wrong.
 
 Prefill is the throughput metric that matters most and it is measured
 end-to-end:

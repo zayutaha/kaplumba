@@ -74,11 +74,59 @@ run_locked() {
   ' "$LOCK" "$@"
 }
 
-# Free memory in GiB, used to warn before a load that will thrash.
-free_gib() {
-  awk '/Pages free/ { printf "%.1f", $3 * 16384 / 1073741824; exit }' \
-    < <(vm_stat 2>/dev/null) || echo "?"
+# Memory available for a new model load, in GiB.
+#
+# This must NOT be "Pages free". On macOS that counter only counts pages that
+# have never been touched, so a machine with 11 GiB sitting in the file cache
+# reports under 1 GiB free -- which is how this script came to warn "below the
+# ~16 GiB a load needs" on a box that could load comfortably. File cache is
+# reclaimable at exactly the moment a load needs it.
+#
+# What a load can actually get is: untouched pages, plus inactive and
+# speculative pages (the file cache, reclaimable on demand), plus purgeable.
+# Verified empirically on this box: with the weight file's pages in the cache,
+# vm_stat said 1.5 GiB "free" while top said 15 GiB unused, and the load took
+# 10.8 s and succeeded. A load reclaims the file cache rather than needing it
+# free, so top's "unused" figure is the one that predicts success.
+available_gib() {
+  # Verified against `top` on this box: with the weight file's pages sitting in
+  # the file cache, vm_stat reported 1.5 GiB "free" while top reported 15 GiB
+  # unused, and a load succeeded in 10.8 s. So the honest measure of "can a load
+  # proceed" is top's own figure, which already accounts for reclaimable pages.
+  # vm_stat is kept as a fallback for when top is unavailable.
+  local t
+  t="$(top -l 1 -n 0 2>/dev/null | awk '
+        /PhysMem/ {
+          # "23G used (2807M wired, 536M compressor), 502M unused"
+          n = split($0, a, /, +/)
+          u = a[n]
+          gsub(/[^0-9.]/, "", u)
+          printf "%.1f", u
+          exit
+        }')"
+  case "$t" in
+    "" | "." | 0|0.0)
+      awk '
+        /Pages free:/        { gsub(/\./,"",$NF); t += $NF }
+        /Pages inactive:/    { gsub(/\./,"",$NF); t += $NF }
+        /Pages speculative:/ { gsub(/\./,"",$NF); t += $NF }
+        /Pages purgeable:/   { gsub(/\./,"",$NF); t += $NF }
+        END { printf "%.1f", t * 16384 / 1073741824 }
+      ' < <(vm_stat 2>/dev/null) 2>/dev/null || echo "?"
+      ;;
+    *) echo "$t" ;;
+  esac
 }
+
+# Anonymous memory already faulted in by running processes, in GiB. This is the
+# part a new load genuinely competes with.
+anon_gib() {
+  awk '/Pages active:/ { gsub(/\./,"",$NF); printf "%.1f", $NF * 16384 / 1073741824 }' \
+    < <(vm_stat 2>/dev/null) 2>/dev/null || echo "?"
+}
+
+# Kept as a name callers already use; now means "available", not "untouched".
+free_gib() { available_gib; }
 
 swap_used_mb() {
   sysctl -n vm.swapusage 2>/dev/null |
@@ -157,10 +205,15 @@ case "$cmd" in
     s="$(swap_used_mb)"
     printf 'gpu: %s\n' "$h"
     printf 'queue: %s waiting\n' "$n"
-    printf 'memory: %s GiB free, %s MiB swap used\n' "$f" "$s"
-    # A load needs ~15 GiB; say so before the OOM rather than after.
-    if [ "$f" != "?" ] && awk "BEGIN{exit !($f < 16)}" 2>/dev/null; then
-      printf 'warning: below the ~16 GiB a model load needs; loading now risks a swap storm\n'
+    printf 'memory: %s GiB available (reclaimable), %s GiB in use by processes, %s MiB swap\n' \
+      "$f" "$(anon_gib)" "$s"
+    # A load needs ~12 GiB of resident weights plus scratch. Available memory is
+    # the right thing to compare against, NOT "Pages free": the weight file's
+    # own pages are file cache and come straight back when a load faults them in.
+    if [ "$f" != "?" ] && awk "BEGIN{exit !($f < 11)}" 2>/dev/null; then
+      printf 'warning: only %s GiB available; a model load needs ~12 GiB and will swap\n' "$f"
+    else
+      printf 'ok: enough available memory for a model load\n'
     fi
     ;;
 
@@ -198,8 +251,8 @@ case "$cmd" in
         sleep "$HEARTBEAT"
         h="$(holder)"
         [ "$h" = "free" ] && break
-        printf 'gpuq: still waiting (#%s), free=%s GiB, holder: %s\n' \
-          "$(position)" "$(free_gib)" "$h" >&2
+        printf 'gpuq: still waiting (#%s), %s GiB available, holder: %s\n' \
+          "$(position)" "$(available_gib)" "$h" >&2
       done
     ) &
     hb=$!
