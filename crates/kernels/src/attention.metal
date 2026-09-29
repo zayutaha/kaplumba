@@ -733,7 +733,8 @@ static void attention_gqa_body(
     constant AttentionParams &params,
     uint tid,
     uint tgid,
-    threadgroup float *wbuf) {
+    threadgroup float *wbuf,
+    threadgroup float *qfbuf) {
     static_assert(HEAD_DIM % 256 == 0, "HEAD_DIM must be a multiple of 32 * 8");
     // -FLT_MAX/2 rather than -inf, exactly as llama.cpp does: it keeps
     // `m_old - m` finite for a fully dead tile, so `exp()` can never return NaN
@@ -780,6 +781,27 @@ static void attention_gqa_body(
     // whole threadgroup column: no lane ever needs another's copy.
     float m = NEG;
     float s = 0.0f;
+
+    // Hoist Q's half->float conversion out of the per-key loop. `qrow` is
+    // loop-invariant -- it is this threadgroup's single query row -- yet the
+    // scalar QK loop reloaded and reconverted all HEAD_DIM of it for every
+    // key, which is half of the loop's instructions and the single largest
+    // term in it. All 32 lanes want the same row, so one threadgroup copy,
+    // converted once, is read back as plain floats. The values and the
+    // accumulation order into `dot` are unchanged, so this is bit-exact.
+    threadgroup float *qf = qfbuf + sg * uint(HEAD_DIM);
+    for (int c = int(lane); c < HEAD_DIM / 4; c += 32) {
+        const uint2 qraw = *reinterpret_cast<const device uint2 *>(qrow + 4 * c);
+        const float2 h0 = unpack_half2(qraw.x);
+        const float2 h1 = unpack_half2(qraw.y);
+        qf[4 * c + 0] = h0.x;
+        qf[4 * c + 1] = h0.y;
+        qf[4 * c + 2] = h1.x;
+        qf[4 * c + 3] = h1.y;
+    }
+    // Barrier-safe: an inactive simdgroup writes its own (unused) slot and
+    // must not return early, or the threads below strand here.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
     threadgroup float *my_weights = wbuf + sg * 32u;
 
     uint phase = 0u;
@@ -801,17 +823,16 @@ static void attention_gqa_body(
             float dot = 0.0f;
             for (int i = 0; i < HEAD_DIM / 4; ++i) {
                 const uint2 kraw = *reinterpret_cast<const device uint2 *>(krow + 4 * i);
-                const uint2 qraw = *reinterpret_cast<const device uint2 *>(qrow + 4 * i);
                 const float2 kh0 = unpack_half2(kraw.x);
                 const float2 kh1 = unpack_half2(kraw.y);
-                const float2 qh0 = unpack_half2(qraw.x);
-                const float2 qh1 = unpack_half2(qraw.y);
+                const float4 qv =
+                    *reinterpret_cast<const threadgroup float4 *>(qf + 4 * i);
                 // Accumulated in d order, so this dot product is bit-identical
                 // to the 256-wide scalar loop it replaces.
-                dot += qh0.x * kh0.x;
-                dot += qh0.y * kh0.y;
-                dot += qh1.x * kh1.x;
-                dot += qh1.y * kh1.y;
+                dot += qv.x * kh0.x;
+                dot += qv.y * kh0.y;
+                dot += qv.z * kh1.x;
+                dot += qv.w * kh1.y;
             }
             score = dot * params.scale;
         }
@@ -951,9 +972,10 @@ static void attention_decode_combine_body(
         uint tid [[thread_position_in_threadgroup]],                           \
         uint tgid [[threadgroup_position_in_grid]]) {                          \
         threadgroup float wbuf[2 * (NSG) * 32];                                \
+        threadgroup float qfbuf[(NSG) * (HEAD_DIM)];                           \
         attention_gqa_body<HEAD_DIM, NSG, false>(queries, keys, values,        \
             query_positions, key_positions, output, (device float *)output,    \
-            params, tid, tgid, wbuf);                                          \
+            params, tid, tgid, wbuf, qfbuf);                                   \
     }
 
 // Decode: same body, one workgroup per (split, kv head), partial output. The
@@ -971,9 +993,10 @@ static void attention_decode_combine_body(
         uint tid [[thread_position_in_threadgroup]],                           \
         uint tgid [[threadgroup_position_in_grid]]) {                          \
         threadgroup float wbuf[2 * (NSG) * 32];                                \
+        threadgroup float qfbuf[(NSG) * (HEAD_DIM)];                           \
         attention_gqa_body<HEAD_DIM, NSG, true>(queries, keys, values,         \
             query_positions, key_positions, (device half *)partials, partials, \
-            params, tid, tgid, wbuf);                                          \
+            params, tid, tgid, wbuf, qfbuf);                                   \
     }
 
 #define KAPLUMBA_FA_COMBINE(NAME, HEAD_DIM)                                    \
