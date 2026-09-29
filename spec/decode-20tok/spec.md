@@ -1,5 +1,11 @@
 # Push decode from 1.18 to 20+ tok/s
 
+> **SUPERSEDED by `spec/decode-19tok/`.** The baseline and roofline in
+> this document are both wrong: decode is 8.1 tok/s (not 1.18) and the
+> roofline is 16.7 tok/s (not 22.6), because 273 GB/s is arithmetic and
+> the measured ceiling is ~220 GB/s. Kept for the reasoning and the
+> reference findings, not for its numbers.
+
 ## The problem, stated exactly
 
 Decode runs at **1.18 tok/s**, about **850 ms per token**. The target is 20+.
