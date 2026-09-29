@@ -139,3 +139,47 @@ section of `implementation_notes.md` that explains why.
       Probably the machine-level shift flagged in notes §8.3; unconfirmed.
 - [ ] **T12 — Fix the stale test doc comment** at `linear_metal.rs:745-753`
       (see `spec.md` Q11). Trivial, but it will mislead the next reader.
+
+---
+
+## Session 2026-09-29: converged search + memory accounting
+
+- [x] **M1 — Register-pipelined dequant.** `1b5de3c`. 77.8 -> 81.3 tok/s @614.
+      Bit-identical, 20/20 suites, 5/5 prompts.
+- [x] **M2 — Hoist Q's conversion out of the per-key attention loop.**
+      `fc474ff`. 73.7 -> 75.0 tok/s @8192. Bit-exact, no change at 614.
+- [x] **M3 — Stop reporting `ru_maxrss` as a footprint.** `ee14f62`. Renamed to
+      `peak_resident_pages_bytes`, documented the measured 6.23 vs 11.69 GiB
+      pair, fixed the dangling `measure_footprint_with_time` reference, and
+      recorded that the `task_info` FFI has been tried twice and rejected.
+- [x] **M4 — Fix `scripts/gpuq holder()` naming dead pids.** `ee14f62`. Stale /
+      live / missing-lock cases all verified.
+- [x] **M5 — Correct the budget 12 -> 14 GiB** in AGENTS.md §10.1/§10.2/§10.3
+      and the `gpuq` warning, and add the §10.3 warning against reading
+      `peak_resident_pages_bytes` as a footprint.
+- [x] **M6 — Establish where the 1.5 GiB context delta goes.** No leak: 11.696
+      GiB @622 -> 12.963 GiB @8126, with 1038 and 1630 byte-identical. KV growth
+      + sliding-window fill + scratch + a ~0.25-0.5 GiB driver Metal residual.
+- [x] **M7 — Rule out the sliding-KV "333 MiB waste".** Not waste: the sliding
+      caches ring, so the full 1024 window is required from the start, and
+      untouched buffers charge ~0.016 MiB. No code change, deliberately.
+- [x] **M8 — Rule out the in-flight window as the residual.** 2 vs 8 at 7814 tok
+      is 23 MiB at no speed cost. The window is saturated at 8 and the bulk of
+      the residual is committed-then-released buffers, which A14 showed cannot be
+      batched without a 0.913x regression.
+- [x] **M9 — Record the negative results** in `implementation_notes.md` so the
+      closed questions (8 accumulators, KCHUNK, dequant cost, host overhead,
+      14.79 TFLOPS, fp8, repacking, page faults, Metal pipelines, Q_TILE) are not
+      re-litigated. Includes corrections to the earlier KV arithmetic.
+- [ ] **T13 — Fix the nondeterminism.** AGENTS.md §8 requires greedy-identical;
+      14 runs give 13 identical and 1 outlier. **Live violation. Not fixed.**
+- [ ] **T14 — Build a quality gate that can see 2e-3.** `output_identity.rs` is
+      `#[ignore]`d, 160 tokens total, tolerance 2e-2 vs 2.16e-3 actual. Replace
+      with a 16-prompt logit fingerprint + 12x256 exact text + 5x determinism.
+- [ ] **T15 — Land and verify `decode-matvec-k3`** (`e360769`, on that branch;
+      bit-exact, 8.7 -> 9.3 tok/s, unverified against current HEAD).
+- [ ] **T16 — Cost the "less math" directions** for 120 tok/s: exploit the 12.51
+      bits of real per-weight value content. fp8 is confirmed absent on this
+      M4 Pro, so operand-narrowing is closed.
+- [ ] **T12 — Fix the stale test doc comment** at `linear_metal.rs:745-753`
+      (carried forward; still open).

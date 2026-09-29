@@ -225,7 +225,7 @@ These are global restrictions; any spec that conflicts with them must call the c
 
 ## 10. GPU access discipline (mandatory)
 
-**This box has 24 GiB of unified memory and the model needs 11.5-15 GiB. Two
+**This box has 24 GiB of unified memory and the model needs 11.7-13.0 GiB by measurement. Two
 concurrent model instances exceed physical memory.** That has already been
 measured in this repo: file-backed pages get evicted, which cost 3.9 GiB of swap
 and a collapse to ~1.4 tok/s (`crates/engine/src/weights.rs:1217`). It also
@@ -236,7 +236,7 @@ residency.
 
 | command | behaviour | when to use it |
 |---|---|---|
-| `scripts/gpuq status` | instant; prints holder, queue depth, available memory, and warns below the ~11 GiB a load needs | before anything that will load the model |
+| `scripts/gpuq status` | instant; prints holder, queue depth, available memory, and warns below the ~14 GiB a load needs | before anything that will load the model |
 | `scripts/gpuq try -- <cmd>` | runs the command; **the engine** decides. Exits **75** immediately if the GPU is busy | **the default.** Do analysis, then retry |
 | `scripts/gpuq run -- <cmd>` | same, but the engine blocks until free (use only when there is nothing else to do) | deliberate queueing |
 
@@ -257,7 +257,7 @@ that would have been useful meanwhile. Prefer `try` in a loop around
 ### 10.2 The rules
 
 1. **Check `gpuq status` before every model run.** Only act on its warning if it
-   reports under 11 GiB *available*; it reads `top`, not `vm_stat` (see §10.3).
+   reports under 14 GiB *available*; it reads `top`, not `vm_stat` (see §10.3).
 2. **One model process at a time, always.** The engine enforces this with a
    kernel `flock`, so it holds even when `gpuq` is bypassed — a stray direct run
    from a worktree is exactly the case that once held 11 GiB invisibly. A second
@@ -306,6 +306,27 @@ sysctl -n vm.swapusage
 
 There are 24 GiB of RAM and no discrete GPU. The earlier 32 GiB figure recorded
 in some notes is wrong.
+
+**Do not read `--metrics peak_resident_pages_bytes` as a memory footprint.** It
+is `getrusage().ru_maxrss`, which counts resident pages only and misses the
+Metal buffer pages entirely. Measured on the same run at 614 tokens, by
+`/usr/bin/time -l`:
+
+```text
+peak_resident_pages_bytes    6 691 717 120  =  6.23 GiB
+peak memory footprint       12 555 691 320  = 11.69 GiB
+```
+
+and at 8192 tokens the footprint reaches ~12.96 GiB. The field was renamed from
+`peak_rss_bytes` in `ee14f62` precisely so it cannot be misread again; it
+understated real usage by 5.5 GiB and made a 93%-of-budget situation look like
+57%. The budget figure is `phys_footprint`, which only the OS will report, via
+`/usr/bin/time -l` (see `crates/engine/tests/memory_proof.rs`). A hand-rolled
+`task_info` FFI has been attempted twice and rejected twice: `libc` exports
+neither `TASK_VM_INFO` nor `task_vm_info_data_t`, and the struct has grown
+across macOS releases so the `phys_footprint` offset is unstable and returns
+garbage. A guessed offset yields a plausible wrong number, which is the worst
+possible failure for the metric the memory budget is judged on.
 
 Prefill is the throughput metric that matters most and it is measured
 end-to-end:

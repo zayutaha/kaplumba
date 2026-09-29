@@ -1026,7 +1026,7 @@ and at 128-row granularity the waste is `(-tokens) mod 128` by construction.
 | 512 | 71.97 (71.52-72.21) | 7.90 GiB | -- | -- |
 | **1024 (after)** | **77.79 (77.55-78.23)** | **8.01 GiB** | **74.57 (74.30-74.59)** | **7.91 GiB** |
 
-+10.2% at 614, +7.5% at 7814. Scratch 93 MB -> 372 MB, and `peak_rss_bytes` is
++10.2% at 614, +7.5% at 7814. Scratch 93 MB -> 372 MB, and `peak_resident_pages_bytes` is
 flat-to-+160 MB, so the 12 GiB budget is untouched: the extra scratch displaces
 file cache, not the 15.5 GB of weights. 2048 was rejected -- 743 MB of scratch
 for no measured gain once the grid is already 1344 threadgroups.
@@ -1099,5 +1099,180 @@ instead of 7 at 7814, and 0 for any prompt up to 1024 tokens.
 - `scripts/ab.sh` / `scripts/dec.sh` / `scripts/prof.sh` / `scripts/bisect.sh` in
   the throwaway worktree implement "on 75, discard the cell and carry on".
   `scripts/prof.sh <chunk> <reps> <size>` is the one to reuse: it prints
-  `chunks=`, `prefill_tok_s`, `peak_rss_bytes`, summed GEMM ms, and the per-chunk
+  `chunks=`, `prefill_tok_s`, `peak_resident_pages_bytes`, summed GEMM ms, and the per-chunk
   GEMM breakdown in one line per run.
+
+---
+
+## 2026-09-29: the search converged, and it converged against 120 tok/s
+
+Prefill went 77.8 -> **81.3** at 614 and 73.7 -> **75.0** at 8192 this session.
+More importantly, six research angles came back negative and the reasons are now
+recorded, because they close the largest open questions in the project.
+
+### Landed
+
+- `1b5de3c` — register-pipelined dequant (`linear_gemm_mma_regpipe`).
+  `linear_gemm_mma` alternated dequant / barrier / MMA / barrier inside one
+  threadgroup, and both barriers are load-bearing for the single 9216 B `bstage`,
+  so the ALU and tensor phases never coexisted in time. A second `bstage` cannot
+  fix that: `simdgroup_multiply_accumulate` is a 32-lane collective, so all 8
+  simdgroups must enter together. Each thread already decodes its OWN 16 weights
+  per chunk and those fit in 16 registers, so writing them to registers instead
+  of `bstage` gives one barrier per chunk and puts `{ MMAs; dequant }` in one
+  basic block with no memory dependency. Bit-identical (SHA f3508d3a31537325);
+  `bstage` unchanged so occupancy is unaffected. Defaults on for folded-MCG
+  (rate 3 + Mcg, i.e. every projection here); `KAPLUMBA_NO_REGPIPE=1` falls back.
+  **Caveat on the win:** an ablation attributes only 1.8% of it to the actual
+  overlap and ~3.6% to the barrier reduction. The overlap is not the win.
+- `fc474ff` — hoisted Q's half->float conversion out of the per-key attention
+  loop. `qrow` is loop-invariant (one query row per threadgroup) but was reloaded
+  and reconverted for every key, which was half the loop's instructions. All 32
+  lanes want the same row, so it is converted once into threadgroup memory and
+  read back as floats. Bit-exact by construction. +2% at 8k, nothing at 614,
+  which is what the cost model predicts (attention is 5.4% of prefill at 614 and
+  26.1% at 8k).
+
+### Closed negatively — do not re-litigate these
+
+- **8 accumulators instead of 16: 0.944x, slower.** The premise was wrong, not
+  just the result. At 614 tokens the dispatch is 1680 threadgroups on 20 cores =
+  **84 per core**, so any 3-vs-4 residency cap is oversubscribed ~20x and can
+  never bind. A probe found no knee at 3 or 4 and no sensitivity to +-32 dummy
+  registers. The `+92.6%` for 16->8 chains came from a microbenchmark with 84
+  groups/core of nothing else to compete with. Occupancy was never the limit.
+  Tail-waste premise was also inverted: a 64-row tile never wastes more than a
+  128-row one (both round 614 up to 640; at 7814 the 64-row tile is better).
+- **`KCHUNK` sweep 16/32/64/128/256: 64 is optimal.** 16 and 32 are ~2.5-4.5%
+  slower, 128 is free at 614 but -7.5% at 8k (1 group/core), and 256 is
+  impossible: `bstage` would be 36 864 B against a 32 768 B device maximum.
+  `OUTS` 32 is -8%, `OUTS` 128 is +1.4% at 8k only. Question closed.
+- **The MCG dequant is free; "46.6%" was an artifact.** Isolated properly, the
+  entire decode is 0.303 ms and the fetch-kept-alive-no-decode arm is 0.298 ms.
+  The 0.18 ms that "removing" the decode appeared to save was the *trellis word
+  fetch* being dead-coded away, not arithmetic. In the real kernel, deleting all
+  dequant math makes it **4.4% slower**. Real ratio is ~1.4 ALU/MMA, and +8
+  injected ops per weight costs only 4.5%. The codebook is folded: there is no
+  select and no table.
+- **No host submission overhead exists to remove.** The 1.42 s "stall" is not a
+  stall. Per-dispatch host cost is **0.60 us**; 99.78% of wall is
+  `wait_until_completed` on the 9th rolled buffer, which is correct
+  back-pressure. Raising the in-flight window from 8 to 16 changed nothing
+  (20.9-22.3 vs 22.1-23.1, i.e. noise), which is the decisive test: if there were
+  really 19% dead time a deeper queue would have absorbed it. The overlap is
+  already maxed. An earlier "GPU idle 18.5-19.9%" was a measurement artifact.
+  Batching into fewer, larger command buffers is 0.913x -- the stall grows with
+  work per buffer.
+- **The MMA ceiling is not 14.79 TFLOPS.** That number (from a
+  structure-matched 16-chain issue probe) disagrees by ~19x with another
+  structure-matched probe reading 0.79 on the real tile shape, and A13's
+  ablation puts MMAs at 99.5% of kernel time. Three agents had converged on 7.93
+  (a low-chain-count artifact) before this. **The 14.79 is the number that
+  produced the "~123 tok/s ceiling" and it does not survive contact.** Treat the
+  prefill GEMM as near its achievable issue rate and stop promising 120 from
+  this shape.
+- **fp8 does not exist on this M4 Pro.** `float8_t_e4m3`/`e5m2` fail as
+  *undeclared identifier* as scalar, matrix, 16x16, mixed accumulator, and even
+  `as_type<char4>` — the types are absent from the stdlib, not an operand-width
+  error. No 2x is reachable via precision. `simdgroup_float8x8` exists but is a
+  half alias. The 7.01 vs 7.93 penalty is a *narrow accumulator*, not a narrow
+  operand, so half accumulators are not a register saving.
+- **Repacking the weights can never reduce bytes.** 410 tensors sit at exactly
+  3.000 bits/value (43 352 064 / 451 584 = 96 B/tile) and lm_head at 6.000. The
+  3.04->3.35 effective-bpw gap is bf16 embed_tokens + scales + lm_head at 6 bpw,
+  not padding. The kernel calls `decode_state(s & 0xffff, ...)` on the FULL 16-bit
+  window, never masked to the rate: 14 490 distinct states -> 7 103 distinct
+  values, 12.51 bits of real content against 3.000 bits paid. `exl3_decode8` has
+  24/24 distinct words across 32 lanes, i.e. 100% of a tile with zero inter-lane
+  overlap, so the 4x is intra-L1 within a 96 B working set and DRAM is already
+  optimal.
+- **Page faults during decode are irrelevant** (20/token, 0.003% of 12.06 GB;
+  236 547 major faults are the one-off load). The layer trellis is *dirty*
+  anonymous arena (11 GB, `SM=SHM PURGE=N`), so it is compressible and evictable
+  but not free. Full residency is rejected on measurement: decode 8.70/8.93/8.99
+  (default) vs 7.59/8.31/8.80 (resident), prefill 2.5-4.3x slower, +3.55 GiB.
+- **Metal pipeline caches cost nothing.** All 68 pipelines plus 4 `include_str!`
+  libraries total **6.97 MiB**; compilation is out-of-process
+  (`MTLCompilerService`) with zero load-time transient (peak 9.4 MiB during
+  load, 43+8+12 = 63 ms warm).
+- **Widening the attention query tile does not work.** Q_TILE=2 is 0.87, =4 is
+  0.88, =8 is 0.98 (spills). It trades K/V bytes for *more* Q bytes and more PV
+  work. A persistent-tile estimate of 26.8 s -> 8-11 s (+15-18%) is not reachable
+  this way. Attention at 8k is instead bound by the per-lane serial QK loop
+  being instruction-bound on ~2 `cvt.f32.f16` per FMA (57% cvt / 29% FMA / 14%
+  loads) — which is what `fc474ff` attacked.
+
+### Measurement traps hit this session, all now documented
+
+- **`peak_resident_pages_bytes` was wrong by 5.5 GiB** and is now `peak_resident_pages_bytes`
+  (`ee14f62`). See AGENTS.md §10.3. This is what made a 1.5 GiB
+  context-scaling question sound like there was several GB of slack.
+- **Untouched buffers are free.** A 354 MiB `ForwardScratch` that is allocated
+  but never written charges 0.016 MiB; at load the whole 840 MB KV cache was
+  uncharged. Footprint only appears on first write, so no static audit can
+  predict it and every "resident bytes" under-report is explained by this.
+- **The 1.5 GiB context delta is fully accounted for** and is not a leak:
+  11.696 GiB @ 622 tok -> 12.963 GiB @ 8126. 1038 and 1630 tokens are
+  byte-identical in both allocated and footprint, so there is no hidden O(L)
+  term beyond KV. Delta = KV growth (full layers 80->640 MiB) + sliding-window
+  fill as context passes 1024 (~312 MiB) + scratch (213->354 MiB) + a residual
+  ~0.25-0.5 GiB of driver-side Metal graphics regions that are not returned.
+- **Sliding-layer KV allocated at the full 1024 window is NOT waste.** The
+  sliding caches *ring* (`gpu_cache.rs:10,123-132`), so position 0 is evicted
+  once the ring wraps and the buffer genuinely needs its full window from the
+  start. Full-attention layers get grow-on-demand because they are not rings and
+  hold the whole context; sliding layers never grow, so the asymmetry is correct
+  and intentional. Combined with "untouched is free", the "333 MiB never
+  written" figure is worth approximately nothing.
+- **In-flight command buffers are not the residual.** `KAPLUMBA_MAX_IN_FLIGHT`
+  2 vs 8 at 7814 tok: 12.93 vs 12.95 GiB, i.e. 23 MiB for a 4x change in window,
+  at no speed cost (75.3 vs 75.6). ~5-7 MiB retained per buffer, consistent with
+  the earlier 34.75 MB -> ~5 MB measurement. The bulk of the residual is
+  committed-then-released buffers plus driver graphics regions, and A14 already
+  showed that batching them is 0.913x. Characterized, not fixable without a
+  speed regression.
+- **The in-flight window is saturated at 8**: 1 -> 18.7, 4 -> 21.1, 8 -> 22.1-23.1
+  tok/s on a short prompt, and 8 -> 12 -> 16 is noise. The 8 is right.
+- **`footprint` prints 3 significant digits** (`10 GB`, `120 MB`), so big
+  categories carry +-512 MiB of quantisation. An agent initially misread
+  `11 GB` as 11264 MiB and invented a 280 MiB phantom. Do not do byte-exact
+  cross-checks above ~1 GB from this tool.
+- **`scripts/gpuq holder()` named dead pids** as the GPU holder indefinitely
+  (`waiters()` pruned, `holder()` did not), so an agent reported the box busy
+  against a pid that had exited 20 s earlier. Fixed in `ee14f62`; all three cases
+  (stale / live / missing) verified.
+
+### Open, in priority order
+
+1. **Nondeterminism is a live AGENTS.md §8 violation.** 14 runs of the same
+   binary gave 13 identical outputs and 1 outlier, and that is recorded in
+   `1f11f47`'s own commit message. Greedy-identical is required. Not fixed.
+2. **The quality gate cannot detect a 2e-3 change.** `output_identity.rs` is
+   `#[ignore]`d, reads `lines().next()` for 32 tokens on 5 prompts (~160 tokens
+   total), and `MMA_TOLERANCE` is 2e-2 against 2.16e-3 actual, so a 9x
+   regression passes. Proposed replacement: a 16-prompt SHA-256 logit
+   fingerprint (262144 f16 row + top-8 pairs + top1-top2 margin), 12 prompts x
+   256 tokens exact-match, and 5x determinism per prompt in a fresh process. The
+   determinism arm fails today, correctly.
+3. **120 tok/s is not reachable from this implementation shape.** It needs less
+   math or fewer operands, not faster execution of the same math. The two
+   directions nobody has costed: exploiting the 12.51 bits of real per-weight
+   value content, and narrowing the B operand — though fp8 is confirmed absent
+   on this part, so that one is closed.
+4. **Attention at 8k.** A QK `simdgroup_matrix` rewrite is estimated 2.4x on
+   attention (+18% at 8k, +0.7% at 614) but is not bit-exact, and an 8x8
+   fragment needs 8 query rows = 128 accumulator registers per lane. Unbuilt.
+5. `decode-matvec-k3` is preserved on that branch (commit `e360769`, bit-exact,
+   measured 8.7 -> 9.3 tok/s) but is unlanded and unverified against current HEAD.
+
+### Corrections to earlier notes in this file
+
+- The KV arithmetic in §-history that assumed 16 KB/token x 60 layers =
+  0.98 MB/token is WRONG. The two layer types differ: sliding is 16 heads x 256 =
+  16 KB/token but capped at the 1024 window (800 MiB total, fixed), and
+  full-attention is 4 heads x 512 = 8 KB/token and grows (80 MiB -> 640 MiB at
+  8k). KV total is 880 MiB at 614 tok, not the ~2.1 GB or 8.05 GB implied.
+- `max_sequence_len` is a hardcoded 8192 (`model.rs:2284`), NOT the checkpoint's
+  `max_position_embeddings` of 262144.
+- The budget is **14 GiB** (AGENTS.md said 12 in several places; corrected in
+  `ee14f62` and the `gpuq` warning).
