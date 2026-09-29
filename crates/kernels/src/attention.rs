@@ -46,6 +46,24 @@ pub fn decode_splits(q_heads: usize, key_count: usize) -> usize {
     if q_heads == 0 || key_count == 0 {
         return 1;
     }
+    // MEASUREMENT KNOB. `KAPLUMBA_DECODE_SPLITS=N` pins the split count so the
+    // choice can be swept without a rebuild, which matters because the optimum
+    // is not the thread target: an isolated harness measured the full-attention
+    // layers (4 kv heads) at 8k running 1.91x faster at 12 splits than at 16,
+    // reproduced twice at 3 significant figures. The shipped thread target gives
+    // 16 for both layer shapes, and that is suspicious rather than established:
+    // it fixes the *thread* count at 16384 while the *workgroup* count then
+    // differs 4x between shapes (16 kv heads x 16 = 256 workgroups of 64
+    // threads, versus 4 x 16 = 64 workgroups of 256 threads), and 64 workgroups
+    // on 20 cores quantises badly. That is a hypothesis, not a measurement, so
+    // the default stays at the thread target until this is swept end to end.
+    if let Some(pinned) = std::env::var("KAPLUMBA_DECODE_SPLITS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|v| (1..=ATTENTION_SPLITS_MAX).contains(v))
+    {
+        return pinned;
+    }
     let wanted = ATTENTION_DECODE_THREADS_TARGET / (32 * q_heads.max(1));
     let affordable = key_count.div_ceil(ATTENTION_MIN_KEYS_PER_SPLIT);
     wanted.clamp(1, ATTENTION_SPLITS_MAX).min(affordable).max(1)
