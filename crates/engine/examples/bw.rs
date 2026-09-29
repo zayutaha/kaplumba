@@ -44,7 +44,15 @@ fn main() {
             }
         }
         let out = device.new_buffer(threads * 4, MTLResourceOptions::StorageModeShared);
-        let mut best = f64::MAX;
+        // Report MEDIAN as well as best. This probe reported min-of-passes, and
+        // min-of-passes on a shared box is not a peak, it is the one pass that
+        // happened to run while a competitor was idle: an agent watching this
+        // binary saw the mean rise 24.8 -> 80.6 GB/s over 180 s "competitors
+        // exiting", and best-swing 79.9 -> 230.5 while load *fell*. That
+        // selection effect is the most likely origin of the project's 248.5 GB/s
+        // figure, which sits above what NVIDIA's GB10 -- an identical
+        // 256-bit LPDDR5X-8533 part -- measures at 229-230 GB/s.
+        let mut times: Vec<f64> = Vec::new();
         for round in 0..10 {
             let cb = queue.new_command_buffer();
             let e = cb.new_compute_command_encoder();
@@ -61,14 +69,22 @@ fn main() {
             cb.commit();
             cb.wait_until_completed();
             if round >= 3 {
-                best = best.min(t.elapsed().as_secs_f64());
+                times.push(t.elapsed().as_secs_f64());
             }
         }
+        times.sort_by(|a, b| a.partial_cmp(b).expect("no NaN in timings"));
+        let best = *times.first().expect("at least one timed pass");
+        let median = times[times.len() / 2];
+        let worst = *times.last().expect("at least one timed pass");
         let gbps = bytes as f64 / best / 1e9;
+        let med_gbps = bytes as f64 / median / 1e9;
+        let worst_gbps = bytes as f64 / worst / 1e9;
         println!(
-            "  stream {gib:>2} GB: {gbps:>6.1} GB/s  ({:>4.0}% of 273)  -> {:.1} tok/s on 12.06 GB",
-            gbps / 273.0 * 100.0,
-            gbps / 12.06
+            "  stream {gib:>2} GB: med {med_gbps:>6.1} GB/s ({:>4.0}% of 273) -> {:>5.1} tok/s | \
+             best {gbps:>6.1} | worst {worst_gbps:>6.1} | spread {:>4.1}x",
+            med_gbps / 273.0 * 100.0,
+            med_gbps / 12.06,
+            best / worst
         );
     }
 }
