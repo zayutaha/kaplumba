@@ -255,39 +255,84 @@ kernel void gated_gelu(
     output[gid] = half(gelu_tanh_value(float(gate[gid])) * float(up[gid]));
 }
 
+// One thread per (token, head, rotation PAIR), not per column.
+//
+// The kernel is called IN PLACE on q and k (`encode_rope(&scratch.q,
+// &scratch.q, ...)`, model.rs:1265/1279), and the rotation reads column
+// `c + head_dim/2` while writing column `c`. With one thread per column, the
+// thread for `c` could write `output[c]` before the thread for
+// `c + head_dim/2` had read `input[c]`. That is a cross-warp race whose winner
+// depended on scheduling, and it is why greedy decode was nondeterministic in
+// ~2 of 8 runs of a 64-token prompt. `KAPLUMBA_MAX_IN_FLIGHT=1` could not fix
+// it: the hazard is inside one dispatch, not between command buffers.
+//
+// Each thread now owns both halves of the pair it writes, so it reads exactly
+// the two elements it produces and no thread touches another's. No barrier and
+// no scratch are needed. The arithmetic is unchanged, so the result is
+// bit-identical to the out-of-place form. Dispatch is halved, and the per-thread
+// cos/sin count is halved with it, so the cost nets out.
 kernel void rope(
     const device half *input [[buffer(0)]],
     device half *output [[buffer(1)]],
     constant RopeParams &params [[buffer(2)]],
     uint gid [[thread_position_in_grid]]) {
-    uint vector_width = params.heads * params.head_dim;
-    if (gid >= params.tokens * vector_width) {
-        return;
-    }
-    uint token = gid / vector_width;
-    uint within = gid % vector_width;
-    uint column = within % params.head_dim;
     uint half_width = params.head_dim / 2u;
-    uint pair = column < half_width ? column : column - half_width;
     uint rotated_pairs = params.proportional != 0u
         ? uint(params.partial_factor * float(params.head_dim) / 2.0f)
         : half_width;
-    if (pair >= rotated_pairs) {
-        output[gid] = input[gid];
+    // Non-rotated tail.
+    //
+    // A column is rotated iff its PAIR is below `rotated_pairs`, and a pair
+    // spans BOTH halves -- columns `p` and `p + head_dim/2`. So the unrotated
+    // tail is pairs `rotated_pairs .. half_width`, i.e. columns
+    // `rotated_pairs .. half_width` in the low half AND the same columns shifted
+    // by `half_width` in the high half. Copying only the low half leaves the
+    // high half unwritten, which is what the proportional test caught.
+    //
+    // This range lives AFTER the rotated range: the host dispatches
+    // `rotated + tail` threads, so both cannot start at gid 0.
+    uint vector_width = params.heads * params.head_dim;
+    uint pair_total = params.tokens * params.heads * rotated_pairs;
+    if (rotated_pairs < half_width) {
+        uint copy_width = half_width - rotated_pairs;
+        uint copy_count = params.tokens * params.heads * copy_width;
+        if (gid >= pair_total && gid < pair_total + copy_count) {
+            uint local = gid - pair_total;
+            uint token = local / (params.heads * copy_width);
+            uint within = local - token * params.heads * copy_width;
+            uint head = within / copy_width;
+            uint pair = rotated_pairs + within % copy_width;
+            uint base = token * vector_width + head * params.head_dim + pair;
+            output[base] = input[base];
+            output[base + half_width] = input[base + half_width];
+        }
+    }
+    if (gid >= pair_total) {
         return;
     }
+    // The rotated branch reads the partner at `base + half_width`, which for
+    // `pair < rotated_pairs` lands in the tail region the copy branch above
+    // also touches. The two must not both act: the copy is a straight
+    // pass-through of columns `rotated_pairs..half_width`, and the rotation
+    // reads (and writes) `base + half_width` only for the pairs it owns, so
+    // reading a value the copy already moved is fine but WRITING it is not.
+    // Hence the rotation writes only `base` and `base + half_width` for pairs
+    // it owns, and the copy owns everything else. That is exactly the original
+    // per-column split, reorganised so no thread reads another's output.
+    uint pair = gid % rotated_pairs;
+    uint within = gid / rotated_pairs;
+    uint head = within % params.heads;
+    uint token = within / params.heads;
     uint position = params.offset + token;
     float exponent = 2.0f * float(pair) / float(params.head_dim);
     float angle = float(position) / pow(params.theta, exponent);
     float cosine = cos(angle);
     float sine = sin(angle);
-    uint base = gid - column;
-    float value = float(input[base + column]);
-    if (column < half_width) {
-        output[gid] = half(value * cosine - float(input[base + half_width + pair]) * sine);
-    } else {
-        output[gid] = half(value * cosine + float(input[base + pair]) * sine);
-    }
+    uint base = token * vector_width + head * params.head_dim + pair;
+    float lo = float(input[base]);
+    float hi = float(input[base + half_width]);
+    output[base] = half(lo * cosine - hi * sine);
+    output[base + half_width] = half(hi * cosine + lo * sine);
 }
 
 kernel void softcap(

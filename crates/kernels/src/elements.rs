@@ -72,6 +72,45 @@ struct SoftcapParams {
     softcap: f32,
 }
 
+/// Threads the `rope` kernel needs: one per (token, head, rotation pair) over
+/// the rotated span, plus one per (token, head, column) over the non-rotated
+/// tail.
+///
+/// The kernel is one thread per PAIR, not per column. Both call sites must use
+/// this; when `rope()` dispatched `input.len()` and `encode_rope` dispatched
+/// something else, they disagreed and the proportional path failed.
+pub fn rope_threads(
+    tokens: usize,
+    heads: usize,
+    head_dim: usize,
+    partial_factor: f32,
+    proportional: bool,
+) -> Result<usize, KernelError> {
+    let half_width = head_dim / 2;
+    let rotated_pairs = if proportional {
+        ((partial_factor * head_dim as f32 / 2.0) as usize).min(half_width)
+    } else {
+        half_width
+    };
+    let rotated = checked_product(
+        tokens,
+        checked_product(heads, rotated_pairs, "RoPE rotated pair count")?,
+        "RoPE rotated thread count",
+    )?;
+    let tail = if rotated_pairs < half_width {
+        checked_product(
+            tokens,
+            checked_product(heads, half_width - rotated_pairs, "RoPE tail column count")?,
+            "RoPE tail thread count",
+        )?
+    } else {
+        0
+    };
+    rotated.checked_add(tail).ok_or_else(|| {
+        KernelError::InvalidInput("RoPE thread count overflowed".to_string())
+    })
+}
+
 #[derive(Clone, Copy)]
 pub struct RopeRequest<'a> {
     pub input: &'a [u16],
@@ -543,7 +582,7 @@ impl ElementKernels {
             &self.rope_pipeline,
             &[Some(&input_buffer), Some(&output)],
             params_bytes(&params),
-            input.len() as u64,
+            rope_threads(tokens, heads, head_dim, partial_factor, proportional)? as u64,
         )?;
         read_u16_buffer(&output)
     }
@@ -811,16 +850,17 @@ impl ElementKernels {
             partial_factor,
             proportional: u32::from(proportional),
         };
-        let threads = checked_product(
-            tokens,
-            checked_product(heads, head_dim, "RoPE head shape")?,
-            "RoPE element count",
-        )?;
+        // One thread per (token, head, rotation pair) for the rotated span, plus
+        // one per (token, head, column) for the non-rotated tail. The kernel
+        // derives the same split from `params`, so this only has to total the
+        // two, and both dispatch sites go through `rope_threads` so they cannot
+        // disagree -- which is exactly how the `rope()` helper and
+        // `encode_rope` drifted apart once already.
         encoder.dispatch_1d(
             &self.rope_pipeline,
             &[Some(input), Some(output)],
             params_bytes(&params),
-            threads as u64,
+            rope_threads(tokens, heads, head_dim, partial_factor, proportional)? as u64,
             64,
         )
     }

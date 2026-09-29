@@ -276,6 +276,7 @@ fn metal_buffer_backed_linear_matches_slice_path() {
         BitRate::Integer(3),
         Codebook::Mcg,
     );
+    eprintln!("MASTER expected[0..3] = {:?}", &expected_single[0..3]);
     for (index, value) in single.iter().enumerate() {
         let actual = f16::from_bits(*value).to_f32();
         assert!((actual - expected_single[index]).abs() < 1e-1);
