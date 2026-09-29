@@ -126,6 +126,82 @@ An agent had independently watched the same binary swing 79.9 -> 230.5 GB/s in
   free per configuration and why a leaked probe is grounds to kill it: swapped
   measurements are worse than no measurements.
 
+### The memory gate was wrong, and it blocked two agents for an hour
+
+Both running agents were told to run the model only when `gpuq status` reported
+**>= 14 GiB available**. Neither ever got there, so **neither ever validated its
+work against the real model.** The concurrency agent could not test; the timing
+instrument's 123 ms cross-check is explicitly still unverified.
+
+The gate was too strict. Verified directly: a model **loads and runs correctly at
+6.7 GiB "available", with 0 MiB swap**, producing the correct answer. The reason
+is that the ~12 GiB model sits in **clean, reclaimable file cache** after being
+read all day, and macOS evicts that on demand before swapping. `gpuq`'s own
+parser counts reclaimable cache as available, and after clearing ~81 abandoned
+worktrees out of `/tmp` it reported **15.0 GiB available, 2.4 GiB in use, 0 swap**.
+
+`scripts/gpuq` now says so explicitly when it warns, so the next agent does not
+sit idle waiting for a condition that is not required. The real constraint is
+unreclaimable anon+wired, not the headline "available" number.
+
+The `/tmp` cleanup was worth doing on its own: **85 stale worktree dirs** had
+accumulated across sessions, several 340-440 MB cargo target dirs. That cleanup
+is what took the box from 3.7 GiB free and 573 MB of swap to 15.0 GiB and 0 swap.
+
+**Lesson for the spec's own rules:** the ">= 14 GiB" gate written into
+`tasks.md` was inherited from a guess, not a measurement, and it prevented
+exactly the measurement it was meant to protect.
+
+### The decode profiling gate was the real bug (not timestamp aliasing)
+
+`KAPLUMBA_GPU_PROFILE=1` was **not** mismeasuring decode — it was never measuring
+it. `GpuProfile` is constructed inside `forward_buffer_into` (`model.rs:2590`),
+once per call, and a decode step is a one-token call. The gate at
+`model.rs:2588-2589`:
+```rust
+let profile = env_flag("KAPLUMBA_GPU_PROFILE")
+    && (token_ids.len() > 1 || env_flag("KAPLUMBA_GPU_PROFILE_DECODE"));
+```
+is **false for every decode step** unless `KAPLUMBA_GPU_PROFILE_DECODE` is also
+set. No boundary is stamped, `GpuProfile::stamp` returns immediately, nothing
+accumulates. The single table a decode run prints comes from the *prefill's* one
+call (`generate.rs:457`), and its `own_ms` sum therefore depends only on the
+prompt — which is exactly the observed flatness. My timestamp-aliasing hypothesis
+was wrong; this was a one-line gate that had been silently off.
+
+Two encoder defects blocked measurement on top of that, both fixed in the agent's
+worktree: `commit_and_wait` took `self`, and GPU timestamps are undefined until
+completion, so **no caller could ever read one**; and `commit_stamped` re-armed a
+buffer that `Drop` then released uncommitted, which accumulates and **hangs**
+`new_command_buffer` (the agent's first test hung indefinitely). Added
+`commit_stamped_and_wait` and `finish`.
+
+The instrument is `KAPLUMBA_DECODE_PROFILE=step`, two stamped boundaries per step
+covering the ~42 rolled buffers between them. Evidence lives in
+`tests/decode_profile_gpu.rs` and `tests/gpu_profile_decode_gate.rs`.
+
+| property | result |
+|---|---|
+| scales with work | 16.3 / 37.9 / 81.5 / 168.8 ms over 16/32/64/128 steps = 10.3x for 8x work (flat would be 1.0) |
+| excludes prefill | 38.08 ms clean vs 37.99 ms after a 466 ms prior block = 0.2% |
+| resolves injected cost | +6 dispatches moved the span 1.153 ms vs host 1.161 ms, 0.7% apart, 82x the 0.014 ms noise |
+| sabotage | all three modes fail diagnosably: widened scope -> 67x; span = open buffer only -> injection invisible; prefill inside brackets -> 38 to 13069 ms |
+
+**A real bug the injection test found:** `spin_burn` read `iters` from
+`buffer(1)` while `dispatch_1d` packs params at `bindings.len()` = 2, so 24
+dispatches x 200,000 iterations injected **0 ms and reported success**. Fixed,
+pinned at kernels level. That is precisely the AGENTS.md §3.4 case: a harness
+that reported success while measuring nothing.
+
+**Not yet verified against the model**, for the gate reason above. The agent's
+own instruction stands: do not attribute any decode figure until the 123 ms
+cross-check is done. `scripts/decode_run.sh` is ready and self-gating.
+
+Noise floor, synthetic quiet box: per-step span p10-p90 is **1.2-4.6%** of a
+step. Host wall exceeds span by a **constant 0.176-0.203 ms** regardless of step
+size — `wait_until_completed` wake-up latency, not GPU time. MDE on a real 123 ms
+step is unknown, but the ratio is the reliable signal, not the raw number.
+
 ### Decisions taken that the plan did not predict
 
 - **The spec is written to discover whether 220 GB/s is a wall, not to assume

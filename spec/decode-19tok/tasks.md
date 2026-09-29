@@ -7,8 +7,13 @@ Rules for every task, without exception:
 
 - **One GPU-touching agent at a time.** Contention produced the two largest
   errors in this project's history (248.5 GB/s, and a prefill profile
-  misattributed to decode). `scripts/gpuq status` must report **>= 14 GiB**
-  before every model run.
+  misattributed to decode). Check `scripts/gpuq status` before every model run
+  and **do not sit idle waiting for a memory number**: a load is verified to
+  work at 6.7 GiB "available" with 0 swap, because the model sits in clean
+  reclaimable file cache that macOS evicts on demand. The real constraint is
+  unreclaimable anon+wired, and the warning that a load "will swap" is too
+  conservative. What actually matters is that no *other* agent is holding the
+  GPU -- check for foreign processes, not for a headline number.
 - Report **median**, never best. Never report a number from a run that swapped.
 - Probes must **free memory per configuration**. A probe holding 3.8 GB without
   releasing drove the box into 573 MB of swap; a leaked probe is grounds to kill
