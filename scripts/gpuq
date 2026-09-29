@@ -106,11 +106,22 @@ swap_used_mb() {
 # a status command. It can be a second out of date; that is acceptable, because
 # the engine re-checks for real.
 holder() {
-  if [ -s "$LOCK" ]; then
-    head -1 "$LOCK" 2>/dev/null | tr -d '\n'
-  else
-    echo "unknown"
+  [ -s "$LOCK" ] || { echo "unknown"; return; }
+  local line pid
+  line=$(head -1 "$LOCK" 2>/dev/null | tr -d '\n')
+  # A crashed or finished engine leaves its last line behind, because this file
+  # is advisory and nobody removes it on exit. Reporting a dead pid as the GPU
+  # holder then misleads the next reader into thinking the box is busy -- which
+  # is exactly what happened: an agent reported "blocked, exit 75" against a pid
+  # that had exited twenty seconds earlier. `waiters` already prunes dead pids on
+  # read; this does the same, and says plainly that the line is stale instead of
+  # printing a pid that is not there.
+  pid=$(printf '%s\n' "$line" | sed -n 's/.*(pid \([0-9][0-9]*\)).*/\1/p')
+  if [ -n "$pid" ] && ! kill -0 "$pid" 2>/dev/null; then
+    echo "none (stale lock, pid $pid is gone)"
+    return
   fi
+  printf '%s\n' "$line"
 }
 
 # Live waiters, in arrival order. Dead pids are pruned on read so a crashed

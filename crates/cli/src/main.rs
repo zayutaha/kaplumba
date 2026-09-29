@@ -67,12 +67,12 @@ fn run() -> Result<(), String> {
         )
         .map_err(|error| error.to_string())?;
         println!(
-            "benchmark prefill_tok_s={:.3} decode_tok_s={:.3} measured_tokens={} warmup_steps={} peak_rss_bytes={} load_ms={:.3}",
+            "benchmark prefill_tok_s={:.3} decode_tok_s={:.3} measured_tokens={} warmup_steps={} peak_resident_pages_bytes={} load_ms={:.3}",
             result.prefill_tokens_per_second,
             result.decode_tokens_per_second,
             result.measured_tokens,
             result.warmup_steps,
-            result.peak_rss_bytes,
+            result.peak_resident_pages_bytes,
             load_ms
         );
         return Ok(());
@@ -112,7 +112,7 @@ fn run() -> Result<(), String> {
             ttft_ms: result.ttft_ms,
             prefill_tokens_per_second: result.prefill_tokens_per_second,
             decode_tokens_per_second: result.decode_tokens_per_second,
-            peak_rss_bytes: measure_rss().unwrap_or(0),
+            peak_resident_pages_bytes: measure_rss().unwrap_or(0),
         };
         println!("{}", report::format_metrics(&result, metrics));
     }

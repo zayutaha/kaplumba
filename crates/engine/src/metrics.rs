@@ -18,7 +18,7 @@ pub enum MetricsError {
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-/// Memory note: `peak_rss_bytes` is `ru_maxrss`, i.e. resident pages only. On
+/// Memory note: `peak_resident_pages_bytes` is `ru_maxrss`, i.e. resident pages only. On
 /// this engine it reads ~7.0 GiB while the kernel charges ~15.7 GiB, because
 /// Metal buffer pages are not counted as resident. The budget-relevant figure
 /// is `phys_footprint` (Activity Monitor "Memory"), which must be measured
@@ -30,7 +30,7 @@ pub struct RunMetrics {
     pub decode: Duration,
     pub prefill_tokens: u64,
     pub decode_tokens: u64,
-    pub peak_rss_bytes: u64,
+    pub peak_resident_pages_bytes: u64,
 }
 
 impl RunMetrics {
@@ -87,7 +87,7 @@ pub struct BenchmarkResult {
     pub decode_tokens_per_second: f64,
     pub measured_tokens: usize,
     pub warmup_steps: usize,
-    pub peak_rss_bytes: u64,
+    pub peak_resident_pages_bytes: u64,
 }
 
 pub fn measure_rss() -> Result<u64, MetricsError> {
@@ -117,7 +117,7 @@ pub fn benchmark_result(
         decode_tokens_per_second: metrics.decode_tokens_per_second(),
         measured_tokens: plan.measured_tokens,
         warmup_steps: plan.warmup_steps,
-        peak_rss_bytes: metrics.peak_rss_bytes,
+        peak_resident_pages_bytes: metrics.peak_resident_pages_bytes,
     })
 }
 
@@ -138,6 +138,18 @@ fn rate(tokens: u64, duration: Duration) -> f64 {
 /// offset is not stable and the query returned garbage. `getrusage().ru_maxrss`
 /// is also unsuitable because it counts resident pages only and under-reports a
 /// Metal engine. See `measure_footprint_with_time`.
+/// Peak CPU-resident pages (`getrusage().ru_maxrss`) -- NOT the memory budget.
+///
+/// A hand-rolled `task_info` FFI for `phys_footprint` was tried TWICE and
+/// rejected both times: `task_vm_info_data_t` has grown across macOS releases,
+/// so the field offset is not stable and the query returns garbage. `libc` does
+/// not export `TASK_VM_INFO` or `task_vm_info_data_t` at all, so any such
+/// attempt means hand-writing the struct and guessing the offset -- which
+/// produces a plausible wrong number, the worst possible failure for a metric
+/// used to judge a memory budget.
+///
+/// The correct figure is obtained by wrapping the process in `/usr/bin/time -l`
+/// and reading `peak memory footprint`; see `crates/engine/tests/memory_proof.rs`.
 pub fn measure_footprint_note() -> &'static str {
-    "use /usr/bin/time -l 'peak memory footprint' (see spec notes)"
+    "use /usr/bin/time -l 'peak memory footprint' (see crates/engine/tests/memory_proof.rs)"
 }

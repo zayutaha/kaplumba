@@ -11,7 +11,7 @@ fn metrics_rates_and_benchmark_plan_are_deterministic() {
         decode: Duration::from_secs(4),
         prefill_tokens: 100,
         decode_tokens: 40,
-        peak_rss_bytes: 123,
+        peak_resident_pages_bytes: 123,
         ..RunMetrics::default()
     };
     assert!((metrics.prefill_tokens_per_second() - 50.0).abs() < 1e-9);
@@ -24,7 +24,7 @@ fn metrics_rates_and_benchmark_plan_are_deterministic() {
     let result = benchmark_result(metrics, plan).unwrap();
     assert_eq!(result.measured_tokens, 128);
     assert_eq!(result.warmup_steps, 8);
-    assert_eq!(result.peak_rss_bytes, 123);
+    assert_eq!(result.peak_resident_pages_bytes, 123);
 }
 
 #[test]

@@ -359,7 +359,7 @@ pub fn run_benchmark(
         decode,
         prefill_tokens: prompt_ids.len() as u64,
         decode_tokens: plan.measured_tokens as u64,
-        peak_rss_bytes: measure_rss()?,
+        peak_resident_pages_bytes: measure_rss()?,
         ..RunMetrics::default()
     };
     Ok(benchmark_result(metrics, plan)?)
