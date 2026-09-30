@@ -48,6 +48,15 @@ struct NormParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct NormScaleParams {
+    rows: u32,
+    width: u32,
+    eps: f32,
+    scale: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct RopeParams {
     tokens: u32,
     heads: u32,
@@ -156,6 +165,8 @@ pub struct ElementKernels {
     /// for why the per-row variants collapse at `rows == 1`.
     rms_norm_weighted_tg_pipeline: ComputePipelineState,
     rms_norm_unweighted_tg_pipeline: ComputePipelineState,
+    rms_norm_residual_tg_pipeline: ComputePipelineState,
+    rms_norm_residual_layer_scale_tg_pipeline: ComputePipelineState,
     /// Greedy pick, so the decode loop can stay on the GPU between steps.
     greedy_pick_pipeline: ComputePipelineState,
     greedy_token_pipeline: ComputePipelineState,
@@ -237,6 +248,9 @@ impl ElementKernels {
         let rms_norm_weighted_tg_pipeline = pipeline(&device, &library, "rms_norm_weighted_tg")?;
         let rms_norm_unweighted_tg_pipeline =
             pipeline(&device, &library, "rms_norm_unweighted_tg")?;
+        let rms_norm_residual_tg_pipeline = pipeline(&device, &library, "rms_norm_residual_tg")?;
+        let rms_norm_residual_layer_scale_tg_pipeline =
+            pipeline(&device, &library, "rms_norm_residual_layer_scale_tg")?;
         let greedy_pick_pipeline = pipeline(&device, &library, "greedy_pick")?;
         let greedy_token_pipeline = pipeline(&device, &library, "greedy_token")?;
         let residual_pipeline = pipeline(&device, &library, "residual_add")?;
@@ -260,6 +274,8 @@ impl ElementKernels {
             rms_norm_unweighted_pipeline,
             rms_norm_weighted_tg_pipeline,
             rms_norm_unweighted_tg_pipeline,
+            rms_norm_residual_tg_pipeline,
+            rms_norm_residual_layer_scale_tg_pipeline,
             greedy_pick_pipeline,
             greedy_token_pipeline,
             residual_pipeline,
@@ -661,6 +677,70 @@ impl ElementKernels {
             params_bytes(&params),
             rows as u64,
             64,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_rms_norm_residual(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        input: &Buffer,
+        weight: &Buffer,
+        residual: &Buffer,
+        output: &Buffer,
+        rows: usize,
+        width: usize,
+        eps: f32,
+    ) -> Result<(), KernelError> {
+        if rows == 0 || width == 0 || !eps.is_finite() || eps <= 0.0 {
+            return Err(KernelError::InvalidInput(
+                "RMSNorm dimensions must be non-zero and eps finite and positive".to_string(),
+            ));
+        }
+        let params = NormParams {
+            rows: to_u32(rows, "row count")?,
+            width: to_u32(width, "norm width")?,
+            eps,
+        };
+        encoder.dispatch_groups(
+            &self.rms_norm_residual_tg_pipeline,
+            &[Some(input), Some(weight), Some(residual), Some(output)],
+            params_bytes(&params),
+            rows as u64,
+            Self::NORM_GROUP_THREADS,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_rms_norm_residual_layer_scale(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        input: &Buffer,
+        weight: &Buffer,
+        residual: &Buffer,
+        output: &Buffer,
+        rows: usize,
+        width: usize,
+        eps: f32,
+        scale: f32,
+    ) -> Result<(), KernelError> {
+        if rows == 0 || width == 0 || !eps.is_finite() || eps <= 0.0 {
+            return Err(KernelError::InvalidInput(
+                "RMSNorm dimensions must be non-zero and eps finite and positive".to_string(),
+            ));
+        }
+        let params = NormScaleParams {
+            rows: to_u32(rows, "row count")?,
+            width: to_u32(width, "norm width")?,
+            eps,
+            scale,
+        };
+        encoder.dispatch_groups(
+            &self.rms_norm_residual_layer_scale_tg_pipeline,
+            &[Some(input), Some(weight), Some(residual), Some(output)],
+            params_bytes(&params),
+            rows as u64,
+            Self::NORM_GROUP_THREADS,
         )
     }
 

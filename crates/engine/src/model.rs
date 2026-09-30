@@ -1648,21 +1648,34 @@ impl DecoderLayer {
         )?;
         profile.stamp(encoder, &format!("{}o_proj", prefix()))?;
         timer.lap("o_proj");
-        self.hidden_norm(
-            encoder,
-            &self.gpu_weights.post_attention_norm,
-            &scratch.proj,
-            &scratch.normed,
-            tokens,
-            eps,
-        )?;
-        self.elements.encode_residual_add(
-            encoder,
-            input,
-            &scratch.normed,
-            &scratch.hidden_b,
-            elements,
-        )?;
+        if decode {
+            self.elements.encode_rms_norm_residual(
+                encoder,
+                &scratch.proj,
+                &self.gpu_weights.post_attention_norm,
+                input,
+                &scratch.hidden_b,
+                tokens,
+                self.config.hidden_size,
+                eps,
+            )?;
+        } else {
+            self.hidden_norm(
+                encoder,
+                &self.gpu_weights.post_attention_norm,
+                &scratch.proj,
+                &scratch.normed,
+                tokens,
+                eps,
+            )?;
+            self.elements.encode_residual_add(
+                encoder,
+                input,
+                &scratch.normed,
+                &scratch.hidden_b,
+                elements,
+            )?;
+        }
         profile.stamp(encoder, &format!("{}post_attn_norm_res", prefix()))?;
         timer.lap("post_attn_norm_res");
         self.hidden_norm(
@@ -1686,6 +1699,7 @@ impl DecoderLayer {
         }
         profile.stamp(encoder, &format!("{}pre_ffn_norm_transform", prefix()))?;
         timer.lap("pre_ffn_norm_transform");
+
         if decode && self.weights.gate_proj.permutation_mode == 1 {
             let packed_gate = self.weights.gate_proj.metal_buffer.as_ref().ok_or_else(|| {
                 ModelError::InvalidWeights("gate_proj has no GPU-resident weights".to_string())
@@ -1784,28 +1798,42 @@ impl DecoderLayer {
             profile.stamp(encoder, &format!("{}down_proj", prefix()))?;
             timer.lap("down_proj");
         }
-        self.hidden_norm(
-            encoder,
-            &self.gpu_weights.post_ffn_norm,
-            &scratch.proj,
-            &scratch.proj,
-            tokens,
-            eps,
-        )?;
-        self.elements.encode_residual_add(
-            encoder,
-            &scratch.hidden_b,
-            &scratch.proj,
-            output,
-            elements,
-        )?;
-        self.elements.encode_layer_scale(
-            encoder,
-            output,
-            output,
-            elements,
-            self.weights.layer_scalar,
-        )?;
+        if decode {
+            self.elements.encode_rms_norm_residual_layer_scale(
+                encoder,
+                &scratch.proj,
+                &self.gpu_weights.post_ffn_norm,
+                &scratch.hidden_b,
+                output,
+                tokens,
+                self.config.hidden_size,
+                eps,
+                self.weights.layer_scalar,
+            )?;
+        } else {
+            self.hidden_norm(
+                encoder,
+                &self.gpu_weights.post_ffn_norm,
+                &scratch.proj,
+                &scratch.proj,
+                tokens,
+                eps,
+            )?;
+            self.elements.encode_residual_add(
+                encoder,
+                &scratch.hidden_b,
+                &scratch.proj,
+                output,
+                elements,
+            )?;
+            self.elements.encode_layer_scale(
+                encoder,
+                output,
+                output,
+                elements,
+                self.weights.layer_scalar,
+            )?;
+        }
         profile.stamp(encoder, &format!("{}post_ffn_out", prefix()))?;
         timer.lap("post_ffn_out");
         Ok(())

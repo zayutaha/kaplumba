@@ -26,6 +26,13 @@ struct NormParams {
     float eps;
 };
 
+struct NormScaleParams {
+    uint rows;
+    uint width;
+    float eps;
+    float scale;
+};
+
 struct RopeParams {
     uint tokens;
     uint heads;
@@ -132,6 +139,78 @@ kernel void rms_norm_weighted_tg(
         output[base + i] = half(float(input[base + i]) * inverse * float(weight[i]));
     }
 }
+
+kernel void rms_norm_residual_tg(
+    const device half *input [[buffer(0)]],
+    const device half *weight [[buffer(1)]],
+    const device half *residual [[buffer(2)]],
+    device half *output [[buffer(3)]],
+    constant NormParams &params [[buffer(4)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    if (tgid >= params.rows) {
+        return;
+    }
+    threadgroup float partial[256];
+    const uint count = params.width;
+    const uint base = tgid * count;
+    float sum = 0.0f;
+    for (uint i = lid; i < count; i += tgdim) {
+        const float value = float(input[base + i]);
+        sum += value * value;
+    }
+    partial[lid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tgdim / 2u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            partial[lid] += partial[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inverse = rsqrt(partial[0] / float(count) + params.eps);
+    for (uint i = lid; i < count; i += tgdim) {
+        const float normed = float(input[base + i]) * inverse * float(weight[i]);
+        output[base + i] = half(float(residual[base + i]) + normed);
+    }
+}
+
+kernel void rms_norm_residual_layer_scale_tg(
+    const device half *input [[buffer(0)]],
+    const device half *weight [[buffer(1)]],
+    const device half *residual [[buffer(2)]],
+    device half *output [[buffer(3)]],
+    constant NormScaleParams &params [[buffer(4)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    if (tgid >= params.rows) {
+        return;
+    }
+    threadgroup float partial[256];
+    const uint count = params.width;
+    const uint base = tgid * count;
+    float sum = 0.0f;
+    for (uint i = lid; i < count; i += tgdim) {
+        const float value = float(input[base + i]);
+        sum += value * value;
+    }
+    partial[lid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tgdim / 2u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            partial[lid] += partial[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inverse = rsqrt(partial[0] / float(count) + params.eps);
+    for (uint i = lid; i < count; i += tgdim) {
+        const float normed = float(input[base + i]) * inverse * float(weight[i]);
+        const float res = float(residual[base + i]) + normed;
+        output[base + i] = half(res * params.scale);
+    }
+}
+
 
 kernel void rms_norm_unweighted_tg(
     const device half *input [[buffer(0)]],
