@@ -1546,64 +1546,105 @@ impl DecoderLayer {
             timer.lap("v_proj");
         }
 
-        self.elements.encode_rms_norm(
-            encoder,
-            &scratch.q,
-            &self.gpu_weights.q_norm,
-            &scratch.q,
-            tokens * config.q_heads,
-            head_dim,
-            eps,
-        )?;
-        self.elements.encode_rms_norm(
-            encoder,
-            &scratch.k,
-            &self.gpu_weights.k_norm,
-            &scratch.k,
-            tokens * config.kv_heads,
-            head_dim,
-            eps,
-        )?;
-        self.elements.encode_rms_norm_unweighted(
-            encoder,
-            &scratch.v,
-            &scratch.v,
-            tokens * config.kv_heads,
-            head_dim,
-            eps,
-        )?;
+        // Q/K norm+RoPE and V norm, as ONE dispatch instead of five.
+        //
+        // Decode only, and the restriction is real rather than conservative:
+        // `norm_rope_qkv` has no token axis, so `offset` is the position of the
+        // single token. Prefill (up to 1024 rows) keeps the five-dispatch path,
+        // which also lets its norms pick the per-row kernel for large `rows` --
+        // a reduction order the fused kernel does not reproduce.
+        //
+        // The kernel is bit-identical to the path it replaces, not merely close:
+        // it reproduces the fp16 rounding the separate norms write and `rope`
+        // reads back, and reduces each head in `rms_norm_weighted_tg`'s order.
+        // `crates/engine/tests/norm_rope_qkv_bit_exact.rs` asserts `to_bits()`
+        // equality on the model's real shapes, for both head dims and both rope
+        // modes, and its three assertions were each confirmed to fail under
+        // sabotage.
+        //
+        // `KAPLUMBA_NO_NORM_ROPE_QKV` restores the five-dispatch path. It exists
+        // so the A/B can be run from ONE binary, which is the only way to
+        // attribute a step-time delta to this and not to a rebuild.
+        let fused_norm_rope = decode && !env_flag("KAPLUMBA_NO_NORM_ROPE_QKV");
+        if fused_norm_rope {
+            self.elements
+                .encode_norm_rope_qkv(
+                    encoder,
+                    &scratch.q,
+                    &scratch.k,
+                    &scratch.v,
+                    &self.gpu_weights.q_norm,
+                    &self.gpu_weights.k_norm,
+                    config.q_heads,
+                    config.kv_heads,
+                    head_dim,
+                    offset,
+                    config.rope_theta,
+                    config.rope_partial_factor,
+                    config.rope_mode == RopeMode::Proportional,
+                    eps,
+                )
+                .map_err(ModelError::from)?;
+        } else {
+            self.elements.encode_rms_norm(
+                encoder,
+                &scratch.q,
+                &self.gpu_weights.q_norm,
+                &scratch.q,
+                tokens * config.q_heads,
+                head_dim,
+                eps,
+            )?;
+            self.elements.encode_rms_norm(
+                encoder,
+                &scratch.k,
+                &self.gpu_weights.k_norm,
+                &scratch.k,
+                tokens * config.kv_heads,
+                head_dim,
+                eps,
+            )?;
+            self.elements.encode_rms_norm_unweighted(
+                encoder,
+                &scratch.v,
+                &scratch.v,
+                tokens * config.kv_heads,
+                head_dim,
+                eps,
+            )?;
 
-        self.elements.encode_rope(
-            encoder,
-            &scratch.q,
-            &scratch.q,
-            RopeBufferRequest {
-                tokens,
-                heads: config.q_heads,
-                head_dim,
-                offset,
-                theta: config.rope_theta,
-                partial_factor: config.rope_partial_factor,
-                proportional: config.rope_mode == RopeMode::Proportional,
-            },
-        )?;
-        self.elements.encode_rope(
-            encoder,
-            &scratch.k,
-            &scratch.k,
-            RopeBufferRequest {
-                tokens,
-                heads: config.kv_heads,
-                head_dim,
-                offset,
-                theta: config.rope_theta,
-                partial_factor: config.rope_partial_factor,
-                proportional: config.rope_mode == RopeMode::Proportional,
-            },
-        )?;
-        // Boundary 5: three head-width norms and two ropes, five dispatches, all
-        // elementwise over `tokens * head_dim * heads`. Too small to be worth a
-        // boundary each.
+            self.elements.encode_rope(
+                encoder,
+                &scratch.q,
+                &scratch.q,
+                RopeBufferRequest {
+                    tokens,
+                    heads: config.q_heads,
+                    head_dim,
+                    offset,
+                    theta: config.rope_theta,
+                    partial_factor: config.rope_partial_factor,
+                    proportional: config.rope_mode == RopeMode::Proportional,
+                },
+            )?;
+            self.elements.encode_rope(
+                encoder,
+                &scratch.k,
+                &scratch.k,
+                RopeBufferRequest {
+                    tokens,
+                    heads: config.kv_heads,
+                    head_dim,
+                    offset,
+                    theta: config.rope_theta,
+                    partial_factor: config.rope_partial_factor,
+                    proportional: config.rope_mode == RopeMode::Proportional,
+                },
+            )?;
+        }
+        // Boundary 5: three head-width norms and two ropes (one fused dispatch
+        // when decode), all elementwise over `tokens * head_dim * heads`. Too
+        // small to be worth a boundary each.
         profile.stamp(encoder, &format!("{}kv_norm_rope", prefix()))?;
         timer.lap("kv_norm_rope");
 
