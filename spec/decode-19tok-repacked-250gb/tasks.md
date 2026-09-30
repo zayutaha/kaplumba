@@ -70,15 +70,30 @@
   - Intent: Merge `gate_up` GEMV, Hadamard output transform, and `gated_gelu` into `encode_gemv_fused2_mlp`. Output directly to `scratch.activated`.
   - Result: Eliminated `scratch.gate` and `scratch.up` buffers from global DRAM (20.6 MB roundtrips per token eliminated). Eliminated 120 kernel dispatches per token. Measured steady-state forward step dropped from 85.5 ms to 81.0 ms (saving 4.5 ms per token). 100% bit-exact greedy match verified.
 
-- [ ] **T7.6.3: Fast zero-copy argmax in `generate_gpu`**
+- [x] **T7.6.3: Fast zero-copy argmax in `generate_gpu`** (`9848a2b`)
   - Files: `crates/engine/src/generate.rs`
   - Intent: Eliminate the 262,144 element `f16 -> f32` conversion and heap `Vec` allocations on every token step. Use direct integer/half comparisons on `scratch.capped` or `logits` slice.
-  - Test: Real model greedy text matches baseline.
+  - Result: Eliminated 262,144 f32 allocation and conversion on CPU per token. Forward step dropped to 80.8 ms. Bit-exact greedy text verified.
 
-- [ ] **T7.6.4: Contiguous 4-tile unrolled GEMV (`contig4`) evaluation**
+- [x] **T7.6.4: Contiguous 4-tile unrolled GEMV (`contig4`) evaluation** (`4182ef6`, `9844142`)
   - Files: `crates/kernels/src/linear.rs`, `crates/engine/examples/bench_colmajor.rs`
   - Intent: Wire `linear_gemv_ishizuki_k3_colmajor_contig4` into `linear.rs` and benchmark across all layer projection shapes.
-  - Test: Microbenchmarks report bandwidth and latency comparison against baseline colmajor.
+  - Result: Achieved 129 GB/s on 5376x5376 and 188 GB/s on gate_up. Replaced inner loops of fused2/fused3 with contiguous 4-tile loading.
+
+- [x] **T7.6.5: Switch `encode_ishizuki_gemv_named` to SIMD butterfly finalize** (`6faaf7f`)
+  - Files: `crates/kernels/src/linear.rs`
+  - Intent: Replace slow vector `finalize_pipeline` with 32-thread SIMD butterfly `finalize_simd_pipeline`.
+  - Result: `down_proj` dropped from 18.95 ms to 14.47 ms; `o_proj` dropped from 10.72 ms to 6.80 ms.
+
+- [x] **T7.6.6: Switch `encode_gemv_fused3` to SIMD butterfly finalize** (`aea8af5`)
+  - Files: `crates/kernels/src/linear.rs`
+  - Intent: Replace vector finalize in `encode_gemv_fused3` with SIMD butterfly `finalize_simd_pipeline`.
+  - Result: `qkv_proj` dropped from 14.97 ms down to 9.48 ms per step. Total kernel time dropped from 76.5 ms to 71.0 ms.
+
+- [x] **T7.6.7: Fuse `down_proj` input transform and fuse QKV finalize** (`6327c84`)
+  - Files: `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`, `crates/engine/src/model.rs`
+  - Intent: Merge `down_proj` input transform into `gate_up_gelu` output, eliminating `scratch.activated` DRAM writes and 60 dispatches. Fuse Q, K, V finalize into single-dispatch `linear_finalize_simd3`.
+  - Result: 100% bit-exact greedy decode verified. Total kernel time down to 70.7 ms/step.
 
 - [ ] **T8: End-to-end decode benchmark and acceptance validation**
   - Files: `spec/decode-19tok-repacked-250gb/implementation_notes.md`

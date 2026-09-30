@@ -130,4 +130,29 @@ Running log for `spec/decode-19tok-repacked-250gb/`. Updated per task.
     - Padding 96-byte tiles to 128 bytes would add 32 bytes of zeros per tile (+33% footprint), ballooning weights from 15.5 GB to 20.7 GB. This would violate the unified memory budget and force paging to disk swap (collapsing to ~1.4 tok/s).
     - Conclusion: 384-byte coalesced chunking (4 tiles of 96 bytes) is the optimal footprint-preserving repacking format.
 
+13. **Fast Zero-Copy Argmax in `generate_gpu` (`9848a2b`):**
+    - Eliminated per-token `f16 -> f32` conversion and 1 MB heap `Vec<f32>` allocation for the 262,144 vocab logits on CPU.
+    - Directly extracts argmax via half comparison on the host-mapped logits buffer slice.
+    - Bit-exact output verified ("Paris."). Step latency reduced to 80.8 ms.
 
+14. **SIMD Butterfly Finalize Replacement (`6faaf7f`, `aea8af5`):**
+    - Replaced slow vector-stack `finalize_pipeline` with 32-thread SIMD butterfly register kernel (`finalize_simd_pipeline`) across all Ishizuki GEMVs and `fused3`.
+    - `down_proj` dropped from 18.95 ms to 14.47 ms (180 GB/s achieved).
+    - `o_proj` dropped from 10.72 ms to 6.80 ms (146 GB/s achieved).
+    - `qkv_proj` dropped from 14.97 ms to 9.48 ms.
+    - Total kernel own time dropped from 85.5 ms down to 71.0 ms per step.
+
+15. **MLP Activation & Input Transform Fusion (`6327c84`):**
+    - Implemented `linear_finalize_gated_gelu_and_down_input_transform`: fuses `gate_up` GEMV Hadamard output transform, GELU, and `down_proj` input signs Hadamard transform into a single kernel dispatch.
+    - Writes directly to `scratch.transformed`, completely eliminating `scratch.activated` DRAM buffer roundtrips (5.2 MB per token) and eliminating 60 kernel dispatches per token.
+    - Dispatches `down_proj` with `pretransformed: true`.
+
+16. **Fused QKV Finalize (`linear_finalize_simd3`):**
+    - Combined 3 separate finalize dispatches for Q, K, and V into a single SIMD dispatch (`linear_finalize_simd3`), eliminating 100 kernel dispatches per token.
+    - 100% bit-exact greedy decode verified. Total kernel own time dropped to **70.73 ms**.
+
+17. **Current Performance Status:**
+    - Kernel own time: **70.73 ms** (effective 165 GB/s sustained across all 60 layers).
+    - Step span median: **84.06 ms** (min: 79.72 ms).
+    - Uninstrumented decode throughput: **10.8+ tok/s** (up from 6.0 tok/s baseline, an 80% speedup).
+    - Bit-exactness: 100% bit-for-bit exact match on all golden test sentences.

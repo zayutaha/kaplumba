@@ -256,6 +256,7 @@ pub struct LinearKernels {
     gemm_mma_regpipe_pipeline: ComputePipelineState,
     finalize_rows_pipeline: ComputePipelineState,
     zero_raw_pipeline: ComputePipelineState,
+    gemv_reduce_sk2_pipeline: Option<ComputePipelineState>,
     gemv_reduce_sk4_pipeline: Option<ComputePipelineState>,
     /// `linear_gemv_fast` specialised on (bits, MCG codebook) for integer rates.
     fast_gemv_pipelines: Vec<Option<ComputePipelineState>>,
@@ -516,6 +517,10 @@ impl LinearKernels {
         let zero_raw_pipeline = device
             .new_compute_pipeline_state_with_function(&zero_raw_function)
             .map_err(KernelError::Pipeline)?;
+        let gemv_reduce_sk2_pipeline = match library.get_function("gemv_reduce_sk2", None) {
+            Ok(function) => device.new_compute_pipeline_state_with_function(&function).ok(),
+            Err(_) => None,
+        };
         let gemv_reduce_sk4_pipeline = match library.get_function("gemv_reduce_sk4", None) {
             Ok(function) => device.new_compute_pipeline_state_with_function(&function).ok(),
             Err(_) => None,
@@ -556,6 +561,7 @@ impl LinearKernels {
             gemm_mma_regpipe_pipeline,
             finalize_rows_pipeline,
             zero_raw_pipeline,
+            gemv_reduce_sk2_pipeline,
             gemv_reduce_sk4_pipeline,
             fast_gemv_pipelines,
         })
@@ -1089,6 +1095,7 @@ impl LinearKernels {
             }
         }
         let is_stream = name.ends_with("_stream");
+        let is_sk2 = name.ends_with("_sk2");
         let is_sk4 = name.ends_with("_sk4");
         if is_stream {
             let tiles = (request.out_features / 16) as u64;
@@ -1108,6 +1115,34 @@ impl LinearKernels {
                 groups * 256,
                 256,
             )?;
+        } else if is_sk2 {
+            let tiles = (request.out_features / 16) as u64;
+            let groups = tiles * 2;
+            let shape_values = [
+                to_u32(request.in_features, "input dimension")?,
+                to_u32(request.out_features, "output dimension")?,
+            ];
+            encoder.dispatch_1d_offset(
+                pipeline,
+                &[
+                    TensorRef::new(request.packed, request.packed_offset),
+                    TensorRef::new(request.transformed, 0),
+                    TensorRef::new(request.raw, 0),
+                ],
+                params_bytes(&shape_values),
+                groups * 256,
+                256,
+            )?;
+            if let Some(reduce) = &self.gemv_reduce_sk2_pipeline {
+                let n_u32 = to_u32(request.out_features, "reduce n")?;
+                encoder.dispatch_1d(
+                    reduce,
+                    &[Some(request.raw), Some(request.raw)],
+                    &n_u32.to_le_bytes(),
+                    request.out_features as u64,
+                    256.min(request.out_features as u64),
+                )?;
+            }
         } else if is_sk4 {
             let tiles = (request.out_features / 16) as u64;
             let groups = tiles * 4;
