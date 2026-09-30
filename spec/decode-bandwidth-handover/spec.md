@@ -169,27 +169,59 @@ Full table in the spec.
 
 ---
 
-## 5. The correctness bug you should probably fix first
+## 5. The correctness bug — REPRODUCED, and localised to long context
 
-**Decode is nondeterministic.** 8 runs of a 64-token prompt produce 3 distinct
-outputs. The `rope` cross-warp race was fixed in `9bd62a9`; the remaining source
-is unidentified.
+**Decode is nondeterministic, and the trigger is prompt length, not generation
+length.** Measured on the current build:
 
-This matters more than any bandwidth work, for two reasons:
+| probe | prompt | generated | result |
+|---|---|---|---|
+| A | 20 tokens | 256 | **6/6 identical** |
+| B | 6 tokens | 128 | **5/5 identical** |
+| C | **~1000 tokens** | 64 | **2 distinct outputs out of 4 runs** |
 
-1. **It undermines every bit-exactness claim in this project**, including T6's.
-   A kernel that is bit-exact *in isolation* is not the same as a model that
-   reproduces.
-2. It is a correctness bug in a shipped engine, not a performance one.
+Reproduce C (it needs several attempts — 2 of 4 hit):
 
-The instrumentation to find it already exists: `KAPLUMBA_DECODE_PROFILE=kernel`
-gives a per-kernel table for a real decode step, and `KAPLUMBA_GPU_PROFILE=1`
-gives GPU-side attribution. Run the same prompt N times and diff the kernel
-tables — the first kernel whose time *and* output varies is the culprit. Note
-that `KAPLUMBA_GPU_PROFILE` alone historically printed the **prefill's** table
-for a decode run; that was fixed in `a58fa7b` and there is a gate test for it.
+```bash
+P3=$(python3 -c "print('Explain the theory of relativity. '*100)")
+for i in $(seq 8); do
+  ./target/release/kaplumba --model ~/.kaplumba/models/Gxma/Gxma \
+    --prompt "$P3" --max-new-tokens 64 --temperature 0 --show-ids 2>/dev/null \
+    | grep token_ids | md5
+done | sort | uniq -c
+```
 
-A second, smaller gap: **no test covers the input-transform dispatch the engine
+**Why this matters more than any bandwidth work.** It undermines every
+bit-exactness claim in this project, including T6's: a kernel that is bit-exact
+*in isolation* is not a model that reproduces. It is also a correctness bug in a
+shipped engine.
+
+**What the discrimination already rules out.** Generation length is not the
+trigger (A generated 256 tokens deterministically), and the greedy path is not
+the trigger (B and A both go through `argmax_logits`). The trigger is on the
+**prefill** side: prompt length is the only thing that varies between B and C.
+
+That points at `online_attention` / `online_attention_256` / `_512`
+(`crates/kernels/src/attention.metal`) — the flash-style prefill kernels, which
+are the path a long prompt takes and a short one does not. The decode attention
+path and the whole `linear_gemv_ishizuki_*` family are common to A, B and C and
+are therefore exonerated by A and B being clean.
+
+**Instrument to bisect with** (both already exist):
+
+- `KAPLUMBA_DECODE_PROFILE=kernel` — per-kernel table for a decode step.
+- `KAPLUMBA_GPU_PROFILE=1` — GPU-side attribution. Note it historically printed
+  the **prefill's** table for a decode run; fixed in `a58fa7b` with a gate test
+  (`tests/gpu_profile_decode_gate.rs`).
+
+**And a second, independent check now exists**, which is cheaper than diffing
+kernel tables: `KAPLUMBA_MARGIN=1` prints, per step, the gap between the winning
+logit and the runner-up **in fp16 ulps**. Run probe C twice; where the two runs
+diverge, the last common step will have a margin near 1 ulp. That converts
+"somewhere in the prefill" into a specific step, and it is a permanent
+instrument rather than a one-off.
+
+A third, smaller gap: **no test covers the input-transform dispatch the engine
 actually uses.** `encode_input_transform` in `model.rs` is not what the suites
 drive (they use `gemv_buffer_impl`). There are **four** dispatch sites for the
 transform/finalize pair and they must stay in lockstep — factor the thread count

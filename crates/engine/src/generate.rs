@@ -480,6 +480,127 @@ pub fn argmax_with_margin(logits: &[u16]) -> ArgmaxMargin {
     }
 }
 
+/// Per-segment decode rate, bucketed by how much context had accumulated.
+///
+/// The question this exists to answer is "does decode get slower as the
+/// generation gets longer?", and the aggregate `decode_tok_s` cannot answer it:
+/// a run that starts fast and decays reports one number that describes neither
+/// end. Context grows by one token per step, so any per-token cost that depends
+/// on it -- attention over a longer KV, a larger working set, more TLB pressure,
+/// more of the KV cache falling out of a cache level -- shows up here as a
+/// downward trend and is invisible in the average.
+///
+/// Buckets are fixed-size windows of *steps*, not of context length, because the
+/// step index is what the loop actually knows and it makes the boundaries exact.
+/// 128 steps is a reasonable default: the reference run is ~128 tokens, so the
+/// first bucket is directly comparable to the benchmark number and the rest show
+/// the drift from there.
+///
+/// Gated on `KAPLUMBA_SEGMENTS=1`. The bookkeeping is a push and an add per step
+/// and never runs otherwise.
+struct SegmentLog {
+    enabled: bool,
+    bucket: usize,
+    /// `(first_step, last_step, total_ms, n_steps)` per completed bucket.
+    buckets: Vec<(usize, usize, f64, usize)>,
+    current: Option<(usize, f64, usize)>,
+}
+
+impl SegmentLog {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var("KAPLUMBA_SEGMENTS").is_ok_and(|v| v != "0"),
+            bucket: std::env::var("KAPLUMBA_SEGMENTS_BUCKET")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .filter(|n| *n > 0)
+                .unwrap_or(128),
+            buckets: Vec::new(),
+            current: None,
+        }
+    }
+
+    /// One decode step's wall time. `context` is the position being computed,
+    /// which is the KV length that step attends over.
+    fn record(&mut self, step: usize, context: u32, step_ms: f64) {
+        if !self.enabled {
+            return;
+        }
+        let entry = match &mut self.current {
+            Some(e) => e,
+            None => {
+                self.current = Some((step, 0.0, 0));
+                self.current.as_mut().expect("just assigned")
+            }
+        };
+        entry.1 += step_ms;
+        entry.2 += 1;
+        if entry.2 == self.bucket {
+            let (first, ms, n) = self.current.take().expect("just matched");
+            self.buckets.push((first, first + n - 1, ms, n));
+        }
+        let _ = context;
+    }
+
+    fn finish(&mut self) {
+        if let Some((first, ms, n)) = self.current.take() {
+            if n > 0 {
+                self.buckets.push((first, first + n - 1, ms, n));
+            }
+        }
+    }
+
+    fn report(&self) {
+        if !self.enabled || self.buckets.is_empty() {
+            return;
+        }
+        eprintln!("=== SEGMENTED DECODE (KAPLUMBA_SEGMENTS) ===");
+        eprintln!(
+            "{:>6} {:>7} {:>10} {:>9} {:>8}",
+            "steps", "context", "ms/step", "tok/s", "vs_first"
+        );
+        let first_rate = self
+            .buckets
+            .first()
+            .map(|(_, _, ms, n)| *n as f64 / (*ms / 1000.0));
+        for (first, last, ms, n) in &self.buckets {
+            let rate = *n as f64 / (*ms / 1000.0);
+            let ratio = match first_rate {
+                Some(fr) if fr > 0.0 => rate / fr,
+                _ => 1.0,
+            };
+            eprintln!(
+                "{:>6} {:>7} {:>10.3} {:>9.3} {:>7.1}%",
+                format!("{first}-{last}"),
+                format!("~{last}"),
+                *ms / *n as f64,
+                rate,
+                ratio * 100.0
+            );
+        }
+        // The trend is the result. A single number per bucket does not say
+        // whether decode is holding up, and "it was fine" is exactly the
+        // conclusion that a drifting rate gets filed under.
+        let last_rate = self
+            .buckets
+            .last()
+            .map(|(_, _, ms, n)| *n as f64 / (ms / 1000.0));
+        if let (Some(first_rate), Some(last_rate)) = (first_rate, last_rate) {
+            let drift = (last_rate / first_rate - 1.0) * 100.0;
+            eprintln!(
+                "SEGMENT-DRIFT first={first_rate:.3} tok/s last={last_rate:.3} tok/s \
+                 drift={drift:+.1}%"
+            );
+            if drift < -10.0 {
+                eprintln!(
+                    "SEGMENT-NOTE decode loses more than 10% from the first bucket to the last; \
+                     per-token cost is growing with context"
+                );
+            }
+        }
+    }
+}
+
 /// Collects the per-step margin so a run can report its own fragility.
 ///
 /// Gated on `KAPLUMBA_MARGIN=1`. The cost when off is one `Once` read, because
@@ -637,6 +758,9 @@ where
     // in fp16 ulps. See `argmax_with_margin`. This is the measurement that makes
     // "decode reproduces" a claim rather than an observation.
     let mut margins = MarginLog::new();
+    // `KAPLUMBA_SEGMENTS=1`: decode rate bucketed by context length, so a run
+    // says whether per-token cost grows as the KV does. See `SegmentLog`.
+    let mut segments = SegmentLog::new();
 
     let result = (|| -> Result<(), GenerationError> {
         let prefill_started = Instant::now();
@@ -715,6 +839,7 @@ where
             let step_ms = step_started.elapsed().as_secs_f64() * 1e3;
             crate::decode_profile::end_step(&mut encoder, step_ms).map_err(ModelError::from)?;
             decode_duration += Duration::from_secs_f64(step_ms / 1e3);
+            segments.record(generated_ids.len(), position, step_ms);
             logits = model.last_logits();
         }
 
@@ -733,6 +858,8 @@ where
     // in `forward_buffer`, the only scope that holds the encoder.
     crate::model::report_buffers_per_step();
     margins.report();
+    segments.finish();
+    segments.report();
 
     let decode_steps = generated_ids.len().saturating_sub(1);
     Ok(GenerationResult {

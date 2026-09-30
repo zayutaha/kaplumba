@@ -370,3 +370,51 @@ available. Deriving the set gave the experiment its own control group for free.
 - The `gemv_shape` byte-axis sweep (4.1 MB -> 528 MB at 3 bpw, 57.6 -> 167.9
   GB/s) is the fixed term showing through, not a size effect: it fits the same
   affine line.
+
+## Decode rate is flat over 1024 tokens of generation (2026-09-30)
+
+Asked directly: does decode slow down as a generation gets longer? Measured over
+a real 1024-token generation, context growing 89 -> 1113 tokens.
+
+    prompt_tokens=89 generated_tokens=1024 stopped_on_eos=false
+    load_ms=2784.679  ttft_ms=3114.934  prefill_tok_s=28.580
+    decode_tok_s=10.741  peak_resident_pages_bytes=8583413760
+
+**10.741 tok/s**, against 10.78 measured over the 96-token reference runs. So a
+14x longer context costs nothing measurable.
+
+This closes a worry that was never in the spec: per-token cost depending on
+accumulated KV. It does not, at least to 1113 tokens, which is 14% of the 8192
+context limit. The likely reason is that decode is bandwidth-bound on the
+**weights** (10.875 GB/token, constant) while the KV read is small and stays in
+cache — 1113 tokens of KV is tens of MB against 10.875 GB of weights, so the KV
+traffic cannot move the average. That also predicts no cliff before 8192, and
+predicts a cliff only if the KV grew large enough to matter (roughly >2 GB).
+
+**A shorter run for comparison**, same prompt style, which stopped naturally:
+
+    generated_tokens=277  decode_tok_s=10.534  ttft_ms=3241.702
+
+So 277 tokens -> 10.53, 1024 tokens -> 10.74. The 277-token number is *lower*,
+which is the opposite of a degradation trend and is just run-to-run spread
+(this box has been measured at 3.7-6.4 tok/s from the same binary minutes apart
+on the pre-T6 build).
+
+**`KAPLUMBA_SEGMENTS=1` was added to make this measurable per bucket** rather
+than as one aggregate. The aggregate cannot answer the question: a run that
+starts fast and decays reports a number describing neither end. `SEGMENT-DRIFT`
+reports first-bucket vs last-bucket rate as a percentage, and warns past -10%.
+The aggregate `decode_tok_s` also excludes the first token (it divides
+generated-minus-one by the decode total), so a per-bucket table and the headline
+number legitimately differ slightly.
+
+Also worth recording: **the prompt has to ask for length or the run stops on
+EOS well short of the target.** A "write a detailed paragraph" prompt ended at 277
+tokens; the same request with "at least 2000 words ... do not stop early" ran
+the full 1024. There is no `--no-eos` flag, so getting a 1k-token measurement
+means choosing a prompt that wants to keep going.
+
+Side observation, not a timing result: the 1024-token greedy output degenerates
+into verbatim repetition ("The Roman Kingdom is the story of a city that became a
+kingdom." x40). That is greedy decoding on a small 31B-class model at temperature
+0, not a memory or caching fault -- the rate held flat right through it.

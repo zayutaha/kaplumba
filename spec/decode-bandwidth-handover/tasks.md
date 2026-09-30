@@ -125,42 +125,72 @@ first even though H2a is the most likely to be the fix.
 
 ## H3 — Fix the decode nondeterminism (correctness, not performance)
 
-**8 runs of a 64-token prompt produce 3 distinct outputs.** The `rope` cross-warp
-race was fixed in `9bd62a9`; the remaining source is unidentified.
+**REPRODUCED, and localised: the trigger is PROMPT LENGTH, not generation
+length.**
+
+| probe | prompt | generated | result |
+|---|---|---|---|
+| A | 20 tok | 256 | 6/6 identical |
+| B | 6 tok | 128 | 5/5 identical |
+| C | **~1000 tok** | 64 | **2 distinct of 4** |
 
 This outranks everything above on merit. It is a correctness bug in a shipped
 engine, and it **undermines every bit-exactness claim in this project**,
-including T6's: a kernel that is bit-exact in isolation is not a model that
-reproduces.
+including T6's.
 
-- [ ] **Reproduce it first, on the current build.** Nothing here has been
-  re-checked since `a58fa7b`:
+- [x] **Reproduced** (above). The earlier "8 runs of a 64-token prompt give 3
+  distinct outputs" did **not** reproduce on the current build — that prompt has
+  a short context. Probe C, with ~1000 tokens of context, reproduces at ~50%.
 
-  ```bash
-  P="Write a detailed essay about the history of the Roman Empire, its rise, its governance, and its eventual decline."
-  for i in $(seq 8); do
-    ./target/release/kaplumba --model ~/.kaplumba/models/Gxma/Gxma \
-      --prompt "$P" --max-new-tokens 64 --temperature 0 --show-ids
-  done | grep token_ids | sort | uniq -c
-  ```
+- [x] **Discriminated, which is the useful part.** Generation length is not the
+  trigger (A made 256 tokens deterministically). The greedy sampler is not the
+  trigger (A and B both go through `argmax_logits`). **Prompt length is the only
+  variable that separates clean B from dirty C**, so the divergence originates on
+  the **prefill** path.
 
-  Fewer than 8 distinct lines means it still reproduces.
+- [ ] **Suspect list, now narrowed to the prefill attention kernels**:
+  `online_attention`, `online_attention_256`, `online_attention_512`,
+  `online_attention_tg2_256`, `online_attention_tg2_512` in
+  `crates/kernels/src/attention.metal`. These are the path a long prompt takes
+  and a short one does not. The decode attention path and the entire
+  `linear_gemv_ishizuki_*` family are common to A, B and C, so A and B being
+  clean **exonerates** them — do not spend time on the matvecs.
 
-- [ ] **Bisect with the instrument that already exists.** `KAPLUMBA_DECODE_PROFILE=kernel`
-  gives a per-kernel table for a real decode step. Run the same prompt N times and
-  diff the tables; the first kernel whose output or time varies is the culprit.
-  `KAPLUMBA_GPU_PROFILE=1` gives GPU-side attribution.
+  The flash-style kernels reduce across query blocks with an online-softmax
+  rescale. The classic bugs there, in the order to check:
+  1. **The online-softmax rescale race** — a `m`/`l` accumulator written by all
+     lanes of a simdgroup while another lane reads the previous value. Needs the
+     same discipline as the ishizuki `red[SG][16]` reuse: is there a barrier
+     between the rescale and the read, and does it survive every early exit?
+  2. **A missing `threadgroup_barrier` on a partial K-block**, where the last
+     block takes a different branch than the loop body. The `tk`-style remainder
+     loops are exactly where this hides, and they are the same shape as the
+     ishizuki tile loop that T6 had to reason about.
+  3. **The threadgroup size actually dispatched** vs the `SG`/`TG2` the kernel
+     was compiled for. A `_256` kernel dispatched with fewer threads per group
+     would leave `threadgroup` memory partly unwritten, and unwritten
+     threadgroup memory is *whatever was there last time* — which is a
+     nondeterminism source that looks exactly like a race.
+
+- [ ] **Bisect with the margin instrument, which is cheaper than diffing kernel
+  tables.** `KAPLUMBA_MARGIN=1` prints per-step top-1-vs-runner-up in fp16 ulps.
+  Run probe C twice; where the two runs diverge, the last common step will show a
+  margin near 1 ulp. That names the step instead of the kernel.
+
+  Note what the margin means here: the logits are fp16, so a margin below one
+  fp16 ulp at the winning logit is a single rounding decision from a different
+  token. If the divergence always lands on a sub-ulp step, the prefill bug only
+  has to be *tiny* to explain it — do not go looking for a large error.
 
 - [ ] **Note the trap:** `KAPLUMBA_GPU_PROFILE` alone historically printed the
   **prefill's** table for a decode run. Fixed in `a58fa7b`, with a gate test
   (`tests/gpu_profile_decode_gate.rs`). If the table looks like prefill, that gate
   is not covering the path you are on.
 
-- [ ] **Prime suspects**, in order: the four-lane `simd_shuffle_xor` butterfly
-  reduction (correct only if all 32 lanes are active — check every dispatch's
-  threadgroup size is a multiple of 256 with no partial group), the threadgroup
-  `red[SG][16]` reuse across output tiles (there is a drain barrier; check it
-  survives every early-exit path), and the KV cache append.
+- [ ] **Regression gate, once fixed.** A test that runs probe C's shape twice and
+  asserts identical token ids. It will be slow, so mark it `#[ignore]` and gate it
+  the way the other checkpoint-loading tests are gated — but it must exist, or the
+  next kernel change re-opens this silently.
 
 ---
 
