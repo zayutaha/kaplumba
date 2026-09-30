@@ -84,18 +84,10 @@ impl Exl3Kernels {
         let library = device
             .new_library_with_source(SOURCE, &options)
             .map_err(KernelError::Shader)?;
-        let decode_function = library
-            .get_function("exl3_decode_tile", None)
-            .map_err(KernelError::Shader)?;
-        let hadamard_function = library
-            .get_function("hadamard128_vectors", None)
-            .map_err(KernelError::Shader)?;
-        let decode_pipeline = device
-            .new_compute_pipeline_state_with_function(&decode_function)
-            .map_err(KernelError::Pipeline)?;
-        let hadamard_pipeline = device
-            .new_compute_pipeline_state_with_function(&hadamard_function)
-            .map_err(KernelError::Pipeline)?;
+        let decode_pipeline =
+            crate::pipeline_audit::build(&device, &library, "exl3_decode_tile")?;
+        let hadamard_pipeline =
+            crate::pipeline_audit::build(&device, &library, "hadamard128_vectors")?;
         let queue = device.new_command_queue();
         Ok(Self {
             device,

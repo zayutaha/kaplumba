@@ -1298,3 +1298,192 @@ mid-flight) and a shared `target/` can rebuild the binary under another agent.
   measured in the same compiler run as every arm, and the probe ships in nothing:
   `crates/kernels/src/linear.rs:23` concatenates only `linear.metal` and
   `linear_repacked.metal`.
+
+---
+
+## Pipeline-compilation audit (measurement-correctness, not perf)
+
+**Question.** A cold kernel inside a timed A/B measures Metal shader compilation,
+not the kernel. `warmup_decode` (T7.6.8, `b35a779`) runs one decode step at load
+to kill a 1277 ms first-step JIT, but nobody had verified that *all* kernels
+reachable in the decode path are compiled before the timed loop. omlx names
+load-time template specialisation as its #1 CPU-overhead fix
+(`reference/omlx/benchmarks/bonsai_decode_bench.py:466-470`) and ishizuki
+precompiles every specialisation at load, so the hazard is real in principle.
+
+**Answer, measured.** There is no gap, and now there is a way to keep it that way.
+
+### 1. Everything is already eager. `LinearKernels::new` builds 127 of them.
+
+`LinearKernels::new` (`crates/kernels/src/linear.rs`) compiles one library
+(`combined_source()` = `linear.metal` + `linear_repacked.metal`, so the two share
+one compilation and one `decode_state`) and then builds a pipeline for:
+
+| construction site | count | note |
+|---|---:|---|
+| `linear_input_transform` | 1 | |
+| every `linear_gemv_ishizuki_*` in the library | 31 | via `ishizuki_kernel_names`, sorted so build order is stable across edits |
+| every `(codebook, aligned, bits)` EXL3 slot | 48 | 3 codebooks x 2 alignments x 8 rates; the mul1 family re-requests the plain names, so 48 builds over 32 kernels |
+| every NR0 variant `_mcg_r{2,4,8}` | 24 | A/B-only, built so a bad name is a startup error |
+| `gemv_reduce_sk2` / `gemv_reduce_sk4` | 2 | **never dispatched by the engine** (see 3) |
+| `linear_gemv_fast1..8` | 8 | reached only if ishizuki *and* EXL3 both decline |
+| fixed fields | 13 | incl. `linear_gemm_mma`, `linear_gemm_mma_regpipe`, `linear_gemv_tiled` |
+| **total** | **127** | over a library of 111 kernels |
+
+`ElementKernels::new` builds 21 and `AttentionKernels::new` builds 25 (7 base +
+8 `online_attention_gqa_*` + 8 `attention_decode_split_*` + 2
+`attention_decode_combine_*`), all inside their own `OnceLock`. `shared()` on
+each family means the whole set is constructed once per process, inside load.
+
+### 2. `repacked_gemv_by_name` is dead, and the repacked kernels are built anyway
+
+`repacked_kernel_names` filters for `linear_gemv_repacked_`. The only occurrence
+of that string in the tree is a **comment** in `linear_repacked.metal:47`; every
+kernel that file defines is named `linear_gemv_ishizuki_k3_*` (`_colmajor`,
+`_colmajor_simd`, `_fused2`, `_fused2_sk2`, `_fused3`, `_fused3_sk2`,
+`_colmajor_stream`, `_colmajor_sk4`, `_colmajor_contig4`, `_contig4_sk2`,
+`_contig4_sk4`, `_u4`). So the map is **always empty** and every repacked kernel
+is collected by `ishizuki_kernel_names` instead. The field survives only because
+`encode_gemv`'s `trace_gemv` chains it. Documented at the function; not removed,
+because removing it is a change to a tracing path and not this task's business.
+
+### 3. What is and is not decode-reachable (50 sliding + 10 full layers, short context, temperature 0)
+
+| candidate | reachable? | why |
+|---|---|---|
+| `_sk2` / `_sk4` ishizuki split-K | **no** | only under `KAPLUMBA_USE_SK`, and it also requires `perm_mode == 1 \|\| KAPLUMBA_REPACKED_GEMV` |
+| `linear_gemv_ishizuki_k3_colmajor_contig4_sk2` / `_sk4` | **no** | same gate, and this checkpoint is not colmajor |
+| `gemv_reduce_sk2` / `gemv_reduce_sk4` | **no** | dispatched only from `encode_ishizuki_gemv_named`, an A/B entry point the engine never calls. Built, never used. |
+| `_u4` (`linear_gemv_ishizuki_k3_colmajor_u4`) | **no** | name-addressable only |
+| `_colmajor_simd`, `_colmajor_stream`, `_fused3*` | **no** | name-addressable only |
+| `linear_finalize_simd_sk{2,4}`, `..._gated_gelu_simd_sk2`, `..._and_down_input_transform_sk2` | **no** | no dispatch site in the crate at all |
+| `linear_finalize_simd3_sk2`, `linear_zero_raw` | **no** | no dispatch site; the compiler says "never read" |
+| `attention_dim_256` / `_512` | **no** | no dispatch site (the GQA kernels took over) |
+| 6 bpw `lm_head` | **yes** | `validate_current_graph` pins 6 bpw; trellis starts at `packed_offset % 4 == 2`, so it takes the **unaligned EXL3 arm** `linear_gemv_exl3_k6_u_mcg`, not the ishizuki one |
+| `linear_gemv_ishizuki_k3_w2` | **yes** | the live decode matvec for all 420 decoder linears: 3 bpw, 4-byte aligned, `perm_mode == 0`, so the 2-word window is selected by name lookup |
+| split-KV attention | **yes**, two specialisations | `gqa_index(head_dim, q_heads/kv_heads)`: sliding is 32/16 at 256 -> `attention_decode_split_256_2`, full is 32/4 at 512 -> `attention_decode_split_512_8`, plus `attention_decode_combine_256` / `_512` |
+| probe kernels | **no** | `spin_burn` is the only one, it is a profiler, and it is built at load regardless |
+
+**Six pipelines are built at load and never dispatched**: `gemv_reduce_sk2`,
+`gemv_reduce_sk4`, `linear_finalize_simd3_sk2`, `linear_zero_raw`,
+`attention_dim_256`, `attention_dim_512`. Pure load cost, zero decode relevance.
+Worth knowing before anyone reads a build count as a decode-kernel count.
+
+### 4. The measurement
+
+New module `crates/kernels/src/pipeline_audit.rs`. Every pipeline construction in
+the crate now goes through `pipeline_audit::build`, which times it and records the
+name; a test greps the four source files and fails if any construction site
+bypasses it. Real 614-token greedy run, 48 decode steps,
+`KAPLUMBA_PIPELINE_AUDIT=1 KAPLUMBA_ASSERT_NO_LATE_PIPELINES=1`:
+
+```
+at=after-warmup  builds=173 build_ms=10.3 distinct=157 armed=173 late_builds=0 late_build_ms=0.0
+at=after-decode  builds=173 build_ms=10.3 distinct=157 armed=173 late_builds=0 late_build_ms=0.0
+```
+
+**173 pipeline builds, 157 distinct kernels, 10.3 ms total -- all at load, and
+`late_builds=0` across the prefill and every decode step.** Nothing is compiled
+inside a timed loop. The largest single build is `embedding_scaled` at 1.3 ms, so
+the ceiling on the error a missed warmup could inject into one step is ~1.3 ms,
+not the 10.3 ms of the whole set.
+
+`LinearKernels::shared()` being a `OnceLock` is what makes this true: the whole
+library compiles once per process and no dispatch path can reach
+`newComputePipelineStateWithFunction` at all.
+
+### 5. The instrument can fail (AGENTS.md 3.4)
+
+- `the_late_pipeline_assert_can_fail` (`#[should_panic]`) builds a pipeline after
+  a mark and calls the real `check_no_builds_since(mark, true)`. Observed panic
+  message: `KAPLUMBA_ASSERT_NO_LATE_PIPELINES: 1 pipeline(s) were compiled after
+  load (56 us total, ...)`.
+- `every_pipeline_construction_goes_through_the_audit` was **sabotaged** by putting
+  a raw `new_compute_pipeline_state_with_function` back into
+  `attention.rs:323`. Observed failure: `attention.rs:323 constructs a pipeline
+  outside pipeline_audit::build: device.new_compute_pipeline_state_with_function(&f).ok();`
+- `decode_shaped_dispatches_compile_nothing`
+  (`crates/engine/tests/pipeline_warmup_coverage.rs`) was **sabotaged** by moving
+  `linear_finalize_simd`'s build out of `new()` into a `OnceLock` built on first
+  dispatch -- exactly the regression. Observed failure:
+  `decode-shaped dispatches compiled 1 pipeline(s) after load: [("linear_finalize_simd", 56)]`.
+  Reverted; the file is byte-identical to before the sabotage.
+
+### 6. The prefill warmup step: measured, and it buys nothing
+
+`warmup_decode` ran one decode step, which cannot reach the multi-query kernels
+(`linear_input_rows`, `linear_gemm_mma`/`_regpipe`, `linear_finalize_rows`,
+`online_attention_gqa_*`) because the gate is `tokens == 1`. A second two-query
+forward was added ahead of it to close that, and then **measured and reverted**.
+Interleaved A/B, one binary, 614-token prompt, `--max-new-tokens 2`:
+
+| arm | load_ms (median) | ttft_ms (median) | prefill_tok_s (median) |
+|---|---:|---:|---:|
+| with the prefill step | 6010 | 6274 | 97.90 |
+| without | 5687 | 6249 | 98.27 |
+
+Two results, and the first is the one worth keeping:
+
+- **It is not additive.** The two-query forward takes ~3.0 s, which looks like a
+  3 s addition to load and is not: with it the warmup totals ~3.1 s, without it
+  the total is also ~3.0 s -- because the *decode* step is then what costs ~3.0 s.
+  The prefill step warms the weight path (page-in, residency, the MMA weight
+  dequant code) that the one-query step would otherwise warm expensively. Both
+  arms pay ~3 s once; the prefill step only changes *which* forward pays it.
+- **It buys nothing on TTFT**, the only metric it could have bought anything on.
+  `prefill_tok_s` is *higher* without it, so the prefill kernels' first dispatch
+  is not a cost worth pre-paying: a 614-token prefill does not feel whatever the
+  3 s is.
+
+**Consequence for the rest of this spec: the ~3 s of first-forward cost is
+NOT prefill-kernel first-dispatch, and warming the prefill path does not remove
+it. Do not re-derive it from a decode-only warmup.** T7.6.8's 1277 ms and this
+~3 s are the same phenomenon at different prompt sizes, and neither is
+compilation (`late_builds=0`).
+
+### 7. `--metrics` adds no per-token readback or synchronisation
+
+`--metrics` is read in `crates/cli/src/main.rs:109`, **after** `generate_gpu`
+returns. Its only work is `measure_rss()` (one `getrusage`) and
+`format_metrics`, which is string formatting over the `GenerationResult` the loop
+already produced. Nothing inside the loop branches on it, so every tok/s quoted
+with `--metrics` is the same tok/s the uninstrumented run produces.
+
+That is the answer to the question as asked, and it is worth stating plainly
+because the *adjacent* thing is real. The greedy decode loop has per-token host
+work that is **not** gated by anything:
+
+- `logits = model.last_logits()` allocates and copies the 262,144-entry row
+  (512 KiB) every step. Measured **0.0066 ms/token**. Necessary -- the argmax is
+  on the host -- and it sits *outside* `step_ms`, so it does not enter
+  `decode_tok_s`.
+- In `generate_gpu_greedy` (the `--legacy-path` route only; the CLI's default
+  `generate_gpu` gates this correctly behind `track_margin`),
+  `margins.record(step, argmax_with_margin(&logits))` evaluates its argument
+  **unconditionally** -- `MarginLog::record` checks `enabled` inside, so the
+  value is computed anyway. That is two extra full passes over 262,144 fp16 per
+  token. Measured: `argmax_logits` 0.2804 ms/pass, `argmax_with_margin`
+  0.4328 ms/call, i.e. **0.152 ms/token of waste**, 0.21% of a 74 ms step. Small,
+  but it is pure waste and `generate_gpu` already shows the one-line fix
+  (`if track_margin { ... }`).
+
+The instruments that *do* tax a run, none of which is `--metrics`:
+`KAPLUMBA_DECODE_PROFILE=kernel` (a `wait_until_completed` every `DRAIN_EVERY`
+boundaries, so its wall times are inflated and its own_ms shares are not),
+`KAPLUMBA_DECODE_PROFILE=step` (one extra commit per step), `KAPLUMBA_GPU_PROFILE`
+(prefill only unless `KAPLUMBA_GPU_PROFILE_DECODE`), and `KAPLUMBA_MARGIN` /
+`KAPLUMBA_SEGMENTS` / `KAPLUMBA_COUNT_BUFFERS` (host bookkeeping).
+
+### 8. Two process facts that cost time here and are worth writing down
+
+- **A concurrent session was editing this tree throughout.** HEAD moved twice
+  under me (`e9c2785` -> `9cd57a7` -> `379ae9e`) and `linear.metal`,
+  `linear_repacked.metal`, `attention.metal` and `model.rs` all gained
+  uncommitted work, including a `_bench` kernel in `linear_repacked.metal` with a
+  syntax error (`[[buffer(0)],` -- missing `]`) that makes **every** library
+  compile fail in the shared tree. All measurement here was therefore done in a
+  worktree at a pinned HEAD with its own `CARGO_TARGET_DIR`, per AGENTS.md
+  10.2.4.
+- **The other session's `git add -A` swept up my `generate.rs` change** into
+  `9cd57a7`. So part of this work is already committed under someone else's
+  message. Check before assuming a line is uncommitted.

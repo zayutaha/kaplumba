@@ -8,6 +8,7 @@ use metal::{
 
 use crate::encoder::TensorRef;
 use crate::exl3::{Exl3Codebook, Exl3Rate, KernelError};
+use crate::pipeline_audit;
 
 const SOURCE: &str = include_str!("linear.metal");
 
@@ -234,6 +235,24 @@ fn ishizuki_kernel_names(library: &Library) -> Vec<String> {
     names
 }
 
+/// Names of the kernels in `linear_repacked.metal` that this module indexes
+/// separately from the rest of the ishizuki family.
+///
+/// **This currently matches nothing, and that is a fact about the source rather
+/// than about the filter.** The file's only `linear_gemv_repacked_` occurrence
+/// is a comment; every kernel it actually defines is named
+/// `linear_gemv_ishizuki_k3_*` (`_colmajor`, `_colmajor_simd`, `_fused2`,
+/// `_fused2_sk2`, `_fused3`, `_fused3_sk2`, `_colmajor_stream`, `_colmajor_sk4`,
+/// `_colmajor_contig4`, `_colmajor_contig4_sk2`, `_colmajor_contig4_sk4`,
+/// `_colmajor_u4`), so `ishizuki_kernel_names` above already collects and
+/// builds all of them.
+///
+/// The map is left in place because it is a dispatch input (see
+/// [`Self::encode_gemv`]'s `trace_gemv`, which chains it), and removing it is a
+/// behaviour change to a tracing path that is not this task's business. But the
+/// honest reading is: the repacked family is reached through
+/// `ishizuki_gemv_by_name`, and a name lookup in `repacked_gemv_by_name` always
+/// returns `None`.
 fn repacked_kernel_names(library: &Library) -> Vec<String> {
     let mut names: Vec<String> = library
         .function_names()
@@ -251,11 +270,15 @@ pub struct LinearKernels {
     input_pipeline: ComputePipelineState,
     gemv_pipeline: ComputePipelineState,
     finalize_pipeline: ComputePipelineState,
-    finalize_simd_pipeline: ComputePipelineState,
+    pub finalize_simd_pipeline: ComputePipelineState,
+    pub finalize_simd_sk2_pipeline: ComputePipelineState,
+    pub finalize_simd_sk4_pipeline: ComputePipelineState,
     finalize_simd3_pipeline: ComputePipelineState,
     finalize_simd3_sk2_pipeline: ComputePipelineState,
     finalize_gated_gelu_pipeline: ComputePipelineState,
+    finalize_gated_gelu_sk2_pipeline: ComputePipelineState,
     finalize_gated_gelu_and_down_input_pipeline: ComputePipelineState,
+    finalize_gated_gelu_and_down_input_sk2_pipeline: ComputePipelineState,
     input_rows_pipeline: ComputePipelineState,
     gemv_tiled_pipeline: ComputePipelineState,
     /// Tensor-core prefill GEMM (`linear_gemm_mma`): dequantize the EXL3 weights
@@ -362,42 +385,17 @@ impl LinearKernels {
         let library = device
             .new_library_with_source(&combined_source(), &options)
             .map_err(KernelError::Shader)?;
-        let input_function = library
-            .get_function("linear_input_transform", None)
-            .map_err(KernelError::Shader)?;
-        let gemv_function = library
-            .get_function("linear_gemv", None)
-            .map_err(KernelError::Shader)?;
-        let finalize_function = library
-            .get_function("linear_finalize", None)
-            .map_err(KernelError::Shader)?;
-        let finalize_simd_function = library
-            .get_function("linear_finalize_simd", None)
-            .map_err(KernelError::Shader)?;
-        let finalize_simd3_function = library
-            .get_function("linear_finalize_simd3", None)
-            .map_err(KernelError::Shader)?;
-        let finalize_simd3_sk2_function = library
-            .get_function("linear_finalize_simd3_sk2", None)
-            .map_err(KernelError::Shader)?;
-        let finalize_gated_gelu_function = library
-            .get_function("linear_finalize_gated_gelu_simd", None)
-            .map_err(KernelError::Shader)?;
-        let finalize_gated_gelu_and_down_input_function = library
-            .get_function("linear_finalize_gated_gelu_and_down_input_transform", None)
-            .map_err(KernelError::Shader)?;
-        let input_rows_function = library
-            .get_function("linear_input_rows", None)
-            .map_err(KernelError::Shader)?;
-        let gemv_tiled_function = library
-            .get_function("linear_gemv_tiled", None)
-            .map_err(KernelError::Shader)?;
-        let finalize_rows_function = library
-            .get_function("linear_finalize_rows", None)
-            .map_err(KernelError::Shader)?;
-        let input_pipeline = device
-            .new_compute_pipeline_state_with_function(&input_function)
-            .map_err(KernelError::Pipeline)?;
+        // Every pipeline below goes through `pipeline_audit::build`, never
+        // `new_compute_pipeline_state_with_function` directly. The audit is
+        // what makes "this family compiles once, at load" a measurement rather
+        // than a reading of the code, and it is only worth what its coverage
+        // is -- so `pipeline_audit`'s own test fails if a construction site
+        // here ever bypasses it.
+        //
+        // Which means the eager build below is load-bearing, not tidiness: a
+        // kernel reached for the first time inside a timed loop charges Metal's
+        // shader compilation to that loop's number.
+        let input_pipeline = pipeline_audit::build(&device, &library, "linear_input_transform")?;
         let mut ishizuki_gemv_pipelines = Vec::with_capacity(9);
         let mut ishizuki_gemv_by_name = std::collections::HashMap::new();
         ishizuki_gemv_pipelines.push(None);
@@ -406,13 +404,15 @@ impl LinearKernels {
         // the golden reference; a name that is absent fails at `shared()`, which
         // is where a typo should die rather than at a dispatch 20 minutes into a
         // benchmark.
+        //
+        // This loop also covers the repacked file: `combined_source()` splices
+        // `linear_repacked.metal` into the same library and every kernel there
+        // is named `linear_gemv_ishizuki_k3_*`, so the `_colmajor*`, `_fused*`,
+        // `_contig4*` and `_u4` variants are built here rather than by
+        // `repacked_kernel_names` -- which matches `linear_gemv_repacked_` and so
+        // finds nothing at all. See `repacked_gemv_by_name` below.
         for name in ishizuki_kernel_names(&library) {
-            let function = library
-                .get_function(&name, None)
-                .map_err(KernelError::Pipeline)?;
-            let pipeline = device
-                .new_compute_pipeline_state_with_function(&function)
-                .map_err(KernelError::Pipeline)?;
+            let pipeline = pipeline_audit::build(&device, &library, &name)?;
             if let Some(bits) = Self::ishizuki_rate_of_name(&name) {
                 // The first (unsuffixed) kernel for a rate owns the dispatch slot.
                 if ishizuki_gemv_pipelines.len() <= bits as usize {
@@ -427,12 +427,7 @@ impl LinearKernels {
 
         let mut repacked_gemv_by_name = std::collections::HashMap::new();
         for name in repacked_kernel_names(&library) {
-            let function = library
-                .get_function(&name, None)
-                .map_err(KernelError::Pipeline)?;
-            let pipeline = device
-                .new_compute_pipeline_state_with_function(&function)
-                .map_err(KernelError::Pipeline)?;
+            let pipeline = pipeline_audit::build(&device, &library, &name)?;
             repacked_gemv_by_name.insert(name, pipeline);
         }
 
@@ -454,12 +449,7 @@ impl LinearKernels {
                 for bits in 1..=8_u32 {
                     let suffix = if aligned { "" } else { "_u" };
                     let name = format!("linear_gemv_exl3_k{bits}{suffix}{family}");
-                    let function = library
-                        .get_function(&name, None)
-                        .map_err(KernelError::Pipeline)?;
-                    let pipeline = device
-                        .new_compute_pipeline_state_with_function(&function)
-                        .map_err(KernelError::Pipeline)?;
+                    let pipeline = pipeline_audit::build(&device, &library, &name)?;
                     exl3_gemv_by_name.insert(name.clone(), pipeline.clone());
                     exl3_gemv_slot_names.push(name);
                     exl3_gemv_pipelines.push(Some(pipeline));
@@ -481,85 +471,72 @@ impl LinearKernels {
         // `linear.metal`, a stale checkout) must still start: the engine's
         // default is NR0 = 1, which is the unsuffixed kernel and is always
         // present.
+        //
+        // The `is_ok()` on the pipeline is deliberate and is the one place the
+        // audit can miss a build: `build` records *after* a successful
+        // construction, so an NR0 kernel that fails to compile leaves no trace.
+        // That is acceptable precisely because the fallback is the unsuffixed
+        // kernel, which the table above did record.
         for bits in 1..=8_u32 {
             for nr0 in NR0_VARIANTS {
                 let name = format!("linear_gemv_exl3_k{bits}_mcg_r{nr0}");
-                if let Ok(function) = library.get_function(&name, None) {
-                    if let Ok(pipeline) = device.new_compute_pipeline_state_with_function(&function)
-                    {
-                        exl3_gemv_by_name.insert(name, pipeline);
-                    }
+                // `get_function` first, so a build without the generated family
+                // is a quiet skip rather than a `KernelError::Shader`.
+                if library.get_function(&name, None).is_ok()
+                    && let Ok(pipeline) = pipeline_audit::build(&device, &library, &name)
+                {
+                    exl3_gemv_by_name.insert(name, pipeline);
                 }
             }
         }
 
-        let gemv_pipeline = device
-            .new_compute_pipeline_state_with_function(&gemv_function)
-            .map_err(KernelError::Pipeline)?;
-        let finalize_pipeline = device
-            .new_compute_pipeline_state_with_function(&finalize_function)
-            .map_err(KernelError::Pipeline)?;
-        let finalize_simd_pipeline = device
-            .new_compute_pipeline_state_with_function(&finalize_simd_function)
-            .map_err(KernelError::Pipeline)?;
-        let finalize_simd3_pipeline = device
-            .new_compute_pipeline_state_with_function(&finalize_simd3_function)
-            .map_err(KernelError::Pipeline)?;
-        let finalize_gated_gelu_pipeline = device
-            .new_compute_pipeline_state_with_function(&finalize_gated_gelu_function)
-            .map_err(KernelError::Pipeline)?;
-        let finalize_simd3_sk2_pipeline = device
-            .new_compute_pipeline_state_with_function(&finalize_simd3_sk2_function)
-            .map_err(KernelError::Pipeline)?;
-        let finalize_gated_gelu_and_down_input_pipeline = device
-            .new_compute_pipeline_state_with_function(&finalize_gated_gelu_and_down_input_function)
-            .map_err(KernelError::Pipeline)?;
-        let input_rows_pipeline = device
-            .new_compute_pipeline_state_with_function(&input_rows_function)
-            .map_err(KernelError::Pipeline)?;
-        let gemv_tiled_pipeline = device
-            .new_compute_pipeline_state_with_function(&gemv_tiled_function)
-            .map_err(KernelError::Pipeline)?;
-        let gemm_mma_function = library
-            .get_function("linear_gemm_mma", None)
-            .map_err(KernelError::Shader)?;
-        let gemm_mma_pipeline = device
-            .new_compute_pipeline_state_with_function(&gemm_mma_function)
-            .map_err(KernelError::Pipeline)?;
-        let gemm_mma_regpipe_function = library
-            .get_function("linear_gemm_mma_regpipe", None)
-            .map_err(KernelError::Shader)?;
-        let gemm_mma_regpipe_pipeline = device
-            .new_compute_pipeline_state_with_function(&gemm_mma_regpipe_function)
-            .map_err(KernelError::Pipeline)?;
-        let finalize_rows_pipeline = device
-            .new_compute_pipeline_state_with_function(&finalize_rows_function)
-            .map_err(KernelError::Pipeline)?;
-        let zero_raw_function = library
-            .get_function("linear_zero_raw", None)
-            .map_err(KernelError::Shader)?;
-        let zero_raw_pipeline = device
-            .new_compute_pipeline_state_with_function(&zero_raw_function)
-            .map_err(KernelError::Pipeline)?;
-        let gemv_reduce_sk2_pipeline = match library.get_function("gemv_reduce_sk2", None) {
-            Ok(function) => device.new_compute_pipeline_state_with_function(&function).ok(),
-            Err(_) => None,
-        };
-        let gemv_reduce_sk4_pipeline = match library.get_function("gemv_reduce_sk4", None) {
-            Ok(function) => device.new_compute_pipeline_state_with_function(&function).ok(),
-            Err(_) => None,
-        };
+        let gemv_pipeline = pipeline_audit::build(&device, &library, "linear_gemv")?;
+        let finalize_pipeline = pipeline_audit::build(&device, &library, "linear_finalize")?;
+        let finalize_simd_pipeline =
+            pipeline_audit::build(&device, &library, "linear_finalize_simd")?;
+        let finalize_simd_sk2_pipeline =
+            pipeline_audit::build(&device, &library, "linear_finalize_simd_sk2")?;
+        let finalize_simd_sk4_pipeline =
+            pipeline_audit::build(&device, &library, "linear_finalize_simd_sk4")?;
+        let finalize_simd3_pipeline =
+            pipeline_audit::build(&device, &library, "linear_finalize_simd3")?;
+        let finalize_gated_gelu_pipeline =
+            pipeline_audit::build(&device, &library, "linear_finalize_gated_gelu_simd")?;
+        let finalize_gated_gelu_sk2_pipeline =
+            pipeline_audit::build(&device, &library, "linear_finalize_gated_gelu_simd_sk2")?;
+        let finalize_simd3_sk2_pipeline =
+            pipeline_audit::build(&device, &library, "linear_finalize_simd3_sk2")?;
+        let finalize_gated_gelu_and_down_input_pipeline = pipeline_audit::build(
+            &device,
+            &library,
+            "linear_finalize_gated_gelu_and_down_input_transform",
+        )?;
+        let finalize_gated_gelu_and_down_input_sk2_pipeline = pipeline_audit::build(
+            &device,
+            &library,
+            "linear_finalize_gated_gelu_and_down_input_transform_sk2",
+        )?;
+        let input_rows_pipeline = pipeline_audit::build(&device, &library, "linear_input_rows")?;
+        let gemv_tiled_pipeline = pipeline_audit::build(&device, &library, "linear_gemv_tiled")?;
+        let gemm_mma_pipeline = pipeline_audit::build(&device, &library, "linear_gemm_mma")?;
+        let gemm_mma_regpipe_pipeline =
+            pipeline_audit::build(&device, &library, "linear_gemm_mma_regpipe")?;
+        let finalize_rows_pipeline =
+            pipeline_audit::build(&device, &library, "linear_finalize_rows")?;
+        let zero_raw_pipeline = pipeline_audit::build(&device, &library, "linear_zero_raw")?;
+        // `Option`, so a build without the standalone split-K reduce kernels
+        // still starts. Nothing in the engine dispatches them -- the fused
+        // `linear_finalize_simd_sk{2,4}` reduce in the same dispatch -- so this
+        // is a bench/test-only pair.
+        let gemv_reduce_sk2_pipeline =
+            pipeline_audit::build(&device, &library, "gemv_reduce_sk2").ok();
+        let gemv_reduce_sk4_pipeline =
+            pipeline_audit::build(&device, &library, "gemv_reduce_sk4").ok();
         // Specialised decode pipelines, one per integer bit rate.
         let mut fast_gemv_pipelines = Vec::with_capacity(8);
         for bits in 1..=8_u32 {
             let entry = format!("linear_gemv_fast{bits}");
-            let specialised = match library.get_function(&entry, None) {
-                Ok(function) => device
-                    .new_compute_pipeline_state_with_function(&function)
-                    .ok(),
-                Err(_) => None,
-            };
-            fast_gemv_pipelines.push(specialised);
+            fast_gemv_pipelines.push(pipeline_audit::build(&device, &library, &entry).ok());
         }
         let queue = device.new_command_queue();
         Ok(Self {
@@ -576,10 +553,14 @@ impl LinearKernels {
             gemv_pipeline,
             finalize_pipeline,
             finalize_simd_pipeline,
+            finalize_simd_sk2_pipeline,
+            finalize_simd_sk4_pipeline,
             finalize_simd3_pipeline,
             finalize_simd3_sk2_pipeline,
             finalize_gated_gelu_pipeline,
+            finalize_gated_gelu_sk2_pipeline,
             finalize_gated_gelu_and_down_input_pipeline,
+            finalize_gated_gelu_and_down_input_sk2_pipeline,
             input_rows_pipeline,
             gemv_tiled_pipeline,
             gemm_mma_pipeline,
@@ -1158,16 +1139,18 @@ impl LinearKernels {
                 groups * 256,
                 256,
             )?;
-            if let Some(reduce) = &self.gemv_reduce_sk2_pipeline {
-                let n_u32 = to_u32(request.out_features, "reduce n")?;
-                encoder.dispatch_1d(
-                    reduce,
-                    &[Some(request.raw), Some(request.raw)],
-                    &n_u32.to_le_bytes(),
-                    request.out_features as u64,
-                    256.min(request.out_features as u64),
-                )?;
-            }
+            let output_blocks = to_u32(request.out_features / 128, "output dimension")?;
+            return encoder.dispatch_1d(
+                &self.finalize_simd_sk2_pipeline,
+                &[
+                    Some(request.raw),
+                    Some(request.output_signs),
+                    Some(request.output),
+                ],
+                &output_blocks.to_le_bytes(),
+                u64::from(output_blocks) * 32,
+                32,
+            );
         } else if is_sk4 {
             let tiles = (request.out_features / 16) as u64;
             let groups = tiles * 4;
@@ -1186,16 +1169,18 @@ impl LinearKernels {
                 groups * 256,
                 256,
             )?;
-            if let Some(reduce) = &self.gemv_reduce_sk4_pipeline {
-                let n_u32 = to_u32(request.out_features, "reduce n")?;
-                encoder.dispatch_1d(
-                    reduce,
-                    &[Some(request.raw), Some(request.raw)],
-                    &n_u32.to_le_bytes(),
-                    request.out_features as u64,
-                    256.min(request.out_features as u64),
-                )?;
-            }
+            let output_blocks = to_u32(request.out_features / 128, "output dimension")?;
+            return encoder.dispatch_1d(
+                &self.finalize_simd_sk4_pipeline,
+                &[
+                    Some(request.raw),
+                    Some(request.output_signs),
+                    Some(request.output),
+                ],
+                &output_blocks.to_le_bytes(),
+                u64::from(output_blocks) * 32,
+                32,
+            );
         } else {
             self.encode_ishizuki_gemv(
                 encoder,
@@ -1519,8 +1504,54 @@ impl LinearKernels {
         )
     }
 
-    fn exl3_gemv_pipeline_by_name(&self, name: &str) -> Option<&ComputePipelineState> {
+    /// Look up a decode-matvec pipeline by kernel name.
+    ///
+    /// Public so a test can assert that every `(codebook, aligned, bits)` slot
+    /// the loader can produce resolves to a kernel that is actually in the
+    /// library. A missing one is not an error at dispatch: `encode_gemv` falls
+    /// through to the next family, so a gap in this table would show up as
+    /// finite, plausible, wrong output from a checkpoint whose rate happens to
+    /// land on it. See `crates/engine/tests/rate4_8_kernel_coverage.rs`.
+    pub fn exl3_gemv_pipeline_by_name(&self, name: &str) -> Option<&ComputePipelineState> {
         self.exl3_gemv_by_name.get(name)
+    }
+
+    /// Test/diagnostic-only: which kernel the EXL3 arm would name for this
+    /// tensor, as a string.
+    ///
+    /// `probe_forward` prints this next to a head failure, because "which arm
+    /// ran" is the whole question when two checkpoints differ only in
+    /// `packed_offset`'s alignment: `ishizuki_gemv_pipeline` refuses anything not
+    /// 4-byte aligned, so the same weights take different families depending on
+    /// where the tensor happened to land in the file.
+    pub fn exl3_gemv_kernel_name_for_test(
+        &self,
+        rate: Exl3Rate,
+        packed_offset: u64,
+        codebook: Exl3Codebook,
+    ) -> Option<&str> {
+        self.exl3_gemv_kernel_name(rate, packed_offset, codebook)
+    }
+
+    /// Test/diagnostic-only: the ishizuki kernel `encode_gemv` would select, or
+    /// `None` if this tensor takes the EXL3 arm instead.
+    pub fn ishizuki_name_for_test(
+        &self,
+        rate: Exl3Rate,
+        packed_offset: u64,
+    ) -> Option<&'static str> {
+        // `ishizuki_gemv_pipeline` returns a pipeline object and a name cannot be
+        // recovered from it, but the *rate* arm is what matters here: a non-4-byte
+        // offset, or a non-`Integer(1..=8)` rate, is the only way this returns
+        // `None` for a checkpoint the loader accepted.
+        if self
+            .ishizuki_gemv_pipeline(rate, packed_offset, 0)
+            .is_some()
+        {
+            Some("ishizuki")
+        } else {
+            None
+        }
     }
 
     /// The kernel name the live decode path dispatches to for
@@ -1738,6 +1769,73 @@ impl LinearKernels {
         // Integer rates go to the lane-per-thread matvec: one window setup per
         // eight codes, 256-thread groups, and enough threads to fill the GPU.
         // This is the real decode path; `gemv_buffer` routes the same way.
+        let use_sk = env_flag("KAPLUMBA_USE_SK")
+            && (perm_mode == 1 || env_flag("KAPLUMBA_REPACKED_GEMV"))
+            && matches!(rate, Exl3Rate::Integer(3));
+
+        if use_sk {
+            if in_features >= 16384 {
+                if let Some(pipeline) = self
+                    .ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_colmajor_contig4_sk4")
+                {
+                    Self::trace_gemv("linear_gemv_ishizuki_k3_colmajor_contig4_sk4");
+                    let tiles = (out_features / 16) as u64;
+                    let groups = tiles * 4;
+                    let shape_values = [
+                        to_u32(in_features, "input dimension")?,
+                        to_u32(out_features, "output dimension")?,
+                    ];
+                    encoder.dispatch_1d_offset(
+                        pipeline,
+                        &[
+                            TensorRef::new(packed, packed_offset),
+                            TensorRef::new(transformed, 0),
+                            TensorRef::new(raw, 0),
+                        ],
+                        params_bytes(&shape_values),
+                        groups * 256,
+                        256,
+                    )?;
+                    return encoder.dispatch_1d(
+                        &self.finalize_simd_sk4_pipeline,
+                        &[Some(raw), Some(output_signs), Some(output)],
+                        &output_blocks.to_le_bytes(),
+                        u64::from(output_blocks) * 32,
+                        32,
+                    );
+                }
+            }
+            if let Some(pipeline) =
+                self.ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_colmajor_contig4_sk2")
+            {
+                Self::trace_gemv("linear_gemv_ishizuki_k3_colmajor_contig4_sk2");
+                let tiles = (out_features / 16) as u64;
+                let groups = tiles * 2;
+                let shape_values = [
+                    to_u32(in_features, "input dimension")?,
+                    to_u32(out_features, "output dimension")?,
+                ];
+                encoder.dispatch_1d_offset(
+                    pipeline,
+                    &[
+                        TensorRef::new(packed, packed_offset),
+                        TensorRef::new(transformed, 0),
+                        TensorRef::new(raw, 0),
+                    ],
+                    params_bytes(&shape_values),
+                    groups * 256,
+                    256,
+                )?;
+                return encoder.dispatch_1d(
+                    &self.finalize_simd_sk2_pipeline,
+                    &[Some(raw), Some(output_signs), Some(output)],
+                    &output_blocks.to_le_bytes(),
+                    u64::from(output_blocks) * 32,
+                    32,
+                );
+            }
+        }
+
         if let Some(pipeline) = self.ishizuki_gemv_pipeline(rate, packed_offset, perm_mode) {
             // Trace the name that was *actually selected*, not one reconstructed
             // from the rate: the trace exists to answer "which kernel ran", and a
@@ -1845,19 +1943,55 @@ impl LinearKernels {
                 32,
             )?;
         }
-        let pipeline = self
-            .ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2")
-            .ok_or_else(|| {
-                KernelError::InvalidInput("missing linear_gemv_ishizuki_k3_fused2".to_string())
-            })?;
         let tiles_a = (out_features_a / 16) as u64;
         let tiles_b = (out_features_b / 16) as u64;
-        let groups = tiles_a + tiles_b;
         let shape = [
             to_u32(in_features, "in_features")?,
             to_u32(out_features_a, "out_features_a")?,
             to_u32(out_features_b, "out_features_b")?,
         ];
+        if env_flag("KAPLUMBA_USE_SK") {
+            if let Some(pipeline) =
+                self.ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2_sk2")
+            {
+                let groups = (tiles_a + tiles_b) * 2;
+                encoder.dispatch_1d_offset(
+                    pipeline,
+                    &[
+                        TensorRef::new(packed_a, offset_a),
+                        TensorRef::new(packed_b, offset_b),
+                        TensorRef::new(transformed, 0),
+                        TensorRef::new(raw_a, 0),
+                        TensorRef::new(raw_b, 0),
+                    ],
+                    params_bytes(&shape),
+                    groups * 256,
+                    256,
+                )?;
+                let blocks_a = to_u32(out_features_a / 128, "output dimension a")?;
+                encoder.dispatch_1d(
+                    &self.finalize_simd_sk2_pipeline,
+                    &[Some(raw_a), Some(output_signs_a), Some(output_a)],
+                    &blocks_a.to_le_bytes(),
+                    u64::from(blocks_a) * 32,
+                    32,
+                )?;
+                let blocks_b = to_u32(out_features_b / 128, "output dimension b")?;
+                return encoder.dispatch_1d(
+                    &self.finalize_simd_sk2_pipeline,
+                    &[Some(raw_b), Some(output_signs_b), Some(output_b)],
+                    &blocks_b.to_le_bytes(),
+                    u64::from(blocks_b) * 32,
+                    32,
+                );
+            }
+        }
+        let pipeline = self
+            .ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2")
+            .ok_or_else(|| {
+                KernelError::InvalidInput("missing linear_gemv_ishizuki_k3_fused2".to_string())
+            })?;
+        let groups = tiles_a + tiles_b;
         encoder.dispatch_1d_offset(
             pipeline,
             &[
@@ -1921,19 +2055,71 @@ impl LinearKernels {
                 32,
             )?;
         }
-        let pipeline = self
-            .ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2")
-            .ok_or_else(|| {
-                KernelError::InvalidInput("missing linear_gemv_ishizuki_k3_fused2".to_string())
-            })?;
         let tiles_a = (out_features_gate / 16) as u64;
         let tiles_b = (out_features_up / 16) as u64;
-        let groups = tiles_a + tiles_b;
         let shape = [
             to_u32(in_features, "in_features")?,
             to_u32(out_features_gate, "out_features_gate")?,
             to_u32(out_features_up, "out_features_up")?,
         ];
+        if env_flag("KAPLUMBA_USE_SK") {
+            if let Some(pipeline) =
+                self.ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2_sk2")
+            {
+                Self::trace_gemv("linear_gemv_ishizuki_k3_fused2_sk2 (mlp)");
+                let groups = (tiles_a + tiles_b) * 2;
+                encoder.dispatch_1d_offset(
+                    pipeline,
+                    &[
+                        TensorRef::new(packed_gate, offset_gate),
+                        TensorRef::new(packed_up, offset_up),
+                        TensorRef::new(transformed, 0),
+                        TensorRef::new(raw_gate, 0),
+                        TensorRef::new(raw_up, 0),
+                    ],
+                    params_bytes(&shape),
+                    groups * 256,
+                    256,
+                )?;
+                let blocks = to_u32(out_features_gate / 128, "features dimension")?;
+                if let Some(down_signs) = down_input_signs {
+                    return encoder.dispatch_1d(
+                        &self.finalize_gated_gelu_and_down_input_sk2_pipeline,
+                        &[
+                            Some(raw_gate),
+                            Some(gate_out_signs),
+                            Some(raw_up),
+                            Some(up_out_signs),
+                            Some(down_signs),
+                            Some(activated_or_transformed),
+                        ],
+                        &blocks.to_le_bytes(),
+                        u64::from(blocks) * 32,
+                        32,
+                    );
+                } else {
+                    return encoder.dispatch_1d(
+                        &self.finalize_gated_gelu_sk2_pipeline,
+                        &[
+                            Some(raw_gate),
+                            Some(gate_out_signs),
+                            Some(raw_up),
+                            Some(up_out_signs),
+                            Some(activated_or_transformed),
+                        ],
+                        &blocks.to_le_bytes(),
+                        u64::from(blocks) * 32,
+                        32,
+                    );
+                }
+            }
+        }
+        let pipeline = self
+            .ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2")
+            .ok_or_else(|| {
+                KernelError::InvalidInput("missing linear_gemv_ishizuki_k3_fused2".to_string())
+            })?;
+        let groups = tiles_a + tiles_b;
         encoder.dispatch_1d_offset(
             pipeline,
             &[
@@ -2018,21 +2204,66 @@ impl LinearKernels {
                 32,
             )?;
         }
-        let pipeline = self
-            .ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused3")
-            .ok_or_else(|| {
-                KernelError::InvalidInput("missing linear_gemv_ishizuki_k3_fused3".to_string())
-            })?;
         let tiles_a = (out_features_a / 16) as u64;
         let tiles_b = (out_features_b / 16) as u64;
         let tiles_c = (out_features_c / 16) as u64;
-        let groups = tiles_a + tiles_b + tiles_c;
         let shape = [
             to_u32(in_features, "in_features")?,
             to_u32(out_features_a, "out_features_a")?,
             to_u32(out_features_b, "out_features_b")?,
             to_u32(out_features_c, "out_features_c")?,
         ];
+        if env_flag("KAPLUMBA_USE_SK") {
+            if let Some(pipeline) =
+                self.ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused3_sk2")
+            {
+                Self::trace_gemv("linear_gemv_ishizuki_k3_fused3_sk2");
+                let groups = (tiles_a + tiles_b + tiles_c) * 2;
+                encoder.dispatch_1d_offset(
+                    pipeline,
+                    &[
+                        TensorRef::new(packed_a, offset_a),
+                        TensorRef::new(packed_b, offset_b),
+                        TensorRef::new(packed_c, offset_c),
+                        TensorRef::new(transformed, 0),
+                        TensorRef::new(raw_a, 0),
+                        TensorRef::new(raw_b, 0),
+                        TensorRef::new(raw_c, 0),
+                    ],
+                    params_bytes(&shape),
+                    groups * 256,
+                    256,
+                )?;
+                let blocks_a = to_u32(out_features_a / 128, "output dimension a")?;
+                let blocks_b = to_u32(out_features_b / 128, "output dimension b")?;
+                let blocks_c = to_u32(out_features_c / 128, "output dimension c")?;
+                let blocks_abc = [blocks_a, blocks_b, blocks_c];
+                let total_blocks = (blocks_a + blocks_b + blocks_c) as u64;
+                return encoder.dispatch_1d(
+                    &self.finalize_simd3_sk2_pipeline,
+                    &[
+                        Some(raw_a),
+                        Some(output_signs_a),
+                        Some(output_a),
+                        Some(raw_b),
+                        Some(output_signs_b),
+                        Some(output_b),
+                        Some(raw_c),
+                        Some(output_signs_c),
+                        Some(output_c),
+                    ],
+                    params_bytes(&blocks_abc),
+                    total_blocks * 32,
+                    32,
+                );
+            }
+        }
+        let pipeline = self
+            .ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused3")
+            .ok_or_else(|| {
+                KernelError::InvalidInput("missing linear_gemv_ishizuki_k3_fused3".to_string())
+            })?;
+        let groups = tiles_a + tiles_b + tiles_c;
         encoder.dispatch_1d_offset(
             pipeline,
             &[

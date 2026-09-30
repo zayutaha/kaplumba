@@ -1343,17 +1343,17 @@ impl ElementKernels {
     }
 }
 
+/// Build one compute pipeline, through the audit.
+///
+/// See [`crate::pipeline_audit`]: the point is not the build, it is that the
+/// build is *counted*, so "the element kernels compile once, at load" is a
+/// measurement and not a reading of this file.
 fn pipeline(
     device: &Device,
     library: &Library,
     name: &str,
 ) -> Result<ComputePipelineState, KernelError> {
-    let function = library
-        .get_function(name, None)
-        .map_err(KernelError::Shader)?;
-    device
-        .new_compute_pipeline_state_with_function(&function)
-        .map_err(KernelError::Pipeline)
+    crate::pipeline_audit::build(device, library, name)
 }
 
 fn validate_norm(

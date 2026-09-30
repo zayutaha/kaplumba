@@ -280,6 +280,12 @@ where
     // number would describe a decision the engine did not make.
     let greedy = config.sampler.temperature == 0.0;
     let track_margin = greedy && std::env::var_os("KAPLUMBA_MARGIN").is_some();
+    // Where pipeline compilation stood when load finished; `warmup_decode` armed
+    // it. Read here and not only in `generate_gpu_greedy`, for the reason the
+    // margin instrumentation above spells out: `generate_gpu` is the function the
+    // CLI calls, so an instrument that lives only in the greedy path compiles,
+    // passes its tests, and never fires.
+    let load_mark = kaplumba_kernels::pipeline_audit::armed_mark().unwrap_or(0);
     for step in 0..config.max_new_tokens {
         let token = if greedy {
             argmax_logits(&logits)
@@ -324,6 +330,12 @@ where
         }
         decode_duration += decode_started.elapsed();
         segments.record(generated_ids.len(), position, step_ms);
+        // The measurement hazard this guards: a kernel compiled inside this loop
+        // charges Metal's shader build to `step_ms`, which is what
+        // `decode_tokens_per_second` is made of. Checked AFTER the step is
+        // timed, so a panic here cannot be mistaken for a slow step, and gated,
+        // so a default run pays one relaxed atomic load.
+        kaplumba_kernels::pipeline_audit::assert_no_builds_since(load_mark);
     }
     if let Some(chunk) = detokenizer.finish()? {
         text.push_str(&chunk);
@@ -349,6 +361,16 @@ where
     // `forward_buffer`, the only scope that holds the encoder, so it has to be
     // *read* from each of the two decode entry points.
     crate::model::report_buffers_per_step();
+    // `KAPLUMBA_PIPELINE_AUDIT`: what was compiled, when, and whether any of it
+    // happened inside the loop above. Printed here, after the loop, so
+    // `late_builds` is a statement about the whole timed region rather than
+    // about whichever step happened to sample it.
+    if load_mark != 0 && std::env::var_os("KAPLUMBA_PIPELINE_AUDIT").is_some() {
+        eprintln!(
+            "{}",
+            kaplumba_kernels::pipeline_audit::audit_line_with_mark("after-decode", load_mark)
+        );
+    }
     margins.report();
     segments.finish();
     segments.report();

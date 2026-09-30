@@ -10,6 +10,7 @@ use kaplumba_kernels::attention::{
 use kaplumba_kernels::elements::{ElementKernels, RopeBufferRequest, RopeRequest};
 use kaplumba_kernels::encoder::MetalEncoder;
 use kaplumba_kernels::exl3::{Exl3Codebook, Exl3Rate, KernelError};
+use kaplumba_kernels::pipeline_audit;
 use kaplumba_kernels::linear::{
     LinearBufferRequest, LinearEncodeRequest, LinearKernels, LinearRequest, PrefillEncodeRequest,
     PrefillRequest,
@@ -18,7 +19,7 @@ use kaplumba_kernels::linear::{
 use crate::exl3::unpack_signs;
 use crate::gpu_cache::{GpuCacheError, GpuKvCache};
 use crate::kv_cache::{FullKvCache, KvCache, KvCacheError, SlidingKvCache};
-use crate::metal::{DEFAULT_RESIDENT_LIMIT_BYTES, MetalContext, MetalError};
+use crate::metal::{MetalContext, MetalError};
 use crate::safetensors::inspect_model_dir;
 use crate::weights::{TextWeights, WeightError};
 
@@ -1564,7 +1565,10 @@ impl DecoderLayer {
         //
         // `KAPLUMBA_NO_NORM_ROPE_QKV` restores the five-dispatch path. It exists
         // so the A/B can be run from ONE binary, which is the only way to
-        // attribute a step-time delta to this and not to a rebuild.
+        // attribute a step-time delta to this and not to a rebuild. It is also
+        // the A/B for attribution when a checkpoint's decode warmup fails: this
+        // fused kernel is decode-only, so the five-dispatch path below is the
+        // control for "is the fault in the fusion or in the weights".
         let fused_norm_rope = decode && !env_flag("KAPLUMBA_NO_NORM_ROPE_QKV");
         if fused_norm_rope {
             self.elements
@@ -2783,7 +2787,7 @@ impl TextModel {
             model_dir,
             &metadata.selection,
             context,
-            DEFAULT_RESIDENT_LIMIT_BYTES,
+            crate::metal::resident_limit_bytes(),
         )?;
         // The embedding is offloaded when the loader mapped it instead of copying
         // it, in which case the view is a page-aligned window and its length
@@ -2804,6 +2808,19 @@ impl TextModel {
                 Some((buffer, offset)) => (buffer, offset, true),
                 None => (weights.tensor_buffer(EMBED_NAME)?, 0, false),
             };
+        // Rates come from the checkpoint's own `quantization_config.json`, which
+        // `validate_quantization_summary` (config.rs) has already reconciled
+        // against `config.json`, and whose per-module `bits_per_weight` has been
+        // cross-checked against the trellis shapes in
+        // `validate_linear_geometry` (safetensors.rs). Hardcoding 3 here made the
+        // loader build 3-bpw `QuantizedLinear`s over 4-bpw weights, which then
+        // failed `QuantizedLinear::validate`'s packed-length check with a message
+        // about buffer sizes rather than about the bitrate.
+        let layer_rate = integer_rate(metadata.quantization.bits, "quantization.bits")?;
+        let head_rate = integer_rate(
+            metadata.quantization.head_bits as f32,
+            "quantization.head_bits",
+        )?;
         let mut layers = Vec::with_capacity(metadata.config.num_hidden_layers);
         for index in 0..metadata.config.num_hidden_layers {
             let full = metadata.config.layer_types[index].is_full();
@@ -2855,7 +2872,7 @@ impl TextModel {
                     &format!("{prefix}.self_attn.q_proj"),
                     metadata.config.hidden_size,
                     metadata.config.num_attention_heads * head_dim,
-                    Exl3Rate::Integer(3),
+                    layer_rate,
                     Exl3Codebook::Mcg,
                 )?,
                 k_proj: load_quantized_linear(
@@ -2863,7 +2880,7 @@ impl TextModel {
                     &format!("{prefix}.self_attn.k_proj"),
                     metadata.config.hidden_size,
                     kv_heads * head_dim,
-                    Exl3Rate::Integer(3),
+                    layer_rate,
                     Exl3Codebook::Mcg,
                 )?,
                 v_proj: if full {
@@ -2874,7 +2891,7 @@ impl TextModel {
                         &format!("{prefix}.self_attn.v_proj"),
                         metadata.config.hidden_size,
                         kv_heads * head_dim,
-                        Exl3Rate::Integer(3),
+                        layer_rate,
                         Exl3Codebook::Mcg,
                     )?)
                 },
@@ -2883,7 +2900,7 @@ impl TextModel {
                     &format!("{prefix}.self_attn.o_proj"),
                     metadata.config.num_attention_heads * head_dim,
                     metadata.config.hidden_size,
-                    Exl3Rate::Integer(3),
+                    layer_rate,
                     Exl3Codebook::Mcg,
                 )?,
                 gate_proj: load_quantized_linear(
@@ -2891,7 +2908,7 @@ impl TextModel {
                     &format!("{prefix}.mlp.gate_proj"),
                     metadata.config.hidden_size,
                     metadata.config.intermediate_size,
-                    Exl3Rate::Integer(3),
+                    layer_rate,
                     Exl3Codebook::Mcg,
                 )?,
                 up_proj: load_quantized_linear(
@@ -2899,7 +2916,7 @@ impl TextModel {
                     &format!("{prefix}.mlp.up_proj"),
                     metadata.config.hidden_size,
                     metadata.config.intermediate_size,
-                    Exl3Rate::Integer(3),
+                    layer_rate,
                     Exl3Codebook::Mcg,
                 )?,
                 down_proj: load_quantized_linear(
@@ -2907,7 +2924,7 @@ impl TextModel {
                     &format!("{prefix}.mlp.down_proj"),
                     metadata.config.intermediate_size,
                     metadata.config.hidden_size,
-                    Exl3Rate::Integer(3),
+                    layer_rate,
                     Exl3Codebook::Mcg,
                 )?,
                 q_norm: weights.read_f16(&format!("{prefix}.self_attn.q_norm.weight"))?,
@@ -2938,7 +2955,7 @@ impl TextModel {
             "lm_head",
             metadata.config.hidden_size,
             metadata.config.vocab_size,
-            Exl3Rate::Integer(6),
+            head_rate,
             Exl3Codebook::Mcg,
         )?;
         let mut model = Self::from_metal_parts_with_len(
@@ -2975,9 +2992,76 @@ impl TextModel {
         Ok(model)
     }
 
+    /// Run one decode step and one prefill step so nothing in the timed loops
+    /// meets a pipeline it has never dispatched.
+    ///
+    /// # Two steps, not one, and the second is the one this adds
+    ///
+    /// The decode step is what T7.6.8 added, to kill a 1277 ms first-step cost.
+    /// It is `forward_buffer(&[1], &[0])`: one query, position 0. That covers
+    /// the whole single-query path -- every layer's `encode_gemv`, the element
+    /// kernels, the split-KV attention pair, `lm_head` at 6 bpw.
+    ///
+    /// It does **not** cover the multi-query path, and a real request runs that
+    /// one immediately: prefill dispatches `linear_input_rows`, `linear_gemm_mma`
+    /// (or `linear_gemm_mma_regpipe` for folded-MCG), `linear_finalize_rows` and
+    /// the transposed `online_attention_gqa_*`, none of which a one-query forward
+    /// can reach -- the gate is `tokens == 1`, not "was this warmup or a real
+    /// step". Those pipelines are *built* at load (`LinearKernels::new` and
+    /// `AttentionKernels::new` build every one of them, eagerly), so this is not
+    /// about compilation; it is about first *dispatch*, which is a different and
+    /// separately-real cost on this hardware.
+    ///
+    /// Two queries rather than one, because `queries > 1` is the gate. The cost
+    /// is one prefill of two rows: the GEMM tiles are `ceil(queries / 128)`, so
+    /// two rows issue one tile of exactly the shape a 614-token prompt's last
+    /// chunk does. It is not free.
+    ///
+    /// # Order and the cache
+    ///
+    /// Prefill first, then `reset_caches`, then the decode step. A forward must
+    /// begin at the current cache position, so a second forward at positions
+    /// `0, 1` immediately after one at position `0` is rejected -- and it is
+    /// *rejected*, not silently mis-run, which is the only reason this ordering
+    /// bug shows up at load instead of as a wrong number much later. The decode
+    /// step is second so that it is the last thing before the final reset, i.e.
+    /// as close as possible to the state a real first decode step meets.
+    ///
+    /// # What this does and does not prove
+    ///
+    /// Neither step can prove that *every* decode-reachable kernel was
+    /// dispatched -- position 0 has an empty KV cache, so a kernel that only
+    /// runs once the cache is non-empty is not covered. What it does is arm
+    /// [`pipeline_audit`], so `KAPLUMBA_PIPELINE_AUDIT=1` reports the totals and
+    /// `KAPLUMBA_ASSERT_NO_LATE_PIPELINES=1` turns any pipeline *compiled* after
+    /// this point into a panic inside the decode loop.
     pub fn warmup_decode(&mut self) -> Result<(), ModelError> {
-        let _ = self.forward_buffer(&[1], &[0])?;
+        // `Metal command buffer failed` from here names neither the layer, the
+        // kernel, nor WHICH of the two warmup forwards failed -- and the two
+        // exercise disjoint kernel families (`linear_gemm_mma` for prefill,
+        // `encode_gemv` plus split-KV attention for decode). Both are labelled, so
+        // a failure says which one. This cost a bisect over 60 layers x 2 forwards
+        // before the labels existed.
+        //
+        // Prefill: two queries at positions 0 and 1, so `tokens > 1` and the
+        // multi-query kernels become reachable.
+        let _ = self
+            .forward_buffer(&[1, 2], &[0, 1])
+            .map_err(warmup_error("prefill"))?;
         self.reset_caches()?;
+        // Decode: one query at position 0.
+        let _ = self.forward_buffer(&[1], &[0]).map_err(warmup_error("decode"))?;
+        self.reset_caches()?;
+        // Arm the audit *after* the warmup, so the mark is the state a timed
+        // loop starts from. After, not before: a mark taken first would include
+        // the warmup's own builds in `builds_since` and report them as late.
+        let mark = pipeline_audit::arm();
+        if env_flag("KAPLUMBA_PIPELINE_AUDIT") {
+            eprintln!(
+                "{}",
+                pipeline_audit::audit_line_with_mark("after-warmup", mark)
+            );
+        }
         Ok(())
     }
 
@@ -2985,11 +3069,16 @@ impl TextModel {
         self.layers.len()
     }
 
+    /// The head rate is whatever the checkpoint declared, not a constant: the
+    /// load path builds `lm_head` from `quantization.head_bits`, so pinning 6
+    /// here made a correct 4/8-bpw checkpoint fail this check after a full
+    /// weight load. The dimension and codebook pins are unchanged, and the rate
+    /// is still bounded (`1..=8`) by `integer_rate` at construction.
     pub fn validate_current_graph(&self) -> Result<(), ModelError> {
         if self.layers.len() != 60
             || self.hidden_size != 5376
             || self.vocab_size != 262144
-            || self.lm_head.rate != Exl3Rate::Integer(6)
+            || !matches!(self.lm_head.rate, Exl3Rate::Integer(1..=8))
             || self.lm_head.codebook != Exl3Codebook::Mcg
         {
             return Err(ModelError::InvalidConfig(
@@ -3025,6 +3114,7 @@ impl TextModel {
     ///
     /// Prefill only needs logits for the position that is actually sampled, so
     /// the 262,144-wide vocabulary head runs for the last row alone.
+    ///
     /// The queue the forward runs on, so a caller can queue several steps.
     pub fn forward_queue(&self) -> metal::CommandQueue {
         self.forward_queue.clone()
@@ -3948,6 +4038,61 @@ impl TextModel {
         };
         Ok(self.elements.softcap(&logits, self.final_softcap)?)
     }
+}
+
+/// Test/diagnostic-only accessors on [`QuantizedLinear`].
+///
+/// `probe_forward.rs` needs to report what a loaded linear actually holds — the
+/// rate, the packed length, the buffer offset — because "Metal command buffer
+/// failed" from a 13.65 GiB load says none of that. Read-only; none of these can
+/// change a weight.
+impl QuantizedLinear {
+}
+
+
+/// Test-only re-export of [`integer_rate`], which is private.
+///
+/// The refusal of a fractional rate is the load path's last line of defence
+/// against a checkpoint whose `bits` has no kernel, and it is otherwise only
+/// reachable by loading 20 GB of weights. Exposing the one function keeps that
+/// check testable without a model.
+#[cfg(test)]
+pub(crate) fn integer_rate_for_test(bits: f32) -> Result<Exl3Rate, ModelError> {
+    integer_rate(bits, "test bits")
+}
+
+/// Prefix a warmup failure with the forward that produced it.
+///
+/// `KernelError::CommandFailed` is a bare "Metal command buffer failed". At load
+/// time that string appears once, after 60 layers have been built, and it says
+/// nothing about which of the two warmup forwards issued the offending dispatch
+/// -- and the two issue different kernel families (`encode_gemv` for decode,
+/// `linear_gemm_mma` for prefill). One word of context here replaced a bisect
+/// over 60 layers times 2 forwards.
+fn warmup_error(which: &'static str) -> impl FnOnce(ModelError) -> ModelError {
+    move |error| match error {
+        ModelError::Kernel(KernelError::CommandFailed) => {
+            ModelError::InvalidConfig(format!("Metal command buffer failed during warmup {which}"))
+        }
+        other => ModelError::InvalidConfig(format!("warmup {which}: {other}")),
+    }
+}
+
+/// A bitrate from checkpoint metadata as an [`Exl3Rate`].
+///
+/// A non-integer rate (3.5 bpw, say) has no kernel in this build: every family is
+/// specialised on an integer `KA` from 1 to 8. Converting one to
+/// `Exl3Rate::Fractional` would type-check and then dispatch a kernel that reads
+/// the wrong number of words per tile, so it is refused here, by name, where the
+/// value in `quantization_config.json` is still legible.
+fn integer_rate(bits: f32, field: &str) -> Result<Exl3Rate, ModelError> {
+    if bits.fract() != 0.0 || !(1.0..=8.0).contains(&bits) {
+        return Err(ModelError::InvalidConfig(format!(
+            "{field} is {bits}, which is not an integer rate in 1..=8; the kernels \
+             are specialised per integer rate and no fractional kernel exists"
+        )));
+    }
+    Ok(Exl3Rate::Integer(bits as u8))
 }
 
 fn load_quantized_linear(
