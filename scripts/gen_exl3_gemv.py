@@ -1,16 +1,42 @@
 #!/usr/bin/env python3
-"""Generate the rate/alignment-specialised EXL3 decode matvec kernels.
+"""Generate the rate/alignment/codebook-specialised EXL3 decode matvec kernels.
 
 Metal has no templates, so `linear_gemv_exl3` is emitted once per integer rate
-(KA) and per buffer alignment (ALIGNED), 16 kernels in total. Both axes are worth
-real throughput:
+(KA), per buffer alignment (ALIGNED), and per codebook SPECIALISATION. Three
+axes are worth real throughput:
 
-  KA      shift amounts and the ring size fold to constants.
-  ALIGNED a 4-byte-aligned buffer is read with one 32-bit load per word instead
-          of two 16-bit loads. Arena weights always are; mapped checkpoint bytes
-          are not (lm_head.trellis starts at % 4 == 2). Loads dominate the
-          kernel -- measured 0.336 ms of 0.612 ms for q_proj -- so halving the
-          load instruction count matters.
+  KA        shift amounts and the ring size fold to constants.
+  ALIGNED   a 4-byte-aligned buffer is read with one 32-bit load per word
+            instead of two 16-bit loads. Arena weights always are; mapped
+            checkpoint bytes are not (lm_head.trellis starts at % 4 == 2). Loads
+            dominate the kernel -- measured 0.336 ms of 0.612 ms for q_proj -- so
+            halving the load instruction count matters.
+  CODEBOOK  the codebook is a per-tensor constant, and branching on it inside
+            the eight-times-unrolled value loop cost 61.7% of the kernel. See the
+            measurement table on `exl3_decode8_mcg` in linear.metal.
+
+STATE COUNT, and why it is 16 + 16 and not 48.
+
+A fully general [aligned][bits][codebook] grid is 2 x 8 x 3 = 48 kernels. Only
+the MCG codebook is specialised, so the grid is 2 x 8 x 1 = 16 new kernels, and
+the original 16 (runtime-codebook) kernels are kept as the fallback for the
+`plain` and `mul1` codebooks. Total decode states: 32.
+
+Justification for specialising only MCG, which is a reachability fact and not a
+guess:
+
+  * Every linear in all 60 decoder layers is constructed with
+    `Exl3Rate::Integer(3)` + `Exl3Codebook::Mcg` (crates/engine/src/model.rs,
+    the seven `load_quantized_linear` calls per layer).
+  * `lm_head` is the only other tensor, and `Model::validate_current_graph`
+    refuses to run unless it is `Exl3Rate::Integer(6)` + `Exl3Codebook::Mcg`.
+  * The loader config validation likewise refuses any checkpoint whose
+    `quantization.codebook` is not "mcg".
+
+So MCG is the only codebook the engine can dispatch, and the plain/mul1 kernels
+exist only for the unit tests and the reference comparisons. Leaving them on the
+generic path costs nothing that is ever measured and saves 32 kernels of
+compile time and code size.
 
 Run from the repo root:  python3 scripts/gen_exl3_gemv.py
 It rewrites the block between the EXL3 matvec banner and `kernel void
@@ -22,7 +48,11 @@ from pathlib import Path
 
 PATH = Path("crates/kernels/src/linear.metal")
 BANNER = "// EXL3 decode matvec, shaped like the reference implementation."
-NEXT = "kernel void linear_gemv("
+# `kernel void linear_gemv(` is a PREFIX of `kernel void linear_gemv_exl3_k1(`,
+# so a plain `str.index` finds the first generated kernel instead of the
+# fallback kernel and the block is measured as empty. Require the `(` to be
+# followed by end-of-name, i.e. not another identifier character.
+NEXT_RE = re.compile(r"^kernel void linear_gemv\((?![\w])", re.M)
 
 HEADER = '''// EXL3 decode matvec, shaped like the reference implementation.
 //
@@ -34,12 +64,28 @@ HEADER = '''// EXL3 decode matvec, shaped like the reference implementation.
 //
 // The previous kernel used one thread per output element -- 5,376 threads for a
 // 5376-wide projection on a 20-core GPU -- and re-derived the 64-bit window once
-// per weight instead of once per eight weights.
+// per eight weights.
 //
 // A lane's eight codes land on rows {r0, r0+1, r0+8, r0+9} and columns {c, c+8},
 // so four x values feed all eight, each used twice. The reduction is
 // simd_shuffle_xor over four lanes then a threadgroup sum over the eight
 // simdgroups. No atomics.
+//
+// Three axes are specialised, because all three are worth real throughput and
+// Metal has no templates for any of them:
+//   * KA (1..8), so shift amounts and the ring size fold to constants.
+//   * ALIGNED, so a 4-byte-aligned buffer is read with one 32-bit load per word
+//     instead of two 16-bit loads. Arena-resident weights are always aligned;
+//     only mapped checkpoint bytes are not. The two-16-bit-load form doubles the
+//     load instruction count on the hottest path in the engine, and loads -- not
+//     the codebook -- dominate: measured 0.336 ms of 0.612 ms for q_proj.
+//   * CODEBOOK, only for MCG. The codebook is a per-tensor constant and
+//     branching on it eight times per lane cost 61.7% of the kernel; see
+//     `exl3_decode8_mcg` for the measurement and for the reason it is the BRANCH
+//     and not the arithmetic. `kN`/`kN_u` remain as the runtime-codebook
+//     fallback for the plain and mul1 codebooks.
+//
+// Variants are generated by `scripts/gen_exl3_gemv.py`; do not hand-edit.
 //
 // GENERATED by scripts/gen_exl3_gemv.py -- do not hand-edit below this line.
 '''
@@ -48,27 +94,130 @@ HEADER = '''// EXL3 decode matvec, shaped like the reference implementation.
 def main() -> None:
     src = PATH.read_text()
     start = src.index(BANNER)
-    end = src.index(NEXT)
+    match_next = NEXT_RE.search(src, start)
+    assert match_next, "fallback `kernel void linear_gemv(` not found"
+    end = match_next.start()
     body = src[start:end]
-    first = body.index("kernel void linear_gemv_exl3_k1(")
-    second = body.index("kernel void linear_gemv_exl3_k2(")
-    tmpl = body[first:second]
-    tmpl = tmpl.replace("kernel void linear_gemv_exl3_k1(", "KERNEL(")
-    tmpl = tmpl.replace("    const uint KA = 1u;", "    const uint KA = KA_N;")
-    tmpl = tmpl.replace(
-        "exl3_decode8(packed, tile_index, lane, KA, params.codebook, v);",
-        "exl3_decode8<ALIGNED>(packed, tile_index, lane, KA, params.codebook, v);",
+    # Everything between the banner and the first GENERATED kernel is preserved
+    # verbatim: the ishizuki reference kernels (`linear_gemv_ishizuki_k1..8`)
+    # live there. Slicing the template to "exactly one kernel" -- which is what
+    # makes this script idempotent -- would otherwise delete them, and
+    # `LinearKernels::new` then fails with "Function
+    # 'linear_gemv_ishizuki_k1' does not exist" at library build, far from the
+    # generator that removed it.
+    prefix_end = re.search(
+        r"^kernel void linear_gemv_exl3_k1\((?![\w])", body, re.M
+    ).start()
+    # Skip past the whole banner COMMENT, not just its first line: BANNER is one
+    # line, but the comment block runs on for ~40 lines and HEADER re-emits all
+    # of it. Slicing from `len(BANNER)` would duplicate the rest of the comment
+    # on every run -- a file that grows by 42 lines a pass, which is exactly the
+    # unbounded growth the join below exists to prevent.
+    #
+    # The pristine file has no `GENERATED by` marker, so the comment is found by
+    # its first non-comment line: everything from the banner to the first line
+    # that is not a comment and not blank.
+    lines = body.splitlines(keepends=True)
+    consumed = 0
+    for line in lines:
+        stripped = line.strip()
+        if stripped and not stripped.startswith("//"):
+            break
+        consumed += len(line)
+    preamble = body[consumed:prefix_end]
+    # The template is EXACTLY ONE kernel: from the first generated kernel up to
+    # the next line-initial `kernel void` after it.
+    #
+    # The name is matched with a trailing `(` that is NOT followed by more
+    # identifier characters, and anchored to the start of a line. A plain
+    # `index("linear_gemv_exl3_k1(")` also matches the prefix of `k1_u(` and
+    # `k1_mcg(`, so after one run it can land on a different kernel than the
+    # first one -- and if that kernel is a specialised one, the decode call
+    # normalises to the same thing, so the slice is silently the wrong template.
+    first_match = re.search(
+        r"^kernel void linear_gemv_exl3_k1\((?![\w])", body, re.M
     )
-    out = [HEADER]
+    assert first_match, "first EXL3 kernel not found"
+    first = first_match.start()
+    # Search from the END of the declaration line, not from `first`: `first` is
+    # itself a `^kernel void ` match, so a search starting there returns offset 0
+    # and the template comes out empty.
+    after = body.index("\n", first) + 1
+    match = re.search(r"^kernel void ", body[after:], re.M)
+    assert match, "no following kernel declaration"
+    second = after + match.start()
+    tmpl = body[first:second]
+    tmpl = tmpl.replace("kernel void linear_gemv_exl3_k1_u_mcg(", "KERNEL(")
+    tmpl = tmpl.replace("kernel void linear_gemv_exl3_k1_mcg(", "KERNEL(")
+    tmpl = tmpl.replace("kernel void linear_gemv_exl3_k1_u(", "KERNEL(")
+    tmpl = tmpl.replace("kernel void linear_gemv_exl3_k1(", "KERNEL(")
+    # The pristine file writes `const uint KA = 1;` (no `u` suffix); a previous
+    # run of this script leaves `KA_N` in place, which must be matched too, or the
+    # generated kernels all come out as KA = 1.
+    tmpl = re.sub(r"const uint KA = (?:1|1u|KA_N);", "const uint KA = KA_N;", tmpl)
+    # Normalise BOTH the generic and the already-specialised decode call into a
+    # single placeholder, so a second run of this script derives the same template
+    # as the first. `CBARG` is the ENTIRE optional argument INCLUDING its leading
+    # comma and the space after it -- either ", params.codebook " or nothing --
+    # because the two output families differ in whether the codebook argument is
+    # present at all. Leaving the comma outside the placeholder produces
+    # `KA, , v);`, a compile error rather than a silent miscompile, but still a
+    # wasted build.
+    # The replacement is a lambda, not a template string, so `re.sub` does not try
+    # to interpret the placeholder's punctuation as a group reference.
+    tmpl, n = re.subn(
+        r"exl3_decode8(?:_mcg)?<(true|false)>\(\s*packed,\s*tile_index,\s*lane,\s*"
+        r"KA\s*,?\s*(params\.codebook)?\s*,?\s*v\s*\);",
+        # The placeholder owns the ENTIRE tail of the argument list, so neither
+        # family can leave a dangling comma or omit a needed one. Generic emits
+        # the pristine text exactly; specialised drops the codebook argument and
+        # the comma that introduced it. Getting this wrong yields `KA, , v);` or
+        # `KAv);` -- both compile errors, so a mistake here is loud.
+        lambda m: f"DECODE<{m.group(1)}>(packed, tile_index, lane, KA@CB@);",
+        tmpl,
+    )
+    assert n == 1, f"expected exactly one decode call in the template, got {n}"
+    out = [HEADER, preamble.rstrip()]
+    # Fallback first: runtime codebook, for plain and mul1. Unchanged shape.
     for bits in range(1, 9):
         for aligned, suffix in ((True, ""), (False, "_u")):
             out.append(
                 tmpl.replace("KERNEL(", f"kernel void linear_gemv_exl3_k{bits}{suffix}(")
                 .replace("KA_N", str(bits))
-                .replace("ALIGNED", "true" if aligned else "false")
+                # `@CB@` swallows the codebook argument AND its leading comma AND
+                # the space before it, so the emitted call is
+                # `..., lane, KA, params.codebook, v);` -- the pristine text,
+                # byte for byte. Getting this wrong yields `KA, , v);` or
+                # `KAv);`, both of which are compile errors, so a mistake here
+                # is loud rather than silent.
+                .replace("@CB@", ", params.codebook, v")
+                .replace("DECODE", "exl3_decode8")
+                .replace("<true>", "<true>" if aligned else "<false>")
             )
-    PATH.write_text(src[:start] + "\n".join(out) + src[end:])
-    print(f"generated 16 kernels in {PATH}")
+    # Specialised: MCG codebook folded to a compile-time constant. The two
+    # variants differ ONLY in this one call, so the difference in the emitted
+    # source is one token and everything else -- window setup, shifts, unroll,
+    # accumulation -- is identical by construction.
+    for bits in range(1, 9):
+        for aligned, suffix in ((True, ""), (False, "_u")):
+            out.append(
+                tmpl.replace(
+                    "KERNEL(", f"kernel void linear_gemv_exl3_k{bits}{suffix}_mcg("
+                )
+                .replace("KA_N", str(bits))
+                .replace("@CB@", ", v")
+                .replace("DECODE", "exl3_decode8_mcg")
+                .replace("<true>", "<true>" if aligned else "<false>")
+            )
+    # Each generated kernel carries a trailing newline, so joining with "\n"
+    # inserts a blank line between kernels and, because the template is sliced
+    # back out of this block, one MORE blank line is appended on every run. The
+    # file grows without bound. Strip each kernel and join with a fixed two
+    # newlines so repeated runs are byte-identical.
+    PATH.write_text(
+        src[:start] + "\n\n".join(k.rstrip() + "\n" for k in out) + src[end:]
+    )
+    print(f"generated 32 kernels in {PATH}")
 
 
 if __name__ == "__main__":

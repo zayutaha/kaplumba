@@ -81,24 +81,68 @@ static uint fractional_window_tg(const threadgroup uint *tile, uint word_count, 
     return uint((merged >> (48u - offset)) & 0xffffu);
 }
 
-static float decode_state(uint state, uint codebook) {
-    uint value = state;
-    if (codebook == 0u) {
-        value = value * 89226354u + 64248484u;
-        value = 0x3b603b60u ^ (value & 0x8fff8fffu);
-        return float(as_type<half>((ushort)value) + as_type<half>((ushort)(value >> 16)));
-    }
-    if (codebook == 1u) {
-        value = value * 0xCBAC1FEDu;
-        value = 0x3b603b60u ^ (value & 0x8fff8fffu);
-        return float(as_type<half>((ushort)value) + as_type<half>((ushort)(value >> 16)));
-    }
+// The three codebooks, one function each, with NO branch on the codebook.
+//
+// `decode_state` below is the generic form and branches on a runtime `codebook`;
+// it exists for the paths that still take the codebook as data (prefill staging,
+// the non-specialised kernels, the reference kernels). The per-codebook functions
+// exist so a kernel that knows its codebook at compile time can call one of these
+// and have no `codebook == k` test in the eight-times-unrolled value loop at all.
+//
+// This split is the single largest win in the decode matvec. The measurement that
+// motivated it, on the real 5376x5376 shape (medians of 15, 384 MB working set,
+// exclusive GPU):
+//
+//   loads only (no decode)        212.2 GB/s
+//   production, runtime codebook   62.4 GB/s
+//   codebook folded to a constant 163.0 GB/s   (2.61x)
+//   branch hoisted, still runtime 128.5 GB/s
+//   no decode arithmetic at all    134.3 GB/s
+//
+// The last two lines are the important ones. Removing the decode *ops* on top of
+// the specialization makes it SLOWER (134.3 < 163.0): the arithmetic is free and
+// the BRANCH is what serialises the eight values per lane. So the fix is to
+// specialise the branch away and leave the arithmetic alone; do not try to make
+// the decode cheaper.
+//
+// Bit-exactness is non-negotiable here -- this is the one path in the engine
+// with exactness, and the 2.16e-3 error seen elsewhere comes from fp16 operands,
+// never from decode arithmetic. Each function is a transcription of one arm of
+// the old `decode_state`, and a unit test compares all three against the engine's
+// CPU reference (`decode_state` in crates/engine/src/exl3.rs) for every codebook
+// and every bit rate, so a typo in a constant cannot survive.
+
+static float decode_state_plain(uint value) {
+    value = value * 89226354u + 64248484u;
+    value = 0x3b603b60u ^ (value & 0x8fff8fffu);
+    return float(as_type<half>((ushort)value) + as_type<half>((ushort)(value >> 16)));
+}
+
+static float decode_state_mcg(uint value) {
+    value = value * 0xCBAC1FEDu;
+    value = 0x3b603b60u ^ (value & 0x8fff8fffu);
+    return float(as_type<half>((ushort)value) + as_type<half>((ushort)(value >> 16)));
+}
+
+static float decode_state_mul1(uint value) {
     value = value * 0x83DCD12Du;
     uint sum = 0x6400u + (value & 0xffu) + ((value >> 8) & 0xffu) + ((value >> 16) & 0xffu) + ((value >> 24) & 0xffu);
     half byte_value = as_type<half>((ushort)sum);
     half inverse = as_type<half>((ushort)0x1eeeu);
     half bias = as_type<half>((ushort)0xc931u);
     return float(half(float(byte_value) * float(inverse) + float(bias)));
+}
+
+// Generic, runtime-dispatched decode. Bit-identical to the three above; the only
+// difference is that the choice happens per code instead of at compile time.
+static float decode_state(uint state, uint codebook) {
+    if (codebook == 0u) {
+        return decode_state_plain(state);
+    }
+    if (codebook == 1u) {
+        return decode_state_mcg(state);
+    }
+    return decode_state_mul1(state);
 }
 
 // Map a logical (row, column) of the 16x16 tile to its state index in the
@@ -262,6 +306,69 @@ static inline void exl3_decode8(
     }
 }
 
+// The codebook-specialised twin of `exl3_decode8`.
+//
+// The body is a transcription of the body above with ONE difference: the decode
+// call is `decode_state_mcg` instead of `decode_state(s, codebook)`, so the
+// `codebook == 0u` / `codebook == 1u` tests -- which sit inside the eight-times
+// unrolled value loop, once per decoded weight -- do not exist. Everything else
+// is character-for-character the same, so the two are bit-identical by
+// construction rather than by argument.
+//
+// Why the branch and not the arithmetic: on the real 5376x5376 shape (medians of
+// 15, 384 MB working set, exclusive GPU)
+//
+//   loads only, no decode          212.2 GB/s
+//   production, runtime codebook    62.4 GB/s
+//   codebook folded to a constant  163.0 GB/s   (2.61x)
+//   branch hoisted, still runtime  128.5 GB/s
+//   no decode arithmetic at all    134.3 GB/s
+//
+// The last two lines are the point. Removing the decode OPS on top of the
+// specialization makes it SLOWER (134.3 < 163.0): the arithmetic is free and the
+// BRANCH is what serialises the eight values per lane. So specialise the branch
+// away and leave the arithmetic alone.
+//
+// Two traps this shape is deliberately built to avoid:
+//
+//  1. Do NOT hold the decoded values in a `uint code[8]` local array written in
+//     one `#pragma unroll` loop and read in another. That MISCOMPILED and gave
+//     32762/32768 wrong outputs while the harness reported success. `v[]` is
+//     thread-local and written in exactly one loop, as before.
+//  2. Do NOT let the accumulation re-associate. `acc += x0*v0 + x1*v1 + ...` is
+//     an FMA contraction; two variants can each match a baseline alone and
+//     differ from each other when combined (30818/32768 differed). The caller's
+//     accumulation is left untouched for exactly this reason -- the ONLY change
+//     in this file is which decode function is called.
+template <bool ALIGNED>
+static inline void exl3_decode8_mcg(
+    const device ushort *packed,
+    uint tile_index,
+    uint lane,
+    uint ka,
+    thread float *v) {
+    const uint ring_words = ka * 8u;
+    const uint ring = ring_words * 32u;
+    const uint lo = (lane * 8u + 1u) * ka + ring - 16u;
+    const uint i0 = lo / 32u;
+    const uint sh = lo % 32u;
+    const uint j0 = i0 >= ring_words ? i0 - ring_words : i0;
+    const uint j1 = j0 + 1u >= ring_words ? j0 + 1u - ring_words : j0 + 1u;
+    const uint j2 = j1 + 1u >= ring_words ? j1 + 1u - ring_words : j1 + 1u;
+    const uint base = tile_index * ring_words;
+    const ulong w0 = ulong(ring_word<ALIGNED>(packed, base + j0));
+    const ulong w1 = ulong(ring_word<ALIGNED>(packed, base + j1));
+    const ulong w2 = ulong(ring_word<ALIGNED>(packed, base + j2));
+    const ulong a = ((w0 << 32) | w1) << sh | (sh ? (w2 >> (32 - sh)) : 0ul);
+    const ulong c = ((w1 << 32) | w2) << sh;
+    #pragma unroll
+    for (uint i = 0u; i < 8u; ++i) {
+        const uint r = i * ka + 16u;
+        const uint s = (r <= 64u) ? uint(a >> (64u - r)) : uint(c >> (96u - r));
+        v[i] = decode_state_mcg(s & 0xffffu);
+    }
+}
+
 static uint packed_state(const device ushort *packed, uint tile_index, uint local_row, uint local_column, uint words, uint rate, uint mode) {
     if (rate < 16u) {
         return exl3_code_at(packed, tile_index, local_row, local_column, 256u * rate / 32u, rate);
@@ -317,41 +424,32 @@ kernel void linear_input_transform(
 //
 // The previous kernel used one thread per output element -- 5,376 threads for a
 // 5376-wide projection on a 20-core GPU -- and re-derived the 64-bit window once
-// per weight instead of once per eight weights.
+// per eight weights.
 //
 // A lane's eight codes land on rows {r0, r0+1, r0+8, r0+9} and columns {c, c+8},
 // so four x values feed all eight, each used twice. The reduction is
 // simd_shuffle_xor over four lanes then a threadgroup sum over the eight
 // simdgroups. No atomics.
 //
-// Two axes are specialised, because both are worth real throughput and Metal has
-// no templates for either:
+// Three axes are specialised, because all three are worth real throughput and
+// Metal has no templates for any of them:
 //   * KA (1..8), so shift amounts and the ring size fold to constants.
 //   * ALIGNED, so a 4-byte-aligned buffer is read with one 32-bit load per word
 //     instead of two 16-bit loads. Arena-resident weights are always aligned;
 //     only mapped checkpoint bytes are not. The two-16-bit-load form doubles the
 //     load instruction count on the hottest path in the engine, and loads -- not
 //     the codebook -- dominate: measured 0.336 ms of 0.612 ms for q_proj.
-//     Variants are generated by `scripts/gen_exl3_gemv.py`; do not hand-edit.
+//   * CODEBOOK, only for MCG. The codebook is a per-tensor constant and
+//     branching on it eight times per lane cost 61.7% of the kernel; see
+//     `exl3_decode8_mcg` for the measurement and for the reason it is the BRANCH
+//     and not the arithmetic. `kN`/`kN_u` remain as the runtime-codebook
+//     fallback for the plain and mul1 codebooks.
+//
+// Variants are generated by `scripts/gen_exl3_gemv.py`; do not hand-edit.
+//
+// GENERATED by scripts/gen_exl3_gemv.py -- do not hand-edit below this line.
 
-// ---------------------------------------------------------------------------
-// Verbatim port of ishizuki's `exl3_matvec`, for A/B only.
-//
-// Sources/IshizukiKit/Core/EXL3.swift:286. Their EXL3 kernel reports 28 tok/s on
-// a 2-bit Qwen 27B on M1 Max, which has comparable *real* bandwidth to an M4
-// Pro, so the format is not the ceiling and our kernel must be. This is a
-// line-for-line transcription of theirs -- same `column` pointer hoisted out of
-// the loop, same `xr` hoisted, same 8-simdgroup striding, same shuffle tree -- so
-// that any difference in throughput is attributable to the code and not to a
-// paraphrase. Do not "improve" it; that is the whole point.
-//
-// Differences from ours that are deliberate, and listed so they can be checked:
-//   * `trellis` is `const device uint *` and indexed directly, so each ring word
-//     is one 32-bit load. Every layer weight in our model is 4-byte aligned
-//     (verified: all packed_offset == 0), so this is the same path our ALIGNED
-//     specialisation takes.
-//   * `column` is hoisted, so the address is affine in `tk` and the compiler can
-//     strength-reduce it across the loop.
+
 kernel void linear_gemv_ishizuki_k1(
     const device ushort *packed [[buffer(0)]],
     const device half *x [[buffer(1)]],
@@ -1248,6 +1346,7 @@ kernel void linear_gemv_ishizuki_k8(
     }
 }
 
+
 kernel void linear_gemv_exl3_k1(
     const device ushort *packed [[buffer(0)]],
     const device half *input [[buffer(1)]],
@@ -1299,7 +1398,6 @@ kernel void linear_gemv_exl3_k1(
         output[out_base + lid] = s;
     }
 }
-
 
 
 kernel void linear_gemv_exl3_k1_u(
@@ -1355,7 +1453,6 @@ kernel void linear_gemv_exl3_k1_u(
 }
 
 
-
 kernel void linear_gemv_exl3_k2(
     const device ushort *packed [[buffer(0)]],
     const device half *input [[buffer(1)]],
@@ -1407,7 +1504,6 @@ kernel void linear_gemv_exl3_k2(
         output[out_base + lid] = s;
     }
 }
-
 
 
 kernel void linear_gemv_exl3_k2_u(
@@ -1463,7 +1559,6 @@ kernel void linear_gemv_exl3_k2_u(
 }
 
 
-
 kernel void linear_gemv_exl3_k3(
     const device ushort *packed [[buffer(0)]],
     const device half *input [[buffer(1)]],
@@ -1515,7 +1610,6 @@ kernel void linear_gemv_exl3_k3(
         output[out_base + lid] = s;
     }
 }
-
 
 
 kernel void linear_gemv_exl3_k3_u(
@@ -1571,7 +1665,6 @@ kernel void linear_gemv_exl3_k3_u(
 }
 
 
-
 kernel void linear_gemv_exl3_k4(
     const device ushort *packed [[buffer(0)]],
     const device half *input [[buffer(1)]],
@@ -1623,7 +1716,6 @@ kernel void linear_gemv_exl3_k4(
         output[out_base + lid] = s;
     }
 }
-
 
 
 kernel void linear_gemv_exl3_k4_u(
@@ -1679,7 +1771,6 @@ kernel void linear_gemv_exl3_k4_u(
 }
 
 
-
 kernel void linear_gemv_exl3_k5(
     const device ushort *packed [[buffer(0)]],
     const device half *input [[buffer(1)]],
@@ -1731,7 +1822,6 @@ kernel void linear_gemv_exl3_k5(
         output[out_base + lid] = s;
     }
 }
-
 
 
 kernel void linear_gemv_exl3_k5_u(
@@ -1787,7 +1877,6 @@ kernel void linear_gemv_exl3_k5_u(
 }
 
 
-
 kernel void linear_gemv_exl3_k6(
     const device ushort *packed [[buffer(0)]],
     const device half *input [[buffer(1)]],
@@ -1839,7 +1928,6 @@ kernel void linear_gemv_exl3_k6(
         output[out_base + lid] = s;
     }
 }
-
 
 
 kernel void linear_gemv_exl3_k6_u(
@@ -1895,7 +1983,6 @@ kernel void linear_gemv_exl3_k6_u(
 }
 
 
-
 kernel void linear_gemv_exl3_k7(
     const device ushort *packed [[buffer(0)]],
     const device half *input [[buffer(1)]],
@@ -1947,7 +2034,6 @@ kernel void linear_gemv_exl3_k7(
         output[out_base + lid] = s;
     }
 }
-
 
 
 kernel void linear_gemv_exl3_k7_u(
@@ -2003,7 +2089,6 @@ kernel void linear_gemv_exl3_k7_u(
 }
 
 
-
 kernel void linear_gemv_exl3_k8(
     const device ushort *packed [[buffer(0)]],
     const device half *input [[buffer(1)]],
@@ -2055,7 +2140,6 @@ kernel void linear_gemv_exl3_k8(
         output[out_base + lid] = s;
     }
 }
-
 
 
 kernel void linear_gemv_exl3_k8_u(
@@ -2111,6 +2195,852 @@ kernel void linear_gemv_exl3_k8_u(
 }
 
 
+kernel void linear_gemv_exl3_k1_mcg(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 1;
+    threadgroup float red[8][16];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint out_base = tn * 16u;
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        const uint tile_index = tk * tiles_n + tn;
+        float v[8];
+        exl3_decode8_mcg<true>(packed, tile_index, lane, KA, v);
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
+        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k1_u_mcg(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 1;
+    threadgroup float red[8][16];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint out_base = tn * 16u;
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        const uint tile_index = tk * tiles_n + tn;
+        float v[8];
+        exl3_decode8_mcg<false>(packed, tile_index, lane, KA, v);
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
+        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k2_mcg(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 2;
+    threadgroup float red[8][16];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint out_base = tn * 16u;
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        const uint tile_index = tk * tiles_n + tn;
+        float v[8];
+        exl3_decode8_mcg<true>(packed, tile_index, lane, KA, v);
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
+        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k2_u_mcg(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 2;
+    threadgroup float red[8][16];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint out_base = tn * 16u;
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        const uint tile_index = tk * tiles_n + tn;
+        float v[8];
+        exl3_decode8_mcg<false>(packed, tile_index, lane, KA, v);
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
+        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k3_mcg(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 3;
+    threadgroup float red[8][16];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint out_base = tn * 16u;
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        const uint tile_index = tk * tiles_n + tn;
+        float v[8];
+        exl3_decode8_mcg<true>(packed, tile_index, lane, KA, v);
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
+        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k3_u_mcg(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 3;
+    threadgroup float red[8][16];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint out_base = tn * 16u;
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        const uint tile_index = tk * tiles_n + tn;
+        float v[8];
+        exl3_decode8_mcg<false>(packed, tile_index, lane, KA, v);
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
+        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k4_mcg(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 4;
+    threadgroup float red[8][16];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint out_base = tn * 16u;
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        const uint tile_index = tk * tiles_n + tn;
+        float v[8];
+        exl3_decode8_mcg<true>(packed, tile_index, lane, KA, v);
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
+        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k4_u_mcg(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 4;
+    threadgroup float red[8][16];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint out_base = tn * 16u;
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        const uint tile_index = tk * tiles_n + tn;
+        float v[8];
+        exl3_decode8_mcg<false>(packed, tile_index, lane, KA, v);
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
+        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k5_mcg(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 5;
+    threadgroup float red[8][16];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint out_base = tn * 16u;
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        const uint tile_index = tk * tiles_n + tn;
+        float v[8];
+        exl3_decode8_mcg<true>(packed, tile_index, lane, KA, v);
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
+        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k5_u_mcg(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 5;
+    threadgroup float red[8][16];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint out_base = tn * 16u;
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        const uint tile_index = tk * tiles_n + tn;
+        float v[8];
+        exl3_decode8_mcg<false>(packed, tile_index, lane, KA, v);
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
+        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k6_mcg(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 6;
+    threadgroup float red[8][16];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint out_base = tn * 16u;
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        const uint tile_index = tk * tiles_n + tn;
+        float v[8];
+        exl3_decode8_mcg<true>(packed, tile_index, lane, KA, v);
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
+        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k6_u_mcg(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 6;
+    threadgroup float red[8][16];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint out_base = tn * 16u;
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        const uint tile_index = tk * tiles_n + tn;
+        float v[8];
+        exl3_decode8_mcg<false>(packed, tile_index, lane, KA, v);
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
+        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k7_mcg(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 7;
+    threadgroup float red[8][16];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint out_base = tn * 16u;
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        const uint tile_index = tk * tiles_n + tn;
+        float v[8];
+        exl3_decode8_mcg<true>(packed, tile_index, lane, KA, v);
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
+        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k7_u_mcg(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 7;
+    threadgroup float red[8][16];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint out_base = tn * 16u;
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        const uint tile_index = tk * tiles_n + tn;
+        float v[8];
+        exl3_decode8_mcg<false>(packed, tile_index, lane, KA, v);
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
+        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k8_mcg(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 8;
+    threadgroup float red[8][16];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint out_base = tn * 16u;
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        const uint tile_index = tk * tiles_n + tn;
+        float v[8];
+        exl3_decode8_mcg<true>(packed, tile_index, lane, KA, v);
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
+        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k8_u_mcg(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 8;
+    threadgroup float red[8][16];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint out_base = tn * 16u;
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        const uint tile_index = tk * tiles_n + tn;
+        float v[8];
+        exl3_decode8_mcg<false>(packed, tile_index, lane, KA, v);
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
+        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
 kernel void linear_gemv(
     const device ushort *packed [[buffer(0)]],
     const device half *input [[buffer(1)]],

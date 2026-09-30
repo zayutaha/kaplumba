@@ -11,6 +11,11 @@ use crate::exl3::{Exl3Codebook, Exl3Rate, KernelError};
 
 const SOURCE: &str = include_str!("linear.metal");
 
+/// Length of the decode-matvec pipeline table: index 0 is unused, then one slot
+/// per `(codebook, aligned, bits)` triple -- 3 x 2 x 8 = 48, plus the unused
+/// index 0. See [`LinearKernels::exl3_gemv_index`] for the layout.
+const EXL3_GEMV_STATES: usize = 1 + 3 * 2 * 8;
+
 /// Cached "is this switch set?" lookups.
 ///
 /// These used to be live `std::env::var_os` calls on the hot path. `var_os` takes
@@ -190,8 +195,18 @@ pub struct LinearKernels {
     /// `linear_gemv_fast` specialised on (bits, MCG codebook) for integer rates.
     fast_gemv_pipelines: Vec<Option<ComputePipelineState>>,
     /// Lane-per-thread EXL3 matvec, one per integer rate so `KA` folds to a
-    /// constant; see `linear_gemv_exl3_k*` in linear.metal. Index 0 is unused.
+    /// constant; see `linear_gemv_exl3_k*` in linear.metal. Indexed by
+    /// [codebook][aligned][bits]; see [`Self::exl3_gemv_index`].
     exl3_gemv_pipelines: Vec<Option<ComputePipelineState>>,
+    /// The same pipelines keyed by kernel name, so a test can dispatch a named
+    /// kernel and A/B two of them inside one process. Shares every
+    /// `MTLComputePipelineState` with `exl3_gemv_pipelines`; the map holds
+    /// clones, not rebuilds, so this costs no extra pipeline compilation.
+    exl3_gemv_by_name: std::collections::HashMap<String, ComputePipelineState>,
+    /// The kernel name each slot of `exl3_gemv_pipelines` was built from, in the
+    /// same order. Recorded so a test can assert the INDEX selects the kernel it
+    /// was built with; see [`Self::exl3_gemv_kernel_name`].
+    exl3_gemv_slot_names: Vec<String>,
     /// Verbatim ishizuki `exl3_matvec`, for A/B only.
     ishizuki_gemv_pipelines: Vec<Option<ComputePipelineState>>,
 }
@@ -257,22 +272,38 @@ impl LinearKernels {
             ));
         }
 
-        let mut exl3_gemv_pipelines = Vec::with_capacity(18);
+        let mut exl3_gemv_pipelines = Vec::with_capacity(EXL3_GEMV_STATES);
         exl3_gemv_pipelines.push(None); // index 0 unused
-        // Index by [aligned][bits]: 0 = unaligned, 1 = 4-byte aligned.
-        for aligned in [false, true] {
-            for bits in 1..=8_u32 {
-                let suffix = if aligned { "" } else { "_u" };
-                let name = format!("linear_gemv_exl3_k{bits}{suffix}");
-                let function = library
-                    .get_function(&name, None)
-                    .map_err(KernelError::Pipeline)?;
-                let pipeline = device
-                    .new_compute_pipeline_state_with_function(&function)
-                    .map_err(KernelError::Pipeline)?;
-                exl3_gemv_pipelines.push(Some(pipeline));
+        let mut exl3_gemv_by_name = std::collections::HashMap::new();
+        let mut exl3_gemv_slot_names: Vec<String> = vec![String::new()]; // index 0
+        // Index by [codebook][aligned][bits]; see `exl3_gemv_index`. The MCG
+        // family is emitted with the codebook folded to a compile-time constant
+        // (`_mcg` suffix), which is the only family the engine can dispatch; the
+        // plain and mul1 families keep the runtime-codebook form.
+        for codebook in [Exl3Codebook::Mcg, Exl3Codebook::Plain, Exl3Codebook::Mul1] {
+            let family = if codebook == Exl3Codebook::Mcg {
+                "_mcg"
+            } else {
+                ""
+            };
+            for aligned in [false, true] {
+                for bits in 1..=8_u32 {
+                    let suffix = if aligned { "" } else { "_u" };
+                    let name = format!("linear_gemv_exl3_k{bits}{suffix}{family}");
+                    let function = library
+                        .get_function(&name, None)
+                        .map_err(KernelError::Pipeline)?;
+                    let pipeline = device
+                        .new_compute_pipeline_state_with_function(&function)
+                        .map_err(KernelError::Pipeline)?;
+                    exl3_gemv_by_name.insert(name.clone(), pipeline.clone());
+                    exl3_gemv_slot_names.push(name);
+                    exl3_gemv_pipelines.push(Some(pipeline));
+                }
             }
         }
+        debug_assert_eq!(exl3_gemv_pipelines.len(), EXL3_GEMV_STATES);
+        debug_assert_eq!(exl3_gemv_slot_names.len(), EXL3_GEMV_STATES);
 
         let gemv_pipeline = device
             .new_compute_pipeline_state_with_function(&gemv_function)
@@ -326,6 +357,8 @@ impl LinearKernels {
             _library: library,
             input_pipeline,
             exl3_gemv_pipelines,
+            exl3_gemv_by_name,
+            exl3_gemv_slot_names,
             ishizuki_gemv_pipelines,
             gemv_pipeline,
             finalize_pipeline,
@@ -425,6 +458,35 @@ impl LinearKernels {
     }
 
     pub fn gemv_buffer(&self, request: LinearBufferRequest<'_>) -> Result<Vec<u16>, KernelError> {
+        self.gemv_buffer_impl(request, None)
+    }
+
+    /// [`Self::gemv_buffer`] with the decode kernel chosen by NAME instead of by
+    /// `(codebook, aligned, bits)`.
+    ///
+    /// This exists so a test can A/B two kernels inside ONE process. The
+    /// environment switches cannot do that: `env_flag` memoises on first read and
+    /// documents that no test mutates the environment mid-process, so flipping
+    /// `KAPLUMBA_LEGACY_GEMV` halfway through a test would make the two halves
+    /// measure different kernels and report the difference as if it were a
+    /// property of the code. A named dispatch carries no hidden state.
+    ///
+    /// `name` must be one of the generated `linear_gemv_exl3_*` kernels and must
+    /// be consistent with the request's `rate` and `codebook`; the caller owns
+    /// that pairing. Nothing in the engine calls this.
+    pub fn gemv_buffer_named(
+        &self,
+        name: &str,
+        request: LinearBufferRequest<'_>,
+    ) -> Result<Vec<u16>, KernelError> {
+        self.gemv_buffer_impl(request, Some(name))
+    }
+
+    fn gemv_buffer_impl(
+        &self,
+        request: LinearBufferRequest<'_>,
+        named: Option<&str>,
+    ) -> Result<Vec<u16>, KernelError> {
         let LinearBufferRequest {
             packed,
             packed_offset,
@@ -490,7 +552,22 @@ impl LinearKernels {
         // Integer rates go to the lane-per-thread matvec: one window setup per
         // eight codes, 256-thread groups, and enough threads to fill the GPU.
         // Grid is (out_features / 16) column-tiles x 256 threads.
-        if let Some(pipeline) = self.exl3_gemv_pipeline(rate, packed_offset) {
+        if let Some(name) = named {
+            let pipeline = self
+                .exl3_gemv_pipeline_by_name(name)
+                .ok_or_else(|| KernelError::InvalidInput(format!("no decode kernel {name}")))?;
+            self.encode_offset_256(
+                encoder,
+                pipeline,
+                &[
+                    TensorRef::new(packed, packed_offset),
+                    TensorRef::new(&transformed, 0),
+                    TensorRef::new(&raw, 0),
+                ],
+                params_bytes(&params),
+                (out_features / 16 * 256) as u64,
+            );
+        } else if let Some(pipeline) = self.exl3_gemv_pipeline(rate, packed_offset, codebook) {
             self.encode_offset_256(
                 encoder,
                 pipeline,
@@ -816,23 +893,179 @@ impl LinearKernels {
         self.ishizuki_gemv_pipelines[bits as usize].as_ref()
     }
 
-    fn exl3_gemv_pipeline(
-        &self,
+    /// Slot of a `(codebook, aligned, bits)` triple in `exl3_gemv_pipelines`.
+    ///
+    /// The decode matvec is specialised on three axes -- integer rate, buffer
+    /// alignment, and codebook -- because all three fold a comparison away from
+    /// the innermost loop. The codebook axis is new here: it was a runtime
+    /// argument branching eight times per lane, which cost 61.7% of the kernel
+    /// (62.4 -> 163.0 GB/s on the real 5376x5376 shape, bit-exact).
+    ///
+    /// Layout must stay in step with the construction loop in [`Self::new`]:
+    /// `1 + codebook_family * 16 + aligned * 8 + (bits - 1)`, family order MCG,
+    /// plain, mul1. Index 0 is unused, so the table is [`EXL3_GEMV_STATES`] long.
+    ///
+    /// Slot of a `(codebook, aligned, bits)` triple in `exl3_gemv_pipelines`.
+    ///
+    /// Public so a test can pin the mapping. It is public because getting it
+    /// wrong is silent and catastrophic: an off-by-one here selects the kernel
+    /// for the NEXT bit rate, so every 3-bit decoder linear in the model runs
+    /// the 4-bit kernel. The kernel still runs, still returns plausible-looking
+    /// numbers, and the whole engine is simply wrong. That happened while this
+    /// change was being written -- `1 + family*16 + aligned*8 + bits` instead of
+    /// `... + (bits - 1)` -- and no test caught it, because the bit-exactness
+    /// test dispatches by NAME and never goes through this function. Hence
+    /// `exl3_gemv_index_matches_the_generated_kernel_names`.
+    pub fn exl3_gemv_index(
         rate: Exl3Rate,
         packed_offset: u64,
-    ) -> Option<&ComputePipelineState> {
-        if env_flag("KAPLUMBA_LEGACY_GEMV") {
-            return None; // A/B switch against the pre-lane-per-thread kernels
-        }
+        codebook: Exl3Codebook,
+    ) -> Option<usize> {
         let Exl3Rate::Integer(bits) = rate else {
             return None;
         };
         if bits == 0 || bits > 8 {
             return None;
         }
-        let aligned = packed_offset % 4 == 0;
-        let index = if aligned { 8 + bits as usize } else { bits as usize };
+        let family = match codebook {
+            Exl3Codebook::Mcg => 0usize,
+            Exl3Codebook::Plain => 1,
+            Exl3Codebook::Mul1 => 2,
+        };
+        let aligned = usize::from(packed_offset % 4 == 0);
+        // `bits` is 1-based, the table is 0-based, so subtract one. Getting this
+        // wrong selects the kernel for the NEXT bit rate -- which for the 3-bit
+        // decoder linears means running the 4-bit kernel, and every output is
+        // wrong while the kernel still runs and still looks fast.
+        Some(1 + family * 16 + aligned * 8 + (bits as usize - 1))
+    }
+
+    fn exl3_gemv_pipeline(
+        &self,
+        rate: Exl3Rate,
+        packed_offset: u64,
+        codebook: Exl3Codebook,
+    ) -> Option<&ComputePipelineState> {
+        if env_flag("KAPLUMBA_LEGACY_GEMV") {
+            return None; // A/B switch against the pre-lane-per-thread kernels
+        }
+        let index = Self::exl3_gemv_index(rate, packed_offset, codebook)?;
         self.exl3_gemv_pipelines.get(index)?.as_ref()
+    }
+
+    /// Dispatch a specific decode-matvec pipeline by name, bypassing the
+    /// `(codebook, aligned, bits)` selection above.
+    ///
+    /// This exists so a test can A/B two kernels inside ONE process. The
+    /// environment switches cannot do that: `env_flag` memoises on first read
+    /// and documents that no test mutates the environment mid-process, because
+    /// a cached switch flipped halfway through a test would silently make the
+    /// two halves measure different kernels and report a difference in the code.
+    ///
+    /// The name must be one of the generated `linear_gemv_exl3_*` kernels; the
+    /// caller is responsible for it matching the `params` it encodes. Nothing in
+    /// the engine calls this.
+    pub fn encode_gemv_named(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        name: &str,
+        request: &LinearEncodeRequest<'_>,
+    ) -> Result<(), KernelError> {
+        // Dimension shape only. `validate_encode` also requires the MCG codebook,
+        // which is the right gate for the engine but not for a test that needs to
+        // dispatch the plain and mul1 families to show they stay distinct.
+        if request.in_features == 0
+            || request.out_features == 0
+            || !request.in_features.is_multiple_of(128)
+            || !request.out_features.is_multiple_of(128)
+            || !request.out_features.is_multiple_of(16)
+        {
+            return Err(KernelError::InvalidInput(
+                "linear dimensions must be non-zero multiples of 128 (output of 16)"
+                    .to_string(),
+            ));
+        }
+        let in_features = request.in_features;
+        let out_features = request.out_features;
+        let pipeline = self
+            .exl3_gemv_pipeline_by_name(name)
+            .ok_or_else(|| KernelError::InvalidInput(format!("no decode kernel {name}")))?;
+        let params = LinearParams {
+            in_features: to_u32(in_features, "input dimension")?,
+            out_features: to_u32(out_features, "output dimension")?,
+            tile_columns: to_u32(out_features / 16, "tile column count")?,
+            packed_words: to_u32(request.rate.packed_words(), "packed shape")?,
+            rate: request.rate.encoded(),
+            codebook: request.codebook.encoded(),
+            queries: 1,
+            perm_mode: request.perm_mode,
+        };
+        if !request.pretransformed {
+            let input_blocks = to_u32(in_features / 128, "input dimension")?;
+            encoder.dispatch_1d(
+                &self.input_pipeline,
+                &[
+                    Some(request.input),
+                    Some(request.input_signs),
+                    Some(request.transformed),
+                ],
+                &input_blocks.to_le_bytes(),
+                u64::from(input_blocks),
+                64,
+            )?;
+        }
+        encoder.dispatch_1d_offset(
+            pipeline,
+            &[
+                TensorRef::new(request.packed, request.packed_offset),
+                TensorRef::new(request.transformed, 0),
+                TensorRef::new(request.raw, 0),
+            ],
+            params_bytes(&params),
+            (out_features / 16 * 256) as u64,
+            256,
+        )?;
+        let output_blocks = to_u32(out_features / 128, "output dimension")?;
+        encoder.dispatch_1d(
+            &self.finalize_pipeline,
+            &[
+                Some(request.raw),
+                Some(request.output_signs),
+                Some(request.output),
+            ],
+            &output_blocks.to_le_bytes(),
+            u64::from(output_blocks),
+            64,
+        )
+    }
+
+    fn exl3_gemv_pipeline_by_name(&self, name: &str) -> Option<&ComputePipelineState> {
+        self.exl3_gemv_by_name.get(name)
+    }
+
+    /// The kernel name a `(codebook, aligned, bits)` triple dispatches to, or
+    /// `None` if the triple is not one the table covers.
+    ///
+    /// This exists so a test can pin `exl3_gemv_index` against the table the
+    /// construction loop actually built, rather than against a second copy of
+    /// the layout written in the test. The bug it guards against is silent and
+    /// total: an off-by-one in the index makes every 3-bit decoder linear in the
+    /// model run the 4-bit kernel, and the engine keeps producing finite
+    /// numbers. See [`Self::exl3_gemv_index`].
+    ///
+    /// The name is recorded at construction time and read back out of the slot,
+    /// rather than recovered by matching pipeline objects: a
+    /// `ComputePipelineState` clone is a distinct Rust value, so pointer
+    /// identity does not survive the clone that populates the name map, and
+    /// matching on it silently returns `None` for every slot.
+    pub fn exl3_gemv_kernel_name(
+        &self,
+        rate: Exl3Rate,
+        packed_offset: u64,
+        codebook: Exl3Codebook,
+    ) -> Option<&str> {
+        let index = Self::exl3_gemv_index(rate, packed_offset, codebook)?;
+        self.exl3_gemv_slot_names.get(index).map(String::as_str)
     }
 
     fn fast_gemv_pipeline(
@@ -933,7 +1166,7 @@ impl LinearKernels {
                 in_features,
                 out_features,
             )?;
-        } else if let Some(pipeline) = self.exl3_gemv_pipeline(rate, packed_offset) {
+        } else if let Some(pipeline) = self.exl3_gemv_pipeline(rate, packed_offset, codebook) {
             encoder.dispatch_1d_offset(
                 pipeline,
                 &[
