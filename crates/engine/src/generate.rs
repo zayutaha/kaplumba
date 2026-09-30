@@ -313,6 +313,9 @@ where
         let decode_started = Instant::now();
         logits = model.forward_buffer(&[token], &[position])?;
         let step_ms = decode_started.elapsed().as_secs_f64() * 1e3;
+        if std::env::var_os("KAPLUMBA_STEP_TRACE").is_some() {
+            eprintln!("GPU_STEP_TRACE: forward_buffer={:.2}ms", step_ms);
+        }
         decode_duration += decode_started.elapsed();
         segments.record(generated_ids.len(), position, step_ms);
     }
@@ -886,9 +889,11 @@ where
                 model.calibration_dispatch(encoder)
             })
             .map_err(ModelError::from)?;
+            let t_encode_start = Instant::now();
             model
                 .forward_buffer_into_step(&mut encoder, position, token)
                 .map_err(ModelError::from)?;
+            let t_encode_ms = t_encode_start.elapsed().as_secs_f64() * 1e3;
             // `commit_terminal` ends the step's trailing partial slice of rolled
             // command buffers; `wait` covers all of them, in commit order, which
             // is the barrier the next step's host-side staging needs.
@@ -899,13 +904,18 @@ where
             // cover and does not touch the fresh buffer `close_step` re-armed.
             let step_mode =
                 crate::decode_profile::active_mode() == crate::decode_profile::Mode::Step;
+            let t_wait_start = Instant::now();
             if step_mode {
                 crate::decode_profile::close_step(&mut encoder).map_err(ModelError::from)?;
             } else {
                 encoder.commit_terminal().map_err(ModelError::from)?;
                 encoder.wait();
             }
+            let t_wait_ms = t_wait_start.elapsed().as_secs_f64() * 1e3;
             let step_ms = step_started.elapsed().as_secs_f64() * 1e3;
+            if std::env::var_os("KAPLUMBA_STEP_TRACE").is_some() {
+                eprintln!("STEP_TRACE: encode={:.2}ms wait={:.2}ms total={:.2}ms", t_encode_ms, t_wait_ms, step_ms);
+            }
             crate::decode_profile::end_step(&mut encoder, step_ms).map_err(ModelError::from)?;
             decode_duration += Duration::from_secs_f64(step_ms / 1e3);
             segments.record(generated_ids.len(), position, step_ms);

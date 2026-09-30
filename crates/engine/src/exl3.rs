@@ -660,6 +660,103 @@ pub fn pack_signs(values: &[f16]) -> Result<Vec<u16>, Exl3Error> {
     Ok(output)
 }
 
+/// Extracts the 8 codes for lane `lane` from original Ishizuki packed words (24 u32s = 48 u16s).
+pub fn extract_ishizuki_lane_codes(words: &[u32; 24], lane: usize) -> [u8; 8] {
+    let ka = 3u32;
+    let ring = 256u32 * ka;
+    let words_count = (ring / 32) as usize;
+    let lo0 = (lane as u32 * 8 + 1) * ka + ring - 16;
+    let sh0 = lo0 % 32;
+    let hi0 = (lo0 / 32) as usize;
+    let j0 = if hi0 >= words_count { hi0 - words_count } else { hi0 };
+    let j1 = if j0 + 1 >= words_count { j0 + 1 - words_count } else { j0 + 1 };
+    let w0a = words[j0] as u64;
+    let w0b = words[j1] as u64;
+    let a0 = ((w0a << 32) | w0b) << sh0;
+
+    let mut codes = [0u8; 8];
+    for i in 0..8 {
+        let r = (i as u32) * ka + 16;
+        let s = (a0 >> (64 - r)) as u32;
+        codes[i] = (s & 0x7) as u8;
+    }
+    codes
+}
+
+/// Repacks a 16x16 tile's 24 uint32 words (96 bytes) into 3 bit-planes of 32 bytes each (96 bytes).
+pub fn repack_trellis_3bpw_tile(words: &[u32; 24]) -> [u8; 96] {
+    let mut repacked = [0u8; 96];
+    for lane in 0..32 {
+        let codes = extract_ishizuki_lane_codes(words, lane);
+        let mut b0 = 0u8;
+        let mut b1 = 0u8;
+        let mut b2 = 0u8;
+        for i in 0..8 {
+            b0 |= ((codes[i] >> 0) & 1) << i;
+            b1 |= ((codes[i] >> 1) & 1) << i;
+            b2 |= ((codes[i] >> 2) & 1) << i;
+        }
+        repacked[0 + lane] = b0;
+        repacked[32 + lane] = b1;
+        repacked[64 + lane] = b2;
+    }
+    repacked
+}
+
+/// Repacks an entire 3 bpw trellis tensor from original Ishizuki format to bit-plane format.
+pub fn repack_trellis_3bpw_tensor(packed_u16: &[u16]) -> Result<Vec<u16>, Exl3Error> {
+    if !packed_u16.len().is_multiple_of(48) {
+        return Err(Exl3Error::TrellisLength {
+            actual: packed_u16.len(),
+            expected: 48,
+        });
+    }
+    let mut output = Vec::with_capacity(packed_u16.len());
+    for chunk in packed_u16.chunks_exact(48) {
+        let mut words = [0u32; 24];
+        for (i, pair) in chunk.chunks_exact(2).enumerate() {
+            words[i] = u32::from(pair[0]) | (u32::from(pair[1]) << 16);
+        }
+        let repacked_bytes = repack_trellis_3bpw_tile(&words);
+        for pair in repacked_bytes.chunks_exact(2) {
+            output.push(u16::from_le_bytes([pair[0], pair[1]]));
+        }
+    }
+    Ok(output)
+}
+
+/// Reorders a 3 bpw trellis tensor from row-major tiles (tile_k, tile_n)
+/// to column-major tiles (tile_n, tile_k).
+///
+/// In row-major, tile (tk, tn) is at index (tk * tiles_n + tn) * 48.
+/// In column-major, tile (tk, tn) is at index (tn * tiles_k + tk) * 48.
+pub fn reorder_tensor_to_colmajor(
+    packed_u16: &[u16],
+    in_features: usize,
+    out_features: usize,
+) -> Result<Vec<u16>, Exl3Error> {
+    let tiles_k = in_features / 16;
+    let tiles_n = out_features / 16;
+    let expected = tiles_k * tiles_n * 48;
+    if packed_u16.len() != expected {
+        return Err(Exl3Error::TrellisLength {
+            actual: packed_u16.len(),
+            expected,
+        });
+    }
+    let mut output = vec![0u16; expected];
+    for tk in 0..tiles_k {
+        for tn in 0..tiles_n {
+            let src_offset = (tk * tiles_n + tn) * 48;
+            let dst_offset = (tn * tiles_k + tk) * 48;
+            output[dst_offset..dst_offset + 48]
+                .copy_from_slice(&packed_u16[src_offset..src_offset + 48]);
+        }
+    }
+    Ok(output)
+}
+
+
 #[cfg(test)]
 mod tests {
     use super::*;

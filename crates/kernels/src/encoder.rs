@@ -1,5 +1,4 @@
 use std::ffi::c_void;
-use std::marker::PhantomData;
 
 use metal::{
     Buffer, CommandBuffer, CommandQueue, ComputeCommandEncoder, ComputePipelineState,
@@ -196,6 +195,16 @@ fn max_in_flight() -> usize {
             .and_then(|value| value.trim().parse::<usize>().ok())
             .filter(|value| (1..=MAX_IN_FLIGHT).contains(value))
             .unwrap_or(MAX_IN_FLIGHT)
+    })
+}
+
+fn max_dispatches_per_buffer() -> u32 {
+    static CACHE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("KAPLUMBA_MAX_DISPATCHES_PER_BUFFER")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .unwrap_or(MAX_DISPATCHES_PER_BUFFER)
     })
 }
 
@@ -426,7 +435,7 @@ impl<'q> MetalEncoder<'q> {
     /// full, bounding how much work any single buffer carries.
     fn tick(&mut self) -> Result<(), KernelError> {
         self.dispatches += 1;
-        if self.dispatches >= MAX_DISPATCHES_PER_BUFFER {
+        if self.dispatches >= max_dispatches_per_buffer() {
             self.roll()?;
         }
         Ok(())

@@ -217,6 +217,16 @@ fn ishizuki_kernel_names(library: &Library) -> Vec<String> {
     names
 }
 
+fn repacked_kernel_names(library: &Library) -> Vec<String> {
+    let mut names: Vec<String> = library
+        .function_names()
+        .into_iter()
+        .filter(|name| name.starts_with("linear_gemv_repacked_"))
+        .collect();
+    names.sort();
+    names
+}
+
 pub struct LinearKernels {
     device: Device,
     queue: CommandQueue,
@@ -276,6 +286,7 @@ pub struct LinearKernels {
     /// kernels are selected by *rate*, not by a `(codebook, aligned, bits)` slot,
     /// and the variants under test have no slot.
     ishizuki_gemv_by_name: std::collections::HashMap<String, ComputePipelineState>,
+    repacked_gemv_by_name: std::collections::HashMap<String, ComputePipelineState>,
 }
 
 impl LinearKernels {
@@ -373,6 +384,17 @@ impl LinearKernels {
                 }
             }
             ishizuki_gemv_by_name.insert(name, pipeline);
+        }
+
+        let mut repacked_gemv_by_name = std::collections::HashMap::new();
+        for name in repacked_kernel_names(&library) {
+            let function = library
+                .get_function(&name, None)
+                .map_err(KernelError::Pipeline)?;
+            let pipeline = device
+                .new_compute_pipeline_state_with_function(&function)
+                .map_err(KernelError::Pipeline)?;
+            repacked_gemv_by_name.insert(name, pipeline);
         }
 
         let mut exl3_gemv_pipelines = Vec::with_capacity(EXL3_GEMV_STATES);
@@ -488,6 +510,7 @@ impl LinearKernels {
             exl3_gemv_slot_names,
             ishizuki_gemv_pipelines,
             ishizuki_gemv_by_name,
+            repacked_gemv_by_name,
             gemv_pipeline,
             finalize_pipeline,
             input_rows_pipeline,
@@ -1136,6 +1159,14 @@ impl LinearKernels {
         // so there is no correctness reason to want the old form — only an
         // attribution reason, when re-measuring a number that was taken before
         // this landed.
+        if env_flag("KAPLUMBA_REPACKED_GEMV") {
+            if let Some(pipeline) = self
+                .ishizuki_gemv_by_name
+                .get(&format!("linear_gemv_ishizuki_k{bits}_colmajor"))
+            {
+                return Some(pipeline);
+            }
+        }
         if !env_flag("KAPLUMBA_ISHIZUKI_3WORD") {
             if let Some(pipeline) = self
                 .ishizuki_gemv_by_name
@@ -1548,8 +1579,9 @@ impl LinearKernels {
             // reconstructed name would keep answering the old question correctly
             // while the answer changed.
             Self::trace_gemv(
-                self.ishizuki_gemv_by_name
+                self.repacked_gemv_by_name
                     .iter()
+                    .chain(self.ishizuki_gemv_by_name.iter())
                     .find(|(_, candidate)| std::ptr::eq(*candidate, pipeline))
                     .map(|(name, _)| name.as_str())
                     .unwrap_or("linear_gemv_ishizuki_k<unknown>"),
@@ -1886,7 +1918,7 @@ fn validate_encode(
 #[allow(clippy::too_many_arguments)]
 fn validate_buffer_shape(
     packed_bytes: u64,
-    packed_offset: u64,
+    _packed_offset: u64,
     input_len: usize,
     input_sign_len: usize,
     output_sign_len: usize,
