@@ -1403,6 +1403,48 @@ impl DecoderLayer {
                 .map_err(ModelError::Kernel)?;
             profile.stamp(encoder, &format!("{}qkv_proj", prefix()))?;
             timer.lap("qkv_proj");
+        } else if decode && self.weights.q_proj.permutation_mode == 1 {
+            let packed_q = self.weights.q_proj.metal_buffer.as_ref().ok_or_else(|| {
+                ModelError::InvalidWeights("q_proj has no GPU-resident weights".to_string())
+            })?;
+            let packed_k = self.weights.k_proj.metal_buffer.as_ref().ok_or_else(|| {
+                ModelError::InvalidWeights("k_proj has no GPU-resident weights".to_string())
+            })?;
+            let q_out_signs = self.weights.q_proj.output_signs_buffer.as_ref().ok_or_else(|| {
+                ModelError::InvalidWeights("q_proj output signs are not resident".to_string())
+            })?;
+            let k_out_signs = self.weights.k_proj.output_signs_buffer.as_ref().ok_or_else(|| {
+                ModelError::InvalidWeights("k_proj output signs are not resident".to_string())
+            })?;
+            let input_signs = self.weights.q_proj.input_signs_buffer.as_ref().ok_or_else(|| {
+                ModelError::InvalidWeights("q_proj input signs are not resident".to_string())
+            })?;
+            self.linear
+                .encode_gemv_fused2(
+                    encoder,
+                    packed_q,
+                    self.weights.q_proj.metal_offset,
+                    self.weights.q_proj.out_features,
+                    q_out_signs,
+                    &scratch.q,
+                    packed_k,
+                    self.weights.k_proj.metal_offset,
+                    self.weights.k_proj.out_features,
+                    k_out_signs,
+                    &scratch.k,
+                    &scratch.normed,
+                    input_signs,
+                    &scratch.transformed,
+                    &scratch.raw,
+                    &scratch.raw_b,
+                    self.weights.q_proj.in_features,
+                    true,
+                )
+                .map_err(ModelError::Kernel)?;
+            self.elements
+                .encode_copy(encoder, &scratch.k, &scratch.v, kv_elements)?;
+            profile.stamp(encoder, &format!("{}qk_proj", prefix()))?;
+            timer.lap("qk_proj");
         } else {
             self.encode_linear(
                 encoder,

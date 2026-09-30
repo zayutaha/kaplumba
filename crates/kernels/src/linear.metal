@@ -8052,10 +8052,10 @@ kernel void linear_gemv_ishizuki_k3_colmajor_pair(
             #pragma unroll
             for (uint i = 0; i < 8u; ++i) {
                 const uint r = i * KA + 16u;
-                v0[i] = decode_state(uint(A0 >> (64u - r)) & 0xffffu, CB);
-                v1[i] = decode_state(uint(A1 >> (64u - r)) & 0xffffu, CB);
-                v2[i] = decode_state(uint(A2 >> (64u - r)) & 0xffffu, CB);
-                v3[i] = decode_state(uint(A3 >> (64u - r)) & 0xffffu, CB);
+                v0[i] = decode_state_mcg(uint(A0 >> (64u - r)) & 0xffffu);
+                v1[i] = decode_state_mcg(uint(A1 >> (64u - r)) & 0xffffu);
+                v2[i] = decode_state_mcg(uint(A2 >> (64u - r)) & 0xffffu);
+                v3[i] = decode_state_mcg(uint(A3 >> (64u - r)) & 0xffffu);
             }
 
             acc0 += p00 * v0[0] + p01 * v0[1] + p02 * v0[2] + p03 * v0[3];
@@ -8081,7 +8081,7 @@ kernel void linear_gemv_ishizuki_k3_colmajor_pair(
             for (uint i = 0; i < 8u; ++i) {
                 const uint r = i * KA + 16u;
                 const uint s = uint(A0 >> (64u - r));
-                v[i] = decode_state(s & 0xffffu, CB);
+                v[i] = decode_state_mcg(s & 0xffffu);
             }
             acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
             acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
@@ -8182,10 +8182,10 @@ kernel void linear_gemv_ishizuki_k3_fused2(
         #pragma unroll
         for (uint i = 0; i < 8u; ++i) {
             const uint rad = i * KA + 16u;
-            v0[i] = decode_state(uint(A0 >> (64u - rad)) & 0xffffu, CB);
-            v1[i] = decode_state(uint(A1 >> (64u - rad)) & 0xffffu, CB);
-            v2[i] = decode_state(uint(A2 >> (64u - rad)) & 0xffffu, CB);
-            v3[i] = decode_state(uint(A3 >> (64u - rad)) & 0xffffu, CB);
+            v0[i] = decode_state_mcg(uint(A0 >> (64u - rad)) & 0xffffu);
+            v1[i] = decode_state_mcg(uint(A1 >> (64u - rad)) & 0xffffu);
+            v2[i] = decode_state_mcg(uint(A2 >> (64u - rad)) & 0xffffu);
+            v3[i] = decode_state_mcg(uint(A3 >> (64u - rad)) & 0xffffu);
         }
 
         acc0 += p00 * v0[0] + p01 * v0[1] + p02 * v0[2] + p03 * v0[3];
@@ -8209,7 +8209,7 @@ kernel void linear_gemv_ishizuki_k3_fused2(
         for (uint i = 0; i < 8u; ++i) {
             const uint rad = i * KA + 16u;
             const uint s = uint(A0 >> (64u - rad));
-            v[i] = decode_state(s & 0xffffu, CB);
+            v[i] = decode_state_mcg(s & 0xffffu);
         }
         acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
         acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
@@ -8323,10 +8323,10 @@ kernel void linear_gemv_ishizuki_k3_fused3(
         #pragma unroll
         for (uint i = 0; i < 8u; ++i) {
             const uint rad = i * KA + 16u;
-            v0[i] = decode_state(uint(A0 >> (64u - rad)) & 0xffffu, CB);
-            v1[i] = decode_state(uint(A1 >> (64u - rad)) & 0xffffu, CB);
-            v2[i] = decode_state(uint(A2 >> (64u - rad)) & 0xffffu, CB);
-            v3[i] = decode_state(uint(A3 >> (64u - rad)) & 0xffffu, CB);
+            v0[i] = decode_state_mcg(uint(A0 >> (64u - rad)) & 0xffffu);
+            v1[i] = decode_state_mcg(uint(A1 >> (64u - rad)) & 0xffffu);
+            v2[i] = decode_state_mcg(uint(A2 >> (64u - rad)) & 0xffffu);
+            v3[i] = decode_state_mcg(uint(A3 >> (64u - rad)) & 0xffffu);
         }
 
         acc0 += p00 * v0[0] + p01 * v0[1] + p02 * v0[2] + p03 * v0[3];
@@ -8350,7 +8350,7 @@ kernel void linear_gemv_ishizuki_k3_fused3(
         for (uint i = 0; i < 8u; ++i) {
             const uint rad = i * KA + 16u;
             const uint s = uint(A0 >> (64u - rad));
-            v[i] = decode_state(s & 0xffffu, CB);
+            v[i] = decode_state_mcg(s & 0xffffu);
         }
         acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
         acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
@@ -8602,6 +8602,126 @@ kernel void gemv_reduce_sk4(
     }
 }
 
+kernel void linear_gemv_ishizuki_k3_colmajor_contig4(
+    const device ushort *packed [[buffer(0)]],
+    const device half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant const uint *shape [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    constexpr uint KA = 3u;
+    constexpr int CB = 1;
+    constexpr uint RING = 256u * KA;
+    constexpr uint WORDS = RING / 32u;
+    const uint K = shape[0];
+    const uint N = shape[1];
+    const uint tiles_n = N / 16u;
+    const uint tiles_k = K / 16u;
+    constexpr int SG = 8;
+    threadgroup float red[SG][16];
+    const uint r0 = (lane % 4u) * 2u;
+
+    const uint lo0 = (lane * 8u + 1u) * 3u + RING - 16u;
+    const uint sh0 = lo0 % 32u;
+    const uint hi0 = lo0 / 32u;
+    const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
+    const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
+
+    for (uint tn = tgid; tn < tiles_n; tn += ntg) {
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        const device uint *column = (const device uint *)packed + tn * (tiles_k * WORDS);
+        const uint stride = WORDS;
+
+        const uint step = SG * 4u;
+        const uint k_unroll_end = (tiles_k / step) * step;
+
+        uint tk = sg * 4u;
+        for (; tk < k_unroll_end; tk += step) {
+            const device uint *t0 = column + (tk + 0u) * stride;
+            const device uint *t1 = column + (tk + 1u) * stride;
+            const device uint *t2 = column + (tk + 2u) * stride;
+            const device uint *t3 = column + (tk + 3u) * stride;
+
+            const ulong w0a = t0[j0], w0b = t0[j1];
+            const ulong w1a = t1[j0], w1b = t1[j1];
+            const ulong w2a = t2[j0], w2b = t2[j1];
+            const ulong w3a = t3[j0], w3b = t3[j1];
+
+            const ulong A0 = ((w0a << 32) | w0b) << sh0;
+            const ulong A1 = ((w1a << 32) | w1b) << sh0;
+            const ulong A2 = ((w2a << 32) | w2b) << sh0;
+            const ulong A3 = ((w3a << 32) | w3b) << sh0;
+
+            const device half *xr0 = x + (tk + 0u) * 16u + r0;
+            const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
+            const device half *xr1 = x + (tk + 1u) * 16u + r0;
+            const float p10 = float(xr1[0]), p11 = float(xr1[1]), p12 = float(xr1[8]), p13 = float(xr1[9]);
+            const device half *xr2 = x + (tk + 2u) * 16u + r0;
+            const float p20 = float(xr2[0]), p21 = float(xr2[1]), p22 = float(xr2[8]), p23 = float(xr2[9]);
+            const device half *xr3 = x + (tk + 3u) * 16u + r0;
+            const float p30 = float(xr3[0]), p31 = float(xr3[1]), p32 = float(xr3[8]), p33 = float(xr3[9]);
+
+            float v0[8], v1[8], v2[8], v3[8];
+            #pragma unroll
+            for (uint i = 0; i < 8u; ++i) {
+                const uint rad = i * KA + 16u;
+                v0[i] = decode_state_mcg(uint(A0 >> (64u - rad)) & 0xffffu);
+                v1[i] = decode_state_mcg(uint(A1 >> (64u - rad)) & 0xffffu);
+                v2[i] = decode_state_mcg(uint(A2 >> (64u - rad)) & 0xffffu);
+                v3[i] = decode_state_mcg(uint(A3 >> (64u - rad)) & 0xffffu);
+            }
+
+            acc0 += p00 * v0[0] + p01 * v0[1] + p02 * v0[2] + p03 * v0[3];
+            acc1 += p00 * v0[4] + p01 * v0[5] + p02 * v0[6] + p03 * v0[7];
+            acc0 += p10 * v1[0] + p11 * v1[1] + p12 * v1[2] + p13 * v1[3];
+            acc1 += p10 * v1[4] + p11 * v1[5] + p12 * v1[6] + p13 * v1[7];
+            acc0 += p20 * v2[0] + p21 * v2[1] + p22 * v2[2] + p23 * v2[3];
+            acc1 += p20 * v2[4] + p21 * v2[5] + p22 * v2[6] + p23 * v2[7];
+            acc0 += p30 * v3[0] + p31 * v3[1] + p32 * v3[2] + p33 * v3[3];
+            acc1 += p30 * v3[4] + p31 * v3[5] + p32 * v3[6] + p33 * v3[7];
+        }
+
+        for (tk = k_unroll_end + sg; tk < tiles_k; tk += SG) {
+            const device uint *t0 = column + tk * stride;
+            const ulong a0 = t0[j0], a1 = t0[j1];
+            const ulong A0 = ((a0 << 32) | a1) << sh0;
+            const device half *xr0 = x + tk * 16u + r0;
+            const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
+            float v[8];
+            #pragma unroll
+            for (uint i = 0; i < 8u; ++i) {
+                const uint rad = i * KA + 16u;
+                const uint s = uint(A0 >> (64u - rad));
+                v[i] = decode_state_mcg(s & 0xffffu);
+            }
+            acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
+            acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
+        }
+
+        acc0 += simd_shuffle_xor(acc0, 1u);
+        acc0 += simd_shuffle_xor(acc0, 2u);
+        acc1 += simd_shuffle_xor(acc1, 1u);
+        acc1 += simd_shuffle_xor(acc1, 2u);
+        if (lane % 4u == 0u) {
+            red[sg][lane / 4u] = acc0;
+            red[sg][lane / 4u + 8u] = acc1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid < 16u) {
+            float sum = 0.0f;
+            for (int g = 0; g < SG; ++g) {
+                sum += red[g][lid];
+            }
+            y[tn * 16u + lid] = sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 kernel void linear_gemv_ishizuki_k3_colmajor_u4(
     const device ushort *packed [[buffer(0)]],
     const device half *x [[buffer(1)]],
@@ -8665,7 +8785,7 @@ kernel void linear_gemv_ishizuki_k3_colmajor_u4(
             #pragma unroll
             for (uint i = 0; i < 8u; ++i) {
                 const uint r = i * KA + 16u;
-                v[i] = decode_state(uint(A0 >> (64u - r)) & 0xffffu, CB);
+                v[i] = decode_state_mcg(uint(A0 >> (64u - r)) & 0xffffu);
             }
             acc0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
             acc1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
@@ -8685,7 +8805,7 @@ kernel void linear_gemv_ishizuki_k3_colmajor_u4(
         for (uint i = 0; i < 8u; ++i) {
             const uint rad = i * KA + 16u;
             const uint s = uint(A0 >> (64u - rad));
-            v[i] = decode_state(s & 0xffffu, CB);
+            v[i] = decode_state_mcg(s & 0xffffu);
         }
         acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
         acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
