@@ -1,0 +1,75 @@
+probe library compiled: 8 kernels
+  cpu-check noload(seed=0x11111111,0x22222222): finite=true max_rel_err=1.630e-7 exact_f32_order=false got[0]=13.241812 want[0]=13.241813
+  cpu-check noload(seed=0x9abcdef0,0xfedcba9): finite=true max_rel_err=1.774e-7 exact_f32_order=false got[0]=4.902884 want[0]=4.902884
+
+=== gate_up  5376x43008: working set 1.99 GB (23 copies, 86.7 MB each), weights 86.7 MB, grid 2688 threadgroups x 256
+  FIDELITY: replica bitwise-equal to production = true, production output finite = true
+  DCE GATE: noload(seed A) != noload(seed B) = true, != production = true, nonzero = true
+
+  arm                             min ms median ms    max ms GB/s(min)    med/min   vs (a)
+  (a) production                  0.4589    0.4687    0.7139      188.9      1.02    +0.0%
+  (r) replica (control)           0.4580    0.4678    0.5784      189.3      1.02    -0.2%
+  (b) NO loads, full decode       0.4233    0.4339    0.5017      204.8      1.02    -7.8%
+  (e) NO loads, hoisted decode    0.1352    0.1372    0.1597      641.5      1.02   -70.5%
+  (f) (b) + constant shift amt    0.1253    0.1261    0.1363      692.1      1.01   -72.7%
+  (g) (b) + NO decode body        0.5818    0.5892    0.5972      149.0      1.01   +26.8%
+  (c) loads kept, NO decode       0.5885    0.5965    0.6212      147.3      1.01   +28.2%
+  (d) loads kept, 129KB window    0.4554    0.4661    0.4743      190.4      1.02    -0.8%
+
+  --- partition, attributed against the replica T(r) = 0.4580 ms ---
+  T(a) production                  0.4589 ms  (+0.2% vs T(r))
+  T(e) loads gone, decode hoisted  0.1352 ms  (-70.5% vs T(r))
+  T(b) loads gone, decode kept     0.4233 ms  (-7.6% vs T(r))
+  T(f) (b), constant shift amt     0.1253 ms  (-72.6% vs T(r))
+  T(g) (b), no decode body         0.5818 ms  (+27.0% vs T(r))
+  T(c) loads kept, no decode       0.5885 ms  (+28.5% vs T(r))
+  T(d) loads kept, 129KB window    0.4554 ms  (-0.6% vs T(r))
+
+  decode total = T(b) - T(e)       +0.2882 ms  (+62.9% of T(r))
+    of which 64-bit barrel shift = T(b) - T(f)   +0.2981 ms  (+65.1%)
+    of which decode_state_mcg    = T(f) - T(e)   -0.0099 ms  (-2.2%)
+    cross-check (g): shift only   = T(b) - T(g)   -0.1585 ms  (-34.6%)
+                 decode only     = T(g) - T(e)   +0.4467 ms  (+97.5%)
+  load  total = T(r) - T(b)       +0.0347 ms  (+7.6% of T(r))
+    cross-check (c): loads kept, decode gone = T(c) - T(r) +0.1305 ms (+28.5%)
+    cross-check (d): DRAM/L2 miss only = T(r) - T(d) +0.0026 ms (+0.6%)
+  residual = T(b) - T(e) - (T(r) - T(b)) = +0.2535 ms (+55.4%)
+  => partition of T(r): decode +62.9% / load +7.6% / neither +29.5%
+
+  ESTIMATOR: min over 11 interleaved rounds. Worst median/min ratio across arms = 1.02x (>1 means another process stole the GPU during the run; gpuq only excludes the engine's flock, not a benchmark harness). Interleaved A B A B, so a stolen round inflates every arm it touched rather than biasing one.
+
+=== down     21504x5376: working set 1.99 GB (46 copies, 43.4 MB each), weights 43.4 MB, grid 336 threadgroups x 256
+  FIDELITY: replica bitwise-equal to production = true, production output finite = true
+  DCE GATE: noload(seed A) != noload(seed B) = true, != production = true, nonzero = true
+
+  arm                             min ms median ms    max ms GB/s(min)    med/min   vs (a)
+  (a) production                  0.2390    0.2479    0.3611      181.4      1.04    +0.0%
+  (r) replica (control)           0.2392    0.2415    0.3494      181.2      1.01    +0.1%
+  (b) NO loads, full decode       0.2189    0.2204    0.3017      198.0      1.01    -8.4%
+  (e) NO loads, hoisted decode    0.0661    0.0671    0.0846      656.2      1.02   -72.4%
+  (f) (b) + constant shift amt    0.0650    0.0661    0.0778      667.3      1.02   -72.8%
+  (g) (b) + NO decode body        0.2981    0.2996    0.3574      145.4      1.00   +24.7%
+  (c) loads kept, NO decode       0.3068    0.3087    0.3449      141.3      1.01   +28.4%
+  (d) loads kept, 129KB window    0.2351    0.2361    0.2644      184.4      1.00    -1.6%
+
+  --- partition, attributed against the replica T(r) = 0.2392 ms ---
+  T(a) production                  0.2390 ms  (-0.1% vs T(r))
+  T(e) loads gone, decode hoisted  0.0661 ms  (-72.4% vs T(r))
+  T(b) loads gone, decode kept     0.2189 ms  (-8.5% vs T(r))
+  T(f) (b), constant shift amt     0.0650 ms  (-72.8% vs T(r))
+  T(g) (b), no decode body         0.2981 ms  (+24.6% vs T(r))
+  T(c) loads kept, no decode       0.3068 ms  (+28.3% vs T(r))
+  T(d) loads kept, 129KB window    0.2351 ms  (-1.7% vs T(r))
+
+  decode total = T(b) - T(e)       +0.1528 ms  (+63.9% of T(r))
+    of which 64-bit barrel shift = T(b) - T(f)   +0.1539 ms  (+64.4%)
+    of which decode_state_mcg    = T(f) - T(e)   -0.0011 ms  (-0.5%)
+    cross-check (g): shift only   = T(b) - T(g)   -0.0792 ms  (-33.1%)
+                 decode only     = T(g) - T(e)   +0.2320 ms  (+97.0%)
+  load  total = T(r) - T(b)       +0.0203 ms  (+8.5% of T(r))
+    cross-check (c): loads kept, decode gone = T(c) - T(r) +0.0676 ms (+28.3%)
+    cross-check (d): DRAM/L2 miss only = T(r) - T(d) +0.0041 ms (+1.7%)
+  residual = T(b) - T(e) - (T(r) - T(b)) = +0.1326 ms (+55.4%)
+  => partition of T(r): decode +63.9% / load +8.5% / neither +27.6%
+
+  ESTIMATOR: min over 11 interleaved rounds. Worst median/min ratio across arms = 1.04x (>1 means another process stole the GPU during the run; gpuq only excludes the engine's flock, not a benchmark harness). Interleaved A B A B, so a stolen round inflates every arm it touched rather than biasing one.

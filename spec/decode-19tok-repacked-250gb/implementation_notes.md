@@ -1132,3 +1132,169 @@ flipped-input arm above.
 `scripts/gen_exl3_gemv.py` twice: `git status --short` identical both times, no
 `linear*.metal` churn. `attention_metal` (4) + `attention_shapes` (1) +
 `kaplumba-kernels --lib` (19) + the new file (7) all pass.
+
+---
+
+## 20. The load-vs-ALU partition of `contig4`, MEASURED (probe, not inference)
+
+`crates/kernels/probe/contig4_load_alu.metal` +
+`crates/engine/examples/probe_contig4_load_alu.rs`. Raw output kept at
+`crates/kernels/probe/probe-r4.txt` and `probe-final3.txt`.
+
+### The prior "no weight loads" probe was void, and that is where the bad partition came from
+
+`spec/decode-20tok/tasks.md:404` and `implementation_notes.md` §19.2 record
+"no weight loads 1.87x, the decode is entirely hidden". That probe was commit
+`49814d4`'s `linear_gemv_nold_k3`, and its decode input was a **loop-invariant
+64-bit literal**:
+
+```metal
+const ulong w0 = 0x9E3779B97F4A7C15ul;   // never varies with tk
+v[i] = decode_state(s & 0xffffu, CB);
+```
+
+`v[i]` is loop-invariant, so LICM hoists all eight decodes out of the tile loop
+and the accumulation degenerates to a multiply by a constant. That instrument
+measured *loads gone AND decode gone* and attributed the whole difference to the
+loads. The 46%/54% partition was then inferred on top of it. Both are wrong, and
+the error is the same class as the two false coverage claims in AGENTS.md §3.4: a
+probe whose fast arm was not checked to still contain the work it claimed to
+isolate.
+
+### The corrected probe, and why each arm is a literal kernel
+
+Arms are full top-level kernels, each a copy of
+`linear_gemv_ishizuki_k3_colmajor_contig4` (`linear_repacked.metal:1101`) with the
+lines marked `PROBE-DELTA` changed. The first version used a `template<int ARM>`
+with the reduction array passed in as a `threadgroup float *` (MSL forbids a
+`threadgroup` variable in a non-kernel function). **Arm (r) came out bitwise
+identical to production but 12.6% slower**, i.e. the parameterisation itself
+perturbed the schedule, so the literal copies replaced it. Reported numbers are
+attributed against T(r), not T(a), so the replica's residual difference cannot
+leak into the partition.
+
+    (r) replica         byte-identical control, bitwise-equal to (a)  [FIDELITY gate]
+    (b) NO loads, full decode          words := probe_word(seed, tk+q), tk-varying
+    (e) NO loads, hoisted decode       same but tile := 0 (the 49814d4 shape)
+    (f) (b) + constant shift amount    rad := 48 instead of i*KA+16
+    (g) (b) + no decode body           decode_state_mcg -> nod_stub
+    (c) loads kept, no decode          nod_stub, real loads   [_nod replication]
+    (d) loads kept, 129 KB window      tn -> tn & 3          [miss vs issue]
+
+`(b)` is the arm nobody had run. Its words depend on the induction variable, so
+the decode cannot be hoisted -- a compiler invariant, not a hope -- and `(e)` is
+the hoisted control, so if `(b)` had been hoisted then T(b) == T(e) and the
+partition would come out as a flat contradiction rather than a number.
+
+### Result. gate_up 5376x43008, 1.99 GB working set, 11 interleaved rounds, min
+
+    arm                        min ms   median   med/min   vs (a)
+    (a) production               0.4589   0.4687    1.02     +0.0%
+    (r) replica (control)        0.4580   0.4678    1.02     -0.2%
+    (b) NO loads, full decode    0.4233   0.4339    1.02     -7.8%
+    (e) NO loads, hoisted        0.1352   0.1372    1.02    -70.5%
+    (f) (b) + constant shift     0.1253   0.1261    1.01    -72.7%
+    (g) (b) + no decode body     0.5818   0.5892    1.01    +26.8%
+    (c) loads kept, no decode    0.5885   0.5965    1.01    +28.2%
+    (d) loads kept, 129 KB       0.4554   0.4661    1.02     -0.8%
+
+    decode total = T(b)-T(e)     +0.2882 ms   +62.9% of T(r)
+    load  total = T(r)-T(b)      +0.0347 ms   + 7.6% of T(r)
+    neither (floor + x loads)     0.1352 ms   +29.5% of T(r)
+
+down 21504x5376 reproduces it: decode 63.9% / load 8.5% / neither 27.6%, worst
+median/min 1.02-1.04x across three independent runs. **The partition is additive
+to within the spread** (63 + 8 + 30 = 101), which is the check that the three arms
+are measuring separable costs.
+
+### Conclusion: ALU-bound, ~8:1, and the ALU is the 64-bit barrel shift
+
+**The ~46% load / 54% ALU hypothesis is wrong. The measured partition is ~8%
+load-issue and ~63% decode-ALU.** Removing *every* weight load buys 7.8%; removing
+the dequant arithmetic would have bought 63%.
+
+The reason the `_nod` probe looked like it said otherwise is now explicit and it is
+not mysterious: removing `decode_state_mcg` **destroys the ILP** that hides the
+barrel-shift latency. Arm (g)/(c) measure that directly -- keeping the loads and
+the variable shift but stubbing the decode body is **27% SLOWER**, reproducing
+`_nod`'s sign exactly, and arm (f) isolates the cause:
+
+    T(f) = (b) with the shift amount pinned to a constant = 0.1253 ms
+    T(b) = (b) as production                           = 0.4233 ms
+
+So `decode_state_mcg`'s mul/xor/half2-add body costs **-2.3%** (i.e. nothing;
+`T(f) <= T(e)`, it is free and slightly negative), and **65.6% of the kernel is
+`uint(A >> (64u - rad))` with `rad` varying per element** -- a 64-bit barrel shift
+executed 32 times per 4-tile iteration. `rad` unrolls to 16,19,22,...,37, and a
+64-bit variable shift is a shift of each half plus a select on a 32-bit ALU.
+
+Also measured, and against the "the loads are the problem" reading:
+
+- **(d) is +0.6% vs production.** Same load count, same address arithmetic, but a
+  129 KB L2-resident window instead of 2.6 GB of DRAM. **DRAM/L2 miss cost is
+  ~1% of the kernel.** At 190 GB/s the kernel is nowhere near a bandwidth limit;
+  the "~250 GB/s ceiling" framing does not apply to this loop, because the loop
+  is not waiting on memory. The 187.7 GB/s is not a bandwidth shortfall at all.
+- **(c) replicates `_nod`** on `contig4`: +28.2%. Consistent with the 167.3 ->
+  122.7 recorded for `k3`.
+
+### What this redirects
+
+1. The `KAPLUMBA_GEMV_MAX_GROUPS` / Split-K / 4 bpw "fewer lane-loads per byte"
+   line of work attacks ~8% of the kernel. The 4 bpw speed-up is therefore NOT
+   evidence of load-issue boundedness -- 4 bpw has *more* bytes and is faster
+   precisely because `rad = i*KA+16` has fewer elements to barrel-shift, i.e.
+   it is a decode-width effect, not a load effect.
+2. The lever is making `rad` compile-time, i.e. a layout in which each lane's
+   codes sit at a fixed bit offset. `crates/engine/src/exl3.rs:687`
+   `extract_ishizuki_lane_codes` / `repack_trellis_3bpw_tensor` was reaching for
+   exactly this and was reverted (`9c85e9a`). Arm (f) is the upper bound on that
+   idea: **if `rad` can be made constant, the kernel goes 0.459 -> 0.125 ms, i.e.
+   3.6x, and 690 GB/s equivalent.** That is the number to beat. It is not a
+   cheaper decode -- there is nothing cheaper to find; `decode_state_mcg` is
+   already free.
+3. `probe_contig4_alufloor` at 0.135 ms is the floor for this loop structure:
+   loop, x loads, 64-bit shifts, mask, 32 FMAs, reduction. 29.5% of production.
+   Any fix has to beat that too.
+
+### Reproduce
+
+```bash
+W=$(mktemp -d)/wt && git worktree add "$W" HEAD          # or e9c2785
+mkdir -p "$W/crates/kernels/probe"
+cp crates/kernels/probe/contig4_load_alu.metal "$W/crates/kernels/probe/"
+cp crates/engine/examples/probe_contig4_load_alu.rs "$W/crates/engine/examples/"
+cd "$W" && CARGO_TARGET_DIR=$(mktemp -d)/t \
+  cargo build --release --example probe_contig4_load_alu
+scripts/gpuq try -- "$CARGO_TARGET_DIR/release/examples/probe_contig4_load_alu" \
+  --rounds 11 --iters 15 --bytes 2000000000
+```
+
+Use a worktree with its own `CARGO_TARGET_DIR`: the main tree's engine crate did
+not compile during this work (another agent's `pipeline_audit` wiring was
+mid-flight) and a shared `target/` can rebuild the binary under another agent.
+
+### Method notes, including a measurement bug of mine
+
+- **Estimator is min over interleaved rounds, not median.** `gpuq` excludes the
+  *engine's* flock, not a benchmark harness, so this probe competes with other
+  agents' `kaplumba` processes and loses rounds. Contention can only add time to a
+  GPU kernel, so min estimates the uncontended kernel. An early median-based run
+  was 250% off on `down` purely from contention and would have produced a
+  completely wrong partition; the median/min ratio is printed per run so this is
+  visible rather than silent. Under contention, gate_up medians were within 2% of
+  mins; `down` medians were 10-40% high.
+- **No Metal Toolchain on this box** (`xcrun metal` -> "cannot execute tool"), so
+  there is no AIR/IR check. Validation is instead (i) FIDELITY: (r) bitwise-equal
+  to production on every shape, or the harness panics before reporting a time;
+  (ii) DCE GATE: perturbing the seeds must change (b)'s output and it must differ
+  from production's, or the harness panics; (iii) a CPU model of (b)'s exact
+  semantics on a tiny shape (K=512, N=16, one unrolled iteration per simdgroup)
+  agreeing to **1.6e-7** max relative error, with `decode_state_mcg` reimplemented
+  on the host including the fp16 `h.x + h.y` rounding. 1.6e-7 is fp32 noise; a
+  hoisted or eliminated decode would disagree by O(1).
+- The harness compiles its **own** library (preamble + `include_str!` of the
+  unmodified `linear_repacked.metal` + the probe file), so production (a) is
+  measured in the same compiler run as every arm, and the probe ships in nothing:
+  `crates/kernels/src/linear.rs:23` concatenates only `linear.metal` and
+  `linear_repacked.metal`.
