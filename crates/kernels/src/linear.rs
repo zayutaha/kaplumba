@@ -39,6 +39,40 @@ fn env_flag(name: &str) -> bool {
     value
 }
 
+/// Output tile-columns per threadgroup for the decode matvec: the NR0 axis.
+///
+/// The kernel reads a fixed three ring words per lane whatever the rate is, so a
+/// lane spends 12 B of load traffic on `8*KA` bits of codes. At 3 bpw -- 410 of
+/// the 411 tensors in this checkpoint -- that leaves the loop short of distinct
+/// bytes in flight, and the measured 3 bpw asymptote is 168.6 GB/s against a
+/// 240 GB/s ceiling. Giving a thread NR0 output tile-columns puts NR0
+/// independent streams in flight without changing which bytes are read, and the
+/// accumulator and reduction are unchanged, so the result is bit-exact.
+///
+/// `KAPLUMBA_DECODE_NR0` in {1, 2, 4, 8}; anything else, including unset, is 1.
+/// Unset must stay 1: the default is what the reference prompts were verified
+/// against, and a default that silently changes the decode kernel would make
+/// every "the five reference prompts are exact" claim in this repository a claim
+/// about whichever machine ran it. Read once, like every other switch here.
+fn decode_nr0() -> u32 {
+    static CACHE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        match std::env::var("KAPLUMBA_DECODE_NR0")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<u32>().ok())
+        {
+            Some(value) if NR0_VARIANTS.contains(&value) => value,
+            _ => 1,
+        }
+    })
+}
+
+/// The NR0 values a kernel name exists for, excluding 1 (which is the unsuffixed
+/// `linear_gemv_exl3_kN_mcg`). Must match `NR0_VALUES` in
+/// `scripts/gen_exl3_gemv.py`; a test asserts every name here resolves, which is
+/// what catches the two drifting apart.
+pub const NR0_VARIANTS: [u32; 3] = [2, 4, 8];
+
 /// `KAPLUMBA_GEMV_MAX_GROUPS`, read once. `u64::MAX` (no cap) when unset.
 fn gemv_max_groups() -> u64 {
     static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -304,6 +338,30 @@ impl LinearKernels {
         }
         debug_assert_eq!(exl3_gemv_pipelines.len(), EXL3_GEMV_STATES);
         debug_assert_eq!(exl3_gemv_slot_names.len(), EXL3_GEMV_STATES);
+        // The NR0 family (`_mcg_r2` / `_r4` / `_r8`) is addressable by name but
+        // deliberately NOT in `exl3_gemv_pipelines`: that table is indexed by
+        // [codebook][aligned][bits] and `exl3_gemv_index` is what the engine
+        // dispatches through, so adding a second kernel per slot would make the
+        // index ambiguous. These are A/B-only, reached through
+        // `encode_gemv_named` and `KAPLUMBA_DECODE_NR0`, and every one of them
+        // is built here so that a name which does not compile is a startup error
+        // rather than a silent `None` at dispatch time.
+        //
+        // `Option` because a build that drops the generated family (an older
+        // `linear.metal`, a stale checkout) must still start: the engine's
+        // default is NR0 = 1, which is the unsuffixed kernel and is always
+        // present.
+        for bits in 1..=8_u32 {
+            for nr0 in NR0_VARIANTS {
+                let name = format!("linear_gemv_exl3_k{bits}_mcg_r{nr0}");
+                if let Ok(function) = library.get_function(&name, None) {
+                    if let Ok(pipeline) = device.new_compute_pipeline_state_with_function(&function)
+                    {
+                        exl3_gemv_by_name.insert(name, pipeline);
+                    }
+                }
+            }
+        }
 
         let gemv_pipeline = device
             .new_compute_pipeline_state_with_function(&gemv_function)
@@ -563,7 +621,13 @@ impl LinearKernels {
                 params_bytes(&params),
                 (out_features / 16 * 256) as u64,
             );
-        } else if let Some(pipeline) = self.exl3_gemv_pipeline(rate, packed_offset, codebook) {
+        } else if let Some(pipeline) = self.decode_gemv_pipeline(rate, packed_offset, codebook) {
+            // `decode_gemv_pipeline`, not `exl3_gemv_pipeline`, so this path
+            // honours `KAPLUMBA_DECODE_NR0` exactly as `encode_gemv` does. The
+            // two entry points dispatch the same kernel for the same tensor, and
+            // an NR0 knob that moved only one of them would give two different
+            // answers for the same projection -- which is how a sweep comes to
+            // measure the wrong kernel while the engine keeps passing.
             self.encode_offset_256(
                 encoder,
                 pipeline,
@@ -573,7 +637,7 @@ impl LinearKernels {
                     TensorRef::new(&raw, 0),
                 ],
                 params_bytes(&params),
-                (out_features / 16 * 256) as u64,
+                (out_features / 16 / decode_nr0().max(1) as usize * 256) as u64,
             );
         } else {
             self.encode_offset(
@@ -872,6 +936,20 @@ impl LinearKernels {
         )
     }
 
+    /// The ishizuki kernel `encode_gemv` would dispatch for this tensor, if any.
+    ///
+    /// Exists because the dispatch order in `encode_gemv` is *ishizuki first,
+    /// EXL3 second*, and the two are easy to confuse: the whole `_mcg`
+    /// specialisation work -- the codebook folded to a compile-time constant, the
+    /// 8.1 -> 9.2 tok/s step -- only pays if the EXL3 arm is the one that runs.
+    /// `KAPLUMBA_OWN_GEMV` flips the order, and which arm is live decides what any
+    /// EXL3 measurement is a measurement *of*. There was no way to ask before
+    /// this, which is a gap a reader of the notes could easily fall into.
+    pub fn ishizuki_gemv_kernel_name(&self, rate: Exl3Rate, packed_offset: u64) -> Option<String> {
+        self.ishizuki_gemv_pipeline(rate, packed_offset)
+            .map(|_| "ishizuki".to_string())
+    }
+
     fn ishizuki_gemv_pipeline(
         &self,
         rate: Exl3Rate,
@@ -961,6 +1039,22 @@ impl LinearKernels {
     /// The name must be one of the generated `linear_gemv_exl3_*` kernels; the
     /// caller is responsible for it matching the `params` it encodes. Nothing in
     /// the engine calls this.
+    /// The NR0 a named kernel was generated with, read off its `_r{n}` suffix.
+    ///
+    /// `encode_gemv_named` takes the kernel name rather than consulting
+    /// `KAPLUMBA_DECODE_NR0`, so it has to recover the axis from the name or the
+    /// grid it dispatches will not match the kernel it dispatches *to* -- an
+    /// r4 kernel with an r1-sized grid leaves three quarters of the output
+    /// unwritten, and returns a buffer that is right for three quarters of the
+    /// columns and zero for the rest. That is a plausible-looking wrong answer,
+    /// so the grid is derived from the name rather than from the environment.
+    pub fn nr0_of_kernel_name(name: &str) -> u32 {
+        match name.rsplit_once("_r") {
+            Some((_, suffix)) => suffix.parse::<u32>().unwrap_or(1),
+            None => 1,
+        }
+    }
+
     pub fn encode_gemv_named(
         &self,
         encoder: &mut crate::encoder::MetalEncoder,
@@ -1009,6 +1103,13 @@ impl LinearKernels {
                 64,
             )?;
         }
+        let nr0 = Self::nr0_of_kernel_name(name).max(1) as usize;
+        let tiles = out_features / 16;
+        if !tiles.is_multiple_of(nr0) {
+            return Err(KernelError::InvalidInput(format!(
+                "out_features/16 = {tiles} is not a multiple of {name}'s NR0 ({nr0})"
+            )));
+        }
         encoder.dispatch_1d_offset(
             pipeline,
             &[
@@ -1017,7 +1118,7 @@ impl LinearKernels {
                 TensorRef::new(request.raw, 0),
             ],
             params_bytes(&params),
-            (out_features / 16 * 256) as u64,
+            (tiles / nr0 * 256) as u64,
             256,
         )?;
         let output_blocks = to_u32(out_features / 128, "output dimension")?;
@@ -1036,6 +1137,49 @@ impl LinearKernels {
 
     fn exl3_gemv_pipeline_by_name(&self, name: &str) -> Option<&ComputePipelineState> {
         self.exl3_gemv_by_name.get(name)
+    }
+
+    /// The kernel name the live decode path dispatches to for
+    /// `(rate, codebook)`, honouring `KAPLUMBA_DECODE_NR0`.
+    ///
+    /// Separate from [`Self::exl3_gemv_kernel_name`] on purpose: that one
+    /// answers "what does the index table hold", which is a property of the
+    /// table and is what a test pins. This one answers "what will actually
+    /// run", which is the table *plus* the environment. Conflating them is how a
+    /// sweep knob ends up invisible to the test that is supposed to be checking
+    /// the thing the sweep is sweeping.
+    pub fn decode_gemv_kernel_name(
+        &self,
+        rate: Exl3Rate,
+        packed_offset: u64,
+        codebook: Exl3Codebook,
+    ) -> Option<String> {
+        let base = self.exl3_gemv_kernel_name(rate, packed_offset, codebook)?;
+        let nr0 = decode_nr0();
+        if nr0 == 1 {
+            return Some(base.to_string());
+        }
+        // Only the ALIGNED MCG family has r-variants; anything else keeps NR0=1
+        // rather than failing, because a sweep knob must not be able to make the
+        // engine unrunnable.
+        if !base.ends_with("_mcg") || base.contains("_u") {
+            return Some(base.to_string());
+        }
+        let stem = base.trim_end_matches("_mcg");
+        Some(format!("{stem}_mcg_r{nr0}"))
+    }
+
+    /// [`Self::decode_gemv_kernel_name`], resolved to a pipeline, or the
+    /// unsuffixed kernel if the r-variant is absent from this build.
+    fn decode_gemv_pipeline(
+        &self,
+        rate: Exl3Rate,
+        packed_offset: u64,
+        codebook: Exl3Codebook,
+    ) -> Option<&ComputePipelineState> {
+        let name = self.decode_gemv_kernel_name(rate, packed_offset, codebook)?;
+        self.exl3_gemv_pipeline_by_name(&name)
+            .or_else(|| self.exl3_gemv_pipeline(rate, packed_offset, codebook))
     }
 
     /// The kernel name a `(codebook, aligned, bits)` triple dispatches to, or
@@ -1135,6 +1279,35 @@ impl LinearKernels {
         );
     }
 
+    /// Record one dispatch under `KAPLUMBA_TRACE_GEMV`, once per distinct name.
+    ///
+    /// The dispatch order in [`Self::encode_gemv`] is **ishizuki first, EXL3
+    /// second**, decided by `packed_offset % 4` and `KAPLUMBA_OWN_GEMV`. Every
+    /// kernel in this file therefore has one question asked about it before any of
+    /// its numbers mean anything: *is this the one that runs?* For the shipped
+    /// checkpoint the answer was that 410 of 411 tensors are 4-byte aligned, so
+    /// they take the **ishizuki** arm and the whole `_mcg` family -- the codebook
+    /// specialisation, and the NR0 axis -- only ever runs for `lm_head`, whose
+    /// trellis starts at `% 4 == 2`.
+    ///
+    /// That is a claim about which kernel runs, not a measurement, so it needs a
+    /// way to be checked rather than a way to be believed. This prints the answer
+    /// for a real run.
+    fn trace_gemv(name: &str) {
+        static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+            std::sync::OnceLock::new();
+        static ONCE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ONCE.get_or_init(|| std::env::var_os("KAPLUMBA_TRACE_GEMV").is_some());
+        if !on {
+            return;
+        }
+        let seen = SEEN.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+        let mut seen = seen.lock().unwrap_or_else(|error| error.into_inner());
+        if seen.insert(name.to_string()) {
+            eprintln!("GEMV-DISPATCH {name}");
+        }
+    }
+
     pub fn encode_gemv(
         &self,
         encoder: &mut crate::encoder::MetalEncoder,
@@ -1182,6 +1355,13 @@ impl LinearKernels {
         // eight codes, 256-thread groups, and enough threads to fill the GPU.
         // This is the real decode path; `gemv_buffer` routes the same way.
         if let Some(pipeline) = self.ishizuki_gemv_pipeline(rate, packed_offset) {
+            Self::trace_gemv(&format!(
+                "linear_gemv_ishizuki_k{}",
+                match rate {
+                    Exl3Rate::Integer(bits) => bits,
+                    _ => 0,
+                }
+            ));
             self.encode_ishizuki_gemv(
                 encoder,
                 pipeline,
@@ -1192,7 +1372,22 @@ impl LinearKernels {
                 in_features,
                 out_features,
             )?;
-        } else if let Some(pipeline) = self.exl3_gemv_pipeline(rate, packed_offset, codebook) {
+        } else if let Some(pipeline) = self.decode_gemv_pipeline(rate, packed_offset, codebook) {
+            if let Some(name) = self.decode_gemv_kernel_name(rate, packed_offset, codebook) {
+                Self::trace_gemv(&name);
+            }
+            // One threadgroup per NR0 output tile-columns, so the grid shrinks by
+            // NR0. The kernel derives its own `out_base = tn * 16 * NR0`, so
+            // every column is still written exactly once and in the same place;
+            // only the mapping from threadgroup index to columns changes.
+            let tiles = out_features / 16;
+            let nr0 = decode_nr0().max(1) as usize;
+            if !tiles.is_multiple_of(nr0) {
+                return Err(KernelError::InvalidInput(format!(
+                    "out_features/16 = {tiles} is not a multiple of the NR0 axis \
+                     ({nr0}); pick a shape whose output tiles divide evenly"
+                )));
+            }
             encoder.dispatch_1d_offset(
                 pipeline,
                 &[
@@ -1201,7 +1396,7 @@ impl LinearKernels {
                     TensorRef::new(raw, 0),
                 ],
                 params_bytes(&params),
-                (out_features / 16 * 256) as u64,
+                (tiles / nr0 * 256) as u64,
                 256,
             )?;
         } else {

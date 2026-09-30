@@ -1439,39 +1439,92 @@ kernel void linear_gemv_exl3_k1(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 1;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8<true>(packed, tile_index, lane, KA, params.codebook, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, params.codebook, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -1492,39 +1545,92 @@ kernel void linear_gemv_exl3_k1_u(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 1;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8<false>(packed, tile_index, lane, KA, params.codebook, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8<false>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, params.codebook, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -1545,39 +1651,92 @@ kernel void linear_gemv_exl3_k2(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 2;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8<true>(packed, tile_index, lane, KA, params.codebook, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, params.codebook, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -1598,39 +1757,92 @@ kernel void linear_gemv_exl3_k2_u(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 2;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8<false>(packed, tile_index, lane, KA, params.codebook, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8<false>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, params.codebook, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -1651,39 +1863,92 @@ kernel void linear_gemv_exl3_k3(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 3;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8<true>(packed, tile_index, lane, KA, params.codebook, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, params.codebook, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -1704,39 +1969,92 @@ kernel void linear_gemv_exl3_k3_u(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 3;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8<false>(packed, tile_index, lane, KA, params.codebook, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8<false>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, params.codebook, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -1757,39 +2075,92 @@ kernel void linear_gemv_exl3_k4(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 4;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8<true>(packed, tile_index, lane, KA, params.codebook, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, params.codebook, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -1810,39 +2181,92 @@ kernel void linear_gemv_exl3_k4_u(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 4;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8<false>(packed, tile_index, lane, KA, params.codebook, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8<false>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, params.codebook, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -1863,39 +2287,92 @@ kernel void linear_gemv_exl3_k5(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 5;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8<true>(packed, tile_index, lane, KA, params.codebook, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, params.codebook, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -1916,39 +2393,92 @@ kernel void linear_gemv_exl3_k5_u(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 5;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8<false>(packed, tile_index, lane, KA, params.codebook, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8<false>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, params.codebook, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -1969,39 +2499,92 @@ kernel void linear_gemv_exl3_k6(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 6;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8<true>(packed, tile_index, lane, KA, params.codebook, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, params.codebook, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -2022,39 +2605,92 @@ kernel void linear_gemv_exl3_k6_u(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 6;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8<false>(packed, tile_index, lane, KA, params.codebook, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8<false>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, params.codebook, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -2075,39 +2711,92 @@ kernel void linear_gemv_exl3_k7(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 7;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8<true>(packed, tile_index, lane, KA, params.codebook, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, params.codebook, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -2128,39 +2817,92 @@ kernel void linear_gemv_exl3_k7_u(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 7;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8<false>(packed, tile_index, lane, KA, params.codebook, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8<false>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, params.codebook, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -2181,39 +2923,92 @@ kernel void linear_gemv_exl3_k8(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 8;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8<true>(packed, tile_index, lane, KA, params.codebook, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, params.codebook, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -2234,39 +3029,92 @@ kernel void linear_gemv_exl3_k8_u(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 8;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8<false>(packed, tile_index, lane, KA, params.codebook, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8<false>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, params.codebook, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -2287,39 +3135,92 @@ kernel void linear_gemv_exl3_k1_mcg(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 1;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8_mcg<true>(packed, tile_index, lane, KA, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -2340,39 +3241,92 @@ kernel void linear_gemv_exl3_k1_u_mcg(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 1;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8_mcg<false>(packed, tile_index, lane, KA, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<false>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -2393,39 +3347,92 @@ kernel void linear_gemv_exl3_k2_mcg(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 2;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8_mcg<true>(packed, tile_index, lane, KA, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -2446,39 +3453,92 @@ kernel void linear_gemv_exl3_k2_u_mcg(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 2;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8_mcg<false>(packed, tile_index, lane, KA, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<false>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -2499,39 +3559,92 @@ kernel void linear_gemv_exl3_k3_mcg(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 3;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8_mcg<true>(packed, tile_index, lane, KA, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -2552,39 +3665,92 @@ kernel void linear_gemv_exl3_k3_u_mcg(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 3;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8_mcg<false>(packed, tile_index, lane, KA, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<false>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -2605,39 +3771,92 @@ kernel void linear_gemv_exl3_k4_mcg(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 4;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8_mcg<true>(packed, tile_index, lane, KA, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -2658,39 +3877,92 @@ kernel void linear_gemv_exl3_k4_u_mcg(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 4;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8_mcg<false>(packed, tile_index, lane, KA, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<false>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -2711,39 +3983,92 @@ kernel void linear_gemv_exl3_k5_mcg(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 5;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8_mcg<true>(packed, tile_index, lane, KA, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -2764,39 +4089,92 @@ kernel void linear_gemv_exl3_k5_u_mcg(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 5;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8_mcg<false>(packed, tile_index, lane, KA, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<false>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -2817,39 +4195,92 @@ kernel void linear_gemv_exl3_k6_mcg(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 6;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8_mcg<true>(packed, tile_index, lane, KA, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -2870,39 +4301,92 @@ kernel void linear_gemv_exl3_k6_u_mcg(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 6;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8_mcg<false>(packed, tile_index, lane, KA, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<false>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -2923,39 +4407,92 @@ kernel void linear_gemv_exl3_k7_mcg(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 7;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8_mcg<true>(packed, tile_index, lane, KA, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -2976,39 +4513,92 @@ kernel void linear_gemv_exl3_k7_u_mcg(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 7;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8_mcg<false>(packed, tile_index, lane, KA, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<false>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -3029,39 +4619,92 @@ kernel void linear_gemv_exl3_k8_mcg(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 8;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8_mcg<true>(packed, tile_index, lane, KA, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
@@ -3082,39 +4725,2636 @@ kernel void linear_gemv_exl3_k8_u_mcg(
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
     const uint KA = 8;
-    threadgroup float red[8][16];
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 1;
+    threadgroup float red[8][16 * NR0];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
     const uint tiles_k = params.in_features / 16u;
     const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
 
-    float acc0 = 0.0f;
-    float acc1 = 0.0f;
-    const uint out_base = tn * 16u;
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
 
     for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
-        const uint tile_index = tk * tiles_n + tn;
-        float v[8];
-        exl3_decode8_mcg<false>(packed, tile_index, lane, KA, v);
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<false>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
         const uint xbase = tk * 16u;
         const float x0 = float(input[xbase + r0 + 0u]);
         const float x1 = float(input[xbase + r0 + 1u]);
         const float x2 = float(input[xbase + r0 + 8u]);
         const float x3 = float(input[xbase + r0 + 9u]);
-        acc0 += x0 * v[0] + x1 * v[1] + x2 * v[2] + x3 * v[3];
-        acc1 += x0 * v[4] + x1 * v[5] + x2 * v[6] + x3 * v[7];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
     }
-    acc0 += simd_shuffle_xor(acc0, 1u);
-    acc0 += simd_shuffle_xor(acc0, 2u);
-    acc1 += simd_shuffle_xor(acc1, 1u);
-    acc1 += simd_shuffle_xor(acc1, 2u);
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
     if (lane % 4u == 0u) {
-        red[sg][lane / 4u] = acc0;
-        red[sg][lane / 4u + 8u] = acc1;
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    if (lid < 16u) {
+    if (lid < 16u * NR0) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k1_mcg_r2(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 1;
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 2;
+    threadgroup float red[8][16 * NR0];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
+
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
+    }
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
+    if (lane % 4u == 0u) {
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u * NR0) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k1_mcg_r4(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 1;
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 4;
+    threadgroup float red[8][16 * NR0];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
+
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
+    }
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
+    if (lane % 4u == 0u) {
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u * NR0) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k1_mcg_r8(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 1;
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 8;
+    threadgroup float red[8][16 * NR0];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
+
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
+    }
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
+    if (lane % 4u == 0u) {
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u * NR0) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k2_mcg_r2(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 2;
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 2;
+    threadgroup float red[8][16 * NR0];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
+
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
+    }
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
+    if (lane % 4u == 0u) {
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u * NR0) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k2_mcg_r4(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 2;
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 4;
+    threadgroup float red[8][16 * NR0];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
+
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
+    }
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
+    if (lane % 4u == 0u) {
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u * NR0) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k2_mcg_r8(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 2;
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 8;
+    threadgroup float red[8][16 * NR0];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
+
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
+    }
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
+    if (lane % 4u == 0u) {
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u * NR0) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k3_mcg_r2(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 3;
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 2;
+    threadgroup float red[8][16 * NR0];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
+
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
+    }
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
+    if (lane % 4u == 0u) {
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u * NR0) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k3_mcg_r4(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 3;
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 4;
+    threadgroup float red[8][16 * NR0];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
+
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
+    }
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
+    if (lane % 4u == 0u) {
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u * NR0) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k3_mcg_r8(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 3;
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 8;
+    threadgroup float red[8][16 * NR0];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
+
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
+    }
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
+    if (lane % 4u == 0u) {
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u * NR0) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k4_mcg_r2(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 4;
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 2;
+    threadgroup float red[8][16 * NR0];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
+
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
+    }
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
+    if (lane % 4u == 0u) {
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u * NR0) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k4_mcg_r4(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 4;
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 4;
+    threadgroup float red[8][16 * NR0];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
+
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
+    }
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
+    if (lane % 4u == 0u) {
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u * NR0) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k4_mcg_r8(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 4;
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 8;
+    threadgroup float red[8][16 * NR0];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
+
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
+    }
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
+    if (lane % 4u == 0u) {
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u * NR0) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k5_mcg_r2(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 5;
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 2;
+    threadgroup float red[8][16 * NR0];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
+
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
+    }
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
+    if (lane % 4u == 0u) {
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u * NR0) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k5_mcg_r4(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 5;
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 4;
+    threadgroup float red[8][16 * NR0];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
+
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
+    }
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
+    if (lane % 4u == 0u) {
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u * NR0) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k5_mcg_r8(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 5;
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 8;
+    threadgroup float red[8][16 * NR0];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
+
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
+    }
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
+    if (lane % 4u == 0u) {
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u * NR0) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k6_mcg_r2(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 6;
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 2;
+    threadgroup float red[8][16 * NR0];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
+
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
+    }
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
+    if (lane % 4u == 0u) {
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u * NR0) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k6_mcg_r4(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 6;
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 4;
+    threadgroup float red[8][16 * NR0];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
+
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
+    }
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
+    if (lane % 4u == 0u) {
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u * NR0) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k6_mcg_r8(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 6;
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 8;
+    threadgroup float red[8][16 * NR0];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
+
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
+    }
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
+    if (lane % 4u == 0u) {
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u * NR0) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k7_mcg_r2(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 7;
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 2;
+    threadgroup float red[8][16 * NR0];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
+
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
+    }
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
+    if (lane % 4u == 0u) {
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u * NR0) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k7_mcg_r4(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 7;
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 4;
+    threadgroup float red[8][16 * NR0];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
+
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
+    }
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
+    if (lane % 4u == 0u) {
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u * NR0) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k7_mcg_r8(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 7;
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 8;
+    threadgroup float red[8][16 * NR0];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
+
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
+    }
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
+    if (lane % 4u == 0u) {
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u * NR0) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k8_mcg_r2(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 8;
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 2;
+    threadgroup float red[8][16 * NR0];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
+
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
+    }
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
+    if (lane % 4u == 0u) {
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u * NR0) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k8_mcg_r4(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 8;
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 4;
+    threadgroup float red[8][16 * NR0];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
+
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
+    }
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
+    if (lane % 4u == 0u) {
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u * NR0) {
+        float s = 0.0f;
+        for (uint g = 0u; g < simdgroups; ++g) {
+            s += red[g][lid];
+        }
+        output[out_base + lid] = s;
+    }
+}
+
+
+kernel void linear_gemv_exl3_k8_mcg_r8(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint KA = 8;
+    // NR0 output tile-columns per threadgroup: how many independent weight
+    // streams one thread keeps in flight. NR0 = 1 is exactly the previous
+    // kernel's shape. The tk order, the accumulator update, the four-lane
+    // butterfly and the serial threadgroup sum are all untouched, so every
+    // output column sees an identical sequence of fp32 adds and NR0 = 1 is
+    // bit-identical to the kernel it replaces by construction. The test still
+    // has to check that, because FMA contraction is not stable across
+    // recompiles: two variants can each match the baseline alone and differ when
+    // combined.
+    //
+    // Why the axis exists, measured with `examples/gemv_shape.rs` holding the
+    // weight bytes constant at 43.4 MB and varying only the rate:
+    //
+    //   3 bpw 124.6 GB/s   4 bpw 175.4   6 bpw 178.9   8 bpw 156.1
+    //
+    // Identical bytes, and the rate is the only thing that moved.
+    // `exl3_decode8` reads a fixed three ring words per lane whatever KA is, so
+    // a lane spends 12 B of load traffic to produce 8*KA bits of codes: three
+    // useful bytes at KA = 3, six at KA = 6. The loop is therefore short of
+    // distinct bytes in flight rather than short of DRAM, and 3 bpw is 410 of
+    // the 411 tensors in this checkpoint. The measured 3 bpw asymptote is
+    // 168.6 GB/s against a 240 GB/s ceiling, so the prize is ~1.4x -- and NR0 is
+    // the only lever left that adds streams without changing what is loaded.
+    //
+    // The NR0 streams are CONTIGUOUS tile columns (`tn*NR0 + q`), i.e. 96*NR0
+    // adjacent bytes per thread per iteration. The llama.cpp experiment this
+    // axis is borrowed from found *adjacent* rows lost 4-11% and rows 32 KiB
+    // apart won, but that is a row-major layout where adjacent rows share DRAM
+    // pages; here adjacent tile columns are simply adjacent bytes, and DRAM row
+    // locality was measured at zero effect from 4 KiB to 3 MiB. Contiguous is
+    // therefore the better bet -- and it is a bet, not a measurement, which is
+    // why the r-variants are all generated and all measurable.
+    const uint NR0 = 8;
+    threadgroup float red[8][16 * NR0];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * (16u * NR0);
+
+    float acc[NR0][2];
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] = 0.0f;
+        acc[q][1] = 0.0f;
+    }
+
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        // All NR0 window setups first, so the loads for every stream are in
+        // flight before the first FMA consumes any of them. That is the entire
+        // point of the axis: at NR0 = 1 the single stream's FMAs sit between its
+        // load and its use, and at NR0 = 2 the load for q = 1 is issued before
+        // the FMAs for q = 0 rather than after them.
+        float v[NR0][8];
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            exl3_decode8_mcg<true>(packed, tk * tiles_n + tn * NR0 + q, lane, KA, v[q]);
+        }
+        const uint xbase = tk * 16u;
+        const float x0 = float(input[xbase + r0 + 0u]);
+        const float x1 = float(input[xbase + r0 + 1u]);
+        const float x2 = float(input[xbase + r0 + 8u]);
+        const float x3 = float(input[xbase + r0 + 9u]);
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            acc[q][0] = fma(x3, v[q][3], fma(x2, v[q][2], fma(x1, v[q][1], fma(x0, v[q][0], acc[q][0]))));
+            acc[q][1] = fma(x3, v[q][7], fma(x2, v[q][6], fma(x1, v[q][5], fma(x0, v[q][4], acc[q][1]))));
+        }
+    }
+    #pragma unroll
+    for (uint q = 0u; q < NR0; ++q) {
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 1u);
+        acc[q][0] += simd_shuffle_xor(acc[q][0], 2u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 1u);
+        acc[q][1] += simd_shuffle_xor(acc[q][1], 2u);
+    }
+    if (lane % 4u == 0u) {
+        #pragma unroll
+        for (uint q = 0u; q < NR0; ++q) {
+            red[sg][q * 16u + lane / 4u] = acc[q][0];
+            red[sg][q * 16u + lane / 4u + 8u] = acc[q][1];
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u * NR0) {
         float s = 0.0f;
         for (uint g = 0u; g < simdgroups; ++g) {
             s += red[g][lid];
