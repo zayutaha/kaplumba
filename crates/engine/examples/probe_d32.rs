@@ -296,6 +296,41 @@ fn main() {
         "  AC7 gate  : D=32 vector arm must reach {GO_NO_GO_RATIO:.2}x the reference median\n",
     );
 
+    // Sweep every D that tiles the 256-code tile, with the rate the fitted law
+    // predicts for each.
+    //
+    // `tiles/sg` is the structural cost and it is the reason this whole family
+    // is suspect. A tile has 256 codes, so a lane holding D of them needs
+    // 256/D lanes per tile; a 32-lane simdgroup therefore covers `32/(256/D)` =
+    // **D/8** output tiles, and a threadgroup (8 simdgroups) covers D of them.
+    // Grid width is then `tiles_n / D`. This model has narrow projections --
+    // `full/kv` is 128 output tiles -- so D=32 leaves **4 threadgroups on 20
+    // cores**. That is the prediction to check the measurement against.
+    println!("  D sweep (3 bpw, 96 B useful per tile):");
+    println!(
+        "    {:>3}  {:>6}  {:>5}  {:>5}  {:>6}  {:>7}  {:>9}  {:>8}  {:>9}",
+        "D", "lanes", "w/lane", "reqs", "scalar", "bytes", "byte amp", "pred GB/s", "tiles/sg"
+    );
+    for d in [4u32, 8, 16, 32, 64, 128, 256] {
+        let a = tile_amplification(3, d);
+        let pred =
+            (ceiling * tile_amplification(6, 8).byte_amplification() / a.byte_amplification())
+                .min(ceiling);
+        println!(
+            "    {:>3}  {:>6}  {:>5}  {:>5}  {:>6}  {:>7}  {:>9.3}  {:>9.1}  {:>9}",
+            d,
+            a.lanes,
+            a.words_per_lane,
+            a.ideal_lane_loads,
+            a.scalar_lane_loads,
+            a.requested_bytes,
+            a.byte_amplification(),
+            pred,
+            d / 8,
+        );
+    }
+    println!();
+
     let mut go = true;
     for (index, shape) in selected.iter().enumerate() {
         let (in_f, out_f) = (shape.in_features, shape.out_features);
@@ -337,46 +372,43 @@ fn main() {
             out_features: out_f,
         };
 
-        // Calibrate iteration count off the reference so all three arms time the
-        // same amount of work.
-        let iters = (0..)
-            .find(|_| false)
-            .unwrap_or_else(|| {
-                let mut n = MIN_ITERS;
-                loop {
-                    let mut enc = MetalEncoder::new(&ctx.queue).expect("encoder");
-                    kernels
-                        .encode_gemv_named(
-                            &mut enc,
-                            REFERENCE,
-                            &LinearEncodeRequest {
-                                packed: &view,
-                                packed_offset: 0,
-                                perm_mode: 1,
-                                input: &ctx.input,
-                                input_signs: &ctx.input_signs,
-                                output_signs: &ctx.output_signs,
-                                transformed: &ctx.transformed,
-                                raw: &ctx.raw,
-                                output: &ctx.output,
-                                in_features: in_f,
-                                out_features: out_f,
-                                rate: Exl3Rate::Integer(3),
-                                codebook: Exl3Codebook::Mcg,
-                                pretransformed: false,
-                            },
-                        )
-                        .expect("calibrate");
-                    let started = Instant::now();
-                    enc.commit_and_wait().expect("wait");
-                    if started.elapsed().as_secs_f64() * 1000.0 * n as f64 >= ROUND_TARGET_MS
-                        || n >= MAX_ITERS
-                    {
-                        return n;
-                    }
-                    n += 1;
+        // Calibrate the iteration count off the reference, so all three arms time
+        // the same amount of work.
+        let iters = {
+            let mut n = MIN_ITERS;
+            loop {
+                let mut enc = MetalEncoder::new(&ctx.queue).expect("encoder");
+                kernels
+                    .encode_gemv_named(
+                        &mut enc,
+                        REFERENCE,
+                        &LinearEncodeRequest {
+                            packed: &view,
+                            packed_offset: 0,
+                            perm_mode: 1,
+                            input: &ctx.input,
+                            input_signs: &ctx.input_signs,
+                            output_signs: &ctx.output_signs,
+                            transformed: &ctx.transformed,
+                            raw: &ctx.raw,
+                            output: &ctx.output,
+                            in_features: in_f,
+                            out_features: out_f,
+                            rate: Exl3Rate::Integer(3),
+                            codebook: Exl3Codebook::Mcg,
+                            pretransformed: false,
+                        },
+                    )
+                    .expect("calibrate");
+                let started = Instant::now();
+                enc.commit_and_wait().expect("wait");
+                let per_dispatch_ms = started.elapsed().as_secs_f64() * 1000.0;
+                if per_dispatch_ms * n as f64 >= ROUND_TARGET_MS || n >= MAX_ITERS {
+                    break n;
                 }
-            });
+                n += 1;
+            }
+        };
 
         // Smoke check: one dispatch of each probe arm, before committing to
         // `iters * rounds` of them. A kernel with a register-pressure problem
@@ -402,8 +434,16 @@ fn main() {
         let mut reference = Vec::new();
         let mut vector = Vec::new();
         let mut scalar = Vec::new();
+        // One round of each, discarded. The first round of a cold arm is always
+        // slow -- first touch of the scratch mapping, first dispatch of each
+        // pipeline, cold instruction cache -- and at 3 rounds that contaminated
+        // the median enough to produce a 0.39 spread, which cannot resolve the
+        // 1.15x the gate asks about. Interleaved A/B/C so drift hits all three
+        // arms equally.
+        dispatch(&kernels, &ctx, REFERENCE, &view, iters, &fb);
+        dispatch(&kernels, &ctx, VECTOR, &view, iters, &fb);
+        dispatch(&kernels, &ctx, SCALAR, &view, iters, &fb);
         for _ in 0..rounds {
-            // Interleaved A/B/C so drift hits all three arms equally.
             reference.push(dispatch(&kernels, &ctx, REFERENCE, &view, iters, &fb));
             vector.push(dispatch(&kernels, &ctx, VECTOR, &view, iters, &fb));
             scalar.push(dispatch(&kernels, &ctx, SCALAR, &view, iters, &fb));
@@ -437,19 +477,25 @@ fn main() {
         );
         let ratio = v.median / r.median;
         let repeatable = r.is_repeatable(0.10) && v.is_repeatable(0.10);
+        // The two probe arms are byte-identical and differ only in request count
+        // (22 vs 32). The first version of this printed "REQUESTS matter" or
+        // "BYTES matter" off a 5% threshold, and the data disproves both
+        // readings: the 22-request arm is *slower* than the 32-request arm on
+        // every shape measured (2.6-8.1%). Fewer requests did not help, and
+        // identical bytes cannot differ, so the load path is not what sets the
+        // rate -- and the vector loads are themselves a small loss.
         println!(
-            "  -> {:.3}x   {}   requests-vs-bytes: {}",
+            "  -> {:.3}x   {}   {}   scalar-vs-vector {:.3}x ({} requests vs {}; fewer requests did NOT help)",
             ratio,
             if ratio >= GO_NO_GO_RATIO {
                 "PASS"
             } else {
                 "FAIL (AC7: cancel T14.2)"
             },
-            if (v.median - s.median).abs() / v.median > 0.05 {
-                format!("REQUESTS matter (scalar {:.3}x of vector)", s.median / v.median)
-            } else {
-                format!("BYTES matter (scalar {:.3}x of vector)", s.median / v.median)
-            },
+            if repeatable { "repeatable" } else { "NOT repeatable" },
+            s.median / v.median,
+            d32.scalar_lane_loads,
+            d32.ideal_lane_loads,
         );
         if !repeatable {
             println!("  -> WARNING: spread > 10%; this run cannot resolve a 1.15x effect");

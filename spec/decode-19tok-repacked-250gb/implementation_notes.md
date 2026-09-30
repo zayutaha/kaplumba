@@ -523,3 +523,85 @@ slot. Necessary because `ishizuki_rate_of_name` still parses
 for a rate sorts first — so a probe could silently become the live kernel, and these
 probes return deliberately wrong numbers. `encode_d32_probe` additionally refuses
 any name that is not a probe. Both are tested.
+
+---
+
+## 2026-09-30: T14.1 result — AC7 FAILED, and the amplification law is dead
+
+`probe_d32 9`, all 11 shapes, cold (`MADV_DONTNEED`), interleaved A/B/C, one warmup
+round discarded. Spreads 0.92–0.99, so the run resolves the 1.15x it was asked about.
+
+| shape | tiles_n | threadgroups `_contig4` | `_contig4` | `D=32` vec | ratio | scalar/vec |
+|---|---:|---:|---:|---:|---:|---:|
+| `full/kv` 5376×2048 | 128 | 128 | 126.5 | 36.4 | **0.288** | 1.081 |
+| `sliding/v` 5376×4096 | 256 | 256 | 152.8 | 70.5 | 0.462 | 1.026 |
+| `sliding/k` 5376×4096 | 256 | 256 | 153.9 | 72.2 | 0.469 | 1.039 |
+| `sliding/down` 21504×5376 | 336 | 336 | 181.7 | 93.4 | 0.514 | 1.039 |
+| `full/o` 16384×5376 | 1024 | 1024 | 179.2 | 93.5 | 0.521 | 1.033 |
+| `sliding/o` 8192×5376 | 512 | 512 | 169.8 | 92.2 | 0.543 | 1.033 |
+| `sliding/q` 5376×8192 | 512 | 512 | 167.2 | 133.0 | 0.796 | 1.035 |
+| `sliding/up` 5376×21504 | 1344 | 1344 | 183.5 | 148.9 | 0.811 | 1.078 |
+| `sliding/gate` 5376×21504 | 1344 | 1344 | 183.0 | 148.7 | 0.812 | 1.076 |
+| `full/q` 5376×16384 | 1024 | 1024 | 180.0 | 165.2 | **0.918** | 1.062 |
+
+GB/s against *useful* weight bytes, so the ratio is a pure efficiency ratio.
+
+### Three findings, in order of how much they matter
+
+**1. `D = 32` is 0.29–0.92x on every shape. The +3.13 tok/s does not exist.**
+T14.2–T14.4 cancelled. This is what the probe was for: plan §4.3 sequenced it
+first precisely because the 1.333x was an extrapolation, and it cost ~1 hour
+instead of a day of kernel work.
+
+**2. The grid collapse is the mechanism, and the shape ordering proves it.**
+A tile needs `256/D` lanes, so a 32-lane simdgroup covers `D/8` output tiles and a
+threadgroup covers `D` of them; grid width is `tiles_n / D`. `full/kv` has 128
+output tiles, so `D=32` launches **4 threadgroups on 20 cores** and gets 0.288x.
+The monotone ordering with `tiles_n` is the signature: 128 → 0.288, 256 → 0.47,
+336 → 0.51, 512 → 0.54–0.80, 1024 → 0.52–0.92, 1344 → 0.81. (The two shapes at
+1024 differ, 0.521 vs 0.918, so `tiles_n` is not the whole story — `full/o` is
+5376-K, which is 336 tiles against `full/q`'s 336 as well, so the difference is
+elsewhere and is not resolved here.)
+
+**3. The load path is not the wall. The two arms are byte-matched on purpose.**
+`_d32_probe` (22 requests) and `_d32_probe_sc4` (32 requests) fetch **identical
+128 bytes per tile**. The 22-request arm is slower on **all 11 shapes**, by
+2.6–8.1%. So:
+- more requests cost essentially nothing (32 vs 22 is within noise, and both are
+  2.3–2.9x below the live kernel's 64 without a matching slowdown);
+- fewer requests do not help, because the `uint4`/`uint2` loads are themselves a
+  small loss — plausibly because one wide load is a single dependency the decode
+  must wait on, where four scalars issue independently and pipeline.
+
+That kills both candidate mechanisms for the 2.667x. The `2.000/2.667` ratio fitted
+3 bpw and 6 bpw to 0.1% and **does not survive a third point**: 3 bpw at 187.7,
+`D=32` at 148.7, 6 bpw at 250.5. No single amplification law fits all three.
+
+### What this leaves, stated as an open question rather than a conclusion
+
+The 3 bpw layers sit at ~180–187 GB/s against a ~250 GB/s streaming ceiling.
+Ruled out by measurement: bytes (halving them made it worse), requests (halving
+them made it worse), ALU (removing it made it worse — `_nod` 167.3 → 122.7), page
+backing (0.98–1.03x, `bench_residency`). Not ruled out: **latency and occupancy**
+— whether the grid is wide enough to cover DRAM latency, and whether the decode's
+dependent chain rather than its arithmetic is what serialises. That plus the ~8.9 ms
+of unattributed host time is T15.
+
+### Process notes worth keeping
+
+- The first calibration loop was `(0..).find(|_| false)` on an **unbounded** `Range`,
+  which never returns. It looked exactly like a GPU hang: the process sat in
+  `main` with no deeper frame. Two earlier "the kernel is pathologically slow"
+  conclusions were drawn before a `sample` showed a CPU-bound leaf frame in Rust
+  rather than in Metal. **Sample before believing a hang.**
+- The `float v[32]` register spill was real and separate (128 live registers with
+  the caller's 4-way unroll on a ~128-register part). Both bugs had to be found for
+  the probe to run at all, and the smoke check that would have caught the second
+  one in seconds was written *after* losing twenty minutes to it.
+- `probe_d32` now prints the model sweep and the prediction beside every
+  measurement, so a reader never has to take the arithmetic on trust:
+  `D=4` amp 5.333 pred 93.9 | `D=8` amp 2.667 pred 187.9 (**measured 183-187**) |
+  `D=16` amp 2.000 pred 250.5 | `D=32` amp 1.333 pred 250.5 (**measured 148.7**) |
+  `D=64` amp 1.167 | `D=128` amp 1.083 | `D=256` amp 1.042.
+  The model is right where it was fitted and wrong everywhere it was not, which is
+  exactly the shape of a two-point fit.

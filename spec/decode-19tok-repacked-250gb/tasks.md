@@ -107,28 +107,24 @@ Sole route to 15 tok/s. Each lever in this group is worth **+3.13 tok/s alone**;
 Sequenced probe-first on purpose: the 1.333× prediction extrapolates a law fitted at two
 points, and plan §4.3 explains why that is not good enough to build against.
 
-- [ ] **T14.1: Microbenchmark probe for the `D = 32` load pattern** (AC7)
-  - Files: `crates/kernels/src/linear_repacked.metal` (new `*_d32_probe` kernels, garbage output), `crates/kernels/src/linear.rs` (dispatch arm), `crates/engine/examples/probe_d32.rs` (harness)
-  - Intent: Issue 8 lanes × 4 words per 16×16 tile with the real `decode_state_mcg` body, on the 11 real shapes, cold via `MADV_DONTNEED`, interleaved A/B against `_contig4`. Report the per-shape request-rate ratio.
-  - Test: the harness must compute the ratio from measured ns, and a unit test must assert the *predicted* ratio is 2.667/1.333 = 2.0 from first principles. **Sabotage-verified**: break the probe's word index and confirm the ratio moves; a probe that cannot fail is not evidence (AGENTS.md §3.4).
-  - **Gate:** median ratio within 1.6× of 2.0. Otherwise T14.2 is **cancelled** and the amplification law is recorded as a 2-point coincidence.
+- [x] **T14.1: Microbenchmark probe for the `D = 32` load pattern** (AC7) — **FAIL** (`7d285fc`)
+  - Files: `crates/kernels/src/linear_repacked.metal` (2 probe kernels, garbage output), `crates/kernels/src/linear.rs` (`is_probe_name`, `encode_d32_probe`, `tile_amplification` + 11 unit tests), `crates/engine/examples/probe_d32.rs`
+  - Result: 9 rounds, warmup round discarded, all 11 `bench.rs` shapes, cold (`MADV_DONTNEED`), interleaved A/B/C. **Spreads 0.92–0.99**, so the run resolves the effect it is being asked about.
+  - **AC7 FAILED on every shape.** `D=32` median ratio to `_contig4`: `full/kv` **0.288**, `sliding/v` 0.462, `sliding/k` 0.469, `sliding/down` 0.514, `full/o` 0.521, `sliding/o` 0.543, `sliding/q` 0.796, `sliding/up` 0.811, `sliding/gate` 0.812, `full/q` 0.918. **Never above 1.0.**
+  - **The two probe arms are byte-identical (128 B/tile) and differ only in requests (22 vs 32) — and the 22-request arm is SLOWER on all 11 shapes, by 2.6–8.1%.** So neither a bytes wall nor a requests wall is what sets the rate.
+  - **Conclusion: the 0.1% fit of `rate = 250.5 x 2.000/amp` to 3 bpw and 6 bpw was a two-point coincidence, not a law.** Halving the byte amplification does not buy bandwidth.
+  - The cost is structural, and the shape ordering proves it: a tile needs `256/D` lanes, so a 32-lane simdgroup covers `D/8` output tiles and the grid becomes `tiles_n / D`. `full/kv` has 128 output tiles, so `D=32` launches **4 threadgroups on 20 cores**. The narrow shapes lose most (0.29–0.55), the widest loses least (0.92).
+  - **The +3.13 tok/s attributed to T14 does not exist.** Per the plan's own fallback, effort moves to T15.
 
-- [ ] **T14.2: Implement `D = 32` GEMV, 4 tiles per simdgroup** (AC8 prerequisite)
-  - Files: `crates/kernels/src/linear_repacked.metal`, `crates/kernels/src/linear.rs`
-  - Intent: The real kernel. 8 lanes/tile, `uint4` + `uint2` for the straddling lane, 32 decodes/lane into 2 accumulators, `simd_shuffle_xor` 1/2/4 within an 8-lane group, threadgroup reduce across 8 simdgroups, 64 outputs per threadgroup.
-  - Test: `cargo test -p kaplumba-engine --test live_kernel_bit_exact` extended to all 9 real decode shapes; `fused_bit_exact.rs` (fused vs **independent** `encode_gemv`) re-run for the fused2/fused3 paths, since those now cover 4 tiles per simdgroup.
-  - Must be **sabotage-verified** in both directions: an off-by-one in the tile-to-lane map must fail the test, and the f32 reference must be allowed to differ.
+- [~] **T14.2: ~~Implement `D = 32` GEMV, 4 tiles per simdgroup~~ — CANCELLED by T14.1**
+  - Not built. The probe answered the question at a small fraction of the cost, which is what the probe was sequenced for (plan §4.3).
 
-- [ ] **T14.3: Assert fp16 bit-identity on all 9 real shapes** (AC8)
-  - Files: `crates/engine/tests/live_kernel_bit_exact.rs`
-  - Intent: `to_bits()` equality of the **fp16** output of `D = 32` vs `_contig4` on every real decode shape. f32 divergence is expected (up to ~51 ULP is the `_contig4` precedent) and recorded, not gated.
-  - **All 9 or nothing.** No env var, no partial rollout, no "ship it and measure quality later" — this repo has no perplexity/KKL instrument, so greedy-output identity on 5 prompts is the only downstream gate and it cannot detect a small argmax-flip rate.
-  - Sabotage-verified by perturbing one accumulation order and confirming the fp16 assertion fires.
+- [~] **T14.3: ~~Assert fp16 bit-identity on all 9 real shapes~~ — CANCELLED by T14.1**
+  - Nothing to gate: the kernel measures 0.29–0.92x the reference on every shape.
 
-- [ ] **T14.4: Per-shape A/B and env-gated wiring** (AC9, AC10)
-  - Files: `crates/kernels/src/linear.rs` (`ishizuki_gemv_pipeline` arm, env var **default off**), `crates/engine/examples/bench_residency.rs` (all 11 `bench.rs:SHAPES` shapes for both kernels)
-  - Intent: Report every shape for both kernels, interleaved, medians and spread. **Narrow-shape regressions are expected and reported, not hidden**: 4 tiles/simdgroup means `down_proj` 336 → 84 threadgroups, 4.2 waves on 20 cores instead of 16.8. Then decide go/no-go on the whole table.
-  - Test: `KAPLUMBA_TRACE_GEMV=1` re-run in both configurations to prove which kernel dispatches (AC10) — the historical failure here was a golden test asserting kernels that did not run. AC6 re-verified: generator ×2, `git diff` clean.
+- [~] **T14.4: ~~Per-shape A/B and env-gated wiring~~ — CANCELLED by T14.1**
+  - The per-shape table AC9 asked for was produced anyway, by the probe, and is the evidence for the cancellation. No env var is needed: `LinearKernels::is_probe_name` already keeps both probe kernels out of every dispatch slot, and they stay in the tree as the instrument that killed the hypothesis. AC10 is satisfied vacuously and is re-checked whenever a new probe is added.
+
 
 - [ ] **T15: Attribute and reduce the ~8.9 ms host/dispatch gap**
   - Files: `crates/engine/src/decode_profile.rs`, `crates/engine/src/generate.rs`, `crates/engine/src/model.rs`
