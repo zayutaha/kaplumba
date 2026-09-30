@@ -5,6 +5,8 @@
 //! 2. 100% mathematical equivalence to original Ishizuki 3 bpw decoding.
 //! 3. Fail-first verification per AGENTS.md §3.4.
 
+use kaplumba_kernels::encoder::TensorRef;
+
 const WORDS_PER_TILE_ORIGINAL: usize = 24; // 24 uint32 words = 96 bytes
 
 /// Extracts the 8 codes for lane `lane` from original Ishizuki packed words for a tile.
@@ -313,26 +315,50 @@ fn test_metal_gemv_repacked_bit_exact() {
         encoder.commit_and_wait().unwrap();
     }
 
+    // Dispatch the Split-K 4 GEMV **on its own**, with no reduce/finalize step, into
+    // a buffer only this dispatch writes. `encode_gemv_named` picks the tail for us
+    // and there are two incompatible tails in this tree -- `gemv_reduce_sk4` writes
+    // the full sum back into `raw[0..n]` and leaves the partials in `raw[n..4n]`,
+    // while the fused `linear_finalize_simd_sk4` reduces the splits on the way to
+    // fp16 and leaves `raw` holding split 0's partial. Reading `raw` after the
+    // shared entry point therefore has no layout that is correct for both, and
+    // guessing one is how this test came to fail. Owning the dispatch makes the
+    // layout known: one partial per K-split at `raw[split * out_features + n]`.
+    let sk4_partials = device.new_buffer((out_features * 4 * 4) as u64, MTLResourceOptions::StorageModeShared);
+    {
+        let pipeline = kernels
+            .ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_colmajor_sk4")
+            .expect("the sk4 GEMV must be registered");
+        let shape: [u32; 2] = [in_features as u32, out_features as u32];
+        let tiles = (out_features / 16) as u64;
+        let mut encoder = MetalEncoder::new(&queue).unwrap();
+        encoder.dispatch_1d_offset(
+            pipeline,
+            &[
+                TensorRef::new(&colmajor_buf, 0),
+                TensorRef::new(&trans_repack, 0),
+                TensorRef::new(&sk4_partials, 0),
+            ],
+            &[
+                shape[0].to_le_bytes(),
+                shape[0].to_le_bytes(),
+                shape[1].to_le_bytes(),
+                shape[1].to_le_bytes(),
+            ]
+            .concat(),
+            tiles * 4 * 256,
+            256,
+        )
+        .expect("dispatch sk4 gemv");
+        encoder.commit_and_wait().unwrap();
+    }
+
     // Compare raw f32 outputs: MUST BE 100% BIT-EXACT
     let p_orig = out_orig.contents() as *const f32;
     let p_repack = out_repack.contents() as *const f32;
     let p_simd = out_simd.contents() as *const f32;
     let p_u4 = out_u4.contents() as *const f32;
-    let p_sk4 = out_sk4.contents() as *const f32;
-    // `raw` is the GEMV scratch, not the result. A split-K kernel writes one
-    // *partial* dot product per K-split at `raw[split * out_features + n]`
-    // (`linear_gemv_ishizuki_k3_colmajor_sk4`), and the partials are summed on
-    // the way out: either by `gemv_reduce_sk4` writing the sum back into `raw`,
-    // or -- now -- by the fused `linear_finalize_simd_sk4`, which reduces the
-    // splits, applies the butterfly and the output signs, and writes fp16 to
-    // `output` in one pass, leaving `raw` holding split 0's partial.
-    //
-    // So read `raw` the way the kernel fills it and reduce here. Asserting
-    // `raw[i]` directly tested the *reduce kernel in isolation*; summing the
-    // splits tests the arithmetic that actually ships, and it is strictly
-    // stronger coverage because the finalized fp16 loop below then checks the
-    // fused result of the same reduction. This assertion was the thing that
-    // caught the contract change, so it is kept -- against the real contract.
+    let p_sk4 = sk4_partials.contents() as *const f32;
     let sk4_reduce = |i: usize| -> f32 {
         (0..4).map(|s| unsafe { *p_sk4.add(s * out_features + i) }).sum()
     };

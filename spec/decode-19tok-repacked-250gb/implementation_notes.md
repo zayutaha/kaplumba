@@ -853,10 +853,36 @@ sum            -98.65691   <- exactly orig
 ```
 
 The arithmetic was never wrong; the test was reading the wrong buffer layout.
-The test now sums the partials, which is *stronger* coverage: the old
-assertion exercised the reduce kernel in isolation and never looked at what
-the reduce fed, whereas the finalized fp16 loop now checks the same
-reduction's result end to end. See `db61003`.
+
+**The first fix for this was also wrong, and it is worth recording why.** `db61003`
+changed the assertion to read `raw[split * out_features + i]` and sum the four
+slots, reasoning that the kernel writes partials there. That is true of the GEMV, but
+`encode_gemv_named` then *owns* the tail, and the tail differs by build:
+
+- at `e9c2785` the tail is `gemv_reduce_sk4`, which writes the **full sum** into
+  `raw[0..n]` and leaves the partials in `raw[n..4n]`;
+- with the fused `linear_finalize_simd_sk4`, `raw[0..n]` holds **split 0's
+  partial** and the rest are partials too.
+
+So `db61003` passes in the shipping tree and **fails at `e9c2785`**, where
+`raw[0] + raw[n] + raw[2n] + raw[3n]` is `(-98.657) + (-83.447) + 35.127 +
+(-91.823) = -238.80` — the reduced sum *plus* splits 1-3 counted twice. Measured
+in a worktree, not guessed:
+
+```text
+SK4 reduced-partial mismatch at element 0: orig -98.65691 vs sk4 -238.8005
+```
+
+There is no expression over all four slots that is correct under both tails, which is
+the real lesson: **`raw` is scratch and its post-dispatch layout is not a contract, so
+nothing outside the kernel should assert on it.** The fix is for the test to own the
+dispatch — it dispatches `linear_gemv_ishizuki_k3_colmajor_sk4` by name into a
+buffer only that dispatch writes, and *then* the partial layout is known and stable
+regardless of which tail is compiled in. The shared `encode_gemv_named` entry point
+is still exercised, but only through `output`, which is the actual contract.
+
+See the commit that follows `db61003`. Both failure modes were run: the corrected
+test passes at `e9c2785` (in-place reduce) and with the fused finalize.
 
 **Sabotage record (AGENTS.md 3.4).** All three failure modes were induced and
 observed, then reverted:
@@ -864,7 +890,7 @@ observed, then reverted:
 | sabotage | caught by | message |
 |---|---|---|
 | `linear_finalize_simd_sk4` drops `input[3*n+base]` | `repacked_golden.rs:406` | `Finalized SK4 output mismatch at element 0: orig 0xd457 vs sk4 0xcd9b (diff 47.015625)` |
-| SK4 partial write flipped split-major -> tile-major (`y[(sk*N)+...]` -> `y[(tn*N)+sk*16+...]`) | `repacked_golden.rs:364` | `SK4 reduced-partial mismatch at element 0: orig -98.65691 vs sk4 -30.435787 (diff 68.22113)` |
+| SK4 partial write flipped split-major -> tile-major (`y[(sk*N)+...]` -> `y[(tn*N)+sk*16+...]`) | `repacked_golden.rs` | `SK4 reduced-partial mismatch at element 0: orig -98.65691 vs sk4 -30.435787 (diff 68.22113)` (caught by the reduced-partial loop; after the dispatch-owning fix, still caught) |
 | `linear_finalize_simd_sk2` drops `input[n+base]` | `live_kernel_bit_exact.rs` | `sk2 fp16 output differs from reference in 336 elements` |
 
 Note the first sabotage leaves the *raw* assertion passing, correctly: it
