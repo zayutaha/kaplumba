@@ -1134,15 +1134,15 @@ impl LinearKernels {
         }
         let output_blocks = to_u32(request.out_features / 128, "output dimension")?;
         encoder.dispatch_1d(
-            &self.finalize_pipeline,
+            &self.finalize_simd_pipeline,
             &[
                 Some(request.raw),
                 Some(request.output_signs),
                 Some(request.output),
             ],
             &output_blocks.to_le_bytes(),
-            u64::from(output_blocks),
-            64,
+            u64::from(output_blocks) * 32,
+            32,
         )
     }
 
@@ -1729,11 +1729,11 @@ impl LinearKernels {
             )?;
         }
         encoder.dispatch_1d(
-            &self.finalize_pipeline,
+            &self.finalize_simd_pipeline,
             &[Some(raw), Some(output_signs), Some(output)],
             &output_blocks.to_le_bytes(),
-            u64::from(output_blocks),
-            64,
+            u64::from(output_blocks) * 32,
+            32,
         )
     }
 
