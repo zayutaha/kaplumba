@@ -1,4 +1,5 @@
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use metal::Buffer;
 use thiserror::Error;
@@ -136,6 +137,37 @@ pub fn prefill_chunk() -> usize {
             _ => PREFILL_CHUNK,
         }
     })
+}
+
+/// Decode command buffers created, and decode steps run, since the process
+/// started.
+///
+/// A process-wide counter rather than a field on [`TextModel`], because the only
+/// thing that wants it is the `KAPLUMBA_COUNT_BUFFERS` diagnostic, and adding a
+/// field to `TextModel` for it would put a diagnostic-only member in the type
+/// every layer and forward path carries.
+///
+/// Relaxed ordering: a diagnostic tally with no synchronisation to carry, whose
+/// only reader is a human after the run has finished.
+fn decode_counters() -> (&'static AtomicUsize, &'static AtomicUsize) {
+    static BUFFERS: AtomicUsize = AtomicUsize::new(0);
+    static STEPS: AtomicUsize = AtomicUsize::new(0);
+    (&BUFFERS, &STEPS)
+}
+
+/// Command buffers per decode step over the process's lifetime, if
+/// `KAPLUMBA_COUNT_BUFFERS` is set.
+pub fn report_buffers_per_step() {
+    if std::env::var_os("KAPLUMBA_COUNT_BUFFERS").is_none() {
+        return;
+    }
+    let (buffers, steps) = decode_counters();
+    let buffers = buffers.load(Ordering::Relaxed);
+    let steps = steps.load(Ordering::Relaxed);
+    eprintln!(
+        "BUFFERS total={buffers} steps={steps} per_step={:.2}",
+        buffers as f64 / steps.max(1) as f64
+    );
 }
 
 #[derive(Debug, Error)]
@@ -2749,6 +2781,25 @@ impl TextModel {
         if let Err(error) = self.forward_buffer_into(token_ids, positions, &mut encoder) {
             encoder.abandon();
             return Err(error);
+        }
+        // Read the tally BEFORE `commit_and_wait`, which consumes the encoder.
+        // Command buffers per decode step.
+        //
+        // Read here because this is the only scope that holds the encoder, and
+        // deliberately NOT under `KAPLUMBA_DECODE_PROFILE`: `begin_step` and
+        // `close_step` each commit a stamped buffer, so step mode adds two per
+        // step to a count it is trying to measure. An instrument that perturbs
+        // the quantity it reports is worse than no instrument.
+        //
+        // It matters because the per-command-buffer cost measured by
+        // `gemv_shape --fixed` is ~155 us, and the spec multiplied a per-buffer
+        // figure by the *matvec* count (420). Those multipliers differ by an
+        // order of magnitude, and the difference is the difference between the
+        // cost being 4% of a token and 26% of one.
+        if decode_step && std::env::var_os("KAPLUMBA_COUNT_BUFFERS").is_some() {
+            let (buffers, steps) = decode_counters();
+            buffers.fetch_add(encoder.command_buffers_created(), Ordering::Relaxed);
+            steps.fetch_add(1, Ordering::Relaxed);
         }
         let started = std::time::Instant::now();
         if decode_step {

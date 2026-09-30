@@ -92,27 +92,125 @@ is to make a lane's window word-aligned — at KA=3 a lane needs 24 bits of a
 is in the `r0`/`i` index arithmetic, and changing it changes which codes a lane
 owns, hence the accumulation order, hence bit-exactness.
 
-## The 79 us was 59 us, and the old method was measuring the wrong thing
+## T6 landed: the third ring word is dead at 3 bpw
 
-`gemv_shape.rs --selftest` AFFINE, three sizes, least squares:
+`linear_gemv_ishizuki_k3` reads **three** ring words per lane per tile and builds
+
+```metal
+const ulong A0 = ((w0a << 32) | w0b) << sh0 | (sh0 ? (w0c >> (32 - sh0)) : 0ul);
+```
+
+then extracts, for each code `i` in `0..8`, `r = i*KA + 16` and a 16-bit field
+from `A0 >> (64 - r)`. So the A0 bits any code can touch are exactly
+`[48 - 7*KA, 63]` — and `w0c` contributes **only** to A0 bits `[0, sh)`, the low
+bits shifted down from its top.
+
+At KA=3, `sh = lo0 % 32` with `lo0 = (lane*8+1)*KA + RING - 16`, so `sh` takes
+values `{19, 11, 3, 27}` over the 32 lanes. **max sh = 27, and the lowest used
+bit is 48 - 21 = 27.** The third load is never read. Two words suffice.
+
+`TWO_WORD_SAFE_RATES` in `scripts/gen_exl3_gemv.py` *derives* which rates are
+safe rather than listing them — it checks `48 - 7*KA >= max(sh)` and
+`7*KA + 16 <= 64`, and enumerates `sh` over all 32 lanes rather than bounding it.
+Emitted: 1, 2, 3, 4 bpw. Not emitted: 5 (`used [13,63] < max sh 29`), 6
+(`[6,63] < 22`), 7 and 8 (the `B0` arm is live and genuinely reads word 3).
+**6 bpw is `lm_head`, so the one shape where the lever does not apply is the one
+already at the ceiling** — which is a tidy result rather than a lucky one.
+
+Microbenchmark, medians of 7 interleaved rounds, two full sweeps
+(`gemv_shape --w2`):
+
+| shape | 3-word | 2-word | ratio |
+|---|---|---|---|
+| gate_proj 5376x21504 | 151.6 / 152.3 | 166.6 / 167.1 | 1.099x / 1.097x |
+| up_proj 5376x21504 | 148.0 / 152.7 | 164.5 / 166.7 | 1.112x / 1.092x |
+| down_proj 21504x5376 | 148.2 / 148.6 | 163.3 / 161.8 | 1.102x / 1.089x |
+| o_proj 5376x8192 | 145.7 / 147.0 | 157.1 / 157.1 | 1.078x / 1.068x |
+| k_proj 5376x4096 | 135.5 / 140.4 | 146.6 / 154.3 | 1.082x / 1.099x |
+
+End to end, 96 tokens, 5 interleaved A/B pairs:
 
 ```
-t = 58.9 us + 0.00608 ms/MB   ->  164.6 GB/s streaming,  58.9 us fixed
-max residual 0.0001 ms = 0.0% of span
+3-word  9.034 10.115 10.073 10.095  9.054   median 10.07 tok/s
+2-word 10.782 10.688 10.962 10.860  3.544   median 10.78 tok/s
 ```
 
-Reproduced. So the fixed per-matvec term is **59 us, not 79**, and 420 matvecs
-x 59 us = 24.8 ms of a 96 ms token.
+**+7.0% on the median, 9 of 10 paired comparisons favour the 2-word arm**, and the
+2-word arm won every microbenchmark shape, so the effect is the kernel and not
+the box. The 3.544 sample is unexplained and is counted as neither evidence nor
+counter-evidence: a single 3.5x-slow run in a set of five is the signature of the
+paging failure already measured at `weights.rs:1217` (3.9 GiB of swap, 1.4
+tok/s), and `gpuq` reported 0 swap at the time, so the cause is not established.
 
-The old figure came from "one matvec per command buffer, idle verified", which
-includes the CPU/GPU round trip. Two lessons:
+**The win is smaller than 3->2 loads suggests, and that is the informative part.**
+The window is sector-perfect, so word 3 was an L1 *request*, not a DRAM sector —
+and the wall is DRAM. What the result establishes is that request count is not
+free, which is the first positive result on the axis every previous lever
+(concurrency, load width, `N_R0`, `uint4`, unroll) missed.
 
-- **"2x the bytes must take 2x the time" is the wrong check** when a real fixed
-  cost exists. It failed here at 1.62x on a real effect, and I nearly "fixed" the
-  instrument to satisfy it. The right statement is that time is **affine** in
-  bytes, and the check is on the fit.
-- **An affine intercept is the honest way to separate fixed from streaming**, and
-  it hands you the streaming rate as a by-product.
+## T1: the 79 us, the 59 us, and the 155 us were all the wrong quantity
+
+The spec carried a "per-matvec fixed latency" of 79 us, corrected to 59 us in
+this session, and **both were artifacts.** The sequence matters because each
+correction looked like an improvement.
+
+**Where 59 us came from.** A three-point affine fit of time against bytes, with
+the pass count scaled as `1/bytes` so every size streamed ~300 MB. A *per-buffer*
+cost is therefore amortised differently at every size, and lands in the **slope**,
+not the intercept. Reading the intercept as a "per-matvec" fixed term is reading
+a per-byte term and naming it a fixed one.
+
+**The tell.** Refitting today's numbers the same way gives **8.1 us** — a 7x
+disagreement with the 59 us recorded hours earlier from the same instrument. Two
+readings of one method that differ by 7x mean the method is not measuring the
+quantity, whatever it is called.
+
+**The right instrument** (`gemv_shape --fixed`) varies the **pass count** at fixed
+bytes, where the slope is per-dispatch work and the intercept is genuinely
+per-dispatch fixed:
+
+| shape | per-dispatch | streaming | command-buffer overhead |
+|---|---|---|---|
+| 1024x1024 (0.4 MB) | 9.3 us | 42.1 GB/s | 126.3 us |
+| 5376x4096 (8.3 MB) | 56.1 us | 147.3 GB/s | 116.8 us |
+| 5376x8192 (16.5 MB) | 104.4 us | 158.2 GB/s | 119.5 us |
+| 5376x21504 (43.4 MB) | 261.2 us | 166.0 GB/s | 156.8 us |
+| 21504x5376 (43.4 MB) | 269.1 us | 161.1 GB/s | 159.5 us |
+
+The overhead is **flat across shapes** (117-203 us over two runs), which is the
+signature of a real fixed cost: a page-walk term would scale with the buffer and
+a launch term would not. Fit residuals 2.6-15%.
+
+**The multiplier was wrong too, by 10x.** The spec multiplied a per-*buffer*
+figure by the *matvec* count (420). Measured with `KAPLUMBA_COUNT_BUFFERS` on a
+real 96-token run:
+
+```
+BUFFERS total=3990 steps=95 per_step=42.00
+```
+
+**42 command buffers per decode step**, from `MAX_DISPATCHES_PER_BUFFER = 50`
+against ~1260 dispatches. This confirms a claim the code comment already made
+("the ~42 rolled buffers in between") and had never measured.
+
+**So the real budget:**
+
+```
+42 buffers x 155 us   =  6.5 ms per token
+  = 29% of the 22.3 ms HOST wall per token
+  =  7.3% of the 89.5 ms GPU span per token
+```
+
+and it is **host** time, spent while the GPU has 67 ms of queued work it is not
+waiting on — the host runs **4.01x ahead** of the GPU (89.5 ms span / 22.3 ms
+wall). The cost is real, it is 29% of the host's budget, and it is **completely
+invisible** in the token time.
+
+**T1's answer: the fixed cost is not a lever, and the spec's framing of it was
+wrong in three ways** — the quantity (per-buffer, not per-matvec), the magnitude
+(155 us, not 59), and the multiplier (42, not 420). What is left is 147-166 GB/s
+of streaming, which is item 2 below.
+
 
 ## Three bugs the new tests found, all of which had teeth
 

@@ -511,6 +511,153 @@ fn w2_sweep(rig: &Rig, shape: &Shape) {
     }
 }
 
+/// Decompose the per-dispatch fixed cost, by scaling **passes** and extrapolating
+/// to one.
+///
+/// # The first version of this instrument was wrong, and the way it was wrong is
+/// the finding
+///
+/// It fitted `ms = fixed + count * per_pass` and got a **negative** per-pass
+/// slope — time going *down* as passes go up. That is impossible if the passes
+/// are the work, so the model was wrong, and the reason is the one worth
+/// recording:
+///
+/// * the measured quantity is one `commit_and_wait`, which is a **command-buffer
+///   round trip** plus N kernel dispatches;
+/// * so the correct model is `ms = overhead + count * per_pass`, and `overhead`
+///   dominates at low counts.
+///
+/// The *old* 59 us figure was read off a (bytes, time) fit whose pass count
+/// scaled as `1/bytes`, so a per-dispatch cost was amortised differently at every
+/// size and landed in the **slope**. Refitting today's numbers that way gives
+/// 8.1 us — a 7x disagreement with 59 us, which is what prompted this
+/// instrument. Neither number was a per-dispatch cost; both were an artefact of
+/// the batching.
+///
+/// So the honest decomposition is now two terms, and both are reported: the
+/// per-command-buffer overhead and the per-dispatch streaming cost. The check
+/// that the split is real is that the *per-dispatch* term is flat across shapes
+/// in **GB/s** — a page-walk or launch cost would not be.
+fn fixed_cost(rig: &Rig, shape: &Shape) {
+    let case = Case::build(rig, shape.in_f, shape.out_f, shape.rate);
+    let name = format!("linear_gemv_ishizuki_k{}", shape.rate);
+    if rig.kernels.ishizuki_gemv_pipeline_by_name(&name).is_none() {
+        println!("  {name} not in the library, skipping");
+        return;
+    }
+    // Pass counts spanning an order of magnitude, so the slope is well determined.
+    let counts: Vec<usize> = vec![1, 2, 4, 8, 16, 32];
+    // Warm, so the first count is not also the clock ramp.
+    for count in &counts {
+        let _ = run_named(rig, &case, &name, *count);
+    }
+    let rounds = 7;
+    // `run_named` returns **per-pass** milliseconds -- it divides by the pass
+    // count, which is what makes it the right unit for a bandwidth A/B (every
+    // arm sees the same count) and the wrong unit here. The decomposition needs
+    // TOTALS, or the fit sees time falling as passes rise and reports a negative
+    // per-dispatch cost, which is what the first version of this instrument did.
+    //
+    // The two units differ by exactly a factor of `count`, and that factor is the
+    // whole decomposition: dividing by it is what turns a per-dispatch cost into
+    // an apparent fixed term.
+    let mut totals = Vec::with_capacity(counts.len());
+    for count in &counts {
+        let mut samples = Vec::with_capacity(rounds);
+        for _ in 0..rounds {
+            samples.push(run_named(rig, &case, &name, *count) * *count as f64);
+        }
+        samples.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        totals.push(samples[rounds / 2]);
+    }
+    // Least squares on (count, total_ms): total = buffer_overhead + count * per_dispatch.
+    let n = counts.len() as f64;
+    let sx: f64 = counts.iter().map(|c| *c as f64).sum();
+    let sy: f64 = totals.iter().sum();
+    let sxx: f64 = counts.iter().map(|c| (*c as f64) * (*c as f64)).sum();
+    let sxy: f64 = counts
+        .iter()
+        .zip(totals.iter())
+        .map(|(c, t)| (*c as f64) * t)
+        .sum();
+    let den = n * sxx - sx * sx;
+    let per_dispatch = (n * sxy - sx * sy) / den;
+    let overhead = (sxx * sy - sx * sxy) / den;
+    assert!(
+        per_dispatch > 0.0,
+        "fitted a NEGATIVE per-dispatch cost ({per_dispatch:.8} ms) for {}x{}: \
+         time decreases as passes increase, so the model is wrong and no \
+         decomposition can be read off it",
+        shape.in_f,
+        shape.out_f
+    );
+    let worst = counts
+        .iter()
+        .zip(totals.iter())
+        .map(|(c, t)| (overhead + per_dispatch * (*c as f64) - t).abs() / t)
+        .fold(0.0f64, f64::max);
+    let mb = case.bytes / 1e6;
+    println!(
+        "\n  {} x{} @ {}bpw = {mb:.1} MB, medians of {rounds} at each pass count",
+        shape.in_f, shape.out_f, shape.rate
+    );
+    println!(
+        "    {:>7}{:>12}{:>14}{:>14}",
+        "passes", "total ms", "per-pass us", "GB/s"
+    );
+    for (count, total) in counts.iter().zip(totals.iter()) {
+        println!(
+            "    {count:>7}{total:>12.4}{:>14.1}{:>14.1}",
+            total / (*count as f64) * 1e3,
+            gbps(mb, total / (*count as f64))
+        );
+    }
+    println!(
+        "    fit: {overhead:.4} ms command-buffer + {per_dispatch:.8} ms/dispatch  \
+         (residual max {:.1}%)",
+        100.0 * worst
+    );
+    println!(
+        "    => per-dispatch {:.1} us at {:.1} GB/s; command-buffer overhead {:.1} us",
+        per_dispatch * 1e3,
+        gbps(mb, per_dispatch),
+        overhead * 1e3
+    );
+    // The plausibility gate. It is here because this harness's first version
+    // printed 0.0-0.2 GB/s for a kernel every other instrument measures at
+    // 150+ GB/s: it divided MB by a *total* spanning `count` passes, and
+    // separately divided by a per-dispatch time still in milliseconds. Both are
+    // unit errors that compile, run, and print a confident wrong number -- the
+    // same failure as the seconds-labelled-as-milliseconds bug that claimed
+    // 131,512 GB/s.
+    //
+    // The band is wide on purpose: it is there to catch a factor-of-1000 slip,
+    // not to police small shapes. 1024x1024 legitimately reads ~38 GB/s because
+    // at 0.4 MB the per-dispatch work is smaller than its own launch, and an
+    // earlier version of this gate rejected exactly that case -- a gate that
+    // fires on the correct answer trains you to ignore it.
+    let streaming = gbps(mb, per_dispatch);
+    assert!(
+        (5.0..=400.0).contains(&streaming),
+        "per-dispatch streaming rate {streaming:.1} GB/s for {}x{} is outside 5-400. \
+         Every instrument on this box reports 38-250 GB/s for this kernel, so this is \
+         a unit error in the decomposition, not a result.",
+        shape.in_f,
+        shape.out_f
+    );
+}
+
+/// MB and milliseconds to GB/s.
+///
+/// One function, because the two places that needed this got it wrong in two
+/// different ways, and a single definition cannot be wrong in two ways at once.
+fn gbps(mb: f64, ms: f64) -> f64 {
+    if ms <= 0.0 {
+        return f64::INFINITY;
+    }
+    (mb / 1e3) / (ms / 1e3)
+}
+
 fn nr0_sweep(rig: &Rig, shape: &Shape) {
     let case = Case::build(rig, shape.in_f, shape.out_f, shape.rate);
     let passes = ((300e6 / case.bytes).ceil() as usize).clamp(4, 64);
@@ -570,6 +717,7 @@ fn main() {
         .map(|i| args[i + 1].clone());
     let nr0 = args.iter().any(|a| a == "--nr0");
     let w2 = args.iter().any(|a| a == "--w2");
+    let fixed = args.iter().any(|a| a == "--fixed");
 
     let device = Device::system_default().expect("Metal device");
     let kernels = LinearKernels::shared().expect("kernels");
@@ -597,6 +745,55 @@ fn main() {
 
     if selftest {
         run_selftest(&rig);
+        return;
+    }
+
+    if fixed {
+        // Four shapes chosen so a per-dispatch term that secretly scales with
+        // work would be visible: the fixed cost is claimed to be independent of
+        // both in_features and out_features, so varying each alone is the test.
+        // down_proj inverts the aspect ratio (16x more k), gate_proj is 4x more
+        // n, and 1024x1024 is small enough that the term should dominate.
+        for shape in [
+            Shape {
+                name: "small",
+                in_f: 1024,
+                out_f: 1024,
+                rate: 3,
+            },
+            Shape {
+                name: "k_proj slide",
+                in_f: 5376,
+                out_f: 4096,
+                rate: 3,
+            },
+            Shape {
+                name: "o_proj slide",
+                in_f: 5376,
+                out_f: 8192,
+                rate: 3,
+            },
+            Shape {
+                name: "gate_proj",
+                in_f: 5376,
+                out_f: 21504,
+                rate: 3,
+            },
+            Shape {
+                name: "down_proj",
+                in_f: 21504,
+                out_f: 5376,
+                rate: 3,
+            },
+        ] {
+            fixed_cost(&rig, &shape);
+        }
+        println!(
+            "\n  A per-dispatch GB/s that is roughly CONSTANT across these five shapes \
+             is streaming, and the command-buffer overhead that is roughly constant \
+             is the per-dispatch fixed cost. If instead the per-dispatch GB/s rises \
+             with size, the overhead is per-work and the split above is mislabelled."
+        );
         return;
     }
 

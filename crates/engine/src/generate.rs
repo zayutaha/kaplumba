@@ -313,6 +313,10 @@ where
     // `printed`, so if both this entry point and `generate_gpu_greedy` reach it
     // in one process only the first produces a table.
     crate::decode_profile::report();
+    // `KAPLUMBA_COUNT_BUFFERS`: command buffers per decode step. The tally is in
+    // `forward_buffer`, the only scope that holds the encoder, so it has to be
+    // *read* from each of the two decode entry points.
+    crate::model::report_buffers_per_step();
     Ok(GenerationResult {
         text,
         prompt_tokens: prompt_ids.len(),
@@ -548,6 +552,9 @@ where
     // One report for the whole run, after the loop: printed per step it would be
     // N tables of the same thing and unreadable.
     crate::decode_profile::report();
+    // `KAPLUMBA_COUNT_BUFFERS`: command buffers per decode step. The tally lives
+    // in `forward_buffer`, the only scope that holds the encoder.
+    crate::model::report_buffers_per_step();
 
     let decode_steps = generated_ids.len().saturating_sub(1);
     Ok(GenerationResult {
