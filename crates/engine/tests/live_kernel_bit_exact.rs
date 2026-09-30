@@ -63,6 +63,7 @@ fn live_kernel_contig4_is_bit_exact_against_colmajor() {
     let cases: &[(usize, usize, &str)] = &[
         (21504, 5376, "down_proj  21504x5376"),
         (5376, 21504, "gate_proj  5376x21504"),
+        (4096, 5376, "o_proj     4096x5376"),
     ];
 
     for (idx, (in_f, out_f, label)) in cases.iter().enumerate() {
@@ -75,10 +76,12 @@ fn live_kernel_contig4_is_bit_exact_against_colmajor() {
             .collect();
         let ones = |n: usize| upload(&device, &vec![f16::from_f32(1.0).to_bits(); n]);
 
-        let raw_ref = device.new_buffer((out_f * 4) as u64, MTLResourceOptions::StorageModeShared);
-        let raw_live = device.new_buffer((out_f * 4) as u64, MTLResourceOptions::StorageModeShared);
+        let raw_ref = device.new_buffer((out_f * 4 * 4) as u64, MTLResourceOptions::StorageModeShared);
+        let raw_live = device.new_buffer((out_f * 4 * 4) as u64, MTLResourceOptions::StorageModeShared);
+        let raw_sk2 = device.new_buffer((out_f * 4 * 4) as u64, MTLResourceOptions::StorageModeShared);
         let out_ref = device.new_buffer((out_f * 2) as u64, MTLResourceOptions::StorageModeShared);
         let out_live = device.new_buffer((out_f * 2) as u64, MTLResourceOptions::StorageModeShared);
+        let out_sk2 = device.new_buffer((out_f * 2) as u64, MTLResourceOptions::StorageModeShared);
 
         let run = |kernel: &str, raw: &Buffer, out: &Buffer| -> (Vec<u32>, Vec<u16>) {
             let mut e = MetalEncoder::new(&queue).expect("encoder");
@@ -118,6 +121,11 @@ fn live_kernel_contig4_is_bit_exact_against_colmajor() {
         let (ref_f32, ref_f16) = run("linear_gemv_ishizuki_k3_colmajor", &raw_ref, &out_ref);
         let (live_f32, live_f16) =
             run("linear_gemv_ishizuki_k3_colmajor_contig4", &raw_live, &out_live);
+        let (_sk2_f32, sk2_f16) = run(
+            "linear_gemv_ishizuki_k3_colmajor_contig4_sk2",
+            &raw_sk2,
+            &out_sk2,
+        );
 
         assert!(
             ref_f32.iter().any(|&v| v != 0),
@@ -134,6 +142,13 @@ fn live_kernel_contig4_is_bit_exact_against_colmajor() {
              {} of {} elements, so greedy decode is not bit-exact",
             ref_f16.iter().zip(&live_f16).filter(|(a, b)| a != b).count(),
             ref_f16.len()
+        );
+
+        let sk2_diff = ref_f16.iter().zip(&sk2_f16).filter(|(a, b)| a != b).count();
+        println!("{label}: sk2 fp16 diff count: {sk2_diff}/{}", ref_f16.len());
+        assert_eq!(
+            ref_f16, sk2_f16,
+            "{label}: sk2 fp16 output differs from reference in {sk2_diff} elements"
         );
 
         let first = ref_f32.iter().zip(&live_f32).position(|(a, b)| a != b);

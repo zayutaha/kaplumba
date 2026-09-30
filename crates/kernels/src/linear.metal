@@ -118,10 +118,11 @@ static float decode_state_plain(uint value) {
     return float(as_type<half>((ushort)value) + as_type<half>((ushort)(value >> 16)));
 }
 
-static float decode_state_mcg(uint value) {
+static inline float decode_state_mcg(uint value) {
     value = value * 0xCBAC1FEDu;
     value = 0x3b603b60u ^ (value & 0x8fff8fffu);
-    return float(as_type<half>((ushort)value) + as_type<half>((ushort)(value >> 16)));
+    half2 h = as_type<half2>(value);
+    return float(h.x + h.y);
 }
 
 static float decode_state_mul1(uint value) {
@@ -525,6 +526,52 @@ kernel void linear_finalize_simd(
     output[base + 96u] = half(v3 * float(output_signs[base + 96u]));
 }
 
+kernel void linear_finalize_simd_sk2(
+    const device float *input [[buffer(0)]],
+    const device half *output_signs [[buffer(1)]],
+    device half *output [[buffer(2)]],
+    constant uint &blocks [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= blocks * 32u) {
+        return;
+    }
+    const uint lane = gid & 31u;
+    const uint base = (gid >> 5) * 128u + lane;
+    const uint n = blocks * 128u;
+    float v0 = input[base] + input[n + base];
+    float v1 = input[base + 32u] + input[n + base + 32u];
+    float v2 = input[base + 64u] + input[n + base + 64u];
+    float v3 = input[base + 96u] + input[n + base + 96u];
+    transform_simd(v0, v1, v2, v3, lane);
+    output[base] = half(v0 * float(output_signs[base]));
+    output[base + 32u] = half(v1 * float(output_signs[base + 32u]));
+    output[base + 64u] = half(v2 * float(output_signs[base + 64u]));
+    output[base + 96u] = half(v3 * float(output_signs[base + 96u]));
+}
+
+kernel void linear_finalize_simd_sk4(
+    const device float *input [[buffer(0)]],
+    const device half *output_signs [[buffer(1)]],
+    device half *output [[buffer(2)]],
+    constant uint &blocks [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= blocks * 32u) {
+        return;
+    }
+    const uint lane = gid & 31u;
+    const uint base = (gid >> 5) * 128u + lane;
+    const uint n = blocks * 128u;
+    float v0 = input[base] + input[n + base] + input[2u * n + base] + input[3u * n + base];
+    float v1 = input[base + 32u] + input[n + base + 32u] + input[2u * n + base + 32u] + input[3u * n + base + 32u];
+    float v2 = input[base + 64u] + input[n + base + 64u] + input[2u * n + base + 64u] + input[3u * n + base + 64u];
+    float v3 = input[base + 96u] + input[n + base + 96u] + input[2u * n + base + 96u] + input[3u * n + base + 96u];
+    transform_simd(v0, v1, v2, v3, lane);
+    output[base] = half(v0 * float(output_signs[base]));
+    output[base + 32u] = half(v1 * float(output_signs[base + 32u]));
+    output[base + 64u] = half(v2 * float(output_signs[base + 64u]));
+    output[base + 96u] = half(v3 * float(output_signs[base + 96u]));
+}
+
 kernel void linear_finalize_gated_gelu_simd(
     const device float *raw_gate [[buffer(0)]],
     const device half *gate_signs [[buffer(1)]],
@@ -594,6 +641,96 @@ kernel void linear_finalize_gated_gelu_and_down_input_transform(
     float u1 = raw_up[base + 32u];
     float u2 = raw_up[base + 64u];
     float u3 = raw_up[base + 96u];
+    transform_simd(u0, u1, u2, u3, lane);
+    u0 *= float(up_signs[base]);
+    u1 *= float(up_signs[base + 32u]);
+    u2 *= float(up_signs[base + 64u]);
+    u3 *= float(up_signs[base + 96u]);
+
+    float v0 = float(half(gelu_tanh_value(g0) * u0)) * float(down_input_signs[base]);
+    float v1 = float(half(gelu_tanh_value(g1) * u1)) * float(down_input_signs[base + 32u]);
+    float v2 = float(half(gelu_tanh_value(g2) * u2)) * float(down_input_signs[base + 64u]);
+    float v3 = float(half(gelu_tanh_value(g3) * u3)) * float(down_input_signs[base + 96u]);
+
+    transform_simd(v0, v1, v2, v3, lane);
+
+    transformed[base] = half(v0);
+    transformed[base + 32u] = half(v1);
+    transformed[base + 64u] = half(v2);
+    transformed[base + 96u] = half(v3);
+}
+
+kernel void linear_finalize_gated_gelu_simd_sk2(
+    const device float *raw_gate [[buffer(0)]],
+    const device half *gate_signs [[buffer(1)]],
+    const device float *raw_up [[buffer(2)]],
+    const device half *up_signs [[buffer(3)]],
+    device half *activated [[buffer(4)]],
+    constant uint &blocks [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= blocks * 32u) {
+        return;
+    }
+    const uint lane = gid & 31u;
+    const uint base = (gid >> 5) * 128u + lane;
+    const uint n = blocks * 128u;
+
+    float g0 = raw_gate[base] + raw_gate[n + base];
+    float g1 = raw_gate[base + 32u] + raw_gate[n + base + 32u];
+    float g2 = raw_gate[base + 64u] + raw_gate[n + base + 64u];
+    float g3 = raw_gate[base + 96u] + raw_gate[n + base + 96u];
+    transform_simd(g0, g1, g2, g3, lane);
+    g0 *= float(gate_signs[base]);
+    g1 *= float(gate_signs[base + 32u]);
+    g2 *= float(gate_signs[base + 64u]);
+    g3 *= float(gate_signs[base + 96u]);
+
+    float u0 = raw_up[base] + raw_up[n + base];
+    float u1 = raw_up[base + 32u] + raw_up[n + base + 32u];
+    float u2 = raw_up[base + 64u] + raw_up[n + base + 64u];
+    float u3 = raw_up[base + 96u] + raw_up[n + base + 96u];
+    transform_simd(u0, u1, u2, u3, lane);
+    u0 *= float(up_signs[base]);
+    u1 *= float(up_signs[base + 32u]);
+    u2 *= float(up_signs[base + 64u]);
+    u3 *= float(up_signs[base + 96u]);
+
+    activated[base] = half(gelu_tanh_value(g0) * u0);
+    activated[base + 32u] = half(gelu_tanh_value(g1) * u1);
+    activated[base + 64u] = half(gelu_tanh_value(g2) * u2);
+    activated[base + 96u] = half(gelu_tanh_value(g3) * u3);
+}
+
+kernel void linear_finalize_gated_gelu_and_down_input_transform_sk2(
+    const device float *raw_gate [[buffer(0)]],
+    const device half *gate_signs [[buffer(1)]],
+    const device float *raw_up [[buffer(2)]],
+    const device half *up_signs [[buffer(3)]],
+    const device half *down_input_signs [[buffer(4)]],
+    device half *transformed [[buffer(5)]],
+    constant uint &blocks [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= blocks * 32u) {
+        return;
+    }
+    const uint lane = gid & 31u;
+    const uint base = (gid >> 5) * 128u + lane;
+    const uint n = blocks * 128u;
+
+    float g0 = raw_gate[base] + raw_gate[n + base];
+    float g1 = raw_gate[base + 32u] + raw_gate[n + base + 32u];
+    float g2 = raw_gate[base + 64u] + raw_gate[n + base + 64u];
+    float g3 = raw_gate[base + 96u] + raw_gate[n + base + 96u];
+    transform_simd(g0, g1, g2, g3, lane);
+    g0 *= float(gate_signs[base]);
+    g1 *= float(gate_signs[base + 32u]);
+    g2 *= float(gate_signs[base + 64u]);
+    g3 *= float(gate_signs[base + 96u]);
+
+    float u0 = raw_up[base] + raw_up[n + base];
+    float u1 = raw_up[base + 32u] + raw_up[n + base + 32u];
+    float u2 = raw_up[base + 64u] + raw_up[n + base + 64u];
+    float u3 = raw_up[base + 96u] + raw_up[n + base + 96u];
     transform_simd(u0, u1, u2, u3, lane);
     u0 *= float(up_signs[base]);
     u1 *= float(up_signs[base + 32u]);

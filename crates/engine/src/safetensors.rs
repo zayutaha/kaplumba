@@ -1044,6 +1044,13 @@ mod tests {
     }
 
     fn base_config(layer_types: Vec<&str>) -> Vec<u8> {
+        base_config_with_rates(layer_types, 3.0, 6)
+    }
+
+    /// `base_config` with the checkpoint's declared rates, so a test can state
+    /// "this export is 4 bpw / 8 bpw head" as data instead of editing a literal
+    /// deep inside a large JSON blob.
+    fn base_config_with_rates(layer_types: Vec<&str>, bits: f32, head_bits: u8) -> Vec<u8> {
         serde_json::to_vec(&json!({
             "model_type": "gemma4",
             "image_token_id": 1,
@@ -1092,8 +1099,8 @@ mod tests {
             "quantization_config": {
                 "quant_method": "exl3",
                 "version": "0.0.37",
-                "bits": 3.0,
-                "head_bits": 6,
+                "bits": bits,
+                "head_bits": head_bits,
                 "calibration": {"rows": 250, "cols": 2048},
                 "out_scales": "always",
                 "codebook": "mcg"
@@ -1126,6 +1133,119 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(error.contains("layer_types"));
+    }
+
+    /// The 60 layer types of the confirmed graph: every sixth layer is
+    /// full-attention. `validate_current_checkpoint` checks this exact
+    /// pattern, so a test that wants to reach the *rate* gate has to supply all
+    /// 60 -- otherwise it fails earlier, on the dimensions, and never exercises
+    /// the branch under test.
+    fn sixty_layer_types() -> Vec<String> {
+        (0..60)
+            .map(|index| {
+                if index % 6 == 5 {
+                    "full_attention"
+                } else {
+                    "sliding_attention"
+                }
+                .to_string()
+            })
+            .collect()
+    }
+
+    /// A 4 bpw / 8 bpw-head export is a legal EXL3 checkpoint. The gate that used
+    /// to reject it was a hardcoded `bits == 3.0 && head_bits == 6` rather than
+    /// anything about the data, and both checkpoints in this repository are the
+    /// same architecture, so the graph pins must accept both.
+    #[test]
+    fn accepts_any_supported_mcg_bitrate_pair() {
+        for (bits, head_bits) in [(3.0f32, 6u8), (4.0, 8), (2.0, 4), (8.0, 8)] {
+            let mut value: serde_json::Value = serde_json::from_slice(&base_config_with_rates(
+                vec!["sliding_attention"],
+                bits,
+                head_bits,
+            ))
+            .unwrap();
+            value["text_config"]["layer_types"] = json!(sixty_layer_types());
+            value["text_config"]["num_hidden_layers"] = json!(60);
+            let config = crate::config::parse_config(&serde_json::to_vec(&value).unwrap())
+                .unwrap_or_else(|e| panic!("{bits}/{head_bits} rejected at parse: {e}"));
+            assert_eq!(config.quantization.bits, bits);
+            assert_eq!(config.quantization.head_bits, head_bits);
+            // The gate under test, on a config that satisfies every other pin.
+            config.validate_current_checkpoint().unwrap_or_else(|e| {
+                panic!("{bits}/{head_bits} failed the current-checkpoint gate: {e}")
+            });
+        }
+    }
+
+    /// Relaxing the rate must not open the codebook: the decode path folds the
+    /// codebook to a compile-time constant, so a `mul1` checkpoint would decode
+    /// to noise through the MCG kernel.
+    #[test]
+    fn still_rejects_a_non_mcg_codebook_at_any_rate() {
+        let mut value: serde_json::Value = serde_json::from_slice(&base_config_with_rates(
+            vec!["sliding_attention"],
+            4.0,
+            8,
+        ))
+        .unwrap();
+        value["text_config"]["layer_types"] = json!(sixty_layer_types());
+        value["text_config"]["num_hidden_layers"] = json!(60);
+        value["quantization_config"]["codebook"] = json!("mul1");
+        let config = crate::config::parse_config(&serde_json::to_vec(&value).unwrap())
+            .unwrap_or_else(|e| panic!("parse should succeed; the gate is later: {e}"));
+        let error = config
+            .validate_current_checkpoint()
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains("codebook"),
+            "a mul1 checkpoint must be refused, got: {error}"
+        );
+    }
+
+    /// The head bitrate is no longer a constant, so its bound has to be enforced
+    /// somewhere: `head_bits = 0` would become `Exl3Rate::Integer(0)`, and
+    /// `ishizuki_gemv_pipelines[0]` is a deliberately empty slot.
+    #[test]
+    fn still_rejects_an_out_of_range_head_bitrate() {
+        for head_bits in [0u8, 9] {
+            let mut value: serde_json::Value = serde_json::from_slice(&base_config_with_rates(
+                vec!["sliding_attention"],
+                4.0,
+                head_bits,
+            ))
+            .unwrap();
+            value["text_config"]["layer_types"] = json!(sixty_layer_types());
+            value["text_config"]["num_hidden_layers"] = json!(60);
+            let config = crate::config::parse_config(&serde_json::to_vec(&value).unwrap())
+                .unwrap_or_else(|e| panic!("parse should succeed; the gate is later: {e}"));
+            let error = config
+                .validate_current_checkpoint()
+                .unwrap_err()
+                .to_string();
+            assert!(
+                error.contains("head bitrate"),
+                "head_bits {head_bits} must be refused, got: {error}"
+            );
+        }
+    }
+
+    /// A non-integer rate has no kernel in this build, and `integer_rate` in
+    /// model.rs is what refuses it at load time. Pin that refusal here, on the
+    /// function, because it is the only thing standing between a 3.5 bpw export
+    /// and a kernel reading the wrong number of words per tile.
+    #[test]
+    fn refuses_a_fractional_rate_at_load_time() {
+        assert!(crate::model::integer_rate_for_test(3.0).is_ok());
+        assert!(crate::model::integer_rate_for_test(8.0).is_ok());
+        for bad in [3.5f32, 0.0, 9.0, -1.0] {
+            assert!(
+                crate::model::integer_rate_for_test(bad).is_err(),
+                "{bad} must be refused: no kernel exists for a fractional rate"
+            );
+        }
     }
 
     #[test]

@@ -250,13 +250,41 @@ impl Gemma4Config {
                 )));
             }
         }
-        if self.quantization.bits != 3.0
-            || self.quantization.head_bits != 6
-            || self.quantization.codebook != "mcg"
-        {
-            return Err(ConfigError::Invalid(
-                "current checkpoint must use 3-bit mcg linears and a 6-bit mcg head".to_string(),
-            ));
+        // The rates are the CHECKPOINT's, read from its own metadata, not
+        // constants. This used to pin `bits == 3.0 && head_bits == 6` and reject
+        // everything else, which made a 4 bpw / 8 bpw-head EXL3 export unloadable
+        // even though the kernels exist for every integer rate 1..=8
+        // (`linear_gemv_ishizuki_k1..k8`, `linear_gemv_exl3_k1..k8`) and the
+        // trellis geometry is checked from the same numbers a few lines below.
+        //
+        // What is still checked here, and is the real content of the gate:
+        // the codebook must be `mcg`, because the decode path's codebook
+        // specialisation (`decode_state_mcg`) is folded to a compile-time
+        // constant in the kernel and a `plain`/`mul1` checkpoint would decode to
+        // noise through it. The bitrates themselves are validated as *supported
+        // rates* by `is_supported_rate` in `QuantizationConfig::validate`, and
+        // the per-tensor trellis shapes are checked against these exact numbers
+        // in `validate_linear_geometry` (safetensors.rs), so a config that
+        // disagrees with the weights is still rejected -- at the module that can
+        // see the weights, rather than by refusing a bitrate here.
+        if self.quantization.codebook != "mcg" {
+            return Err(ConfigError::Invalid(format!(
+                "checkpoint codebook {} is not supported; the decode path is \
+                 specialised for mcg",
+                self.quantization.codebook
+            )));
+        }
+        if !is_supported_rate(self.quantization.bits) {
+            return Err(ConfigError::Invalid(format!(
+                "unsupported quantization rate {}",
+                self.quantization.bits
+            )));
+        }
+        if self.quantization.head_bits == 0 || self.quantization.head_bits > 8 {
+            return Err(ConfigError::Invalid(format!(
+                "unsupported head bitrate {}",
+                self.quantization.head_bits
+            )));
         }
         if self.rope.sliding.rope_type != "default"
             || self.rope.sliding.theta != 10_000.0
