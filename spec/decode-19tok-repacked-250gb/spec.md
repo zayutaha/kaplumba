@@ -1,5 +1,17 @@
 # Spec: Decode 15+ tok/s and 250+ GB/s via repacked weights
 
+> **Amended 2026-09-30 a third time — documentation repair, 13.5 tok/s.**
+> The D=32 revert (`9c85e9a`) rolled back `4e4480a` wholesale, and `4e4480a` is where
+> the *measured negative results* were recorded. Eight withdrawn-claim rows, §6.3's
+> correction, §6.6/§6.7 and four of §7's questions were destroyed with the T14 probe
+> code — even though the measurements do not depend on the probe existing. **All of it
+> is restored here.** A measurement is not invalidated by deleting the kernel that
+> produced it; only the kernel is gone.
+>
+> State at this amendment: **13.511 tok/s** (T7.6.10c, 16 interleaved pairs, spread
+> 4.1%), 1167 dispatches/token, 74.01 ms/step. The measured marginal cost of a
+> dispatch is **3.5 us** (§9), which collapses the remaining fusion budget to ~0.8 ms.
+>
 > **Amended 2026-09-30.** Target lowered 19 → 15 tok/s. The 96-byte/128-byte DRAM
 > burst thesis that justified 19 tok/s is **withdrawn as fact** — see §5. R1, R3, R4
 > and R6 rewritten. T7.2/T7.3/T7.5 (the `_vec128` work) **cancelled**. Prior text and
@@ -19,9 +31,29 @@ on the M4 Pro, by making the measurement instruments trustworthy and by removing
 load-path and dispatch bottlenecks in the repacked GEMV. Prove hardware streaming
 bandwidth separately, as hardware bandwidth, not as a proxy for GEMV bandwidth.
 
-**Current measured state: ~11.7 tok/s median** (range 10.5-12.9 across runs).
-The remaining gap to 15.0 is ~18 ms/token. See 6.4 for why a single reading
-cannot be quoted on this box.
+**Current measured state: 13.511 tok/s** (T7.6.10c, median of 16 interleaved A/B pairs,
+spread 4.1%; 74.01 ms/step, 1167 dispatches/token). The remaining gap to 15.0 is
+**7.35 ms/token**. See 6.4 for why a single reading cannot be quoted on this box.
+
+**The gap is not reachable by the work on the books.** Two independent measurements
+bound what is left, and both are recorded here so the next agent does not re-derive
+them:
+
+- **Dispatch fusion: ~0.8 ms.** A dispatch costs 3.5 us of latency and ~0 of work at
+  this size (§9). The entire remaining roadmap — T7.6.11, T7.6.12, T7.6.13 — is 240
+  dispatches, i.e. **0.84 ms, which lands at 13.67 tok/s.**
+- **The GEMV: 64.6 ms of the step, and nothing has moved it.** Every attack on the 3 bpw
+  rate has failed: `simd_shuffle` 180.5 → 146.5, `_u4` 173.7, ring staging 118.8 vs
+  119.5, cheaper dequant **slower** (−26.7%), and `D = 32` at 0.288–0.918× on all 11
+  shapes (§6.6). Bytes, requests, ALU and page backing are all *ruled out* by
+  measurement.
+
+So 15.0 is reachable only by finding something nobody has found yet, not by executing
+this plan. **That is a statement about the plan, not a reason to lower the gate** —
+but the user should decide knowingly, and §6.2 gives the arithmetic. What *is*
+deliverable today is **13.7 tok/s**; 14.0 needs 2.59 ms, which the remaining fusion
+budget does not cover either.
+
 
 ## 2. Non-goals & restrictions
 
@@ -70,6 +102,13 @@ cannot be quoted on this box.
    requirement: measured at 1.01–1.03×, i.e. nothing.)
 6. **R6 (End-to-end performance):** **>= 15.0 tok/s** sustained, per R4's method.
    16.0 tok/s is stretch, not a gate.
+   > **USER DECISION PENDING — do not "fix" this number without asking.** The target was
+   > already lowered 19 → 15 (§ header). §6.2 now shows 15.0 is arithmetically
+   > *excluded* for 19 and *unreachable for the current plan* at 15: the remaining
+   > fusion budget is 0.8 ms (§9), which lands at 13.67. The options are (a) keep 15.0
+   > as a stretch target and record 13.7 as the commitment, (b) lower the gate to what
+   > the plan delivers, or (c) keep 15.0 and treat the GEMV as unsolved. **This is the
+   > user's call, not the implementer's.** The number is left at 15.0 deliberately.
 
 ## 4. Acceptance criteria
 
@@ -89,7 +128,14 @@ cannot be quoted on this box.
 5. **AC5** `scripts/gpuq run -- ./target/release/kaplumba --model
    ~/.kaplumba/models/Gxma-repacked --prompt "Explain the theory of relativity." \
    --max-new-tokens 128 --temperature 0 --metrics` reports **median >= 15.0 tok/s**
-   across >= 5 interleaved runs, with spread reported.
+   across >= 16 interleaved pairs, with spread and a paired test reported.
+   **Currently 13.511** (spread 4.1%). Method note, from T7.6.10c: **>= 5 unpaired
+   samples is not enough** — 16 unpaired samples spread 4–12% and cannot resolve a 1%
+   effect, while 16 *paired* samples resolve it at p = 0.0005 because each pair
+   cancels the box's drift. The threshold is unchanged; the *method* is raised to
+   match the evidence standard this repo already applies elsewhere.
+   *(The 15.0 figure itself is under review — see the R6 note and §6.2. Not changed
+   here.)*
 6. **AC6** The repacked kernels live **outside** `scripts/gen_exl3_gemv.py`'s rewrite
    region, verified by running the generator twice and confirming `git diff` is clean.
 
@@ -105,10 +151,27 @@ cannot be quoted on this box.
 | "12 GB = full model weight footprint" | `implementation_notes.md` T1 | **Wrong.** Checkpoint is 16.03 GB; streamed matvec bytes are 12.039 GB. And a 12 GB linear sweep is not the real access pattern: decode is a 60-deep **dependent** chain of ~43 MB GEMVs. |
 | "Deeper K-unroll (`_u8`) gives +24%" | T12 | **Withdrawn as an effect.** It gave 1.01–1.03× on the cold instrument and −0.55%/+0.62% in-engine. The 1.24× came from a `bench_gemv` arm measuring a partly-cached working set. The kernels are kept (bit-exact, neutral) but they are not a lever. |
 | "Split-K raises narrow-shape bandwidth" | T12 | **Unavailable under the no-quality-loss rule.** Measured 3–5 ULP from the reference on every shape, because it reassociates a float sum. |
+| "`gemv_reduce_sk2/sk4` are constructed but never dispatched" and "`live_kernel_bit_exact` asserts the `_sk2` fp16" | `implementation_notes.md` §20.8 | **False at `e9c2785`.** Both reduce pipelines *are* dispatched there (`linear.rs:1161`, `linear.rs:1189`), and that test file contains no `sk2`/`sk4` string at HEAD. The claims described the dirty working tree from memory instead of reading `git show`. |
+| "The bit-plane repacker is the remaining untried lever" | `implementation_notes.md` §6.6 draft | **Withdrawn — it is lossy, not a layout change.** `extract_ishizuki_lane_codes` (`exl3.rs:664-681`) keeps `s & 0x7`, the lane's own 3 bits, while `decode_state_mcg` consumes a **16-bit window** of which **13 bits survive** `0x8fff8fff`. The single `imul` mixes all 16 before any masking, so 3 bits of input yields *different dequant*, not imprecise dequant. `repack_trellis_3bpw_tensor` (`exl3.rs:687-726`) is dead code with zero callers and **must not be revived as-is** — it cannot be made bit-exact without keeping the 13 discarded bits, which is the 24-word layout again. |
+| "2.0 bpw → 18.1 tok/s" | `decode-bandwidth-240gb/spec.md:274` | **Void.** Scales bytes by 2/3 while holding the 3-bpw rate constant. Under this repo's own amplification law (§6.7) `bytes ÷ rate` is invariant for 1–4 bpw, so the predicted gain is **exactly zero**. |
+| "oMLX 2.25 bpw → 26 tok/s" | `decode-bandwidth-240gb/tasks.md:119-120` | **Void.** 2.25 is not an EXL3 rate at all — it is oMLX's oQ2+gs64. This repo's fractional set is 1.5/2.5/3.5 (`exl3.rs:57`). |
+| "~13 ms span-minus-own gap" | old §6.3 | **Withdrawn — an arithmetic error.** It differenced `span` from **step** mode against `own` from **kernel** mode, and step-mode `own` is documented as *not a decode cost* (`decode_profile.rs`, "What the report is allowed to claim"). Corrected in §6.3. |
+| "~42 command buffers per decode step" | `decode_profile.rs:19`, `generate.rs:893`, `encoder.rs:869` | **Stale.** 1407 dispatches were measured per step (1167 after T7.6.10c); since that is < `max_dispatches` (2500), `tick()` never fires `roll()` and a step commits **2 command buffers, one of them empty**. `MAX_IN_FLIGHT` is never engaged. The ~42 figure is `2100/50`, and the 2100 constant predates both `set_max_dispatches` and every fusion. The three code comments carrying it are corrected. |
+| "Killing the 16.9 ms of non-GEMV + host overhead is worth +8 tok/s" | T14 planning table | **Double-counted.** +8.54 is the *combined* T14+T15 figure and was sitting in T15's delta column. T15 alone is worth at most **+3.21**; T14's +3.13 was itself false (next row). |
+| "Byte amplification explains the 3 bpw vs 6 bpw gap, and `D = 32` will halve it for +3.13 tok/s" | spec §6.6 draft, T14 | **Falsified by measurement.** `D = 32` reached **0.288–0.918×** `_contig4` on all 11 real shapes, cold, 9 rounds, interleaved — never faster. The 0.1% fit at 3 bpw and 6 bpw was a two-point coincidence. T14.2–T14.4 cancelled. See §6.6. |
+| "The 22-request `D = 32` load should beat the 32-request one" | T14 probe design | **Inverted.** The 22-request arm is **slower on all 11 shapes** by 2.6–8.1%, at identical bytes. Request count is not what sets the rate. |
+| "A dispatch costs its own kernel time, so fusing N of them saves N × (that kernel's ms)" | §19.4 fusion roadmap, T7.6.11–13 | **Wrong by ~10×, measured.** `norm_rope_qkv` removed 240 dispatches and saved **0.84 ms** = **3.5 us each**, while `dpk_own_ms_per_token` was **unchanged** (71.649 → 71.644). A dispatch buys latency, not work. See §9. |
+| "The whole 12.8 ms non-linear tax can be fused away for 9.0 ms, giving 46.5–50.0 ms/step (20.0–21.5 tok/s)" | `implementation_notes.md` §19.4 | **Not reachable.** The same measurement that falsified the per-item estimates also caps the total: 1167 remaining dispatches × 3.5 us = 4.1 ms of theoretical headroom, of which the roadmap claims 0.84. 46.5 ms needs the 64.6 ms of GEMV to move, and nothing has moved it. |
 
-**The 2.67× figure was real but mislabelled.** 64 lane-loads per warp per tile touch
-24 distinct words — that is 2.67× **L1 request amplification**, not DRAM byte
-amplification. DRAM traffic per tile is 1.00×.
+**The 2.67× figure was real but mislabelled, and then it was falsified too.** 64
+lane-loads per warp per tile touch 24 distinct words — that is 2.67× **L1 request
+amplification**, not DRAM byte amplification (DRAM traffic per tile is 1.00×), which
+was the *corrected* reading after the 128-byte-burst story died. That corrected
+reading then failed its own test: halving it to 1.333× made the kernel slower on every
+shape (§6.6). **Neither the burst story nor the request story survives.** What survives
+is the measurement: 3 bpw layers run at 178–188 GB/s, 6 bpw `lm_head` runs at ~250, and
+no mechanism in this repo explains the difference.
+
 
 ## 6. Arithmetic this spec is built on
 
@@ -137,59 +200,133 @@ This is **411 trellis tensors**, not 421: full-attention layers have no separate
 
 | | ms/token | tok/s | aggregate effective |
 |---|---:|---:|---:|
-| **measured at HEAD** | **~85** | **~11.7** | **~142 GB/s** |
-| **15.0 tok/s** | **66.67** | **15.0** | **180.6 GB/s** |
+| **measured at HEAD** (T7.6.10c, 16 pairs) | **74.01** | **13.511** | **162.6 GB/s** |
+| **15.0 tok/s** (the gate) | **66.67** | **15.0** | **180.6 GB/s** |
+| 13.67 tok/s (all remaining fusion, delivered) | 73.17 | 13.67 | 164.5 GB/s |
+| 14.0 tok/s (would need) | 71.43 | 14.0 | 168.6 GB/s |
 | 16.0 tok/s (stretch) | 62.50 | 16.0 | 192.6 GB/s |
 
-Required remaining gain: **1.28× at 15 tok/s.**
+Required remaining gain to the gate: **1.11×** (7.35 ms/token).
 
-**19.0 tok/s is withdrawn.** It required a *dequantizing* GEMV to sustain this
-fraction of what a pure *copy* sustains on this box:
+**19.0 tok/s is arithmetically out of reach at 3.0 bpw, and this is the whole proof.**
+19 tok/s is 52.632 ms/token. The weight traffic is 12.039 GB, so even if *every* 3 bpw
+GEMV ran at the measured **250.5 GB/s streaming-probe ceiling** — a pure copy, with no
+dequant at all — the weights alone would take:
 
-| non-matvec | matvec budget | required | vs the 250.5 GB/s streaming probe |
-|---:|---:|---:|---:|
-| 0 ms | 52.63 ms | 228.8 GB/s | 91.4% |
-| 5.0 ms | 47.63 ms | 252.8 GB/s | **100.9%** |
-| 7.4 ms | 45.23 ms | 266.2 GB/s | **106.3%** |
+```
+12.039487488 GB / 250.5 GB/s = 48.06 ms      leaving 52.63 - 48.06 = 4.57 ms
+```
 
-The bottom two rows are excluded outright: no kernel can out-run a copy. And the top
-row is moot, because `lm_head` **already measures ~261 GB/s** — the wide shapes are
-at the memory system's limit, so a perfect GEMV would save at most ~5% of the step.
-Three predecessor specs reached the same conclusion (`decode-19tok`, `decode-20tok`,
-`decode-bandwidth-240gb`).
+for *everything else in the step*. The non-GEMV kernels **alone** measure 7.0 ms
+(71.644 total own − 64.61 GEMV, T7.6.10c build) to 9.5–10.1 ms (the 119-step profile at
+§6.3). Putting the low end of that range in:
 
-### 6.3 Where the remaining ~13 ms is
+| non-GEMV own | weight time at 250.5 | floor | best case | GEMV rate 19 tok/s would demand | vs the 250.5 ceiling |
+|---:|---:|---:|---:|---:|---:|
+| 0 ms | 48.06 | 48.06 | 20.8 tok/s | 228.8 GB/s | 91.4% |
+| **7.03 ms** | 48.06 | 55.10 | **18.15 tok/s** | **264.0 GB/s** | **105.4%** |
+| 7.45 ms | 48.06 | 55.51 | 18.01 tok/s | 266.5 GB/s | 106.4% |
+| 9.53 ms | 48.06 | 57.59 | 17.36 tok/s | 279.0 GB/s | 111.4% |
+| 10.08 ms | 48.06 | 58.14 | 17.20 tok/s | 282.9 GB/s | 112.9% |
 
-From `KAPLUMBA_DECODE_PROFILE=kernel` at HEAD, per step (own time ≈ 71 ms, span ≈ 78 ms):
+**Every row except the first demands more than a memcpy.** No kernel can out-run a
+copy, so 19 tok/s is not "hard" at 3.0 bpw — it is excluded, and the best case even
+with a *perfect* GEMV is 17.2–18.2 tok/s. Three predecessor specs reached the same
+conclusion from the other direction (`decode-19tok`, `decode-20tok`,
+`decode-bandwidth-240gb`); this is the first version of the argument that is arithmetic
+rather than inference.
 
-| kernel | ms/step | note |
-|---|---:|---|
-| `gate_up_gelu` | 27.4 | fused MLP; at ~190 GB/s |
-| `down_proj` | 14.3 | ~181 GB/s |
-| `qkv_proj` | 9.2 | narrow grid |
-| `o_proj` | 6.9 | narrow grid |
-| `head/gemv` | 4.1 | ~261 GB/s — at the ceiling |
-| non-GEMV (norm/rope/attention/gelu) | ~6.8 | |
+**15.0 tok/s is the honest gate and it is *not* a number this plan can produce.** It
+needs every 3 bpw GEMV at 180.6 GB/s aggregate — which is what they *already* achieve,
+so the gate is really asking for the **64.6 ms of GEMV to fall to ~57 ms**, i.e. for
+the 3 bpw-vs-6 bpw gap to close. Four candidate mechanisms have been tested and ruled
+out (§6.6); latency and occupancy are the two axes not yet tested. `lm_head` measures
+~250–261 GB/s, so the wide shapes are at the memory system's limit and a perfect GEMV
+there saves at most ~5% of the step.
 
-Plus a **~13 ms span-minus-own gap** — inter-kernel scheduling latency across ~800
-dispatches per token. That gap is now comparable to the entire non-GEMV cost and is
-the single largest unexplained item.
+**Open for the user:** 15.0 remains the stated gate, but the honest deliverable of the
+remaining roadmap is 13.7, and nothing on the books reaches 14.0. Lowering the gate to
+what the plan delivers, or keeping 15.0 as an explicit *stretch* with 13.7 as the
+commitment, is a decision for the user and has deliberately **not** been made here.
+
+
+### 6.3 Where the 72.6 ms of kernel time is
+
+Fresh `KAPLUMBA_DECODE_PROFILE=kernel` at HEAD, 119 steps, per token:
+
+| kernel | ms/token | % | derived GB/s |
+|---|---:|---:|---:|
+| `gate_up_gelu` | 27.71 | 38.4% | 187.7 |
+| `down_proj` | 14.49 | 20.1% | 179.5 |
+| `qkv_proj` | 9.28 | 12.9% | 178.0 |
+| `o_proj` | 6.82 | 9.5% | 169.5 |
+| `head/gemv` (6 bpw) | 4.22 | 5.9% | **250.5** |
+| `attention` | 2.31 | 3.2% | |
+| `qk_proj` | 2.09 | 2.9% | |
+| norm/rope/cache (7 rows) | 5.13 | 7.1% | |
+| **total kernel own** | **72.6** | | |
+
+The later T7.6.10c build re-measured `dpk_own_ms_per_token` at **71.644 ms** over 96
+tokens, with the same GEMV set summing to 64.61 — so non-GEMV own time is
+**7.0–10.1 ms** depending on build, and §6.2's reachability table uses the low end.
+
+**The "~13 ms span-minus-own gap" previously recorded here was an arithmetic error and
+is withdrawn.** It differenced `span` from **step** mode against `own` from **kernel**
+mode. `decode_profile.rs` ("What the report is allowed to claim") states that step-mode
+`own` covers "only the two boundary buffers, so it is small and **not a decode cost**".
+The two instruments also do not commute: kernel mode stamps ~665 command buffers per
+step where the uninstrumented path commits 1–2, so some of the non-GEMV figure is the
+profiler distorting what it measures.
+
+| instrument | own | span | wall | tok/s |
+|---|---:|---:|---:|---:|
+| step (clock; undistorted) | 71.3 *not a decode cost* | 73.8 | 71.8 | 10.92 |
+| kernel (attribution; wall inflated by drains) | 72.6 | 83.5 | — | 9.16 |
+| uninstrumented | — | — | ~81.5 | 12.27 |
+
+So kernel own is ~95% of an uninstrumented step and the host/dispatch gap is
+**~8.9 ms/token on that build — not 13** — but it is *unattributed*, and it is a
+**cross-instrument difference**: one number from the distorted kernel instrument, one
+from an uninstrumented run. The latest build does not support the 8.9 ms figure either;
+`dpk_own` 71.644 against T7.6.10c's uninstrumented 74.01 ms/step leaves **2.37 ms**,
+which is a 6.5 ms improvement that nobody has recorded and nobody should believe until
+one instrument measures both. §7.1 is the open question.
+
+`gate_up_gelu` has no meaningful headroom: 5.202 GB of weight streaming against
+30.97 MB of everything else, so deleting **all** non-weight traffic saves ≤ 0.155 ms
+(0.56%). Its epilogue moves 64 B/thread at ~0.88 FLOP/B, ~2.5% of the machine's ridge
+point, so it is latency-bound. `scratch.gate`/`scratch.up` are already dead at HEAD
+(`6327c84`); the live intermediate is fp32 `raw`/`raw_b` at 20.6 MB/token.
+
 
 ### 6.4 What was measured to get here
 
-Measured, 64 tokens, temperature 0, uninstrumented, interleaved across two binaries
-(9 samples): `11.03 / 11.57 / 11.64 / 12.03 / 12.14 / 12.52 / 12.76 / 12.80 / 12.93`
-→ **median 12.14 tok/s**, spread **0.85**. The spread is the machine drifting, not the
-kernel changing: the same binary spans that range run to run. **No single reading is
-a measurement on this box** (AGENTS.md 10.5 records 3.7-6.4 tok/s from one binary).
-The 15.0 tok/s target is therefore quoted against 12.14, the centre, not against a
-best-of run.
+**Current, and the only figure the gate should be quoted against** — T7.6.10c, one
+binary, flag A/B, 96 greedy tokens, **16 interleaved pairs**:
 
-- 5 interleaved uninstrumented runs, 64 tokens: `11.57 / 12.76 / 12.93 / 12.52 / 12.80`
-  → **median 12.76 tok/s**, up from ~10.5 before the fusion work.
+| arm | dispatches/token | median tok/s | median ms/step | spread |
+|---|---:|---:|---:|---:|
+| unfused (`KAPLUMBA_NO_NORM_ROPE_QKV=1`) | 1407 | 13.320 | 75.08 | 4.5% |
+| **fused (default, HEAD)** | **1167** | **13.511** | **74.01** | **4.1%** |
+
+B faster in 15/16 pairs, sign test p = 0.0005, paired t = 6.80 on 14 df.
+
+The preceding history, for the record — **no single reading is a measurement on this
+box** (AGENTS.md 10.5 records 3.7–6.4 tok/s from one binary), so these are quoted as
+ranges and medians only:
+
+- Interleaved uninstrumented, 64 tokens, 9 samples across two binaries:
+  `11.03 / 11.57 / 11.64 / 12.03 / 12.14 / 12.52 / 12.76 / 12.80 / 12.93`
+  → **median 12.14**, spread 0.85. (An earlier 5-round run gave 12.76 and was quoted as
+  *the* number; it is the high end of this range, not its centre.)
+- After the D=32 revert, 7 interleaved runs: median 12.50, range 10.86–12.98.
+- 5 interleaved uninstrumented runs during the fusion work: median 12.76, up from
+  ~10.5 before it.
 - Greedy output unchanged on three prompts ("Paris", "The theory of relativity is not
   one single theory, but two separate theories developed by Albert Einstein…",
-  "Hello! How can I help you today?").
+  "Hello! How can I help you today?"), and byte-identical over 128 tokens between the
+  T7.6.10c arms (sha256 `2fff2c97…6795b2`, including `--show-ids`).
+
 
 ### 6.5 The one documented bit-exactness exception
 
@@ -211,23 +348,198 @@ previous golden test asserted `to_bits()` for kernels that did not run and used 
 `1e-3` tolerance for ones that did not matter; this asserts the property that
 actually governs the output.
 
-The split-K kernels (`_sk4`, `contig4_sk2`/`_sk4`) reassociate similarly and are **not
-on the decode path**. The `linear_repacked.metal` header says so explicitly.
+The split-K kernels (`_sk4`, `contig4_sk2`/`_sk4`) reassociate similarly and are **not on
+the default decode path** — `encode_gemv` reaches them only under `KAPLUMBA_USE_SK=1`,
+which is off, because split-K measured slower than `contig4` on every shape
+(`implementation_notes.md` §19.1). `linear_repacked.metal`'s header says so too.
+
+Two corrections to the numbers above, both from adding `o_proj 4096x5376` as a third
+shape (`live_kernel_bit_exact.rs`):
+
+| shape | `contig4` f32 max ULP | `contig4` fp16 |
+|---|---|---|
+| `o_proj     4096x5376` | **833** | **differs 0/5376** |
+
+The 51 ULP quoted above was the max over two shapes; it is not the worst case. `o_proj`
+deviates 833 ULP in f32 and its fp16 is still identical, so the conclusion — that
+`linear_finalize_simd`'s fp16 rounding absorbs the reassociation — is unchanged, and is
+now asserted on three shapes instead of two.
+
+Split-K's own fp16 is **bit-identical to the reference on all three real decode shapes**
+(0 / 5376, 0 / 21504, 0 / 5376 via `contig4_sk2`), but it is *not* bit-exact in general:
+on the synthetic 512-element `repacked_golden` case, `_sk4`'s fp16 differs on 2 elements
+by one ULP. So the blanket "reassociates similarly" is right, and split-K staying gated is
+right for two independent reasons — it is slower (§19.1) *and* it is not provably fp16
+bit-exact, which the no-quality-loss rule would not permit on the decode path anyway.
+
+### 6.6 The amplification law — fitted to two points, then falsified
+
+**Restored.** This section was destroyed by the D=32 revert (`9c85e9a`) along with the
+probe code. The probe is gone; the measurement is not, and it is the single most
+important negative result in the repo.
+
+A 3 bpw tile is `256·3/8 = 24` distinct `u32` words. The live kernel has 32 lanes each
+issuing **2** scalar `uint` loads, so a warp requests **64** loads for 24 words —
+**2.667× amplification**, DRAM traffic 1.00×. At 6 bpw a tile is 48 words and the kernel
+issues 96 loads — **2.000×**.
+
+| rate | lane-loads | distinct words | amplification | measured |
+|---|---:|---:|---:|---:|
+| 3 bpw (layers) | 64 | 24 | 2.667 | **187.7 GB/s** |
+| 6 bpw (`lm_head`) | 96 | 48 | 2.000 | **250.5 GB/s** |
+
+```
+predicted 3 bpw = 250.5 x 2.00/2.667 = 187.9 GB/s
+measured  gate_up_gelu               = 187.7 GB/s      fit error 0.1%
+```
+
+`lm_head` is a fair comparator: it is **not** colmajor (`model.rs` sets
+`permutation_mode = 1` only on the seven per-layer linears), so it takes the row-major
+`_w2` arm with 16384 threadgroups — same op mix, same `decode_state` body, same memory
+system.
+
+**That 0.1% is a coincidence of two points, and it does not extrapolate.** It was
+tested, not assumed, and it failed. `D = 32` gives each lane 32 codes: 96 ring bits,
+needing `96+13 = 109` bits = 4 words, with 19 bits of slack. Eight lanes cover the tile,
+so byte amplification drops 2.667 → **1.333**, which the law says is DRAM-capped at
+250.5 GB/s.
+
+Measured, 11 shapes, cold (`MADV_DONTNEED`), 9 rounds, interleaved, warmup discarded
+(spreads 0.92–0.99, so the run resolves the effect):
+
+| shape | tiles_n | `_contig4` | `D=32` | ratio |
+|---|---:|---:|---:|---:|
+| `full/kv` 5376×2048 | 128 | 126.5 | 36.4 | **0.288** |
+| `sliding/v` 5376×4096 | 256 | 152.8 | 70.5 | 0.462 |
+| `sliding/k` 5376×4096 | 256 | 153.9 | 72.2 | 0.469 |
+| `sliding/down` 21504×5376 | 336 | 181.7 | 93.4 | 0.514 |
+| `full/o` 16384×5376 | 1024 | 179.2 | 93.5 | 0.521 |
+| `sliding/o` 8192×5376 | 512 | 169.8 | 92.2 | 0.543 |
+| `sliding/q` 5376×8192 | 512 | 167.2 | 133.0 | 0.796 |
+| `sliding/up` 5376×21504 | 1344 | 183.5 | 148.9 | 0.811 |
+| `sliding/gate` 5376×21504 | 1344 | 183.0 | 148.7 | 0.812 |
+| `full/q` 5376×16384 | 1024 | 180.0 | 165.2 | **0.918** |
+
+**Every shape regressed, and the ordering is the diagnosis.** A tile needs `256/D`
+lanes, so a 32-lane simdgroup covers `D/8` output tiles and the grid becomes
+`tiles_n / D`. `full/kv` has 128 output tiles, so `D=32` launches **4 threadgroups on
+20 cores**. The direction that reduces per-lane work starves the machine of
+threadgroups. The ordering is monotone in `tiles_n`, which is the signature of a
+starved grid rather than a bandwidth problem.
+
+**The load path is not the wall, and the two probe arms prove it.** They fetched
+identical 128 bytes and differed only in requests (22 vs 32) — and the **22-request arm
+was slower on all 11 shapes, by 2.6–8.1%**. Fewer requests did not help; more requests
+cost nothing. So the rate is not set by request count and not by byte count, and the
+`2.00/2.667` ratio that fitted 3 bpw and 6 bpw so precisely is coincidence. (`D=8`
+reaches 187.7 and `D=32` reaches 148.7 on the same shape, and `lm_head` at 6 bpw
+reaches 250.5 — three points no single amplification law fits.)
+
+**The ALU is not the limit either, and that is measured twice with the opposite sign to
+intuition.** Removing the dequant arithmetic makes the kernel **slower**: the `_nod`
+stub gives 3 bpw 167.3 → **122.7** (−26.7%), 4 bpw 217.1 → 206.3, 8 bpw 222.5 → 219.2;
+and a four-probe sweep on `gate_proj` gives no-decode 115.1 vs baseline 124.7. Deleting
+59% of the ALU work costs throughput because the decode's dependent chains were
+accidentally supplying the ILP that hides load latency. "Cheaper dequant" is ruled out.
+
+**What is left.** The 3 bpw layers are at ~178–188 GB/s against a ~250 GB/s streaming
+ceiling, and neither the byte path, the request path, nor the ALU explains the gap.
+Page backing is also out (`bench_residency`: file/resident 0.98–1.03×, i.e. noise).
+What remains untested is the **latency/occupancy** axis: whether the grid is wide
+enough to hide DRAM latency, and whether the decode's dependent chain — not its
+arithmetic — is what serialises.
+
+### 6.7 Lowering bpw below 3.0 buys exactly zero time
+
+Derived from the law above (which §6.6 then falsified as a *predictor* — this section
+is kept because the conclusion is independently measured, not because the law holds):
+
+| rate | bytes | amp | predicted GB/s | ms/token, layer stack |
+|---|---:|---:|---:|---:|
+| 1 bpw | ×1/3 | 8.000 | 62.6 | 58.5 |
+| 2 bpw | ×2/3 | 4.000 | 125.3 | 58.5 |
+| **3 bpw (now)** | ×1 | 2.667 | **187.9** | **58.5** |
+| 4 bpw | ×4/3 | 2.000 | 250.5 | 58.5 |
+
+**`bytes ÷ rate` is invariant for 1–4 bpw.** Supported by a measurement against itself:
+the same 5376×21504 matrix takes **0.2616 ms at 3 bpw and 0.2035 ms at 4 bpw** — bytes
+up 33%, time down 22%.
+
+This **voids** the repo's "2.0 bpw → 18.1 tok/s" figure
+(`decode-bandwidth-240gb/spec.md:274`), which scaled bytes by 2/3 while holding the
+3-bpw rate constant. Confirmed against the checkpoint: every one of the 411 quantized
+modules is `bits_per_weight: 3` except `lm_head` at 6, `safetensors.rs` enforces that
+uniformity, and `exl3.rs:57` offers only integer 1–8 plus fractional 1.5/2.5/3.5 —
+**there is no 2-bpw decode measurement in this repo, and none is expected to help.**
 
 ## 7. Open questions
 
-1. The **~13 ms span-minus-own gap** across ~800 dispatches per token. Is it
-   inter-kernel scheduling latency, CPU-side encode, or both? This is now the
-   largest single item and is not yet attributed.
-2. `q`/`k`/`v` sit at 88–92 GB/s on `bench_gemv` while `lm_head` reaches 261. That
-   gap does **not** appear in `bench_residency`, so it may be an artifact of the
-   cached-working-set arm rather than a real effect. Must be settled on the cold
-   instrument before anything is built on it.
-3. AC1 and AC5 must be measured in **separate GPU sessions** — the 12 GB probe
-   buffer and the ~11.7 GiB model cannot coexist on 24 GiB.
+1. **The host/dispatch gap — and it is no longer 13 ms.** Corrected twice: the "~13 ms"
+   was an arithmetic error (§5, §6.3) and the replacement "~8.9 ms" is a
+   *cross-instrument* difference that the current build does not support either
+   (`dpk_own` 71.644 vs uninstrumented 74.01 leaves 2.37 ms). The instrument that would
+   attribute it — step mode's `dp_span_over_wall` / `dp_span_minus_wall` — **has never
+   been recorded in any file in this repo** (`grep -rln "dp_span_over_wall\|dp_span_minus_wall" spec/`
+   returns nothing), as has `KAPLUMBA_STEP_TRACE=1`. It costs one extra commit per step
+   without draining, so it does not serialise the host. **Run it before planning
+   anything against a gap number.**
+2. **Is the amplification law a law or a 2-point coincidence?** It is fitted at exactly
+   two points and `D = 32` predicted amp 1.333, outside both. **MEASURED: it is a
+   coincidence** (§6.6). What survives as an open question is narrower and is the only
+   remaining lead on the 64.6 ms of GEMV: **latency and occupancy**. Bytes, requests,
+   ALU and page backing are all ruled out by measurement.
+3. **Command buffers per step.** "2 buffers, one empty" was derived from the call
+   graph, not measured. `KAPLUMBA_COUNT_BUFFERS=1` settles it in one command.
+4. ~~`q`/`k`/`v` at 88–92 GB/s vs `lm_head` at 261.~~ **CLOSED** — it does not appear in
+   `bench_residency` (121–126 GB/s for `full/kv`); it was the cached-working-set arm of
+   `bench_gemv`. Recorded in `implementation_notes.md`. Do not rebuild on it.
+5. AC1 and AC5 must be measured in **separate GPU sessions** — the 12 GB probe buffer
+   and the ~11.5 GiB model cannot coexist on 24 GiB (`phys_footprint` 11.51 GiB with
+   both offloaded, per `spec/resident-memory-12gib/`).
 
 ## 8. Supersession
 
 Directly continues `spec/decode-bandwidth-handover/`. Baselines of record:
 `spec/decode-bandwidth-240gb/`, `spec/decode-19tok/`, `spec/decode-20tok/`.
-Reopens and answers the 19 tok/s question those three closed.
+
+**Those three are baselines, not authorities.** Two of their load-bearing figures were
+later falsified and are recorded in §5: "2.0 bpw → 18.1 tok/s" and "oMLX 2.25 bpw →
+26 tok/s" (`decode-bandwidth-240gb/spec.md:274`, `tasks.md:119-120`). A reader who lands
+on them via this section must read §5 first.
+
+The folder name still says `19`. It is retained so the ~200 cross-references to this
+path keep resolving; **the target is 15 (§1, §3 R6, §4 AC5)** and 19 is excluded by the
+arithmetic in §6.2.
+
+## 9. The fusion budget, as measured
+
+`norm_rope_qkv` (T7.6.10) is the calibration point for every future dispatch-fusion
+estimate, and it revises the roadmap by an order of magnitude:
+
+| | estimate | **measured** | dispatches removed |
+|---|---:|---:|---:|
+| `norm_rope_qkv` (T7.6.10c, done) | 3.5–4.5 ms | **0.84 ms** | 240 |
+| T7.6.11 finalize + residual + layer scale | 2.0 ms | **0.21 ms** | 60 |
+| T7.6.12 post-attn norm + residual + gate transform | 2.0 ms | **0.42 ms** | 120 |
+| T7.6.13 attention fast path (< 64 ctx) | 1.5 ms | **0.21 ms** | 60 |
+| **remaining total** | **5.5 ms** | **~0.8 ms** | 240 |
+
+**Marginal cost of a dispatch on this box: 3.5 us** (0.84 ms / 240). The original
+estimates assumed a dispatch's *own kernel time*, which the same measurement disproved:
+
+| | unfused | fused |
+|---|---:|---:|
+| `kv_norm_rope` own ms/token | 0.8598 | 0.8622 |
+| total `dpk_own_ms_per_token` | 71.649 | 71.644 |
+
+Kernel own time is unchanged to three decimal places while the step gets 0.84 ms
+faster. **A dispatch buys latency, not work.** Three consequences, all load-bearing:
+
+1. **Fusion cannot pay more by optimising the fused kernel.** Dispatch count is the
+   only lever, and 3.5 us/dispatch is the number to plan against.
+2. **Anyone profiling only `dpk_own_ms_per_token` will measure T7.6.10 as exactly zero**
+   and conclude it did nothing. It needs end-to-end tok/s or `dpk_span_ms_per_token`.
+3. **The whole remaining budget is ~0.8 ms, which lands at 13.67 tok/s.** It cannot
+   reach the 52.63 ms (19 tok/s) figure, and it cannot reach 15.0 either. The gate
+   needs the 64.6 ms of GEMV to move, and §6.6 records four mechanisms tried and four
+   failures.
