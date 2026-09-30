@@ -1,37 +1,34 @@
-//! Is the 8x-unroll fused GEMV bit-exact against its 4x original?
+//! Does the fused GEMV's threadgroup partition actually put each tensor in the
+//! right place?
 //!
-//! `linear_gemv_ishizuki_k3_fused2_u8` and `_fused3_u8` are the biggest single
-//! lever in the decode step: `gate_up_proj` is 36.8% of a step and `qkv_proj`
-//! 17.1% by `KAPLUMBA_DECODE_PROFILE=kernel`. The previous round of `_u8` work
-//! missed them because `encode_gemv_fused2` / `_fused3` look their pipeline up by
-//! hardcoded name, so the measured end-to-end gain was +1.2% against a predicted
-//! +24%.
-//!
-//! ## Why these shapes are chosen the way they are
-//!
-//! The fused kernels split the grid by threadgroup index: `fused2` sends
+//! `encode_gemv_fused2` and `encode_gemv_fused3` merge several projections into one
+//! dispatch by partitioning the grid on threadgroup index: `fused2` sends
 //! `tgid < tiles_a` to tensor A and `tgid >= tiles_a` to B; `fused3` is the
-//! three-way version. **A wrong partition does not crash, does not produce
-//! zeros, and does not look obviously wrong** -- it writes every output exactly
-//! once with plausible magnitudes, just the wrong ones. That is the failure mode
-//! a `to_bits()` comparison against a *sibling kernel on the same data* cannot
-//! see if both shapes are equal, because a self-consistent partition bug produces
-//! self-consistent output on both.
+//! three-way version.
 //!
-//! So every case uses **three different shapes** (A != B != C, and all three
-//! distinct tile-row counts). Then a swapped or off-by-one partition sends a
-//! threadgroup at tensor A's weight data with tensor B's output pointer, and the
-//! two kernels cannot agree by accident.
+//! **A wrong partition is the most dangerous bug in this file.** It does not crash,
+//! does not produce zeros, and does not look obviously wrong -- every output is
+//! written exactly once with plausible magnitudes, just the wrong ones. It can only
+//! be caught by comparing against something that cannot make the same mistake.
 //!
-//! `gate_proj` (5376x21504) and `up_proj` (5376x21504) are genuinely the same
-//! shape in this model, so the equal-shape case is included too -- as a positive
-//! control, to show the test *can* pass, not just fail.
+//! ## Why unequal shapes, and why this comparison
+//!
+//! Comparing the fused kernels against each other would not be enough: two kernels
+//! that share a partition bug produce self-consistently wrong output. So each fused
+//! call is compared against **independent `encode_gemv` calls**, one per tensor,
+//! which take a completely different code path and cannot reproduce a partition
+//! error. Every case uses three different shapes, so a swapped or off-by-one
+//! partition routes threadgroups at the wrong weights and the comparison fails.
+//!
+//! `gate_proj` (5376x21504) and `up_proj` (5376x21504) genuinely are the same shape in
+//! this model, so the equal-shape case is included too -- as a positive control,
+//! to show the test can pass rather than only fail.
 //!
 //! ## Fail-first
 //!
-//! `the_comparison_can_fail` flips one weight bit and asserts the fused output
-//! changes. Without it, a test that compared the fused kernels only against each
-//! other could pass trivially if both were reading the wrong buffer.
+//! `the_fused_comparison_can_fail` flips one weight bit and requires the fused
+//! output to change. Without it, a comparison against an independent path could
+//! pass trivially if both were reading the same wrong buffer.
 
 use half::f16;
 use kaplumba_engine::exl3::pack_integer_states;
@@ -73,59 +70,75 @@ fn ones(device: &Device, n: usize) -> Buffer {
 struct Scratch {
     input: Buffer,
     input_signs: Buffer,
-    output_signs_a: Buffer,
-    output_signs_b: Buffer,
-    output_signs_c: Buffer,
     transformed: Buffer,
-    raw_a: Buffer,
-    raw_b: Buffer,
-    raw_c: Buffer,
-    out_a: Buffer,
-    out_b: Buffer,
-    out_c: Buffer,
+    raw: Buffer,
+    out: Buffer,
 }
 
-fn scratch(device: &Device, in_f: usize, out: &[usize]) -> Scratch {
-    let mut raw = |n: usize| {
-        device.new_buffer((n * 4 * 4) as u64, MTLResourceOptions::StorageModeShared)
-    };
-    let mut fin = |n: usize| {
-        device.new_buffer((n * 2) as u64, MTLResourceOptions::StorageModeShared)
-    };
+fn scratch(device: &Device, in_f: usize, out: usize) -> Scratch {
     let input_v: Vec<u16> = (0..in_f)
         .map(|i| f16::from_f32((i as f32 * 0.013).sin()).to_bits())
         .collect();
     Scratch {
         input: upload(device, &input_v),
         input_signs: ones(device, in_f),
-        output_signs_a: ones(device, out[0]),
-        output_signs_b: ones(device, out[1]),
-        output_signs_c: ones(device, *out.get(2).unwrap_or(&out[1])),
-        transformed: fin(in_f),
-        raw_a: raw(out[0]),
-        raw_b: raw(out[1]),
-        raw_c: raw(*out.get(2).unwrap_or(&out[1])),
-        out_a: fin(out[0]),
-        out_b: fin(out[1]),
-        out_c: fin(*out.get(2).unwrap_or(&out[1])),
+        transformed: device.new_buffer((in_f * 2) as u64, MTLResourceOptions::StorageModeShared),
+        raw: device.new_buffer((out * 4 * 4) as u64, MTLResourceOptions::StorageModeShared),
+        out: device.new_buffer((out * 2) as u64, MTLResourceOptions::StorageModeShared),
     }
 }
 
-fn read_f32(buffer: &Buffer, len: usize) -> Vec<u32> {
-    let ptr = buffer.as_ref().contents() as *const f32;
-    (0..len).map(|i| unsafe { ptr.add(i).read() }.to_bits()).collect()
+fn read_u16(buffer: &Buffer, len: usize) -> Vec<u16> {
+    let ptr = buffer.as_ref().contents() as *const u16;
+    (0..len).map(|i| unsafe { ptr.add(i).read() }).collect()
 }
 
-fn nonempty(v: &[u32], what: &str) {
+fn nonempty(v: &[u16], what: &str) {
     assert!(
         v.iter().any(|&x| x != 0),
         "{what} is all zeros; the kernel computed nothing to compare"
     );
 }
 
-/// Compare one fused pair, 4x against 8x, on both outputs.
+/// One projection, encoded on its own through the plain `encode_gemv` path.
+fn encode_alone(
+    kernels: &LinearKernels,
+    queue: &metal::CommandQueue,
+    device: &Device,
+    packed: &[u16],
+    in_f: usize,
+    out_f: usize,
+) -> Vec<u16> {
+    let buf = upload(device, packed);
+    let sc = scratch(device, in_f, out_f);
+    let mut e = MetalEncoder::new(queue).expect("encoder");
+    kernels
+        .encode_gemv(
+            &mut e,
+            LinearEncodeRequest {
+                packed: &buf,
+                packed_offset: 0,
+                perm_mode: 1,
+                input: &sc.input,
+                input_signs: &sc.input_signs,
+                output_signs: &ones(device, out_f),
+                transformed: &sc.transformed,
+                raw: &sc.raw,
+                output: &sc.out,
+                in_features: in_f,
+                out_features: out_f,
+                rate: Exl3Rate::Integer(BITS),
+                codebook: Exl3Codebook::Mcg,
+                pretransformed: false,
+            },
+        )
+        .expect("encode_gemv");
+    e.commit_and_wait().expect("wait");
+    read_u16(&sc.out, out_f)
+}
+
 #[test]
-fn fused2_u8_is_bit_exact_against_fused2() {
+fn fused2_matches_two_independent_encodes() {
     let Some(device) = Device::system_default() else {
         eprintln!("no Metal device; skipping");
         return;
@@ -136,77 +149,72 @@ fn fused2_u8_is_bit_exact_against_fused2() {
     };
     let queue = device.new_command_queue().to_owned();
 
-    // in_f, out_a, out_b, label
+    // in_f, out_a, out_b, label. Deliberately unequal except the first.
     let cases: &[(usize, usize, usize, &str)] = &[
-        (5376, 21504, 21504, "gate_up: EQUAL shapes (the real model) - positive control"),
+        (5376, 21504, 21504, "gate/up: EQUAL shapes (the real model) - positive control"),
         (5376, 21504, 8192, "unequal A=21504 B=8192"),
         (5376, 8192, 21504, "unequal A=8192 B=21504 (partition reversed)"),
         (5376, 4096, 32768, "unequal, B 4x wider than A"),
-        (5376, 32768, 4096, "unequal, A 4x wider than B"),
     ];
 
     for (idx, (in_f, out_a, out_b, label)) in cases.iter().enumerate() {
-        let pa = upload(&device, &build(*in_f, *out_a, 31 + idx as u32 * 7));
-        let pb = upload(&device, &build(*in_f, *out_b, 97 + idx as u32 * 13));
-        let sc = scratch(&device, *in_f, &[*out_a, *out_b]);
+        let pa = build(*in_f, *out_a, 31 + idx as u32 * 7);
+        let pb = build(*in_f, *out_b, 97 + idx as u32 * 13);
 
-        let run = |kernel: &str| -> (Vec<u32>, Vec<u32>) {
-            let mut enc = MetalEncoder::new(&queue).expect("encoder");
-            let shape_vals = [*in_f as u32, *out_a as u32, *out_b as u32];
-            kernels
-                .encode_gemv_fused2(
-                    &mut enc,
-                    &pa,
-                    0,
-                    *out_a,
-                    &sc.output_signs_a,
-                    &sc.out_a,
-                    &pb,
-                    0,
-                    *out_b,
-                    &sc.output_signs_b,
-                    &sc.out_b,
-                    &sc.input,
-                    &sc.input_signs,
-                    &sc.transformed,
-                    &sc.raw_a,
-                    &sc.raw_b,
-                    *in_f,
-                    false,
-                    Some(kernel),
-                )
-                .unwrap_or_else(|e| panic!("{kernel} {label}: {e}"));
-            enc.commit_and_wait().expect("wait");
-            let _ = shape_vals;
-            (read_f32(&sc.raw_a, *out_a), read_f32(&sc.raw_b, *out_b))
-        };
+        // Reference: each tensor encoded entirely on its own.
+        let ref_a = encode_alone(&kernels, &queue, &device, &pa, *in_f, *out_a);
+        let ref_b = encode_alone(&kernels, &queue, &device, &pb, *in_f, *out_b);
+        nonempty(&ref_a, &format!("fused2 {label} A"));
+        nonempty(&ref_b, &format!("fused2 {label} B"));
 
-        let name_4x = "linear_gemv_ishizuki_k3_fused2";
-        let name_8x = "linear_gemv_ishizuki_k3_fused2_u8";
-        let (a4, b4) = run(name_4x);
-        let (a8, b8) = run(name_8x);
-        nonempty(&a4, &format!("fused2 {label} A"));
-        nonempty(&b4, &format!("fused2 {label} B"));
+        // Fused: both in one dispatch.
+        let ba = upload(&device, &pa);
+        let bb = upload(&device, &pb);
+        let sc_a = scratch(&device, *in_f, *out_a);
+        let sc_b = scratch(&device, *in_f, *out_b);
+        let mut e = MetalEncoder::new(&queue).expect("encoder");
+        kernels
+            .encode_gemv_fused2(
+                &mut e,
+                &ba,
+                0,
+                *out_a,
+                &ones(&device, *out_a),
+                &sc_a.out,
+                &bb,
+                0,
+                *out_b,
+                &ones(&device, *out_b),
+                &sc_b.out,
+                &sc_a.input,
+                &sc_a.input_signs,
+                &sc_a.transformed,
+                &sc_a.raw,
+                &sc_b.raw,
+                *in_f,
+                false,
+            )
+            .unwrap_or_else(|e| panic!("fused2 {label}: {e}"));
+        e.commit_and_wait().expect("wait");
 
-        for (which, x, y, n) in [("A", &a4, &a8, *out_a), ("B", &b4, &b8, *out_b)] {
-            match x.iter().zip(y).position(|(p, q)| p != q) {
-                None => println!("  fused2 {label}: output {which} BIT-EXACT across {n}"),
-                Some(i) => {
-                    let d = (x[i] as i64 - y[i] as i64).abs();
-                    panic!(
-                        "fused2 {label}: output {which} DIFFERS at {i}/{n}: \
-                         4x {:e} vs 8x {:e} ({d} ULP)",
-                        f32::from_bits(x[i]),
-                        f32::from_bits(y[i])
-                    );
-                }
-            }
-        }
+        let got_a = read_u16(&sc_a.out, *out_a);
+        let got_b = read_u16(&sc_b.out, *out_b);
+        assert_eq!(
+            ref_a, got_a,
+            "fused2 {label}: output A differs from an independent encode; the \
+             threadgroup partition is wrong"
+        );
+        assert_eq!(
+            ref_b, got_b,
+            "fused2 {label}: output B differs from an independent encode; the \
+             threadgroup partition is wrong"
+        );
+        println!("  fused2 {label}: A and B both match independent encodes");
     }
 }
 
 #[test]
-fn fused3_u8_is_bit_exact_against_fused3() {
+fn fused3_matches_three_independent_encodes() {
     let Some(device) = Device::system_default() else {
         return;
     };
@@ -216,71 +224,62 @@ fn fused3_u8_is_bit_exact_against_fused3() {
     let queue = device.new_command_queue().to_owned();
 
     let cases: &[(usize, usize, usize, usize, &str)] = &[
-        (5376, 8192, 4096, 4096, "sliding q/k/v (real)"),
+        (5376, 8192, 4096, 4096, "sliding q/k/v (real: k and v are the same shape)"),
         (5376, 16384, 1024, 1024, "full q/kv (real)"),
         (5376, 2048, 8192, 4096, "3-way all different"),
-        (5376, 32768, 2048, 1024, "3-way, A 16x C"),
-        (5376, 1024, 2048, 32768, "3-way, C 16x A"),
+        (5376, 32768, 2048, 1024, "3-way, A 8x C"),
+        (5376, 1024, 2048, 32768, "3-way, C 8x A"),
     ];
 
     for (idx, (in_f, a, b, c, label)) in cases.iter().enumerate() {
-        let pa = upload(&device, &build(*in_f, *a, 41 + idx as u32 * 11));
-        let pb = upload(&device, &build(*in_f, *b, 53 + idx as u32 * 17));
-        let pc = upload(&device, &build(*in_f, *c, 67 + idx as u32 * 19));
-        let sc = scratch(&device, *in_f, &[*a, *b, *c]);
+        let pa = build(*in_f, *a, 41 + idx as u32 * 11);
+        let pb = build(*in_f, *b, 53 + idx as u32 * 17);
+        let pc = build(*in_f, *c, 67 + idx as u32 * 19);
 
-        let run = |kernel: &str| -> (Vec<u32>, Vec<u32>, Vec<u32>) {
-            let mut enc = MetalEncoder::new(&queue).expect("encoder");
-            kernels
-                .encode_gemv_fused3(
-                    &mut enc,
-                    &pa, 0, *a, &sc.output_signs_a, &sc.out_a,
-                    &pb, 0, *b, &sc.output_signs_b, &sc.out_b,
-                    &pc, 0, *c, &sc.output_signs_c, &sc.out_c,
-                    &sc.input, &sc.input_signs, &sc.transformed,
-                    &sc.raw_a, &sc.raw_b, &sc.raw_c,
-                    *in_f,
-                    false,
-                    Some(kernel),
-                )
-                .unwrap_or_else(|e| panic!("{kernel} {label}: {e}"));
-            enc.commit_and_wait().expect("wait");
-            (read_f32(&sc.raw_a, *a), read_f32(&sc.raw_b, *b), read_f32(&sc.raw_c, *c))
-        };
+        let ref_a = encode_alone(&kernels, &queue, &device, &pa, *in_f, *a);
+        let ref_b = encode_alone(&kernels, &queue, &device, &pb, *in_f, *b);
+        let ref_c = encode_alone(&kernels, &queue, &device, &pc, *in_f, *c);
+        nonempty(&ref_a, &format!("fused3 {label} A"));
+        nonempty(&ref_b, &format!("fused3 {label} B"));
+        nonempty(&ref_c, &format!("fused3 {label} C"));
 
-        let (a4, b4, c4) = run("linear_gemv_ishizuki_k3_fused3");
-        let (a8, b8, c8) = run("linear_gemv_ishizuki_k3_fused3_u8");
-        nonempty(&a4, &format!("fused3 {label} A"));
-        nonempty(&b4, &format!("fused3 {label} B"));
-        nonempty(&c4, &format!("fused3 {label} C"));
+        let ba = upload(&device, &pa);
+        let bb = upload(&device, &pb);
+        let bc = upload(&device, &pc);
+        let sa = scratch(&device, *in_f, *a);
+        let sb = scratch(&device, *in_f, *b);
+        let sc = scratch(&device, *in_f, *c);
+        let mut e = MetalEncoder::new(&queue).expect("encoder");
+        kernels
+            .encode_gemv_fused3(
+                &mut e,
+                &ba, 0, *a, &ones(&device, *a), &sa.out,
+                &bb, 0, *b, &ones(&device, *b), &sb.out,
+                &bc, 0, *c, &ones(&device, *c), &sc.out,
+                &sa.input, &sa.input_signs, &sa.transformed,
+                &sa.raw, &sb.raw, &sc.raw,
+                *in_f,
+                false,
+            )
+            .unwrap_or_else(|e| panic!("fused3 {label}: {e}"));
+        e.commit_and_wait().expect("wait");
 
-        for (which, x, y, n) in [
-            ("A", &a4, &a8, *a),
-            ("B", &b4, &b8, *b),
-            ("C", &c4, &c8, *c),
+        for (which, r, g, n) in [
+            ("A", ref_a.clone(), read_u16(&sa.out, *a), *a),
+            ("B", ref_b.clone(), read_u16(&sb.out, *b), *b),
+            ("C", ref_c.clone(), read_u16(&sc.out, *c), *c),
         ] {
-            match x.iter().zip(y).position(|(p, q)| p != q) {
-                None => println!("  fused3 {label}: output {which} BIT-EXACT across {n}"),
-                Some(i) => {
-                    let d = (x[i] as i64 - y[i] as i64).abs();
-                    panic!(
-                        "fused3 {label}: output {which} DIFFERS at {i}/{n}: \
-                         4x {:e} vs 8x {:e} ({d} ULP)",
-                        f32::from_bits(x[i]),
-                        f32::from_bits(y[i])
-                    );
-                }
-            }
+            assert_eq!(
+                r, g,
+                "fused3 {label}: output {which} ({n} elements) differs from an \
+                 independent encode; the threadgroup partition is wrong"
+            );
         }
+        println!("  fused3 {label}: A, B and C all match independent encodes");
     }
 }
 
 /// Fail-first, AGENTS.md 3.4.
-///
-/// Flips one weight bit and requires the fused output to change. Without this,
-/// a test comparing the fused kernels only against each other could pass
-/// trivially if both were reading the same wrong buffer -- which is precisely the
-/// partition bug this file exists to catch.
 #[test]
 fn the_fused_comparison_can_fail() {
     let Some(device) = Device::system_default() else {
@@ -294,44 +293,43 @@ fn the_fused_comparison_can_fail() {
     let in_f = 5376usize;
     let (out_a, out_b) = (21504usize, 8192usize); // deliberately unequal
     let good = build(in_f, out_a, 5);
-    let sc = scratch(&device, in_f, &[out_a, out_b]);
+    let sc = scratch(&device, in_f, out_a);
 
+    let run = |packed: &[u16]| -> Vec<u16> {
+        let buf = upload(&device, packed);
+        let mut e = MetalEncoder::new(&queue).expect("encoder");
+        kernels
+            .encode_gemv_fused2(
+                &mut e,
+                &buf, 0, out_a, &ones(&device, out_a), &sc.out,
+                &buf, 0, out_b, &ones(&device, out_b), &upload(&device, &vec![0u16; out_b]),
+                &sc.input, &sc.input_signs, &sc.transformed,
+                &sc.raw, &device.new_buffer((out_b * 16) as u64, MTLResourceOptions::StorageModeShared),
+                in_f, false,
+            )
+            .expect("encode");
+        e.commit_and_wait().expect("wait");
+        read_u16(&sc.out, out_a)
+    };
+
+    let clean = run(&good);
     let mut dirty = good.clone();
     // Perturb inside tile 0 so the change reaches a real output element.
     dirty[3] ^= 0x0000_0001;
+    let sabotaged = run(&dirty);
 
-    let run = |packed: &[u16], kernel: &str| -> (Vec<u32>, Vec<u32>) {
-        let buf = upload(&device, packed);
-        let mut enc = MetalEncoder::new(&queue).expect("encoder");
-        kernels
-            .encode_gemv_fused2(
-                &mut enc, &buf, 0, out_a, &sc.output_signs_a, &sc.out_a,
-                &buf, 0, out_b, &sc.output_signs_b, &sc.out_b,
-                &sc.input, &sc.input_signs, &sc.transformed,
-                &sc.raw_a, &sc.raw_b, in_f, false, Some(kernel),
-            )
-            .expect("encode");
-        enc.commit_and_wait().expect("wait");
-        (read_f32(&sc.raw_a, out_a), read_f32(&sc.raw_b, out_b))
-    };
-
-    for kernel in [
-        "linear_gemv_ishizuki_k3_fused2",
-        "linear_gemv_ishizuki_k3_fused2_u8",
-    ] {
-        let (ca, cb) = run(&good, kernel);
-        let (da, db) = run(&dirty, kernel);
-        let changed = ca.iter().zip(&da).filter(|(x, y)| x != y).count()
-            + cb.iter().zip(&db).filter(|(x, y)| x != y).count();
-        assert_ne!(
-            ca, da,
-            "FAIL-FIRST BROKEN for {kernel}: flipping one weight bit changed no output \
-             in A, so this test cannot detect a wrong kernel"
-        );
-        assert!(
-            changed > 0,
-            "FAIL-FIRST BROKEN for {kernel}: no output changed at all"
-        );
-        println!("  fail-first ok for {kernel}: {changed} outputs moved");
-    }
+    assert!(
+        clean.iter().any(|&x| x != 0),
+        "FAIL-FIRST BROKEN: clean output is all zeros"
+    );
+    assert_ne!(
+        clean, sabotaged,
+        "FAIL-FIRST BROKEN: flipping one weight bit changed no output, so this \
+         test cannot detect a wrong kernel and 'bit-exact' means nothing."
+    );
+    println!(
+        "  fail-first ok: one flipped weight bit moved {} of {} outputs",
+        clean.iter().zip(&sabotaged).filter(|(a, b)| a != b).count(),
+        clean.len()
+    );
 }

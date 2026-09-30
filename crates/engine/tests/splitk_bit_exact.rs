@@ -33,14 +33,23 @@ const SHAPES: &[(&str, usize, usize)] = &[
 
 const BITS: u8 = 3;
 
-/// Variants that claim to be bit-exact against `linear_gemv_ishizuki_k3_colmajor`.
+/// Variants compared against `linear_gemv_ishizuki_k3_colmajor`.
 /// `_sk4` is here as the documented counter-example: split-K reorders the
 /// summation and is NOT bit-exact, which is why it cannot be used under the
 /// spec's no-quality-loss rule.
-const CANDIDATES: &[(&str, &str)] = &[
-    ("_u8", "linear_gemv_ishizuki_k3_colmajor_u8"),
-    ("_sk4", "linear_gemv_ishizuki_k3_colmajor_sk4"),
-];
+///
+/// NOTE on `_contig4`: it is *not* listed here, and that is deliberate. It is the
+/// kernel the engine dispatches, and it is NOT bit-exact in f32 -- it assigns four
+/// contiguous tiles per simdgroup where `_colmajor` assigns interleaved ones, so
+/// it reassociates (measured up to 51 ULP). It IS bit-identical after the fp16
+/// rounding in `linear_finalize_simd`, which is what the sampler reads; that is
+/// asserted in `live_kernel_bit_exact.rs`. This file compares the raw f32
+/// accumulator, so including it here would report a deviation that does not affect
+/// any generated token.
+///
+/// The `_u8` variant this originally compared against did not survive the branch
+/// reset and measured 1.01-1.03x cold when it did; not worth carrying.
+const CANDIDATES: &[(&str, &str)] = &[("_sk4", "linear_gemv_ishizuki_k3_colmajor_sk4")];
 
 fn build(in_f: usize, out_f: usize, seed: u32) -> Vec<u16> {
     let tiles = (in_f / 16) * (out_f / 16);
@@ -94,8 +103,16 @@ fn read_f32(buffer: &Buffer, len: usize) -> Vec<u32> {
     (0..len).map(|i| unsafe { ptr.add(i).read() }.to_bits()).collect()
 }
 
+/// Records that split-K is NOT bit-exact, as a regression test rather than a
+/// paragraph of prose that can rot.
+///
+/// Every remaining candidate is `_sk4`, and it must differ, so the panic below is
+/// the expected outcome and is asserted. If a future split-K kernel *were*
+/// bit-exact, this test would fail and force the spec's no-quality-loss rule to be
+/// revisited deliberately rather than by accident.
 #[test]
-fn splitk_is_bit_exact_against_colmajor_on_every_real_shape() {
+#[should_panic(expected = "split-K is NOT bit-exact")]
+fn splitk_reassociates_and_is_not_bit_exact() {
     let Some(device) = Device::system_default() else {
         eprintln!("no Metal device; skipping");
         return;
