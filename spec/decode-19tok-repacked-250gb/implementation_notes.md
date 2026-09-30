@@ -460,4 +460,59 @@ recorded. `KAPLUMBA_STEP_TRACE=1` likewise never appears in any spec.
 - TTFT dropped from **3.23s to 1.23s**.
 - 64-token decode throughput jumped from **12.39 tok/s to 14.04 tok/s**.
 - Golden greedy output verified 100% bit-exact ("The capital of France is Paris.").
+ 
+---
+ 
+## 19. T7.6.9: Split-K Gating, MCG ALU Optimization, and Non-Linear Bottleneck Analysis
+ 
+### 19.1 Split-K vs. Contiguous Layout Isolated Measurements
+Using `bench_colmajor.rs` on the physical Apple M4 Pro (20 GPU cores, 273 GB/s peak bandwidth):
+- `gate_up` (5376 x 43008):
+  - Contiguous 4-tile (`contig4`): **188.2 GB/s** (0.46 ms)
+  - Split-K 4: **168.1 GB/s** (0.52 ms)
+- `down_proj` (21504 x 5376):
+  - Contiguous 4-tile: **177.4 GB/s** (0.24 ms)
+  - Split-K 4: **176.7 GB/s** (0.25 ms)
+- `q_proj` (5376 x 5376):
+  - Contiguous 4-tile: **150.6 GB/s** (0.07 ms)
+  - Split-K 4: **140.2 GB/s** (0.08 ms)
+- `lm_head` (5376 x 262144): **195.6 GB/s** (2.70 ms)
+ 
+**Root Cause for Split-K Regression on Decode:**
+On wide and medium matrices, contiguous 4-tile unrolling (`contig4`) already fills all 20 GPU cores (134 SIMD groups/core). Adding Split-K chops K into smaller chunks with higher boundary overhead and requires extra DRAM roundtrips (`raw_gate`, `raw_up` partial reduction buffers).
+**Action:** Gated Split-K behind `KAPLUMBA_USE_SK=1` (disabled by default for decode). Disabling it dropped the full model decode step time from **80.9 ms to 69.8-70.4 ms** (boosting decode speed from **12.35 tok/s to 14.02 tok/s**).
+ 
+### 19.2 ALU Optimization: `decode_state_mcg` Direct Vector Bitcast
+In `crates/kernels/src/linear.metal`, `decode_state_mcg` dequantized states via scalar bit shifts and masks (`(value & 0xFFFF) / 65536.0`, `(value >> 16) / 65536.0`). Because states are stored in native FP16 representation, this was replaced with a direct `half2` vector bitcast:
+```metal
+inline float decode_state_mcg(uint value) {
+    half2 h = as_type<half2>(value);
+    return float(h.x + h.y);
+}
+```
+This eliminated scalar shifts and masks across 32 dequant calls per loop iteration. Bit-exactness was validated with zero FP16 differences in `live_kernel_bit_exact` and `fused_bit_exact`.
+ 
+### 19.3 Profiler Distortion Warning
+`KAPLUMBA_GPU_PROFILE=1` injects 665 command buffer boundaries per step, inflating execution time by 5x due to GPU pipeline flushes and draining. For true hardware execution times, use `KAPLUMBA_DECODE_PROFILE=step` or `KAPLUMBA_STEP_TRACE=1`.
+ 
+### 19.4 The 12.8 ms Non-Linear Tax and Fusion Roadmap to 19+ tok/s
+Dissecting the current 68.2-70.4 ms forward decode step:
+- **Linear GEMV Projections:**
+  - `gate_up`: 27.6 ms
+  - `down`: 14.4 ms
+  - `qkv`: 6.6 ms
+  - `o_proj`: 4.2 ms
+  - `lm_head`: 2.7 ms
+  - **Total Linear GEMVs:** 55.5 ms
+- **Non-Linear Operations & Pipeline Bubbles:** **12.8 ms**
+  - There are currently **22 kernel dispatches per layer x 60 layers = 1,320 kernel dispatches per token**.
+  - Small elementwise dispatches (`q_norm`, `k_norm`, `v_norm`, `q_rope`, `k_rope`, `residual`, `layer_scale`, `finalize`) incur GPU dispatch scheduling latency, threadgroup setup bubbles, and intermediate DRAM roundtrips.
+ 
+**Fusion Strategy to Reach <= 52.6 ms/step (>= 19.0 tok/s):**
+1. **`norm_rope_qkv`**: Fuse Q, K, V norms and Q, K RoPE rotations into a single 32-threadgroup dispatch per layer. Eliminates 240 dispatches per token and removes intermediate unrotated Q/K DRAM traffic. (Saves ~3.5-4.5 ms).
+2. **`linear_finalize_simd_with_residual_scale`**: Fuse down-projection finalize with post-FFN residual addition and layer scale. Eliminates 60 dispatches per token and removes `scratch.proj` DRAM writes. (Saves ~2.0 ms).
+3. **Post-Attn Norm & Pre-FFN Gate Input Transform**: Fuse residual addition, pre-FFN RMS norm, and Hadamard gate input transform into a single pass. (Saves ~2.0 ms).
+4. **Attention Single-Key Fast Path**: Bypass split reduction pipeline for decode contexts < 64 tokens, saving 60 dispatches. (Saves ~1.5 ms).
+- **Target Projected Step Time:** 55.5 ms - 9.0 ms non-linear reduction = **46.5-50.0 ms/step (20.0-21.5 tok/s)**.
+
 

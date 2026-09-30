@@ -100,9 +100,34 @@
   - Intent: Eliminate the 1.27s Metal JIT shader compilation penalty on the first decode step via `warmup_decode` at model load. Skip empty command buffer commits in `flush_and_wait`. Optimize `argmax_logits` comparison loop and reuse `logits` vector in-place via `forward_buffer_into_vec`. Fix shift overflow in `pack_integer_windows`.
   - Result: Step 0 dropped from 1,277 ms to 69.9 ms. Decode throughput boosted from 12.39 tok/s to 14.04 tok/s. TTFT dropped from 3.23s to 1.23s. 100% bit-exact golden output verified.
 
+- [x] **T7.6.9: Split-K gating and MCG ALU half2 vector optimization**
+  - Files: `crates/kernels/src/linear.rs`, `crates/kernels/src/linear.metal`, `crates/kernels/src/linear_repacked.metal`
+  - Intent: Benchmark Split-K vs contiguous 4-tile (`contig4`) layout. Gate Split-K behind `KAPLUMBA_USE_SK=1` because wide/medium matrices already saturate 20 GPU cores (134 SIMD groups/core) and Split-K incurs DRAM roundtrips and smaller reduction loops. Optimize `decode_state_mcg` with direct `half2` vector bitcast.
+  - Result: Eliminating Split-K reduction roundtrips dropped forward step latency from ~80.9 ms to ~69.8-70.4 ms (decode speed jumped from 12.35 tok/s to 14.02 tok/s). `half2` bitcast replaced scalar shifts/masks across 32 dequant calls per loop step. 0 FP16 diffs in `live_kernel_bit_exact` and `fused_bit_exact`.
+
+- [ ] **T7.6.10: Fused QKV Norm & RoPE dispatch (`norm_rope_qkv`)**
+  - Files: `crates/kernels/src/elements.metal`, `crates/kernels/src/elements.rs`, `crates/engine/src/model.rs`
+  - Intent: Combine `q_norm + q_rope`, `k_norm + k_rope`, and `v_norm` into a single 32-threadgroup kernel dispatch per layer, cutting 240 kernel dispatches per token across 60 layers and eliminating DRAM roundtrips for unrotated projections.
+  - Estimated impact: ~3.5-4.5 ms reduction in step latency.
+
+- [ ] **T7.6.11: Fused Down Finalize + Post-FFN Residual & Layer Scale**
+  - Files: `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`, `crates/engine/src/model.rs`
+  - Intent: Combine `linear_finalize_simd` and `encode_rms_norm_residual_layer_scale` into a single kernel dispatch (`linear_finalize_simd_with_residual_scale`), eliminating 60 dispatches and `scratch.proj` DRAM buffer traffic.
+  - Estimated impact: ~2.0 ms reduction in step latency.
+
+- [ ] **T7.6.12: Fused Post-Attention Norm, Residual, and Gate Input Transform**
+  - Files: `crates/kernels/src/elements.metal`, `crates/kernels/src/elements.rs`, `crates/engine/src/model.rs`
+  - Intent: Merge post-attention residual add, pre-FFN RMS norm, and Hadamard gate input transform into a single dispatch per layer, eliminating 120 dispatches per token.
+  - Estimated impact: ~2.0 ms reduction in step latency.
+
+- [ ] **T7.6.13: Attention Fast-Path Single Dispatch for Short Decode Context**
+  - Files: `crates/kernels/src/attention.rs`, `crates/engine/src/model.rs`
+  - Intent: When decode KV context length is < 64 (splits == 1), bypass split pipelines (`decode_split_pipelines` + `decode_combine`), dispatching single-pass attention directly.
+  - Estimated impact: ~1.5 ms reduction in step latency.
+
 - [ ] **T8: End-to-end decode benchmark and acceptance validation**
   - Files: `spec/decode-19tok-repacked-250gb/implementation_notes.md`
   - Intent: Measure end-to-end tok/s using `scripts/gpuq run` across reference prompts.
-  - Acceptance: Pure autoregressive decode throughput characterization against physical 250+ GB/s ceiling.
+  - Acceptance: Pure autoregressive decode throughput >= 19.0 tok/s (<= 52.6 ms/step) against physical 250+ GB/s ceiling with 100% bit-exact greedy generation.
 
 
