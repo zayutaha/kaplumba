@@ -665,15 +665,118 @@ including the `--show-ids` token list. A single fp16 ULP anywhere in the
   `linear.metal` are the pre-existing `_sk2` work, which the generator does not
   touch -- it lives in `linear_repacked.metal` for exactly that reason).
 
-### 20.8 On the uncommitted `_sk2` split-K kernels
+### 20.8 On the uncommitted `_sk2` split-K kernels, and why the SK4 golden test broke
 
-`linear_repacked.metal` carries uncommitted `_sk2` split-K kernels that a prior
-measurement found *slower*; `linear.rs` has had their reduce dispatches removed
-again (`gemv_reduce_sk2_pipeline` / `gemv_reduce_sk4_pipeline` are now
-constructed but never dispatched -- the compiler flags them as dead). They are
-**dead weight, left in place deliberately**: they are not mine to delete, and
-`live_kernel_bit_exact.rs` still asserts the `_sk2` kernel's fp16 output against
-the reference, so removing them would remove a live measurement. The clean-up is
-a one-line question for whoever owns that work: does the `_sk2` assertion still
-earn its keep, or is the pipeline registration and the 139 lines of `.metal`
-just dead?
+An earlier revision of this section claimed two things that were **false at
+`e9c2785`**:
+
+1. that "`linear.rs` has had their reduce dispatches removed again
+   (`gemv_reduce_sk2_pipeline` / `gemv_reduce_sk4_pipeline` are now
+   constructed but never dispatched)"; at `e9c2785` both were still
+   dispatched, at `linear.rs:1161` and `linear.rs:1189`;
+2. that "`live_kernel_bit_exact.rs` still asserts the `_sk2` kernel's fp16
+   output against the reference"; at `e9c2785` that file contained no
+   `sk2`/`sk4` string at all.
+
+Both were true of the *dirty working tree* at the time and were recorded as
+though they were true of HEAD. That is the same failure mode as the
+`linear_metal.rs:900` incident in `spec/engine-performance` Q11: a claim
+about code that was described from memory instead of from `git show`. Both
+are now corrected; the grep commands that establish the real state are in
+`tasks.md` T7.6.11.
+
+**The actual root cause of the failing `repacked_golden` test.** The dirty
+`_sk2`/`_sk4` work replaced the two-kernel split-K tail (GEMV writes N
+partials per K-split into `raw`; `gemv_reduce_sk2`/`_sk4` sums them back
+into `raw`; `linear_finalize_simd` applies the butterfly and writes fp16)
+with a **fused** reduce+finalize (`linear_finalize_simd_sk2` / `_sk4`: sum
+the splits, butterfly, signs, fp16 -> `output`, in one pass).
+
+The GEMV half is unchanged and correct. What changed is the observable
+contract of `raw`: under the fused kernel `raw` holds **split 0's partial**,
+not the reduced dot product. `repacked_golden.rs` read `raw[i]` and compared
+it to the reference, so it saw a partial. Dumping the four partials at
+element 0 makes it concrete:
+
+```text
+orig -98.65691   raw[0] 41.486683
+partials [41.486683, -83.44719, 35.126995, -91.8234]
+sum            -98.65691   <- exactly orig
+```
+
+The arithmetic was never wrong; the test was reading the wrong buffer layout.
+The test now sums the partials, which is *stronger* coverage: the old
+assertion exercised the reduce kernel in isolation and never looked at what
+the reduce fed, whereas the finalized fp16 loop now checks the same
+reduction's result end to end. See `db61003`.
+
+**Sabotage record (AGENTS.md 3.4).** All three failure modes were induced and
+observed, then reverted:
+
+| sabotage | caught by | message |
+|---|---|---|
+| `linear_finalize_simd_sk4` drops `input[3*n+base]` | `repacked_golden.rs:406` | `Finalized SK4 output mismatch at element 0: orig 0xd457 vs sk4 0xcd9b (diff 47.015625)` |
+| SK4 partial write flipped split-major -> tile-major (`y[(sk*N)+...]` -> `y[(tn*N)+sk*16+...]`) | `repacked_golden.rs:364` | `SK4 reduced-partial mismatch at element 0: orig -98.65691 vs sk4 -30.435787 (diff 68.22113)` |
+| `linear_finalize_simd_sk2` drops `input[n+base]` | `live_kernel_bit_exact.rs` | `sk2 fp16 output differs from reference in 336 elements` |
+
+Note the first sabotage leaves the *raw* assertion passing, correctly: it
+changes the finalize, which does not write `raw`. The two assertions cover
+disjoint stages, which is what makes them worth having separately.
+
+**Measured quality of the split-K path** (`live_kernel_bit_exact.rs`,
+reference = `linear_gemv_ishizuki_k3_colmajor`):
+
+| shape | `contig4` f32 max ULP | `contig4` fp16 | `contig4_sk2` fp16 |
+|---|---|---|---|
+| `down_proj  21504x5376` | 26 | 0 / 5376 | **0 / 5376** |
+| `gate_proj  5376x21504` | 51 | 0 / 21504 | **0 / 21504** |
+| `o_proj     4096x5376` | 833 | 0 / 5376 | **0 / 5376** |
+
+`o_proj` is new (added with the `_sk2` work) and its f32 deviation is 833
+ULP -- far larger than the 51 ULP quoted in `spec.md` §6.2, which was
+measured before that shape existed. The fp16 is still identical, so the
+conclusion in §6.2 stands and is now asserted on a third shape.
+
+Split-K is **not** bit-exact everywhere, though: on the synthetic 512-element
+`repacked_golden` case, SK4's fp16 differs from the reference on 2 elements
+by one ULP (`0x2cfd`/`0x2cfc`, `0xc6c4`/`0xc6c3`). It keeps the
+associativity tolerance that U4 gets. Recording this rather than widening
+the tolerance further.
+
+**Left alone, deliberately:**
+
+- `gemv_reduce_sk2_pipeline` / `gemv_reduce_sk4_pipeline` are now dead in
+  the dirty tree: the fused finalize replaced them, so they are constructed
+  and never dispatched (rustc flags both). They are not *mine* to delete,
+  and the tree is being edited concurrently -- see below. Concrete cost if
+  anyone wants it: two `new_compute_pipeline_state_with_function` calls per
+  `LinearKernels::new()`, i.e. two wasted pipeline compiles per model load.
+  The two ~20-line Metal kernels behind them are likewise unreferenced.
+- `decode_state_mcg`'s `half2` rewrite is in the dirty tree, but
+  `tasks.md` T7.6.9 already records it as a completed result. It is
+  semantically equivalent (MSL evaluates `half + half` in half precision,
+  so `float(h.x + h.y)` matches the old
+  `float(as_type<half>(a) + as_type<half>(b))`), and `repacked_golden`'s
+  `to_bits()` equality for `_colmajor` and `_colmajor_simd` covers it --
+  but the task log and HEAD disagree about what is committed.
+- The gratuitous `pub` on `finalize_simd_pipeline` /
+  `finalize_simd_sk2_pipeline` / `finalize_simd_sk4_pipeline`: no consumer
+  outside `linear.rs` exists (grep-verified), and `finalize_simd_pipeline`
+  was private at HEAD, so this is an unnecessary widening.
+
+**Concurrency hazard, recorded because it cost real time.** Partway through
+this investigation another session began editing *this same working tree*:
+`crates/kernels/src/attention.rs`, `crates/kernels/src/attention.metal` went
+from clean to dirty, and an untracked `crates/kernels/tests/argmax_device.rs`
+appeared. Compiling during its save window produced
+
+```text
+error[E0063]: missing field `decode_single_pipelines` in initializer of `AttentionKernels`
+```
+
+which is a mid-write artefact, not a real defect -- the file was consistent
+moments later. This is the concrete failure of AGENTS.md §6 in a shared
+tree: a `cargo test` result from this tree is only trustworthy if the
+compilation window was not concurrent with someone else's save. The commits
+here are therefore scoped to a single file each (`repacked_golden.rs`, then
+the two spec documents) and touch no file owned by the other session.
