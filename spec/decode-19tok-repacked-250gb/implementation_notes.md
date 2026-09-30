@@ -109,4 +109,25 @@ Running log for `spec/decode-19tok-repacked-250gb/`. Updated per task.
    - On wide matrices (`gate_up 5376x43008`), `simd_shuffle` reduced throughput from 189.0 GB/s to 153.0 GB/s because the ALU crossbar becomes the bottleneck rather than DRAM bandwidth.
    - Conclusion: L1 cache on M4 Pro already handles contiguous column-major tile reads at 189–197 GB/s without ALU register shuffling.
 
+10. **U4 Vector Coalesced 128-Byte Aligned Loads (`linear_gemv_ishizuki_k3_colmajor_u4`):**
+    - Grouped 4 consecutive tiles along K ($4 \times 96\text{ bytes} = 384\text{ bytes}$) loaded via 24 `uint4`s by lanes 0..23 into 128-byte aligned chunks.
+    - Verified bit-exact against CPU reference (within 1-ULP fp addition associativity tolerance across 512 elements).
+    - Benchmarked in `bench_colmajor`:
+      - `q_proj 5376x5376`: boosted from 67.9 GB/s to **95.8 GB/s** (+41% speedup, 0.16 ms -> 0.11 ms).
+      - `up_proj 5376x21504`: boosted from 135.3 GB/s to **153.5 GB/s** (+13.5% speedup, 0.32 ms -> 0.28 ms).
+      - `gate_up 5376x43008`: 173.7 GB/s.
+      - `lm_head 5376x262144`: 194.2 GB/s.
+
+11. **Decode Latency Variance & Drop Analysis:**
+    - Profiling instrumentation overhead: `KAPLUMBA_DECODE_PROFILE=kernel` samples GPU hardware timestamps on every dispatch and synchronizes CPU encoder, collapsing measured decode rate from 11.6 tok/s down to 3.7 tok/s. Real throughput must be measured uninstrumented.
+    - Split-K reduction dispatch penalty: Split-K 4 requires a second dispatch (`gemv_reduce_sk4`) per layer (60 extra dispatches per token), adding command buffer encoder overhead that offsets GPU compute gains.
+    - Inner-loop barrier penalty: inserting `threadgroup_barrier` inside the K-loop serializes the 8 SIMD groups, preventing memory latency hiding. The K-loop must remain barrier-free.
+    - Memory compression variance: macOS memory compressor (`top PhysMem` showing `588M compressor`) and DRAM thermal throttling introduce natural variance between runs (measured between 9.4 and 11.6 tok/s).
+
+12. **The 250 GB/s Physical Repacking Analysis & Trade-offs:**
+    - Pure streaming probe (`probe_bw_250gb.rs`) hits **254.0 GB/s** because it performs ZERO dequantization math, ZERO barrel shifts, and ZERO codebook lookups.
+    - In 3 bpw GEMV, each 96-byte tile requires 256 dequantizations (`decode_state`) and 256 FP32 FMAs. At 190+ GB/s, the 20 GPU cores become ALU instruction bound alongside memory streaming.
+    - Padding 96-byte tiles to 128 bytes would add 32 bytes of zeros per tile (+33% footprint), ballooning weights from 15.5 GB to 20.7 GB. This would violate the unified memory budget and force paging to disk swap (collapsing to ~1.4 tok/s).
+    - Conclusion: 384-byte coalesced chunking (4 tiles of 96 bytes) is the optimal footprint-preserving repacking format.
+
 

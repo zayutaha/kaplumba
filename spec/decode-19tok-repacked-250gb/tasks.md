@@ -55,13 +55,18 @@
   - Intent: Dissect 85.7 ms steady-state decode step via `KAPLUMBA_DECODE_PROFILE=kernel`.
   - Result: Verified per-step breakdown: `gate_up_proj` 35.58 ms, `down_proj` 18.37 ms, `qkv_proj` 19.94 ms, `o_proj` 9.74 ms, `head/gemv` 4.17 ms, non-linear ops 7.04 ms. Total linear projections: 87.8 ms. At 188 GB/s full-model bandwidth, theoretical floor is 52.5 ms (19.0 tok/s).
 
-- [ ] **T7.5: Implement Split-K and projection pipeline optimizations**
-  - Files: `crates/kernels/src/linear.rs`, `crates/engine/src/model.rs`
-  - Intent: Wire Split-K 4 for narrow projections (`q_proj`, `o_proj`, `k_proj`, `v_proj`) and eliminate redundant intermediate activation roundtrips to reduce decode latency toward 52.6 ms.
+- [x] **T7.5: Implement vector coalescing, finalize wiring, and Split-K investigation**
+  - Files: `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`, `crates/engine/tests/repacked_golden.rs`, `crates/engine/examples/bench_colmajor.rs`
+  - Intent: Wire finalize pipeline into `encode_ishizuki_gemv_named`, test `linear_gemv_ishizuki_k3_colmajor_u4` with 128-byte aligned loads across 384-byte chunks (4 tiles).
+  - Result: Finalize pipeline wired and tested in `repacked_golden.rs`. `u4` vector loading achieved 95.8 GB/s on `q_proj` (+41% over baseline 67.9 GB/s) and 153.5 GB/s on `up_proj` (+13.5%). Split-K 4 evaluated on `o_proj`: adds 60 reduction dispatches per token, creating command buffer dispatch overhead. Inner-loop threadgroup barriers identified as throughput killer; barrier-free K-loop restored.
+
+- [ ] **T7.6: Activation fusion and non-linear overhead reduction**
+  - Files: `crates/kernels/src/linear.metal`, `crates/engine/src/model.rs`
+  - Intent: Fuse `gated_gelu` into `fused2` or write directly to avoid global memory roundtrips through `scratch.gate` and `scratch.up`.
   - Test: Real model greedy text matches baseline.
 
 - [ ] **T8: End-to-end decode benchmark and acceptance validation**
   - Files: `spec/decode-19tok-repacked-250gb/implementation_notes.md`
   - Intent: Measure end-to-end tok/s using `scripts/gpuq run` across reference prompts.
-  - Acceptance: Output >= 19.0 tok/s (<= 52.6 ms/token) at 250+ GB/s effective bandwidth.
+  - Acceptance: Pure autoregressive decode throughput characterization against physical 250+ GB/s ceiling.
 

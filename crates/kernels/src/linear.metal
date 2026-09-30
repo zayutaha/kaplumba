@@ -8602,6 +8602,113 @@ kernel void gemv_reduce_sk4(
     }
 }
 
+kernel void linear_gemv_ishizuki_k3_colmajor_u4(
+    const device ushort *packed [[buffer(0)]],
+    const device half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant const uint *shape [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    constexpr uint KA = 3u;
+    constexpr int CB = 1;
+    constexpr uint RING = 256u * KA;
+    constexpr uint WORDS = RING / 32u;
+    const uint K = shape[0];
+    const uint N = shape[1];
+    const uint tiles_n = N / 16u;
+    const uint tiles_k = K / 16u;
+    constexpr int SG = 8;
+    threadgroup float red[SG][16];
+    threadgroup uint tg_tiles[SG][96]; // 96 words = 4 tiles per SG
+
+    const uint r0 = (lane % 4u) * 2u;
+    const uint lo0 = (lane * 8u + 1u) * 3u + RING - 16u;
+    const uint sh0 = lo0 % 32u;
+    const uint hi0 = lo0 / 32u;
+    const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
+    const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
+
+    const uint tn = tgid;
+    if (tn >= tiles_n) return;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const device uint *col_u32 = (const device uint *)packed + tn * (tiles_k * WORDS);
+    const device uint4 *col_u4 = (const device uint4 *)col_u32;
+
+    const uint k_unroll_end = (tiles_k / (SG * 4u)) * (SG * 4u);
+    uint tk = sg * 4u;
+    for (; tk < k_unroll_end; tk += SG * 4u) {
+        const uint u4_offset = tk * 6u;
+        if (lane < 24u) {
+            uint4 u = col_u4[u4_offset + lane];
+            tg_tiles[sg][lane * 4u + 0u] = u.x;
+            tg_tiles[sg][lane * 4u + 1u] = u.y;
+            tg_tiles[sg][lane * 4u + 2u] = u.z;
+            tg_tiles[sg][lane * 4u + 3u] = u.w;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        #pragma unroll
+        for (uint t = 0; t < 4u; ++t) {
+            threadgroup const uint *t0 = tg_tiles[sg] + t * 24u;
+            const ulong w0a = t0[j0], w0b = t0[j1];
+            const ulong A0 = ((w0a << 32) | w0b) << sh0;
+
+            const device half *xr0 = x + (tk + t) * 16u + r0;
+            const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
+
+            float v[8];
+            #pragma unroll
+            for (uint i = 0; i < 8u; ++i) {
+                const uint r = i * KA + 16u;
+                v[i] = decode_state(uint(A0 >> (64u - r)) & 0xffffu, CB);
+            }
+            acc0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+            acc1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // Trailing tiles
+    for (tk = k_unroll_end + sg; tk < tiles_k; tk += SG) {
+        const device uint *t0 = col_u32 + tk * WORDS;
+        const ulong a0 = t0[j0], a1 = t0[j1];
+        const ulong A0 = ((a0 << 32) | a1) << sh0;
+        const device half *xr0 = x + tk * 16u + r0;
+        const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
+        float v[8];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint rad = i * KA + 16u;
+            const uint s = uint(A0 >> (64u - rad));
+            v[i] = decode_state(s & 0xffffu, CB);
+        }
+        acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
+        acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
+    }
+
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float sum = 0.0f;
+        for (int g = 0; g < SG; ++g) {
+            sum += red[g][lid];
+        }
+        y[tn * 16u + lid] = sum;
+    }
+}
+
 kernel void linear_gemv_repacked_k3(
     const device ushort *packed [[buffer(0)]],
     const device half *x [[buffer(1)]],

@@ -93,6 +93,7 @@ fn main() {
             ("linear_gemv_ishizuki_k3_colmajor", "baseline colmajor"),
             ("linear_gemv_ishizuki_k3_colmajor_stream", "stream colmajor"),
             ("linear_gemv_ishizuki_k3_colmajor_sk4", "split-k 4 colmajor"),
+            ("linear_gemv_ishizuki_k3_colmajor_u4", "u4 vector colmajor"),
         ] {
             // Warmup
             for _ in 0..2 {

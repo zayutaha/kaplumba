@@ -1075,7 +1075,7 @@ impl LinearKernels {
                 params_bytes(&shape_values),
                 groups * 256,
                 256,
-            )
+            )?;
         } else if is_sk4 {
             let tiles = (request.out_features / 16) as u64;
             let groups = tiles * 4;
@@ -1104,7 +1104,6 @@ impl LinearKernels {
                     256.min(request.out_features as u64),
                 )?;
             }
-            Ok(())
         } else {
             self.encode_ishizuki_gemv(
                 encoder,
@@ -1115,8 +1114,20 @@ impl LinearKernels {
                 request.raw,
                 request.in_features,
                 request.out_features,
-            )
+            )?;
         }
+        let output_blocks = to_u32(request.out_features / 128, "output dimension")?;
+        encoder.dispatch_1d(
+            &self.finalize_pipeline,
+            &[
+                Some(request.raw),
+                Some(request.output_signs),
+                Some(request.output),
+            ],
+            &output_blocks.to_le_bytes(),
+            u64::from(output_blocks),
+            64,
+        )
     }
 
     /// The pipeline for a named `linear_gemv_ishizuki_*` kernel, if it exists.

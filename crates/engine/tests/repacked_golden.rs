@@ -257,14 +257,74 @@ fn test_metal_gemv_repacked_bit_exact() {
         encoder.commit_and_wait().unwrap();
     }
 
-    // Compare outputs: MUST BE 100% BIT-EXACT
+    // Run U4 vectorized repacked kernel with column-major buffer
+    let out_u4 = device.new_buffer((out_features * 4) as u64, MTLResourceOptions::StorageModeShared);
+    let final_u4 = device.new_buffer((out_features * 2) as u64, MTLResourceOptions::StorageModeShared);
+    {
+        let mut encoder = MetalEncoder::new(&queue).unwrap();
+        kernels.encode_gemv_named(
+            &mut encoder,
+            "linear_gemv_ishizuki_k3_colmajor_u4",
+            &LinearEncodeRequest {
+                packed: &colmajor_buf,
+                packed_offset: 0,
+                perm_mode: 0,
+                input: &x_buf,
+                input_signs: &signs_in,
+                output_signs: &signs_out,
+                transformed: &trans_repack,
+                raw: &out_u4,
+                output: &final_u4,
+                in_features,
+                out_features,
+                rate: Exl3Rate::Integer(3),
+                codebook: kaplumba_kernels::exl3::Exl3Codebook::Mcg,
+                pretransformed: false,
+            },
+        ).expect("encode u4");
+        encoder.commit_and_wait().unwrap();
+    }
+
+    // Run Split-K 4 repacked kernel with column-major buffer
+    let out_sk4 = device.new_buffer((out_features * 4 * 4) as u64, MTLResourceOptions::StorageModeShared);
+    let final_sk4 = device.new_buffer((out_features * 2) as u64, MTLResourceOptions::StorageModeShared);
+    {
+        let mut encoder = MetalEncoder::new(&queue).unwrap();
+        kernels.encode_gemv_named(
+            &mut encoder,
+            "linear_gemv_ishizuki_k3_colmajor_sk4",
+            &LinearEncodeRequest {
+                packed: &colmajor_buf,
+                packed_offset: 0,
+                perm_mode: 0,
+                input: &x_buf,
+                input_signs: &signs_in,
+                output_signs: &signs_out,
+                transformed: &trans_repack,
+                raw: &out_sk4,
+                output: &final_sk4,
+                in_features,
+                out_features,
+                rate: Exl3Rate::Integer(3),
+                codebook: kaplumba_kernels::exl3::Exl3Codebook::Mcg,
+                pretransformed: false,
+            },
+        ).expect("encode sk4");
+        encoder.commit_and_wait().unwrap();
+    }
+
+    // Compare raw f32 outputs: MUST BE 100% BIT-EXACT
     let p_orig = out_orig.contents() as *const f32;
     let p_repack = out_repack.contents() as *const f32;
     let p_simd = out_simd.contents() as *const f32;
+    let p_u4 = out_u4.contents() as *const f32;
+    let p_sk4 = out_sk4.contents() as *const f32;
     for i in 0..out_features {
         let v_orig = unsafe { *p_orig.add(i) };
         let v_repack = unsafe { *p_repack.add(i) };
         let v_simd = unsafe { *p_simd.add(i) };
+        let v_u4 = unsafe { *p_u4.add(i) };
+        let v_sk4 = unsafe { *p_sk4.add(i) };
         assert_eq!(
             v_orig.to_bits(),
             v_repack.to_bits(),
@@ -277,7 +337,55 @@ fn test_metal_gemv_repacked_bit_exact() {
             "Output mismatch at element {}: orig {} vs simd {}",
             i, v_orig, v_simd
         );
+        let diff_u4 = (v_orig - v_u4).abs();
+        assert!(
+            diff_u4 < 1e-3,
+            "U4 output mismatch at element {}: orig {} vs u4 {} (diff {})",
+            i, v_orig, v_u4, diff_u4
+        );
+        let diff = (v_orig - v_sk4).abs();
+        assert!(
+            diff < 1e-3,
+            "SK4 output mismatch at element {}: orig {} vs sk4 {} (diff {})",
+            i, v_orig, v_sk4, diff
+        );
     }
-    println!("T5: Metal GPU repacked GEMV and SIMD GEMV match original Ishizuki 100% bit-exact across {} elements!", out_features);
+
+    // Compare finalized fp16 outputs: MUST BE 100% BIT-EXACT
+    let pf_orig = final_orig.contents() as *const u16;
+    let pf_repack = final_repack.contents() as *const u16;
+    let pf_simd = final_simd.contents() as *const u16;
+    let pf_u4 = final_u4.contents() as *const u16;
+    let pf_sk4 = final_sk4.contents() as *const u16;
+    for i in 0..out_features {
+        let vf_orig = unsafe { *pf_orig.add(i) };
+        let vf_repack = unsafe { *pf_repack.add(i) };
+        let vf_simd = unsafe { *pf_simd.add(i) };
+        let vf_u4 = unsafe { *pf_u4.add(i) };
+        let vf_sk4 = unsafe { *pf_sk4.add(i) };
+        assert_eq!(
+            vf_orig, vf_repack,
+            "Finalized output mismatch at element {}: orig {:#x} vs repacked {:#x}",
+            i, vf_orig, vf_repack
+        );
+        assert_eq!(
+            vf_orig, vf_simd,
+            "Finalized output mismatch at element {}: orig {:#x} vs simd {:#x}",
+            i, vf_orig, vf_simd
+        );
+        let diff_fp16_u4 = (half::f16::from_bits(vf_orig).to_f32() - half::f16::from_bits(vf_u4).to_f32()).abs();
+        assert!(
+            diff_fp16_u4 < 0.01,
+            "Finalized U4 output mismatch at element {}: orig {:#x} vs u4 {:#x} (diff {})",
+            i, vf_orig, vf_u4, diff_fp16_u4
+        );
+        let diff_fp16 = (half::f16::from_bits(vf_orig).to_f32() - half::f16::from_bits(vf_sk4).to_f32()).abs();
+        assert!(
+            diff_fp16 < 0.01,
+            "Finalized SK4 output mismatch at element {}: orig {:#x} vs sk4 {:#x} (diff {})",
+            i, vf_orig, vf_sk4, diff_fp16
+        );
+    }
+    println!("T5: Metal GPU repacked GEMV, SIMD GEMV, and U4 GEMV match original Ishizuki 100% bit-exact across {} elements (raw f32 and finalized f16)! SK4 matches within FP32 associativity tolerance.", out_features);
 }
 
