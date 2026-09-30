@@ -25,6 +25,12 @@ pub const ATTENTION_SPLITS_MAX: usize = 16;
 const ATTENTION_MIN_KEYS_PER_SPLIT: usize = 64;
 
 /// Threads the decode partial kernel aims to run, before the per-split cap.
+///
+/// **Retained only as the fallback for threadgroup widths whose one-wave
+/// workgroup budget was not measured** -- see [`decode_splits`] and
+/// [`decode_one_wave_workgroups`]. It is a thread target, and a thread target
+/// is the wrong unit: what quantises is workgroups, and the two are not the
+/// same thing once `kv_heads` differs between layer shapes.
 const ATTENTION_DECODE_THREADS_TARGET: usize = 16_384;
 
 /// Key counts at or below which the decode path prefers one single-pass dispatch
@@ -136,36 +142,211 @@ pub fn decode_partial_elements(q_heads: usize, head_dim: usize) -> usize {
 
 /// How many ways to cut `key_count` keys for the decode path.
 ///
-/// Aiming at a fixed *thread* count (not a fixed workgroup count) matters
-/// because a threadgroup is `32 * (q_heads / kv_heads)` threads, so a layer with
-/// a small GQA ratio would otherwise get a quarter of the threads at the same
-/// split count. The result is always in `1 ..= ATTENTION_SPLITS_MAX`, which is
-/// what lets the scratch stay fixed-size.
-pub fn decode_splits(q_heads: usize, key_count: usize) -> usize {
+/// **MEASUREMENT KNOB / DEFAULT PENDING.** The split count used to come from a
+/// *thread* target, `ATTENTION_DECODE_THREADS_TARGET / (32 * q_heads)`, and the
+/// missing `kv_heads` argument is what made that wrong: a threadgroup is
+/// `32 * (q_heads / kv_heads)` threads, so holding the thread count at 16384
+/// lands both of Gxma's layer shapes on 16 splits while giving them workgroup
+/// counts that differ 4x -- 16 kv heads x 16 = **256** workgroups of 64 threads
+/// on the 50 sliding layers, versus 4 x 16 = **64** workgroups of 256 threads on
+/// the 10 full-attention ones. What a GPU scheduler actually packs onto a core is
+/// workgroups, not threads, so the thread target silently assumed a residency
+/// that the wide-threadgroup shape does not have.
+///
+/// The rule is therefore a *one-wave workgroup budget*,
+/// [`decode_one_wave_workgroups`], and the result is still in
+/// `1 ..= ATTENTION_SPLITS_MAX` so the scratch stays fixed-size. See
+/// `spec/decode-19tok/implementation_notes.md` ("the decode split count, from a
+/// workgroup budget rather than a thread count") for the sweep, including the
+/// measurement that the sliding shape is unchanged at 16 and why that is
+/// structural rather than luck.
+///
+/// The budget is stated for the **whole device** rather than per core because
+/// the measurement is: 54 workgroups of 256 threads is one wave on this box and
+/// 55 is two, which is `18 * 3` rather than `20 * 3` or `20 * 2.7`, and picking
+/// a core count to make the arithmetic come out would be inventing a fact.
+///
+/// **The one-wave rule is NOT the default, and the reason is bit-exactness
+/// rather than doubt about the speed.** Changing the split count changes the
+/// order in which the combine pass sums the keys, and floating-point addition is
+/// not associative, so 13 splits is a different -- equally valid, not equally
+/// identical -- answer to the same question.
+///
+/// The precedent for shipping default-off is in this repo and it cuts against
+/// the obvious argument. `spec/decode-19tok-repacked-250gb` §21.2-21.4 measured
+/// a *larger* perturbation elsewhere -- the gate/up GEMV fusion is within 1 fp16
+/// ULP on 0.78% of activations per layer, across all 60 layers -- and it changed
+/// **zero** of 128 greedy tokens. This change is smaller (1 ULP on 3-4 of 16384
+/// attention outputs, on 10 of 60 layers) and changes **43 of 128**. So "it is
+/// only 1 ULP, and we already accept 1 ULP" is not a valid argument: 1 ULP is
+/// not a unit of comparison across sites, and only the measurement settles it.
+///
+/// The rule therefore ships behind `KAPLUMBA_DECODE_SPLIT_RULE=workgroups` and
+/// the default stays the thread target. The measured consequence is in
+/// `spec/decode-19tok/implementation_notes.md`: 1.34x on the full-attention
+/// layers at 8k of context, and a different token stream.
+///
+/// `KAPLUMBA_DECODE_SPLITS` still pins the count, so the two can be compared
+/// without a rebuild.
+pub fn decode_splits(q_heads: usize, kv_heads: usize, key_count: usize) -> usize {
     if q_heads == 0 || key_count == 0 {
         return 1;
     }
     // MEASUREMENT KNOB. `KAPLUMBA_DECODE_SPLITS=N` pins the split count so the
-    // choice can be swept without a rebuild, which matters because the optimum
-    // is not the thread target: an isolated harness measured the full-attention
-    // layers (4 kv heads) at 8k running 1.91x faster at 12 splits than at 16,
-    // reproduced twice at 3 significant figures. The shipped thread target gives
-    // 16 for both layer shapes, and that is suspicious rather than established:
-    // it fixes the *thread* count at 16384 while the *workgroup* count then
-    // differs 4x between shapes (16 kv heads x 16 = 256 workgroups of 64
-    // threads, versus 4 x 16 = 64 workgroups of 256 threads), and 64 workgroups
-    // on 20 cores quantises badly. That is a hypothesis, not a measurement, so
-    // the default stays at the thread target until this is swept end to end.
-    if let Some(pinned) = std::env::var("KAPLUMBA_DECODE_SPLITS")
+    // choice can be swept without a rebuild, which is how the workgroups-per-core
+    // rule below was measured at all. It outranks the rule selector, so a sweep
+    // works under either rule.
+    let pinned = std::env::var("KAPLUMBA_DECODE_SPLITS")
         .ok()
-        .and_then(|v| v.trim().parse::<usize>().ok())
-        .filter(|v| (1..=ATTENTION_SPLITS_MAX).contains(v))
-    {
+        .as_deref()
+        .and_then(parse_pinned_splits);
+    decode_splits_with(q_heads, kv_heads, key_count, pinned, decode_split_rule())
+}
+
+/// Which arithmetic [`decode_splits`] uses. See [`decode_split_rule`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DecodeSplitRule {
+    /// The historical `ATTENTION_DECODE_THREADS_TARGET / (32 * q_heads)`. The
+    /// default, and bit-identical to what shipped before `kv_heads` was passed in.
+    ThreadTarget,
+    /// One wave of workgroups, sized by [`decode_one_wave_workgroups`].
+    WorkgroupsPerCore,
+}
+
+/// `KAPLUMBA_DECODE_SPLIT_RULE` -> the arithmetic to use. Default
+/// [`DecodeSplitRule::ThreadTarget`].
+///
+/// | value | rule |
+/// |---|---|
+/// | unset, empty, `0`, `off`, `false`, `no`, `threads`, `legacy` | thread target (default) |
+/// | `workgroups`, `waves`, `one_wave`, `1`, `on`, `true`, `yes`, `auto` | one-wave workgroup budget |
+///
+/// Parsed as a function so it is testable without touching the process
+/// environment, which Rust 2024 makes `unsafe` and which every other test in
+/// this process shares. Total by construction: an unrecognised value is the
+/// *default*, never an error, because this is read on the decode hot path where
+/// a panic would take the process down and where a typo must not silently
+/// change the numerics of the model.
+pub fn parse_split_rule(raw: &str) -> DecodeSplitRule {
+    match raw.trim() {
+        "workgroups" | "waves" | "one_wave" | "1" | "on" | "true" | "yes" | "auto" => {
+            DecodeSplitRule::WorkgroupsPerCore
+        }
+        _ => DecodeSplitRule::ThreadTarget,
+    }
+}
+
+/// The process's rule, read once. It cannot meaningfully change mid-process --
+/// the split count is baked into every decode step's numerics -- and `getenv`
+/// takes a lock in some libc builds, so this is consulted once per layer per
+/// token (60x/token) rather than 60 times a second of `getenv`.
+pub fn decode_split_rule() -> DecodeSplitRule {
+    static CACHE: std::sync::OnceLock<DecodeSplitRule> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("KAPLUMBA_DECODE_SPLIT_RULE")
+            .ok()
+            .as_deref()
+            .map_or(DecodeSplitRule::ThreadTarget, parse_split_rule)
+    })
+}
+
+/// `KAPLUMBA_DECODE_SPLITS` -> a pinned split count, or `None` for "use the
+/// heuristic".
+///
+/// Split out of [`decode_splits`] so the parsing is testable without mutating the
+/// process environment, which Rust 2024 makes `unsafe` and which other tests in
+/// this process share. Total by construction: anything unrecognised, out of
+/// range, or unparseable is `None` (the heuristic) rather than an error, because
+/// this is read on the decode hot path where a panic would take the process down
+/// and where a typo must not be able to request a grid the scratch cannot hold.
+fn parse_pinned_splits(raw: &str) -> Option<usize> {
+    raw.trim()
+        .parse::<usize>()
+        .ok()
+        .filter(|value| (1..=ATTENTION_SPLITS_MAX).contains(value))
+}
+
+/// The split-count rule with the environment already resolved. Pure, so every
+/// boundary it has is testable without a GPU and without the environment.
+fn decode_splits_with(
+    q_heads: usize,
+    kv_heads: usize,
+    key_count: usize,
+    pinned: Option<usize>,
+    rule: DecodeSplitRule,
+) -> usize {
+    if let Some(pinned) = pinned {
         return pinned;
     }
-    let wanted = ATTENTION_DECODE_THREADS_TARGET / (32 * q_heads.max(1));
+    if q_heads == 0 || key_count == 0 {
+        return 1;
+    }
+    // `kv_heads == 0` is not reachable from the encode path, which rejects it
+    // before it gets here, but the arithmetic must not divide by zero if a
+    // future caller forgets: `max(1)` keeps it finite and the result is then
+    // decided entirely by the cap, which is harmless.
+    let kv_heads = kv_heads.max(1);
     let affordable = key_count.div_ceil(ATTENTION_MIN_KEYS_PER_SPLIT);
-    wanted.clamp(1, ATTENTION_SPLITS_MAX).min(affordable).max(1)
+    // One wave: `splits * kv_heads <= budget`. Integer division rounds *down*,
+    // which is the safe direction -- the alternative is a grid that spills into
+    // a second wave, and a second wave is not a small penalty: measured, 56
+    // workgroups of 256 threads costs 1.50x the time of 52 for the identical
+    // byte count.
+    let workgroup_budget = decode_one_wave_workgroups(32 * (q_heads / kv_heads));
+    let wanted = match (rule, workgroup_budget) {
+        (DecodeSplitRule::WorkgroupsPerCore, Some(budget)) => {
+            (budget / kv_heads).clamp(1, ATTENTION_SPLITS_MAX)
+        }
+        // Either the default rule, or a width whose budget was never measured:
+        // the historical thread target, which is what ships.
+        _ => {
+            (ATTENTION_DECODE_THREADS_TARGET / (32 * q_heads.max(1))).clamp(1, ATTENTION_SPLITS_MAX)
+        }
+    };
+    wanted.min(affordable).max(1)
+}
+
+/// The largest decode grid, in workgroups, that still runs in **one wave** on
+/// this box for a threadgroup of `threads_per_group` threads. `None` for a
+/// width that was not measured, which keeps the historical thread target.
+///
+/// A scheduler reserves per-core resources for a whole threadgroup, so a core
+/// holds far fewer of a wide one, and that is the entire content of this fix.
+/// Measured by sweeping every split count 1..=16 for three shapes that all use
+/// a 256-thread threadgroup and differ only in `kv_heads`, so the grid size
+/// `splits * kv_heads` walks multiples of 4, 5 and 6 and the transition is
+/// bracketed from both sides:
+///
+/// | grid | 48 | 50 | **52** | **54** | **55** | **56** | 60 | 64 |
+/// |---|---|---|---|---|---|---|---|---|
+/// | waves | 1 | 1 | **1** | **1** | 2 | 2 | 2 | 2 |
+///
+/// 54 of 256 threads is one wave and 55 is two, so the budget is **54**. It is
+/// `18 * 3` rather than `20 * 3`; which of those it is does not change any
+/// answer here, and picking a core count to make the arithmetic tidy would be
+/// inventing a fact, so the constant is stated as the measurement.
+///
+/// The rule `budget / kv_heads` then reproduces the *measured* optimum for all
+/// three shapes it was measured on, which is the check that it is a rule and not
+/// a fit to one number: `kv_heads 4 -> 13` (measured best 13), `kv_heads 5 ->
+/// 10` (measured best 10, 50 workgroups), `kv_heads 6 -> 9` (measured best 9,
+/// 54 workgroups).
+///
+/// The 64-thread entry is the important negative result. 288 is `18 * 16`, and
+/// it is a *lower* bound: the sliding curve is still improving at the 256
+/// workgroups the [`ATTENTION_SPLITS_MAX`] cap allows, so the honest statement
+/// is "at least 288", which for 16 kv heads is 18 splits -- above the cap, so
+/// the cap decides and the shipped 16 is unchanged. **That is why 83% of the
+/// layers cannot regress from this rule: for them it provably evaluates to the
+/// number that ships today**, and `the_pinned_sweep_reproduces_the_reference_table`
+/// checks it against the reference measurement rather than against a constant
+/// typed twice.
+pub const fn decode_one_wave_workgroups(threads_per_group: usize) -> Option<usize> {
+    match threads_per_group {
+        64 => Some(288),
+        256 => Some(54),
+        _ => None,
+    }
 }
 
 #[repr(C)]
@@ -511,7 +692,7 @@ impl AttentionKernels {
                 return self.encode_decode_single_pass(encoder, request, index);
             }
         }
-        let splits = decode_splits(q_heads, key_count);
+        let splits = decode_splits(q_heads, kv_heads, key_count);
         self.encode_decode_split_with_splits(encoder, request, partials, index, splits)
     }
 
@@ -957,4 +1138,411 @@ fn read_u16_buffer(buffer: &Buffer) -> Result<Vec<u16>, KernelError> {
         return Err(KernelError::CommandFailed);
     }
     Ok(unsafe { std::slice::from_raw_parts(pointer, length / size_of::<u16>()) }.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Gxma's two layer shapes, from `config.json`: 50 sliding layers at
+    /// `32 q / 16 kv / head_dim 256 / window 1024` and 10 full-attention layers
+    /// at `32 q / 4 kv / head_dim 512`. `config.json` is the only source for
+    /// these numbers, so they are written out rather than derived.
+    const SLIDING_Q: usize = 32;
+    const SLIDING_KV: usize = 16;
+    const FULL_Q: usize = 32;
+    const FULL_KV: usize = 4;
+
+    /// The split count the **one-wave workgroup** rule picks, bypassing the
+    /// environment so a test cannot be perturbed by a `KAPLUMBA_DECODE_SPLITS` or
+    /// a `KAPLUMBA_DECODE_SPLIT_RULE` in the ambient shell.
+    fn chosen(q_heads: usize, kv_heads: usize, key_count: usize) -> usize {
+        decode_splits_with(
+            q_heads,
+            kv_heads,
+            key_count,
+            None,
+            DecodeSplitRule::WorkgroupsPerCore,
+        )
+    }
+
+    /// The split count the **default** (thread-target) rule picks. Every test
+    /// above that quotes a split count is about the workgroup rule, so the
+    /// default has to be pinned separately -- see
+    /// `the_default_is_the_thread_target_and_the_one_wave_rule_is_opt_in`.
+    fn default_chosen(q_heads: usize, kv_heads: usize, key_count: usize) -> usize {
+        decode_splits_with(
+            q_heads,
+            kv_heads,
+            key_count,
+            None,
+            DecodeSplitRule::ThreadTarget,
+        )
+    }
+
+    /// The rule that shipped before the workgroups-per-core refactor, kept
+    /// here so "unchanged for the sliding shape" is a check against the old
+    /// arithmetic and not against a number someone typed twice.
+    fn legacy_thread_target(q_heads: usize, key_count: usize) -> usize {
+        let wanted = ATTENTION_DECODE_THREADS_TARGET / (32 * q_heads.max(1));
+        let affordable = key_count.div_ceil(ATTENTION_MIN_KEYS_PER_SPLIT);
+        wanted.clamp(1, ATTENTION_SPLITS_MAX).min(affordable).max(1)
+    }
+
+    /// **The default must not move.** The one-wave rule is 1.34x faster on the
+    /// full-attention layers and it is *not* the default, because it changes the
+    /// token stream: the combine pass sums the per-split partials in a different
+    /// order and floating-point addition is not associative. So the shipped
+    /// default has to evaluate to the old arithmetic for every shape, and this
+    /// is where that is asserted rather than intended.
+    ///
+    /// The reference is `legacy_thread_target`, i.e. the pre-change code's
+    /// expression, not a transcribed table.
+    #[test]
+    fn the_default_is_the_thread_target_and_the_one_wave_rule_is_opt_in() {
+        for (q, kv) in [
+            (SLIDING_Q, SLIDING_KV),
+            (FULL_Q, FULL_KV),
+            (40, 5),
+            (48, 6),
+            (32, 32),
+        ] {
+            for key_count in [1usize, 64, 65, 512, 1024, 2048, 4096, 8192] {
+                assert_eq!(
+                    default_chosen(q, kv, key_count),
+                    legacy_thread_target(q, key_count),
+                    "{q}q/{kv}kv @{key_count}: the DEFAULT rule changed, which changes \
+                     the model's output and was not authorised",
+                );
+            }
+        }
+        // And the two rules genuinely differ where they are meant to, so this
+        // test cannot pass by both being the same number.
+        assert_eq!(default_chosen(FULL_Q, FULL_KV, 8192), 16);
+        assert_eq!(chosen(FULL_Q, FULL_KV, 8192), 13);
+    }
+
+    /// `KAPLUMBA_DECODE_SPLIT_RULE` parsing. Total by construction, and an
+    /// unrecognised value is the *default* rather than an error: this is read on
+    /// the decode hot path, where a panic takes the process down and where a
+    /// typo must not silently change the numerics.
+    #[test]
+    fn the_split_rule_selector_is_parsed_defensively() {
+        // Case-sensitive, like `parse_single_pass_limit` beside it: an
+        // environment variable's spelling is part of its interface, and a
+        // case-insensitive match would be one more thing to keep in sync.
+        for on in [
+            "workgroups",
+            "waves",
+            "one_wave",
+            "1",
+            "on",
+            "true",
+            "yes",
+            "auto",
+            " workgroups ",
+        ] {
+            assert_eq!(
+                parse_split_rule(on),
+                DecodeSplitRule::WorkgroupsPerCore,
+                "{on:?} should select the one-wave rule",
+            );
+        }
+        for off in [
+            "",
+            "0",
+            "off",
+            "false",
+            "no",
+            "threads",
+            "legacy",
+            "abc",
+            "2",
+            "0x1",
+            "workgroup",
+            "-1",
+            "1.5",
+            "WORKGROUPS",
+            "Workgroups",
+        ] {
+            assert_eq!(
+                parse_split_rule(off),
+                DecodeSplitRule::ThreadTarget,
+                "{off:?} must fall back to the shipped default",
+            );
+        }
+    }
+
+    /// **The non-regression proof for 83% of the layers.** The sliding shape's
+    /// one-wave budget is 288 workgroups, which for 16 kv heads is 18 splits --
+    /// above the cap, so the cap decides and the old and new arithmetic must
+    /// agree at every key count, not merely at the ones that were measured.
+    #[test]
+    fn sliding_layers_are_bit_identical_in_dispatch_to_the_legacy_rule() {
+        for key_count in [
+            1usize, 63, 64, 65, 127, 128, 129, 255, 256, 511, 512, 1023, 1024, 2048, 4096, 8192,
+            65536,
+        ] {
+            assert_eq!(
+                chosen(SLIDING_Q, SLIDING_KV, key_count),
+                legacy_thread_target(SLIDING_Q, key_count),
+                "sliding @{key_count} keys: the rule changed the split count, and \
+                 50 of 60 layers depend on it not doing so",
+            );
+        }
+    }
+
+    /// The sliding layers' split count at the key counts a report quotes, plus
+    /// the workgroup count those splits produce. At a full 1024-key window,
+    /// 16 splits x 16 kv heads = 256 workgroups of 64 threads, which is inside
+    /// the 288-workgroup one-wave budget. At 512 keys the *keys-per-split
+    /// floor* decides (512/64 = 8), not the wave budget, so only 128
+    /// workgroups are dispatched.
+    #[test]
+    fn sliding_layers_dispatch_one_wave_at_every_context_length() {
+        for (key_count, splits) in [(512usize, 8usize), (1024, 16)] {
+            assert_eq!(
+                chosen(SLIDING_Q, SLIDING_KV, key_count),
+                splits,
+                "sliding @{key_count}"
+            );
+            let workgroups = splits * SLIDING_KV;
+            assert!(
+                workgroups <= decode_one_wave_workgroups(64).expect("64-thread budget"),
+                "sliding @{key_count}: {workgroups} workgroups exceeds one wave",
+            );
+        }
+    }
+
+    /// The full-attention layers: `kv_heads 4`, so 16 splits is 64 workgroups of
+    /// 256 threads where only 54 fit in one wave -- a second wave for 10 of
+    /// them, which measured 1.17-1.34x *slower* than 13 splits for the identical
+    /// byte count. The budget puts the grid at 52.
+    #[test]
+    fn full_layers_fit_one_wave_where_sixteen_splits_did_not() {
+        let budget = decode_one_wave_workgroups(256).expect("256-thread budget");
+        assert_eq!(budget, 54, "the one-wave budget moved; re-run the sweep");
+        for key_count in [1024usize, 2048, 4096, 8192] {
+            let splits = chosen(FULL_Q, FULL_KV, key_count);
+            let workgroups = splits * FULL_KV;
+            assert!(
+                workgroups <= budget,
+                "full @{key_count}: {workgroups} workgroups is more than one wave",
+            );
+            assert_ne!(
+                splits, 16,
+                "full @{key_count}: 16 splits is the whole point of the change",
+            );
+            assert!(
+                workgroups + FULL_KV > budget,
+                "full @{key_count}: {splits} splits leaves the wave underfull; \
+                 the budget rounds down and this says it rounded down too far",
+            );
+        }
+    }
+
+    /// **The rule is a rule, not a fit to one number.** Three shapes with the
+    /// same 256-thread threadgroup and different `kv_heads` were swept
+    /// independently, and `budget / kv_heads` has to land on each one's measured
+    /// optimum without being told what it was:
+    ///
+    /// | shape | `kv_heads` | measured best | grid | rule says |
+    /// |---|---|---|---|---|
+    /// | 32q/4kv/d512 | 4 | 13 splits | 52 | `54 / 4 = 13` |
+    /// | 40q/5kv/d512 | 5 | 10 splits | 50 | `54 / 5 = 10` |
+    /// | 48q/6kv/d512 | 6 | 9 splits | 54 | `54 / 6 = 9` |
+    ///
+    /// A budget tuned to make the first row work (say 60, from `20 cores x 3`)
+    /// would say 15, 12 and 10 for these, and 15 and 12 are both *measured worse
+    /// than the 16 that ships today*. This is the test that would have caught
+    /// that.
+    #[test]
+    fn the_budget_reproduces_the_measured_optimum_of_every_shape_it_was_measured_on() {
+        for (q_heads, kv_heads, measured_best_splits) in
+            [(32usize, 4usize, 13usize), (40, 5, 10), (48, 6, 9)]
+        {
+            assert_eq!(
+                32 * (q_heads / kv_heads),
+                256,
+                "{q_heads}q/{kv_heads}kv is not a 256-thread shape",
+            );
+            assert_eq!(
+                chosen(q_heads, kv_heads, 4096),
+                measured_best_splits,
+                "{q_heads}q/{kv_heads}kv: the rule does not reproduce the measured \
+                 optimum, so it is a fit to the 4-kv-head number and nothing else",
+            );
+        }
+    }
+
+    /// The full-attention layers at short context are still bounded by the
+    /// keys-per-split floor, not by the wave budget: at 512 keys the shape can
+    /// only afford 8 splits however many cores there are.
+    #[test]
+    fn the_keys_per_split_floor_still_bounds_short_context() {
+        for key_count in [1usize, 63, 64, 65, 128, 256, 511, 512] {
+            let affordable = key_count.div_ceil(ATTENTION_MIN_KEYS_PER_SPLIT);
+            let splits = chosen(FULL_Q, FULL_KV, key_count);
+            assert!(
+                splits <= affordable.max(1),
+                "full @{key_count}: {splits} splits exceeds the {affordable} the \
+                 key count can afford",
+            );
+        }
+        assert_eq!(chosen(FULL_Q, FULL_KV, 512), 8);
+    }
+
+    /// The full table the report quotes: split count, workgroups, workgroups
+    /// per core, for both shapes at every key count. If a constant here moves,
+    /// this fails and the note has to be re-measured rather than re-typed.
+    #[test]
+    fn the_reported_split_table() {
+        let expected = [
+            // (shape, keys, splits, workgroups)
+            ("sliding", 512, 8, 128),
+            ("sliding", 1024, 16, 256),
+            ("full", 512, 8, 32),
+            ("full", 1024, 13, 52),
+            ("full", 2048, 13, 52),
+            ("full", 4096, 13, 52),
+            ("full", 8192, 13, 52),
+        ];
+        for (name, key_count, splits, workgroups) in expected {
+            let (q, kv) = if name == "sliding" {
+                (SLIDING_Q, SLIDING_KV)
+            } else {
+                (FULL_Q, FULL_KV)
+            };
+            assert_eq!(
+                chosen(q, kv, key_count),
+                splits,
+                "{name} @{key_count}: split count moved",
+            );
+            assert_eq!(splits * kv, workgroups, "{name} @{key_count}: workgroups");
+        }
+    }
+
+    /// Everything this returns has to fit the fixed-size partials buffer, for
+    /// *any* shape a future config could present -- not just Gxma's two.
+    #[test]
+    fn the_result_is_always_inside_the_fixed_scratch() {
+        for q_heads in [1usize, 2, 4, 8, 16, 32, 40, 64, 128] {
+            for kv_heads in [1usize, 2, 4, 8, 16, 32] {
+                if q_heads % kv_heads != 0 {
+                    continue;
+                }
+                for key_count in [0usize, 1, 63, 64, 65, 512, 1024, 8192, 1 << 20] {
+                    let splits = chosen(q_heads, kv_heads, key_count);
+                    assert!(
+                        (1..=ATTENTION_SPLITS_MAX).contains(&splits),
+                        "{q_heads}q/{kv_heads}kv @{key_count}: {splits} splits is \
+                         outside 1..={ATTENTION_SPLITS_MAX}",
+                    );
+                    // The buffer `decode_partial_elements` sizes, and the guard
+                    // in `encode_decode_split_with_splits` enforces.
+                    let floats = splits * q_heads * (256 + 2);
+                    assert!(
+                        floats <= decode_partial_elements(q_heads, 256),
+                        "{q_heads}q/{kv_heads}kv @{key_count}: {floats} floats \
+                         exceed the scratch",
+                    );
+                }
+            }
+        }
+    }
+
+    /// Degenerate inputs must not panic or divide by zero. `kv_heads == 0` is
+    /// unreachable from the encode path (it rejects the request first) but the
+    /// arithmetic is on the hot path and a panic there is a process death. With
+    /// `kv_heads == 0` the result is whatever the legacy thread target says --
+    /// finite, in range, and irrelevant because such a request never gets this
+    /// far.
+    #[test]
+    fn degenerate_head_counts_do_not_panic() {
+        assert_eq!(chosen(0, 0, 8192), 1);
+        assert_eq!(chosen(0, 4, 8192), 1);
+        assert_eq!(chosen(32, 4, 0), 1);
+        assert_eq!(chosen(32, 0, 8192), 16);
+        assert!((1..=ATTENTION_SPLITS_MAX).contains(&chosen(32, 0, 8192)));
+    }
+
+    /// A threadgroup width with no measured budget keeps the old arithmetic
+    /// rather than guessing one, **even with the one-wave rule selected**.
+    /// `kv_heads == q_heads` gives a 32-thread threadgroup, which is not in the
+    /// table. Note that 64q/8kv is *also* a 256-thread threadgroup and therefore
+    /// measured, which is why it is absent.
+    #[test]
+    fn an_unmeasured_threadgroup_width_keeps_the_legacy_thread_target() {
+        assert_eq!(decode_one_wave_workgroups(32), None);
+        assert_eq!(decode_one_wave_workgroups(128), None);
+        assert_eq!(decode_one_wave_workgroups(512), None);
+        for (q, kv) in [(32usize, 32usize), (8, 1), (4, 1), (16, 2), (64, 64)] {
+            for key_count in [64usize, 512, 1024, 8192] {
+                assert_eq!(
+                    chosen(q, kv, key_count),
+                    legacy_thread_target(q, key_count),
+                    "{q}q/{kv}kv @{key_count}: unmeasured shape changed under the \
+                     one-wave rule",
+                );
+            }
+        }
+    }
+
+    /// The pinned sweep, which is how the constants were measured. Parsing is
+    /// tested as a function rather than through the environment, which Rust 2024
+    /// makes `unsafe` and which every other test in this process shares.
+    #[test]
+    fn the_pinned_split_value_is_parsed_defensively() {
+        // `+4` and `4\n` are accepted because `usize::from_str` accepts a
+        // leading `+` and the value is trimmed. Both are in range, so pinning
+        // them is harmless; what must never happen is a value that silently
+        // becomes the *heuristic*'s number by accident, which the range check
+        // rules out.
+        for good in ["1", "16", " 8 ", "4\n", "+4"] {
+            assert_eq!(
+                parse_pinned_splits(good),
+                good.trim().parse::<usize>().ok(),
+                "{good:?}",
+            );
+        }
+        for bad in [
+            "",
+            "0",
+            "17",
+            "-1",
+            "abc",
+            "1.5",
+            "99999999999999999999",
+            "0x4",
+            "4 4",
+        ] {
+            assert_eq!(parse_pinned_splits(bad), None, "{bad:?} must not pin");
+        }
+        // And a pinned value wins over the heuristic, in both directions, so
+        // the sweep can compare 16 (worse) as well as the new value.
+        assert_eq!(
+            decode_splits_with(
+                FULL_Q,
+                FULL_KV,
+                8192,
+                Some(16),
+                DecodeSplitRule::ThreadTarget
+            ),
+            16
+        );
+        assert_eq!(
+            decode_splits_with(
+                FULL_Q,
+                FULL_KV,
+                8192,
+                Some(4),
+                DecodeSplitRule::ThreadTarget
+            ),
+            4
+        );
+        assert_eq!(
+            decode_splits_with(FULL_Q, FULL_KV, 64, Some(16), DecodeSplitRule::ThreadTarget),
+            16
+        );
+    }
 }

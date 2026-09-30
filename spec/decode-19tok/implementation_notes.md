@@ -227,3 +227,287 @@ step is unknown, but the ratio is the reliable signal, not the raw number.
   rejected *before* loading and looks like a silent failure.
 - `scripts/gpuq holder()` used to name dead pids as the GPU holder (`waiters()`
   pruned, `holder()` did not) — fixed in `ee14f62`.
+
+
+## 2026-10-01: the decode split count, from a workgroup budget rather than a thread count
+
+Branch `impl/attn-splits`. Answers this spec's open question "does the split
+count matter?" and the split-count paragraph in `plan.md` §R2.
+
+### 1. The diagnosis, and it is not the one the note assumed
+
+`crates/kernels/src/attention.rs` derived the split count from a **thread**
+target and was never handed `kv_heads`:
+
+```rust
+let wanted = ATTENTION_DECODE_THREADS_TARGET / (32 * q_heads.max(1)); // 16384 / 1024 = 16
+```
+
+A decode workgroup is `32 * (q_heads / kv_heads)` threads and the grid is
+`splits * kv_heads` workgroups. So holding *threads* at 16384 lands both of
+Gxma's shapes on 16 splits while giving them grids that differ 4x:
+
+| layer | shape | workgroup | grid at 16 splits | per core (20 cores) |
+|---|---|---|---|---|
+| 50 sliding | 32 q / 16 kv / d256 | 64 threads | **256** workgroups | 12.8 |
+| 10 full | 32 q / 4 kv / d512 | 256 threads | **64** workgroups | 3.2 |
+
+A scheduler packs *workgroups* onto a core, and a 256-thread workgroup occupies
+about 4x the per-core resources of a 64-thread one, so the thread target was
+implicitly assuming a residency the wide shape does not have. That is the whole
+mechanism; nothing about the number of keys or the partials is involved.
+
+### 2. What the one-wave budget is, measured
+
+Swept every split count 1..=16 for three shapes that all use a **256-thread**
+threadgroup and differ only in `kv_heads`, so `splits * kv_heads` walks multiples
+of 4, 5 and 6 and the one-wave/two-wave transition is bracketed from both sides.
+The 4/5/6 shapes at 4096 keys, us per split+combine pair, 9 interleaved rounds:
+
+| grid (workgroups) | 40 | 45 | 48 | 50 | **52** | **54** | **55** | **56** | 60 | 64 | 65 | 72 | 80 | 96 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| `40q/5kv` best | 40 | | | **50** | | | 55 | | 60 | | 65 | | **80** | |
+| `48q/6kv` best | | | 48 | | | **54** | | | 60 | | | 72 | | 96 |
+| waves | 1 | 1 | 1 | 1 | **1** | **1** | 2 | 2 | 2 | 2 | 2 | 2 | 2 | 2 |
+
+**54 workgroups of 256 threads is one wave and 55 is two.** So the budget is 54,
+which is `18 * 3` rather than `20 * 3`; the constant is stated as the
+measurement because which of those it is changes no answer, and picking a core
+count to make the arithmetic tidy would be inventing a fact.
+
+The rule `budget / kv_heads` then reproduces the *measured* optimum of all three
+shapes without being told what it was — `4 -> 13`, `5 -> 10`, `6 -> 9` — which
+is the evidence that it is a rule and not a fit to the 4-kv-head number. A
+budget chosen to be tidy instead (60, from "20 cores x 3") would say 15, 12 and
+10, and 15 and 12 are both **measured worse than the 16 that ships today**
+(1.34x and 1.17x slower respectively at 4096 keys). `attention.rs`'s
+`the_budget_reproduces_the_measured_optimum_of_every_shape_it_was_measured_on`
+is that check.
+
+The 64-thread width's budget is 288, and that is a **lower bound**: the sliding
+curve is still improving at the 256 workgroups the `ATTENTION_SPLITS_MAX` cap
+allows. 288/16 = 18 splits, above the cap, so the cap decides and **the shipped
+16 is unchanged for 50 of 60 layers**. That is structural, not luck, and it is
+asserted against the old formula rather than a transcribed number
+(`sliding_layers_are_bit_identical_in_dispatch_to_the_legacy_rule`, which
+compares against the pre-change expression itself).
+
+### 3. The result: split count and bandwidth, before and after
+
+9 interleaved rounds, GPU clock, one command buffer per arm, medians. **Taken
+while another agent had a model resident on the box**, so absolute GB/s is
+understated and the *ratios* are the trustworthy part; the within-round ratio
+column is the estimator that survives contention (both arms of a ratio are
+measured inside the same round, ~0.5 s apart).
+
+| shape | keys | before splits / wgroups | waves | us | GB/s | after splits / wgroups | waves | us | GB/s | speedup |
+|---|---|---|---|---|---|---|---|---|---|---|
+| sliding 32q/16kv/d256 | 512 | 16 / 256 | 1 | 57.8 | 145.1 | 16 / 256 | 1 | 57.8 | 145.1 | **1.00x, unchanged** |
+| sliding 32q/16kv/d256 | 1024 | 16 / 256 | 1 | 127.3 | 131.8 | 16 / 256 | 1 | 127.3 | 131.8 | **1.00x, unchanged** |
+| full 32q/4kv/d512 | 512 | 16 / 64 | 2 | 85.0 | 49.3 | 8 / 32 | 1 | 76.5 | 54.8 | 1.11x |
+| full 32q/4kv/d512 | 1024 | 16 / 64 | 2 | 134.0 | 62.6 | 13 / 52 | 1 | 120.8 | 69.5 | 1.11x |
+| full 32q/4kv/d512 | 2048 | 16 / 64 | 2 | 226.3 | 74.1 | 13 / 52 | 1 | 180.4 | 93.0 | 1.25x |
+| full 32q/4kv/d512 | 4096 | 16 / 64 | 2 | 428.7 | 78.3 | 13 / 52 | 1 | 303.9 | 110.4 | 1.41x |
+| full 32q/4kv/d512 | 8192 | 16 / 64 | 2 | 835.2 | 80.3 | 13 / 52 | 1 | 622.5 | 107.8 | **1.34x** |
+
+At 512 keys the *keys-per-split* floor decides, not the wave budget
+(`ceil(512/64) = 8`), so the full shape is 8 splits there however many cores
+there are.
+
+Paired within-round ratios against 12 splits, which is how 12 and 13 were
+separated (they are ~6% apart, measured through 20-140% per-arm spread):
+
+| shape | keys | 13 | 15 | 16 |
+|---|---|---|---|---|
+| sliding | 512 | 1.008 | 0.906 | 0.780 |
+| sliding | 1024 | 0.989 | 1.003 | 0.896 |
+| full | 512 | 0.971 | 1.337 | 1.139 |
+| full | 1024 | 0.926 | 1.235 | 1.085 |
+| full | 2048 | 0.904 | 1.343 | 1.236 |
+| full | 4096 | 0.917 | 1.338 | 1.244 |
+| full | 8192 | 0.936 | 1.336 | 1.168 |
+
+Read that as: **13 beats 12 by 6-7% on every full-shape key count**, and both beat
+16 by 17-27%. The sliding rows are the control — 16 is 11-22% *faster* than 12 or
+13 there, so the rule must not touch them, and it does not.
+
+**Per token**, 10 full-attention layers: at 8192 keys, 212.7 us/layer x 10 =
+**2.13 ms/token**; at 1024 keys, 13.2 us x 10 = **0.13 ms/token**. Both are lower
+bounds for the reason in the caveat above, and lower than the 2.8 / 0.39 ms the
+task brief predicted from the reference harness. Under a contended memory system
+a 1.34x ratio compresses, so the honest reading is "at least 1.34x on those 10
+layers at 8k, and worth re-measuring on a quiet box".
+
+### 4. Partials are not the cause, as claimed
+
+At 8192 keys, 16 splits move 2.0078 MiB of partials (written by the split pass,
+read by the combine) against 64.0 MiB of KV — 3.14%. 13 splits move 1.631 KiB less
+than 16 does, about **0.9 us at 235 GB/s**, against a 212.7 us difference. So
+99.6% of the win is parallelism and 0.4% is partial traffic, which is the
+"97% parallelism" claim confirmed rather than assumed.
+
+### 5. BIT-EXACTNESS: it fails, and the change is default-off because of it
+
+`KAPLUMBA_DECODE_SPLIT_RULE=workgroups` selects the new rule. **The default is
+unchanged** and stays the thread target.
+
+**The control first**, as required — the golden hash reproduces under unchanged
+behaviour, so the harness is sound and the refactor did not perturb the default:
+
+```bash
+BIN=$CARGO_TARGET_DIR/release/kaplumba
+M=~/.kaplumba/models/Gxma-repacked          # NOT the Gxma/Gxma default
+PP="Explain the theory of relativity in simple terms, and then explain why it matters."
+scripts/gpuq try -- "$BIN" --model "$M" --prompt "$PP" \
+    --max-new-tokens 128 --temperature 0 --show-ids > out.txt
+shasum -a 256 out.txt
+# 2fff2c970b611f64c4a485d8a3a3dc719a0f03293a3f48c167f4dff5466795b2   MATCH
+```
+
+**And the one-wave arm reproduces the same hash too** — which is a result worth
+having, because it shows the recorded gate is *blind* to this change:
+
+```text
+arm A (default)        2fff2c97...6795b2
+arm B (workgroups rule) 2fff2c97...6795b2     identical
+```
+
+The reason is structural, not luck: 128 generated tokens over a 28-token prompt is
+~156 keys, and at 156 keys the *keys-per-split floor* caps the full shape at
+`ceil(156/64) = 3` splits in both arms. The wave budget wants 13, the floor says
+3, and `min` gives 3 either way. **A 128-token gate cannot see a change that only
+bites above 13 x 64 = 832 keys.** Anyone using that hash as evidence of
+bit-exactness for this change would be wrong, and would be wrong *silently*.
+
+So the gate was re-run where the rule actually bites — the same 34 000-character
+prompt (`"Explain the theory of relativity. "` x 1000, ~6010 tokens) and the same
+128 greedy tokens, `--show-ids`:
+
+| | arm A (default, 16 splits) | arm B (workgroups, 13 splits) |
+|---|---|---|
+| sha256 | `94713d903a338fc89357a3b698bd42ac65a89f448cb93dd803409963ad4a543a` | `3c65eb18bce3746a56b35b3fc6a6b7d496f634a454b044ee4b578c5d5a5c0597` |
+| tokens | 128 | 128 |
+| differing positions | — | **43 of 128** |
+| first divergence | — | **token 86** (1-based), i.e. after 85 identical tokens |
+
+**The size of the numerical change**, measured on the kernel rather than inferred
+(`attention_single_pass_bit_exact.rs::the_one_wave_split_rule_costs_one_fp16_ulp_and_is_not_bit_exact`):
+
+| full 32q/4kv/d512 | differing fp16 elements (of 16384) | max ULP |
+|---|---|---|
+| @1024 | 3 | 1 |
+| @2048 | 4 | 1 |
+| @4096 | 4 | 1 |
+| @8192 | 3 | 1 |
+
+**1 fp16 ULP on 3-4 elements out of 16384 is the fp16 rounding floor.** It is
+0.02% of the output, four orders of magnitude below the 2.16e-3 the project
+already accepts from prefill's fp16 operand rounding — and it still flips a third
+of the sampled tokens, because greedy decode is a discontinuous function of the
+logits. That gap between "numerically negligible" and "changes the answer" is the
+entire argument for the numerically-frozen classification, and it is why this
+lands default-off with the decision left to the owner.
+
+Two things that are worth stating because they are easy to get wrong:
+
+  * **1 ULP is not a guard.** Verified by sabotage: comparing **1** split against
+    16 also stays within 1 ULP (1-18 elements differ, depending on key count).
+    So "the deviation is at most 1 ULP" is true of *every* split count and
+    discriminates nothing. The test therefore asserts the **exact** element
+    counts, which do discriminate: comparing 16 against 16 fails (0 vs 3), and
+    comparing 14 against 16 fails (1 vs 4).
+  * **The deviation is not monotone in the split-count difference.** 13-vs-16
+    moves 3-4 elements; 1-vs-16 moves 1-18. The fp16 store absorbs the
+    reordering almost entirely, which is the same finding as
+    `split_above_one_is_not_bit_exact_but_fp16_absorbs_most_of_it`.
+
+### 6. Sabotage evidence (AGENTS.md §3.4) — every one reverted, suite green after
+
+| what was broken | observed failure |
+|---|---|
+| `256 => Some(54)` -> `60` (the tidy "20 cores x 3") | 3 tests fail: `the_budget_reproduces_...: left 15, right 13`; `the_reported_split_table: full @1024 split count moved, left 15 right 13`; `full_layers_fit_one_wave: left 60` (budget) |
+| `256 => Some(54)` -> `36` | same 3 tests fail (`left 9, right 13`) |
+| `64 => Some(288)` -> `128` (**the sliding regression**) | 3 tests fail, and the message names the requirement: `sliding @1023 keys: the rule changed the split count, and 50 of 60 layers depend on it not doing so`, `left 8, right 16` |
+| the original bug, reintroduced: threadgroup width from `kv_heads` instead of `q_heads / kv_heads` | 3 tests fail, `left 16, right 13` |
+| keys-per-split floor dropped | 5 tests fail, incl. `full @1: 15 splits exceeds the 1 the key count can afford` |
+| GPU test: compare 16 against 16 | fails with `0 of 16384 fp16 elements differ, measured 3` |
+| GPU test: compare 14 against 16 | fails with `1 of 16384 fp16 elements differ, measured 4` |
+| GPU test: compare 1 against 16 (attempted) | **PASSED — recorded as a non-guard**, see §5 |
+
+The fourth row matters most: the suite fails loudly on the *sliding* regression
+that the brief forbids, not on a proxy for it.
+
+### 7. Three harness defects, all of which produced a plausible wrong number
+
+The sweep was rebuilt from scratch three times. Every one of these produced
+numbers that looked like measurements:
+
+1. **A `MetalEncoder` per arm.** `commit_stamped_and_wait` re-arms a fresh
+   command buffer, and dropping the encoder releases that buffer *uncommitted*.
+   64 warm-up arms took **15 minutes** and the sweep never reached round 0 — the
+   queue blocking in `new_command_buffer`, which is the exact trap
+   `MetalEncoder::finish`'s doc comment describes. One encoder for the whole run.
+2. **Rolling left on (the default is 50 dispatches).** `GPUStartTime`/
+   `GPUEndTime` describe *one command buffer*, and the dispatch counter is
+   cumulative across arms, so from the second arm onwards a 48-dispatch
+   measurement straddles a roll and the stamp describes a fraction of the work.
+   Measured directly: the same arm read **0.000 ms** at 100+ iterations and
+   **721 us against a true 170 us** at 1-10; the sliding shape came out at
+   **0.2 us per pair**, i.e. 42 TB/s for an 8.4 MiB read. Every number before
+   `set_max_dispatches(1_000_000)` was noise. This is worth knowing about
+   *any* GPU-clock measurement in this repo that batches dispatches.
+3. **`(0..ATTENTION_SPLITS_MAX)` instead of `(1..=ATTENTION_SPLITS_MAX)`** in the
+   rotating order: the arm at `splits == 0` does not exist, the run died at round
+   0 with a bare `.expect("arm")`, and 2.5 minutes were spent wondering why.
+
+The harness itself (`crates/engine/examples/attn_splits_sweep.rs`, plus an
+`attn_clock_diag.rs` used for defect 2 and an `attn_splits_ulp.rs` used for §5)
+was **deleted rather than committed**, per AGENTS.md §10.6. The method is
+reproducible from this note: build the two real shapes plus the 5- and
+6-kv-head probes, sweep `splits` 1..=16, one command buffer per arm with rolling
+disabled, warm every arm once first, rotate the order by round, and compare
+within-round ratios.
+
+### 8. The comparison this repo has already made, which cuts against the obvious argument
+
+The argument "it is only 1 fp16 ULP, and this project already accepts 1 ULP" is
+**false as stated**, and the repo contains the counter-example already.
+`spec/decode-19tok-repacked-250gb` §21.2-21.4 measured a *larger* perturbation at
+a different site:
+
+| site | perturbation | layers | tokens changed (128 greedy) |
+|---|---|---|---|
+| gate/up GEMV fusion (§21.2) | 1 ULP on **0.78%** of activations (168 of 21504) per layer | **all 60** | **0** — byte-identical output |
+| decode attention split count (here) | 1 ULP on **0.02%** of attention outputs (3-4 of 16384) per layer | **10** | **43**, first at token 86 |
+
+The smaller perturbation did much more damage. **1 ULP is therefore not a unit of
+comparison across sites**, and "we already accept 1 ULP" cannot authorise this
+change without a measurement. A mechanism is plausible — the gate/up
+perturbation is a rounding difference in a value that then meets a residual add,
+while an attention-output perturbation is multiplied by attention probabilities
+and re-read by every later layer's projections — but that is a hypothesis and
+nothing here tests it. The table is what is measured.
+
+### 9. Not fixed here
+
+- `pipeline_audit::tests::every_pipeline_construction_goes_through_the_audit`
+  fails on this branch at `linear.rs:399` and **fails identically on the clean
+  tree** (verified by stashing this change and re-running). Not ours; not fixed.
+- The end-to-end decode-step number (ms/token for a real 60-layer forward) was
+  **not** measured. Everything here is the isolated kernel, on a box with another
+  agent resident, and the brief's own numbers (2.8 ms/token at 8k) come from a
+  harness that is not in the tree. A quiet-box `--metrics` A/B of
+  `KAPLUMBA_DECODE_SPLIT_RULE` is the missing acceptance measurement, and the
+  128-token golden hash is **not** a substitute: §5 shows it is structurally
+  blind to this change.
+
+### 10. The decision this leaves to the owner
+
+`KAPLUMBA_DECODE_SPLIT_RULE=workgroups` is in the tree, measured, tested,
+default-off. Flipping the default is a one-line change to
+`decode_split_rule()` and buys 1.34x on 10 of 60 layers at 8k of context, at the
+cost of a token stream that is valid, differently-worded, and not identical.
+`spec.md`'s "no quality loss" and the §8 precedent both point at leaving it off
+until someone decides on the record that a 1-ULP-on-3-elements change to ten
+layers' attention output is acceptable. That is a judgement about the model
+rather than about the kernel, which is why it is not made here.

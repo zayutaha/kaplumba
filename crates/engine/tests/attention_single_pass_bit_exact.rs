@@ -43,8 +43,8 @@
 
 use half::f16;
 use kaplumba_kernels::attention::{
-    decode_gqa_index, decode_partial_elements, AttentionEncodeRequest, AttentionKernels,
-    ATTENTION_SPLITS_MAX,
+    ATTENTION_SPLITS_MAX, AttentionEncodeRequest, AttentionKernels, decode_gqa_index,
+    decode_partial_elements,
 };
 use kaplumba_kernels::encoder::MetalEncoder;
 use metal::{Buffer, CommandQueue, Device, MTLResourceOptions};
@@ -119,8 +119,8 @@ struct Case {
 impl Fixture {
     fn new() -> Option<Self> {
         let device = Device::system_default()?;
-        let kernels = AttentionKernels::new()
-            .unwrap_or_else(|e| panic!("AttentionKernels::new failed: {e}"));
+        let kernels =
+            AttentionKernels::new().unwrap_or_else(|e| panic!("AttentionKernels::new failed: {e}"));
         let queue = device.new_command_queue().to_owned();
         Some(Self {
             device,
@@ -158,12 +158,14 @@ impl Fixture {
             values: self.u16(&row(kv, 29.0)),
             query_positions: self.u32(&[query_position]),
             key_positions: self.u32(&key_positions),
-            output_a: self
-                .device
-                .new_buffer((shape.q_heads * shape.head_dim * 2) as u64, MTLResourceOptions::StorageModeShared),
-            output_b: self
-                .device
-                .new_buffer((shape.q_heads * shape.head_dim * 2) as u64, MTLResourceOptions::StorageModeShared),
+            output_a: self.device.new_buffer(
+                (shape.q_heads * shape.head_dim * 2) as u64,
+                MTLResourceOptions::StorageModeShared,
+            ),
+            output_b: self.device.new_buffer(
+                (shape.q_heads * shape.head_dim * 2) as u64,
+                MTLResourceOptions::StorageModeShared,
+            ),
             partials: self.device.new_buffer(
                 (decode_partial_elements(shape.q_heads, shape.head_dim) * 4) as u64,
                 MTLResourceOptions::StorageModeShared,
@@ -220,15 +222,16 @@ fn read_u16(buffer: &Buffer, n: usize) -> Vec<u16> {
     (0..n).map(|i| unsafe { ptr.add(i).read() }).collect()
 }
 
-fn run_split_combine(
-    fx: &Fixture,
-    case: &Case,
-    splits: usize,
-    output: &Buffer,
-) -> Vec<u16> {
+fn run_split_combine(fx: &Fixture, case: &Case, splits: usize, output: &Buffer) -> Vec<u16> {
     let mut enc = MetalEncoder::new(&fx.queue).expect("encoder");
     fx.kernels
-        .encode_decode_split_with_splits(&mut enc, case.request(output), &case.partials, case.index(), splits)
+        .encode_decode_split_with_splits(
+            &mut enc,
+            case.request(output),
+            &case.partials,
+            case.index(),
+            splits,
+        )
         .unwrap_or_else(|e| panic!("split({splits}) on {}: {e}", case.shape.name));
     enc.commit_and_wait().expect("wait");
     read_u16(output, case.shape.q_heads * case.shape.head_dim)
@@ -301,8 +304,11 @@ fn single_pass_matches_split_combine_bit_for_bit_at_one_split() {
             checked += n;
         }
     }
-    println!("bit-exact on {checked} output elements across {} shapes x {} key counts",
-        SHAPES.len(), KEY_COUNTS.len());
+    println!(
+        "bit-exact on {checked} output elements across {} shapes x {} key counts",
+        SHAPES.len(),
+        KEY_COUNTS.len()
+    );
 }
 
 /// The prefill GQA kernel differs from the single-pass kernel in exactly one
@@ -567,6 +573,105 @@ fn split_above_one_is_not_bit_exact_but_fp16_absorbs_most_of_it() {
     );
 }
 
+/// **The numerical cost of `KAPLUMBA_DECODE_SPLIT_RULE=workgroups`, measured and
+/// pinned exactly.**
+///
+/// That rule picks 13 splits for the full-attention layers where the shipped
+/// default picks 16 (13 is the largest grid that fits in one wave -- see
+/// `kaplumba_kernels::attention::decode_one_wave_workgroups`). Changing the
+/// split count changes the order in which the combine sums the per-split
+/// `(m, l, O)` partials, so this is a change of arithmetic and not of dispatch,
+/// and the rule ships default-off for that reason rather than because the speed
+/// is in doubt.
+///
+/// Measured over the real shape: **1 fp16 ULP on 3-4 of 16384 output elements**,
+/// at every key count from 1024 to 8192. That is the fp16 rounding floor. It is
+/// nevertheless *not* bit-exact, and the end-to-end consequence is recorded in
+/// `spec/decode-19tok/implementation_notes.md`: 43 of 128 greedy tokens change
+/// over a ~6000-token context, first divergence at token 86. A change this small
+/// and a token stream this different is the whole argument for treating the
+/// decode numerics as frozen.
+///
+/// **These are exact expected counts, not bounds, and that is deliberate.** The
+/// obvious weaker assertions were tried and *two of them do not discriminate*:
+///
+///   * `worst_ulp <= 1` passes for **1 split against 16** as well (measured:
+///     1-18 elements differ, all 1 ULP), so it is a ceiling on the cost and
+///     proves nothing about which split count was used. Do not read coverage
+///     into it.
+///   * `differing > 0` catches a mis-wired arm (verified: comparing 16 against
+///     16 fails it) but nothing else.
+///
+/// Only the count does. It is deterministic given the kernel, so any change to
+/// the combine's summation order, the tile order, or the split count itself
+/// moves it, and a moved count means the trade this rule offers is not the trade
+/// that was measured.
+#[test]
+fn the_one_wave_split_rule_costs_one_fp16_ulp_and_is_not_bit_exact() {
+    let Some(fx) = Fixture::new() else {
+        eprintln!("no Metal device; skipping");
+        return;
+    };
+    // Measured, not derived. See the note above for why these are exact.
+    const EXPECTED_DIFFERING: [(usize, usize); 4] = [(1024, 3), (2048, 4), (4096, 4), (8192, 3)];
+    for (key_count, expected_differing) in EXPECTED_DIFFERING {
+        let case = fx.case(FULL, key_count, 0);
+        // 16 is what the shipped thread target picks; 13 is what the one-wave
+        // budget picks for `kv_heads 4` (`54 / 4`). Both go through the same
+        // entry point, so the only difference is the argument.
+        let shipped = run_split_combine(&fx, &case, 16, &case.output_a);
+        let one_wave = run_split_combine(&fx, &case, 13, &case.output_b);
+        let n = FULL.q_heads * FULL.head_dim;
+        assert!(
+            shipped.iter().any(|&v| v != 0),
+            "FULL @{key_count}: 16 splits produced all zeros; nothing to compare",
+        );
+        let mut differing = 0usize;
+        let mut worst_ulp = 0i32;
+        for (i, (a, b)) in shipped.iter().zip(&one_wave).enumerate() {
+            if a != b {
+                differing += 1;
+                let ulp = (*a as i32 - *b as i32).abs();
+                worst_ulp = worst_ulp.max(ulp);
+                assert!(
+                    ulp <= 1,
+                    "FULL @{key_count} keys, 13 vs 16 splits: element {i}/{n} moved {ulp} \
+                     fp16 ULP ({} vs {}). The measured cost of the one-wave rule was 1 ULP; \
+                     a larger deviation means the combine's summation order changed and the \
+                     rule is no longer the same trade.",
+                    f16::from_bits(*a),
+                    f16::from_bits(*b)
+                );
+            }
+        }
+        println!(
+            "FULL @{key_count} keys, 13 vs 16 splits: {differing}/{n} fp16 elements differ, \
+             max {worst_ulp} ULP"
+        );
+        assert_eq!(
+            differing, expected_differing,
+            "FULL @{key_count} keys, 13 vs 16 splits: {differing} of {n} fp16 elements differ, \
+             measured {expected_differing}. If this is 0 the split count has stopped affecting \
+             the output and `KAPLUMBA_DECODE_SPLIT_RULE=workgroups` should become the default; \
+             if it is larger, the deviation grew and the rule costs more than it was measured \
+             to cost."
+        );
+    }
+    // The determinism control. Restoring an input must restore the output, or
+    // every count above is run-to-run noise rather than a property of the
+    // arithmetic.
+    for key_count in [512usize, 1024] {
+        let case = fx.case(SLIDING, key_count, 0);
+        let a = run_split_combine(&fx, &case, 16, &case.output_a);
+        let b = run_split_combine(&fx, &case, 16, &case.output_b);
+        assert_eq!(
+            a, b,
+            "SLIDING @{key_count}: the same split count dispatched twice gave different \
+             output, so the comparison above is measuring run-to-run noise",
+        );
+    }
+}
+
 /// The gate. Default is off, so `encode_online_attention_split` must dispatch the
 /// shipping split+combine pair with no environment variable set. This is the test
 /// that would catch the arm being wired in unconditionally, which is the one way
@@ -591,7 +696,10 @@ fn the_single_pass_gate_defaults_to_off() {
 #[test]
 fn the_single_pass_gate_parsing_is_total() {
     // `0` is the shipped default and must mean off, not "one key".
-    assert_eq!(kaplumba_kernels::attention::parse_single_pass_limit("0"), Some(0));
+    assert_eq!(
+        kaplumba_kernels::attention::parse_single_pass_limit("0"),
+        Some(0)
+    );
     for off in ["", "off", "false", "no", "OFF", " off "] {
         assert_eq!(
             kaplumba_kernels::attention::parse_single_pass_limit(off),
@@ -609,8 +717,14 @@ fn the_single_pass_gate_parsing_is_total() {
             "{on:?} must parse as on at the measured threshold"
         );
     }
-    assert_eq!(kaplumba_kernels::attention::parse_single_pass_limit("64"), Some(64));
-    assert_eq!(kaplumba_kernels::attention::parse_single_pass_limit(" 1024 "), Some(1024));
+    assert_eq!(
+        kaplumba_kernels::attention::parse_single_pass_limit("64"),
+        Some(64)
+    );
+    assert_eq!(
+        kaplumba_kernels::attention::parse_single_pass_limit(" 1024 "),
+        Some(1024)
+    );
     // Clamped, so a typo cannot ask for a key count outside the sweep's range.
     assert_eq!(
         kaplumba_kernels::attention::parse_single_pass_limit("99999999"),

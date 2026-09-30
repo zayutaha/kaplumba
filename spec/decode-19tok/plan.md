@@ -126,17 +126,39 @@ The 63 ms gap is the project. Candidates, all currently uneliminated:
   compute-bound and decode is not, so this does not transfer.
 - `lm_head`'s access shape, which differs from the other seven and is 8% of bytes.
 
-**The split-count question, separately.** `decode_splits` returns 16 for both
-layer shapes, giving sliding layers 256 workgroups and full-attention layers
-only 64, on 20 cores. An isolated harness measured full-attention layers at 8k
-running 1.91x faster at 12 splits (6975->5743 and 7301->5739 us, reproduced twice
-at 3 s.f.), at zero byte cost since the partials buffer is already sized for 16.
-Requirements before this lands: it is **not bit-exact** (the combine sums in
-split order), so measure the actual float divergence — if ~1e-7, that is four
-orders of magnitude below the 2.16e-3 the project already accepts from prefill's
-fp16 operand rounding — and re-check the five reference prompts. Use
-`KAPLUMBA_DECODE_SPLITS` to sweep without rebuilding. A wave-quantisation
-argument is the right justification, not the single 12-vs-16 data point.
+**The split-count question, separately. — RESOLVED 2026-10-01, default-off.**
+`decode_splits` returned 16 for both layer shapes, giving sliding layers 256
+workgroups and full-attention layers only 64, on 20 cores. The cause was that it
+was handed `q_heads` and `key_count` but **not `kv_heads`**, so it could not know
+the workgroup count it was producing, and it aimed at a *thread* count. The
+justification is now a wave-quantisation argument rather than a data point, as
+this section asked for: sweeping three shapes that all use a 256-thread
+workgroup and differ only in `kv_heads` puts the one-wave capacity at **54**
+workgroups (54 is one wave, 55 is two), and `54 / kv_heads` reproduces the
+measured optimum of all three shapes — 13 splits for Gxma's full-attention
+layers, **1.34x at 8k of context, 0% change to the sliding layers by
+construction**. See `implementation_notes.md` for the tables.
+
+Two of this section's requirements were met and one was not:
+
+- **The float divergence is measured, and it is bigger than "~1e-7" while still
+  being the fp16 floor**: 1 fp16 ULP on 3-4 of 16384 output elements. That is
+  0.02% of the output and four orders of magnitude below the 2.16e-3 the project
+  already accepts from prefill — and it still changes **43 of 128** greedy
+  tokens over a 6010-token context, first divergence at token 86. Greedy decode
+  is a discontinuous function of the logits, so "negligible" and "identical" are
+  different claims here and only one of them is true.
+- **The five reference prompts are not needed**; one long one is strictly better,
+  because the recorded 128-token gate is *structurally blind* to this change (at
+  156 keys the keys-per-split floor caps both arms at 3 splits) and would have
+  reported a pass. That is recorded because it is the kind of gate that looks
+  like evidence and is not.
+- **The end-to-end measurement is still missing.** Everything is the isolated
+  kernel, taken while another agent had the model resident.
+
+The change therefore ships as `KAPLUMBA_DECODE_SPLIT_RULE=workgroups`, **default
+off**, and the decision to flip it is left open. `KAPLUMBA_DECODE_SPLITS` still
+pins the count for sweeps.
 
 ## R4: bytes per token
 

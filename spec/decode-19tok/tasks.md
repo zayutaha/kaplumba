@@ -113,15 +113,28 @@ GB/s and the single change most likely to close it.
     than trimming it, because weights do not change between tokens. Verify-gated
     and greedy-identical per AGENTS.md §8. A different project from the others;
     named here so it is not lost if T2 returns "wall" and the rest are exhausted.
-- **Split count, as a sub-item.** An isolated harness measured full-attention
-  layers at 8k at 1.91x faster with 12 splits than 16 (6975->5743 and
-  7301->5739 us, twice at 3 s.f.), zero byte cost. `decode_splits` returns 16
-  for both shapes, giving sliding layers 256 workgroups but full-attention only
-  64 on 20 cores. Before proposing it: measure the actual float divergence (the
-  combine sums in split order, so it is not bit-exact) — ~1e-7 would be four
-  orders below the 2.16e-3 prefill already accepts; re-check the five reference
-  prompts; justify by wave quantisation, not the single data point. Use
-  `KAPLUMBA_DECODE_SPLITS` to sweep without rebuilding.
+- **Split count, as a sub-item. — DONE 2026-10-01, shipped default-off.** The
+  1.91x figure is superseded: the direction held, the magnitude did not.
+  `decode_splits` was not passed `kv_heads`, so it aimed at a *thread* count and
+  gave both shapes 16 splits with grids differing 4x. Three requirements, three
+  outcomes:
+  - **Justified by wave quantisation, not one data point** — the one-wave budget
+    is **54** workgroups, measured by sweeping three shapes that bracket it (54
+    one wave, 55 two), and `54 / kv_heads` reproduces the measured optimum of all
+    three. **1.34x at 8k, 1.11x at 1k, 0% change to the sliding layers by
+    construction.**
+  - **Float divergence measured**: 1 fp16 ULP on 3-4 of 16384 output elements,
+    i.e. the fp16 floor and four orders below the 2.16e-3 prefill accepts — and
+    it still changes **43 of 128** greedy tokens over a 6010-token context. The
+    five reference prompts are unnecessary and insufficient: the recorded
+    128-token gate reproduces its hash under *both* arms, because at 156 keys the
+    keys-per-split floor caps both at 3 splits. It is structurally blind to this
+    change.
+  - **End-to-end ms/token: NOT done.** Every number is the isolated kernel on a
+    contended box. This is the one requirement left open.
+  - Shipped as `KAPLUMBA_DECODE_SPLIT_RULE=workgroups`, **default off**; the
+    decision to flip it is a judgement about the model, not the kernel.
+    `KAPLUMBA_DECODE_SPLITS` still pins the count for sweeps.
 
 **Done when:** every mechanism is costed in ms/token and ranked, with quality
 implications stated rather than assumed.

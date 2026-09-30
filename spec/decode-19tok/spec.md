@@ -126,14 +126,31 @@ measurement: decode 8.70/8.93/8.99 default vs 7.59/8.31/8.80 resident, prefill
   the ones under consideration are dispatch/command-buffer gaps, per-thread
   bytes-in-flight at batch 1, dequant arithmetic not overlapped with loads, and
   `lm_head`'s access shape.
-- Does the split count matter? An isolated harness measured full-attention
-  layers at 8k running 1.91x faster at 12 splits than 16 (6975->5743 us and
-  7301->5739 us, reproduced twice at 3 significant figures, zero byte cost).
-  `decode_splits` returns 16 for both layer shapes, which gives sliding layers
-  256 workgroups but full-attention only 64, on 20 cores. **The change is not
-  bit-exact** (the combine sums partials in split order) so it needs the five
-  prompts re-checked before landing, and it was measured in isolation, not
-  end-to-end. `KAPLUMBA_DECODE_SPLITS` exists as a sweep knob.
+- Does the split count matter? **Answered 2026-10-01: yes, and it is in the
+  tree default-off because it is not bit-exact.** See
+  `implementation_notes.md` ("the decode split count, from a workgroup budget
+  rather than a thread count"). The earlier 1.91x figure is superseded: the
+  direction held, the magnitude did not. `decode_splits` was handed `q_heads`
+  and `key_count` but **not `kv_heads`**, and aimed at a *thread* count, so both
+  layer shapes got 16 splits and therefore grids differing 4x — 256 workgroups
+  of 64 threads on the sliding layers against 64 workgroups of 256 threads on the
+  10 full-attention ones, on 20 cores. A one-wave budget of **54** workgroups
+  (measured by sweeping three shapes that bracket the transition: 54 is one
+  wave, 55 is two) gives **13** splits on the full-attention layers,
+  **1.34x at 8k of context, 1.11x at 1k, 0% change on the sliding layers by
+  construction**, and the rule reproduces the measured optimum of all three
+  shapes it was measured on. It is **not** bit-exact: 1 fp16 ULP on 3-4 of 16384
+  output elements, which is enough to change **43 of 128** greedy tokens over a
+  6010-token context. The precedent cuts against the obvious argument: this repo
+  has already accepted a **larger** 1-ULP perturbation elsewhere (the gate/up
+  GEMV fusion, 0.78% of activations on all 60 layers) and it changed **zero**
+  tokens, so "only 1 ULP" does not carry across sites. Shipped as
+  `KAPLUMBA_DECODE_SPLIT_RULE=workgroups`; the remaining question is whether a
+  1-ULP change to ten layers' attention output is an acceptable price for 1.34x
+  on them. **The end-to-end ms/token A/B is still missing** — every number is the
+  isolated kernel, taken on a contended box, and the recorded 128-token hash is
+  structurally blind to this change (at 156 keys the keys-per-split floor caps
+  both arms at 3 splits).
 - The 16 B/thread figure from the load-width sweep is **retracted**: that sweep
   found 8 B/thread already saturates, and the 30 B/thread figure that motivated
   a `uint4` change was based on a wrong threshold. The `uint4` change is
