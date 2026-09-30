@@ -45,8 +45,13 @@ Status legend: `[ ]` pending, `[x]` done, `[~]` in progress.
 - [x] **T8** Offload verification. With offload on: footprint <= 12 GiB and
   output byte-identical to T7. This is the go/no-go gate for the whole spec.
   - Depends: T5, T6, T7.
-- [ ] **T9** Swap watch. Sustained generation with offload on; confirm swap does
+- [x] **T9** Swap watch. Sustained generation with offload on; confirm swap does
   not grow (resolves the open question about `lm_head` page residency).
+  - **Done 2026-09-30.** 2500 generated tokens: `time -l` reports `swaps 0`,
+    `vm.swapusage` 0 MiB at all 15 samples, 11.98 GiB peak footprint, no
+    throughput cliff. The 0.984 GiB of `lm_head.trellis` was re-read 2500 times
+    (~2.6 TB) through the mapping without a single swapped page. Full A/B in
+    `implementation_notes.md`, session 2026-09-30.
   - Depends: T8.
 - [x] **T10** Regression test for R3. Assert layer trellis holds arena spans and
   is therefore resident, so nobody re-enables zero-copy for the 11 GB. Test
@@ -115,3 +120,42 @@ open. T9 was started but the sustained 200-token run was too slow to complete
 interactively; the swap question is therefore still unresolved, though the
 11.51 GiB footprint is well clear of the swap pressure that broke the earlier
 all-file-backed build.
+
+## Results (2026-09-30) — T9 closed, and the `lm_head` comment corrected
+
+Same prompt (62 tokens), same 2500 generated tokens, same binary, same session.
+`phys_footprint` from `/usr/bin/time -l`; `ru_maxrss` is listed only to show how
+far it is from the truth.
+
+| Config | `phys_footprint` | arena weights | `ru_maxrss` | swaps | `decode_tok_s` | `load_ms` |
+|---|---:|---:|---:|---:|---:|---:|
+| both mapped (**default**) | **11.98 GiB** | 10.25 GiB | 7.05 GiB | 0 | 9.124 | 7 464 |
+| `KAPLUMBA_RESIDENT_WEIGHTS=1` | 15.57 GiB | 13.85 GiB | 8.04 GiB | 0 | 11.992 | 19 005 |
+
+- **T9 answered: swap does not grow.** `time -l` `swaps 0`, and `vm.swapusage`
+  read 0 MiB at all 15 samples across the 288 s run, while ~2.6 TB was streamed
+  through the `lm_head.trellis` mapping. No tok/s cliff either.
+- The 3.59 GiB footprint saving equals the offload pair (3.609 GiB) to within
+  0.02 GiB; nothing else in the footprint moved. `phys_footprint` reproduced to
+  **196 488 bytes** across two identical runs, so this is ~18 000x the noise floor.
+- **`decode_tok_s` is not a result and must not be quoted from this table.** The
+  first pair looked like a 24 % cost for mapping (9.124 vs 11.992), but a repeat
+  of the *same* default config returned 12.338 — a 35 % same-config swing, larger
+  than the effect. Settling a throughput difference here needs interleaved
+  A/B/A/B medians (AGENTS.md §10.5). `load_ms` (5 987–7 464 mapped vs 19 005
+  resident) is the trustworthy throughput-adjacent number.
+- **Long greedy generations are not bit-reproducible.** Two runs of the same
+  binary, config, prompt and seed at `--temperature 0` produced different text
+  ("prevented the metal from failing" vs "…cracking"). This is *not* the
+  offload — the control proves it. It does mean the "byte-identical" claim
+  above holds for the short 5-prompt set only, and that any long-generation A/B
+  needs a same-config control before attributing an output difference to
+  anything.
+- **A wrong comment was corrected.** `weights.rs` claimed mapping
+  `lm_head.trellis` was "actively harmful. Left resident", citing
+  12.99 → 14.14 GiB. The 12.99 GiB was the failed run this file already flags
+  as an artifact, so the comparison was made against a run that never allocated
+  KV; the sign of the result was inverted. The comment has been rewritten; the
+  code was always right. This closes `spec/engine-performance` Q12 / T9.
+
+T12 (alignment-cost measurement) is still open.

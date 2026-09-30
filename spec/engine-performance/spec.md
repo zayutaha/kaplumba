@@ -298,17 +298,38 @@ Per `AGENTS.md` §2.1, each includes a plain-language gloss in brackets.
 > `crates/kernels/src/linear.rs:976-987` actually gates on `% 64`. Not fixed
 > because it is a comment in a source file. Anyone relying on it will be misled.
 
-### Q12: **NEW — `lm_head.trellis` is mapped by default against its own comment.**
-> `crates/engine/src/weights.rs:530-533` states that mapping `lm_head.trellis`
+### Q12: **RESOLVED 2026-09-30 — `lm_head.trellis` is correctly mapped; the comment was the fabrication.**
+> **Answer: keep mapping it.** The code was right and the comment was wrong.
+> Full A/B, swap watch and byte sizes in
+> `spec/resident-memory-12gib/implementation_notes.md`, session 2026-09-30.
+>
+> `crates/engine/src/weights.rs:530-533` stated that mapping `lm_head.trellis`
 > (1.06 GB) is *"actively harmful"* — file-backed resident pages cost *more* than
-> arena pages, measured 12.99 → 14.14 GiB — and says "Left resident". Line 552
-> then computes `let offload_head_trellis = offload_head && name ==
-> "lm_head.trellis";`, which **maps it**, because `offload_head = !force_resident`
-> (line 544). The comment and the code contradict each other and only one of
-> them has been benchmarked in the current configuration.
-> *(1.06 GB of weights is being read from a mapping that the comment beside it
-> says is slower than reading it from RAM. One of the two is wrong. Fixing it
-> needs an A/B, not a guess.)*
+> arena pages, measured 12.99 → 14.14 GiB — and said "Left resident", while
+> `weights.rs:552` mapped it. **The 12.99 GiB baseline was a run that had
+> already failed** (`lm_head.suh has 0 values`) and so never allocated KV or
+> scratch; it was artificially low, so comparing a healthy run against it
+> inverted the sign of the result. The correct comparison is against the 15.12 GiB
+> all-resident baseline, where mapping saves **1.00 GiB** (-> 14.12).
+> `resident-memory-12gib/implementation_notes.md` had already flagged 12.99 as
+> an artifact; the comment asserting the conclusion was the one that fell into
+> the trap its own file warns about. The comment is now corrected in place.
+>
+> Mechanism, measured: the 1.06 GB *is* read in full every token, but it stays
+> file-backed-resident and reclaimable. A 2500-token decode re-read it 2500
+> times (~2.6 TB) with `time -l` reporting `swaps 0` and `vm.swapusage` at 0 MiB
+> at every 5 s sample. Same-session A/B: 11.98 GiB mapped vs 15.57 GiB
+> all-resident — a 3.59 GiB saving, exactly the 3.609 GiB offload pair.
+>
+> **Cost side: not established.** A first pair of runs suggested mapping cost
+> ~24 % of decode throughput (9.124 vs 11.992 tok/s), but a repeat of the *same*
+> default config returned 12.338 — a 35 % same-config swing, larger than the
+> effect. Per AGENTS.md §10.5 this metric needs interleaved A/B/A/B medians
+> before any percentage is believed; `phys_footprint`, by contrast, reproduced
+> to 196 488 bytes. `load_ms` does favour the offload (5 987–7 464 mapped vs
+> 19 005 resident). So `decode-20tok` Q6 ("what bandwidth do mapped weights
+> stream at?") remains **open** — this session bounds the memory side only.
+> Q13's conclusion (the 58 s prefill was not host paging) is unaffected.
 
 ### Q13: **NEW — the 58 s prefill was never host paging, and the numerology was a coincidence.**
 > I claimed the 58 s was host-side paging because a per-layer byte count divided

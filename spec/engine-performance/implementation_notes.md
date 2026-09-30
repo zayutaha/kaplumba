@@ -849,8 +849,20 @@ on that comment will be misled.
   resident"), and `weights.rs:552` computes
   `let offload_head_trellis = offload_head && name == "lm_head.trellis";`
   which **maps it**, because `offload_head = !force_resident`
-  (`weights.rs:544`). **Known contradiction. Needs an A/B and a decision, not a
-  guess.** (See `spec.md` Q12.)
+  (`weights.rs:544`). **RESOLVED 2026-09-30: the comment was the error, not the
+  code — keep mapping it.** The 12.99 GiB it used as a baseline was a run that
+  had already failed (`lm_head.suh has 0 values`) and never allocated KV or
+  scratch, so it was artificially low and the comparison inverted the sign of
+  the result. Real A/B, same session, 2500 tokens: **11.98 GiB mapped vs
+  15.57 GiB all-resident**, a 3.59 GiB saving equal to the 3.609 GiB offload
+  pair, with `time -l` `swaps 0` and `vm.swapusage` 0 MiB at every 5 s sample.
+  The comment has been corrected in place; no code change was needed. A
+  throughput cost was **not** established: a first pair suggested ~24 %
+  (9.124 vs 11.992 tok/s), but a repeat of the *same* default config returned
+  12.338, a 35 % same-config swing that swamps the effect — `decode-20tok` Q6
+  stays open. `phys_footprint` by contrast reproduced to 196 488 bytes across
+  two identical runs. Full data in
+  `spec/resident-memory-12gib/implementation_notes.md` (session 2026-09-30).
 - **Decode is 5.3–6.9 tok/s at 614**, degrading to 1.6–2.1 at 4814. The
   degradation is the expected cost of rescanning a long context, not a failure —
   but it is below the 7.87 tok/s in notes §1–§3 and the difference is not

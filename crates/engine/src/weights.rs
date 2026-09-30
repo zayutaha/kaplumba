@@ -520,17 +520,50 @@ impl TextWeights {
             // Both are read as 16-bit values, so the 2-byte-aligned file offsets
             // are fine. Layer trellis is NOT safe to offload: see
             // `exl3_code_at` in linear.metal for the 4-byte alignment trap.
-            // These are separate switches because they behave completely
-            // differently, which measurement made clear:
+            // Both are mapped by default, and the two switches exist because
+            // the tensors behave completely differently. `phys_footprint` via
+            // `/usr/bin/time -l` (never `ru_maxrss`: it misses Metal pages
+            // entirely), output byte-identical at `--temperature 0`:
+            //
+            //   all resident (baseline)          15.12 GiB
+            //   lm_head.trellis mapped           14.12 GiB   (-1.00)
+            //   embed_tokens mapped (in-kernel)  12.45 GiB   (-2.67)
+            //   both mapped (default)            11.51 GiB   (-3.61)
             //
             //   embed_tokens (2.82 GB) - one row is read per token, so mapping
-            //     it leaves ~10 KiB of working set and saves the full 2.82 GB.
-            //     Measured 15.13 -> 12.99 GiB.
+            //     it leaves a ~10 KiB working set and saves the full 2.82 GB.
             //
-            //   lm_head.trellis (1.06 GB) - read *in full* on every token, so
-            //     mapping it just pages every byte back in, and file-backed
-            //     resident pages cost *more* than arena pages. Measured 12.99
-            //     -> 14.14 GiB, i.e. actively harmful. Left resident.
+            //   lm_head.trellis (1.06 GB) - read *in full* on every token, which
+            //     sounds like it should be the worst candidate to map, but
+            //     measurement says otherwise: mapping it saves 1.00 GiB.
+            //
+            // CORRECTION (2026-09-30). An earlier revision of this comment said
+            // the opposite here: "read *in full* on every token, so mapping it
+            // just pages every byte back in, and file-backed resident pages
+            // cost *more* than arena pages. Measured 12.99 -> 14.14 GiB, i.e.
+            // actively harmful. Left resident." **That was wrong and the sign of
+            // the result was inverted.** The 12.99 GiB it used as the baseline
+            // was a run that had already failed (`lm_head.suh has 0 values`) and
+            // so never allocated KV or scratch -- it was artificially LOW, and
+            // comparing a healthy run against it made the healthy run look like
+            // a 1.15 GiB regression. The 14.14 figure was not invented; it is
+            // the correct measurement of the lm-head-only configuration. The
+            // mistake was the baseline it was paired with. (Recorded in
+            // `spec/resident-memory-12gib/implementation_notes.md`, which had
+            // already flagged 12.99 as an artifact.)
+            //
+            // "Left resident" was also false about the code three lines below,
+            // which maps the tensor, and it contradicted the paragraph twelve
+            // lines above in this same block, which had it right. The paging
+            // worry is real in principle but does not bite at this size: the
+            // 1.06 GB stays file-backed-resident in the page cache rather than
+            // costing anonymous memory, and 1.06 GB fits comfortably in the
+            // reclaimable cache left over after the ~11.3 GiB arena. A
+            // 2500-token decode re-reads those 1.06 GB 2500 times (~2.6 TB of
+            // reads) and grows swap by zero pages, at 0 swaps in
+            // `/usr/bin/time -l` and 0 MiB in `vm.swapusage` sampled every 5 s.
+            // See the swap watch (T9) in
+            // `spec/resident-memory-12gib/implementation_notes.md`.
             //
             // `lm_head.suh` / `lm_head.svh` / `lm_head.mcg` are sign side-tensors
             // read on the CPU via `read_f16` and always need their arena copy.

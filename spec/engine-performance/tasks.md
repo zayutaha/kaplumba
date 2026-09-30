@@ -129,9 +129,16 @@ section of `implementation_notes.md` that explains why.
 - [ ] **T8 — Run the 8192-token prefill end to end** and re-measure the scaling
       law, the RSS figure, and the `exp(m_s − M)` combine path at 16 splits.
       Blocked on free memory, not on code.
-- [ ] **T9 — Decide `lm_head.trellis` residency** (`spec.md` Q12).
-      `weights.rs:530-533` says mapping it is "actively harmful" and "Left
+- [x] **T9 — Decide `lm_head.trellis` residency** (`spec.md` Q12).
+      `weights.rs:530-533` said mapping it is "actively harmful" and "Left
       resident"; `weights.rs:552` maps it. Needs an A/B and a decision.
+      **Decided 2026-09-30: keep mapping it.** The comment's 12.99 GiB baseline
+      was a failed run that never allocated KV, which inverted the sign of the
+      result. Measured 11.98 GiB mapped vs 15.57 GiB all-resident (saving
+      3.59 GiB = the 3.609 GiB offload pair), 0 swaps over 2500 tokens.
+      Comment corrected in place; no code change. A throughput cost was *not*
+      established — a same-config control run swung 35 %, so `decode-20tok` Q6
+      stays open.
 - [ ] **T10 — Drain the autorelease pool** (`notes` §16). 0 B leaked per
       buffer/encoder pair after the handle fix, but the pool is still never
       drained.
