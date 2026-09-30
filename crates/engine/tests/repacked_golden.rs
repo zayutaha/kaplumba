@@ -319,12 +319,29 @@ fn test_metal_gemv_repacked_bit_exact() {
     let p_simd = out_simd.contents() as *const f32;
     let p_u4 = out_u4.contents() as *const f32;
     let p_sk4 = out_sk4.contents() as *const f32;
+    // `raw` is the GEMV scratch, not the result. A split-K kernel writes one
+    // *partial* dot product per K-split at `raw[split * out_features + n]`
+    // (`linear_gemv_ishizuki_k3_colmajor_sk4`), and the partials are summed on
+    // the way out: either by `gemv_reduce_sk4` writing the sum back into `raw`,
+    // or -- now -- by the fused `linear_finalize_simd_sk4`, which reduces the
+    // splits, applies the butterfly and the output signs, and writes fp16 to
+    // `output` in one pass, leaving `raw` holding split 0's partial.
+    //
+    // So read `raw` the way the kernel fills it and reduce here. Asserting
+    // `raw[i]` directly tested the *reduce kernel in isolation*; summing the
+    // splits tests the arithmetic that actually ships, and it is strictly
+    // stronger coverage because the finalized fp16 loop below then checks the
+    // fused result of the same reduction. This assertion was the thing that
+    // caught the contract change, so it is kept -- against the real contract.
+    let sk4_reduce = |i: usize| -> f32 {
+        (0..4).map(|s| unsafe { *p_sk4.add(s * out_features + i) }).sum()
+    };
     for i in 0..out_features {
         let v_orig = unsafe { *p_orig.add(i) };
         let v_repack = unsafe { *p_repack.add(i) };
         let v_simd = unsafe { *p_simd.add(i) };
         let v_u4 = unsafe { *p_u4.add(i) };
-        let v_sk4 = unsafe { *p_sk4.add(i) };
+        let v_sk4 = sk4_reduce(i);
         assert_eq!(
             v_orig.to_bits(),
             v_repack.to_bits(),
@@ -346,7 +363,7 @@ fn test_metal_gemv_repacked_bit_exact() {
         let diff = (v_orig - v_sk4).abs();
         assert!(
             diff < 1e-3,
-            "SK4 output mismatch at element {}: orig {} vs sk4 {} (diff {})",
+            "SK4 reduced-partial mismatch at element {}: orig {} vs sk4 {} (diff {})",
             i, v_orig, v_sk4, diff
         );
     }
@@ -379,6 +396,12 @@ fn test_metal_gemv_repacked_bit_exact() {
             "Finalized U4 output mismatch at element {}: orig {:#x} vs u4 {:#x} (diff {})",
             i, vf_orig, vf_u4, diff_fp16_u4
         );
+        // Split-K reassociates the float sum, so its fp16 is *not* bit-exact
+        // here: measured 2 of 512 elements off by one fp16 ULP (0x2cfd/0x2cfc,
+        // 0xc6c4/0xc6c3). On the real decode shapes in `live_kernel_bit_exact`
+        // the fp16 does come out identical (0 of 5376 / 21504 / 5376). This is
+        // the same associativity tolerance U4 gets, and the same reason the
+        // split-K kernels stay behind `KAPLUMBA_USE_SK=1`.
         let diff_fp16 = (half::f16::from_bits(vf_orig).to_f32() - half::f16::from_bits(vf_sk4).to_f32()).abs();
         assert!(
             diff_fp16 < 0.01,
@@ -386,6 +409,6 @@ fn test_metal_gemv_repacked_bit_exact() {
             i, vf_orig, vf_sk4, diff_fp16
         );
     }
-    println!("T5: Metal GPU repacked GEMV, SIMD GEMV, and U4 GEMV match original Ishizuki 100% bit-exact across {} elements (raw f32 and finalized f16)! SK4 matches within FP32 associativity tolerance.", out_features);
+    println!("T5: Metal GPU repacked GEMV, SIMD GEMV, and U4 GEMV match original Ishizuki 100% bit-exact across {} elements (raw f32 and finalized f16)! SK4 matches within FP32 associativity tolerance on both the reduced split partials and the finalized f16.", out_features);
 }
 
