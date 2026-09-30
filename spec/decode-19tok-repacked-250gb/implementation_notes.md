@@ -85,4 +85,28 @@ Running log for `spec/decode-19tok-repacked-250gb/`. Updated per task.
    - Physical DRAM bus: Measured effective weight throughput of **188.4 GB/s** means the physical hardware DRAM bus is transferring $188.4 \times 1.333 = \mathbf{251.2\text{ GB/s}}$ (92% of theoretical peak 273 GB/s).
    - Path to 250+ GB/s effective weight bandwidth: Group 4 consecutive tiles along K into $4 \times 96\text{ bytes} = 384\text{ bytes} = \mathbf{3 \times 128\text{ bytes}}$ (6 full 64-byte cache lines) and issue 16-byte aligned vector loads (`uint4`), eliminating the $1.333\times$ hardware overhead completely.
 
+7. **Ground-Truth Decode Breakdown (Measured via `KAPLUMBA_DECODE_PROFILE=kernel KAPLUMBA_DECODE_PROFILE_WARMUP=1`):**
+   - Steady-state decode step is **85.7 – 86.5 ms** (11.6 tok/s).
+   - Per-kernel GPU time breakdown:
+     - `gate_up_proj` (60 layers, `fused2`): **35.58 ms** (37.5%)
+     - `down_proj` (60 layers): **18.37 ms** (19.4%)
+     - `qkv_proj` (50 layers, `fused3`) + `q/k/v` (10 full-attn layers): **19.94 ms** (21.0%)
+     - `o_proj` (60 layers): **9.74 ms** (10.3%)
+     - `head/gemv` (1 dispatch, 6 bpw): **4.17 ms** (4.4%)
+     - Non-linear ops (`rms_norm`, `attention`, `rope`, `gated_gelu`, `residual`): **7.04 ms** (7.4%)
+   - Key finding: 87.8 ms out of 94.8 ms is in linear projections.
+   - At 188 GB/s across all layers, the total weight transfer (9.88 GB) takes $9.88 / 188 = \mathbf{52.5\text{ ms}}$ ($\mathbf{19.0\text{ tok/s}}$).
+   - At 250 GB/s across all layers, the total weight transfer takes $9.88 / 250 = \mathbf{39.5\text{ ms}}$ ($\mathbf{25.3\text{ tok/s}}$).
+
+8. **Grid Under-Subscription on Narrow Layers (Solved by Split-K 4):**
+   - On `q_proj 5376x5376` and `o_proj 5376x5376`:
+     - Grid size is only 336 threadgroups (16 threadgroups per core on 20 GPU cores).
+     - Measured throughput was only 108.5 GB/s (0.10 ms).
+     - With `linear_gemv_ishizuki_k3_colmajor_sk4` (`split-k 4`): grid size increases to 1344 threadgroups (67 per core), throughput jumps to **142.6 GB/s** (0.08 ms, **+31% speedup**).
+
+9. **`simd_shuffle` vs Direct L1 Cache Gather:**
+   - On small matrices (`5376x5376`), `simd_shuffle` improved throughput from 108.5 GB/s to 128.1 GB/s (+18%) by removing memory latency.
+   - On wide matrices (`gate_up 5376x43008`), `simd_shuffle` reduced throughput from 189.0 GB/s to 153.0 GB/s because the ALU crossbar becomes the bottleneck rather than DRAM bandwidth.
+   - Conclusion: L1 cache on M4 Pro already handles contiguous column-major tile reads at 189–197 GB/s without ALU register shuffling.
+
 

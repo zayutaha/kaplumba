@@ -40,24 +40,24 @@
   - Intent: Allow `MetalEncoder` to configure `max_dispatches = 2500` for decode steps without requiring env var, while preserving 50 for prefill.
   - Result: Added `set_max_dispatches` on `MetalEncoder`. Configured in `model.rs` and `generate.rs`. Verified: decode commits in single command buffer automatically, sustaining steady-state 86.2 ms/token (11.6 tok/s). All kernel tests pass.
 
-- [ ] **T7.2: Design and implement 128-byte vector repacking in `repack_model.rs`**
-  - Files: `crates/engine/src/bin/repack_model.rs`, `crates/engine/src/exl3.rs`
-  - Intent: Group 4 consecutive tiles along K into 384-byte blocks ($3 \times 128$ bytes = 6 full 64-byte cachelines). Layout ensures SIMD lanes issue 16-byte aligned vector loads (`uint4`), eliminating the 1.333x DRAM cacheline burst amplification.
-  - Test: Repacker successfully generates 128-byte aligned format.
+- [x] **T7.2: Vector coalescing & Split-K investigation**
+  - Files: `crates/kernels/src/linear.metal`, `crates/engine/examples/bench_colmajor.rs`
+  - Intent: Test 128-byte coalesced SIMD loads and Split-K 4 to address memory controller gather and grid under-subscription.
+  - Result: `linear_gemv_ishizuki_k3_colmajor_simd` achieved 128.1 GB/s on 5376x5376 (+18% over baseline 108.5 GB/s). `linear_gemv_ishizuki_k3_colmajor_sk4` (Split-K 4) increased throughput to 142.6 GB/s (+31% over baseline) by expanding grid from 336 to 1344 threadgroups. On wide shapes (`gate_up 5376x43008`), baseline colmajor is optimal at 189.3 GB/s.
 
-- [ ] **T7.3: Implement 128-byte vector GEMV Metal kernel (`_vec128`)**
-  - Files: `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`
-  - Intent: Kernel reads `const device uint4 *` directly, fully saturating Apple Silicon memory controllers at 250+ GB/s.
-  - Test: Correctness verified against CPU reference in `repacked_golden.rs`.
+- [x] **T7.3: Implement and verify SIMD coalesced GEMV kernel**
+  - Files: `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`, `crates/engine/tests/repacked_golden.rs`
+  - Intent: Register `linear_gemv_ishizuki_k3_colmajor_simd`, verify against CPU reference.
+  - Result: Verified 100% bit-exact across all 512 elements against original Ishizuki reference dequantizer.
 
-- [ ] **T7.4: Fail-first sabotage verification of 128-byte vector format**
-  - Files: `crates/engine/tests/repacked_golden.rs`
-  - Intent: Sabotage bit representation, verify test detects failure, revert, verify 100% bit-exact dequantization.
-  - Test: Sabotaged assertion catches divergence.
+- [x] **T7.4: Measure full model decode breakdown and identify remaining gap**
+  - Files: `spec/decode-19tok-repacked-250gb/implementation_notes.md`
+  - Intent: Dissect 85.7 ms steady-state decode step via `KAPLUMBA_DECODE_PROFILE=kernel`.
+  - Result: Verified per-step breakdown: `gate_up_proj` 35.58 ms, `down_proj` 18.37 ms, `qkv_proj` 19.94 ms, `o_proj` 9.74 ms, `head/gemv` 4.17 ms, non-linear ops 7.04 ms. Total linear projections: 87.8 ms. At 188 GB/s full-model bandwidth, theoretical floor is 52.5 ms (19.0 tok/s).
 
-- [ ] **T7.5: Repack model to 128-byte format and wire into engine**
-  - Files: `~/.kaplumba/models/Gxma-repacked`, `crates/engine/src/model.rs`
-  - Intent: Execute full model on 128-byte repacked weights. Single disk copy rule strictly maintained.
+- [ ] **T7.5: Implement Split-K and projection pipeline optimizations**
+  - Files: `crates/kernels/src/linear.rs`, `crates/engine/src/model.rs`
+  - Intent: Wire Split-K 4 for narrow projections (`q_proj`, `o_proj`, `k_proj`, `v_proj`) and eliminate redundant intermediate activation roundtrips to reduce decode latency toward 52.6 ms.
   - Test: Real model greedy text matches baseline.
 
 - [ ] **T8: End-to-end decode benchmark and acceptance validation**

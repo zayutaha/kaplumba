@@ -202,6 +202,9 @@ fn test_metal_gemv_repacked_bit_exact() {
         MTLResourceOptions::StorageModeShared,
     );
 
+    let out_simd = device.new_buffer((out_features * 4) as u64, MTLResourceOptions::StorageModeShared);
+    let final_simd = device.new_buffer((out_features * 2) as u64, MTLResourceOptions::StorageModeShared);
+
     // Run repacked kernel with column-major repacked buffer
     {
         let mut encoder = MetalEncoder::new(&queue).unwrap();
@@ -228,19 +231,53 @@ fn test_metal_gemv_repacked_bit_exact() {
         encoder.commit_and_wait().unwrap();
     }
 
+    // Run SIMD coalesced repacked kernel with column-major buffer
+    {
+        let mut encoder = MetalEncoder::new(&queue).unwrap();
+        kernels.encode_gemv_named(
+            &mut encoder,
+            "linear_gemv_ishizuki_k3_colmajor_simd",
+            &LinearEncodeRequest {
+                packed: &colmajor_buf,
+                packed_offset: 0,
+                perm_mode: 0,
+                input: &x_buf,
+                input_signs: &signs_in,
+                output_signs: &signs_out,
+                transformed: &trans_repack,
+                raw: &out_simd,
+                output: &final_simd,
+                in_features,
+                out_features,
+                rate: Exl3Rate::Integer(3),
+                codebook: kaplumba_kernels::exl3::Exl3Codebook::Mcg,
+                pretransformed: false,
+            },
+        ).expect("encode simd");
+        encoder.commit_and_wait().unwrap();
+    }
+
     // Compare outputs: MUST BE 100% BIT-EXACT
     let p_orig = out_orig.contents() as *const f32;
     let p_repack = out_repack.contents() as *const f32;
+    let p_simd = out_simd.contents() as *const f32;
     for i in 0..out_features {
         let v_orig = unsafe { *p_orig.add(i) };
         let v_repack = unsafe { *p_repack.add(i) };
+        let v_simd = unsafe { *p_simd.add(i) };
         assert_eq!(
             v_orig.to_bits(),
             v_repack.to_bits(),
             "Output mismatch at element {}: orig {} vs repacked {}",
             i, v_orig, v_repack
         );
+        assert_eq!(
+            v_orig.to_bits(),
+            v_simd.to_bits(),
+            "Output mismatch at element {}: orig {} vs simd {}",
+            i, v_orig, v_simd
+        );
     }
-    println!("T5: Metal GPU repacked GEMV matches original Ishizuki 100% bit-exact across {} elements!", out_features);
+    println!("T5: Metal GPU repacked GEMV and SIMD GEMV match original Ishizuki 100% bit-exact across {} elements!", out_features);
 }
 

@@ -56,7 +56,7 @@ fn main() {
         let buf = device.new_buffer_with_data(
             big.as_ptr() as *const std::ffi::c_void,
             (big.len() * 2) as u64,
-            MTLResourceOptions::StorageModeShared,
+            MTLResourceOptions::StorageModeShared | MTLResourceOptions::HazardTrackingModeUntracked,
         );
         let stride = (packed.len() * 2) as u64;
         println!(
@@ -85,50 +85,25 @@ fn main() {
             MTLResourceOptions::StorageModeShared,
         );
         let trans = device.new_buffer((in_f * 2) as u64, MTLResourceOptions::StorageModeShared);
-        let raw = device.new_buffer((out_f * 2) as u64, MTLResourceOptions::StorageModeShared);
+        let raw = device.new_buffer((out_f * 16) as u64, MTLResourceOptions::StorageModeShared);
         let outb = device.new_buffer((out_f * 2) as u64, MTLResourceOptions::StorageModeShared);
 
         let iters = 20;
-        // Warmup
-        for _ in 0..3 {
-            let mut e = MetalEncoder::new(&queue).unwrap();
-            kernels
-                .encode_gemv_named(
-                    &mut e,
-                    "linear_gemv_ishizuki_k3_colmajor",
-                    &LinearEncodeRequest {
-                        packed: &buf,
-                        packed_offset: 0,
-                        perm_mode: 0,
-                        input: &input_b,
-                        input_signs: &is_b,
-                        output_signs: &os_b,
-                        transformed: &trans,
-                        raw: &raw,
-                        output: &outb,
-                        in_features: in_f,
-                        out_features: out_f,
-                        rate: Exl3Rate::Integer(bits),
-                        codebook: Exl3Codebook::Mcg,
-                        pretransformed: false,
-                    },
-                )
-                .unwrap();
-            e.commit_and_wait().unwrap();
-        }
-
-        let mut best = f64::MAX;
-        for _ in 0..5 {
-            let mut enc = MetalEncoder::new(&queue).unwrap();
-            let t = Instant::now();
-            for w in 0..iters as u64 {
+        for (k_name, label) in [
+            ("linear_gemv_ishizuki_k3_colmajor", "baseline colmajor"),
+            ("linear_gemv_ishizuki_k3_colmajor_stream", "stream colmajor"),
+            ("linear_gemv_ishizuki_k3_colmajor_sk4", "split-k 4 colmajor"),
+        ] {
+            // Warmup
+            for _ in 0..2 {
+                let mut e = MetalEncoder::new(&queue).unwrap();
                 kernels
                     .encode_gemv_named(
-                        &mut enc,
-                        "linear_gemv_ishizuki_k3_colmajor",
+                        &mut e,
+                        k_name,
                         &LinearEncodeRequest {
                             packed: &buf,
-                            packed_offset: (w as usize % copies) as u64 * stride,
+                            packed_offset: 0,
                             perm_mode: 0,
                             input: &input_b,
                             input_signs: &is_b,
@@ -144,19 +119,50 @@ fn main() {
                         },
                     )
                     .unwrap();
+                e.commit_and_wait().unwrap();
             }
-            enc.commit_and_wait().unwrap();
-            best = best.min(t.elapsed().as_secs_f64() / iters as f64);
+
+            let mut best = f64::MAX;
+            for _ in 0..5 {
+                let mut enc = MetalEncoder::new(&queue).unwrap();
+                let t = Instant::now();
+                for w in 0..iters as u64 {
+                    kernels
+                        .encode_gemv_named(
+                            &mut enc,
+                            k_name,
+                            &LinearEncodeRequest {
+                                packed: &buf,
+                                packed_offset: (w as usize % copies) as u64 * stride,
+                                perm_mode: 0,
+                                input: &input_b,
+                                input_signs: &is_b,
+                                output_signs: &os_b,
+                                transformed: &trans,
+                                raw: &raw,
+                                output: &outb,
+                                in_features: in_f,
+                                out_features: out_f,
+                                rate: Exl3Rate::Integer(bits),
+                                codebook: Exl3Codebook::Mcg,
+                                pretransformed: false,
+                            },
+                        )
+                        .unwrap();
+                }
+                enc.commit_and_wait().unwrap();
+                best = best.min(t.elapsed().as_secs_f64() / iters as f64);
+            }
+            let secs = best;
+            let gbps = weight_bytes / secs / 1e9;
+            let weights = (in_f * out_f) as f64;
+            println!(
+                "  [{label:<15}] {:>7.2} ms  {:>6.1} GB/s  {:>5.2} e9 weights/s  ({:.1}% of 273 GB/s)",
+                secs * 1e3,
+                gbps,
+                weights / secs / 1e9,
+                gbps / 273.0 * 100.0
+            );
         }
-        let secs = best;
-        let gbps = weight_bytes / secs / 1e9;
-        let weights = (in_f * out_f) as f64;
-        println!(
-            "{name}: {:>7.2} ms  {:>6.1} GB/s  {:>5.2} e9 weights/s  ({:.1}% of 273 GB/s)",
-            secs * 1e3,
-            gbps,
-            weights / secs / 1e9,
-            gbps / 273.0 * 100.0
-        );
     }
 }
