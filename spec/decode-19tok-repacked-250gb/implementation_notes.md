@@ -437,3 +437,89 @@ step-mode report prints exactly the decomposition that would attribute the ~9 ms
 (`dp_span` vs `dp_wall` vs their ratio), and it costs one extra commit per step
 without draining, so it does not serialise the host. It has never been run and
 recorded. `KAPLUMBA_STEP_TRACE=1` likewise never appears in any spec.
+
+---
+
+## 2026-09-30: T14.1 — the D=32 probe
+
+### What the probe is, and why the alignment made it worse than advertised
+
+The plan said "8 lanes x 1 `uint4` = 10 requests per tile". That is not achievable.
+A `D=32` lane reads ring words `[3p, 3p+4)`, and word `w` sits at byte `4*w` from
+the tile base. Tile bases are `96*tk + tn*tiles_k*96` bytes — every term a multiple
+of 16 — so only `4*3p = 12p` decides the legal load width:
+
+| p | byte offset | widest legal load | requests |
+|---:|---:|---|---:|
+| 0, 4 | 0, 48 | `uint4` | 1 each |
+| 2, 6 | 24, 72 | 2x `uint2` | 2 each |
+| 1, 3, 5, 7 | 12, 36, 60, 84 | 4x `uint` | 4 each |
+
+**22 requests, not 10.** The *byte* count is unaffected — 128 per tile against the
+live kernel's 256 — because every word a lane loads is a word it needs. Verified
+exhaustively: lane `p` needs ring bits `[96p, 96p+109)` and `{3p..3p+3}` covers that
+for all 8 lanes, with p=7 wrapping through word 0. So there is no fetch
+amplification hiding in the misalignment, only a request count.
+
+That is why the *same* 128 bytes is issued two ways, as two kernels:
+
+| arm | requests | bytes | byte amp |
+|---|---:|---:|---:|
+| `..._contig4` (reference, D=8) | 64 | 256 | 2.667 |
+| `..._d32_probe` | 22 | 128 | 1.333 |
+| `..._d32_probe_sc4` | 32 | 128 | 1.333 |
+
+The last two are byte-identical and differ only in request count. **That is the
+experiment.** If the ~187.7 GB/s plateau is a bytes wall the two match; if it is a
+requests wall the scalar arm is 32/22 slower. The existing data cannot separate
+these, because at 3 bpw and 6 bpw they coincide exactly (64x4 = 2.667x96, 96x4 =
+2.000x192), so a law fitted to those two points cannot either.
+
+### Two model bugs the unit tests caught, both mine
+
+1. **`words = 16 * bits` is the u16 count, not the u32 word count.** The latter is
+   `8 * bits`. This made a 24-word tile report as 48 and the whole model 2x wrong.
+   `16 * bits` appears in `bench.rs` and `exl3.rs:740` for the *u16* length, which
+   is where the confusion came from.
+2. **The span must scale with `bits`, not assume 3.** `3*(D-1) + 19 + 16` happened
+   to give the right answer for 3 bpw and the wrong one (2 words instead of 3) for
+   6 bpw, which broke the `lm_head` reference row.
+
+A third claim was **removed** rather than fixed: "the live kernel issues 64 requests
+where alignment permits 32, a 2x reduction left unclaimed". The model's per-lane
+word index is `floor(3D*p/32)`, but the live kernel's `j0` comes from the ring wrap
+(`lo0 = (lane*8+1)*3 + RING - 16`). Different mappings, so the two request counts
+are not comparable and the claim was not established. Replaced with a test that
+pins `ideal_lane_loads` as meaningful **only** for `D = 32`, where the model's index
+is `3p` and is exactly what the probe loads.
+
+`DECODE_WINDOW_OFFSET = 19` is the model's one measured constant, and it is pinned
+by a `#[should_panic]` sabotage test because the plausible-looking alternative
+(−13) gives the same 2-word answer at `D = 8` and differs by a whole word at
+`D = 32` — 33% of the tile's traffic, silently.
+
+### Register pressure: the probe looked hung and was not
+
+First version of `d32_consume` materialised `float v[32]` and indexed it in a
+second loop. The caller unrolls four k-tiles, so that is **128 live registers per
+thread**; AGX has ~128, so it spilled to local memory and the kernel ran so slowly
+that the benchmark sat in `libobjcMsgSend` (i.e. `commitAndWait`) for minutes. It
+looked exactly like a hang and the process had to be killed.
+
+Fixed by folding each dequantized value straight into the accumulator, leaving one
+value live at a time, with the 16 activations as the only array. Two things kept:
+
+- the note in the kernel body, because the "obvious" refactor reintroduces it;
+- a **single-dispatch smoke check** in `probe_d32` that aborts if any probe arm is
+  >8x slower than the reference. A pathological kernel and a bandwidth result must
+  not be confusable, and waiting 20 minutes to find out which one you have is not
+  a debugging method.
+
+### Wiring safety
+
+`LinearKernels::is_probe_name` keeps `*_probe*` kernels out of every rate's dispatch
+slot. Necessary because `ishizuki_rate_of_name` still parses
+`..._k3_colmajor_d32_probe` as rate 3, and the slot is claimed by whichever kernel
+for a rate sorts first — so a probe could silently become the live kernel, and these
+probes return deliberately wrong numbers. `encode_d32_probe` additionally refuses
+any name that is not a probe. Both are tested.

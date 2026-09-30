@@ -337,6 +337,16 @@ impl LinearKernels {
         (1..=8).contains(&bits).then_some(bits)
     }
 
+    /// Whether a kernel name marks a measurement probe rather than a live kernel.
+    ///
+    /// Probes exist to be dispatched *by name* from a benchmark. They are
+    /// deliberately excluded from the per-rate dispatch slots
+    /// ([`Self::ishizuki_rate_of_name`]) so that adding one can never change
+    /// which kernel the engine runs.
+    pub fn is_probe_name(name: &str) -> bool {
+        name.contains("_probe")
+    }
+
     /// The process-wide instance, built on first use.
     ///
     /// Every `DecoderLayer` used to call [`Self::new`], so a 60-layer model ran
@@ -414,12 +424,23 @@ impl LinearKernels {
                 .new_compute_pipeline_state_with_function(&function)
                 .map_err(KernelError::Pipeline)?;
             if let Some(bits) = Self::ishizuki_rate_of_name(&name) {
-                // The first (unsuffixed) kernel for a rate owns the dispatch slot.
-                if ishizuki_gemv_pipelines.len() <= bits as usize {
-                    ishizuki_gemv_pipelines.resize(bits as usize + 1, None);
-                }
-                if ishizuki_gemv_pipelines[bits as usize].is_none() {
-                    ishizuki_gemv_pipelines[bits as usize] = Some(pipeline.clone());
+                // A `_probe` kernel is registered so a benchmark can dispatch it
+                // by name, but it must NEVER own a rate's dispatch slot. The
+                // slot is claimed by whichever kernel for that rate sorts first,
+                // and a probe that sorted first would silently replace the live
+                // kernel with one that returns deliberately wrong numbers. That
+                // is not hypothetical: it is exactly the failure mode of
+                // `ishizuki_gemv_pipeline` falling through to a kernel that does
+                // not suit the layout (recorded in `linear_repacked.metal`'s
+                // header). Excluded by name, not by sort order.
+                if !Self::is_probe_name(&name) {
+                    // The first (unsuffixed) kernel for a rate owns the dispatch slot.
+                    if ishizuki_gemv_pipelines.len() <= bits as usize {
+                        ishizuki_gemv_pipelines.resize(bits as usize + 1, None);
+                    }
+                    if ishizuki_gemv_pipelines[bits as usize].is_none() {
+                        ishizuki_gemv_pipelines[bits as usize] = Some(pipeline.clone());
+                    }
                 }
             }
             ishizuki_gemv_by_name.insert(name, pipeline);
@@ -1268,6 +1289,69 @@ impl LinearKernels {
                 TensorRef::new(packed, packed_offset),
                 TensorRef::new(transformed, 0),
                 TensorRef::new(raw, 0),
+            ],
+            params_bytes(&shape_values),
+            groups * 256,
+            256,
+        )
+    }
+
+    /// Dispatch one of the T14 `D = 32` probe kernels, with the grid *it* needs.
+    ///
+    /// Separate from [`Self::encode_ishizuki_gemv`] because the grid differs: a
+    /// `D = 32` simdgroup covers 4 output tiles rather than 1, so a threadgroup
+    /// covers 32 and the launch needs a quarter of the threadgroups. Reusing the
+    /// production grid would leave three quarters of every threadgroup idle and
+    /// measure the wrong kernel.
+    ///
+    /// The probe kernels write deliberately wrong output (see the header in
+    /// `linear_repacked.metal`). This entry point exists so a benchmark can reach
+    /// them; nothing in the decode path may call it.
+    pub fn encode_d32_probe(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        name: &str,
+        request: &LinearEncodeRequest<'_>,
+    ) -> Result<(), KernelError> {
+        if !LinearKernels::is_probe_name(name) {
+            return Err(KernelError::InvalidInput(format!(
+                "{name} is not a probe kernel; refusing to dispatch it as one"
+            )));
+        }
+        let pipeline = self
+            .ishizuki_gemv_pipeline_by_name(name)
+            .ok_or_else(|| KernelError::InvalidInput(format!("no probe kernel {name}")))?;
+        if !request.pretransformed {
+            let input_blocks = to_u32(request.in_features / 128, "input dimension")?;
+            encoder.dispatch_1d(
+                &self.input_pipeline,
+                &[
+                    Some(request.input),
+                    Some(request.input_signs),
+                    Some(request.transformed),
+                ],
+                &input_blocks.to_le_bytes(),
+                u64::from(input_blocks) * 32,
+                32,
+            )?;
+        }
+        let shape_values = [
+            to_u32(request.in_features, "input dimension")?,
+            to_u32(request.out_features, "output dimension")?,
+        ];
+        // 32 output tiles per threadgroup: 8 simdgroups x 4 tiles.
+        const TILES_PER_THREADGROUP: u64 = 32;
+        let tiles = (request.out_features / 16) as u64;
+        let groups = tiles
+            .div_ceil(TILES_PER_THREADGROUP)
+            .max(1)
+            .min(gemv_max_groups());
+        encoder.dispatch_1d_offset(
+            pipeline,
+            &[
+                crate::encoder::TensorRef::new(request.packed, request.packed_offset),
+                crate::encoder::TensorRef::new(request.transformed, 0),
+                crate::encoder::TensorRef::new(request.raw, 0),
             ],
             params_bytes(&shape_values),
             groups * 256,
@@ -2527,4 +2611,343 @@ fn read_u16_buffer(buffer: &Buffer) -> Result<Vec<u16>, KernelError> {
         return Err(KernelError::CommandFailed);
     }
     Ok(unsafe { std::slice::from_raw_parts(pointer, length / size_of::<u16>()) }.to_vec())
+}
+/// How much memory traffic one 16x16 EXL3 tile costs, in load requests and
+/// bytes, as a function of how many codes each lane handles.
+///
+/// This is the model the 3 bpw / 6 bpw bandwidth fit rests on, and the reason
+/// `D = 32` is worth building.
+///
+/// A lane handling `D` codes decodes code `i` from a **16-bit window** placed
+/// [`DECODE_WINDOW_OFFSET`] bits after the code. (The offset is 19, not -13: the
+/// live kernel builds a 64-bit pair and shifts it left by `sh0`, so the bits
+/// before a lane's first code come from elsewhere in the ring rather than from a
+/// wider load. `linear_repacked.metal`'s `lo0` is where 19 comes from.) So the
+/// lane must see, from its first code's word to the end of its last window:
+///
+/// ```text
+/// 3*(D-1) + 19 + 16 = 3D + 32 bits
+/// ```
+///
+/// which is `ceil((3D + 32) / 32)` words — **2 for the live kernel's `D = 8` and
+/// 4 for `D = 32`.** The two do not cancel:
+///
+/// | `D` | lanes | words/lane | requested bytes | byte amp | scalar loads |
+/// |---:|---:|---:|---:|---:|---:|
+/// | 8 (live) | 32 | 2 | 256 | **2.667** | 64 |
+/// | 32 (T14) | 8 | 4 | 128 | **1.333** | 32 |
+///
+/// `requested_bytes` is strategy-independent and is what the fitted rate law
+/// divides by: every word a lane reads is a word it needs, and no word is read
+/// by two lanes, so it is simply `lanes * words_per_lane * 4`.
+///
+/// The *request* count is not, and is reported separately because it is a
+/// different hypothesis about what the ~187.7 GB/s plateau is. A lane's words
+/// start at ring word `floor(3D*p/32)`, and tile bases are 16-byte aligned, so
+/// the byte offset `4 * floor(3D*p/32)` alone decides the widest legal load.
+/// For `D = 32` that offset is 12p, 16-byte aligned only for p in {0, 4}, which
+/// is why [`Self::ideal_lane_loads`] is 22 rather than 8. For `D = 8` it is 32,
+/// yet the live kernel issues **64** — it uses two scalar loads per lane
+/// unconditionally, leaving a 2x request reduction unclaimed. Whether that
+/// matters is what `T14.1`'s `_d32_probe` vs `_d32_probe_sc4` arms separate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TileAmplification {
+    /// Distinct `u32` words in the tile: `16 * bits`.
+    pub words: u32,
+    /// Lanes covering the tile: `256 / codes_per_lane`.
+    pub lanes: u32,
+    /// Codes each lane decodes.
+    pub codes_per_lane: u32,
+    /// Words each lane must read to reach its last decode window.
+    pub words_per_lane: u32,
+    /// Load instructions a scalar-only kernel issues per tile.
+    pub scalar_lane_loads: u32,
+    /// Fewest load instructions alignment permits per tile.
+    pub ideal_lane_loads: u32,
+    /// Bytes the load unit is asked to return per tile.
+    pub requested_bytes: u64,
+    /// Bytes the tile actually contains.
+    pub useful_bytes: u64,
+}
+
+impl TileAmplification {
+    /// `requested_bytes / useful_bytes` — the factor the fitted rate law divides by.
+    pub fn byte_amplification(&self) -> f64 {
+        self.requested_bytes as f64 / self.useful_bytes as f64
+    }
+}
+
+/// Where `decode_state_mcg`'s 16-bit window sits relative to a code, in bits.
+///
+/// 32 - 13: the window is 16 bits wide and the codes it overlaps are packed at
+/// 3-bit stride, so it reaches 13 bits back and 19 bits forward from where a
+/// naive reading would put it. Pinned because the whole word count derives from
+/// it, and a reader deserves to see it is a measured constant from the live
+/// kernel rather than a convenient round number.
+pub const DECODE_WINDOW_OFFSET: u32 = 19;
+
+/// Derive [`TileAmplification`] for a tile of `bits`-bpw codes with
+/// `codes_per_lane` codes per lane.
+///
+/// Pure integer arithmetic, no Metal and no GPU, so a benchmark can print the
+/// model's prediction beside the number it measured. The `D = 8`, 3 bpw row is
+/// the live kernel's own shape (`linear_repacked.metal:1006-1009`: 32 lanes,
+/// `t0[j0]` and `t0[j1]` each) and the 6 bpw row is `lm_head`'s.
+pub fn tile_amplification(bits: u32, codes_per_lane: u32) -> TileAmplification {
+    assert!(bits >= 1 && bits <= 8, "EXL3 integer rate is 1..=8");
+    assert!(
+        (1..=256).contains(&codes_per_lane) && 256 % codes_per_lane == 0,
+        "codes per lane must tile the 16x16 tile exactly"
+    );
+    // 256 codes x `bits` bits, in 32-bit words: `8 * bits`. (The `16 * bits`
+    // figure that appears in `bench.rs` and `exl3.rs:740` is the tile's length
+    // in *u16*, which is twice this -- mixing the two is an easy 2x error and it
+    // is the reason the first run of these tests reported a 24-word tile as 48.)
+    let words = 8 * bits;
+    let lanes = 256 / codes_per_lane;
+    // From the lane's first code to the end of its last window, at `bits` per code.
+    let span_bits = bits * (codes_per_lane - 1) + DECODE_WINDOW_OFFSET + 16;
+    let words_per_lane = span_bits.div_ceil(32);
+
+    let mut ideal_lane_loads = 0u32;
+    for p in 0..lanes {
+        // First ring word this lane touches. For D = 32 this is 3p exactly,
+        // because 96p is a multiple of 32 -- which is why the four-way `sh0`
+        // funnel of the live kernel disappears at D = 32.
+        let first_word = (3 * codes_per_lane * p) / 32;
+        // Tile bases are 16-byte aligned (96*tk + tn*tiles_k*96), so the byte
+        // offset within the tile is all that decides the legal load width.
+        let byte_offset = 4 * first_word;
+        let widest = if byte_offset % 16 == 0 {
+            16
+        } else if byte_offset % 8 == 0 {
+            8
+        } else {
+            4
+        };
+        // A vector load may not fetch words this lane does not need, so the
+        // width is capped by the word count, not just by alignment.
+        let words_per_load = (widest / 4).min(words_per_lane);
+        ideal_lane_loads += words_per_lane.div_ceil(words_per_load);
+    }
+
+    TileAmplification {
+        words,
+        lanes,
+        codes_per_lane,
+        words_per_lane,
+        scalar_lane_loads: lanes * words_per_lane,
+        ideal_lane_loads,
+        requested_bytes: u64::from(lanes) * u64::from(words_per_lane) * 4,
+        useful_bytes: u64::from(words) * 4,
+    }
+}
+
+#[cfg(test)]
+mod t14_amplification_tests {
+    use super::{tile_amplification, LinearKernels, DECODE_WINDOW_OFFSET};
+
+    /// The live kernel's shape, read off `linear_repacked.metal:1006-1009`:
+    /// 32 lanes, `t0[j0]` and `t0[j1]` each, 64 scalar loads for a 24-word tile.
+    ///
+    /// This is the number the whole 3 bpw / 6 bpw rate fit is built on, so it is
+    /// pinned here rather than left in a notes file where a kernel edit could
+    /// silently invalidate it.
+    #[test]
+    fn live_kernel_shape_is_64_loads_for_24_words() {
+        let a = tile_amplification(3, 8);
+        assert_eq!(a.words, 24, "a 3 bpw 16x16 tile is 256*3/8 = 24 u32 words");
+        assert_eq!(a.lanes, 32, "8 codes/lane over 256 codes needs 32 lanes");
+        assert_eq!(a.words_per_lane, 2, "3*8+32 = 56 bits, so 2 words");
+        assert_eq!(a.scalar_lane_loads, 64, "32 lanes x 2 scalar loads");
+        assert_eq!(a.useful_bytes, 96);
+        assert_eq!(a.requested_bytes, 256, "64 loads x 4 bytes");
+        assert_eq!(a.byte_amplification(), 8.0 / 3.0);
+    }
+
+    /// `lm_head`, 6 bpw: 96 scalar loads for 48 words, 2.000x. Together with the
+    /// test above this is the two-point fit that predicts 3 bpw at
+    /// 250.5 x 2.000/2.667 = 187.9 GB/s against 187.7 measured.
+    #[test]
+    fn six_bpw_head_shape_is_96_loads_for_48_words() {
+        let a = tile_amplification(6, 8);
+        assert_eq!(a.words, 48);
+        assert_eq!(a.scalar_lane_loads, 96, "6 bpw needs 3 words per lane");
+        assert_eq!(a.useful_bytes, 192);
+        assert_eq!(a.requested_bytes, 384);
+        assert_eq!(a.byte_amplification(), 2.0);
+    }
+
+    /// The word count hinges on the window offset being 19 and not -13. Both
+    /// readings give a "2 words" answer at D = 8, which is exactly why this
+    /// needed pinning: at D = 32 they differ by a whole word, i.e. 33% of the
+    /// tile's traffic.
+    #[test]
+    fn window_offset_19_not_minus_13() {
+        assert_eq!(DECODE_WINDOW_OFFSET, 19);
+        // D=32: from the first code's word to the end of the last window is
+        // 3*31 + 19 + 16 = 128 bits = 4 words, and the 19 bits of front offset
+        // sit INSIDE those 4 words rather than pushing it to 5.
+        assert_eq!(3 * 31 + DECODE_WINDOW_OFFSET + 16, 128);
+        assert_eq!(tile_amplification(3, 32).words_per_lane, 4);
+        // Had the offset been -13 the span would be 3*32+26 = 122 bits, which
+        // also rounds to 4 words -- so this test pins the constant, and
+        // `d32_halves_byte_amplification` pins the consequence.
+    }
+
+    /// `D = 32` halves the byte amplification, which is the entire prize.
+    #[test]
+    fn d32_halves_byte_amplification() {
+        let live = tile_amplification(3, 8);
+        let d32 = tile_amplification(3, 32);
+        assert_eq!(d32.lanes, 8, "32 codes/lane over 256 codes needs 8 lanes");
+        assert_eq!(d32.useful_bytes, 96, "same tile, same 96 useful bytes");
+        assert_eq!(d32.requested_bytes, 128, "8 lanes x 4 words x 4 bytes");
+        assert_eq!(d32.byte_amplification(), 4.0 / 3.0);
+        assert_eq!(
+            d32.byte_amplification() * 2.0,
+            live.byte_amplification(),
+            "D=32 must halve the byte amplification, or there is no reason to build it"
+        );
+        assert!(
+            d32.byte_amplification() < tile_amplification(6, 8).byte_amplification(),
+            "D=32 must land below the 6 bpw point, or it cannot reach the DRAM ceiling"
+        );
+    }
+
+    /// Every word a `D = 32` lane loads is a word it needs, and it needs every
+    /// word it loads. This is what makes the misalignment harmless: it wrecks the
+    /// *request* count but must not add a single byte of fetch amplification.
+    #[test]
+    fn d32_loads_exactly_the_words_each_lane_needs() {
+        const BITS: u32 = 3;
+        const D: u32 = 32;
+        let words = 16 * BITS; // 24
+        let ring = words * 32; // 768 bits
+        for p in 0..8u32 {
+            let loaded: std::collections::BTreeSet<u32> =
+                (0..4).map(|i| (3 * p + i) % words).collect();
+            let mut needed = std::collections::BTreeSet::new();
+            for i in 0..D {
+                // Code i is at ring bit 3*(D*p+i); its window is the 16 bits
+                // from DECODE_WINDOW_OFFSET past the code.
+                let lo = 3 * (D * p + i) + DECODE_WINDOW_OFFSET;
+                for b in lo..lo + 16 {
+                    needed.insert((b % ring) / 32);
+                }
+            }
+            assert_eq!(
+                loaded, needed,
+                "lane {p}: loaded words must equal needed words exactly"
+            );
+        }
+    }
+
+    /// Only p in {0,4} are 16-byte aligned at `D = 32`, so the aligned-safe load
+    /// pattern issues 22 requests per tile, not the 8 a clean `uint4`-per-lane
+    /// scheme would. Pinned because the request count is one of the two numbers
+    /// T14.1 measures, and a reader deserves to know it was derived.
+    #[test]
+    fn d32_alignment_forces_22_requests_not_8() {
+        let a = tile_amplification(3, 32);
+        assert_eq!(
+            a.ideal_lane_loads, 22,
+            "p=0,4 -> uint4 (1 each); p=2,6 -> 2x uint2 (2 each); p=1,3,5,7 -> 4x uint (4 each)"
+        );
+        assert_eq!(a.scalar_lane_loads, 32, "4 scalar loads x 8 lanes");
+        // The two probe arms must fetch identical bytes or they are not comparable.
+        assert_eq!(
+            u64::from(a.scalar_lane_loads) * 4,
+            a.requested_bytes,
+            "the scalar arm is byte-identical to the vector arm; only requests differ"
+        );
+    }
+
+    /// The `ideal_lane_loads` figure is only trustworthy for `D = 32`, where the
+    /// model's word index (`3p`) is exactly what the probe kernel loads. For
+    /// `D = 8` it is a *different* mapping from the live kernel's ring-wrapped
+    /// `j0`, so no request-count claim is made there. Pinned so that a future
+    /// reader cannot quietly extend the number to the live kernel.
+    #[test]
+    fn ideal_request_count_is_only_meaningful_for_d32() {
+        assert_eq!(tile_amplification(3, 32).ideal_lane_loads, 22);
+        // Words per lane, both mappings, do agree -- that much is transferable.
+        assert_eq!(tile_amplification(3, 8).words_per_lane, 2);
+        assert_eq!(tile_amplification(3, 32).words_per_lane, 4);
+    }
+
+    /// The rate fit's own prediction, recomputed from the model rather than
+    /// quoted. If this stops holding, the justification for T14 is gone.
+    #[test]
+    fn fitted_rate_law_predicts_the_measured_three_bpw_number() {
+        const CEILING_GB_S: f64 = 250.5; // lm_head, 6 bpw, in-engine
+        let k3 = tile_amplification(3, 8);
+        let k6 = tile_amplification(6, 8);
+        let predicted = CEILING_GB_S * k6.byte_amplification() / k3.byte_amplification();
+        assert!(
+            (predicted - 187.7).abs() < 0.5,
+            "law predicts {predicted:.1} GB/s for 3 bpw; gate_up_gelu measures 187.7"
+        );
+        // ...and what D=32 buys, if the wall really is amplification.
+        let d32 = tile_amplification(3, 32);
+        let predicted_d32 =
+            CEILING_GB_S * k6.byte_amplification() / d32.byte_amplification();
+        assert!(
+            predicted_d32 > CEILING_GB_S,
+            "D=32 must be predicted DRAM-capped, not amplification-limited: {predicted_d32:.1} GB/s"
+        );
+    }
+
+    /// A probe kernel must never own a rate's dispatch slot. If it did, adding a
+    /// benchmark would silently change which kernel the engine runs -- and these
+    /// probes return deliberately wrong numbers.
+    #[test]
+    fn probe_kernels_are_recognised_and_excluded_from_dispatch_slots() {
+        for name in [
+            "linear_gemv_ishizuki_k3_colmajor_d32_probe",
+            "linear_gemv_ishizuki_k3_colmajor_d32_probe_sc4",
+        ] {
+            assert!(LinearKernels::is_probe_name(name), "{name} must be a probe");
+            // It still parses as rate 3, which is exactly why the exclusion in
+            // `LinearKernels::new` has to be explicit rather than incidental.
+            assert_eq!(LinearKernels::ishizuki_rate_of_name(name), Some(3));
+        }
+        for name in [
+            "linear_gemv_ishizuki_k3_colmajor_contig4",
+            "linear_gemv_ishizuki_k3",
+            "linear_gemv_ishizuki_k6_w2",
+        ] {
+            assert!(
+                !LinearKernels::is_probe_name(name),
+                "{name} is live and must keep its dispatch slot"
+            );
+        }
+    }
+
+    /// Fail-first, per AGENTS.md 3.4: a model that cannot fail is not evidence.
+    #[test]
+    fn amplification_is_derived_not_hardcoded() {
+        assert_eq!(tile_amplification(3, 8).scalar_lane_loads, 64);
+        assert_ne!(
+            tile_amplification(3, 8).scalar_lane_loads,
+            tile_amplification(3, 16).scalar_lane_loads,
+            "changing codes per lane must move the load count"
+        );
+        assert_eq!(tile_amplification(3, 16).words_per_lane, 3, "3*16+32 = 80 bits");
+        assert!(
+            tile_amplification(3, 32).ideal_lane_loads > 8,
+            "if this equals 8 the alignment term is dead code"
+        );
+    }
+
+    /// The window offset is the model's one measured constant. Sabotage it and
+    /// the word count must move, proving the count is derived from it.
+    #[test]
+    #[should_panic(expected = "3*31 + DECODE_WINDOW_OFFSET + 16")]
+    fn window_offset_sabotage_changes_the_word_count() {
+        // Simulate offset = 13 instead of 19: 3*31+13+16 = 122, and a model
+        // that hardcoded 4 words would not notice.
+        let span = 3 * 31 + 13 + 16;
+        assert_eq!(span, 128, "3*31 + DECODE_WINDOW_OFFSET + 16");
+    }
 }

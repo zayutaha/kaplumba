@@ -1436,3 +1436,216 @@ kernel void linear_gemv_ishizuki_k3_colmajor_u4(
     }
 }
 
+// ============================================================================
+// T14 PROBE KERNELS -- 32 codes per lane (`D = 32`).
+//
+// *** THE OUTPUT OF BOTH KERNELS BELOW IS DELIBERATELY MEANINGLESS. ***
+// They exist to answer one question (spec AC7) and nothing else: does issuing
+// 4 words per lane instead of 2 -- which halves the byte amplification per tile
+// from 2.667 to 1.333 -- actually move the achieved bandwidth, or is the ~187.7
+// GB/s plateau caused by something else entirely?
+//
+// They are NOT candidates for the decode path. Both produce wrong numbers on
+// purpose and must never be wired into `ishizuki_gemv_pipeline`. The correct
+// kernel is T14.2 and does not exist yet; if AC7 passes, that is when it gets
+// written, with a brute-force CPU reference for the lane->(output,k) map.
+//
+// ----------------------------------------------------------------------------
+// WHY 8 LANES AND NOT 32
+//
+// A 3 bpw tile is 256 codes in 768 ring bits = 24 `u32` words. The live kernel
+// gives each of 32 lanes 8 codes: 24 consecutive ring bits, and because the
+// decode window is 16 bits wide per code the lane must see 3*8+13 = 37 bits, so
+// it reads 2 words. 32 lanes x 2 = 64 lane-loads for 24 words = 2.667x.
+//
+// `D = 32` gives each lane 32 codes: 96 ring bits, needing 96+13 = 109 bits, so
+// 4 words -- and 4 words is 128 bits, so it fits with 19 bits of slack. Eight
+// lanes now cover the tile, and 8 x 4 = 32 lane-loads = 1.333x in bytes.
+//
+// The alignment decides the request count. A lane's 4 words are the ring words
+// [3p, 3p+4), and word `w` sits at byte 4*w from the tile base. Tile bases are
+// 96*tk + tn*tiles_k*96 bytes, every term a multiple of 16, so only 4*(3p) = 12p
+// decides what load width is legal:
+//
+//   p = 0,4      -> byte offset  0,48 -> uint4        (1 request)
+//   p = 2,6      -> byte offset 24,72 -> 2x uint2      (2 requests)
+//   p = 1,3,5,7  -> byte offset 12,36,60,84 -> 4x uint (4 requests)
+//
+// => 22 requests and 128 bytes per tile, not the 10 requests a clean
+// "8 lanes x 1 uint4" would give. The BYTE count is the one the fitted law turns
+// on and it is unaffected: every one of the 4 words a lane loads is a word it
+// needs. Lane p needs ring bits [96p, 96p+109) and {3p..3p+3} covers that
+// exactly for all 8 lanes, p=7 wrapping through word 0. Nothing is loaded that
+// is not used, so no fetch amplification hides in the misalignment.
+//
+// ----------------------------------------------------------------------------
+// WHY THERE ARE TWO KERNELS
+//
+// `_d32_probe`      22 requests / 128 bytes per tile
+// `_d32_probe_sc4`  32 requests / 128 bytes per tile  (4 scalar loads per lane)
+//
+// Both fetch 128 bytes for 96 useful, so they have IDENTICAL byte amplification
+// and differ only in request count. If the ~187.7 GB/s plateau is a *bytes* wall,
+// the two measure the same. If it is a *requests* wall, the scalar arm is 32/22
+// slower. That difference is the whole experiment, and it is the only
+// measurement that can tell the two hypotheses apart: in the existing data they
+// coincide exactly (64 loads x 4 B = 2.667 x 96 at 3 bpw, and 96 x 4 = 2.000 x 192
+// at 6 bpw), so a law fitted to those two points cannot separate them.
+//
+// The 4-way k-tile unroll matches `_contig4`'s, so the probe's latency-hiding
+// behaviour is representative rather than accidentally pessimistic.
+// ============================================================================
+
+// Consume one 16x16 tile's four words for this lane and fold them into the two
+// partial sums. `xr` points at this tile's 16 activation values.
+//
+// REGISTER PRESSURE — read before changing this. The first version materialised
+// `float v[32]` and then indexed it in a second loop, and because the caller
+// unrolls four k-tiles that is 128 live registers per thread. AGX has ~128, so
+// the whole thing spilled to local memory and the kernel became so slow the
+// benchmark looked hung (it was not: it sat in `commitAndWait` for minutes).
+// Decoding straight into the accumulator keeps exactly one dequantized value
+// live at a time, and the 16 activations are the only array.
+static void d32_consume(
+    uint w0,
+    uint w1,
+    uint w2,
+    uint w3,
+    const device half *xr,
+    thread float &a0,
+    thread float &a1) {
+    // L0 covers ring bits [0,64) of the lane's 128-bit window, L1 covers [64,128).
+    const ulong L0 = ((ulong)w1 << 32) | (ulong)w0;
+    const ulong L1 = ((ulong)w3 << 32) | (ulong)w2;
+
+    // 16 activations, loaded once and used by both outputs.
+    float xs[16];
+    #pragma unroll
+    for (uint k = 0; k < 16u; ++k) {
+        xs[k] = float(xr[k]);
+    }
+
+    #pragma unroll
+    for (uint i = 0; i < 32u; ++i) {
+        // Code i lives at ring bit 3*i of the window and decode_state_mcg wants
+        // the 16 bits from there. `3u*i` folds to a constant under `#pragma
+        // unroll`, so the three arms below are resolved at compile time and cost
+        // nothing at runtime -- which is the point: a probe whose window
+        // extraction cost more than the real kernel's would measure the wrong
+        // thing.
+        const uint b = 3u * i;
+        uint win;
+        if (b + 16u <= 64u) {
+            win = uint(L0 >> b);
+        } else if (b < 64u) {
+            win = (uint(L0 >> b)) | (uint(L1) << (64u - b));
+        } else {
+            win = uint(L1 >> (b - 64u));
+        }
+        // Fold immediately. Do NOT stage these into an array -- see above.
+        const float val = decode_state_mcg(win & 0xffffu);
+        if (i < 16u) {
+            a0 += xs[i] * val;
+        } else {
+            a1 += xs[i - 16u] * val;
+        }
+    }
+}
+
+// Load this lane's 4 words using the widest load each alignment allows.
+static inline uint4 d32_load_vec(const device uint *t0, uint p) {
+    const uint wb = 3u * p;
+    if (p == 0u || p == 4u) {
+        return *(const device uint4 *)(t0 + wb);
+    }
+    if (p == 2u || p == 6u) {
+        const uint2 lo = *(const device uint2 *)(t0 + wb);
+        const uint2 hi = *(const device uint2 *)(t0 + wb + 2u);
+        return uint4(lo, hi);
+    }
+    // p in {1,3,5,7}: 12p is only 4-byte aligned, so four scalar loads.
+    // p == 7 wraps: words 21,22,23 then word 0.
+    return uint4(t0[wb], t0[wb + 1u], t0[wb + 2u], t0[wb + 3u]);
+}
+
+// Same, but always four scalar loads: 32 requests instead of 22 for identical
+// bytes. This is the requests-vs-bytes discriminator. See the header.
+static inline uint4 d32_load_scalar(const device uint *t0, uint p) {
+    const uint wb = 3u * p;
+    return uint4(t0[wb], t0[wb + 1u], t0[wb + 2u], t0[wb + 3u]);
+}
+
+#define D32_PROBE_BODY(LOADER)                                                            \
+    constexpr uint WORDS = 24u;                                                           \
+    constexpr uint SG = 8u;                                                               \
+    const uint K = shape[0];                                                              \
+    const uint N = shape[1];                                                              \
+    const uint tiles_n = N / 16u;                                                         \
+    const uint tiles_k = K / 16u;                                                         \
+    const uint p = lane & 7u;                                                             \
+    const uint tsub = lane >> 3u;                                                         \
+    const uint per_group = SG * 4u;                                                       \
+    const uint step = ntg * per_group;                                                    \
+    for (uint base = tgid * per_group; base < tiles_n; base += step) {                    \
+        const uint tn = base + sg * 4u + tsub;                                            \
+        if (tn >= tiles_n) {                                                              \
+            continue;                                                                     \
+        }                                                                                 \
+        const device uint *column =                                                       \
+            (const device uint *)packed + tn * (tiles_k * WORDS);                         \
+        float a0 = 0.0f;                                                                  \
+        float a1 = 0.0f;                                                                  \
+        const uint k4 = (tiles_k / 4u) * 4u;                                              \
+        uint tk = 0u;                                                                     \
+        for (; tk < k4; tk += 4u) {                                                       \
+            uint4 q0 = LOADER(column + (tk + 0u) * WORDS, p);                             \
+            uint4 q1 = LOADER(column + (tk + 1u) * WORDS, p);                             \
+            uint4 q2 = LOADER(column + (tk + 2u) * WORDS, p);                             \
+            uint4 q3 = LOADER(column + (tk + 3u) * WORDS, p);                             \
+            d32_consume(q0.x, q0.y, q0.z, q0.w, x + (tk + 0u) * 16u, a0, a1);              \
+            d32_consume(q1.x, q1.y, q1.z, q1.w, x + (tk + 1u) * 16u, a0, a1);              \
+            d32_consume(q2.x, q2.y, q2.z, q2.w, x + (tk + 2u) * 16u, a0, a1);              \
+            d32_consume(q3.x, q3.y, q3.z, q3.w, x + (tk + 3u) * 16u, a0, a1);              \
+        }                                                                                 \
+        for (; tk < tiles_k; ++tk) {                                                      \
+            uint4 q = LOADER(column + tk * WORDS, p);                                     \
+            d32_consume(q.x, q.y, q.z, q.w, x + tk * 16u, a0, a1);                         \
+        }                                                                                 \
+        a0 += simd_shuffle_xor(a0, 1u);                                                   \
+        a0 += simd_shuffle_xor(a0, 2u);                                                   \
+        a0 += simd_shuffle_xor(a0, 4u);                                                   \
+        a1 += simd_shuffle_xor(a1, 1u);                                                   \
+        a1 += simd_shuffle_xor(a1, 2u);                                                   \
+        a1 += simd_shuffle_xor(a1, 4u);                                                   \
+        if (p == 0u) {                                                                    \
+            y[tn * 16u + 0u] = a0;                                                        \
+            y[tn * 16u + 1u] = a1;                                                        \
+        }                                                                                 \
+    }
+
+kernel void linear_gemv_ishizuki_k3_colmajor_d32_probe(
+    const device ushort *packed [[buffer(0)]],
+    const device half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant const uint *shape [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    D32_PROBE_BODY(d32_load_vec)
+}
+
+kernel void linear_gemv_ishizuki_k3_colmajor_d32_probe_sc4(
+    const device ushort *packed [[buffer(0)]],
+    const device half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant const uint *shape [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    D32_PROBE_BODY(d32_load_scalar)
+}
+
