@@ -152,6 +152,18 @@ TWO_WORD_SAFE_RATES: tuple[int, ...] = tuple(
     bits for bits in range(1, 9) if two_word_is_safe(bits)[0]
 )
 
+#: Rates at which the NO-DECODE probe is emitted. **Every** rate, deliberately,
+#: and unlike `TWO_WORD_SAFE_RATES` this is a plain list rather than a derivation:
+#: the probe produces garbage, so there is no correctness property for a rate to
+#: satisfy or fail, and narrowing the set would only narrow the experiment.
+#:
+#: The probe exists to separate "3 bpw is slow because of lane-load requests"
+#: from "3 bpw is slow because decode cost per useful byte is higher". Both
+#: predict the same 1.33x, so the contrast arm at a *saturated* high rate is
+#: what makes the reading unambiguous -- without it, a `_nod` number at 3 bpw
+#: could be explained by the probe having removed requests too.
+NO_DECODE_PROBE_RATES: tuple[int, ...] = tuple(range(1, 9))
+
 
 def ishizuki_two_word_kernel(preamble: str, bits: int) -> str:
     """The `linear_gemv_ishizuki_kN_w2` kernel for one bit rate.
@@ -281,6 +293,122 @@ def ishizuki_two_word_kernel(preamble: str, bits: int) -> str:
             "    // This is a VARIANT for A/B and for the golden reference. The\n"
             "    // engine dispatches the unsuffixed kernel unless the measurement\n"
             "    // says otherwise; see spec/decode-bandwidth-240gb/tasks.md T6.\n",
+            1,
+        )
+        .strip()
+    )
+    return kernel
+
+
+NOD_STUB = """
+/// One-AND stand-in for `decode_state`, used ONLY by the `_nod` probe kernels.
+///
+/// Two properties it must have, and both are about the measurement rather than
+/// the arithmetic:
+///
+/// * it **consumes** its argument, so the extraction above it is not
+///   dead-code-eliminated. If the stub ignored `s`, the compiler would delete
+///   the shift-and-mask chain above it and quite possibly the ring loads that
+///   feed it -- which are the very loads being measured. The probe would then
+///   report the bandwidth of a kernel that fetches nothing.
+/// * it is **not constant-foldable**, which is why it is a `static` function
+///   taking a runtime value rather than a macro or a literal.
+///
+/// The output is meaningless. Nothing in the engine dispatches a `_nod` kernel,
+/// and no test compares one against a reference -- see
+/// `ishizuki_no_decode_kernel`.
+static float nod_stub(uint s) { return float(s & 1u); }
+"""
+
+
+def ishizuki_no_decode_kernel(preamble: str, bits: int) -> str:
+    """The `linear_gemv_ishizuki_kN_nod` PROBE kernel for one bit rate.
+
+    **This kernel computes garbage and is never dispatched by the engine.** It
+    replaces `decode_state(s & 0xffffu, CB)` with a cheap function of the same
+    argument, so the output is numerically meaningless while the *memory traffic
+    is byte-for-byte the same as the real kernel*. That is the point: it is a
+    bandwidth probe, not a correctness one, and it is how the two candidate
+    mechanisms behind "3 bpw is slower than 4 bpw" get separated.
+
+    # Why the question needs an experiment
+
+    The trustworthy interleaved sweep (`gemv_shape --rate-interleaved`, control
+    spread 1.13x) gives:
+
+    | rate | GB/s | lane-loads/useful byte | decode_state/useful byte |
+    |---|---|---|---|
+    | 3 bpw | 165.7 | 2.67x | 2.67 |
+    | 4 bpw | 216.4 | 2.00x | 2.00 |
+    | 6 bpw | 215.7 | 2.00x | 1.33 |
+    | 8 bpw | 217.9 | 1.50x | 1.00 |
+
+    4, 6 and 8 bpw are all at ~216 GB/s: DRAM-saturated, insensitive to rate.
+    Only 3 bpw is slow, by 216.4/165.7 = **1.306x**. And *two* mechanisms both
+    predict 1.333x:
+
+    - **requests**: lane-load amplification is 2.67/2.00 = 1.333x
+    - **decode cost**: `decode_state` calls per useful byte is also 2.67/2.00
+
+    A bandwidth table cannot separate these, because both scale identically with
+    rate. Stubbing the decode splits them cleanly:
+
+    - if `_nod` at 3 bpw jumps to ~216 GB/s, decode cost is the wall and the fix
+      is a cheaper decode;
+    - if `_nod` stays near 166, requests are the wall and T6's mechanism is the
+      whole story;
+    - a partial move means both, and the split is readable as a fraction.
+
+    # Why this is a transformation and not a re-derivation
+
+    Same discipline as `ishizuki_two_word_kernel`: the probe is the verbatim
+    source with one asserted substitution, so a difference between `_nod` and the
+    real kernel is attributable to the decode and to nothing else. The counts are
+    asserted, because a reformat that left some `decode_state` calls live would
+    emit a kernel that is neither the probe nor the real thing, and would report a
+    bandwidth that belongs to neither.
+
+    The stub is `float(uint(s) & 1u)` -- one AND, one convert. It must consume
+    `s` (so the extraction above it is not dead-code-eliminated, which would
+    remove the very loads being measured) and must not be constant-foldable.
+    """
+    name = f"linear_gemv_ishizuki_k{bits}"
+    match = re.search(rf"^kernel void {re.escape(name)}\((?![\w])", preamble, re.M)
+    if not match:
+        raise SystemExit(f"{name} not found in the preamble; cannot emit its _nod probe")
+    nxt = re.search(r"^kernel void ", preamble[match.end() :], re.M)
+    # `k8` is the LAST ishizuki kernel, so there is no following declaration to
+    # bound it. Slicing to the end of the preamble is correct for that case, and
+    # it is what makes the probe available at EVERY rate -- which is the point of
+    # the experiment, since it needs a contrast arm at a saturated high rate.
+    end = match.end() + nxt.start() if nxt else len(preamble)
+    body = preamble[match.start() : end]
+
+    # One substitution: every decode call becomes a one-AND stub. The count is
+    # asserted per rate because the verbatim kernels differ in how many decode
+    # sites they have (the unrolled loop has two, the tail loop one).
+    body, n = re.subn(
+        r"decode_state\(s & 0xffffu, CB\)",
+        "nod_stub(s)",
+        body,
+    )
+    assert n >= 3, (
+        f"{name}: expected at least 3 decode_state call sites to stub, replaced "
+        f"{n}. Fewer means the probe no longer covers every decode in the kernel "
+        "and its bandwidth is not attributable to removing decode."
+    )
+
+    kernel = (
+        body.replace(
+            f"kernel void {name}(",
+            f"kernel void {name}_nod(\n"
+            "    // NO-DECODE PROBE. OUTPUT IS GARBAGE BY CONSTRUCTION.\n"
+            "    //\n"
+            "    // Identical memory traffic to the kernel above; `decode_state` is\n"
+            "    // replaced by a one-AND stub so the decode arithmetic is the only\n"
+            "    // difference. Never dispatched by the engine. See\n"
+            "    // `ishizuki_no_decode_kernel` in scripts/gen_exl3_gemv.py for the\n"
+            "    // question this exists to answer.\n",
             1,
         )
         .strip()
@@ -452,7 +580,19 @@ def main() -> None:
         tmpl,
     )
     assert n == 1, f"expected exactly one decode call in the template, got {n}"
-    out = [HEADER, preamble.rstrip()]
+    # `NOD_STUB` lives in the PRESERVED preamble region, so a second run reads it
+    # back out of the file and appends another copy -- the file grows by the stub
+    # on every run and stops being idempotent. Strip any existing copy first, by
+    # its distinctive body rather than by exact text, so a hand-edited comment
+    # does not defeat the strip.
+    preamble = re.sub(
+        r"\n*/// One-AND stand-in for `decode_state`.*?"
+        r"static float nod_stub\(uint s\) \{ return float\(s & 1u\); \}\n",
+        "\n",
+        preamble,
+        flags=re.S,
+    )
+    out = [HEADER, preamble.rstrip(), NOD_STUB.strip()]
     # Fallback first: runtime codebook, for plain and mul1. Unchanged shape.
     for bits in range(1, 9):
         for aligned, suffix in ((True, ""), (False, "_u")):
@@ -518,6 +658,13 @@ def main() -> None:
     # that know the rule, and a test asserts the generated set matches.
     for bits in TWO_WORD_SAFE_RATES:
         out.append(ishizuki_two_word_kernel(preamble, bits))
+    # The ishizuki NO-DECODE probes. Every rate, not just the safe ones: the
+    # question is "is decode cost the wall at LOW rates", so the probe has to
+    # exist at 3 bpw and at the saturated high rates for contrast. Emitting them
+    # from the same verbatim `preamble` as the real kernels is what makes the
+    # comparison attributable to the decode alone.
+    for bits in NO_DECODE_PROBE_RATES:
+        out.append(ishizuki_no_decode_kernel(preamble, bits))
     # Each generated kernel carries a trailing newline, so joining with "\n"
     # inserts a blank line between kernels and, because the template is sliced
     # back out of this block, one MORE blank line is appended on every run. The
@@ -534,6 +681,7 @@ def main() -> None:
             if TWO_WORD_SAFE_RATES
             else ""
         )
+        + f" + {len(NO_DECODE_PROBE_RATES)} ishizuki no-decode PROBES (garbage output, never dispatched)"
         + ")"
     )
     for bits in TWO_WORD_SAFE_RATES:

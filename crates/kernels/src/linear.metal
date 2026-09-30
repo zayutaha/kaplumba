@@ -1428,6 +1428,25 @@ kernel void linear_gemv_ishizuki_k8(
 }
 
 
+/// One-AND stand-in for `decode_state`, used ONLY by the `_nod` probe kernels.
+///
+/// Two properties it must have, and both are about the measurement rather than
+/// the arithmetic:
+///
+/// * it **consumes** its argument, so the extraction above it is not
+///   dead-code-eliminated. If the stub ignored `s`, the compiler would delete
+///   the shift-and-mask chain above it and quite possibly the ring loads that
+///   feed it -- which are the very loads being measured. The probe would then
+///   report the bandwidth of a kernel that fetches nothing.
+/// * it is **not constant-foldable**, which is why it is a `static` function
+///   taking a runtime value rather than a macro or a literal.
+///
+/// The output is meaningless. Nothing in the engine dispatches a `_nod` kernel,
+/// and no test compares one against a reference -- see
+/// `ishizuki_no_decode_kernel`.
+static float nod_stub(uint s) { return float(s & 1u); }
+
+
 kernel void linear_gemv_exl3_k1(
     const device ushort *packed [[buffer(0)]],
     const device half *input [[buffer(1)]],
@@ -7822,6 +7841,974 @@ kernel void linear_gemv_ishizuki_k4_w2(
             const uint r = i * KA + 16u;
             const uint s = uint(A0 >> (64u - r));
             v[i] = decode_state(s & 0xffffu, CB);
+        }
+        acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
+        acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float sum = 0.0f;
+        for (int g = 0; g < SG; ++g) {
+            sum += red[g][lid];
+        }
+        y[tn * 16u + lid] = sum;
+    }
+        // `red` is reused by the next output tile, so it must be drained first.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+
+kernel void linear_gemv_ishizuki_k1_nod(
+    // NO-DECODE PROBE. OUTPUT IS GARBAGE BY CONSTRUCTION.
+    //
+    // Identical memory traffic to the kernel above; `decode_state` is
+    // replaced by a one-AND stub so the decode arithmetic is the only
+    // difference. Never dispatched by the engine. See
+    // `ishizuki_no_decode_kernel` in scripts/gen_exl3_gemv.py for the
+    // question this exists to answer.
+
+    const device ushort *packed [[buffer(0)]],
+    const device half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant const uint *shape [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    constexpr uint KA = 1u;
+    constexpr int CB = 1;
+    constexpr uint RING = 256u * KA;
+    constexpr uint WORDS = RING / 32u;
+    const uint K = shape[0];
+    const uint N = shape[1];
+    const uint tiles_n = N / 16u;
+    const uint tiles_k = K / 16u;
+    constexpr int SG = 8;
+    threadgroup float red[SG][16];
+    const uint r0 = (lane % 4u) * 2u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    // j0/j1/j2 and sh depend only on the lane, not on the tile index, so they
+    // hoist out of the tile loop. Unrolling by two then keeps six weight words
+    // in flight per lane, which is worth ~27% on the full layer.
+    for (uint tn = tgid; tn < tiles_n; tn += ntg) {
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint lo0 = (lane * 8u + 1u) * 1u + RING - 16u;
+    const uint sh0 = lo0 % 32u;
+    const uint hi0 = lo0 / 32u;
+    const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
+    const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
+    const uint j2 = j1 + 1u >= WORDS ? j1 + 1u - WORDS : j1 + 1u;
+    const device uint *column = (const device uint *)packed + tn * WORDS;
+    const uint stride = tiles_n * WORDS;
+    uint tk = sg;
+    for (; tk + SG < tiles_k; tk += 2u * SG) {
+        float v[8];
+        const device uint *t0 = column + (tk + 0 * SG) * stride;
+        const ulong w0a = t0[j0], w0b = t0[j1], w0c = t0[j2];
+        const ulong A0 = ((w0a << 32) | w0b) << sh0 | (sh0 ? (w0c >> (32 - sh0)) : 0ul);
+        const ulong B0 = ((w0b << 32) | w0c) << sh0;
+        const device half *xr0 = x + (tk + 0 * SG) * 16u + r0;
+        const float p00 = float(xr0[0]), p01 = float(xr0[1]);
+        const float p02 = float(xr0[8]), p03 = float(xr0[9]);
+        const device uint *t1 = column + (tk + 1 * SG) * stride;
+        const ulong w1a = t1[j0], w1b = t1[j1], w1c = t1[j2];
+        const ulong A1 = ((w1a << 32) | w1b) << sh0 | (sh0 ? (w1c >> (32 - sh0)) : 0ul);
+        const ulong B1 = ((w1b << 32) | w1c) << sh0;
+        const device half *xr1 = x + (tk + 1 * SG) * 16u + r0;
+        const float p10 = float(xr1[0]), p11 = float(xr1[1]);
+        const float p12 = float(xr1[8]), p13 = float(xr1[9]);
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = (r <= 64u) ? uint(A0 >> (64u - r)) : uint(B0 >> (96u - r));
+            v[i] = nod_stub(s);
+        }
+        acc0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+        acc1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = (r <= 64u) ? uint(A1 >> (64u - r)) : uint(B1 >> (96u - r));
+            v[i] = nod_stub(s);
+        }
+        acc0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+        acc1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+    }
+
+    for (; tk < tiles_k; tk += SG) {
+        const device uint *t0 = column + tk * stride;
+        const ulong a0 = t0[j0], a1 = t0[j1], a2 = t0[j2];
+        const ulong A0 = ((a0 << 32) | a1) << sh0 | (sh0 ? (a2 >> (32 - sh0)) : 0ul);
+        const ulong B0 = ((a1 << 32) | a2) << sh0;
+        const device half *xr0 = x + tk * 16u + r0;
+        const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
+        float v[8];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = (r <= 64u) ? uint(A0 >> (64u - r)) : uint(B0 >> (96u - r));
+            v[i] = nod_stub(s);
+        }
+        acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
+        acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float sum = 0.0f;
+        for (int g = 0; g < SG; ++g) {
+            sum += red[g][lid];
+        }
+        y[tn * 16u + lid] = sum;
+    }
+        // `red` is reused by the next output tile, so it must be drained first.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+
+kernel void linear_gemv_ishizuki_k2_nod(
+    // NO-DECODE PROBE. OUTPUT IS GARBAGE BY CONSTRUCTION.
+    //
+    // Identical memory traffic to the kernel above; `decode_state` is
+    // replaced by a one-AND stub so the decode arithmetic is the only
+    // difference. Never dispatched by the engine. See
+    // `ishizuki_no_decode_kernel` in scripts/gen_exl3_gemv.py for the
+    // question this exists to answer.
+
+    const device ushort *packed [[buffer(0)]],
+    const device half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant const uint *shape [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    constexpr uint KA = 2u;
+    constexpr int CB = 1;
+    constexpr uint RING = 256u * KA;
+    constexpr uint WORDS = RING / 32u;
+    const uint K = shape[0];
+    const uint N = shape[1];
+    const uint tiles_n = N / 16u;
+    const uint tiles_k = K / 16u;
+    constexpr int SG = 8;
+    threadgroup float red[SG][16];
+    const uint r0 = (lane % 4u) * 2u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    // j0/j1/j2 and sh depend only on the lane, not on the tile index, so they
+    // hoist out of the tile loop. Unrolling by two then keeps six weight words
+    // in flight per lane, which is worth ~27% on the full layer.
+    for (uint tn = tgid; tn < tiles_n; tn += ntg) {
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint lo0 = (lane * 8u + 1u) * 2u + RING - 16u;
+    const uint sh0 = lo0 % 32u;
+    const uint hi0 = lo0 / 32u;
+    const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
+    const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
+    const uint j2 = j1 + 1u >= WORDS ? j1 + 1u - WORDS : j1 + 1u;
+    const device uint *column = (const device uint *)packed + tn * WORDS;
+    const uint stride = tiles_n * WORDS;
+    uint tk = sg;
+    for (; tk + SG < tiles_k; tk += 2u * SG) {
+        float v[8];
+        const device uint *t0 = column + (tk + 0 * SG) * stride;
+        const ulong w0a = t0[j0], w0b = t0[j1], w0c = t0[j2];
+        const ulong A0 = ((w0a << 32) | w0b) << sh0 | (sh0 ? (w0c >> (32 - sh0)) : 0ul);
+        const ulong B0 = ((w0b << 32) | w0c) << sh0;
+        const device half *xr0 = x + (tk + 0 * SG) * 16u + r0;
+        const float p00 = float(xr0[0]), p01 = float(xr0[1]);
+        const float p02 = float(xr0[8]), p03 = float(xr0[9]);
+        const device uint *t1 = column + (tk + 1 * SG) * stride;
+        const ulong w1a = t1[j0], w1b = t1[j1], w1c = t1[j2];
+        const ulong A1 = ((w1a << 32) | w1b) << sh0 | (sh0 ? (w1c >> (32 - sh0)) : 0ul);
+        const ulong B1 = ((w1b << 32) | w1c) << sh0;
+        const device half *xr1 = x + (tk + 1 * SG) * 16u + r0;
+        const float p10 = float(xr1[0]), p11 = float(xr1[1]);
+        const float p12 = float(xr1[8]), p13 = float(xr1[9]);
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = (r <= 64u) ? uint(A0 >> (64u - r)) : uint(B0 >> (96u - r));
+            v[i] = nod_stub(s);
+        }
+        acc0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+        acc1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = (r <= 64u) ? uint(A1 >> (64u - r)) : uint(B1 >> (96u - r));
+            v[i] = nod_stub(s);
+        }
+        acc0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+        acc1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+    }
+
+    for (; tk < tiles_k; tk += SG) {
+        const device uint *t0 = column + tk * stride;
+        const ulong a0 = t0[j0], a1 = t0[j1], a2 = t0[j2];
+        const ulong A0 = ((a0 << 32) | a1) << sh0 | (sh0 ? (a2 >> (32 - sh0)) : 0ul);
+        const ulong B0 = ((a1 << 32) | a2) << sh0;
+        const device half *xr0 = x + tk * 16u + r0;
+        const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
+        float v[8];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = (r <= 64u) ? uint(A0 >> (64u - r)) : uint(B0 >> (96u - r));
+            v[i] = nod_stub(s);
+        }
+        acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
+        acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float sum = 0.0f;
+        for (int g = 0; g < SG; ++g) {
+            sum += red[g][lid];
+        }
+        y[tn * 16u + lid] = sum;
+    }
+        // `red` is reused by the next output tile, so it must be drained first.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+
+kernel void linear_gemv_ishizuki_k3_nod(
+    // NO-DECODE PROBE. OUTPUT IS GARBAGE BY CONSTRUCTION.
+    //
+    // Identical memory traffic to the kernel above; `decode_state` is
+    // replaced by a one-AND stub so the decode arithmetic is the only
+    // difference. Never dispatched by the engine. See
+    // `ishizuki_no_decode_kernel` in scripts/gen_exl3_gemv.py for the
+    // question this exists to answer.
+
+    const device ushort *packed [[buffer(0)]],
+    const device half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant const uint *shape [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    constexpr uint KA = 3u;
+    constexpr int CB = 1;
+    constexpr uint RING = 256u * KA;
+    constexpr uint WORDS = RING / 32u;
+    const uint K = shape[0];
+    const uint N = shape[1];
+    const uint tiles_n = N / 16u;
+    const uint tiles_k = K / 16u;
+    constexpr int SG = 8;
+    threadgroup float red[SG][16];
+    const uint r0 = (lane % 4u) * 2u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    // j0/j1/j2 and sh depend only on the lane, not on the tile index, so they
+    // hoist out of the tile loop. Unrolling by two then keeps six weight words
+    // in flight per lane, which is worth ~27% on the full layer.
+    for (uint tn = tgid; tn < tiles_n; tn += ntg) {
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint lo0 = (lane * 8u + 1u) * 3u + RING - 16u;
+    const uint sh0 = lo0 % 32u;
+    const uint hi0 = lo0 / 32u;
+    const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
+    const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
+    const uint j2 = j1 + 1u >= WORDS ? j1 + 1u - WORDS : j1 + 1u;
+    const device uint *column = (const device uint *)packed + tn * WORDS;
+    const uint stride = tiles_n * WORDS;
+    uint tk = sg;
+    for (; tk + SG < tiles_k; tk += 2u * SG) {
+        float v[8];
+        const device uint *t0 = column + (tk + 0 * SG) * stride;
+        const ulong w0a = t0[j0], w0b = t0[j1], w0c = t0[j2];
+        const ulong A0 = ((w0a << 32) | w0b) << sh0 | (sh0 ? (w0c >> (32 - sh0)) : 0ul);
+        const ulong B0 = ((w0b << 32) | w0c) << sh0;
+        const device half *xr0 = x + (tk + 0 * SG) * 16u + r0;
+        const float p00 = float(xr0[0]), p01 = float(xr0[1]);
+        const float p02 = float(xr0[8]), p03 = float(xr0[9]);
+        const device uint *t1 = column + (tk + 1 * SG) * stride;
+        const ulong w1a = t1[j0], w1b = t1[j1], w1c = t1[j2];
+        const ulong A1 = ((w1a << 32) | w1b) << sh0 | (sh0 ? (w1c >> (32 - sh0)) : 0ul);
+        const ulong B1 = ((w1b << 32) | w1c) << sh0;
+        const device half *xr1 = x + (tk + 1 * SG) * 16u + r0;
+        const float p10 = float(xr1[0]), p11 = float(xr1[1]);
+        const float p12 = float(xr1[8]), p13 = float(xr1[9]);
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = (r <= 64u) ? uint(A0 >> (64u - r)) : uint(B0 >> (96u - r));
+            v[i] = nod_stub(s);
+        }
+        acc0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+        acc1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = (r <= 64u) ? uint(A1 >> (64u - r)) : uint(B1 >> (96u - r));
+            v[i] = nod_stub(s);
+        }
+        acc0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+        acc1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+    }
+
+    for (; tk < tiles_k; tk += SG) {
+        const device uint *t0 = column + tk * stride;
+        const ulong a0 = t0[j0], a1 = t0[j1], a2 = t0[j2];
+        const ulong A0 = ((a0 << 32) | a1) << sh0 | (sh0 ? (a2 >> (32 - sh0)) : 0ul);
+        const ulong B0 = ((a1 << 32) | a2) << sh0;
+        const device half *xr0 = x + tk * 16u + r0;
+        const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
+        float v[8];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = (r <= 64u) ? uint(A0 >> (64u - r)) : uint(B0 >> (96u - r));
+            v[i] = nod_stub(s);
+        }
+        acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
+        acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float sum = 0.0f;
+        for (int g = 0; g < SG; ++g) {
+            sum += red[g][lid];
+        }
+        y[tn * 16u + lid] = sum;
+    }
+        // `red` is reused by the next output tile, so it must be drained first.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+
+kernel void linear_gemv_ishizuki_k4_nod(
+    // NO-DECODE PROBE. OUTPUT IS GARBAGE BY CONSTRUCTION.
+    //
+    // Identical memory traffic to the kernel above; `decode_state` is
+    // replaced by a one-AND stub so the decode arithmetic is the only
+    // difference. Never dispatched by the engine. See
+    // `ishizuki_no_decode_kernel` in scripts/gen_exl3_gemv.py for the
+    // question this exists to answer.
+
+    const device ushort *packed [[buffer(0)]],
+    const device half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant const uint *shape [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    constexpr uint KA = 4u;
+    constexpr int CB = 1;
+    constexpr uint RING = 256u * KA;
+    constexpr uint WORDS = RING / 32u;
+    const uint K = shape[0];
+    const uint N = shape[1];
+    const uint tiles_n = N / 16u;
+    const uint tiles_k = K / 16u;
+    constexpr int SG = 8;
+    threadgroup float red[SG][16];
+    const uint r0 = (lane % 4u) * 2u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    // j0/j1/j2 and sh depend only on the lane, not on the tile index, so they
+    // hoist out of the tile loop. Unrolling by two then keeps six weight words
+    // in flight per lane, which is worth ~27% on the full layer.
+    for (uint tn = tgid; tn < tiles_n; tn += ntg) {
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint lo0 = (lane * 8u + 1u) * 4u + RING - 16u;
+    const uint sh0 = lo0 % 32u;
+    const uint hi0 = lo0 / 32u;
+    const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
+    const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
+    const uint j2 = j1 + 1u >= WORDS ? j1 + 1u - WORDS : j1 + 1u;
+    const device uint *column = (const device uint *)packed + tn * WORDS;
+    const uint stride = tiles_n * WORDS;
+    uint tk = sg;
+    for (; tk + SG < tiles_k; tk += 2u * SG) {
+        float v[8];
+        const device uint *t0 = column + (tk + 0 * SG) * stride;
+        const ulong w0a = t0[j0], w0b = t0[j1], w0c = t0[j2];
+        const ulong A0 = ((w0a << 32) | w0b) << sh0 | (sh0 ? (w0c >> (32 - sh0)) : 0ul);
+        const ulong B0 = ((w0b << 32) | w0c) << sh0;
+        const device half *xr0 = x + (tk + 0 * SG) * 16u + r0;
+        const float p00 = float(xr0[0]), p01 = float(xr0[1]);
+        const float p02 = float(xr0[8]), p03 = float(xr0[9]);
+        const device uint *t1 = column + (tk + 1 * SG) * stride;
+        const ulong w1a = t1[j0], w1b = t1[j1], w1c = t1[j2];
+        const ulong A1 = ((w1a << 32) | w1b) << sh0 | (sh0 ? (w1c >> (32 - sh0)) : 0ul);
+        const ulong B1 = ((w1b << 32) | w1c) << sh0;
+        const device half *xr1 = x + (tk + 1 * SG) * 16u + r0;
+        const float p10 = float(xr1[0]), p11 = float(xr1[1]);
+        const float p12 = float(xr1[8]), p13 = float(xr1[9]);
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = (r <= 64u) ? uint(A0 >> (64u - r)) : uint(B0 >> (96u - r));
+            v[i] = nod_stub(s);
+        }
+        acc0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+        acc1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = (r <= 64u) ? uint(A1 >> (64u - r)) : uint(B1 >> (96u - r));
+            v[i] = nod_stub(s);
+        }
+        acc0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+        acc1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+    }
+
+    for (; tk < tiles_k; tk += SG) {
+        const device uint *t0 = column + tk * stride;
+        const ulong a0 = t0[j0], a1 = t0[j1], a2 = t0[j2];
+        const ulong A0 = ((a0 << 32) | a1) << sh0 | (sh0 ? (a2 >> (32 - sh0)) : 0ul);
+        const ulong B0 = ((a1 << 32) | a2) << sh0;
+        const device half *xr0 = x + tk * 16u + r0;
+        const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
+        float v[8];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = (r <= 64u) ? uint(A0 >> (64u - r)) : uint(B0 >> (96u - r));
+            v[i] = nod_stub(s);
+        }
+        acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
+        acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float sum = 0.0f;
+        for (int g = 0; g < SG; ++g) {
+            sum += red[g][lid];
+        }
+        y[tn * 16u + lid] = sum;
+    }
+        // `red` is reused by the next output tile, so it must be drained first.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+
+kernel void linear_gemv_ishizuki_k5_nod(
+    // NO-DECODE PROBE. OUTPUT IS GARBAGE BY CONSTRUCTION.
+    //
+    // Identical memory traffic to the kernel above; `decode_state` is
+    // replaced by a one-AND stub so the decode arithmetic is the only
+    // difference. Never dispatched by the engine. See
+    // `ishizuki_no_decode_kernel` in scripts/gen_exl3_gemv.py for the
+    // question this exists to answer.
+
+    const device ushort *packed [[buffer(0)]],
+    const device half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant const uint *shape [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    constexpr uint KA = 5u;
+    constexpr int CB = 1;
+    constexpr uint RING = 256u * KA;
+    constexpr uint WORDS = RING / 32u;
+    const uint K = shape[0];
+    const uint N = shape[1];
+    const uint tiles_n = N / 16u;
+    const uint tiles_k = K / 16u;
+    constexpr int SG = 8;
+    threadgroup float red[SG][16];
+    const uint r0 = (lane % 4u) * 2u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    // j0/j1/j2 and sh depend only on the lane, not on the tile index, so they
+    // hoist out of the tile loop. Unrolling by two then keeps six weight words
+    // in flight per lane, which is worth ~27% on the full layer.
+    for (uint tn = tgid; tn < tiles_n; tn += ntg) {
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint lo0 = (lane * 8u + 1u) * 5u + RING - 16u;
+    const uint sh0 = lo0 % 32u;
+    const uint hi0 = lo0 / 32u;
+    const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
+    const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
+    const uint j2 = j1 + 1u >= WORDS ? j1 + 1u - WORDS : j1 + 1u;
+    const device uint *column = (const device uint *)packed + tn * WORDS;
+    const uint stride = tiles_n * WORDS;
+    uint tk = sg;
+    for (; tk + SG < tiles_k; tk += 2u * SG) {
+        float v[8];
+        const device uint *t0 = column + (tk + 0 * SG) * stride;
+        const ulong w0a = t0[j0], w0b = t0[j1], w0c = t0[j2];
+        const ulong A0 = ((w0a << 32) | w0b) << sh0 | (sh0 ? (w0c >> (32 - sh0)) : 0ul);
+        const ulong B0 = ((w0b << 32) | w0c) << sh0;
+        const device half *xr0 = x + (tk + 0 * SG) * 16u + r0;
+        const float p00 = float(xr0[0]), p01 = float(xr0[1]);
+        const float p02 = float(xr0[8]), p03 = float(xr0[9]);
+        const device uint *t1 = column + (tk + 1 * SG) * stride;
+        const ulong w1a = t1[j0], w1b = t1[j1], w1c = t1[j2];
+        const ulong A1 = ((w1a << 32) | w1b) << sh0 | (sh0 ? (w1c >> (32 - sh0)) : 0ul);
+        const ulong B1 = ((w1b << 32) | w1c) << sh0;
+        const device half *xr1 = x + (tk + 1 * SG) * 16u + r0;
+        const float p10 = float(xr1[0]), p11 = float(xr1[1]);
+        const float p12 = float(xr1[8]), p13 = float(xr1[9]);
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = (r <= 64u) ? uint(A0 >> (64u - r)) : uint(B0 >> (96u - r));
+            v[i] = nod_stub(s);
+        }
+        acc0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+        acc1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = (r <= 64u) ? uint(A1 >> (64u - r)) : uint(B1 >> (96u - r));
+            v[i] = nod_stub(s);
+        }
+        acc0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+        acc1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+    }
+
+    for (; tk < tiles_k; tk += SG) {
+        const device uint *t0 = column + tk * stride;
+        const ulong a0 = t0[j0], a1 = t0[j1], a2 = t0[j2];
+        const ulong A0 = ((a0 << 32) | a1) << sh0 | (sh0 ? (a2 >> (32 - sh0)) : 0ul);
+        const ulong B0 = ((a1 << 32) | a2) << sh0;
+        const device half *xr0 = x + tk * 16u + r0;
+        const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
+        float v[8];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = (r <= 64u) ? uint(A0 >> (64u - r)) : uint(B0 >> (96u - r));
+            v[i] = nod_stub(s);
+        }
+        acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
+        acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float sum = 0.0f;
+        for (int g = 0; g < SG; ++g) {
+            sum += red[g][lid];
+        }
+        y[tn * 16u + lid] = sum;
+    }
+        // `red` is reused by the next output tile, so it must be drained first.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+
+kernel void linear_gemv_ishizuki_k6_nod(
+    // NO-DECODE PROBE. OUTPUT IS GARBAGE BY CONSTRUCTION.
+    //
+    // Identical memory traffic to the kernel above; `decode_state` is
+    // replaced by a one-AND stub so the decode arithmetic is the only
+    // difference. Never dispatched by the engine. See
+    // `ishizuki_no_decode_kernel` in scripts/gen_exl3_gemv.py for the
+    // question this exists to answer.
+
+    const device ushort *packed [[buffer(0)]],
+    const device half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant const uint *shape [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    constexpr uint KA = 6u;
+    constexpr int CB = 1;
+    constexpr uint RING = 256u * KA;
+    constexpr uint WORDS = RING / 32u;
+    const uint K = shape[0];
+    const uint N = shape[1];
+    const uint tiles_n = N / 16u;
+    const uint tiles_k = K / 16u;
+    constexpr int SG = 8;
+    threadgroup float red[SG][16];
+    const uint r0 = (lane % 4u) * 2u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    // j0/j1/j2 and sh depend only on the lane, not on the tile index, so they
+    // hoist out of the tile loop. Unrolling by two then keeps six weight words
+    // in flight per lane, which is worth ~27% on the full layer.
+    for (uint tn = tgid; tn < tiles_n; tn += ntg) {
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint lo0 = (lane * 8u + 1u) * 6u + RING - 16u;
+    const uint sh0 = lo0 % 32u;
+    const uint hi0 = lo0 / 32u;
+    const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
+    const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
+    const uint j2 = j1 + 1u >= WORDS ? j1 + 1u - WORDS : j1 + 1u;
+    const device uint *column = (const device uint *)packed + tn * WORDS;
+    const uint stride = tiles_n * WORDS;
+    uint tk = sg;
+    for (; tk + SG < tiles_k; tk += 2u * SG) {
+        float v[8];
+        const device uint *t0 = column + (tk + 0 * SG) * stride;
+        const ulong w0a = t0[j0], w0b = t0[j1], w0c = t0[j2];
+        const ulong A0 = ((w0a << 32) | w0b) << sh0 | (sh0 ? (w0c >> (32 - sh0)) : 0ul);
+        const ulong B0 = ((w0b << 32) | w0c) << sh0;
+        const device half *xr0 = x + (tk + 0 * SG) * 16u + r0;
+        const float p00 = float(xr0[0]), p01 = float(xr0[1]);
+        const float p02 = float(xr0[8]), p03 = float(xr0[9]);
+        const device uint *t1 = column + (tk + 1 * SG) * stride;
+        const ulong w1a = t1[j0], w1b = t1[j1], w1c = t1[j2];
+        const ulong A1 = ((w1a << 32) | w1b) << sh0 | (sh0 ? (w1c >> (32 - sh0)) : 0ul);
+        const ulong B1 = ((w1b << 32) | w1c) << sh0;
+        const device half *xr1 = x + (tk + 1 * SG) * 16u + r0;
+        const float p10 = float(xr1[0]), p11 = float(xr1[1]);
+        const float p12 = float(xr1[8]), p13 = float(xr1[9]);
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = (r <= 64u) ? uint(A0 >> (64u - r)) : uint(B0 >> (96u - r));
+            v[i] = nod_stub(s);
+        }
+        acc0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+        acc1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = (r <= 64u) ? uint(A1 >> (64u - r)) : uint(B1 >> (96u - r));
+            v[i] = nod_stub(s);
+        }
+        acc0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+        acc1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+    }
+
+    for (; tk < tiles_k; tk += SG) {
+        const device uint *t0 = column + tk * stride;
+        const ulong a0 = t0[j0], a1 = t0[j1], a2 = t0[j2];
+        const ulong A0 = ((a0 << 32) | a1) << sh0 | (sh0 ? (a2 >> (32 - sh0)) : 0ul);
+        const ulong B0 = ((a1 << 32) | a2) << sh0;
+        const device half *xr0 = x + tk * 16u + r0;
+        const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
+        float v[8];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = (r <= 64u) ? uint(A0 >> (64u - r)) : uint(B0 >> (96u - r));
+            v[i] = nod_stub(s);
+        }
+        acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
+        acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float sum = 0.0f;
+        for (int g = 0; g < SG; ++g) {
+            sum += red[g][lid];
+        }
+        y[tn * 16u + lid] = sum;
+    }
+        // `red` is reused by the next output tile, so it must be drained first.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+
+kernel void linear_gemv_ishizuki_k7_nod(
+    // NO-DECODE PROBE. OUTPUT IS GARBAGE BY CONSTRUCTION.
+    //
+    // Identical memory traffic to the kernel above; `decode_state` is
+    // replaced by a one-AND stub so the decode arithmetic is the only
+    // difference. Never dispatched by the engine. See
+    // `ishizuki_no_decode_kernel` in scripts/gen_exl3_gemv.py for the
+    // question this exists to answer.
+
+    const device ushort *packed [[buffer(0)]],
+    const device half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant const uint *shape [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    constexpr uint KA = 7u;
+    constexpr int CB = 1;
+    constexpr uint RING = 256u * KA;
+    constexpr uint WORDS = RING / 32u;
+    const uint K = shape[0];
+    const uint N = shape[1];
+    const uint tiles_n = N / 16u;
+    const uint tiles_k = K / 16u;
+    constexpr int SG = 8;
+    threadgroup float red[SG][16];
+    const uint r0 = (lane % 4u) * 2u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    // j0/j1/j2 and sh depend only on the lane, not on the tile index, so they
+    // hoist out of the tile loop. Unrolling by two then keeps six weight words
+    // in flight per lane, which is worth ~27% on the full layer.
+    for (uint tn = tgid; tn < tiles_n; tn += ntg) {
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint lo0 = (lane * 8u + 1u) * 7u + RING - 16u;
+    const uint sh0 = lo0 % 32u;
+    const uint hi0 = lo0 / 32u;
+    const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
+    const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
+    const uint j2 = j1 + 1u >= WORDS ? j1 + 1u - WORDS : j1 + 1u;
+    const device uint *column = (const device uint *)packed + tn * WORDS;
+    const uint stride = tiles_n * WORDS;
+    uint tk = sg;
+    for (; tk + SG < tiles_k; tk += 2u * SG) {
+        float v[8];
+        const device uint *t0 = column + (tk + 0 * SG) * stride;
+        const ulong w0a = t0[j0], w0b = t0[j1], w0c = t0[j2];
+        const ulong A0 = ((w0a << 32) | w0b) << sh0 | (sh0 ? (w0c >> (32 - sh0)) : 0ul);
+        const ulong B0 = ((w0b << 32) | w0c) << sh0;
+        const device half *xr0 = x + (tk + 0 * SG) * 16u + r0;
+        const float p00 = float(xr0[0]), p01 = float(xr0[1]);
+        const float p02 = float(xr0[8]), p03 = float(xr0[9]);
+        const device uint *t1 = column + (tk + 1 * SG) * stride;
+        const ulong w1a = t1[j0], w1b = t1[j1], w1c = t1[j2];
+        const ulong A1 = ((w1a << 32) | w1b) << sh0 | (sh0 ? (w1c >> (32 - sh0)) : 0ul);
+        const ulong B1 = ((w1b << 32) | w1c) << sh0;
+        const device half *xr1 = x + (tk + 1 * SG) * 16u + r0;
+        const float p10 = float(xr1[0]), p11 = float(xr1[1]);
+        const float p12 = float(xr1[8]), p13 = float(xr1[9]);
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = (r <= 64u) ? uint(A0 >> (64u - r)) : uint(B0 >> (96u - r));
+            v[i] = nod_stub(s);
+        }
+        acc0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+        acc1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = (r <= 64u) ? uint(A1 >> (64u - r)) : uint(B1 >> (96u - r));
+            v[i] = nod_stub(s);
+        }
+        acc0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+        acc1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+    }
+
+    for (; tk < tiles_k; tk += SG) {
+        const device uint *t0 = column + tk * stride;
+        const ulong a0 = t0[j0], a1 = t0[j1], a2 = t0[j2];
+        const ulong A0 = ((a0 << 32) | a1) << sh0 | (sh0 ? (a2 >> (32 - sh0)) : 0ul);
+        const ulong B0 = ((a1 << 32) | a2) << sh0;
+        const device half *xr0 = x + tk * 16u + r0;
+        const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
+        float v[8];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = (r <= 64u) ? uint(A0 >> (64u - r)) : uint(B0 >> (96u - r));
+            v[i] = nod_stub(s);
+        }
+        acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
+        acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float sum = 0.0f;
+        for (int g = 0; g < SG; ++g) {
+            sum += red[g][lid];
+        }
+        y[tn * 16u + lid] = sum;
+    }
+        // `red` is reused by the next output tile, so it must be drained first.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+
+kernel void linear_gemv_ishizuki_k8_nod(
+    // NO-DECODE PROBE. OUTPUT IS GARBAGE BY CONSTRUCTION.
+    //
+    // Identical memory traffic to the kernel above; `decode_state` is
+    // replaced by a one-AND stub so the decode arithmetic is the only
+    // difference. Never dispatched by the engine. See
+    // `ishizuki_no_decode_kernel` in scripts/gen_exl3_gemv.py for the
+    // question this exists to answer.
+
+    const device ushort *packed [[buffer(0)]],
+    const device half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant const uint *shape [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    constexpr uint KA = 8u;
+    constexpr int CB = 1;
+    constexpr uint RING = 256u * KA;
+    constexpr uint WORDS = RING / 32u;
+    const uint K = shape[0];
+    const uint N = shape[1];
+    const uint tiles_n = N / 16u;
+    const uint tiles_k = K / 16u;
+    constexpr int SG = 8;
+    threadgroup float red[SG][16];
+    const uint r0 = (lane % 4u) * 2u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    // j0/j1/j2 and sh depend only on the lane, not on the tile index, so they
+    // hoist out of the tile loop. Unrolling by two then keeps six weight words
+    // in flight per lane, which is worth ~27% on the full layer.
+    for (uint tn = tgid; tn < tiles_n; tn += ntg) {
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint lo0 = (lane * 8u + 1u) * 8u + RING - 16u;
+    const uint sh0 = lo0 % 32u;
+    const uint hi0 = lo0 / 32u;
+    const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
+    const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
+    const uint j2 = j1 + 1u >= WORDS ? j1 + 1u - WORDS : j1 + 1u;
+    const device uint *column = (const device uint *)packed + tn * WORDS;
+    const uint stride = tiles_n * WORDS;
+    uint tk = sg;
+    for (; tk + SG < tiles_k; tk += 2u * SG) {
+        float v[8];
+        const device uint *t0 = column + (tk + 0 * SG) * stride;
+        const ulong w0a = t0[j0], w0b = t0[j1], w0c = t0[j2];
+        const ulong A0 = ((w0a << 32) | w0b) << sh0 | (sh0 ? (w0c >> (32 - sh0)) : 0ul);
+        const ulong B0 = ((w0b << 32) | w0c) << sh0;
+        const device half *xr0 = x + (tk + 0 * SG) * 16u + r0;
+        const float p00 = float(xr0[0]), p01 = float(xr0[1]);
+        const float p02 = float(xr0[8]), p03 = float(xr0[9]);
+        const device uint *t1 = column + (tk + 1 * SG) * stride;
+        const ulong w1a = t1[j0], w1b = t1[j1], w1c = t1[j2];
+        const ulong A1 = ((w1a << 32) | w1b) << sh0 | (sh0 ? (w1c >> (32 - sh0)) : 0ul);
+        const ulong B1 = ((w1b << 32) | w1c) << sh0;
+        const device half *xr1 = x + (tk + 1 * SG) * 16u + r0;
+        const float p10 = float(xr1[0]), p11 = float(xr1[1]);
+        const float p12 = float(xr1[8]), p13 = float(xr1[9]);
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = (r <= 64u) ? uint(A0 >> (64u - r)) : uint(B0 >> (96u - r));
+            v[i] = nod_stub(s);
+        }
+        acc0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+        acc1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = (r <= 64u) ? uint(A1 >> (64u - r)) : uint(B1 >> (96u - r));
+            v[i] = nod_stub(s);
+        }
+        acc0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+        acc1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+    }
+
+    for (; tk < tiles_k; tk += SG) {
+        const device uint *t0 = column + tk * stride;
+        const ulong a0 = t0[j0], a1 = t0[j1], a2 = t0[j2];
+        const ulong A0 = ((a0 << 32) | a1) << sh0 | (sh0 ? (a2 >> (32 - sh0)) : 0ul);
+        const ulong B0 = ((a1 << 32) | a2) << sh0;
+        const device half *xr0 = x + tk * 16u + r0;
+        const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
+        float v[8];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = (r <= 64u) ? uint(A0 >> (64u - r)) : uint(B0 >> (96u - r));
+            v[i] = nod_stub(s);
         }
         acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
         acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];

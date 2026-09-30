@@ -433,6 +433,283 @@ fn run_named(rig: &Rig, case: &Case, name: &str, passes: usize) -> f64 {
     started.elapsed().as_secs_f64() / passes as f64 * 1e3
 }
 
+/// The equal-bytes bit-rate sweep, **interleaved**, with a control arm.
+///
+/// # Why this exists and why it is not the `--only "bit rate"` group
+///
+/// That group is where "3 bpw is 40% slower than 6 bpw at equal bytes" comes
+/// from, and it measures one shape **to completion** before starting the next.
+/// Any drift over the sweep therefore folds into the shape's number instead of
+/// being visible. Run before and after T6 it gave:
+///
+/// ```text
+/// rate  has _w2?    pre-T6    post-T6    delta
+/// 3 bpw   YES        132.5      146.9     +10.9%
+/// 4 bpw   YES        179.8      153.7     -14.5%
+/// 6 bpw   no         164.5      182.0     +10.6%   <- CONTROL
+/// 8 bpw   no         176.3      162.3      -7.9%   <- CONTROL
+/// ```
+///
+/// 6 and 8 bpw **cannot** have changed from T6: `TWO_WORD_SAFE_RATES` emits no
+/// `_w2` kernel above 4 bpw, so those rows are controls and they moved +10.6%
+/// and -7.9% in opposite directions. A control that moves means the instrument
+/// is not measuring the kernel. Within-sweep spreads were 2.2x-3.7x.
+///
+/// So the table could not resolve a ~10% effect in either direction, and a
+/// conclusion drawn from it either way would have been unsupported.
+///
+/// # What this does instead
+///
+/// Every round measures **every arm once**, so drift appears as a moving *ratio*
+/// rather than a moving number — the same structure `nr0_sweep` and `w2_sweep`
+/// already use, and the reason T6's own +7% result is trustworthy.
+///
+/// On top of that, the **6 bpw arm is a control carried through the whole run**:
+/// no `_w2` kernel exists for it, so its ratio to itself across the sweep is a
+/// direct read of drift. It is printed as `drift` and the run is only
+/// interpretable when it is small. A control that moves is reported as a
+/// control that moved, rather than being quietly averaged into a conclusion.
+fn rate_sweep_interleaved(rig: &Rig, shapes: &[Shape], rounds: usize) {
+    // Build one Case per shape up front: allocating 43 MB of packed weights per
+    // arm inside the round loop would put allocator noise in the measurement.
+    let mut cases = Vec::new();
+    for shape in shapes {
+        let case = Case::build(rig, shape.in_f, shape.out_f, shape.rate);
+        let passes = ((300e6 / case.bytes).ceil() as usize).clamp(4, 64);
+        cases.push((case, passes));
+    }
+
+    // Confirm every arm exists before spending a round on it.
+    let mut names: Vec<Vec<String>> = Vec::new();
+    for (shape, _) in shapes.iter().zip(cases.iter()) {
+        let plain = format!("linear_gemv_ishizuki_k{}", shape.rate);
+        let mut arms = vec![plain.clone()];
+        let w2 = format!("{plain}_w2");
+        if rig.kernels.ishizuki_gemv_pipeline_by_name(&w2).is_some() {
+            arms.push(w2);
+        }
+        for name in &arms {
+            if rig.kernels.ishizuki_gemv_pipeline_by_name(name).is_none() {
+                println!("  skipping {name}: not in the library");
+                return;
+            }
+        }
+        names.push(arms);
+    }
+
+    // Warm every arm once: the first dispatch of a kernel pays pipeline and
+    // residency setup, and a warmup that warms only some arms biases round 1.
+    for (arms, (case, passes)) in names.iter().zip(cases.iter()) {
+        for name in arms {
+            let _ = run_named(rig, case, name, *passes);
+        }
+    }
+
+    // samples[arm][round]
+    let total_arms: usize = names.iter().map(|a| a.len()).sum();
+    let mut samples: Vec<Vec<f64>> = vec![Vec::with_capacity(rounds); total_arms];
+    for round in 0..rounds {
+        let mut index = 0;
+        for (arms, (case, passes)) in names.iter().zip(cases.iter()) {
+            for name in arms {
+                samples[index].push(run_named(rig, case, name, *passes));
+                index += 1;
+            }
+        }
+        // Progress to stderr so a long sweep shows it is alive; stdout stays the
+        // table, which is what gets pasted into the spec.
+        eprintln!("  round {}/{rounds}", round + 1);
+    }
+
+    let control_index = names
+        .iter()
+        .position(|arms| arms.iter().any(|n| n.contains("_k6")))
+        .map(|shape_index| {
+            let offset: usize = names[..shape_index].iter().map(|a| a.len()).sum();
+            offset
+        });
+    // The control is the *first* arm of the 6 bpw shape (the plain 3-word
+    // kernel), which no `_w2` variant can affect.
+    let control_arm = control_index.map(|offset| offset);
+
+    println!("\n  equal-bytes bit-rate sweep, {rounds} interleaved rounds");
+    println!(
+        "    {:<7}{:>9}{:>10}{:>10}{:>10}{:>9}{:>9}",
+        "rate", "MB", "med ms", "best", "worst", "spread", "GB/s"
+    );
+    let mut index = 0;
+    let mut medians = Vec::new();
+    for (shape, (case, _)) in shapes.iter().zip(cases.iter()) {
+        for name in &names[shape_index_of(index, &names)] {
+            let mut s = samples[index].clone();
+            let m = median(&mut s);
+            let mut sorted = s.clone();
+            sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let best = *sorted.first().unwrap();
+            let worst = *sorted.last().unwrap();
+            let mb = case.bytes / 1e6;
+            let gbps = gbps(mb, m);
+            medians.push(m);
+            println!(
+                "    {:<7}{:>9.1}{m:>10.4}{best:>10.4}{worst:>10.4}{:>8.2}x{gbps:>10.1}   {name}",
+                format!("{} bpw", shape.rate),
+                mb,
+                worst / best,
+            );
+            index += 1;
+        }
+    }
+
+    // The drift read. Each arm's ratio to the FIRST arm of its own sweep is not
+    // meaningful across different rates; what is meaningful is the control's
+    // round-to-round spread, and the ratio of every arm to the 3 bpw baseline
+    // computed WITHIN each round and then medianed.
+    if let Some(control) = control_arm {
+        let s = &samples[control];
+        let m = median(&mut s.clone());
+        let mut sorted = s.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let best = *sorted.first().unwrap();
+        let worst = *sorted.last().unwrap();
+        println!("\n  CONTROL (6 bpw, no _w2 kernel exists for it, so T6 cannot move it):");
+        println!(
+            "    median {m:.4} ms, best {best:.4}, worst {worst:.4}, spread {:.2}x",
+            worst / best
+        );
+        if worst / best > 1.30 {
+            println!(
+                "    DRIFT HIGH -- the control moved {:.0}% across the sweep. Any rate comparison \
+                 below is not trustworthy; re-run when the box is quieter.",
+                100.0 * (worst / best - 1.0)
+            );
+        } else {
+            println!(
+                "    drift {:.0}% -- acceptable, the rate comparison below is readable",
+                100.0 * (worst / best - 1.0)
+            );
+        }
+    }
+
+    // Paired per-round ratios against the 3 bpw arm, which is the comparison the
+    // question actually needs. Paired because each round saw the same conditions.
+    if medians.len() >= shapes.len() {
+        println!("\n  paired ratio vs 3 bpw (same round, so drift cancels):");
+        let mut index = 0;
+        for (shape, _) in shapes.iter().zip(cases.iter()) {
+            let arms = names[shape_index_of(index, &names)].len();
+            if index > 0 {
+                let mut ratios: Vec<f64> = Vec::new();
+                for round in 0..rounds {
+                    let base = samples[0][round];
+                    for arm in 0..arms {
+                        ratios.push(base / samples[index + arm][round]);
+                    }
+                }
+                let m = median(&mut ratios);
+                println!(
+                    "    {:<7} {:.3}x  (n={})",
+                    format!("{} bpw", shape.rate),
+                    m,
+                    ratios.len()
+                );
+            }
+            index += arms;
+        }
+    }
+    let _ = &medians;
+}
+
+/// Index of the shape whose arm list contains flattened arm `index`.
+fn shape_index_of(index: usize, names: &[Vec<String>]) -> usize {
+    let mut seen = 0;
+    for (i, arms) in names.iter().enumerate() {
+        seen += arms.len();
+        if index < seen {
+            return i;
+        }
+    }
+    names.len().saturating_sub(1)
+}
+
+/// Real kernel vs the no-decode probe, interleaved, on one shape.
+///
+/// The probe (`linear_gemv_ishizuki_kN_nod`) is the verbatim kernel with
+/// `decode_state` replaced by a one-AND stub, generated by one asserted
+/// substitution in `scripts/gen_exl3_gemv.py`. Memory traffic is identical; the
+/// decode arithmetic is the only difference. Its OUTPUT IS GARBAGE and nothing
+/// in the engine dispatches it -- this measures a rate and nothing else.
+///
+/// Interleaved for the same reason as every other sweep here: a box that drifts
+/// 10% within a sweep cannot resolve a 30% effect, and the arms have to be
+/// compared WITHIN a round for that to be true.
+fn nod_sweep(rig: &Rig, shape: &Shape) {
+    let case = Case::build(rig, shape.in_f, shape.out_f, shape.rate);
+    let passes = ((300e6 / case.bytes).ceil() as usize).clamp(4, 64);
+    let real = format!("linear_gemv_ishizuki_k{}", shape.rate);
+    // Prefer the shipped 2-word form when it exists: that is what the engine runs
+    // at this rate, so the probe has to be built from the same baseline or the
+    // comparison is against a kernel that is no longer in service.
+    let two_word = format!("{real}_w2");
+    let baseline = if rig
+        .kernels
+        .ishizuki_gemv_pipeline_by_name(&two_word)
+        .is_some()
+    {
+        two_word
+    } else {
+        real.clone()
+    };
+    let probe = format!("{real}_nod");
+    for name in [&baseline, &probe] {
+        if rig.kernels.ishizuki_gemv_pipeline_by_name(name).is_none() {
+            println!("  skipping {name}: not in the library");
+            return;
+        }
+    }
+    // Warm both, so round 1 does not pay pipeline setup for one arm only.
+    for name in [&baseline, &probe] {
+        let _ = run_named(rig, &case, name, passes);
+    }
+    let rounds = 9;
+    let mut real_samples = Vec::with_capacity(rounds);
+    let mut nod_samples = Vec::with_capacity(rounds);
+    for _ in 0..rounds {
+        real_samples.push(run_named(rig, &case, &baseline, passes));
+        nod_samples.push(run_named(rig, &case, &probe, passes));
+    }
+    let mb = case.bytes / 1e6;
+    let (rm, nm) = (
+        median(&mut real_samples.clone()),
+        median(&mut nod_samples.clone()),
+    );
+    println!(
+        "\n  {} x{} @ {}bpw = {mb:.1} MB, {rounds} interleaved rounds",
+        shape.in_f, shape.out_f, shape.rate
+    );
+    println!(
+        "    {:<12}{:>10}{:>10}{:>10}{:>9}",
+        "arm", "med ms", "GB/s", "spread", "vs real"
+    );
+    for (label, samples) in [("real", &real_samples), ("no-decode", &nod_samples)] {
+        let m = median(&mut samples.clone());
+        let mut sorted = samples.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let spread = sorted.last().unwrap() / sorted.first().unwrap();
+        println!(
+            "    {label:<12}{m:>10.4}{:>10.1}{:>9.2}x{:>8.3}x",
+            gbps(mb, m),
+            spread,
+            rm / m
+        );
+    }
+    // The verdict, stated as the number that decides between the two mechanisms.
+    let lift = rm / nm - 1.0;
+    println!(
+        "    decode removal lifts this rate by {:+.1}%",
+        lift * 100.0
+    );
+}
+
 /// The NR0 sweep, on the three real shapes that matter, A/B'd **interleaved**.
 ///
 /// Interleaved because this box has been measured at 3.7, 3.9, 4.3, 4.8, 6.0 and
@@ -716,6 +993,8 @@ fn main() {
         .position(|a| a == "--only")
         .map(|i| args[i + 1].clone());
     let nr0 = args.iter().any(|a| a == "--nr0");
+    let rate_interleaved = args.iter().any(|a| a == "--rate-interleaved");
+    let decode_probe = args.iter().any(|a| a == "--decode-probe");
     let w2 = args.iter().any(|a| a == "--w2");
     let fixed = args.iter().any(|a| a == "--fixed");
 
@@ -847,8 +1126,93 @@ fn main() {
         return;
     }
 
+    if decode_probe {
+        // THE experiment. Real kernel vs no-decode probe, interleaved, at the
+        // three rates that answer the question:
+        //
+        //   3 bpw  -- the outlier, 165.7 GB/s, the one that matters (410/411
+        //             tensors) and the one whose rate must double to reach 19 tok/s
+        //   4 bpw  -- nearest saturated rate, 216.4
+        //   8 bpw  -- furthest saturated rate, 217.9
+        //
+        // 3 bpw is 1.306x slower than 4 bpw, and TWO mechanisms both predict
+        // 1.333x: lane-load requests (2.67/2.00) and decode calls per useful byte
+        // (2.67/2.00). The probe removes decode and NOTHING else -- identical
+        // memory traffic, one asserted substitution in the generator -- so:
+        //
+        //   _nod reaches ~216 at 3 bpw  -> decode cost is the wall
+        //   _nod stays near 166          -> requests are the wall
+        //   partial move                 -> both, and the split is the fraction
+        //
+        // The 8 bpw arm is what makes the reading unambiguous. Without a
+        // saturated contrast arm, a `_nod` number at 3 bpw could be explained by
+        // the probe having changed something other than decode.
+        for shape in [
+            Shape {
+                name: "3 bpw (the outlier)",
+                in_f: 5376,
+                out_f: 21504,
+                rate: 3,
+            },
+            Shape {
+                name: "4 bpw (saturated)",
+                in_f: 5376,
+                out_f: 16384,
+                rate: 4,
+            },
+            Shape {
+                name: "8 bpw (saturated)",
+                in_f: 5376,
+                out_f: 8192,
+                rate: 8,
+            },
+        ] {
+            nod_sweep(&rig, &shape);
+        }
+        println!(
+            "\n  The _nod arm computes GARBAGE by construction (decode_state replaced by a\n  one-AND stub) and is never dispatched by the engine. Only its BANDWIDTH is\n  meaningful: identical memory traffic, decode removed."
+        );
+        return;
+    }
+
+    if rate_interleaved {
+        // The four equal-bytes shapes, in the order the old `--only "bit rate"`
+        // group used, so the two tables are directly comparable. 6 bpw comes
+        // third deliberately: it has no `_w2` kernel and so is the control.
+        rate_sweep_interleaved(
+            &rig,
+            &[
+                Shape {
+                    name: "3 bpw",
+                    in_f: 5376,
+                    out_f: 21504,
+                    rate: 3,
+                },
+                Shape {
+                    name: "4 bpw",
+                    in_f: 5376,
+                    out_f: 16384,
+                    rate: 4,
+                },
+                Shape {
+                    name: "6 bpw",
+                    in_f: 5376,
+                    out_f: 10752,
+                    rate: 6,
+                },
+                Shape {
+                    name: "8 bpw",
+                    in_f: 5376,
+                    out_f: 8192,
+                    rate: 8,
+                },
+            ],
+            9,
+        );
+        return;
+    }
+
     if nr0 {
-        // The shapes that carry the bytes, plus the vocabulary head. gate/up/down
         // are 65% of a decode token's bytes; lm_head is the one shape already
         // near the ceiling, and including it says whether NR0 helps where there is
         // nothing left to win -- a regression there would be free to accept if

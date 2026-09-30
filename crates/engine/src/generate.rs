@@ -264,12 +264,33 @@ where
     let mut text = String::new();
     let mut stopped_on_eos = false;
     let vocab_size = model.vocab_size();
+    // `KAPLUMBA_MARGIN=1` / `KAPLUMBA_SEGMENTS=1`. See `MarginLog` and
+    // `SegmentLog`.
+    //
+    // Instrumented HERE, in `generate_gpu`, and not only in `generate_gpu_greedy`,
+    // because this is the function the CLI calls (`crates/cli/src/main.rs:102`).
+    // The greedy path is reached only via `generate`, which is `--legacy-path`.
+    // An instrument placed in the greedy path alone compiles, passes its unit
+    // tests, and never fires — which is exactly what happened the first time
+    // this was written.
+    let mut margins = MarginLog::new();
+    let mut segments = SegmentLog::new();
+    // At temperature 0 the sampler is an argmax, so the margin is meaningful. At
+    // temperature > 0 the sampled token is not the argmax and the fragility
+    // number would describe a decision the engine did not make.
+    let greedy = config.sampler.temperature == 0.0;
     for step in 0..config.max_new_tokens {
         let last_logits = logits
             .iter()
             .map(|value| half::f16::from_bits(*value).to_f32())
             .collect::<Vec<_>>();
         let token = sampler.sample(&last_logits)?;
+        if greedy {
+            // `last_logits` is the f32 view; `argmax_with_margin` wants the fp16
+            // bits, and re-deriving them from `logits` keeps one definition of
+            // "the row" rather than two that can drift.
+            margins.record(generated_ids.len(), margin_from_f32(&last_logits));
+        }
         if generated_ids.is_empty() {
             ttft_duration = request_started.elapsed();
         }
@@ -291,7 +312,9 @@ where
         })?;
         let decode_started = Instant::now();
         logits = model.forward_buffer(&[token], &[position])?;
+        let step_ms = decode_started.elapsed().as_secs_f64() * 1e3;
         decode_duration += decode_started.elapsed();
+        segments.record(generated_ids.len(), position, step_ms);
     }
     if let Some(chunk) = detokenizer.finish()? {
         text.push_str(&chunk);
@@ -317,6 +340,9 @@ where
     // `forward_buffer`, the only scope that holds the encoder, so it has to be
     // *read* from each of the two decode entry points.
     crate::model::report_buffers_per_step();
+    margins.report();
+    segments.finish();
+    segments.report();
     Ok(GenerationResult {
         text,
         prompt_tokens: prompt_ids.len(),
@@ -598,6 +624,49 @@ impl SegmentLog {
                 );
             }
         }
+    }
+}
+
+/// `argmax_with_margin` for a row the caller has already widened to `f32`.
+///
+/// `generate_gpu` converts the fp16 row to `f32` before sampling, because
+/// `Sampler::sample` takes `&[f32]`. Re-running the fp16 path would mean a second
+/// definition of "the row" that could disagree with the one the token came from —
+/// and a fragility number that describes a different row than the one sampled is
+/// worse than no number.
+///
+/// The ulp divisor is still the **fp16** ulp, because that is the precision the
+/// logits were rounded to before anything else happened. Dividing by the `f32`
+/// ulp would report a gap of one fp16 step as ~4600 "ulps", which reads as
+/// enormous safety on what is actually a coin flip.
+pub fn margin_from_f32(row: &[f32]) -> ArgmaxMargin {
+    assert!(
+        row.len() >= 2,
+        "a margin needs a runner-up, so the vocabulary needs two entries"
+    );
+    let mut token = 0usize;
+    for index in 1..row.len() {
+        if row[index] > row[token] {
+            token = index;
+        }
+    }
+    let mut runner_up = usize::MAX;
+    for index in 0..row.len() {
+        if index == token {
+            continue;
+        }
+        if runner_up == usize::MAX || row[index] > row[runner_up] {
+            runner_up = index;
+        }
+    }
+    assert!(runner_up != usize::MAX, "no runner-up in a >= 2 entry row");
+    let gap = row[token] - row[runner_up];
+    ArgmaxMargin {
+        token: token as u32,
+        top: row[token],
+        runner_up: row[runner_up],
+        gap,
+        ulps: gap / fp16_ulp(row[token]),
     }
 }
 
