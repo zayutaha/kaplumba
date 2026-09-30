@@ -353,16 +353,17 @@ struct Arm {
     samples: Vec<f64>,
 }
 
+
 /// `ru_maxrss`, which on Darwin counts resident pages only and misses the Metal
 /// buffer pages. AGENTS.md 10.3 rejects it as a memory figure, and
 /// `peak_resident_pages_bytes` in the engine's `--metrics` is the same number
 /// under a name that once made a 93%-of-budget situation look like 57%.
 ///
-/// Printed anyway, and labelled, because the number that matters for *this*
-/// tool is whether it disturbed anybody: 3 GiB of synthesised weights allocated
-/// while another agent had a model loaded is exactly the AGENTS.md 10.1 failure,
-/// and the only way a reader of these numbers can tell is if the tool says how
-/// much it was holding.
+/// Printed anyway, and labelled, because the number that matters for *this* tool
+/// is whether it disturbed anybody: allocating GiBs of synthesised weights while
+/// another agent had a model loaded is exactly the AGENTS.md 10.1 failure, and the
+/// only way a reader of these numbers can tell is if the tool says how much it was
+/// holding.
 fn max_rss_bytes() -> u64 {
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe {
@@ -371,6 +372,7 @@ fn max_rss_bytes() -> u64 {
     usage.ru_maxrss as u64
 }
 
+/// `(rounds, shape name prefixes, rates, target round ms, determinism only)`.
 fn parse_args() -> (usize, Vec<String>, Vec<u8>, f64, bool) {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut rounds = 9usize;
@@ -401,26 +403,113 @@ fn parse_args() -> (usize, Vec<String>, Vec<u8>, f64, bool) {
                 round_ms = args[i].parse().expect("--round-ms MS");
             }
             "--check-determinism" => determinism = true,
+            "--quiet" => {} // consumed below; harmless in the positional walk
             other => panic!("unknown flag {other}"),
         }
         i += 1;
     }
-    rates.sort_unstable();
     (rounds, shapes, rates, round_ms, determinism)
 }
 
+/// One (shape, rate) measurement, retained across chunks so the final table and
+/// aggregate cover every shape even though the buffers did not all exist at once.
+struct Result_ {
+    shape_idx: usize,
+    rate: u8,
+    bytes: u64,
+    samples: Vec<f64>,
+}
+
+/// Build, warm up and measure every rate of one shape. All rates of a shape are
+/// resident simultaneously and interleaved within every round, which is what the
+/// ratio needs; shapes are handled one chunk at a time so peak memory is a
+/// fraction of the full sweep.
+///
+/// Chunking by shape rather than by arm is deliberate. The quantity under test is
+/// a *ratio between rates of the same shape*, so drift has to be controlled
+/// within a shape, and it is. Drift *between* shapes cannot contaminate a
+/// per-shape ratio because each shape's rates are measured adjacent in time.
+#[allow(clippy::too_many_lines)]
+fn run_shape(
+    device: &Device,
+    queue: &metal::CommandQueue,
+    kernels: &LinearKernels,
+    si: usize,
+    rates: &[u8],
+    rounds: usize,
+    round_ms: f64,
+    verbose: bool,
+) -> Vec<Result_> {
+    let shape = &SHAPES[si];
+    let mut out: Vec<Result_> = Vec::with_capacity(rates.len());
+    let mut arms: Vec<Arm> = Vec::new();
+
+    for &rate in rates {
+        let seed = SEED_BASE.wrapping_add(si as u32 * 131).wrapping_add(rate as u32);
+        let words = build_colmajor(shape, rate, seed);
+        let bytes = useful_bytes(shape, rate);
+        let kernel = kernel_for(rate);
+        let packed = upload_words(device, &words);
+        drop(words);
+        let ctx = make_ctx(device, queue, shape, rate);
+        // Calibrate off the timed path: the first sample runs cold and short, and
+        // an `iters` chosen from a cold measurement is the kind of thing that
+        // quietly halves a run's resolution.
+        let secs = seconds_per_dispatch(kernels, &ctx, kernel, &packed, MIN_ITERS);
+        let iters = (((round_ms * 1e-3) / secs).round() as u64).clamp(MIN_ITERS, MAX_ITERS);
+        let secs = seconds_per_dispatch(kernels, &ctx, kernel, &packed, iters);
+        let iters = ((round_ms * 1e-3) / secs).round() as u64;
+        // One more untimed pass at the chosen count, so the first *timed* round is
+        // not the one that pays for the ramp.
+        let _ = seconds_per_dispatch(kernels, &ctx, kernel, &packed, iters);
+        arms.push(Arm {
+            shape_idx: si,
+            rate,
+            kernel,
+            bytes,
+            packed,
+            ctx,
+            iters: iters.clamp(MIN_ITERS, MAX_ITERS),
+            samples: Vec::with_capacity(rounds),
+        });
+    }
+
+    for round in 0..rounds {
+        let order: Vec<usize> = if round % 2 == 0 {
+            (0..arms.len()).collect()
+        } else {
+            (0..arms.len()).rev().collect()
+        };
+        for ai in order {
+            let arm = &mut arms[ai];
+            let secs = seconds_per_dispatch(kernels, &arm.ctx, arm.kernel, &arm.packed, arm.iters);
+            arm.samples.push(arm.bytes as f64 / secs / 1e9);
+        }
+        if verbose {
+            let line: Vec<String> = arms
+                .iter()
+                .map(|a| {
+                    let s = summarize(&a.samples).expect("at least one sample");
+                    format!("{}bpw {:.1}", a.rate, s.median)
+                })
+                .collect();
+            println!("  {} round {round}: {}", shape.name, line.join("  "));
+        }
+    }
+
+    for arm in arms {
+        out.push(Result_ {
+            shape_idx: arm.shape_idx,
+            rate: arm.rate,
+            bytes: arm.bytes,
+            samples: arm.samples,
+        });
+    }
+    out
+}
+
 fn main() {
-    let (rounds, wanted, rates, round_ms, determinism) = parse_args();
-    // No Metal device until the determinism check has had its chance to run
-    // without one: that mode hashes 3 GiB of weights and must work while the GPU
-    // is busy.
-    let device = if determinism {
-        None
-    } else {
-        Some(Device::system_default().expect("Metal device"))
-    };
-    let queue = device.as_ref().map(|d| d.new_command_queue().to_owned());
-    let kernels = LinearKernels::new().ok();
+    let (rounds, wanted, mut rates, round_ms, determinism) = parse_args();
 
     let shape_idxs: Vec<usize> = (0..SHAPES.len())
         .filter(|i| {
@@ -432,243 +521,178 @@ fn main() {
         "no shape matched {wanted:?}; `bench::SHAPES` has {:?}",
         SHAPES.iter().map(|s| s.name).collect::<Vec<_>>()
     );
-
-    // Every rate must have a kernel, checked before any buffer is allocated. A
-    // benchmark that silently skips a rate it was asked for is worse than one
-    // that refuses. Skipped in determinism mode, which builds no pipeline.
-    if let Some(kernels) = kernels.as_ref() {
-        for rate in &rates {
-            let kernel = kernel_for(*rate);
-            assert!(
-                kernels.ishizuki_gemv_pipeline_by_name(kernel).is_some(),
-                "{kernel} is not in the library. The 3 bpw arm is the engine's live \
-                 decode kernel; the 4/6 bpw arms are measurement kernels added by \
-                 this spec. If one is missing, this harness would measure 3 bpw and \
-                 print a ratio against nothing."
-            );
-            assert_eq!(
-                LinearKernels::ishizuki_rate_of_name(kernel),
-                Some(*rate),
-                "{kernel} does not name a {rate} bpw rate; `encode_gemv_named` \
-                 rejects a name/rate mismatch, so every sample would be an error"
-            );
-        }
-    }
+    rates.sort_unstable();
 
     println!("=== bench_rate_sweep: colmajor _contig4, rate 3 vs 4 (and 6) ===");
     println!(
-        "{} shapes x {} rates, {rounds} interleaved rounds of ~{round_ms:.0} ms, \
-         alternating arm order.\n\
-         Bytes are USEFUL WEIGHT BYTES (the checkpoint's own packed size); `amp` is \
-         lane-load amplification = 8/KA at 3/4 bpw (2 words/lane) and 12/KA at 6 bpw \
-         (3 words/lane -- see linear_repacked.metal).\n\
-         Spread is worst/best, so LOWER is more repeatable.\n",
+        "{} shapes x {} rates, {rounds} interleaved rounds of ~{round_ms:.0} ms per \
+         (shape, rate), arm order reversed on alternate rounds.\n\
+         Bytes are USEFUL WEIGHT BYTES (the checkpoint's own packed size). `amp` is \
+         lane-load amplification = 8/KA at 3 and 4 bpw (2 words/lane) and 12/KA at \
+         6 bpw (3 words/lane -- see linear_repacked.metal).\n\
+         Spread is worst/best, so LOWER is more repeatable. Pass --quiet to drop the \
+         per-round lines.\n",
         shape_idxs.len(),
         rates.len(),
     );
 
-    // --- build every arm up front: memory, not time, is the constraint, and
-    //     allocating per round would put the allocator inside the measurement.
-    let mut arms: Vec<Arm> = Vec::new();
-    let mut allocated: u64 = 0;
-    for (arm_i, &si) in shape_idxs.iter().enumerate() {
-        let shape = &SHAPES[si];
-        for &rate in &rates {
-            let seed = SEED_BASE.wrapping_add(si as u32 * 131).wrapping_add(rate as u32);
-            let words = build_colmajor(shape, rate, seed);
-            if determinism {
-                // Deliberately before any Metal allocation. This mode exists to
-                // be cheap and to be runnable while the GPU is busy -- on a box
-                // where a model is resident, allocating 3 GiB of weights to check
-                // a hash would evict somebody's benchmark. It only hashes.
+    if determinism {
+        // No Metal device, no pipeline, no buffer. This mode hashes the generator's
+        // output and must be runnable while the GPU is busy.
+        for &si in &shape_idxs {
+            for &rate in &rates {
+                let seed = SEED_BASE.wrapping_add(si as u32 * 131).wrapping_add(rate as u32);
+                let words = build_colmajor(&SHAPES[si], rate, seed);
                 println!(
-                    "digest {:>12}  {:<13} @{}bpw  {:>10} B  kernel {}",
+                    "digest {:>12}  {:<13} @{}bpw  {:>10} B  {} words/tile  kernel {}",
                     digest(&words),
-                    shape.name,
+                    SHAPES[si].name,
                     rate,
                     words.len() as u64 * 2,
+                    words_per_tile(rate),
                     kernel_for(rate),
                 );
-                continue;
             }
-            let bytes = useful_bytes(shape, rate);
-            let kernel = kernel_for(rate);
-            // Unwrapped here, once, rather than threaded through: determinism
-            // mode `continue`s above, so these are only reached with a device.
-            let (device, queue, kernels) = (
-                device.as_ref().expect("device in measure mode"),
-                queue.as_ref().expect("queue in measure mode"),
-                kernels.as_ref().expect("kernels in measure mode"),
-            );
-            let packed = upload_words(device, &words);
-            drop(words);
-            allocated += bytes;
-            let ctx = make_ctx(device, queue, shape, rate);
-            // Calibrate once, off the timed path.
-            let secs = seconds_per_dispatch(kernels, &ctx, kernel, &packed, MIN_ITERS);
-            let iters = (((round_ms * 1e-3) / secs).round() as u64).clamp(MIN_ITERS, MAX_ITERS);
-            // Second calibration at the real iteration count: the first one ran
-            // cold and MIN_ITERS is short, and an iters chosen from a cold
-            // measurement is the kind of thing that quietly halves a run's
-            // resolution.
-            let secs = seconds_per_dispatch(kernels, &ctx, kernel, &packed, iters);
-            let iters = ((round_ms * 1e-3) / secs).round() as u64;
-            arms.push(Arm {
-                shape_idx: si,
-                rate,
-                kernel,
-                bytes,
-                packed,
-                ctx,
-                iters: iters.clamp(MIN_ITERS, MAX_ITERS),
-                samples: Vec::with_capacity(rounds),
-            });
-            let _ = arm_i;
         }
-    }
-    if determinism {
         println!(
             "\nre-run and every digest must be identical. No file read, no Metal \
              buffer allocated, no GPU touched."
         );
         return;
     }
-    let kernels = kernels.as_ref().expect("kernels in measure mode");
-    println!(
-        "resident weights: {:.2} GiB across {} arms\n",
-        allocated as f64 / (1u64 << 30) as f64,
-        arms.len()
-    );
 
-    // --- measure. Every arm, every round, order reversed on alternate rounds.
-    for round in 0..rounds {
-        let order: Vec<usize> = if round % 2 == 0 {
-            (0..arms.len()).collect()
-        } else {
-            (0..arms.len()).rev().collect()
-        };
-        for ai in order {
-            let arm = &mut arms[ai];
-            let secs = seconds_per_dispatch(kernels, &arm.ctx, arm.kernel, &arm.packed, arm.iters);
-            let gbps = arm.bytes as f64 / secs / 1e9;
-            arm.samples.push(gbps);
-        }
-        let line: Vec<String> = arms
-            .iter()
-            .map(|a| {
-                let s = summarize(&a.samples).expect("at least one sample");
-                format!("{}/{}bpw {:.0}", SHAPES[a.shape_idx].name, a.rate, s.median)
-            })
-            .collect();
-        println!("round {round}: {}", line.join("  "));
+    let device = Device::system_default().expect("Metal device");
+    let queue = device.new_command_queue().to_owned();
+    let kernels = LinearKernels::new().expect("LinearKernels");
+
+    // Every rate must have a kernel, checked before any buffer is allocated. A
+    // benchmark that silently skips a rate it was asked for is worse than one that
+    // refuses.
+    for rate in &rates {
+        let kernel = kernel_for(*rate);
+        assert!(
+            kernels.ishizuki_gemv_pipeline_by_name(kernel).is_some(),
+            "{kernel} is not in the library. The 3 bpw arm is the engine's live \
+             decode kernel; the 4/6 bpw arms are measurement kernels added by this \
+             spec. If one is missing, this harness would measure 3 bpw and print a \
+             ratio against nothing."
+        );
+        assert_eq!(
+            LinearKernels::ishizuki_rate_of_name(kernel),
+            Some(*rate),
+            "{kernel} does not name a {rate} bpw rate; `encode_gemv_named` rejects a \
+             name/rate mismatch, so every sample would be an error"
+        );
+    }
+
+    let verbose = !std::env::args().any(|a| a == "--quiet");
+    let mut results: Vec<Result_> = Vec::new();
+    for &si in &shape_idxs {
+        println!("--- {} {}x{} ---", SHAPES[si].name, SHAPES[si].in_features, SHAPES[si].out_features);
+        results.extend(run_shape(
+            &device, &queue, &kernels, si, &rates, rounds, round_ms, verbose,
+        ));
     }
 
     // --- report
-    println!("\n--- per shape (medians of {rounds}, GB/s of useful weight bytes) ---");
+    println!("\n=== per shape: medians of {rounds}, GB/s of USEFUL weight bytes ===");
     println!(
-        "{:<13} {:>4} {:>9} {:>8} {:>8} {:>7}  {}",
-        "shape", "bpw", "MB", "median", "spread", "amp", "ratio vs 3 bpw"
+        "{:<13} {:>4} {:>8} {:>8} {:>8} {:>6}  {}",
+        "shape", "bpw", "MB", "median", "spread", "amp", "ratio vs ref"
     );
-    for &si in &shape_idxs {
-        let shape = &SHAPES[si];
-        let base = arms
+    let get = |si: usize, rate: u8| -> Option<kaplumba_engine::bench::Summary> {
+        results
             .iter()
-            .find(|a| a.shape_idx == si && a.rate == rates[0])
-            .and_then(|a| summarize(&a.samples))
-            .expect("the lowest rate is always measured");
+            .find(|r| r.shape_idx == si && r.rate == rate)
+            .and_then(|r| summarize(&r.samples))
+    };
+    for &si in &shape_idxs {
+        let base = get(si, rates[0]).expect("the reference rate is always measured");
         for &rate in &rates {
-            let Some(arm) = arms.iter().find(|a| a.shape_idx == si && a.rate == rate) else {
-                continue;
-            };
-            let Some(s) = summarize(&arm.samples) else { continue };
-            let ratio = s.median / base.median;
+            let Some(s) = get(si, rate) else { continue };
+            let bytes = results
+                .iter()
+                .find(|r| r.shape_idx == si && r.rate == rate)
+                .map(|r| r.bytes)
+                .unwrap_or(0);
             println!(
-                "{:<13} {rate:>4} {:>9.1} {:>8.1} {:>8.3} {:>7.3}  {}",
-                shape.name,
-                arm.bytes as f64 / 1e6,
+                "{:<13} {rate:>4} {:>8.1} {:>8.1} {:>8.3} {:>6.3}  {}",
+                SHAPES[si].name,
+                bytes as f64 / 1e6,
                 s.median,
                 s.spread,
                 amplification(rate),
                 if rate == rates[0] {
-                    "1.000 (ref)".to_string()
+                    format!("1.000 (ref, {:.1})", s.median)
                 } else {
                     format!(
-                        "{ratio:.3}x   amp-predicted {:.3}x",
-                        amplification(rates[0]) / amplification(rate)
+                        "{:.3}x   amp predicts {:.3}x   residual {:.3}",
+                        s.median / base.median,
+                        amplification(rates[0]) / amplification(rate),
+                        (s.median / base.median)
+                            / (amplification(rates[0]) / amplification(rate)),
                     )
                 }
             );
         }
-        // Best/worst for the headline arms, so the median is never the only
-        // number on the page: a shape whose ratio is 1.3 in the median but whose
-        // rounds range 150-260 is a shape whose ratio is not a result.
-        for &rate in &rates {
-            if let Some(arm) = arms.iter().find(|a| a.shape_idx == si && a.rate == rate) {
-                if let Some(s) = summarize(&arm.samples) {
-                    println!(
-                        "{:<13} {rate:>4} {:>9} {:>8} worst {:>8.1} best {:>8.1} spread {:.3} ({:.2}x range)",
-                        "  ", "", "", s.worst, s.best, s.spread, s.best / s.worst,
-                    );
-                }
-            }
-        }
     }
 
-    // --- aggregate, weighted by bytes, which is the number comparable to the
-    //     187.7 GB/s the spec recorded for `gate_up_gelu`.
-    println!("\n--- aggregate over all shapes, byte-weighted (harmonic-free: sum(bytes)/sum(bytes/rate)) ---");
+    // --- aggregate, byte-weighted: the figure comparable to the 187.7 GB/s the
+    // spec recorded for `gate_up_gelu`.
+    println!("\n=== aggregate over all shapes, byte-weighted ===");
+    let mut aggregates: Vec<(u8, f64, f64, f64)> = Vec::new();
     for &rate in &rates {
-        let group: Vec<&Arm> = arms.iter().filter(|a| a.rate == rate).collect();
         let mut total_bytes = 0f64;
         let mut seconds = 0f64;
-        for arm in &group {
-            let Some(s) = summarize(&arm.samples) else { continue };
-            total_bytes += arm.bytes as f64;
-            seconds += arm.bytes as f64 / s.median / 1e9;
+        let mut worst_spread = 0f64;
+        for &si in &shape_idxs {
+            let Some(s) = get(si, rate) else { continue };
+            let bytes = results
+                .iter()
+                .find(|r| r.shape_idx == si && r.rate == rate)
+                .map(|r| r.bytes)
+                .unwrap_or(0);
+            total_bytes += bytes as f64;
+            seconds += bytes as f64 / s.median / 1e9;
+            worst_spread = worst_spread.max(s.spread);
         }
-        let aggregate = total_bytes / seconds / 1e9;
-        let spread = group
-            .iter()
-            .filter_map(|a| summarize(&a.samples))
-            .map(|s| s.spread)
-            .fold(f64::INFINITY, f64::max);
+        aggregates.push((rate, total_bytes / seconds / 1e9, amplification(rate), worst_spread));
+    }
+    for (rate, gbps, amp, worst_spread) in &aggregates {
         println!(
-            "  {rate} bpw: {total_bytes:>12.0} B useful  aggregate {aggregate:>6.1} GB/s  \
-             amp {:.3}  worst per-shape spread {spread:.3}",
-            amplification(rate)
+            "  {rate} bpw: {:>7.1} GB/s   amp {amp:.3}   worst per-shape spread \
+             {worst_spread:.3}",
+            gbps
         );
-        if rate == rates[0] {
-            continue;
-        }
-        // Print the ratio next to the prediction so the two cannot be confused.
-        let base: Vec<&Arm> = arms.iter().filter(|a| a.rate == rates[0]).collect();
-        let mut base_bytes = 0f64;
-        let mut base_seconds = 0f64;
-        for arm in &base {
-            let Some(s) = summarize(&arm.samples) else { continue };
-            base_bytes += arm.bytes as f64;
-            base_seconds += arm.bytes as f64 / s.median / 1e9;
-        }
-        let base_aggregate = base_bytes / base_seconds / 1e9;
+    }
+    let (ref_rate, ref_gbps, ref_amp, _) = aggregates[0];
+    for (rate, gbps, amp, _) in aggregates.iter().skip(1) {
+        let ratio = gbps / ref_gbps;
+        let predicted = ref_amp / amp;
         println!(
-            "           ratio {}bpw/{}bpw = {:.3}x   amp predicts {:.3}x   \
-             residual {}",
-            rate,
-            rates[0],
-            aggregate / base_aggregate,
-            amplification(rates[0]) / amplification(rate),
-            if (aggregate / base_aggregate) > amplification(rates[0]) / amplification(rate) * 0.98 {
-                "AT OR ABOVE the amplification model -> the rate explains the gap"
+            "\n  VERDICT  {rate}bpw / {ref_rate}bpw = {ratio:.3}x   \
+             amplification model predicts {predicted:.3}x   residual {residual:.3}",
+            residual = ratio / predicted,
+        );
+        println!(
+            "           {}",
+            if ratio >= predicted * 0.97 {
+                "the rate's lane-load amplification accounts for the gap: the kernel \
+                 is sound at this rate and the 3 bpw ceiling is a FORMAT property"
+            } else if ratio <= 1.02 {
+                "the stall is rate-INDEPENDENT: this rate moves the amplification and \
+                 nothing else moves, so the cost is in the kernel, not the format"
             } else {
-                "BELOW the amplification model -> the kernel is not rate-clean"
-            },
+                "BETWEEN: between the model's prediction and no effect -- look at the \
+                 per-shape table, a shape-dependent ratio localises the defect"
+            }
         );
     }
 
     println!(
-        "\nheld {:.2} GiB of synthesised weights (ru_maxrss; resident pages only, \
-         not a footprint -- AGENTS.md 10.3). If a model was resident while this ran, \
-         these numbers are contention-limited and must be re-taken on an idle box.",
+        "\nheld {:.2} GiB peak (ru_maxrss; resident pages only, NOT a footprint per \
+         AGENTS.md 10.3). If a model was resident while this ran, these numbers are \
+         contention-limited and must be re-taken on an idle box.",
         max_rss_bytes() as f64 / (1u64 << 30) as f64,
     );
 }
