@@ -105,14 +105,39 @@ fn kernel_for(rate: u8) -> &'static str {
     }
 }
 
-/// Lane-load amplification on this path: 32 lanes x 2 words x 4 B requested per
-/// tile, against `32 * KA` bytes of tile. Derived in
-/// `linear_repacked.metal` at `..._k4_colmajor_contig4_bench` and checked
-/// against `unpack_integer`'s window arithmetic in
-/// `tests/rate4_colmajor_bit_exact.rs`; printed here so the table states the
-/// prediction it is testing rather than leaving it in a comment.
+/// 32-bit words each lane loads per tile, on the colmajor `_contig4` body.
+///
+/// **Two** where the two-word window is legal, **three** where it is not. The
+/// boundary is `max_lane sh <= 48 - 7*KA` (`two_word_is_safe` in
+/// `scripts/gen_exl3_gemv.py`; measured at every rate in
+/// `tests/rate4_colmajor_bit_exact.rs`), which holds for KA 1..=4 -- and 3 and 4
+/// sit exactly on it. KA = 6 does not hold, so the 6 bpw kernel loads a third
+/// word and `..._k4_...` would have decoded six bits of zeros per lane as
+/// weight.
+fn words_per_lane(rate: u8) -> f64 {
+    if rate <= 4 { 2.0 } else { 3.0 }
+}
+
+/// Lane-load amplification on this path: 32 lanes x `words_per_lane` words x 4 B
+/// requested per tile, against `32 * KA` bytes of tile. So
+///
+/// ```text
+/// rate   words/lane   amplification
+/// 3 bpw      2            2.667     <- the engine's decode path
+/// 4 bpw      2            2.000
+/// 6 bpw      3            2.000
+/// ```
+///
+/// Note that 4 bpw and 6 bpw are at the *same* amplification. The 6 bpw arm is
+/// therefore not a lower-amplification point; it is a same-amplification /
+/// different-rate control, and it is the one that separates "the requests are the
+/// limit" from "the rate is the limit".
+///
+/// Derived in `linear_repacked.metal` at `..._k4_colmajor_contig4_bench`; printed
+/// here so the table states the prediction it is testing rather than leaving it in
+/// a comment.
 fn amplification(rate: u8) -> f64 {
-    8.0 / f64::from(rate)
+    words_per_lane(rate) * 4.0 / f64::from(rate)
 }
 
 /// 32-bit words of packed trellis per 16x16 tile: `256 * KA / 32`.
@@ -328,6 +353,24 @@ struct Arm {
     samples: Vec<f64>,
 }
 
+/// `ru_maxrss`, which on Darwin counts resident pages only and misses the Metal
+/// buffer pages. AGENTS.md 10.3 rejects it as a memory figure, and
+/// `peak_resident_pages_bytes` in the engine's `--metrics` is the same number
+/// under a name that once made a 93%-of-budget situation look like 57%.
+///
+/// Printed anyway, and labelled, because the number that matters for *this*
+/// tool is whether it disturbed anybody: 3 GiB of synthesised weights allocated
+/// while another agent had a model loaded is exactly the AGENTS.md 10.1 failure,
+/// and the only way a reader of these numbers can tell is if the tool says how
+/// much it was holding.
+fn max_rss_bytes() -> u64 {
+    let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::getrusage(libc::RUSAGE_SELF, &mut usage);
+    }
+    usage.ru_maxrss as u64
+}
+
 fn parse_args() -> (usize, Vec<String>, Vec<u8>, f64, bool) {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut rounds = 9usize;
@@ -368,9 +411,16 @@ fn parse_args() -> (usize, Vec<String>, Vec<u8>, f64, bool) {
 
 fn main() {
     let (rounds, wanted, rates, round_ms, determinism) = parse_args();
-    let device = Device::system_default().expect("Metal device");
-    let queue = device.new_command_queue().to_owned();
-    let kernels = LinearKernels::new().expect("LinearKernels");
+    // No Metal device until the determinism check has had its chance to run
+    // without one: that mode hashes 3 GiB of weights and must work while the GPU
+    // is busy.
+    let device = if determinism {
+        None
+    } else {
+        Some(Device::system_default().expect("Metal device"))
+    };
+    let queue = device.as_ref().map(|d| d.new_command_queue().to_owned());
+    let kernels = LinearKernels::new().ok();
 
     let shape_idxs: Vec<usize> = (0..SHAPES.len())
         .filter(|i| {
@@ -385,22 +435,24 @@ fn main() {
 
     // Every rate must have a kernel, checked before any buffer is allocated. A
     // benchmark that silently skips a rate it was asked for is worse than one
-    // that refuses.
-    for rate in &rates {
-        let kernel = kernel_for(*rate);
-        assert!(
-            kernels.ishizuki_gemv_pipeline_by_name(kernel).is_some(),
-            "{kernel} is not in the library. The 3 bpw arm is the engine's live \
-             decode kernel; the 4/6 bpw arms are measurement kernels added by \
-             this spec. If one is missing, this harness would measure 3 bpw and \
-             print a ratio against nothing."
-        );
-        assert_eq!(
-            LinearKernels::ishizuki_rate_of_name(kernel),
-            Some(*rate),
-            "{kernel} does not name a {rate} bpw rate; `encode_gemv_named` \
-             rejects a name/rate mismatch, so every sample would be an error"
-        );
+    // that refuses. Skipped in determinism mode, which builds no pipeline.
+    if let Some(kernels) = kernels.as_ref() {
+        for rate in &rates {
+            let kernel = kernel_for(*rate);
+            assert!(
+                kernels.ishizuki_gemv_pipeline_by_name(kernel).is_some(),
+                "{kernel} is not in the library. The 3 bpw arm is the engine's live \
+                 decode kernel; the 4/6 bpw arms are measurement kernels added by \
+                 this spec. If one is missing, this harness would measure 3 bpw and \
+                 print a ratio against nothing."
+            );
+            assert_eq!(
+                LinearKernels::ishizuki_rate_of_name(kernel),
+                Some(*rate),
+                "{kernel} does not name a {rate} bpw rate; `encode_gemv_named` \
+                 rejects a name/rate mismatch, so every sample would be an error"
+            );
+        }
     }
 
     println!("=== bench_rate_sweep: colmajor _contig4, rate 3 vs 4 (and 6) ===");
@@ -408,7 +460,8 @@ fn main() {
         "{} shapes x {} rates, {rounds} interleaved rounds of ~{round_ms:.0} ms, \
          alternating arm order.\n\
          Bytes are USEFUL WEIGHT BYTES (the checkpoint's own packed size); `amp` is \
-         lane-load amplification = 8/KA.\n\
+         lane-load amplification = 8/KA at 3/4 bpw (2 words/lane) and 12/KA at 6 bpw \
+         (3 words/lane -- see linear_repacked.metal).\n\
          Spread is worst/best, so LOWER is more repeatable.\n",
         shape_idxs.len(),
         rates.len(),
@@ -424,22 +477,41 @@ fn main() {
             let seed = SEED_BASE.wrapping_add(si as u32 * 131).wrapping_add(rate as u32);
             let words = build_colmajor(shape, rate, seed);
             if determinism {
-                println!("digest {:>12}  {} @{}bpw", digest(&words), shape.name, rate);
+                // Deliberately before any Metal allocation. This mode exists to
+                // be cheap and to be runnable while the GPU is busy -- on a box
+                // where a model is resident, allocating 3 GiB of weights to check
+                // a hash would evict somebody's benchmark. It only hashes.
+                println!(
+                    "digest {:>12}  {:<13} @{}bpw  {:>10} B  kernel {}",
+                    digest(&words),
+                    shape.name,
+                    rate,
+                    words.len() as u64 * 2,
+                    kernel_for(rate),
+                );
+                continue;
             }
             let bytes = useful_bytes(shape, rate);
             let kernel = kernel_for(rate);
-            let packed = upload_words(&device, &words);
+            // Unwrapped here, once, rather than threaded through: determinism
+            // mode `continue`s above, so these are only reached with a device.
+            let (device, queue, kernels) = (
+                device.as_ref().expect("device in measure mode"),
+                queue.as_ref().expect("queue in measure mode"),
+                kernels.as_ref().expect("kernels in measure mode"),
+            );
+            let packed = upload_words(device, &words);
             drop(words);
             allocated += bytes;
-            let ctx = make_ctx(&device, &queue, shape, rate);
+            let ctx = make_ctx(device, queue, shape, rate);
             // Calibrate once, off the timed path.
-            let secs = seconds_per_dispatch(&kernels, &ctx, kernel, &packed, MIN_ITERS);
+            let secs = seconds_per_dispatch(kernels, &ctx, kernel, &packed, MIN_ITERS);
             let iters = (((round_ms * 1e-3) / secs).round() as u64).clamp(MIN_ITERS, MAX_ITERS);
             // Second calibration at the real iteration count: the first one ran
             // cold and MIN_ITERS is short, and an iters chosen from a cold
             // measurement is the kind of thing that quietly halves a run's
             // resolution.
-            let secs = seconds_per_dispatch(&kernels, &ctx, kernel, &packed, iters);
+            let secs = seconds_per_dispatch(kernels, &ctx, kernel, &packed, iters);
             let iters = ((round_ms * 1e-3) / secs).round() as u64;
             arms.push(Arm {
                 shape_idx: si,
@@ -456,11 +528,12 @@ fn main() {
     }
     if determinism {
         println!(
-            "\nre-run and the digests must be identical; {allocated} bytes of \
-             synthesised weights, no file read"
+            "\nre-run and every digest must be identical. No file read, no Metal \
+             buffer allocated, no GPU touched."
         );
         return;
     }
+    let kernels = kernels.as_ref().expect("kernels in measure mode");
     println!(
         "resident weights: {:.2} GiB across {} arms\n",
         allocated as f64 / (1u64 << 30) as f64,
@@ -476,7 +549,7 @@ fn main() {
         };
         for ai in order {
             let arm = &mut arms[ai];
-            let secs = seconds_per_dispatch(&kernels, &arm.ctx, arm.kernel, &arm.packed, arm.iters);
+            let secs = seconds_per_dispatch(kernels, &arm.ctx, arm.kernel, &arm.packed, arm.iters);
             let gbps = arm.bytes as f64 / secs / 1e9;
             arm.samples.push(gbps);
         }
@@ -591,4 +664,11 @@ fn main() {
             },
         );
     }
+
+    println!(
+        "\nheld {:.2} GiB of synthesised weights (ru_maxrss; resident pages only, \
+         not a footprint -- AGENTS.md 10.3). If a model was resident while this ran, \
+         these numbers are contention-limited and must be re-taken on an idle box.",
+        max_rss_bytes() as f64 / (1u64 << 30) as f64,
+    );
 }
