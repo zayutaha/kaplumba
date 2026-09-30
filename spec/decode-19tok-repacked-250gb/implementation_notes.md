@@ -954,3 +954,40 @@ tree: a `cargo test` result from this tree is only trustworthy if the
 compilation window was not concurrent with someone else's save. The commits
 here are therefore scoped to a single file each (`repacked_golden.rs`, then
 the two spec documents) and touch no file owned by the other session.
+
+### 20.9 Suite state, and a flaky GPU profiler test
+
+Isolated worktree at `57fa90f` (my commits) with a private `CARGO_TARGET_DIR`:
+
+```text
+cargo test --release --workspace
+passed=162 failed=0 ignored=29
+```
+
+The 29 ignored are the model-loading gates, unchanged in kind from the 146/0/22
+recorded at `20.7` -- the delta is the other session's tests and mine.
+
+**`decode_profile_gpu::the_decode_instrument_measures_a_step_and_only_a_step` is
+flaky**: three consecutive runs gave pass, pass, fail (7.4 / 7.5 / 7.6 s). It asserts
+on a GPU timing window, it does not touch `repacked_golden`, and no commit here
+modifies it, so it is pre-existing. Treat a single failure of it as noise and re-run
+before investigating; do not "fix" it by widening the window without a paired
+measurement, per `20.7`'s note that unpaired A/B on this box has 4-12% spread.
+
+**What blocks `cargo test --release` in the shared working tree** (all from the
+concurrent session, none from these commits, as of `57fa90f`):
+
+| symptom | file | nature |
+|---|---|---|
+| `E0061`/`E0599`/`E0596` in a test target | `crates/kernels/tests/argmax_device.rs` (untracked) | does not compile |
+| `error: expected ']'`, so **every** `LinearKernels::new()` panics | `crates/kernels/src/linear_repacked.metal:1641` and `:1775` | truncated kernel signature `[[buffer(0)],` -- a half-finished append |
+| `AttentionKernels::new()` fails, so all 4 `attention_metal` tests fail | `crates/kernels/src/attention.rs` | in-progress refactor |
+| `E0433 cannot find module or crate pipeline_audit` | `crates/kernels/src/linear.rs:11`, `engine/src/generate.rs`, `engine/src/model.rs` | `lib.rs` not yet declaring `pipeline_audit`/`sweep` |
+
+The Metal one is the nastiest, because it is not a compile error. The `.metal` files
+are concatenated into a single shader library at build time, so a truncated kernel
+signature surfaces as `LinearKernels::new()` returning `KernelError::Shader` and
+**every** kernel test panicking at its own `.expect("LinearKernels")` -- which reads as
+"the kernels do not work", not as a typo on line 1641. If the whole Metal test suite
+goes red at once, map the concatenated `program_source` line number back to the `.metal`
+file before looking at anything else.
