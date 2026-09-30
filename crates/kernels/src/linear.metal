@@ -8222,12 +8222,15 @@ kernel void linear_gemv_ishizuki_k3_fused2(
     const device uint *column = (const device uint *)packed + tn * (tiles_k * WORDS);
     const uint stride = WORDS;
 
-    uint tk = sg;
-    for (; tk + 3 * SG < tiles_k; tk += 4u * SG) {
-        const device uint *t0 = column + (tk + 0 * SG) * stride;
-        const device uint *t1 = column + (tk + 1 * SG) * stride;
-        const device uint *t2 = column + (tk + 2 * SG) * stride;
-        const device uint *t3 = column + (tk + 3 * SG) * stride;
+    const uint step = SG * 4u;
+    const uint k_unroll_end = (tiles_k / step) * step;
+
+    uint tk = sg * 4u;
+    for (; tk < k_unroll_end; tk += step) {
+        const device uint *t0 = column + (tk + 0u) * stride;
+        const device uint *t1 = column + (tk + 1u) * stride;
+        const device uint *t2 = column + (tk + 2u) * stride;
+        const device uint *t3 = column + (tk + 3u) * stride;
 
         const ulong w0a = t0[j0], w0b = t0[j1];
         const ulong w1a = t1[j0], w1b = t1[j1];
@@ -8239,13 +8242,13 @@ kernel void linear_gemv_ishizuki_k3_fused2(
         const ulong A2 = ((w2a << 32) | w2b) << sh0;
         const ulong A3 = ((w3a << 32) | w3b) << sh0;
 
-        const device half *xr0 = x + (tk + 0 * SG) * 16u + r0;
+        const device half *xr0 = x + (tk + 0u) * 16u + r0;
         const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
-        const device half *xr1 = x + (tk + 1 * SG) * 16u + r0;
+        const device half *xr1 = x + (tk + 1u) * 16u + r0;
         const float p10 = float(xr1[0]), p11 = float(xr1[1]), p12 = float(xr1[8]), p13 = float(xr1[9]);
-        const device half *xr2 = x + (tk + 2 * SG) * 16u + r0;
+        const device half *xr2 = x + (tk + 2u) * 16u + r0;
         const float p20 = float(xr2[0]), p21 = float(xr2[1]), p22 = float(xr2[8]), p23 = float(xr2[9]);
-        const device half *xr3 = x + (tk + 3 * SG) * 16u + r0;
+        const device half *xr3 = x + (tk + 3u) * 16u + r0;
         const float p30 = float(xr3[0]), p31 = float(xr3[1]), p32 = float(xr3[8]), p33 = float(xr3[9]);
 
         float v0[8], v1[8], v2[8], v3[8];
@@ -8268,7 +8271,7 @@ kernel void linear_gemv_ishizuki_k3_fused2(
         acc1 += p30 * v3[4] + p31 * v3[5] + p32 * v3[6] + p33 * v3[7];
     }
 
-    for (; tk < tiles_k; tk += SG) {
+    for (tk = k_unroll_end + sg; tk < tiles_k; tk += SG) {
         const device uint *t0 = column + tk * stride;
         const ulong a0 = t0[j0], a1 = t0[j1];
         const ulong A0 = ((a0 << 32) | a1) << sh0;
@@ -8363,12 +8366,15 @@ kernel void linear_gemv_ishizuki_k3_fused3(
     const device uint *column = (const device uint *)packed + tn * (tiles_k * WORDS);
     const uint stride = WORDS;
 
-    uint tk = sg;
-    for (; tk + 3 * SG < tiles_k; tk += 4u * SG) {
-        const device uint *t0 = column + (tk + 0 * SG) * stride;
-        const device uint *t1 = column + (tk + 1 * SG) * stride;
-        const device uint *t2 = column + (tk + 2 * SG) * stride;
-        const device uint *t3 = column + (tk + 3 * SG) * stride;
+    const uint step = SG * 4u;
+    const uint k_unroll_end = (tiles_k / step) * step;
+
+    uint tk = sg * 4u;
+    for (; tk < k_unroll_end; tk += step) {
+        const device uint *t0 = column + (tk + 0u) * stride;
+        const device uint *t1 = column + (tk + 1u) * stride;
+        const device uint *t2 = column + (tk + 2u) * stride;
+        const device uint *t3 = column + (tk + 3u) * stride;
 
         const ulong w0a = t0[j0], w0b = t0[j1];
         const ulong w1a = t1[j0], w1b = t1[j1];
@@ -8380,13 +8386,13 @@ kernel void linear_gemv_ishizuki_k3_fused3(
         const ulong A2 = ((w2a << 32) | w2b) << sh0;
         const ulong A3 = ((w3a << 32) | w3b) << sh0;
 
-        const device half *xr0 = x + (tk + 0 * SG) * 16u + r0;
+        const device half *xr0 = x + (tk + 0u) * 16u + r0;
         const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
-        const device half *xr1 = x + (tk + 1 * SG) * 16u + r0;
+        const device half *xr1 = x + (tk + 1u) * 16u + r0;
         const float p10 = float(xr1[0]), p11 = float(xr1[1]), p12 = float(xr1[8]), p13 = float(xr1[9]);
-        const device half *xr2 = x + (tk + 2 * SG) * 16u + r0;
+        const device half *xr2 = x + (tk + 2u) * 16u + r0;
         const float p20 = float(xr2[0]), p21 = float(xr2[1]), p22 = float(xr2[8]), p23 = float(xr2[9]);
-        const device half *xr3 = x + (tk + 3 * SG) * 16u + r0;
+        const device half *xr3 = x + (tk + 3u) * 16u + r0;
         const float p30 = float(xr3[0]), p31 = float(xr3[1]), p32 = float(xr3[8]), p33 = float(xr3[9]);
 
         float v0[8], v1[8], v2[8], v3[8];
@@ -8409,7 +8415,7 @@ kernel void linear_gemv_ishizuki_k3_fused3(
         acc1 += p30 * v3[4] + p31 * v3[5] + p32 * v3[6] + p33 * v3[7];
     }
 
-    for (; tk < tiles_k; tk += SG) {
+    for (tk = k_unroll_end + sg; tk < tiles_k; tk += SG) {
         const device uint *t0 = column + tk * stride;
         const ulong a0 = t0[j0], a1 = t0[j1];
         const ulong A0 = ((a0 << 32) | a1) << sh0;
