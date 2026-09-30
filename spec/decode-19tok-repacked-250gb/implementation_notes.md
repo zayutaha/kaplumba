@@ -303,3 +303,137 @@ anomaly to chase.
 
 Also fixed: the instrument's summary line still looked up a `_u8` kernel that no longer
 exists and printed `0.00x`. Now compares `contig4/colmajor`.
+
+---
+
+## 2026-09-30: where the 72.6 ms actually is
+
+Subagent audit of the kernel-time budget (option (c)), with the load-bearing claims
+re-verified by hand afterwards.
+
+### The measurement this replaces
+
+The "~13 ms span-minus-own gap" reported earlier **was an arithmetic error of mine**:
+I differenced `span` from **step** mode against `own` from **kernel** mode, and
+`decode_profile.rs:36-37` says explicitly that step-mode `own` is "only the two
+boundary buffers, so it is small and **not a decode cost**". Correct figures:
+
+| instrument | own | span | wall | tok/s |
+|---|---:|---:|---:|---:|
+| step (clock, undistorted) | 71.3 * | 73.8 | 71.8 | 10.92 |
+| kernel (attribution; wall inflated) | 72.6 | 83.5 | — | 9.16 |
+| uninstrumented | — | — | ~81.5 | 12.27 |
+
+<sub>*not a decode cost</sub>
+
+So kernel own time is ~95% of the step and the host gap is ~9 ms, not 13.
+
+### The 1.333x was real after all — as REQUEST amplification, not DRAM burst
+
+This is the finding that matters, and it inverts the earlier withdrawal. Agent 3 found
+that lane-load amplification per tile is:
+
+| rate | lane-loads/tile | distinct words | amplification |
+|---|---:|---:|---:|
+| 3 bpw | 64 | 24 | **2.667** |
+| 6 bpw (`lm_head`) | 96 | 48 | **2.000** |
+
+and therefore
+
+```
+predicted 3 bpw ceiling = 250.5 x 2.00/2.667 = 187.9 GB/s
+measured gate_up_gelu               = 187.7 GB/s      fit error 0.1%
+```
+
+**Verified by hand.** The earlier retirement of the 1.333x was right about *mechanism*
+(a 96 B tile does not force a 128 B DRAM fetch; a colmajor column is 32,256 B =
+252x128, fully consumed) and wrong about *consequence*: the ratio is real, it just
+lives in the request path, not the DRAM path. That also explains why `lm_head` at
+6 bpw reaches 250 GB/s while the 3 bpw layers sit at ~188 with no change in bytes.
+
+`lm_head` is **not** colmajor (`model.rs:2829-2848` sets `permutation_mode = 1` only on
+the seven per-layer linears) so it takes the row-major `_w2` arm with 16384
+threadgroups. It is a fair comparator: same op mix, same `decode_state` body, same
+memory system. Verified in code.
+
+### So the ceiling is 187.7, not 250
+
+| | bytes/token | ms now | GB/s | ms at 250 |
+|---|---:|---:|---:|---:|
+| `gate_up_gelu` | 5.202 GB | 27.71 | 187.7 | 20.81 |
+| `down_proj` | 2.601 GB | 14.49 | 179.5 | — |
+| `qkv_proj` + `qk_proj` | 2.023 GB | 11.37 | 178.0 | — |
+| `o_proj` | 1.156 GB | 6.82 | 169.5 | — |
+| `head/gemv` (6 bpw) | 1.057 GB | 4.22 | 250.5 | — |
+
+If every 3 bpw GEMV hit 250 GB/s the GEMV total would fall 64.6 -> 48.2 ms, giving
+**14.7-16.1 tok/s** depending on the inter-boundary gap. That is the *entire* remaining
+prize in the kernels, and it is bounded by the 2.667x request rate, not by DRAM.
+
+Three attacks on the amplification were already measured and **failed**:
+`simd_shuffle` cooperative loads 180.5 -> 146.5; `_u4` 384-byte `uint4` loads 180.5 ->
+173.7 on gate_up; threadgroup ring staging 118.8 vs 119.5 (no change). The remaining
+untried lever is the bit-plane layout at `exl3.rs:687-726`, which makes each lane's
+three codes a single byte in three coalesced 32-byte-per-warp loads — that attacks the
+2.667x directly and is dead code today.
+
+### The ALU is not the problem, and that is measured, not argued
+
+Two independent no-decode probes on the real kernel, both showing the *opposite* sign
+from "dequant is too expensive":
+
+- `_nod` stub (`linear.metal:8353`, driven by `gemv_shape --decode-probe`):
+  3 bpw 167.3 -> **122.7** when decode is removed, i.e. **-26.7%**.
+  4 bpw 217.1 -> 206.3 (-5.0%). 8 bpw 222.5 -> 219.2 (-1.5%).
+- four-probe sweep on gate_proj: baseline 124.7, **no decode 115.1**, no x-loads
+  124.6, **no weight loads 223.4**.
+
+Deleting 59% of the ALU work makes it *slower*. The decode's dependent chains were
+accidentally supplying the ILP that hides load latency. "Cheaper dequant" is ruled out
+as a fix, twice, on two instruments.
+
+### `gate_up_gelu` has essentially no headroom
+
+It is **99.4% weight streaming**: 5.202 GB of weights against 30.97 MB of everything
+else (GEMV writes, finalize reads/writes). Deleting 100% of the non-weight traffic
+saves <= 0.155 ms = 0.56% of the bucket. The epilogue
+(`linear_finalize_gated_gelu_and_down_input_transform`, `linear.metal:568`) moves 64 B
+per thread at ~0.88 FLOP/B — 2.5% of the machine's ridge point — so it is
+latency-bound, not bandwidth-bound, and costs ~0.15-0.27 ms/token total.
+`scratch.gate`/`scratch.up` are already dead at HEAD (commit `6327c84`); the live
+intermediate is `raw`/`raw_b` in **fp32**, 20.6 MB/token, not the 5.2 MB the notes
+claimed.
+
+### Dispatch structure: the "~42 buffers/step" is stale
+
+Derived census: **1407 dispatches per step**, and since `1407 < max_dispatches(2500)`,
+`tick()` never fires `roll()` and the step commits **2 command buffers, one of them
+empty** — not 42. `MAX_IN_FLIGHT` is never engaged. The `~2100 dispatches` constant at
+`encoder.rs:846` and the `42 buffers/step` comments at `decode_profile.rs:21`,
+`generate.rs:893` and `spec/decode-bandwidth-240gb` all predate `set_max_dispatches`
+and the fused kernels. **Derived from the call graph, not yet measured** —
+`KAPLUMBA_COUNT_BUFFERS=1` settles it in one command.
+
+Two real serialisation points per step, and the host **cannot** run ahead:
+`model.rs:3192` commits an empty buffer and waits against a provably idle queue (it
+exists for prefill scratch reuse, `model.rs:3183-3191`, and is dead weight for a
+1-token chunk); and the terminal barrier, after which the host argmax over 262,144
+fp16 must finish before the next step can start. `model.rs:2919-2924` documents why
+there is no device-side hand-off, and `model.rs:3378-3391` why the existing device
+pick is wrong for this vocabulary (`greedy_key` packs `0xFFFF - index` into 16 bits,
+which underflows for every index >= 65,536 — most of a 262,144 vocabulary).
+
+Also found: `generate.rs:867` evaluates `argmax_with_margin(&logits)` **unconditionally**
+even though `MarginLog::record` is gated, costing two extra full passes over the
+logits row per token on the `generate_gpu_greedy` path. The default path
+(`generate_gpu`, `main.rs:99-103`) guards it correctly at `generate.rs:293-299`, so the
+measured numbers are unaffected — but `--legacy-path` is materially slower for a reason
+that has nothing to do with the GPU.
+
+### What nobody has ever measured
+
+`grep -rln "dp_span_over_wall\|dp_span_minus_wall" spec/` returns **nothing**. The
+step-mode report prints exactly the decomposition that would attribute the ~9 ms
+(`dp_span` vs `dp_wall` vs their ratio), and it costs one extra commit per step
+without draining, so it does not serialise the host. It has never been run and
+recorded. `KAPLUMBA_STEP_TRACE=1` likewise never appears in any spec.
