@@ -35,10 +35,10 @@
   - Intent: Implement `linear_gemv_ishizuki_k3_fused2` (`gate_proj` + `up_proj`) and `linear_gemv_ishizuki_k3_fused3` (`q_proj` + `k_proj` + `v_proj`). Wire into `forward_chunk` during decode.
   - Result: Fused2 and Fused3 wired into `model.rs`. Bit-exact greedy decode verified ("Paris", "Relativity posits that space and time are linked..."). Single command buffer execution (`KAPLUMBA_MAX_DISPATCHES_PER_BUFFER=2500`) confirmed running 60 layers in 1 buffer, delivering 83.9 ms GPU own time per token (11.46 tok/s).
 
-- [ ] **T7.1: Internalize single-buffer decode in `MetalEncoder`**
-  - Files: `crates/kernels/src/encoder.rs`, `crates/engine/src/model.rs`
+- [x] **T7.1: Internalize single-buffer decode in `MetalEncoder`**
+  - Files: `crates/kernels/src/encoder.rs`, `crates/engine/src/model.rs`, `crates/engine/src/generate.rs`
   - Intent: Allow `MetalEncoder` to configure `max_dispatches = 2500` for decode steps without requiring env var, while preserving 50 for prefill.
-  - Test: Unit tests pass; decode runs 1 command buffer per token automatically.
+  - Result: Added `set_max_dispatches` on `MetalEncoder`. Configured in `model.rs` and `generate.rs`. Verified: decode commits in single command buffer automatically, sustaining steady-state 86.2 ms/token (11.6 tok/s). All kernel tests pass.
 
 - [ ] **T7.2: Design and implement 128-byte vector repacking in `repack_model.rs`**
   - Files: `crates/engine/src/bin/repack_model.rs`, `crates/engine/src/exl3.rs`

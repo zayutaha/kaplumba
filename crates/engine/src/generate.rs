@@ -881,6 +881,7 @@ where
                 })?;
             let step_started = Instant::now();
             let mut encoder = MetalEncoder::new(&queue).map_err(ModelError::from)?;
+            encoder.set_max_dispatches(2500);
             // `KAPLUMBA_DECODE_PROFILE=step`: two stamped boundaries around the
             // step, so its duration on the GPU timeline can be read. The span
             // between them covers the ~42 rolled buffers in between, because one
