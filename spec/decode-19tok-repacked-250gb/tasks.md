@@ -132,18 +132,20 @@
   - Intent: Five dispatches per layer (3 head-width norms + 2 ropes) → one.
   - Result: Gated on `decode`. Prefill keeps the five-dispatch path for two load-bearing reasons: `norm_rope_qkv` has no token axis so `offset` IS the position, and the reference norms switch to the per-row kernel above `THREADGROUP_NORM_MAX_ROWS` (8192), which a 1024-row × 32-head prefill chunk crosses — a different reduction order is a different `rsqrt`.
   - `KAPLUMBA_NO_NORM_ROPE_QKV` restores the old path so the A/B runs from ONE binary; two rebuilt binaries differ by build layout alone and this box drifts 10%+ run to run.
-  - **MEASURED** (same binary, flag A/B, 96 greedy tokens, 4 interleaved pairs): unfused 1407 dispatches/token, median 13.215 tok/s (75.67 ms/step), spread 1.1%; fused 1167 dispatches/token, median 13.299 tok/s (75.19 ms/step), spread 0.9%. **Delta -0.48 ms/step, +0.64%** — 240 dispatches/token removed, exactly 4 × 60 layers as predicted. The time delta is *inside* the spread, so see the negative result note below.
+  - **MEASURED, final** (same binary, flag A/B, 96 greedy tokens, **16 interleaved pairs**): unfused 1407 dispatches/token, median 13.320 tok/s (75.08 ms/step), spread 4.5%; fused 1167 dispatches/token, median 13.511 tok/s (74.01 ms/step), spread 4.1%. **Median -0.84 ms/step, +1.14%.** B faster in **15/16 pairs**, sign test **p = 0.0005**, paired t = 6.80 on 14 df. 240 dispatches/token removed, exactly 4 × 60 layers as predicted. **The win is ~1%, not the 3.5-4.5 ms the task originally estimated — see the marginal-cost note below.**
+  - **MARGINAL COST PER DISPATCH: 3.5 us** (0.84 ms / 240 dispatches). This is the number to plan against, and it revises the remaining fusion estimates by an order of magnitude.
+  - **Kernel own time is UNCHANGED** (`KAPLUMBA_DECODE_PROFILE=kernel`, 96 tokens): `kv_norm_rope` 0.8598 ms/token unfused vs 0.8622 ms/token fused, and total `dpk_own_ms_per_token` 71.649 vs 71.644. **The 0.84 ms is NOT saved kernel work — it is removed launch/bubble latency.** The five kernels and the one kernel do the same arithmetic over the same data; what changed is that four boundaries per layer are gone. This is direct confirmation of the bubble hypothesis in the task brief, and it also means the win cannot be scaled by making the kernel itself faster.
   - **BIT-EXACTNESS, end to end**: full stdout over 128 greedy tokens byte-identical between arms, sha256 `2fff2c970b611f64c4a485d8a3a3dc719a0f03293a3f48c167f4dff5466795b2` for both, including the `--show-ids` token list. A single fp16 ULP anywhere in the 60-layer forward would change that list.
 
 - [ ] **T7.6.11: Fused Down Finalize + Post-FFN Residual & Layer Scale**
   - Files: `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`, `crates/engine/src/model.rs`
   - Intent: Combine `linear_finalize_simd` and `encode_rms_norm_residual_layer_scale` into a single kernel dispatch (`linear_finalize_simd_with_residual_scale`), eliminating 60 dispatches and `scratch.proj` DRAM buffer traffic.
-  - Estimated impact: ~2.0 ms reduction in step latency. **See the T7.6.10 result before starting: the measured marginal value of a dispatch on this box is ~0.002 ms, so 60 dispatches is ~0.12 ms, not 2.0 ms.**
+  - Estimated impact: ~2.0 ms reduction in step latency. **REVISED BY MEASUREMENT: at the measured 3.5 us marginal cost per dispatch, 60 dispatches is ~0.21 ms, not 2.0 ms — an order of magnitude less than estimated.** The original estimate appears to have assumed the dispatch's *own* kernel time, which T7.6.10 measured as unchanged. Build only with that expectation set.
 
 - [ ] **T7.6.12: Fused Post-Attention Norm, Residual, and Gate Input Transform**
   - Files: `crates/kernels/src/elements.metal`, `crates/kernels/src/elements.rs`, `crates/engine/src/model.rs`
   - Intent: Merge post-attention residual add, pre-FFN RMS norm, and Hadamard gate input transform into a single dispatch per layer, eliminating 120 dispatches per token.
-  - Estimated impact: ~2.0 ms reduction in step latency. **Revise against the measured marginal dispatch cost, as above.**
+  - Estimated impact: ~2.0 ms. **REVISED BY MEASUREMENT: 120 dispatches x 3.5 us = ~0.42 ms, not 2.0 ms.** Note this one also removes a `scratch.proj`-width DRAM round trip (5376 fp16 x 2 = 10.5 KB per layer, 0.63 MB/token), which at 250 GB/s is ~2.5 us of *bandwidth*, so the dispatch saving dominates.
 
 - [ ] **T7.6.13: Attention Fast-Path Single Dispatch for Short Decode Context**
   - Files: `crates/kernels/src/attention.rs`, `crates/engine/src/model.rs`

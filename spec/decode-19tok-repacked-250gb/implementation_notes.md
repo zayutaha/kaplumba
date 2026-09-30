@@ -516,3 +516,164 @@ Dissecting the current 68.2-70.4 ms forward decode step:
 - **Target Projected Step Time:** 55.5 ms - 9.0 ms non-linear reduction = **46.5-50.0 ms/step (20.0-21.5 tok/s)**.
 
 
+ 
+---
+
+## 20. Dispatch fusion: `norm_rope_qkv` measured (T7.6.10)
+
+### 20.1 HEADLINE: the fusion roadmap's estimates were ~5x too high
+
+The roadmap in §19.4 predicted `norm_rope_qkv` would save 3.5-4.5 ms. **It saved
+0.84 ms.** Measured on the same binary, flag A/B, 16 interleaved pairs:
+
+| arm | dispatches/token | median tok/s | median ms/step | spread |
+|---|---:|---:|---:|---:|
+| unfused (`KAPLUMBA_NO_NORM_ROPE_QKV=1`) | 1407 | 13.320 | 75.08 | 4.5% |
+| fused (default) | 1167 | 13.511 | 74.01 | 4.1% |
+
+- B faster in **15/16 pairs**; sign test **p = 0.0005**; paired **t = 6.80** on 14 df.
+- **Marginal cost of a dispatch on this box: 3.5 us** (0.84 ms / 240 dispatches).
+
+**Use 3.5 us/dispatch to plan any further fusion.** The remaining roadmap items
+(T7.6.11 60 dispatches, T7.6.12 120, T7.6.13 60) are worth **0.21 / 0.42 /
+0.21 ms**, not the 2.0 / 2.0 / 1.5 ms each was estimated at. Total remaining
+dispatch-fusion budget is **~0.8 ms**, which cannot reach the 52.6 ms target
+(19 tok/s) on its own — the target needs the 55.5 ms of GEMV time to move, not
+the 12.8 ms of non-linear tax. The §19.4 projection of "46.5-50.0 ms/step" is
+**not reachable by fusion** and should not be planned against.
+
+### 20.2 The saving is NOT saved kernel work -- it is bubble
+
+This is the finding that matters for everything downstream. `KAPLUMBA_DECODE_PROFILE=kernel`
+over 96 tokens:
+
+| | unfused | fused |
+|---|---:|---:|
+| `kv_norm_rope` own ms/token | 0.8598 | 0.8622 |
+| total `dpk_own_ms_per_token` | 71.649 | 71.644 |
+
+**Kernel own time is unchanged to three decimal places** while the step gets
+0.84 ms faster and 240 dispatches disappear. The five kernels and the one kernel
+do the same arithmetic over the same bytes; only four launch boundaries per
+layer are gone. So:
+
+- A dispatch costs ~3.5 us of *latency* and ~0 us of *work* at this size.
+- Fusion cannot be made to pay more by optimising the fused kernel. The lever is
+  dispatch count and nothing else.
+- The corollary is a trap: anyone who profiles only `dpk_own_ms_per_token` will
+  measure this change as exactly zero and conclude it did nothing. It needs the
+  end-to-end tok/s or `dpk_span_ms_per_token` to see.
+
+### 20.3 The kernel as handed over was wrong in three ways
+
+Not "unwired" -- wrong, in ways that would have shipped a 10-layer silent
+numerical error had it been wired without a test:
+
+1. **`head_dim 512` summed only the first 256 columns.** The kernel read
+   `const float val = float(target[base + lid])` with no strided loop. That is
+   correct only when `head_dim` equals the threadgroup width. The 50 sliding
+   layers (256) would have been fine; the **10 full-attention layers (512) would
+   have normalised against a quarter of the head** and produced garbage, with no
+   error anywhere. This is exactly the class of bug the `_contig4` precedent in
+   §? (`live_kernel_bit_exact.rs`) warns about: a kernel that is right on the
+   shape you tested and wrong on the shape you shipped.
+2. **The fp16 rounding was skipped.** The unfused path is
+   `rms_norm_weighted_tg` writing `half(...)` to a buffer, then `rope` reading
+   that half back. The fused version carried the normed value in an fp32
+   register across the rotation. `half(lo*cos - hi*sin)` is not a function of the
+   twice-rounded form: measured **328 of 1024 elements differ, worst 19 ULP**.
+   This is *the* reason the obvious fusion is not bit-exact, and it is invisible
+   to any tolerance-based test at "close enough" thresholds.
+3. **The unrotated tail copied only the low half**, leaving the high half of
+   every tail pair unwritten. Same bug `rope` itself once had, documented at
+   `elements.metal:363`.
+
+Fixed by mirroring the reference exactly: strided sum of squares in
+`rms_norm_weighted_tg`'s order with its 256-lane tree; `normed_shared[i] =
+float(half(normed))`; `threadgroup float normed_shared[512]` so both head dims
+work from one kernel; one thread per PAIR (not per column) for both the rotation
+and the tail, which is what makes the in-place write race-free.
+
+### 20.4 A test that could not fail, and looked like coverage
+
+The "did the kernel write every column?" test -- poison the output, run, assert no
+poison survives -- was **wrong on its first version and passed while sabotaged**.
+It uploaded the real input *over* the poison sentinel and then asserted the
+sentinel did not survive, which can never happen: the input overwrite had
+already removed every one. It reported `ok` with the unrotated tail's high half
+being dropped.
+
+The fix is not a stricter assertion, it is a different construction: **make the
+INPUT the poison.** Fill every buffer with `0x7bff` and set the weights to 1.0.
+A written column comes out near 1.0 (the norm of a constant vector times weight
+1.0); an unwritten column is still `0x7bff`. The input does not have to be
+realistic -- it has to make written and unwritten distinguishable.
+
+Re-verified: with the tail sabotage in place it now reports
+`256 of 1024 columns unwritten, first at column 192, rotated_pairs 64`.
+
+This is the third instance in this repo of the AGENTS.md §3.4 rule earning its
+keep (`crates/engine/tests/linear_metal.rs:900` twice, now here). **A test whose
+setup makes its assertion vacuous is worse than no test**, because it is read as
+coverage by the next person, including in the spec.
+
+### 20.5 Sabotage evidence (all three reverted; kernel byte-identical after)
+
+| sabotage | observed failure |
+|---|---|
+| drop `float(half(normed))` | 328/1024 elements, worst 19 ULP, first at head 0 col 2 |
+| `partial[lid] = (lid==0) ? sum : 0` | 8192/8192 elements, worst 9266 ULP |
+| drop the tail's high half | exactly 256 elements at col 192; poison test 256/1024 unwritten |
+
+### 20.6 End-to-end bit-exactness
+
+Full stdout over 128 greedy tokens, both arms, byte-identical:
+sha256 `2fff2c970b611f64c4a485d8a3a3dc719a0f03293a3f48c167f4dff5466795b2`,
+including the `--show-ids` token list. A single fp16 ULP anywhere in the
+60-layer forward changes that list, so this is the no-quality-loss gate.
+
+### 20.7 Operational notes
+
+- **Dispatch counting needed a new counter.** `command_buffers_created()` cannot
+  answer "how many dispatches", because under `KAPLUMBA_DECODE_PROFILE` the
+  stamped boundaries dominate it: a 48-step profiled run reported **730
+  buffers/step against 1407 real dispatches**. `MetalEncoder::dispatches_total`
+  is the right number and is now folded per decode step.
+- **The tally for the real decode loop must be taken in `generate.rs`.**
+  `forward_buffer_into_step` drives the *caller's* encoder, so `model.rs`'s own
+  hook never fires for it. And it must be read before `commit_terminal`, which
+  consumes the encoder.
+- **`KAPLUMBA_DECODE_PROFILE=kernel`, not `=1`.** The parser matches the literal
+  strings `step`/`kernel`; `=1` silently means Off and the run looks like it
+  worked. Cost me two runs.
+- **`scripts/gpuq try -- env VAR=1 ...`** — a bare `VAR=1 scripts/gpuq ...`
+  does not propagate the variable through.
+- **`cargo fmt --all` reformats files holding other people's uncommitted work.**
+  It reflowed 10 files I never touched and 50 lines of the pre-existing
+  `live_kernel_bit_exact.rs` work. Reverted with `git checkout` on the clean
+  ones and by hand on the dirty one. Use `rustfmt <file>` on what you changed.
+- **A/B on this box needs pairing, not median comparison.** 16 unpaired samples
+  gave spreads of 4-12%; the paired test resolves a 1% effect at p=0.0005
+  because each pair cancels the drift. One pair in 16 is badly contaminated
+  (both arms slow) -- report it, do not silently drop it.
+- `KAPLUMBA_NO_NORM_ROPE_QKV` is kept, not just as an A/B lever: it is the
+  cheapest available regression switch if a future kernel change turns out to
+  break bit-exactness in a way the shape tests miss.
+- Full suite after this change: **146 passed, 0 failed, 22 ignored** (the
+  ignored are the model-loading gates, unchanged). `scripts/gen_exl3_gemv.py`
+  run twice leaves an identical diff (AC6 holds; the 139 lines in
+  `linear.metal` are the pre-existing `_sk2` work, which the generator does not
+  touch -- it lives in `linear_repacked.metal` for exactly that reason).
+
+### 20.8 On the uncommitted `_sk2` split-K kernels
+
+`linear_repacked.metal` carries uncommitted `_sk2` split-K kernels that a prior
+measurement found *slower*; `linear.rs` has had their reduce dispatches removed
+again (`gemv_reduce_sk2_pipeline` / `gemv_reduce_sk4_pipeline` are now
+constructed but never dispatched -- the compiler flags them as dead). They are
+**dead weight, left in place deliberately**: they are not mine to delete, and
+`live_kernel_bit_exact.rs` still asserts the `_sk2` kernel's fp16 output against
+the reference, so removing them would remove a live measurement. The clean-up is
+a one-line question for whoever owns that work: does the `_sk2` assertion still
+earn its keep, or is the pipeline registration and the 139 lines of `.metal`
+just dead?
