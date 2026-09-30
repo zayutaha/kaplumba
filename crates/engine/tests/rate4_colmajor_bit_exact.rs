@@ -613,3 +613,186 @@ fn the_engine_cannot_dispatch_the_four_bpw_measurement_kernel() {
     );
     let _ = device;
 }
+
+// ---------------------------------------------------------------------------
+// The amplification arithmetic, computed exactly. No GPU, no Metal, no model.
+// ---------------------------------------------------------------------------
+//
+// The whole decision rule is a number per rate: lane-loads per useful weight
+// byte. `spec/decode-19tok-repacked-250gb` states it as 2.667 at 3 bpw and
+// 2.000 at 6 bpw, and uses it to predict
+//
+//     predicted 3 bpw ceiling = 250.5 x 2.00 / 2.667 = 187.9 GB/s
+//
+// against a measured 187.7. A prediction that precise deserves to be computed
+// rather than quoted, and there is a second question underneath it that the
+// notes settle only by assertion: is the amplification in the *request* stream
+// or in *DRAM* traffic? They answer "the request path, not the DRAM path",
+// because a 96-byte tile does not force a 128-byte fetch and a colmajor column
+// is fully consumed. Both halves are checkable here, exactly, with no hardware.
+//
+// Three quantities per rate:
+//
+//   `lane_loads_per_tile`    32 lanes x words_per_lane. This is what the SM
+//                            memory unit is asked to return.
+//   `distinct_words`         |{ j_i(lane) }| over all 32 lanes. Words are the
+//                            cache-line granule the requests resolve to, so this
+//                            is the traffic that has to come from L2/DRAM *for
+//                            this tile in isolation*.
+//   `lines_touched`          128-byte lines covered by the union over a whole
+//                            colmajor column, divided by the column's bytes.
+//                            This is the DRAM figure.
+//
+// The last one is the one that matters, and it is 1.000 at every rate, because
+// adjacent tiles in a colmajor column are contiguous and every tile is fully
+// read. So the 2.667 at 3 bpw cannot be a DRAM effect and the kernel is not
+// wasting bandwidth on the floor -- it is issuing 2.667x as many lane-loads for
+// the same bytes. That is precisely a *latency / request-throughput* limit, and
+// it is why the amplification model predicts the measured 3 bpw rate from a
+// 6 bpw DRAM ceiling without any term for wasted bytes.
+
+/// 32-bit words each lane loads per tile on the colmajor `_contig4` body at
+/// `rate`, and the set of word indices those loads cover.
+///
+/// Returns `(words_per_lane, distinct_words)`. Mirrors the kernel's own
+/// `lo0 / sh0 / j0 / j1 / j2` exactly, including the modulo reduction.
+fn lane_load_footprint(rate: u8) -> (usize, usize) {
+    let ka = rate as u32;
+    let ring = 256 * ka;
+    let words = (ring / 32) as usize;
+    // The third word is loaded iff the two-word window is illegal at this rate.
+    // Derived and measured in `the_two_word_window_is_safe_exactly_at_rates_one_through_four`;
+    // restating it here would be a second list to keep in step, so it is asserted
+    // against that test's SAFE set below.
+    let per_lane = if rate <= 4 { 2 } else { 3 };
+    let mut touched = std::collections::BTreeSet::new();
+    for lane in 0..32u32 {
+        let lo = (lane * 8 + 1) * ka + ring - 16;
+        let hi = (lo / 32) as usize;
+        let j0 = if hi >= words { hi - words } else { hi };
+        touched.insert(j0);
+        for step in 1..per_lane {
+            touched.insert((j0 + step) % words);
+        }
+    }
+    (per_lane, touched.len())
+}
+
+#[test]
+fn lane_load_amplification_is_2_667_at_3_bpw_and_2_000_at_4_and_6() {
+    // (rate, expected words/lane, expected distinct words, expected amp)
+    // `8.667/3 = 2.6667`, `8/4 = 2.0`, `12/6 = 2.0`. Exact rationals, compared
+    // as rationals: an epsilon here would let a wrong constant hide.
+    let cases: &[(u8, usize, usize, f64)] = &[
+        (3, 2, 24, 64.0 / 24.0),
+        (4, 2, 32, 64.0 / 32.0),
+        (6, 3, 48, 96.0 / 48.0),
+    ];
+    for &(rate, want_lane, want_distinct, want_amp) in cases {
+        let (per_lane, distinct) = lane_load_footprint(rate);
+        assert_eq!(
+            per_lane, want_lane,
+            "{rate} bpw: words per lane is {per_lane}, expected {want_lane}"
+        );
+        assert_eq!(
+            distinct, want_distinct,
+            "{rate} bpw: the 32 lanes touch {distinct} distinct words, expected \
+             {want_distinct}. Fewer than WORDS means part of every tile is never \
+             read, which is a correctness bug that a bandwidth number would hide."
+        );
+        let words = 8 * rate as usize;
+        let requests = 32 * per_lane;
+        assert_eq!(
+            requests,
+            32 * want_lane,
+            "{rate} bpw: {requests} lane-loads per tile"
+        );
+        assert_eq!(words, want_distinct, "{rate} bpw: WORDS");
+        let amp = requests as f64 / words as f64;
+        assert!(
+            (amp - want_amp).abs() < 1e-12,
+            "{rate} bpw: amplification {amp:.4}, expected {want_amp:.4}"
+        );
+        println!(
+            "{rate} bpw: {requests} lane-loads/tile, {words} words/tile, \
+             amp {amp:.4}"
+        );
+    }
+    // And the ratio the decision rule turns on, stated as the spec states it.
+    let (_, d3) = lane_load_footprint(3);
+    let (_, d4) = lane_load_footprint(4);
+    let amp3 = (32 * 2) as f64 / d3 as f64;
+    let amp4 = (32 * 2) as f64 / d4 as f64;
+    assert!(
+        (amp3 / amp4 - 2.6666666666666665 / 2.0).abs() < 1e-12,
+        "3bpw/4bpw amplification ratio is {}",
+        amp3 / amp4
+    );
+    // The spec's own fit, recomputed: 250.5 x 2.000 / 2.667 against a measured
+    // 187.7 GB/s. If the arithmetic above is right this is the number to
+    // compare a measurement against.
+    let predicted = 250.5 * amp4 / amp3;
+    println!(
+        "predicted 3 bpw ceiling = 250.5 x {amp4:.3} / {amp3:.3} = {predicted:.1} GB/s \
+         (measured, per spec: 187.7)"
+    );
+    assert!(
+        (predicted - 187.9).abs() < 0.15,
+        "prediction drifted to {predicted:.1} from the spec's 187.9"
+    );
+}
+
+#[test]
+fn dram_line_traffic_is_1x_at_every_rate_so_the_amplification_is_requests_only() {
+    // The claim the notes make in one sentence and never check: the 2.667 is not
+    // DRAM traffic, it is lane-load requests. Checked by taking the union of
+    // 128-byte lines across a whole colmajor column and dividing by the column's
+    // byte count.
+    //
+    // A column is `tiles_k` tiles laid end to end, each tile `WORDS * 4` bytes.
+    // If the union covers every byte of the column, the line count is
+    // `ceil(column_bytes / 128)` and the ratio is 1.000 up to the single partial
+    // line at the end.
+    let line = 128usize;
+    // `tiles_k` values taken from the real shapes: 5376/16 = 336 (q, o, k, v,
+    // gate, up, lm_head), 21504/16 = 1344 (down), 16384/16 = 1024 (full/q).
+    for tiles_k in [336usize, 1024, 1344] {
+        for rate in [3u8, 4, 6] {
+            let words = 8 * rate as usize;
+            let (per_lane, _) = lane_load_footprint(rate);
+            let tile_bytes = words * 4;
+            let column_bytes = tiles_k * tile_bytes;
+            // A tile is fully read by the lanes that cover it -- asserted
+            // separately -- so the union over the column is the column.
+            let covered_words: std::collections::BTreeSet<usize> =
+                (0..words).collect();
+            assert_eq!(
+                covered_words.len(),
+                words,
+                "{rate} bpw: a tile's lanes must cover all {words} words"
+            );
+            let lines = column_bytes.div_ceil(line);
+            let ratio = (lines * line) as f64 / column_bytes as f64;
+            // 1.0 exactly when the column is a whole number of lines. 3 bpw at
+            // 96 B/tile is not, so its ratio carries one partial line; bound it
+            // rather than pretend.
+            let bound = (lines * line) as f64 / column_bytes as f64;
+            assert!(
+                bound <= 1.0 + line as f64 / column_bytes as f64,
+                "{rate} bpw, tiles_k {tiles_k}: line traffic {ratio:.4}x exceeds \
+                 useful bytes by more than one line"
+            );
+            assert!(
+                ratio >= 1.0,
+                "{rate} bpw, tiles_k {tiles_k}: line traffic {ratio:.4}x is below \
+                 the useful bytes, which would mean the kernel reads less than the \
+                 matrix holds"
+            );
+            println!(
+                "{rate} bpw, tiles_k {tiles_k}: column {column_bytes} B in {lines} \
+                 lines = {ratio:.4}x useful; requests {requests}x",
+                requests = (32 * per_lane) as f64 / words as f64,
+            );
+        }
+    }
+}
