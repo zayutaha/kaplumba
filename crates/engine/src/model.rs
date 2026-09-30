@@ -1703,18 +1703,17 @@ impl DecoderLayer {
                 ModelError::InvalidWeights("gate_proj input signs are not resident".to_string())
             })?;
             self.linear
-                .encode_gemv_fused2(
+                .encode_gemv_fused2_mlp(
                     encoder,
                     packed_gate,
                     self.weights.gate_proj.metal_offset,
                     self.weights.gate_proj.out_features,
                     gate_out_signs,
-                    &scratch.gate,
                     packed_up,
                     self.weights.up_proj.metal_offset,
                     self.weights.up_proj.out_features,
                     up_out_signs,
-                    &scratch.up,
+                    &scratch.activated,
                     &scratch.normed,
                     input_signs,
                     &scratch.transformed,
@@ -1724,8 +1723,8 @@ impl DecoderLayer {
                     true,
                 )
                 .map_err(ModelError::Kernel)?;
-            profile.stamp(encoder, &format!("{}gate_up_proj", prefix()))?;
-            timer.lap("gate_up_proj");
+            profile.stamp(encoder, &format!("{}gate_up_gelu", prefix()))?;
+            timer.lap("gate_up_gelu");
         } else {
             self.encode_linear(
                 encoder,
@@ -1749,18 +1748,16 @@ impl DecoderLayer {
             )?;
             profile.stamp(encoder, &format!("{}up_proj", prefix()))?;
             timer.lap("up_proj");
+            self.elements.encode_gated_gelu(
+                encoder,
+                &scratch.gate,
+                &scratch.up,
+                &scratch.activated,
+                inter_elements,
+            )?;
+            profile.stamp(encoder, &format!("{}gated_gelu", prefix()))?;
+            timer.lap("gated_gelu");
         }
-        self.elements.encode_gated_gelu(
-            encoder,
-            &scratch.gate,
-            &scratch.up,
-            &scratch.activated,
-            inter_elements,
-        )?;
-        // 1.3M elements at a 256-row chunk: the biggest non-GEMM dispatch in the
-        // layer, so it keeps its own boundary.
-        profile.stamp(encoder, &format!("{}gated_gelu", prefix()))?;
-        timer.lap("gated_gelu");
         self.encode_linear(
             encoder,
             &self.weights.down_proj,

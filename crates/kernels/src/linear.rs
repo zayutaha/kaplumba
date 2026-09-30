@@ -234,6 +234,8 @@ pub struct LinearKernels {
     input_pipeline: ComputePipelineState,
     gemv_pipeline: ComputePipelineState,
     finalize_pipeline: ComputePipelineState,
+    finalize_simd_pipeline: ComputePipelineState,
+    finalize_gated_gelu_pipeline: ComputePipelineState,
     input_rows_pipeline: ComputePipelineState,
     gemv_tiled_pipeline: ComputePipelineState,
     /// Tensor-core prefill GEMM (`linear_gemm_mma`): dequantize the EXL3 weights
@@ -348,6 +350,12 @@ impl LinearKernels {
         let finalize_function = library
             .get_function("linear_finalize", None)
             .map_err(KernelError::Shader)?;
+        let finalize_simd_function = library
+            .get_function("linear_finalize_simd", None)
+            .map_err(KernelError::Shader)?;
+        let finalize_gated_gelu_function = library
+            .get_function("linear_finalize_gated_gelu_simd", None)
+            .map_err(KernelError::Shader)?;
         let input_rows_function = library
             .get_function("linear_input_rows", None)
             .map_err(KernelError::Shader)?;
@@ -461,6 +469,12 @@ impl LinearKernels {
         let finalize_pipeline = device
             .new_compute_pipeline_state_with_function(&finalize_function)
             .map_err(KernelError::Pipeline)?;
+        let finalize_simd_pipeline = device
+            .new_compute_pipeline_state_with_function(&finalize_simd_function)
+            .map_err(KernelError::Pipeline)?;
+        let finalize_gated_gelu_pipeline = device
+            .new_compute_pipeline_state_with_function(&finalize_gated_gelu_function)
+            .map_err(KernelError::Pipeline)?;
         let input_rows_pipeline = device
             .new_compute_pipeline_state_with_function(&input_rows_function)
             .map_err(KernelError::Pipeline)?;
@@ -518,6 +532,8 @@ impl LinearKernels {
             repacked_gemv_by_name,
             gemv_pipeline,
             finalize_pipeline,
+            finalize_simd_pipeline,
+            finalize_gated_gelu_pipeline,
             input_rows_pipeline,
             gemv_tiled_pipeline,
             gemm_mma_pipeline,
@@ -1777,19 +1793,92 @@ impl LinearKernels {
         )?;
         let blocks_a = to_u32(out_features_a / 128, "output dimension a")?;
         encoder.dispatch_1d(
-            &self.finalize_pipeline,
+            &self.finalize_simd_pipeline,
             &[Some(raw_a), Some(output_signs_a), Some(output_a)],
             &blocks_a.to_le_bytes(),
-            u64::from(blocks_a),
-            64,
+            u64::from(blocks_a) * 32,
+            32,
         )?;
         let blocks_b = to_u32(out_features_b / 128, "output dimension b")?;
         encoder.dispatch_1d(
-            &self.finalize_pipeline,
+            &self.finalize_simd_pipeline,
             &[Some(raw_b), Some(output_signs_b), Some(output_b)],
             &blocks_b.to_le_bytes(),
-            u64::from(blocks_b),
-            64,
+            u64::from(blocks_b) * 32,
+            32,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_gemv_fused2_mlp(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        packed_gate: &Buffer,
+        offset_gate: u64,
+        out_features_gate: usize,
+        gate_out_signs: &Buffer,
+        packed_up: &Buffer,
+        offset_up: u64,
+        out_features_up: usize,
+        up_out_signs: &Buffer,
+        activated: &Buffer,
+        input: &Buffer,
+        input_signs: &Buffer,
+        transformed: &Buffer,
+        raw_gate: &Buffer,
+        raw_up: &Buffer,
+        in_features: usize,
+        pretransformed: bool,
+    ) -> Result<(), KernelError> {
+        if !pretransformed {
+            let input_blocks = to_u32(in_features / 128, "input dimension")?;
+            encoder.dispatch_1d(
+                &self.input_pipeline,
+                &[Some(input), Some(input_signs), Some(transformed)],
+                &input_blocks.to_le_bytes(),
+                u64::from(input_blocks) * 32,
+                32,
+            )?;
+        }
+        let pipeline = self
+            .ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2")
+            .ok_or_else(|| {
+                KernelError::InvalidInput("missing linear_gemv_ishizuki_k3_fused2".to_string())
+            })?;
+        let tiles_a = (out_features_gate / 16) as u64;
+        let tiles_b = (out_features_up / 16) as u64;
+        let groups = tiles_a + tiles_b;
+        let shape = [
+            to_u32(in_features, "in_features")?,
+            to_u32(out_features_gate, "out_features_gate")?,
+            to_u32(out_features_up, "out_features_up")?,
+        ];
+        encoder.dispatch_1d_offset(
+            pipeline,
+            &[
+                TensorRef::new(packed_gate, offset_gate),
+                TensorRef::new(packed_up, offset_up),
+                TensorRef::new(transformed, 0),
+                TensorRef::new(raw_gate, 0),
+                TensorRef::new(raw_up, 0),
+            ],
+            params_bytes(&shape),
+            groups * 256,
+            256,
+        )?;
+        let blocks = to_u32(out_features_gate / 128, "features dimension")?;
+        encoder.dispatch_1d(
+            &self.finalize_gated_gelu_pipeline,
+            &[
+                Some(raw_gate),
+                Some(gate_out_signs),
+                Some(raw_up),
+                Some(up_out_signs),
+                Some(activated),
+            ],
+            &blocks.to_le_bytes(),
+            u64::from(blocks) * 32,
+            32,
         )
     }
 

@@ -495,6 +495,76 @@ kernel void linear_input_transform(
     output[base + 96u] = half(v3);
 }
 
+static float gelu_tanh_value(float value) {
+    constexpr float coefficient = 0.7978845608028654f;
+    float cubic = value * value * value;
+    float argument = coefficient * (value + 0.044715f * cubic);
+    argument = clamp(argument, -20.0f, 20.0f);
+    return 0.5f * value * (1.0f + tanh(argument));
+}
+
+kernel void linear_finalize_simd(
+    const device float *input [[buffer(0)]],
+    const device half *output_signs [[buffer(1)]],
+    device half *output [[buffer(2)]],
+    constant uint &blocks [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= blocks * 32u) {
+        return;
+    }
+    const uint lane = gid & 31u;
+    const uint base = (gid >> 5) * 128u + lane;
+    float v0 = input[base];
+    float v1 = input[base + 32u];
+    float v2 = input[base + 64u];
+    float v3 = input[base + 96u];
+    transform_simd(v0, v1, v2, v3, lane);
+    output[base] = half(v0 * float(output_signs[base]));
+    output[base + 32u] = half(v1 * float(output_signs[base + 32u]));
+    output[base + 64u] = half(v2 * float(output_signs[base + 64u]));
+    output[base + 96u] = half(v3 * float(output_signs[base + 96u]));
+}
+
+kernel void linear_finalize_gated_gelu_simd(
+    const device float *raw_gate [[buffer(0)]],
+    const device half *gate_signs [[buffer(1)]],
+    const device float *raw_up [[buffer(2)]],
+    const device half *up_signs [[buffer(3)]],
+    device half *activated [[buffer(4)]],
+    constant uint &blocks [[buffer(5)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= blocks * 32u) {
+        return;
+    }
+    const uint lane = gid & 31u;
+    const uint base = (gid >> 5) * 128u + lane;
+
+    float g0 = raw_gate[base];
+    float g1 = raw_gate[base + 32u];
+    float g2 = raw_gate[base + 64u];
+    float g3 = raw_gate[base + 96u];
+    transform_simd(g0, g1, g2, g3, lane);
+    g0 *= float(gate_signs[base]);
+    g1 *= float(gate_signs[base + 32u]);
+    g2 *= float(gate_signs[base + 64u]);
+    g3 *= float(gate_signs[base + 96u]);
+
+    float u0 = raw_up[base];
+    float u1 = raw_up[base + 32u];
+    float u2 = raw_up[base + 64u];
+    float u3 = raw_up[base + 96u];
+    transform_simd(u0, u1, u2, u3, lane);
+    u0 *= float(up_signs[base]);
+    u1 *= float(up_signs[base + 32u]);
+    u2 *= float(up_signs[base + 64u]);
+    u3 *= float(up_signs[base + 96u]);
+
+    activated[base] = half(gelu_tanh_value(g0) * u0);
+    activated[base + 32u] = half(gelu_tanh_value(g1) * u1);
+    activated[base + 64u] = half(gelu_tanh_value(g2) * u2);
+    activated[base + 96u] = half(gelu_tanh_value(g3) * u3);
+}
+
 // EXL3 decode matvec, shaped like the reference implementation.
 //
 // Thread mapping follows the trellis rather than the output:
