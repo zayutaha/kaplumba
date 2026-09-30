@@ -1247,7 +1247,11 @@ impl LinearKernels {
         if perm_mode == 1 || env_flag("KAPLUMBA_REPACKED_GEMV") {
             if let Some(pipeline) = self
                 .ishizuki_gemv_by_name
-                .get(&format!("linear_gemv_ishizuki_k{bits}_colmajor"))
+                .get(&format!("linear_gemv_ishizuki_k{bits}_colmajor_contig4"))
+                .or_else(|| {
+                    self.ishizuki_gemv_by_name
+                        .get(&format!("linear_gemv_ishizuki_k{bits}_colmajor"))
+                })
             {
                 return Some(pipeline);
             }
