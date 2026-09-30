@@ -20,12 +20,15 @@
 //!   order between the two, so the span covers all of them without stamping any.
 //!   Cost: one extra commit per step.
 //!
-//!   (Corrected: an earlier version of this comment said "~42 of them for a
-//!   31B-class step". That is stale. A decode step now issues 1407 dispatches
-//!   -- 1167 after T7.6.10c -- and callers set `max_dispatches(2500)`, so
-//!   `tick()` never rolls and the step commits 2 command buffers, one of them
-//!   empty. The rolling path below is still what prefill and any caller that
-//!   leaves the default 50 in place exercise.)
+//!   (History, because the number in this file was wrong twice. It first said
+//!   "~42 of them for a 31B-class step", which was circular -- 42 is exactly
+//!   2100/50, the test constant divided by the default budget. It was then
+//!   corrected to "a decode step commits 2 command buffers", because callers
+//!   called `set_max_dispatches(2500)` against a step that issues 1617
+//!   dispatches, so `tick()` never rolled. Callers now pass
+//!   `decode_max_dispatches_per_buffer()`, which defaults to 50, so the step
+//!   rolls again. Read the buffer count from `KAPLUMBA_COUNT_BUFFERS=1`, not
+//!   from here.)
 //!   This is the clock.
 //! * `kernel` — stamps every existing per-kernel boundary and accumulates
 //!   across steps into one report instead of printing a table per token. This
@@ -39,9 +42,17 @@
 //! * `span` is the step's GPU-timeline duration and includes GPU idle between
 //!   buffers, so `span` vs the caller's host `wall` is the instrument's own
 //!   distortion check; they should agree closely in `step` mode.
-//! * `own` is the sum of the stamped buffers' own durations, i.e. GPU work only.
-//!   In `step` mode that is only the two boundary buffers, so it is small and
-//!   not a decode cost; in `kernel` mode it is the whole step's dispatch time.
+//! * `own` is the sum of the **stamped** buffers' own durations. In `kernel`
+//!   mode every boundary is stamped, so it is the whole step's dispatch time.
+//!   In `step` mode only the two boundaries are stamped -- but "only the two
+//!   boundaries" does NOT mean "small", and an earlier version of this file
+//!   asserted that it did. It is small only when the step *rolls*: the closing
+//!   boundary then holds just the trailing partial slice. While callers forced
+//!   `set_max_dispatches(2500)` the step did not roll, so the entire step sat
+//!   in the closing boundary and `own` was the whole step's GPU cost, not a
+//!   rounding error. **`own` in `step` mode is a function of the rolling
+//!   threshold, not of the instrument.** `span` is correct in both regimes and
+//!   is the number to quote.
 //! * Prefill and load are timed separately and reported separately, so a
 //!   decode total can never silently absorb them.
 //!

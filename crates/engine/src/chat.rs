@@ -460,7 +460,7 @@ impl<'a> ChatSession<'a> {
                 let position = (base + need + step) as u32;
                 let mut encoder =
                     kaplumba_kernels::encoder::MetalEncoder::new(&queue).map_err(ModelError::from)?;
-                encoder.set_max_dispatches(2500);
+                encoder.set_max_dispatches(kaplumba_kernels::encoder::decode_max_dispatches_per_buffer());
                 self.model
                     .forward_step_pipelined(
                         &mut encoder,

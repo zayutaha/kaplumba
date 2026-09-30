@@ -3817,8 +3817,8 @@ impl TextModel {
         // a one-token forward is a decode step; a prefill is timed by its caller
         // and must not be able to enter a decode total.
         let decode_step = token_ids.len() == 1;
-        encoder.set_max_dispatches(2500);
         if decode_step {
+            encoder.set_max_dispatches(kaplumba_kernels::encoder::decode_max_dispatches_per_buffer());
             crate::decode_profile::begin_step(&mut encoder, |encoder| {
                 self.calibration_dispatch(encoder)
             })?;

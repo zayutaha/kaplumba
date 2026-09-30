@@ -952,7 +952,7 @@ where
                             limit: config.context_limit,
                         })?;
                     let mut enc0 = MetalEncoder::new(&queue).map_err(ModelError::from)?;
-                    enc0.set_max_dispatches(2500);
+                    enc0.set_max_dispatches(kaplumba_kernels::encoder::decode_max_dispatches_per_buffer());
                     model.forward_step_pipelined(&mut enc0, pos0, Some(token), 0, 0)?;
                     crate::model::record_decode_step_tallies(&enc0);
                     enc0.commit_terminal().map_err(ModelError::from)?;
@@ -970,7 +970,7 @@ where
                             })?;
 
                         let mut next_enc = MetalEncoder::new(&queue).map_err(ModelError::from)?;
-                        next_enc.set_max_dispatches(2500);
+                        next_enc.set_max_dispatches(kaplumba_kernels::encoder::decode_max_dispatches_per_buffer());
                         model.forward_step_pipelined(&mut next_enc, pos, None, slot, step_idx as u32)?;
                         crate::model::record_decode_step_tallies(&next_enc);
                         next_enc.commit_terminal().map_err(ModelError::from)?;
@@ -1044,7 +1044,7 @@ where
                     })?;
                 let step_started = Instant::now();
                 let mut encoder = MetalEncoder::new(&queue).map_err(ModelError::from)?;
-                encoder.set_max_dispatches(2500);
+                encoder.set_max_dispatches(kaplumba_kernels::encoder::decode_max_dispatches_per_buffer());
                 crate::decode_profile::begin_step(&mut encoder, |encoder| {
                     model.calibration_dispatch(encoder)
                 })

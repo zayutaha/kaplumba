@@ -199,6 +199,15 @@ fn command_failed(buffer: &CommandBuffer) -> KernelError {
 /// part, not guesses, and they are the direct fix for our symptom: one buffer
 /// holding a whole prefill (~8k dispatches) is what made the host spend 58 s
 /// wall on work whose GPU time is a few seconds.
+///
+/// The same value is now also the decode default, via
+/// [`decode_max_dispatches_per_buffer`]. Decode needs it for the opposite
+/// reason: a step is small enough to encode in ~5 ms, so with the whole step in
+/// one uncommitted buffer the GPU receives nothing until the host has finished
+/// encoding and then runs ~73 ms with the host blocked in the barrier. Commit
+/// every 50 dispatches instead and the two overlap. The one barrier per step is
+/// still there — the next token is the argmax of this step's logits — but it no
+/// longer has to wait for the encode as well.
 pub const MAX_DISPATCHES_PER_BUFFER: u32 = 50;
 
 /// Command buffers allowed in flight. MLX's `MAX_ACTIVE_TASKS = 10`
@@ -234,6 +243,29 @@ fn max_dispatches_per_buffer() -> u32 {
         std::env::var("KAPLUMBA_MAX_DISPATCHES_PER_BUFFER")
             .ok()
             .and_then(|value| value.trim().parse::<u32>().ok())
+            .unwrap_or(MAX_DISPATCHES_PER_BUFFER)
+    })
+}
+
+/// Dispatches per command buffer for a **decode** step. Defaults to
+/// [`MAX_DISPATCHES_PER_BUFFER`]; `KAPLUMBA_DECODE_MAX_DISPATCHES_PER_BUFFER=N`
+/// overrides it.
+///
+/// Separate from [`max_dispatches_per_buffer`] on purpose. Prefill already
+/// rolls at the default and is correct doing so; the decode path used to call
+/// `set_max_dispatches(2500)`, which disabled rolling entirely and left a whole
+/// step in one uncommitted buffer. Folding that into the one shared
+/// `KAPLUMBA_MAX_DISPATCHES_PER_BUFFER` knob would make the A/B for the decode
+/// threshold also move prefill's, which is exactly the confound §3 of the
+/// measurement plan warns about. With its own variable, the A and B arms differ
+/// in one number and nothing else.
+pub fn decode_max_dispatches_per_buffer() -> u32 {
+    static CACHE: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        std::env::var("KAPLUMBA_DECODE_MAX_DISPATCHES_PER_BUFFER")
+            .ok()
+            .and_then(|value| value.trim().parse::<u32>().ok())
+            .filter(|value| *value > 0)
             .unwrap_or(MAX_DISPATCHES_PER_BUFFER)
     })
 }
@@ -890,14 +922,18 @@ kernel void burn(device float* out [[buffer(0)]],
         };
         // A decode-sized step of a 31B-class model at 1 query. The constant is
         // only a scale choice for this rolling test; the real figure is
-        // 1407 dispatches/token (1167 after T7.6.10c), measured via
-        // `MetalEncoder::dispatches_total`.
+        // 1617 dispatches/token, measured via `MetalEncoder::dispatches_total`
+        // under `KAPLUMBA_COUNT_BUFFERS=1`.
         //
-        // (Corrected: this comment claimed "measured: 42 command buffers per
-        // step in `forward_buffer_into_step`". That was stale and circular --
-        // 42 is exactly 2100/50, i.e. this constant divided by the default
-        // budget. `forward_buffer_into_step` calls `set_max_dispatches(2500)`,
-        // so it never rolls at all and commits 2 buffers, one of them empty.)
+        // (This comment has been corrected twice and was circular both times:
+        // it first claimed "measured: 42 command buffers per step", which is
+        // exactly 2100/50 -- this constant divided by the default budget. It
+        // was then corrected to "`forward_buffer_into_step` calls
+        // `set_max_dispatches(2500)`, so it never rolls", which was true of
+        // the callers, not of `tick`: the mechanism works, the threshold was
+        // simply set above the step size. The callers now ask for
+        // `decode_max_dispatches_per_buffer()`, 50 by default, and the step
+        // rolls again.)
         const DECODE_DISPATCHES: usize = 2100;
         let mut encoder = MetalEncoder::new(&queue).expect("encoder");
         for _ in 0..DECODE_DISPATCHES {
