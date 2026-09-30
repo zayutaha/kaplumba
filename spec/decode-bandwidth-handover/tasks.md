@@ -8,120 +8,70 @@ document**; the rest is context.
 
 ---
 
-## H1 — Fix the equal-bytes rate sweep, *then* use it
+## H1 — DONE. The instrument is fixed and the table is trustworthy
 
-**This is the first task because the instrument cannot currently answer the
-question, and finding that out is itself the finding.**
+`gemv_shape --rate-interleaved` replaces `--only "bit rate"`, interleaves every
+arm, and **carries 6 bpw through the run as a control** (drift 13%, acceptable):
 
-`gemv_shape --only "bit rate"` is the table everyone reaches for when asking "why
-is 3 bpw slower than 6 bpw?". Run it before and after T6 and the numbers do not
-support any conclusion:
+| rate | window | GB/s |
+|---|---|---|
+| 3 bpw | 3-word | 150.9 |
+| 3 bpw | **2-word (shipped)** | **165.7** |
+| 4 bpw | 2-word | 216.4 |
+| 6 bpw | control | 215.7 |
+| 8 bpw | 3-word | 217.9 |
 
-```
-rate  has _w2?    pre-T6    post-T6    delta
-3 bpw   YES        132.5      146.9     +10.9%
-4 bpw   YES        179.8      153.7     -14.5%
-6 bpw   no         164.5      182.0     +10.6%
-8 bpw   no         176.3      162.3      -7.9%
-```
+The old table's numbers are withdrawn. It could not resolve a 10% effect.
 
-**6 and 8 bpw cannot have changed from T6** — `TWO_WORD_SAFE_RATES` emits no `_w2`
-kernel above 4 bpw, so those two rows are **controls**. They moved +10.6% and
--7.9%. A control that moves means the measurement is not measuring the kernel.
+## H2 — DONE, and the answer is that none of the three is the mechanism
 
-The within-sweep spreads are the other half of the story: **2.2x to 3.7x**
-worst-to-best, so the median of 9 is not sitting on a stable distribution.
+- [x] **H2c (decode cost) is measured dead — in the strongest way.** The `_nod`
+  probe (`--decode-probe`) is the verbatim kernel with `decode_state` replaced by
+  a one-AND stub: identical memory traffic, one asserted substitution, garbage
+  output, never dispatched.
 
-So the box drifts by >=10% between sweeps and the sweep is internally
-inconsistent, which means **this instrument cannot resolve a ~10% effect** — and
-T6's effect is ~7-10%. Any conclusion drawn from this table, in either direction,
-is unsupported.
+  | rate | real | no-decode | effect of REMOVING decode |
+  |---|---|---|---|
+  | 3 bpw | 167.3 | 122.7 | **-26.7%** |
+  | 4 bpw | 217.1 | 206.3 | -5.0% |
+  | 8 bpw | 222.5 | 219.2 | -1.5% |
 
-- [ ] **Make the sweep interleaved.** The `--w2` and `--nr0` sweeps already do
-  this correctly: every round measures every arm once, and the baseline is
-  re-measured in every round so a clock ramp shows up as a *moving ratio* rather
-  than a moving number. The rate sweep measures one shape at a time to
-  completion, which is why it cannot see drift. **Reuse `w2_sweep`'s structure
-  with the rate as the arm instead of the window.**
+  **Removing the decode made every rate slower.** A cheaper decode cannot be the
+  fix, because the free decode is slower than the real one. Probably
+  `decode_state`'s dependent chains were accidentally supplying the ILP that
+  hides load latency.
 
-- [ ] **Add a control arm that cannot change.** A 6 bpw shape measured in the same
-  interleaved round as the 3 bpw shape gives a drift estimate for free. If the
-  control moves, the round is not trustworthy and should be reported as such
-  rather than as a number.
+- [x] **H2a (register pressure) and H2b (shifter pressure) are now implausible as
+  the primary mechanism.** Both were motivated by the 3-vs-6 bpw gap, and the gap
+  turns out to be request/latency-bound — T6's mechanism — with the residual
+  2.67x lane-load amplification structural to the EXL3 lane layout, whose
+  on-disk format is fixed.
 
-- [ ] **Report the drift explicitly**, as a first-class column, not a footnote.
-  The spec's own rule is that the *median* has to be clean and the spread has to be
-  *visible*; here the spread is 2-4x, which is the signal.
+**The single most important finding: 4, 6 and 8 bpw are all at 215-218 GB/s.**
+Flat across a 2x range of rate. DRAM-saturated. Only 3 bpw is slow, by 1.306x.
+Nothing kernel-level has been found for it, and three separate candidate
+mechanisms are now measured or reasoned out.
 
-- [ ] **Then** answer the actual question: with an instrument that can resolve
-  10%, is 3 bpw now at 6 bpw, or still short?
+## H2.5 — The target itself is not reachable at 3.0 bpw (read this before optimising)
 
-  | outcome | meaning | next step |
-  |---|---|---|
-  | 3 bpw lands near 6 bpw | request count *was* the mechanism | T7 closed; go to T4 (fewer bytes) |
-  | 3 bpw lands well short | residual mechanism, unidentified | T7 open; work H2 |
-  | 3 bpw lands *above* 6 bpw | the "3 bpw is slow" framing was wrong | re-examine whether 6 bpw is the anomaly |
+| | ms/token | tok/s |
+|---|---|---|
+| measured now | 93.1 | 10.74 |
+| 3 bpw at 4 bpw's 217 GB/s | 62.4 | 16.0 |
+| 3 bpw at pure-streaming 240 GB/s | 57.1 | 17.5 |
 
-- [ ] **Commit the instrument fix before the number.** A better table with no
-  conclusion is worth more than a conclusion from the current one, and this
-  repository has six figures that were believed on exactly that trade.
+**19 tok/s needs 52.6 ms; after 7.4 ms of non-matvec work the matvec has 45.2 ms
+for 11.932 GB = 264 GB/s, above this box's measured 239-244 GB/s ceiling.**
+Working back, 19 tok/s requires **1.888 bpw**.
 
-**Do not skip the plausibility gate.** `gemv_shape` asserts the streaming rate
-lands in 5-400 GB/s. It is there because this harness printed 0.0-0.2 GB/s for a
-kernel every other instrument measures at 150+.
+So the honest routes are:
+- **~17.5 tok/s at 3.0 bpw** — the hard ceiling, and only if the 3 bpw gap closes.
+- **~18.1 tok/s at 2.0 bpw** — ishizuki's published operating point.
+- **19+ tok/s at 1.9 bpw** — below anything known to work on this model.
 
----
-
-## H2 — Attack whatever H1 leaves open
-
-Three candidates, in the order worth testing. Each is a *probe*, not a
-commitment: a clean negative is a result.
-
-### H2a — Register pressure (most likely)
-
-`NR0=8` loses **20%** on `down_proj` (98.6 vs 123.4 GB/s), and the mechanism is
-register pressure: `acc[NR0][2]` plus `v[NR0][8]` is 10·NR0 floats of accumulator
-and 8·NR0 of decoded values per thread. At KA=3 the unrolled ishizuki loop holds
-`v[8]` for two tiles plus 8 accumulators.
-
-If low KA is register-bound, the unroll depth should be the lever, and it should
-be **KA-parameterised** — the current unroll-by-2 is the same for every rate.
-
-- Probe: an unroll-by-1 and unroll-by-3 variant of `linear_gemv_ishizuki_k3`,
-  measured against unroll-by-2 on `gate_proj` and `down_proj`.
-- If unroll-by-1 *wins* at KA=3, the register-pressure story is confirmed and
-  the fix is free.
-
-### H2b — Shifter pressure
-
-The extraction is `(A0 >> (64 - r))` with `r` varying per unrolled index — a
-**variable shift per code, 8 per tile**, inside an already-unrolled loop.
-
-- **Check `spec/engine-performance` before starting.** `extract_bits` was tried
-  there and found inapplicable; do not re-report that as new. What has *not* been
-  tried is a KA-specialised extraction where the shift is a compile-time constant
-  per unrolled index.
-- Probe: unroll the `i` loop fully and make `r` a literal, so the compiler emits a
-  constant shift.
-
-### H2c — Decode cost does not scale with KA
-
-8 `decode_state` calls per tile **regardless of `KA`**, so the decode work is
-amortised over fewer bits at low KA. This predicts a *compute* term that vanishes
-at high rates, which is consistent with the shape of the original table.
-
-- The uop/byte knee (16.6 uop/B, we run 1.35) says we are 8x under it — but that
-  knee was measured for **streaming**, not for this kernel, so **it does not
-  clear this hypothesis**. Do not cite it as if it does.
-- Probe: replace `decode_state` with a no-op in a variant kernel (output is then
-  garbage — this is a bandwidth probe, not a correctness one) and measure the
-  rate at 3 and 6 bpw. If removing decode lifts 3 bpw much more than 6 bpw, this
-  is the residual.
-
-**Order matters.** H2c is the cheapest and the cleanest discriminator, so run it
-first even though H2a is the most likely to be the fix.
-
----
+**All of the routes past 17.5 are quantisation decisions, not code.** They need a
+different, smaller checkpoint and a quality trade the user has to make. Do not
+spend kernel effort chasing 19 tok/s at 3.0 bpw; the arithmetic forecloses it.
 
 ## H3 — Fix the decode nondeterminism (correctness, not performance)
 

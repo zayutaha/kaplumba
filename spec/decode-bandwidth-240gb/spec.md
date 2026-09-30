@@ -217,6 +217,67 @@ distinct words** (4.0x). This is item 2 seen from the warp's side, and T6 closed
 the actionable half of it. `N_R0 = 4` measured +88% pre-specialisation and
 **+6.8%** on the current kernel (`T2`), which is now a dead lever.
 
+### 4. The 3-vs-4 bpw residual — *CLOSED, and it is request-bound (T7)*
+
+**Measured with a trustworthy instrument** (`gemv_shape --rate-interleaved`,
+every arm interleaved, 6 bpw carried as a control with 13% drift):
+
+| rate | window | GB/s |
+|---|---|---|
+| 3 bpw | 3-word | 150.9 |
+| 3 bpw | **2-word (shipped)** | **165.7** |
+| 4 bpw | 2-word | 216.4 |
+| 6 bpw | control | 215.7 |
+| 8 bpw | 3-word | 217.9 |
+
+**4, 6 and 8 bpw are all at 215–218 GB/s** — flat across a 2x range of rate.
+They are DRAM-saturated. Only 3 bpw is slow, by 1.306x.
+
+Two mechanisms both predicted 1.333x and **a bandwidth table cannot separate
+them**: lane-load amplification per useful byte is 2.67x at 3 bpw vs 2.00x at
+4 bpw, and `decode_state` calls per useful byte is *also* 2.67 vs 2.00 (8 codes
+per tile is rate-invariant). The `_nod` probe — the verbatim kernel with
+`decode_state` replaced by a one-AND stub, one asserted substitution, identical
+memory traffic, garbage output, never dispatched — separates them:
+
+| rate | real | no-decode | effect of removing decode |
+|---|---|---|---|
+| 3 bpw | 167.3 | 122.7 | **−26.7%** |
+| 4 bpw | 217.1 | 206.3 | −5.0% |
+| 8 bpw | 222.5 | 219.2 | −1.5% |
+
+**Removing the decode made every rate slower.** Decode arithmetic is not the
+cost — a cheaper decode cannot be the fix, because the free decode is slower
+than the real one. So the gap is **request/latency-bound**: T6's mechanism, and
+the residual 2.67x lane-load amplification is **structural** to the EXL3 lane
+layout, whose on-disk format is fixed.
+
+This closes T7 and the handover's H2a/H2b/H2c. No kernel-level lever for this
+gap remains identified.
+
+### 5. What is left: bytes, not speed — *the arithmetic, stated once*
+
+At the measured 165.7 GB/s for 3 bpw:
+
+| | ms/token | tok/s |
+|---|---|---|
+| measured now | 93.1 | 10.74 |
+| if 3 bpw reached 4 bpw's 217 GB/s | 62.4 | 16.0 |
+| if 3 bpw reached pure-streaming 240 GB/s | 57.1 | 17.5 |
+
+**19 tok/s needs 52.6 ms.** With 7.4 ms of non-matvec work, the matvec has
+45.2 ms for 11.932 GB = **264 GB/s** — above this box's measured 239–244 GB/s
+ceiling. Working back: **19 tok/s requires 1.888 bpw.**
+
+- **1.9 bpw** — below anything known to work on this model (oMLX runs 2.25,
+  ishizuki benchmarks 2.0). A different, smaller checkpoint; a real quality loss.
+- **2.0 bpw** — ~18.1 tok/s by the model above, and a published operating point.
+  Still a different checkpoint; still the user's quality call.
+- **16–17.5 tok/s at 3.0 bpw** — requires the 3 bpw gap to close, which the probe
+  says is not reachable by any kernel change identified so far.
+
+**The next real decision is a quantisation one, and it belongs to the user.**
+
 ## Where this leaves the target
 
 Per-token budget, from the first honest per-decode-step profile
