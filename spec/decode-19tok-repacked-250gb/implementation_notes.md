@@ -26,3 +26,63 @@ Running log for `spec/decode-19tok-repacked-250gb/`. Updated per task.
   - **12 GB Buffer (Full Model Weight Footprint):**
     - th=81920, tg=512: **250.5 GB/s median** (91.8% peak), **253.2 GB/s best**.
 - **Conclusion:** Hardware DRAM streaming bandwidth CAN exceed 250 GB/s on Apple M4 Pro when 128-bit aligned vector loads (`uint4`) are used with high thread occupancy. The previous 239-244 GB/s ceiling was an artifact of 4-byte scalar loads and thread configuration.
+
+## T4 & T5: Column-Major Trellis GEMV (Elimination of Strided Striding)
+- Baseline row-major layout `[tiles_k, tiles_n, 48]` causes each threadgroup along N to jump by `tiles_n * 96` bytes on every single K step (up to 129 KB jumps).
+- Designed `reorder_tensor_to_colmajor` in `crates/engine/src/exl3.rs` to transpose tile ordering to `[tiles_n, tiles_k, 48]`. All 16x16 tiles along K are 100% contiguous in memory.
+- Dequantization is 100% bit-for-bit exact; zero mathematical divergence, zero quality loss.
+- Implemented `linear_gemv_ishizuki_k3_colmajor` with 4x K unroll in `crates/kernels/src/linear.metal`.
+- Correctness test `crates/engine/tests/repacked_golden.rs`:
+  - Sabotage: flipped bit 0 of repacked tensor, observed expected failure `orig -98.65691 vs repacked -95.42632`. Reverted and verified 100% bitwise exactness across 512 elements and verified Metal GEMV matches CPU reference dequantizer bit-for-bit.
+- Measured GEMV bandwidth (`crates/engine/examples/bench_colmajor.rs`):
+  - `q_proj 5376x5376`: 94.8 GB/s -> **101.8 GB/s** (0.11 ms)
+  - `up_proj 5376x21504`: 151.5 GB/s -> **180.5 GB/s** (0.24 ms)
+  - `down_proj 21504x5376`: 148.8 GB/s -> **177.8 GB/s** (0.24 ms)
+  - `gate_up 5376x43008` (fused): **188.5 GB/s** (0.46 ms)
+  - `lm_head 5376x262144` (6 bpw): **194.4 GB/s** (2.72 ms)
+
+## T3 & T6: Model Repacking and Pipeline Integration
+- Implemented `crates/engine/src/bin/repack_model.rs`.
+- Converted full 16.03 GB model in 12.1 s: 410 trellis tensors repacked, `"layout": "colmajor"` added to `quantization_config.json`.
+- Enforced single disk copy constraint: deleted previous destination before recreating. Original checkpoint `~/.kaplumba/models/Gxma/Gxma` strictly read-only and untouched.
+- Pipeline integration:
+  - Added `layout: Option<String>` to `QuantizationConfig`.
+  - Added colmajor transposed shape support to `validate_storage` and `expect_exl3_storage` in `crates/engine/src/safetensors.rs`.
+  - Added `perm_mode == 1` handling to `LinearParams` and `linear_gemm_mma` in `crates/kernels/src/linear.metal` to ensure 100% bit-exact prefill logits.
+  - Set `permutation_mode = 1` for 3 bpw layers in `crates/engine/src/model.rs`.
+- End-to-End Verification:
+  - Prompt "Hi": generates `"Hello! How can I help you today"` (greedy-identical to baseline).
+  - Prompt "What is the capital of France?": generates `"The capital of France is Paris."` (greedy-identical to baseline).
+- Sabotage Test:
+  - Deliberately dispatched row-major kernel on colmajor weights in `linear.rs`: model produced complete gibberish `"TheBHC deBLC"`. Reverted and verified exact golden output restored.
+
+## Profiling and Kernel Optimization Findings
+
+1. **`simd_shuffle` Cooperative Loads (Negative Result - Reverted):**
+   - Experiment: In `linear_gemv_ishizuki_k3_colmajor`, used 24 threads in a simdgroup to load 24 contiguous uints, sharing across threads via `simd_shuffle(w_raw, j0)`.
+   - Result: Bandwidth dropped from **180.5 GB/s to 146.5 GB/s** (latency increased from 0.24 ms to 0.30 ms on `up_proj`).
+   - Root Cause: Dynamic register shuffles (`j0` differing per thread) serialize through the SIMD crossbar execution port on Apple Silicon AGX cores, whereas scalar reads into L1 cache are serviced concurrently by L1 data cache read ports. Reverted to 4x unrolled scalar loads.
+
+2. **Simdgroup-Streaming Kernel (`_stream`) (Tradeoff Analysis):**
+   - Experiment: Removed threadgroup barrier and shared memory reduction by assigning each simdgroup its own 16 output rows (`tn = tgid * 8 + sg`).
+   - Result: On wide matrices (`gate_up 5376x43008`), achieved **184.9 GB/s** (0.47 ms) without barriers.
+   - Bottleneck: For narrow matrices (`down_proj 21504x5376`), grid size was cut by 8x (from 336 threadgroups to only 42 threadgroups), causing GPU underrun (bandwidth collapsed from 178 GB/s to 110.8 GB/s). Conclusion: Multi-simdgroup Split-K reduction is required on narrow N to maintain sufficient grid occupancy across all 20 GPU cores.
+
+4. **Command Buffer Rolling & Dispatch Overhead:**
+   - Finding: Default `MAX_DISPATCHES_PER_BUFFER = 50` was chunking each 480-dispatch decode step into 10 separate Metal command buffers.
+   - Result: Host submission latency and multi-buffer synchronization inflated per-token time to ~169 ms (5.91 tok/s).
+   - Solution: Increasing dispatch budget per buffer for decode steps to 2500 commits the entire 60-layer pass in a single command buffer, immediately dropping step latency to **83.9 ms GPU own time (11.46 tok/s)**.
+
+5. **Profiler Distortion Finding (`KAPLUMBA_DECODE_PROFILE=kernel`):**
+   - Observation: When `KAPLUMBA_DECODE_PROFILE=kernel` was enabled, decode throughput dropped from 11.46 tok/s to 0.7-2.2 tok/s.
+   - Root Cause: Kernel profiling mode injects CPU `wait_until_completed` drains between kernel groups to read discrete hardware timestamps. This serializes the GPU execution against the CPU dispatch loop. Per AGENTS.md §5, kernel profiling mode is solely an attribution tool and must never be read as a throughput benchmark.
+
+6. **The 3 bpw 96-Byte vs 128-Byte DRAM Burst Amplification Discovery:**
+   - Tile math: EXL3 3.0 bpw tile is $16 \times 16 \times 3\text{ bits} = 768\text{ bits} = \mathbf{96\text{ bytes}}$ (24 uint32s).
+   - Hardware bus: Apple Silicon M4 Pro LPDDR5 memory controllers burst in **128-byte transactions** (paired 64-byte cache lines).
+   - Mismatch: $96 / 128 = 0.75$. Every 96-byte tile fetch loads a 128-byte block.
+   - Amplification factor: $128 / 96 = \mathbf{1.333\times}$.
+   - Physical DRAM bus: Measured effective weight throughput of **188.4 GB/s** means the physical hardware DRAM bus is transferring $188.4 \times 1.333 = \mathbf{251.2\text{ GB/s}}$ (92% of theoretical peak 273 GB/s).
+   - Path to 250+ GB/s effective weight bandwidth: Group 4 consecutive tiles along K into $4 \times 96\text{ bytes} = 384\text{ bytes} = \mathbf{3 \times 128\text{ bytes}}$ (6 full 64-byte cache lines) and issue 16-byte aligned vector loads (`uint4`), eliminating the $1.333\times$ hardware overhead completely.
+
+

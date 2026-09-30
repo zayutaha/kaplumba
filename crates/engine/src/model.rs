@@ -1350,46 +1350,101 @@ impl DecoderLayer {
         // the trailing norm/residual pairs below.
         profile.stamp(encoder, &format!("{}norm_transform", prefix()))?;
         timer.lap("norm_transform");
-        self.encode_linear(
-            encoder,
-            &self.weights.q_proj,
-            &scratch.normed,
-            &scratch.q,
-            tokens,
-            scratch,
-            decode,
-        )?;
-        profile.stamp(encoder, &format!("{}q_proj", prefix()))?;
-        timer.lap("q_proj");
-        self.encode_linear(
-            encoder,
-            &self.weights.k_proj,
-            &scratch.normed,
-            &scratch.k,
-            tokens,
-            scratch,
-            decode,
-        )?;
-        profile.stamp(encoder, &format!("{}k_proj", prefix()))?;
-        timer.lap("k_proj");
-        if let Some(v_proj) = &self.weights.v_proj {
+        if decode && self.weights.q_proj.permutation_mode == 1 && self.weights.v_proj.is_some() {
+            let v_proj = self.weights.v_proj.as_ref().unwrap();
+            let packed_q = self.weights.q_proj.metal_buffer.as_ref().ok_or_else(|| {
+                ModelError::InvalidWeights("q_proj has no GPU-resident weights".to_string())
+            })?;
+            let packed_k = self.weights.k_proj.metal_buffer.as_ref().ok_or_else(|| {
+                ModelError::InvalidWeights("k_proj has no GPU-resident weights".to_string())
+            })?;
+            let packed_v = v_proj.metal_buffer.as_ref().ok_or_else(|| {
+                ModelError::InvalidWeights("v_proj has no GPU-resident weights".to_string())
+            })?;
+            let q_out_signs = self.weights.q_proj.output_signs_buffer.as_ref().ok_or_else(|| {
+                ModelError::InvalidWeights("q_proj output signs are not resident".to_string())
+            })?;
+            let k_out_signs = self.weights.k_proj.output_signs_buffer.as_ref().ok_or_else(|| {
+                ModelError::InvalidWeights("k_proj output signs are not resident".to_string())
+            })?;
+            let v_out_signs = v_proj.output_signs_buffer.as_ref().ok_or_else(|| {
+                ModelError::InvalidWeights("v_proj output signs are not resident".to_string())
+            })?;
+            let input_signs = self.weights.q_proj.input_signs_buffer.as_ref().ok_or_else(|| {
+                ModelError::InvalidWeights("q_proj input signs are not resident".to_string())
+            })?;
+            self.linear
+                .encode_gemv_fused3(
+                    encoder,
+                    packed_q,
+                    self.weights.q_proj.metal_offset,
+                    self.weights.q_proj.out_features,
+                    q_out_signs,
+                    &scratch.q,
+                    packed_k,
+                    self.weights.k_proj.metal_offset,
+                    self.weights.k_proj.out_features,
+                    k_out_signs,
+                    &scratch.k,
+                    packed_v,
+                    v_proj.metal_offset,
+                    v_proj.out_features,
+                    v_out_signs,
+                    &scratch.v,
+                    &scratch.normed,
+                    input_signs,
+                    &scratch.transformed,
+                    &scratch.raw,
+                    &scratch.raw_b,
+                    &scratch.raw_c,
+                    self.weights.q_proj.in_features,
+                    true,
+                )
+                .map_err(ModelError::Kernel)?;
+            profile.stamp(encoder, &format!("{}qkv_proj", prefix()))?;
+            timer.lap("qkv_proj");
+        } else {
             self.encode_linear(
                 encoder,
-                v_proj,
+                &self.weights.q_proj,
                 &scratch.normed,
-                &scratch.v,
+                &scratch.q,
                 tokens,
                 scratch,
-                true,
+                decode,
             )?;
-        } else {
-            // Full attention reuses the raw K projection as V, before K is
-            // normalised and rotated in place.
-            self.elements
-                .encode_copy(encoder, &scratch.k, &scratch.v, kv_elements)?;
+            profile.stamp(encoder, &format!("{}q_proj", prefix()))?;
+            timer.lap("q_proj");
+            self.encode_linear(
+                encoder,
+                &self.weights.k_proj,
+                &scratch.normed,
+                &scratch.k,
+                tokens,
+                scratch,
+                decode,
+            )?;
+            profile.stamp(encoder, &format!("{}k_proj", prefix()))?;
+            timer.lap("k_proj");
+            if let Some(v_proj) = &self.weights.v_proj {
+                self.encode_linear(
+                    encoder,
+                    v_proj,
+                    &scratch.normed,
+                    &scratch.v,
+                    tokens,
+                    scratch,
+                    true,
+                )?;
+            } else {
+                // Full attention reuses the raw K projection as V, before K is
+                // normalised and rotated in place.
+                self.elements
+                    .encode_copy(encoder, &scratch.k, &scratch.v, kv_elements)?;
+            }
+            profile.stamp(encoder, &format!("{}v_proj", prefix()))?;
+            timer.lap("v_proj");
         }
-        profile.stamp(encoder, &format!("{}v_proj", prefix()))?;
-        timer.lap("v_proj");
 
         self.elements.encode_rms_norm(
             encoder,
@@ -1589,28 +1644,70 @@ impl DecoderLayer {
         }
         profile.stamp(encoder, &format!("{}pre_ffn_norm_transform", prefix()))?;
         timer.lap("pre_ffn_norm_transform");
-        self.encode_linear(
-            encoder,
-            &self.weights.gate_proj,
-            &scratch.normed,
-            &scratch.gate,
-            tokens,
-            scratch,
-            decode,
-        )?;
-        profile.stamp(encoder, &format!("{}gate_proj", prefix()))?;
-        timer.lap("gate_proj");
-        self.encode_linear(
-            encoder,
-            &self.weights.up_proj,
-            &scratch.normed,
-            &scratch.up,
-            tokens,
-            scratch,
-            decode,
-        )?;
-        profile.stamp(encoder, &format!("{}up_proj", prefix()))?;
-        timer.lap("up_proj");
+        if decode && self.weights.gate_proj.permutation_mode == 1 {
+            let packed_gate = self.weights.gate_proj.metal_buffer.as_ref().ok_or_else(|| {
+                ModelError::InvalidWeights("gate_proj has no GPU-resident weights".to_string())
+            })?;
+            let packed_up = self.weights.up_proj.metal_buffer.as_ref().ok_or_else(|| {
+                ModelError::InvalidWeights("up_proj has no GPU-resident weights".to_string())
+            })?;
+            let gate_out_signs = self.weights.gate_proj.output_signs_buffer.as_ref().ok_or_else(|| {
+                ModelError::InvalidWeights("gate_proj output signs are not resident".to_string())
+            })?;
+            let up_out_signs = self.weights.up_proj.output_signs_buffer.as_ref().ok_or_else(|| {
+                ModelError::InvalidWeights("up_proj output signs are not resident".to_string())
+            })?;
+            let input_signs = self.weights.gate_proj.input_signs_buffer.as_ref().ok_or_else(|| {
+                ModelError::InvalidWeights("gate_proj input signs are not resident".to_string())
+            })?;
+            self.linear
+                .encode_gemv_fused2(
+                    encoder,
+                    packed_gate,
+                    self.weights.gate_proj.metal_offset,
+                    self.weights.gate_proj.out_features,
+                    gate_out_signs,
+                    &scratch.gate,
+                    packed_up,
+                    self.weights.up_proj.metal_offset,
+                    self.weights.up_proj.out_features,
+                    up_out_signs,
+                    &scratch.up,
+                    &scratch.normed,
+                    input_signs,
+                    &scratch.transformed,
+                    &scratch.raw,
+                    &scratch.raw_b,
+                    self.weights.gate_proj.in_features,
+                    true,
+                )
+                .map_err(ModelError::Kernel)?;
+            profile.stamp(encoder, &format!("{}gate_up_proj", prefix()))?;
+            timer.lap("gate_up_proj");
+        } else {
+            self.encode_linear(
+                encoder,
+                &self.weights.gate_proj,
+                &scratch.normed,
+                &scratch.gate,
+                tokens,
+                scratch,
+                decode,
+            )?;
+            profile.stamp(encoder, &format!("{}gate_proj", prefix()))?;
+            timer.lap("gate_proj");
+            self.encode_linear(
+                encoder,
+                &self.weights.up_proj,
+                &scratch.normed,
+                &scratch.up,
+                tokens,
+                scratch,
+                decode,
+            )?;
+            profile.stamp(encoder, &format!("{}up_proj", prefix()))?;
+            timer.lap("up_proj");
+        }
         self.elements.encode_gated_gelu(
             encoder,
             &scratch.gate,
@@ -2101,6 +2198,8 @@ pub struct ForwardScratch {
     pub activated: Buffer,
     /// FP32 accumulator shared by every linear in the batch.
     pub raw: Buffer,
+    pub raw_b: Buffer,
+    pub raw_c: Buffer,
     /// FP16 input-transform staging, shared by every linear in the batch.
     pub transformed: Buffer,
     pub query_positions: Buffer,
@@ -2160,6 +2259,8 @@ impl ForwardScratch {
         // the shared accumulator must cover a full single-row head pass.
         let raw_elements = (max_tokens * inter).max(vocab);
         let raw = device.new_buffer((raw_elements * std::mem::size_of::<f32>()) as u64, options);
+        let raw_b = device.new_buffer((raw_elements * std::mem::size_of::<f32>()) as u64, options);
+        let raw_c = device.new_buffer((raw_elements * std::mem::size_of::<f32>()) as u64, options);
         let query_positions =
             device.new_buffer((max_tokens * std::mem::size_of::<u32>()) as u64, options);
         let token_ids =
@@ -2178,6 +2279,8 @@ impl ForwardScratch {
             up: u16_elements(max_tokens, inter)?,
             activated: u16_elements(max_tokens, inter)?,
             raw,
+            raw_b,
+            raw_c,
             transformed: u16_elements(max_tokens, inter)?,
             query_positions,
             token_ids,

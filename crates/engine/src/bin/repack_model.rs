@@ -171,9 +171,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
 
-        // Serialize new header
-        let new_header_bytes = serde_json::to_vec(&header_json)?;
+        // Recompute data_offsets aligned to 64 bytes
+        struct AlignedEntry {
+            name: String,
+            shape: Vec<usize>,
+            old_start: u64,
+            old_end: u64,
+            new_start: u64,
+            _new_end: u64,
+        }
+
+        let mut aligned_entries = Vec::new();
+        let mut cur_offset = 0u64;
+        for entry in &tensor_entries {
+            let tensor_len = entry.end - entry.start;
+            let aligned_start = (cur_offset + 63) & !63;
+            let aligned_end = aligned_start + tensor_len;
+            if let Some(val) = header_obj.get_mut(&entry.name) {
+                if let Some(obj) = val.as_object_mut() {
+                    obj.insert("data_offsets".to_string(), json!([aligned_start, aligned_end]));
+                }
+            }
+            aligned_entries.push(AlignedEntry {
+                name: entry.name.clone(),
+                shape: entry.shape.clone(),
+                old_start: entry.start,
+                old_end: entry.end,
+                new_start: aligned_start,
+                _new_end: aligned_end,
+            });
+            cur_offset = aligned_end;
+        }
+
+        // Serialize new header, padded with spaces so (8 + header_len) is a multiple of 64
+        let mut new_header_bytes = serde_json::to_vec(&header_json)?;
+        let rem = (8 + new_header_bytes.len()) % 64;
+        if rem != 0 {
+            let pad = 64 - rem;
+            new_header_bytes.extend(std::iter::repeat(b' ').take(pad));
+        }
         let new_header_len = new_header_bytes.len() as u64;
+        assert_eq!((8 + new_header_len) % 64, 0);
 
         // Open destination file
         let mut dst_file = BufWriter::with_capacity(16 * 1024 * 1024, File::create(&dst_shard)?);
@@ -182,10 +220,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
         let payload_base = 8 + header_len as u64;
         let mut shard_repacked_tensors = 0;
+        let mut current_written_payload = 0u64;
 
-        for entry in &tensor_entries {
-            let tensor_len = (entry.end - entry.start) as usize;
-            src_file.seek(SeekFrom::Start(payload_base + entry.start))?;
+        for entry in &aligned_entries {
+            let tensor_len = (entry.old_end - entry.old_start) as usize;
+            src_file.seek(SeekFrom::Start(payload_base + entry.old_start))?;
+
+            // Write 64-byte alignment padding if needed
+            if entry.new_start > current_written_payload {
+                let pad = (entry.new_start - current_written_payload) as usize;
+                dst_file.write_all(&vec![0u8; pad])?;
+                current_written_payload += pad as u64;
+            }
 
             if entry.name.ends_with(".trellis") && entry.shape.len() == 3 && entry.shape[2] == 48 {
                 let tiles_k = entry.shape[0];
@@ -219,6 +265,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                     remaining -= to_read;
                 }
             }
+            current_written_payload += tensor_len as u64;
         }
 
         dst_file.flush()?;

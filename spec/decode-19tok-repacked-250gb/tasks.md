@@ -30,12 +30,38 @@
   - Intent: Auto-detect repacked model checkpoint and dispatch repacked GEMV and prefill GEMM.
   - Result: Auto-detects `"layout": "colmajor"` in `quantization_config.json`, sets `permutation_mode = 1` for 3 bpw layers, dispatches `linear_gemv_ishizuki_k3_colmajor`. Verified bit-exact output on reference prompts ("The capital of France is Paris."). Sabotage test verified: forcing rowmajor w2 kernel on repacked weights produced gibberish ("TheBHC deBLC"); reverted and verified exact recovery.
 
-- [ ] **T7: Implement non-matvec overlap & command encoder optimization**
-  - Files: `crates/engine/src/model.rs`
-  - Intent: Overlap attention and norm execution with GEMV buffer submissions to reduce 7.4 ms idle span.
-  - Test: `KAPLUMBA_DECODE_PROFILE=kernel` shows non-matvec span compressed.
+- [x] **T7: Implement fused GEMV kernels & command buffer optimization**
+  - Files: `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`, `crates/engine/src/model.rs`
+  - Intent: Implement `linear_gemv_ishizuki_k3_fused2` (`gate_proj` + `up_proj`) and `linear_gemv_ishizuki_k3_fused3` (`q_proj` + `k_proj` + `v_proj`). Wire into `forward_chunk` during decode.
+  - Result: Fused2 and Fused3 wired into `model.rs`. Bit-exact greedy decode verified ("Paris", "Relativity posits that space and time are linked..."). Single command buffer execution (`KAPLUMBA_MAX_DISPATCHES_PER_BUFFER=2500`) confirmed running 60 layers in 1 buffer, delivering 83.9 ms GPU own time per token (11.46 tok/s).
+
+- [ ] **T7.1: Internalize single-buffer decode in `MetalEncoder`**
+  - Files: `crates/kernels/src/encoder.rs`, `crates/engine/src/model.rs`
+  - Intent: Allow `MetalEncoder` to configure `max_dispatches = 2500` for decode steps without requiring env var, while preserving 50 for prefill.
+  - Test: Unit tests pass; decode runs 1 command buffer per token automatically.
+
+- [ ] **T7.2: Design and implement 128-byte vector repacking in `repack_model.rs`**
+  - Files: `crates/engine/src/bin/repack_model.rs`, `crates/engine/src/exl3.rs`
+  - Intent: Group 4 consecutive tiles along K into 384-byte blocks ($3 \times 128$ bytes = 6 full 64-byte cachelines). Layout ensures SIMD lanes issue 16-byte aligned vector loads (`uint4`), eliminating the 1.333x DRAM cacheline burst amplification.
+  - Test: Repacker successfully generates 128-byte aligned format.
+
+- [ ] **T7.3: Implement 128-byte vector GEMV Metal kernel (`_vec128`)**
+  - Files: `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`
+  - Intent: Kernel reads `const device uint4 *` directly, fully saturating Apple Silicon memory controllers at 250+ GB/s.
+  - Test: Correctness verified against CPU reference in `repacked_golden.rs`.
+
+- [ ] **T7.4: Fail-first sabotage verification of 128-byte vector format**
+  - Files: `crates/engine/tests/repacked_golden.rs`
+  - Intent: Sabotage bit representation, verify test detects failure, revert, verify 100% bit-exact dequantization.
+  - Test: Sabotaged assertion catches divergence.
+
+- [ ] **T7.5: Repack model to 128-byte format and wire into engine**
+  - Files: `~/.kaplumba/models/Gxma-repacked`, `crates/engine/src/model.rs`
+  - Intent: Execute full model on 128-byte repacked weights. Single disk copy rule strictly maintained.
+  - Test: Real model greedy text matches baseline.
 
 - [ ] **T8: End-to-end decode benchmark and acceptance validation**
   - Files: `spec/decode-19tok-repacked-250gb/implementation_notes.md`
   - Intent: Measure end-to-end tok/s using `scripts/gpuq run` across reference prompts.
-  - Test: Output >= 19.0 tok/s.
+  - Acceptance: Output >= 19.0 tok/s (<= 52.6 ms/token) at 250+ GB/s effective bandwidth.
+

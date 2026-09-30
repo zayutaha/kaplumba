@@ -252,6 +252,7 @@ pub struct LinearKernels {
     gemm_mma_regpipe_pipeline: ComputePipelineState,
     finalize_rows_pipeline: ComputePipelineState,
     zero_raw_pipeline: ComputePipelineState,
+    gemv_reduce_sk4_pipeline: Option<ComputePipelineState>,
     /// `linear_gemv_fast` specialised on (bits, MCG codebook) for integer rates.
     fast_gemv_pipelines: Vec<Option<ComputePipelineState>>,
     /// Lane-per-thread EXL3 matvec, one per integer rate so `KA` folds to a
@@ -487,6 +488,10 @@ impl LinearKernels {
         let zero_raw_pipeline = device
             .new_compute_pipeline_state_with_function(&zero_raw_function)
             .map_err(KernelError::Pipeline)?;
+        let gemv_reduce_sk4_pipeline = match library.get_function("gemv_reduce_sk4", None) {
+            Ok(function) => device.new_compute_pipeline_state_with_function(&function).ok(),
+            Err(_) => None,
+        };
         // Specialised decode pipelines, one per integer bit rate.
         let mut fast_gemv_pipelines = Vec::with_capacity(8);
         for bits in 1..=8_u32 {
@@ -519,6 +524,7 @@ impl LinearKernels {
             gemm_mma_regpipe_pipeline,
             finalize_rows_pipeline,
             zero_raw_pipeline,
+            gemv_reduce_sk4_pipeline,
             fast_gemv_pipelines,
         })
     }
@@ -1050,16 +1056,67 @@ impl LinearKernels {
                 )));
             }
         }
-        self.encode_ishizuki_gemv(
-            encoder,
-            pipeline,
-            request.packed,
-            request.packed_offset,
-            request.transformed,
-            request.raw,
-            request.in_features,
-            request.out_features,
-        )
+        let is_stream = name.ends_with("_stream");
+        let is_sk4 = name.ends_with("_sk4");
+        if is_stream {
+            let tiles = (request.out_features / 16) as u64;
+            let groups = (tiles + 7) / 8;
+            let shape_values = [
+                to_u32(request.in_features, "input dimension")?,
+                to_u32(request.out_features, "output dimension")?,
+            ];
+            encoder.dispatch_1d_offset(
+                pipeline,
+                &[
+                    TensorRef::new(request.packed, request.packed_offset),
+                    TensorRef::new(request.transformed, 0),
+                    TensorRef::new(request.raw, 0),
+                ],
+                params_bytes(&shape_values),
+                groups * 256,
+                256,
+            )
+        } else if is_sk4 {
+            let tiles = (request.out_features / 16) as u64;
+            let groups = tiles * 4;
+            let shape_values = [
+                to_u32(request.in_features, "input dimension")?,
+                to_u32(request.out_features, "output dimension")?,
+            ];
+            encoder.dispatch_1d_offset(
+                pipeline,
+                &[
+                    TensorRef::new(request.packed, request.packed_offset),
+                    TensorRef::new(request.transformed, 0),
+                    TensorRef::new(request.raw, 0),
+                ],
+                params_bytes(&shape_values),
+                groups * 256,
+                256,
+            )?;
+            if let Some(reduce) = &self.gemv_reduce_sk4_pipeline {
+                let n_u32 = to_u32(request.out_features, "reduce n")?;
+                encoder.dispatch_1d(
+                    reduce,
+                    &[Some(request.raw), Some(request.raw)],
+                    &n_u32.to_le_bytes(),
+                    request.out_features as u64,
+                    256.min(request.out_features as u64),
+                )?;
+            }
+            Ok(())
+        } else {
+            self.encode_ishizuki_gemv(
+                encoder,
+                pipeline,
+                request.packed,
+                request.packed_offset,
+                request.transformed,
+                request.raw,
+                request.in_features,
+                request.out_features,
+            )
+        }
     }
 
     /// The pipeline for a named `linear_gemv_ishizuki_*` kernel, if it exists.
@@ -1645,6 +1702,176 @@ impl LinearKernels {
             &[Some(raw), Some(output_signs), Some(output)],
             &output_blocks.to_le_bytes(),
             u64::from(output_blocks),
+            64,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_gemv_fused2(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        packed_a: &Buffer,
+        offset_a: u64,
+        out_features_a: usize,
+        output_signs_a: &Buffer,
+        output_a: &Buffer,
+        packed_b: &Buffer,
+        offset_b: u64,
+        out_features_b: usize,
+        output_signs_b: &Buffer,
+        output_b: &Buffer,
+        input: &Buffer,
+        input_signs: &Buffer,
+        transformed: &Buffer,
+        raw_a: &Buffer,
+        raw_b: &Buffer,
+        in_features: usize,
+        pretransformed: bool,
+    ) -> Result<(), KernelError> {
+        if !pretransformed {
+            let input_blocks = to_u32(in_features / 128, "input dimension")?;
+            encoder.dispatch_1d(
+                &self.input_pipeline,
+                &[Some(input), Some(input_signs), Some(transformed)],
+                &input_blocks.to_le_bytes(),
+                u64::from(input_blocks) * 32,
+                32,
+            )?;
+        }
+        let pipeline = self
+            .ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2")
+            .ok_or_else(|| {
+                KernelError::InvalidInput("missing linear_gemv_ishizuki_k3_fused2".to_string())
+            })?;
+        let tiles_a = (out_features_a / 16) as u64;
+        let tiles_b = (out_features_b / 16) as u64;
+        let groups = tiles_a + tiles_b;
+        let shape = [
+            to_u32(in_features, "in_features")?,
+            to_u32(out_features_a, "out_features_a")?,
+            to_u32(out_features_b, "out_features_b")?,
+        ];
+        encoder.dispatch_1d_offset(
+            pipeline,
+            &[
+                TensorRef::new(packed_a, offset_a),
+                TensorRef::new(packed_b, offset_b),
+                TensorRef::new(transformed, 0),
+                TensorRef::new(raw_a, 0),
+                TensorRef::new(raw_b, 0),
+            ],
+            params_bytes(&shape),
+            groups * 256,
+            256,
+        )?;
+        let blocks_a = to_u32(out_features_a / 128, "output dimension a")?;
+        encoder.dispatch_1d(
+            &self.finalize_pipeline,
+            &[Some(raw_a), Some(output_signs_a), Some(output_a)],
+            &blocks_a.to_le_bytes(),
+            u64::from(blocks_a),
+            64,
+        )?;
+        let blocks_b = to_u32(out_features_b / 128, "output dimension b")?;
+        encoder.dispatch_1d(
+            &self.finalize_pipeline,
+            &[Some(raw_b), Some(output_signs_b), Some(output_b)],
+            &blocks_b.to_le_bytes(),
+            u64::from(blocks_b),
+            64,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_gemv_fused3(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        packed_a: &Buffer,
+        offset_a: u64,
+        out_features_a: usize,
+        output_signs_a: &Buffer,
+        output_a: &Buffer,
+        packed_b: &Buffer,
+        offset_b: u64,
+        out_features_b: usize,
+        output_signs_b: &Buffer,
+        output_b: &Buffer,
+        packed_c: &Buffer,
+        offset_c: u64,
+        out_features_c: usize,
+        output_signs_c: &Buffer,
+        output_c: &Buffer,
+        input: &Buffer,
+        input_signs: &Buffer,
+        transformed: &Buffer,
+        raw_a: &Buffer,
+        raw_b: &Buffer,
+        raw_c: &Buffer,
+        in_features: usize,
+        pretransformed: bool,
+    ) -> Result<(), KernelError> {
+        if !pretransformed {
+            let input_blocks = to_u32(in_features / 128, "input dimension")?;
+            encoder.dispatch_1d(
+                &self.input_pipeline,
+                &[Some(input), Some(input_signs), Some(transformed)],
+                &input_blocks.to_le_bytes(),
+                u64::from(input_blocks) * 32,
+                32,
+            )?;
+        }
+        let pipeline = self
+            .ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused3")
+            .ok_or_else(|| {
+                KernelError::InvalidInput("missing linear_gemv_ishizuki_k3_fused3".to_string())
+            })?;
+        let tiles_a = (out_features_a / 16) as u64;
+        let tiles_b = (out_features_b / 16) as u64;
+        let tiles_c = (out_features_c / 16) as u64;
+        let groups = tiles_a + tiles_b + tiles_c;
+        let shape = [
+            to_u32(in_features, "in_features")?,
+            to_u32(out_features_a, "out_features_a")?,
+            to_u32(out_features_b, "out_features_b")?,
+            to_u32(out_features_c, "out_features_c")?,
+        ];
+        encoder.dispatch_1d_offset(
+            pipeline,
+            &[
+                TensorRef::new(packed_a, offset_a),
+                TensorRef::new(packed_b, offset_b),
+                TensorRef::new(packed_c, offset_c),
+                TensorRef::new(transformed, 0),
+                TensorRef::new(raw_a, 0),
+                TensorRef::new(raw_b, 0),
+                TensorRef::new(raw_c, 0),
+            ],
+            params_bytes(&shape),
+            groups * 256,
+            256,
+        )?;
+        let blocks_a = to_u32(out_features_a / 128, "output dimension a")?;
+        encoder.dispatch_1d(
+            &self.finalize_pipeline,
+            &[Some(raw_a), Some(output_signs_a), Some(output_a)],
+            &blocks_a.to_le_bytes(),
+            u64::from(blocks_a),
+            64,
+        )?;
+        let blocks_b = to_u32(out_features_b / 128, "output dimension b")?;
+        encoder.dispatch_1d(
+            &self.finalize_pipeline,
+            &[Some(raw_b), Some(output_signs_b), Some(output_b)],
+            &blocks_b.to_le_bytes(),
+            u64::from(blocks_b),
+            64,
+        )?;
+        let blocks_c = to_u32(out_features_c / 128, "output dimension c")?;
+        encoder.dispatch_1d(
+            &self.finalize_pipeline,
+            &[Some(raw_c), Some(output_signs_c), Some(output_c)],
+            &blocks_c.to_le_bytes(),
+            u64::from(blocks_c),
             64,
         )
     }
