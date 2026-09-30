@@ -423,16 +423,14 @@ impl LinearKernels {
         };
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
-        self.encode(
+        self.encode_input_transform_blocks(
             encoder,
-            &self.input_pipeline,
             &[
                 Some(&input_buffer),
                 Some(&input_sign_buffer),
                 Some(&transformed),
             ],
-            &input_blocks.to_le_bytes(),
-            u64::from(input_blocks),
+            input_blocks,
         );
         self.encode(
             encoder,
@@ -538,16 +536,14 @@ impl LinearKernels {
         };
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
-        self.encode(
+        self.encode_input_transform_blocks(
             encoder,
-            &self.input_pipeline,
             &[
                 Some(&input_buffer),
                 Some(&input_sign_buffer),
                 Some(&transformed),
             ],
-            &input_blocks.to_le_bytes(),
-            u64::from(input_blocks),
+            input_blocks,
         );
         // Integer rates go to the lane-per-thread matvec: one window setup per
         // eight codes, 256-thread groups, and enough threads to fill the GPU.
@@ -1091,6 +1087,14 @@ impl LinearKernels {
     /// synchronised once.
     /// Dispatch only the input transform, so several matvecs that read the same
     /// activation can share it instead of each recomputing it.
+    ///
+    /// `blocks` is `in_features / 128`. The dispatch is `blocks * 32` threads in
+    /// groups of exactly 32 -- one simdgroup per 128-element block. Both halves of
+    /// that matter: the kernel's butterfly is `simd_shuffle_xor`-based, which is
+    /// undefined when part of a simdgroup is inactive, so the threadgroup must not
+    /// straddle a block boundary; and one thread per block is 42 threads at
+    /// in_features = 5376, which cannot fill 20 GPU cores while each keeps 128
+    /// floats live.
     pub fn encode_input_transform(
         &self,
         encoder: &mut crate::encoder::MetalEncoder,
@@ -1104,9 +1108,32 @@ impl LinearKernels {
             &self.input_pipeline,
             &[Some(input), Some(input_signs), Some(transformed)],
             &input_blocks.to_le_bytes(),
-            u64::from(input_blocks),
-            64,
+            u64::from(input_blocks) * 32,
+            32,
         )
+    }
+
+    /// The same dispatch over a raw encoder, for the buffer-returning entry
+    /// points, which do not go through `MetalEncoder` at all.
+    fn encode_input_transform_blocks(
+        &self,
+        encoder: &ComputeCommandEncoderRef,
+        bindings: &[Option<&Buffer>],
+        blocks: u32,
+    ) {
+        encoder.set_compute_pipeline_state(&self.input_pipeline);
+        for (index, binding) in bindings.iter().enumerate() {
+            encoder.set_buffer(index as u64, binding.map(|value| &**value), 0);
+        }
+        encoder.set_bytes(
+            bindings.len() as u64,
+            size_of::<u32>() as u64,
+            (&blocks as *const u32) as *const c_void,
+        );
+        encoder.dispatch_threads(
+            MTLSize::new(u64::from(blocks) * 32, 1, 1),
+            MTLSize::new(32, 1, 1),
+        );
     }
 
     pub fn encode_gemv(
@@ -1148,8 +1175,8 @@ impl LinearKernels {
                 &self.input_pipeline,
                 &[Some(input), Some(input_signs), Some(transformed)],
                 &input_blocks.to_le_bytes(),
-                u64::from(input_blocks),
-                64,
+                u64::from(input_blocks) * 32,
+                32,
             )?;
         }
         // Integer rates go to the lane-per-thread matvec: one window setup per

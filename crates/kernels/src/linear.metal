@@ -378,6 +378,66 @@ static uint packed_state(const device ushort *packed, uint tile_index, uint loca
     return fractional_window(tile, lane, rate - 16u);
 }
 
+// The same butterfly, one 32-lane simdgroup per 128-element block.
+//
+// Element `sub*32 + lane` lives in sub-register `sub` of lane `lane`, so the
+// five low passes (`width` 1..16) are a `simd_shuffle_xor` away and the two
+// high passes (`width` 32 and 64) are register swaps inside the lane -- no
+// threadgroup memory, and four floats of registers per thread instead of the
+// 128-float array `transform_vector` needs.
+//
+// Bit-exact with `transform_vector`, pass for pass:
+//   * the width loop runs 1, 2, 4, ... 64 in the same order, and each pass reads
+//     both partners before writing either, so every add/sub sees the same two
+//     values it saw before -- no reassociation;
+//   * `width 32` pairs sub-registers 0/1 and 2/3 and `width 64` pairs 0/2 and
+//     1/3, which is exactly `i` with bit 5 resp. bit 6 cleared;
+//   * a lane holding the *upper* partner must produce `left - right`, so it
+//     computes `theirs - mine`, not `mine - theirs`. Those two differ: IEEE-754
+//     subtraction is antisymmetric (`a - b` is the exact negation of `b - a`),
+//     and half of the output came out sign-flipped when it got that backwards.
+//     The extra operand swap is what makes the SIMD form bit-identical rather
+//     than merely equal in exact arithmetic.
+static inline void transform_simd(thread float &v0, thread float &v1, thread float &v2, thread float &v3, uint lane) {
+    #pragma unroll
+    for (uint width = 1u; width < 32u; width <<= 1u) {
+        const ushort mask = ushort(width);
+        float p0 = simd_shuffle_xor(v0, mask);
+        float p1 = simd_shuffle_xor(v1, mask);
+        float p2 = simd_shuffle_xor(v2, mask);
+        float p3 = simd_shuffle_xor(v3, mask);
+        const bool upper = (lane & width) != 0u;
+        v0 = upper ? p0 - v0 : v0 + p0;
+        v1 = upper ? p1 - v1 : v1 + p1;
+        v2 = upper ? p2 - v2 : v2 + p2;
+        v3 = upper ? p3 - v3 : v3 + p3;
+    }
+    // width 32: pairs (0,1) and (2,3). Every pair reads both of its inputs
+    // before either is written, which is what keeps the pass order irrelevant to
+    // the result.
+    float t0 = v0;
+    float t1 = v1;
+    float t2 = v2;
+    float t3 = v3;
+    v0 = t0 + t1;
+    v1 = t0 - t1;
+    v2 = t2 + t3;
+    v3 = t2 - t3;
+    // width 64: pairs (0,2) and (1,3).
+    float s0 = v0;
+    float s1 = v1;
+    v0 = s0 + v2;
+    v2 = s0 - v2;
+    v1 = s1 + v3;
+    v3 = s1 - v3;
+    // 1 / sqrt(128), the same constant `transform_vector` scales by, last.
+    const float SCALE = 0.08838834764831845f;
+    v0 *= SCALE;
+    v1 *= SCALE;
+    v2 *= SCALE;
+    v3 *= SCALE;
+}
+
 static void transform_vector(thread float *values) {
     for (uint width = 1u; width < 128u; width <<= 1u) {
         for (uint start = 0u; start < 128u; start += width << 1u) {
@@ -394,24 +454,45 @@ static void transform_vector(thread float *values) {
     }
 }
 
+// EXL3 input transform for decode.
+//
+// One 128-element block per thread, as before, but the block is transformed by a
+// 32-lane simdgroup (four registers per lane) instead of by one thread holding
+// 128 floats. At in_features = 5376 this dispatches 42 blocks against a 20-core
+// GPU, and each thread had to keep a `thread float values[128]` array alive
+// across seven runtime-bounded butterfly passes -- local memory.
+//
+// `blocks` is `in_features / 128` and the dispatch is `blocks * 32` threads in
+// groups of 32 (`LinearKernels::encode_input_transform` is the only caller), so
+// every threadgroup is exactly one simdgroup and the guard below can never split
+// one. That matters: `simd_shuffle_xor` is undefined if part of the simdgroup is
+// inactive, and a 64-thread group with 42 active blocks has an inactive lane in
+// its second simdgroup. Under that dispatch this kernel writes *nothing*.
+//
+// Block index and lane both come from `gid`, so nothing depends on
+// `thread_index_in_simdgroup` agreeing with `gid % 32`.
 kernel void linear_input_transform(
     const device half *input [[buffer(0)]],
     const device half *input_signs [[buffer(1)]],
     device half *output [[buffer(2)]],
     constant uint &blocks [[buffer(3)]],
     uint gid [[thread_position_in_grid]]) {
-    if (gid >= blocks) {
+    if (gid >= blocks * 32u) {
         return;
     }
-    float values[128];
-    uint base = gid * 128u;
-    for (uint i = 0; i < 128u; ++i) {
-        values[i] = float(input[base + i]) * float(input_signs[base + i]);
-    }
-    transform_vector(values);
-    for (uint i = 0; i < 128u; ++i) {
-        output[base + i] = half(values[i]);
-    }
+    // `input` and `input_signs` are both `in_features` long and share this
+    // indexing exactly: block `gid >> 5` reads [base, base + 128).
+    const uint lane = gid & 31u;
+    const uint base = (gid >> 5) * 128u + lane;
+    float v0 = float(input[base]) * float(input_signs[base]);
+    float v1 = float(input[base + 32u]) * float(input_signs[base + 32u]);
+    float v2 = float(input[base + 64u]) * float(input_signs[base + 64u]);
+    float v3 = float(input[base + 96u]) * float(input_signs[base + 96u]);
+    transform_simd(v0, v1, v2, v3, lane);
+    output[base] = half(v0);
+    output[base + 32u] = half(v1);
+    output[base + 64u] = half(v2);
+    output[base + 96u] = half(v3);
 }
 
 // EXL3 decode matvec, shaped like the reference implementation.
