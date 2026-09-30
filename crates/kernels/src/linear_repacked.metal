@@ -419,6 +419,145 @@ kernel void linear_gemv_ishizuki_k3_fused2(
     }
 }
 
+kernel void linear_gemv_ishizuki_k3_fused2_sk2(
+    const device ushort *packed_a [[buffer(0)]],
+    const device ushort *packed_b [[buffer(1)]],
+    const device half *x [[buffer(2)]],
+    device float *y_a [[buffer(3)]],
+    device float *y_b [[buffer(4)]],
+    constant const uint *shape [[buffer(5)]], // [K, N_a, N_b]
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    constexpr uint KA = 3u;
+    constexpr int CB = 1;
+    constexpr uint RING = 256u * KA;
+    constexpr uint WORDS = RING / 32u;
+    const uint K = shape[0];
+    const uint N_a = shape[1];
+    const uint N_b = shape[2];
+    const uint tiles_a = N_a / 16u;
+    const uint tiles_b = N_b / 16u;
+    const uint total_tiles = tiles_a + tiles_b;
+    const uint tiles_k = K / 16u;
+    constexpr int SG = 8;
+    constexpr uint SK = 2u;
+    threadgroup float red[SG][16];
+    const uint r0 = (lane % 4u) * 2u;
+
+    const uint lo0 = (lane * 8u + 1u) * 3u + RING - 16u;
+    const uint sh0 = lo0 % 32u;
+    const uint hi0 = lo0 / 32u;
+    const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
+    const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
+
+    const uint tg_tile = tgid % total_tiles;
+    const uint sk = tgid / total_tiles;
+    if (sk >= SK) return;
+
+    const bool is_b = (tg_tile >= tiles_a);
+    const uint tn = is_b ? (tg_tile - tiles_a) : tg_tile;
+    if (is_b && tn >= tiles_b) return;
+
+    const device ushort *packed = is_b ? packed_b : packed_a;
+    device float *y = is_b ? y_b : y_a;
+    const uint N_curr = is_b ? N_b : N_a;
+
+    const uint k_per_split = ((tiles_k / SK) / 32u) * 32u;
+    const uint k_start = sk * k_per_split;
+    const uint k_end = (sk == SK - 1u) ? tiles_k : (k_start + k_per_split);
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const device uint *column = (const device uint *)packed + tn * (tiles_k * WORDS);
+    const uint stride = WORDS;
+
+    const uint step = SG * 4u;
+    const uint k_unroll_end = k_start + ((k_end - k_start) / step) * step;
+
+    uint tk = k_start + sg * 4u;
+    for (; tk < k_unroll_end; tk += step) {
+        const device uint *t0 = column + (tk + 0u) * stride;
+        const device uint *t1 = column + (tk + 1u) * stride;
+        const device uint *t2 = column + (tk + 2u) * stride;
+        const device uint *t3 = column + (tk + 3u) * stride;
+
+        const ulong w0a = t0[j0], w0b = t0[j1];
+        const ulong w1a = t1[j0], w1b = t1[j1];
+        const ulong w2a = t2[j0], w2b = t2[j1];
+        const ulong w3a = t3[j0], w3b = t3[j1];
+
+        const ulong A0 = ((w0a << 32) | w0b) << sh0;
+        const ulong A1 = ((w1a << 32) | w1b) << sh0;
+        const ulong A2 = ((w2a << 32) | w2b) << sh0;
+        const ulong A3 = ((w3a << 32) | w3b) << sh0;
+
+        const device half *xr0 = x + (tk + 0u) * 16u + r0;
+        const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
+        const device half *xr1 = x + (tk + 1u) * 16u + r0;
+        const float p10 = float(xr1[0]), p11 = float(xr1[1]), p12 = float(xr1[8]), p13 = float(xr1[9]);
+        const device half *xr2 = x + (tk + 2u) * 16u + r0;
+        const float p20 = float(xr2[0]), p21 = float(xr2[1]), p22 = float(xr2[8]), p23 = float(xr2[9]);
+        const device half *xr3 = x + (tk + 3u) * 16u + r0;
+        const float p30 = float(xr3[0]), p31 = float(xr3[1]), p32 = float(xr3[8]), p33 = float(xr3[9]);
+
+        float v0[8], v1[8], v2[8], v3[8];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint rad = i * KA + 16u;
+            v0[i] = decode_state_mcg(uint(A0 >> (64u - rad)) & 0xffffu);
+            v1[i] = decode_state_mcg(uint(A1 >> (64u - rad)) & 0xffffu);
+            v2[i] = decode_state_mcg(uint(A2 >> (64u - rad)) & 0xffffu);
+            v3[i] = decode_state_mcg(uint(A3 >> (64u - rad)) & 0xffffu);
+        }
+
+        acc0 += p00 * v0[0] + p01 * v0[1] + p02 * v0[2] + p03 * v0[3];
+        acc1 += p00 * v0[4] + p01 * v0[5] + p02 * v0[6] + p03 * v0[7];
+        acc0 += p10 * v1[0] + p11 * v1[1] + p12 * v1[2] + p13 * v1[3];
+        acc1 += p10 * v1[4] + p11 * v1[5] + p12 * v1[6] + p13 * v1[7];
+        acc0 += p20 * v2[0] + p21 * v2[1] + p22 * v2[2] + p23 * v2[3];
+        acc1 += p20 * v2[4] + p21 * v2[5] + p22 * v2[6] + p23 * v2[7];
+        acc0 += p30 * v3[0] + p31 * v3[1] + p32 * v3[2] + p33 * v3[3];
+        acc1 += p30 * v3[4] + p31 * v3[5] + p32 * v3[6] + p33 * v3[7];
+    }
+
+    for (tk = k_unroll_end + sg; tk < k_end; tk += SG) {
+        const device uint *t0 = column + tk * stride;
+        const ulong a0 = t0[j0], a1 = t0[j1];
+        const ulong A0 = ((a0 << 32) | a1) << sh0;
+        const device half *xr0 = x + tk * 16u + r0;
+        const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
+        float v[8];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint rad = i * KA + 16u;
+            v[i] = decode_state_mcg(uint(A0 >> (64u - rad)) & 0xffffu);
+        }
+        acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
+        acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
+    }
+
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float sum = 0.0f;
+        for (int g = 0; g < SG; ++g) {
+            sum += red[g][lid];
+        }
+        y[(sk * N_curr) + tn * 16u + lid] = sum;
+    }
+}
+
+
 kernel void linear_gemv_ishizuki_k3_fused3(
     const device ushort *packed_a [[buffer(0)]],
     const device ushort *packed_b [[buffer(1)]],
@@ -1436,3 +1575,379 @@ kernel void linear_gemv_ishizuki_k3_colmajor_u4(
     }
 }
 
+// ---------------------------------------------------------------------------
+// MEASUREMENT KERNEL, NOT A DECODE PATH: 4 bpw on the `_contig4` colmajor body.
+// ---------------------------------------------------------------------------
+//
+// WHY IT EXISTS. Every colmajor decode kernel in this file is 3 bpw, and
+// `exl3::reorder_tensor_to_colmajor` hardcodes 48 u16 (= 24 32-bit words) per
+// tile, so a 4 bpw colmajor tensor cannot even be built by the production
+// repacker. That makes 3 bpw the only rate this path can be measured at, which
+// is what leaves the following question open:
+//
+//   is the 3 bpw colmajor decode's ~188 GB/s (spec/decode-19tok-repacked-250gb,
+//   `gate_up_gelu`, fit error 0.1% against `250.5 x 2.00/2.667`) the EXL3 *rate*,
+//   or a kernel defect that would show at every rate?
+//
+// Answering it needs the same body at two rates. This is that body at KA = 4,
+// character-for-character identical to `linear_gemv_ishizuki_k3_colmajor_contig4`
+// except for three constants (`KA`, and the two derived from it: `RING`, `WORDS`)
+// and one literal (`lo0`'s `* 3u` -> `* KA`).
+//
+// THE NAME IS DELIBERATE, AND IT IS THE SAFETY ARGUMENT.
+// `ishizuki_gemv_pipeline` (linear.rs) selects a production decode kernel by
+// *exact HashMap key* on one of four names:
+//
+//     linear_gemv_ishizuki_k{bits}_colmajor_contig4
+//     linear_gemv_ishizuki_k{bits}_colmajor
+//     linear_gemv_ishizuki_k{bits}_w2
+//     <the sorted-first kernel naming that rate>          (the slot table)
+//
+// The first key is the dangerous one: it is built from a format string, so a
+// kernel named `..._k4_colmajor_contig4` would be picked up by a 4 bpw
+// `perm_mode == 1` tensor. Naming it `..._contig4_bench` means no `get()` can
+// ever match it. The slot table is safe for the complementary reason:
+// `ishizuki_kernel_names` sorts, and `linear_gemv_ishizuki_k4` is a prefix of this
+// name, so the unsuffixed kernel claims slot 4 first. Both halves are asserted by
+// `crates/engine/tests/rate4_colmajor_bit_exact.rs`.
+//
+//   * Nothing in the engine dispatches this kernel, and nothing can: the model
+//     is 3 bpw for all seven per-layer linears and 6 bpw (row-major,
+//     `perm_mode = 0`) for `lm_head`, and the repacker can only ever emit 3 bpw
+//     colmajor tiles.
+//   * `scripts/gen_exl3_gemv.py` rewrites `linear.metal` only, so this file is
+//     outside the generated block (spec AC6: generator twice -> clean diff).
+//
+// WHY TWO WORDS PER LANE IS CORRECT AT 4 bpW -- derived, not assumed, and the
+// derivation has TWO failure conditions, not one.
+// The two-word form `A0 = ((w0 << 32) | w1) << sh` fills A0 bits `[sh, 64)` from
+// the pair and leaves `[0, sh)` zero. Code `i` reads A0 bits `[64 - r, 80 - r)`
+// with `r = i*KA + 16`, so the lowest bit any code touches is `48 - 7*KA` and the
+// pair suffices exactly when
+//
+//     (a) 7*KA + 16 <= 64          (no code falls through to B0)   AND
+//     (b) max over lanes of sh <= 48 - 7*KA   (no code reads below its own sh)
+//
+// (b) is the one that bites. At KA = 4, `sh` is 20 for every lane
+// (`(lane*8+1)*4 - 16` is constant mod 32) and `48 - 28 = 20`, so the two-word
+// form is legal **exactly on the boundary**. `WORDS = RING/32 = 32` -- 64 u16 per
+// tile, against the 48 u16 (24 words) that `exl3::reorder_tensor_to_colmajor`
+// hardcodes, which is why the 4 bpw colmajor repack has to be built separately.
+//
+// The same derivation is in `unpack_integer` (crates/engine/src/exl3.rs:231-280)
+// and, stated as both failure conditions, in `two_word_is_safe` in
+// `scripts/gen_exl3_gemv.py`, whose `TWO_WORD_SAFE_RATES` evaluates to
+// (1, 2, 3, 4). `crates/engine/tests/rate4_colmajor_bit_exact.rs` measures
+// 2-word against 3-word at every rate 1..=8 and pins that set.
+//
+// I first wrote (a) alone and concluded "KA <= 6, so 4 bpw needs two words". (a)
+// alone is not sufficient, and the 6 bpw kernel below is where that showed up.
+//
+// CONSEQUENCE FOR BANDWIDTH, the point of the measurement: a lane loads
+// 2 x 4 B = 8 B and consumes `8 * KA` bits, so lane-load amplification per useful
+// byte is `8 / KA` -- **2.667 at 3 bpw, 2.000 at 4 bpw**. If 3 bpw is slow
+// because of the rate, 4 bpw on this body should be 2.667/2.000 = 1.333x faster.
+// If 4 bpw is slow by the same factor, the stall is rate-independent and there is
+// headroom in the kernel.
+//
+// `constexpr int CB` is carried over verbatim from the kernel it is copied from,
+// where it is likewise unused: `decode_state_mcg` is called directly, which is the
+// whole point of the specialisation documented at linear.metal:310-343.
+kernel void linear_gemv_ishizuki_k4_colmajor_contig4_bench(
+    const device ushort *packed [[buffer(0)]],
+    const device half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant const uint *shape [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    constexpr uint KA = 4u;
+    constexpr int CB = 1;
+    constexpr uint RING = 256u * KA;
+    constexpr uint WORDS = RING / 32u;
+    const uint K = shape[0];
+    const uint N = shape[1];
+    const uint tiles_n = N / 16u;
+    const uint tiles_k = K / 16u;
+    constexpr int SG = 8;
+    threadgroup float red[SG][16];
+    const uint r0 = (lane % 4u) * 2u;
+
+    const uint lo0 = (lane * 8u + 1u) * KA + RING - 16u;
+    const uint sh0 = lo0 % 32u;
+    const uint hi0 = lo0 / 32u;
+    const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
+    const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
+
+    for (uint tn = tgid; tn < tiles_n; tn += ntg) {
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        const device uint *column = (const device uint *)packed + tn * (tiles_k * WORDS);
+        const uint stride = WORDS;
+
+        const uint step = SG * 4u;
+        const uint k_unroll_end = (tiles_k / step) * step;
+
+        uint tk = sg * 4u;
+        for (; tk < k_unroll_end; tk += step) {
+            const device uint *t0 = column + (tk + 0u) * stride;
+            const device uint *t1 = column + (tk + 1u) * stride;
+            const device uint *t2 = column + (tk + 2u) * stride;
+            const device uint *t3 = column + (tk + 3u) * stride;
+
+            const ulong w0a = t0[j0], w0b = t0[j1];
+            const ulong w1a = t1[j0], w1b = t1[j1];
+            const ulong w2a = t2[j0], w2b = t2[j1];
+            const ulong w3a = t3[j0], w3b = t3[j1];
+
+            const ulong A0 = ((w0a << 32) | w0b) << sh0;
+            const ulong A1 = ((w1a << 32) | w1b) << sh0;
+            const ulong A2 = ((w2a << 32) | w2b) << sh0;
+            const ulong A3 = ((w3a << 32) | w3b) << sh0;
+
+            const device half *xr0 = x + (tk + 0u) * 16u + r0;
+            const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
+            const device half *xr1 = x + (tk + 1u) * 16u + r0;
+            const float p10 = float(xr1[0]), p11 = float(xr1[1]), p12 = float(xr1[8]), p13 = float(xr1[9]);
+            const device half *xr2 = x + (tk + 2u) * 16u + r0;
+            const float p20 = float(xr2[0]), p21 = float(xr2[1]), p22 = float(xr2[8]), p23 = float(xr2[9]);
+            const device half *xr3 = x + (tk + 3u) * 16u + r0;
+            const float p30 = float(xr3[0]), p31 = float(xr3[1]), p32 = float(xr3[8]), p33 = float(xr3[9]);
+
+            float v0[8], v1[8], v2[8], v3[8];
+            #pragma unroll
+            for (uint i = 0; i < 8u; ++i) {
+                const uint rad = i * KA + 16u;
+                v0[i] = decode_state_mcg(uint(A0 >> (64u - rad)) & 0xffffu);
+                v1[i] = decode_state_mcg(uint(A1 >> (64u - rad)) & 0xffffu);
+                v2[i] = decode_state_mcg(uint(A2 >> (64u - rad)) & 0xffffu);
+                v3[i] = decode_state_mcg(uint(A3 >> (64u - rad)) & 0xffffu);
+            }
+
+            acc0 += p00 * v0[0] + p01 * v0[1] + p02 * v0[2] + p03 * v0[3];
+            acc1 += p00 * v0[4] + p01 * v0[5] + p02 * v0[6] + p03 * v0[7];
+            acc0 += p10 * v1[0] + p11 * v1[1] + p12 * v1[2] + p13 * v1[3];
+            acc1 += p10 * v1[4] + p11 * v1[5] + p12 * v1[6] + p13 * v1[7];
+            acc0 += p20 * v2[0] + p21 * v2[1] + p22 * v2[2] + p23 * v2[3];
+            acc1 += p20 * v2[4] + p21 * v2[5] + p22 * v2[6] + p23 * v2[7];
+            acc0 += p30 * v3[0] + p31 * v3[1] + p32 * v3[2] + p33 * v3[3];
+            acc1 += p30 * v3[4] + p31 * v3[5] + p32 * v3[6] + p33 * v3[7];
+        }
+
+        for (tk = k_unroll_end + sg; tk < tiles_k; tk += SG) {
+            const device uint *t0 = column + tk * stride;
+            const ulong a0 = t0[j0], a1 = t0[j1];
+            const ulong A0 = ((a0 << 32) | a1) << sh0;
+            const device half *xr0 = x + tk * 16u + r0;
+            const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
+            float v[8];
+            #pragma unroll
+            for (uint i = 0; i < 8u; ++i) {
+                const uint rad = i * KA + 16u;
+                const uint s = uint(A0 >> (64u - rad));
+                v[i] = decode_state_mcg(s & 0xffffu);
+            }
+            acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
+            acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
+        }
+
+        acc0 += simd_shuffle_xor(acc0, 1u);
+        acc0 += simd_shuffle_xor(acc0, 2u);
+        acc1 += simd_shuffle_xor(acc1, 1u);
+        acc1 += simd_shuffle_xor(acc1, 2u);
+        if (lane % 4u == 0u) {
+            red[sg][lane / 4u] = acc0;
+            red[sg][lane / 4u + 8u] = acc1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid < 16u) {
+            float sum = 0.0f;
+            for (int g = 0; g < SG; ++g) {
+                sum += red[g][lid];
+            }
+            y[tn * 16u + lid] = sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MEASUREMENT KERNEL, NOT A DECODE PATH: 6 bpw on the colmajor contig4 body.
+// ---------------------------------------------------------------------------
+//
+// WHY IT EXISTS. `lm_head` is 6 bpw and measured 250.5 GB/s in situ
+// (spec/decode-19tok-repacked-250gb), and the spec attributes that to it being at
+// lane-load amplification 2.000 rather than 2.667. That is a claim about the
+// *ratio*, and the 4 bpw arm below now supplies the missing half: 4 bpw is also
+// amplification 2.000, so 4 bpw colmajor and 6 bpw row-major differ in rate but
+// not in requests. If both land at the same number, amplification explains the
+// 3 bpw gap and the rate does not; if they differ, something rate-dependent is
+// still in the picture.
+//
+// THIS ONE NEEDS THREE WORDS PER LANE, NOT TWO, and that is the whole point of
+// deriving it rather than copying the 4 bpw kernel.
+//
+// The two-word form `A0 = ((w0 << 32) | w1) << sh` fills A0 bits `[sh, 64)` from
+// the pair and leaves `[0, sh)` zero. A code `i` reads A0 bits
+// `[64 - r, 80 - r)` with `r = i*KA + 16`, so the lowest bit any code touches is
+// `48 - 7*KA` and the third word is dead exactly when
+//
+//     max over lanes of sh  <=  48 - 7*KA
+//
+// At KA = 6: `sh in {6, 22}` (only four distinct `lane*8+1` residues mod 32
+// exist), so max is 22, while `48 - 42 = 6`. 22 > 6, and every lane with sh = 22
+// reads six bits of zeros as if they were weight.
+//
+// That is not a subtlety I worked out and then checked. The first version of this
+// kernel was a literal copy of the 4 bpw one and it decoded garbage -- 1023 of
+// 1024 fp16 outputs wrong at 128x1024, caught by
+// `crates/engine/tests/rate4_colmajor_bit_exact.rs`, which holds the 3 bpw
+// *production* kernel to 0 ULP from the same CPU reference and therefore makes
+// "the reference is wrong" a distinguishable alternative. The repo already had
+// the correct derivation: `two_word_is_safe` in `scripts/gen_exl3_gemv.py`
+// states both failure conditions, and `TWO_WORD_SAFE_RATES` comes out as
+// (1, 2, 3, 4). Note that 3 bpw and 4 bpw sit exactly *on* the boundary
+// (27 <= 27 and 20 <= 20) -- the two-word form is legal there only because the
+// lowest bit read coincides with the first valid bit. `rate4_colmajor_bit_exact.rs`
+// pins that set by measuring 2-word against 3-word at every rate 1..=8.
+//
+// CONSEQUENCE FOR THE MEASUREMENT, stated so it cannot be misread:
+//   rate    words/lane    amplification
+//   3 bpw      2             2.667
+//   4 bpw      2             2.000
+//   6 bpw      3             2.000
+//
+// So the 6 bpw arm is NOT a lower-amplification point. It is a
+// same-amplification / different-rate control, and the ratio to report against
+// 3 bpw is 2.667/2.000 = 1.333 for *both* 4 bpw and 6 bpw -- if the
+// amplification model holds.
+//
+// `constexpr int CB` is carried over from the kernel this is transcribed from,
+// where it is likewise unused: `decode_state_mcg` is called directly.
+kernel void linear_gemv_ishizuki_k6_colmajor_contig4_bench(
+    const device ushort *packed [[buffer(0)]],
+    const device half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant const uint *shape [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    constexpr uint KA = 6u;
+    constexpr int CB = 1;
+    constexpr uint RING = 256u * KA;
+    constexpr uint WORDS = RING / 32u;
+    const uint K = shape[0];
+    const uint N = shape[1];
+    const uint tiles_n = N / 16u;
+    const uint tiles_k = K / 16u;
+    constexpr int SG = 8;
+    threadgroup float red[SG][16];
+    const uint r0 = (lane % 4u) * 2u;
+
+    const uint lo0 = (lane * 8u + 1u) * KA + RING - 16u;
+    const uint sh0 = lo0 % 32u;
+    const uint hi0 = lo0 / 32u;
+    const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
+    const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
+    // `j1 + 1` reduced modulo WORDS. The `: j0` in linear.metal's `else` arm of
+    // `linear_gemv_ishizuki_k*` is `j0` where `j1 + 1` belongs; it is latent
+    // there (Metal reports it as `unused variable 'j2'`, because at those rates
+    // no code reads A0 below its own `sh`), and at 6 bpw it would be read on
+    // every lane with `j0 < WORDS - 2`. Corrected here rather than copied.
+    const uint j2 = j1 + 1u >= WORDS ? j1 + 1u - WORDS : j1 + 1u;
+
+    for (uint tn = tgid; tn < tiles_n; tn += ntg) {
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+        const device uint *column = (const device uint *)packed + tn * (tiles_k * WORDS);
+        const uint stride = WORDS;
+
+        const uint step = SG * 4u;
+        const uint k_unroll_end = (tiles_k / step) * step;
+
+        uint tk = sg * 4u;
+        for (; tk < k_unroll_end; tk += step) {
+            const device uint *t0 = column + (tk + 0u) * stride;
+            const device uint *t1 = column + (tk + 1u) * stride;
+            const device uint *t2 = column + (tk + 2u) * stride;
+            const device uint *t3 = column + (tk + 3u) * stride;
+
+            const ulong w0a = t0[j0], w0b = t0[j1], w0c = t0[j2];
+            const ulong w1a = t1[j0], w1b = t1[j1], w1c = t1[j2];
+            const ulong w2a = t2[j0], w2b = t2[j1], w2c = t2[j2];
+            const ulong w3a = t3[j0], w3b = t3[j1], w3c = t3[j2];
+
+            const ulong A0 = ((w0a << 32) | w0b) << sh0 | (sh0 ? (w0c >> (32 - sh0)) : 0ul);
+            const ulong A1 = ((w1a << 32) | w1b) << sh0 | (sh0 ? (w1c >> (32 - sh0)) : 0ul);
+            const ulong A2 = ((w2a << 32) | w2b) << sh0 | (sh0 ? (w2c >> (32 - sh0)) : 0ul);
+            const ulong A3 = ((w3a << 32) | w3b) << sh0 | (sh0 ? (w3c >> (32 - sh0)) : 0ul);
+
+            const device half *xr0 = x + (tk + 0u) * 16u + r0;
+            const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
+            const device half *xr1 = x + (tk + 1u) * 16u + r0;
+            const float p10 = float(xr1[0]), p11 = float(xr1[1]), p12 = float(xr1[8]), p13 = float(xr1[9]);
+            const device half *xr2 = x + (tk + 2u) * 16u + r0;
+            const float p20 = float(xr2[0]), p21 = float(xr2[1]), p22 = float(xr2[8]), p23 = float(xr2[9]);
+            const device half *xr3 = x + (tk + 3u) * 16u + r0;
+            const float p30 = float(xr3[0]), p31 = float(xr3[1]), p32 = float(xr3[8]), p33 = float(xr3[9]);
+
+            float v0[8], v1[8], v2[8], v3[8];
+            #pragma unroll
+            for (uint i = 0; i < 8u; ++i) {
+                const uint rad = i * KA + 16u;
+                v0[i] = decode_state_mcg(uint(A0 >> (64u - rad)) & 0xffffu);
+                v1[i] = decode_state_mcg(uint(A1 >> (64u - rad)) & 0xffffu);
+                v2[i] = decode_state_mcg(uint(A2 >> (64u - rad)) & 0xffffu);
+                v3[i] = decode_state_mcg(uint(A3 >> (64u - rad)) & 0xffffu);
+            }
+
+            acc0 += p00 * v0[0] + p01 * v0[1] + p02 * v0[2] + p03 * v0[3];
+            acc1 += p00 * v0[4] + p01 * v0[5] + p02 * v0[6] + p03 * v0[7];
+            acc0 += p10 * v1[0] + p11 * v1[1] + p12 * v1[2] + p13 * v1[3];
+            acc1 += p10 * v1[4] + p11 * v1[5] + p12 * v1[6] + p13 * v1[7];
+            acc0 += p20 * v2[0] + p21 * v2[1] + p22 * v2[2] + p23 * v2[3];
+            acc1 += p20 * v2[4] + p21 * v2[5] + p22 * v2[6] + p23 * v2[7];
+            acc0 += p30 * v3[0] + p31 * v3[1] + p32 * v3[2] + p33 * v3[3];
+            acc1 += p30 * v3[4] + p31 * v3[5] + p32 * v3[6] + p33 * v3[7];
+        }
+
+        for (tk = k_unroll_end + sg; tk < tiles_k; tk += SG) {
+            const device uint *t0 = column + tk * stride;
+            const ulong a0 = t0[j0], a1 = t0[j1], a2 = t0[j2];
+            const ulong A0 = ((a0 << 32) | a1) << sh0 | (sh0 ? (a2 >> (32 - sh0)) : 0ul);
+            const device half *xr0 = x + tk * 16u + r0;
+            const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
+            float v[8];
+            #pragma unroll
+            for (uint i = 0; i < 8u; ++i) {
+                const uint rad = i * KA + 16u;
+                const uint s = uint(A0 >> (64u - rad));
+                v[i] = decode_state_mcg(s & 0xffffu);
+            }
+            acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
+            acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
+        }
+
+        acc0 += simd_shuffle_xor(acc0, 1u);
+        acc0 += simd_shuffle_xor(acc0, 2u);
+        acc1 += simd_shuffle_xor(acc1, 1u);
+        acc1 += simd_shuffle_xor(acc1, 2u);
+        if (lane % 4u == 0u) {
+            red[sg][lane / 4u] = acc0;
+            red[sg][lane / 4u + 8u] = acc1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid < 16u) {
+            float sum = 0.0f;
+            for (int g = 0; g < SG; ++g) {
+                sum += red[g][lid];
+            }
+            y[tn * 16u + lid] = sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
