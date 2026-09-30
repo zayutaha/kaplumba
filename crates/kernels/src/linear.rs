@@ -72,7 +72,6 @@ fn decode_nr0() -> u32 {
 /// `scripts/gen_exl3_gemv.py`; a test asserts every name here resolves, which is
 /// what catches the two drifting apart.
 pub const NR0_VARIANTS: [u32; 3] = [2, 4, 8];
-
 /// `KAPLUMBA_GEMV_MAX_GROUPS`, read once. `u64::MAX` (no cap) when unset.
 fn gemv_max_groups() -> u64 {
     static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -201,6 +200,23 @@ pub struct PrefillEncodeRequest<'a> {
     pub codebook: Exl3Codebook,
 }
 
+/// Every `linear_gemv_ishizuki_*` function in the library, sorted.
+///
+/// Sorted so the pipeline build order — and therefore any error a missing kernel
+/// raises — is the same on every run. `functionNames` comes back from the
+/// Objective-C runtime in whatever order the compiler emitted, which is not
+/// stable across source edits, and an A/B that changes which kernel it measured
+/// when a header was touched is not an A/B.
+fn ishizuki_kernel_names(library: &Library) -> Vec<String> {
+    let mut names: Vec<String> = library
+        .function_names()
+        .into_iter()
+        .filter(|name| name.starts_with("linear_gemv_ishizuki_"))
+        .collect();
+    names.sort();
+    names
+}
+
 pub struct LinearKernels {
     device: Device,
     queue: CommandQueue,
@@ -243,9 +259,49 @@ pub struct LinearKernels {
     exl3_gemv_slot_names: Vec<String>,
     /// Verbatim ishizuki `exl3_matvec`, for A/B only.
     ishizuki_gemv_pipelines: Vec<Option<ComputePipelineState>>,
+    /// Every `linear_gemv_ishizuki_*` kernel, by name.
+    ///
+    /// This family is the one that actually runs: `encode_gemv` tries it *first*,
+    /// and 410 of this checkpoint's 411 tensors are 4-byte aligned, so all 60
+    /// layers' projections dispatch here. That makes two things a prerequisite
+    /// rather than a nicety, and both need to name a kernel in this family:
+    ///
+    ///   * a bit-exactness **reference** (`tests/decode_matvec_golden.rs`), which
+    ///     until now covered only `_mcg` -- i.e. it could not detect a change to
+    ///     the kernel that carries 91% of a decode token's bytes;
+    ///   * an A/B of a **variant** of the live kernel, which has to be
+    ///     name-addressable for the same reason the EXL3 r-variants are.
+    ///
+    /// A `HashMap` rather than extending the indexed `Vec`, because these
+    /// kernels are selected by *rate*, not by a `(codebook, aligned, bits)` slot,
+    /// and the variants under test have no slot.
+    ishizuki_gemv_by_name: std::collections::HashMap<String, ComputePipelineState>,
 }
 
 impl LinearKernels {
+    /// The bit rate a `linear_gemv_ishizuki_k<N>[...]` name dispatches for.
+    ///
+    /// Parsed from the name so the rate table and the name map cannot disagree —
+    /// the same reason `nr0_of_kernel_name` exists for the EXL3 r-variants, and
+    /// for the same reason: the alternative is an env var read at dispatch time,
+    /// which is how a benchmark ends up measuring a kernel the engine would not
+    /// choose.
+    ///
+    /// A suffixed variant (`_k3_w2`) reports the same rate as `_k3`. That is what
+    /// makes a variant substitutable: it must be dispatchable wherever the
+    /// original is, with only the window arithmetic changed.
+    pub fn ishizuki_rate_of_name(name: &str) -> Option<u8> {
+        let rest = name.strip_prefix("linear_gemv_ishizuki_k")?;
+        let digits: String = rest.chars().take_while(|c| c.is_ascii_digit()).collect();
+        if digits.is_empty() {
+            return None;
+        }
+        let bits: u8 = digits.parse().ok()?;
+        // 1..=8, and the rate must be the *whole* numeric prefix: `_k34` is not a
+        // thing, and silently reading it as 3 would be a naming trap.
+        (1..=8).contains(&bits).then_some(bits)
+    }
+
     /// The process-wide instance, built on first use.
     ///
     /// Every `DecoderLayer` used to call [`Self::new`], so a 60-layer model ran
@@ -293,17 +349,30 @@ impl LinearKernels {
             .new_compute_pipeline_state_with_function(&input_function)
             .map_err(KernelError::Pipeline)?;
         let mut ishizuki_gemv_pipelines = Vec::with_capacity(9);
+        let mut ishizuki_gemv_by_name = std::collections::HashMap::new();
         ishizuki_gemv_pipelines.push(None);
-        for bits in 1..=8_u32 {
-            let name = format!("linear_gemv_ishizuki_k{bits}");
+        // Every `linear_gemv_ishizuki_*` in the library, not just the eight the
+        // rate table dispatches. The extras are variants kept for A/B and for
+        // the golden reference; a name that is absent fails at `shared()`, which
+        // is where a typo should die rather than at a dispatch 20 minutes into a
+        // benchmark.
+        for name in ishizuki_kernel_names(&library) {
             let function = library
                 .get_function(&name, None)
                 .map_err(KernelError::Pipeline)?;
-            ishizuki_gemv_pipelines.push(Some(
-                device
-                    .new_compute_pipeline_state_with_function(&function)
-                    .map_err(KernelError::Pipeline)?,
-            ));
+            let pipeline = device
+                .new_compute_pipeline_state_with_function(&function)
+                .map_err(KernelError::Pipeline)?;
+            if let Some(bits) = Self::ishizuki_rate_of_name(&name) {
+                // The first (unsuffixed) kernel for a rate owns the dispatch slot.
+                if ishizuki_gemv_pipelines.len() <= bits as usize {
+                    ishizuki_gemv_pipelines.resize(bits as usize + 1, None);
+                }
+                if ishizuki_gemv_pipelines[bits as usize].is_none() {
+                    ishizuki_gemv_pipelines[bits as usize] = Some(pipeline.clone());
+                }
+            }
+            ishizuki_gemv_by_name.insert(name, pipeline);
         }
 
         let mut exl3_gemv_pipelines = Vec::with_capacity(EXL3_GEMV_STATES);
@@ -418,6 +487,7 @@ impl LinearKernels {
             exl3_gemv_by_name,
             exl3_gemv_slot_names,
             ishizuki_gemv_pipelines,
+            ishizuki_gemv_by_name,
             gemv_pipeline,
             finalize_pipeline,
             input_rows_pipeline,
@@ -898,6 +968,92 @@ impl LinearKernels {
     /// usual three buffers. They ride in the params slot, which the encoder binds
     /// immediately after the tensor bindings.
     #[allow(clippy::too_many_arguments)]
+    /// Dispatch a named `linear_gemv_ishizuki_*` kernel.
+    ///
+    /// Separate from [`Self::encode_ishizuki_gemv`] only in where the pipeline
+    /// comes from — everything after that is shared, deliberately, so a variant
+    /// cannot differ from the original in its grid, its threadgroup size, or its
+    /// bound buffers. A variant that changed the launch shape would not be
+    /// measuring the window arithmetic, it would be measuring two changes at
+    /// once, and the A/B would be unattributable.
+    ///
+    /// The rate is checked against the name so a test cannot pass `_k3`'s data
+    /// to `_k6`: the two disagree about `KA`, and the result would be garbage
+    /// rather than wrong-looking.
+    pub fn encode_ishizuki_gemv_named(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        name: &str,
+        request: &LinearEncodeRequest<'_>,
+    ) -> Result<(), KernelError> {
+        // The input transform first, exactly as `encode_gemv` does it. Omitting
+        // this was a real bug: the kernel then reads a `transformed` buffer that
+        // was never written, produces all zeros, and looks like a kernel that
+        // does not work rather than a dispatch that skipped a step. Found by
+        // `tests/decode_matvec_golden.rs`, whose all-zero guard is what turned
+        // "the digest is empty" into a diagnosable message.
+        if !request.pretransformed {
+            let input_blocks = to_u32(request.in_features / 128, "input dimension")?;
+            encoder.dispatch_1d(
+                &self.input_pipeline,
+                &[
+                    Some(request.input),
+                    Some(request.input_signs),
+                    Some(request.transformed),
+                ],
+                &input_blocks.to_le_bytes(),
+                u64::from(input_blocks) * 32,
+                32,
+            )?;
+        }
+        let pipeline = self.ishizuki_gemv_pipeline_by_name(name).ok_or_else(|| {
+            KernelError::InvalidInput(format!("no ishizuki decode kernel {name}"))
+        })?;
+        let Exl3Rate::Integer(bits) = request.rate else {
+            return Err(KernelError::InvalidInput(
+                "the ishizuki family only dispatches integer rates".to_string(),
+            ));
+        };
+        match Self::ishizuki_rate_of_name(name) {
+            Some(named) if named == bits => {}
+            Some(named) => {
+                return Err(KernelError::InvalidInput(format!(
+                    "{name} decodes {named} bpw but the request is {bits} bpw"
+                )));
+            }
+            None => {
+                return Err(KernelError::InvalidInput(format!(
+                    "{name} does not name a bit rate"
+                )));
+            }
+        }
+        self.encode_ishizuki_gemv(
+            encoder,
+            pipeline,
+            request.packed,
+            request.packed_offset,
+            request.transformed,
+            request.raw,
+            request.in_features,
+            request.out_features,
+        )
+    }
+
+    /// The pipeline for a named `linear_gemv_ishizuki_*` kernel, if it exists.
+    pub fn ishizuki_gemv_pipeline_by_name(&self, name: &str) -> Option<&ComputePipelineState> {
+        self.ishizuki_gemv_by_name.get(name)
+    }
+
+    /// Every `linear_gemv_ishizuki_*` kernel name, sorted.
+    ///
+    /// Public so a test can assert the family is complete and so an A/B harness
+    /// can enumerate variants rather than hard-coding names that then drift.
+    pub fn ishizuki_gemv_kernel_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self.ishizuki_gemv_by_name.keys().cloned().collect();
+        names.sort();
+        names
+    }
+
     fn encode_ishizuki_gemv(
         &self,
         encoder: &mut crate::encoder::MetalEncoder,
@@ -1061,6 +1217,14 @@ impl LinearKernels {
         name: &str,
         request: &LinearEncodeRequest<'_>,
     ) -> Result<(), KernelError> {
+        // The ishizuki family is checked first, and it is not an EXL3 family: it
+        // takes `shape` in a params slot rather than a `LinearParams` struct, and
+        // it ignores the codebook. Dispatching it through the EXL3 path would
+        // build a `LinearParams` and read it as two u32s, which happens to work
+        // only by accident of field order.
+        if name.starts_with("linear_gemv_ishizuki_") {
+            return self.encode_ishizuki_gemv_named(encoder, name, request);
+        }
         // Dimension shape only. `validate_encode` also requires the MCG codebook,
         // which is the right gate for the engine but not for a test that needs to
         // dispatch the plain and mul1 families to show they stay distinct.

@@ -77,9 +77,13 @@ pub fn states_for(tile: usize, code: usize, rate: u8) -> u16 {
 }
 
 /// One case's output, as raw bits plus the header the reference is keyed by.
+///
+/// `u32` rather than `u16` because the ishizuki family is digested as fp32 — see
+/// [`compute`]. A narrower word would silently truncate that to the low half and
+/// make the two families' digests look like the same kind of thing.
 pub struct Case {
     pub header: String,
-    pub values: Vec<u16>,
+    pub values: Vec<u32>,
 }
 
 /// Run every case in [`CASES`] and return their output words.
@@ -143,44 +147,115 @@ pub fn compute() -> Vec<Case> {
         let raw = device.new_buffer((out_f * 4) as u64, MTLResourceOptions::StorageModeShared);
         let out = device.new_buffer((out_f * 2) as u64, MTLResourceOptions::StorageModeShared);
 
-        let name = format!("linear_gemv_exl3_k{rate}_mcg");
-        let mut encoder = MetalEncoder::new(&queue).unwrap();
-        kernels
-            .encode_gemv_named(
-                &mut encoder,
-                &name,
-                &LinearEncodeRequest {
-                    packed: &packed_b,
-                    packed_offset: 0,
-                    perm_mode: 0,
-                    input: &input_b,
-                    input_signs: &is_b,
-                    output_signs: &os_b,
-                    transformed: &trans,
-                    raw: &raw,
-                    output: &out,
-                    in_features: *in_f,
-                    out_features: *out_f,
-                    rate: Exl3Rate::Integer(*rate),
-                    codebook: Exl3Codebook::Mcg,
-                    pretransformed: false,
-                },
-            )
-            .unwrap();
-        encoder.commit_and_wait().unwrap();
-        let ptr = out.contents() as *const u16;
-        let values = unsafe { std::slice::from_raw_parts(ptr, *out_f) }.to_vec();
-        assert!(
-            values.iter().any(|v| *v != 0),
-            "{name} on {in_f}x{out_f} produced an all-zero output; the kernel did not run, \
+        for name in kernels_for(*rate) {
+            // Zero both output buffers first. The two families write to *different*
+            // buffers — ishizuki writes fp32 straight into `raw` and leaves
+            // `output` for the caller's finalize pass, `_mcg` writes fp16 into
+            // `output` — so "the output is non-zero" has to be checked against the
+            // buffer this family actually writes, and a stale value from the
+            // previous kernel must not be able to stand in for a dispatch that did
+            // nothing.
+            unsafe {
+                std::ptr::write_bytes(out.contents() as *mut u16, 0, *out_f);
+                std::ptr::write_bytes(raw.contents() as *mut f32, 0, *out_f);
+            }
+            let mut encoder = MetalEncoder::new(&queue).unwrap();
+            kernels
+                .encode_gemv_named(
+                    &mut encoder,
+                    &name,
+                    &LinearEncodeRequest {
+                        packed: &packed_b,
+                        packed_offset: 0,
+                        perm_mode: 0,
+                        input: &input_b,
+                        input_signs: &is_b,
+                        output_signs: &os_b,
+                        transformed: &trans,
+                        raw: &raw,
+                        output: &out,
+                        in_features: *in_f,
+                        out_features: *out_f,
+                        rate: Exl3Rate::Integer(*rate),
+                        codebook: Exl3Codebook::Mcg,
+                        pretransformed: false,
+                    },
+                )
+                .unwrap();
+            encoder.commit_and_wait().unwrap();
+
+            // Digest whichever buffer this family wrote, as raw bits. fp32 for
+            // ishizuki, fp16 for `_mcg`.
+            //
+            // Digesting the fp32 is not a convenience, it is the point: rounding to
+            // fp16 first would hide any difference below half an ulp of the output,
+            // and the failure mode being hunted here is exactly a 1-ulp
+            // re-association. A golden that rounds before comparing can be
+            // insensitive to the thing it exists to catch.
+            let values: Vec<u32> = if writes_raw(&name) {
+                let ptr = raw.contents() as *const u32;
+                (0..*out_f)
+                    .map(|i| unsafe { std::ptr::read(ptr.add(i)) })
+                    .collect()
+            } else {
+                let ptr = out.contents() as *const u16;
+                (0..*out_f)
+                    .map(|i| u32::from(unsafe { std::ptr::read(ptr.add(i)) }))
+                    .collect()
+            };
+            assert!(
+                values.iter().any(|v| *v != 0),
+                "{name} on {in_f}x{out_f} produced an all-zero output; the kernel did not run, \
              so this digest is meaningless"
-        );
-        cases.push(Case {
-            header: format!("{rate}bpw {in_f}x{out_f} via {name}"),
-            values,
-        });
+            );
+            cases.push(Case {
+                header: format!("{rate}bpw {in_f}x{out_f} via {name}"),
+                values,
+            });
+        }
     }
     cases
+}
+
+/// Does this kernel write fp32 into `raw` (leaving `output` to finalize), rather
+/// than fp16 into `output`?
+///
+/// Derived from the kernel's own signature rather than from a list, because the
+/// two facts are independent and a list would let them drift: `y` is bound to
+/// buffer 2 in both, and for ishizuki that buffer is `raw` (`device float *`) in
+/// `encode_ishizuki_gemv`, while for the EXL3 family it is `output`
+/// (`device half *`) via the finalize pair.
+pub fn writes_raw(name: &str) -> bool {
+    name.starts_with("linear_gemv_ishizuki_")
+}
+
+/// Which kernels each rate is digested through.
+///
+/// **Both** families, and the ishizuki one is the more important half: it is what
+/// `encode_gemv` dispatches for 410 of this checkpoint's 411 tensors, so it
+/// carries 91% of a decode token's bytes. The `_mcg` family runs for `lm_head`
+/// alone — see `examples/which_gemv.rs` and `KAPLUMBA_TRACE_GEMV` on a real run.
+///
+/// Digesting only `_mcg`, which is what the first version of this file did,
+/// means the golden cannot detect a change to the kernel that actually runs. That
+/// is the same blind spot as comparing a kernel against a baseline rebuilt from
+/// the same edited source, one level up: here the *family* was the unexamined
+/// variable.
+///
+/// The two families compute the same function by different routes — different
+/// window widths, different reduction — so they do **not** agree bit for bit, and
+/// this file must not compare them to each other. That divergence is not a defect
+/// in either: `lm_head` has been validated through `_mcg` and the layer
+/// projections through ishizuki, and neither has been cross-checked against the
+/// other. Each is pinned to its own committed output. Recording that rather than
+/// normalising it away is deliberate: a cross-family equality claim would be
+/// something someone has to *earn*, and neither family needs it to be
+/// regression-protected.
+fn kernels_for(rate: u8) -> Vec<String> {
+    vec![
+        format!("linear_gemv_ishizuki_k{rate}"),
+        format!("linear_gemv_exl3_k{rate}_mcg"),
+    ]
 }
 
 /// Render cases in the reference file's format: a `# header` line, then hex words
@@ -191,7 +266,7 @@ pub fn render(cases: &[Case]) -> String {
         text.push_str(&format!("# {}\n", case.header));
         let mut line = String::with_capacity(case.values.len() * 5);
         for value in &case.values {
-            line.push_str(&format!("{value:04x} "));
+            line.push_str(&format!("{value:08x} "));
             if line.len() > 4000 {
                 text.push_str(&line);
                 text.push('\n');
@@ -207,10 +282,10 @@ pub fn render(cases: &[Case]) -> String {
 }
 
 /// Parse the reference format back into cases.
-pub fn parse(text: &str) -> Vec<(String, Vec<u16>)> {
-    let mut out: Vec<(String, Vec<u16>)> = Vec::new();
+pub fn parse(text: &str) -> Vec<(String, Vec<u32>)> {
+    let mut out: Vec<(String, Vec<u32>)> = Vec::new();
     let mut header = String::new();
-    let mut values: Vec<u16> = Vec::new();
+    let mut values: Vec<u32> = Vec::new();
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("# ") {
             if !header.is_empty() {
@@ -219,7 +294,7 @@ pub fn parse(text: &str) -> Vec<(String, Vec<u16>)> {
             header = rest.to_string();
         } else {
             for word in line.split_whitespace() {
-                values.push(u16::from_str_radix(word, 16).expect("golden word is hex"));
+                values.push(u32::from_str_radix(word, 16).expect("golden word is hex"));
             }
         }
     }

@@ -39,23 +39,36 @@
 //! is reviewed rather than rubber-stamped.
 
 #[path = "common/matvec_golden.rs"]
-mod matvec_golden;
+pub mod matvec_golden;
 
 use half::f16;
 use matvec_golden::{CASES, compute, parse, render};
 
 const GOLDEN: &str = include_str!("data/decode_matvec_golden.txt");
 
+/// Kernels digested per shape. Pinned as a constant so the count assertion
+/// catches a change to `kernels_for` — including one that *adds* a kernel, which
+/// is exactly what happens when a window variant is introduced, and which would
+/// otherwise silently go unreferenced.
+const KERNELS_PER_CASE: usize = 2;
+
 #[test]
 fn the_decode_matvec_matches_its_committed_output() {
     let reference = parse(GOLDEN);
+    // Two kernels per case, not one: the ishizuki family is what the engine
+    // dispatches for 91% of a decode token's bytes, and it is the family a
+    // change to the window arithmetic would touch. A count assertion of
+    // `CASES.len()` would have let the ishizuki half be dropped without
+    // failing.
     assert_eq!(
         reference.len(),
-        CASES.len(),
-        "the golden file holds {} cases, this test runs {}; `CASES` changed without the \
-         reference being regenerated",
+        CASES.len() * KERNELS_PER_CASE,
+        "the golden file holds {} cases, this test runs {} ({} shapes x {} kernels); \
+         `CASES` or `kernels_for` changed without the reference being regenerated",
         reference.len(),
-        CASES.len()
+        CASES.len() * KERNELS_PER_CASE,
+        CASES.len(),
+        KERNELS_PER_CASE,
     );
 
     if std::env::var_os("KAPLUMBA_ACCEPT_MATVEC_GOLDEN").is_some() {
@@ -103,12 +116,24 @@ fn the_decode_matvec_matches_its_committed_output() {
                 .iter()
                 .take(4)
                 .map(|i| {
+                    // The word width follows the family: ishizuki is digested as
+                    // fp32, `_mcg` as fp16. Guessing wrong here would report a
+                    // nonsense delta on a real difference, which is worse than
+                    // reporting none.
+                    let (now, before) = if matvec_golden::writes_raw(&case.header) {
+                        (f32::from_bits(case.values[*i]), f32::from_bits(want[*i]))
+                    } else {
+                        (
+                            f16::from_bits(case.values[*i] as u16).to_f32(),
+                            f16::from_bits(want[*i] as u16).to_f32(),
+                        )
+                    };
                     format!(
-                        "col {i}: {:04x} now vs {:04x} in the reference (delta {:+e})",
+                        "col {i}: {:08x} now vs {:08x} in the reference \
+                         ({now:.9} vs {before:.9}, delta {:+e})",
                         case.values[*i],
                         want[*i],
-                        f16::from_bits(case.values[*i]).to_f32()
-                            - f16::from_bits(want[*i]).to_f32()
+                        now - before,
                     )
                 })
                 .collect();
