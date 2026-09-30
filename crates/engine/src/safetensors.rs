@@ -542,7 +542,14 @@ fn validate_storage(
                 "quantization references missing text tensor {name}"
             ))
         })?;
-        if tensor.shape != metadata.shape {
+        let shape_matches = tensor.shape == metadata.shape
+            || (quantization.layout.as_deref() == Some("colmajor")
+                && tensor.shape.len() == 3
+                && metadata.shape.len() == 3
+                && tensor.shape[0] == metadata.shape[1]
+                && tensor.shape[1] == metadata.shape[0]
+                && tensor.shape[2] == metadata.shape[2]);
+        if !shape_matches {
             return Err(SafetensorError::Metadata(format!(
                 "quantization shape mismatch for {name}"
             )));
@@ -884,7 +891,12 @@ fn validate_linear_geometry(
         .ok_or_else(|| SafetensorError::Metadata(format!("missing trellis for {module}")))?;
     if bits.fract() == 0.0 {
         let packed_width = (bits as usize * 256) / 16;
-        if trellis.shape != [input / 16, output / 16, packed_width] {
+        let expected_shape = if quantization.layout.as_deref() == Some("colmajor") && module != "lm_head" {
+            vec![output / 16, input / 16, packed_width]
+        } else {
+            vec![input / 16, output / 16, packed_width]
+        };
+        if trellis.shape != expected_shape {
             return Err(SafetensorError::Metadata(format!(
                 "trellis shape mismatch for {module}"
             )));

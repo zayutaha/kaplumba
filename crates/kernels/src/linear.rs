@@ -1125,7 +1125,7 @@ impl LinearKernels {
     /// EXL3 measurement is a measurement *of*. There was no way to ask before
     /// this, which is a gap a reader of the notes could easily fall into.
     pub fn ishizuki_gemv_kernel_name(&self, rate: Exl3Rate, packed_offset: u64) -> Option<String> {
-        self.ishizuki_gemv_pipeline(rate, packed_offset)
+        self.ishizuki_gemv_pipeline(rate, packed_offset, 0)
             .map(|_| "ishizuki".to_string())
     }
 
@@ -1133,6 +1133,7 @@ impl LinearKernels {
         &self,
         rate: Exl3Rate,
         packed_offset: u64,
+        perm_mode: u32,
     ) -> Option<&ComputePipelineState> {
         if env_flag("KAPLUMBA_OWN_GEMV") {
             return None; // A/B against the pre-port kernel
@@ -1159,7 +1160,7 @@ impl LinearKernels {
         // so there is no correctness reason to want the old form — only an
         // attribution reason, when re-measuring a number that was taken before
         // this landed.
-        if env_flag("KAPLUMBA_REPACKED_GEMV") {
+        if perm_mode == 1 || env_flag("KAPLUMBA_REPACKED_GEMV") {
             if let Some(pipeline) = self
                 .ishizuki_gemv_by_name
                 .get(&format!("linear_gemv_ishizuki_k{bits}_colmajor"))
@@ -1573,7 +1574,7 @@ impl LinearKernels {
         // Integer rates go to the lane-per-thread matvec: one window setup per
         // eight codes, 256-thread groups, and enough threads to fill the GPU.
         // This is the real decode path; `gemv_buffer` routes the same way.
-        if let Some(pipeline) = self.ishizuki_gemv_pipeline(rate, packed_offset) {
+        if let Some(pipeline) = self.ishizuki_gemv_pipeline(rate, packed_offset, perm_mode) {
             // Trace the name that was *actually selected*, not one reconstructed
             // from the rate: the trace exists to answer "which kernel ran", and a
             // reconstructed name would keep answering the old question correctly

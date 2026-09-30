@@ -25,10 +25,10 @@
   - Intent: Column-major contiguous GEMV `linear_gemv_ishizuki_k3_colmajor` with 4x K unroll, eliminating strided jumps.
   - Result: Increased GEMV throughput from 151 GB/s to 180.5-188.5 GB/s (and 194.4 GB/s on large matrices) with 0 quality loss. Verified bit-exact.
 
-- [ ] **T6: Wire repacked weights and GEMV into engine pipeline**
-  - Files: `crates/engine/src/weights.rs`, `crates/engine/src/model.rs`
-  - Intent: Auto-detect repacked model checkpoint and dispatch repacked GEMV.
-  - Test: Sabotage dispatch branch, confirm failure, revert, verify execution on real model.
+- [x] **T6: Wire repacked weights and GEMV into engine pipeline**
+  - Files: `crates/engine/src/config.rs`, `crates/engine/src/safetensors.rs`, `crates/engine/src/model.rs`, `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`
+  - Intent: Auto-detect repacked model checkpoint and dispatch repacked GEMV and prefill GEMM.
+  - Result: Auto-detects `"layout": "colmajor"` in `quantization_config.json`, sets `permutation_mode = 1` for 3 bpw layers, dispatches `linear_gemv_ishizuki_k3_colmajor`. Verified bit-exact output on reference prompts ("The capital of France is Paris."). Sabotage test verified: forcing rowmajor w2 kernel on repacked weights produced gibberish ("TheBHC deBLC"); reverted and verified exact recovery.
 
 - [ ] **T7: Implement non-matvec overlap & command encoder optimization**
   - Files: `crates/engine/src/model.rs`

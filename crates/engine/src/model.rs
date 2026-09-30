@@ -2630,7 +2630,7 @@ impl TextModel {
             Exl3Rate::Integer(6),
             Exl3Codebook::Mcg,
         )?;
-        let model = Self::from_metal_parts_with_len(
+        let mut model = Self::from_metal_parts_with_len(
             embedding_buffer,
             embedding_bytes,
             embedding_offset,
@@ -2641,6 +2641,24 @@ impl TextModel {
             metadata.config.final_logit_softcapping,
             Some(weights),
         )?;
+        if metadata.quantization.layout.as_deref() == Some("colmajor") {
+            for layer in &mut model.layers {
+                for linear in [
+                    Some(&mut layer.weights.q_proj),
+                    Some(&mut layer.weights.k_proj),
+                    layer.weights.v_proj.as_mut(),
+                    Some(&mut layer.weights.o_proj),
+                    Some(&mut layer.weights.gate_proj),
+                    Some(&mut layer.weights.up_proj),
+                    Some(&mut layer.weights.down_proj),
+                ]
+                .into_iter()
+                .flatten()
+                {
+                    linear.permutation_mode = 1;
+                }
+            }
+        }
         model.validate_current_graph()?;
         Ok(model)
     }

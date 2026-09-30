@@ -9088,7 +9088,9 @@ kernel void linear_gemv(
         uint tile_row = i / 16u;
         uint local_row = i & 15u;
         uint local_column = gid & 15u;
-        uint tile_index = tile_row * params.tile_columns + tile_column;
+        uint tile_index = (params.perm_mode == 1u)
+            ? (tile_column * (params.in_features / 16u) + tile_row)
+            : (tile_row * params.tile_columns + tile_column);
         uint state = packed_state(packed, tile_index, local_row, local_column, params.packed_words, params.rate, params.perm_mode);
         sum += float(input[i]) * decode_state(state, params.codebook);
     }
@@ -9212,7 +9214,10 @@ kernel void linear_gemv_tiled(
         for (uint i = tid; i < TILES * word_count; i += 256u) {
             uint t = i / word_count;
             uint w = i - t * word_count;
-            uint tile_index = (kbase / 16u + t) * params.tile_columns + tile_column;
+            uint tk = kbase / 16u + t;
+            uint tile_index = (params.perm_mode == 1u)
+                ? (tile_column * (params.in_features / 16u) + tk)
+                : (tk * params.tile_columns + tile_column);
             tw[i] = trellis_word(packed, tile_index * word_count + w);
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -9334,6 +9339,13 @@ kernel void linear_gemv_tiled(
 // any element's accumulation order, so this kernel and the 64x32 one agree to
 // the last bit (2.1603336e-3 normalised error against the CPU reference, all
 // of it from the fp16 weights).
+inline uint mma_tile_gbase(uint tk, uint tn, constant LinearParams &params, uint word_count) {
+    uint tile_idx = (params.perm_mode == 1u)
+        ? (tn * (params.in_features / 16u) + tk)
+        : (tk * params.tile_columns + tn);
+    return 2u * tile_idx * word_count;
+}
+
 kernel void linear_gemm_mma(
     const device ushort *packed [[buffer(0)]],
     const device half *input [[buffer(1)]],
@@ -9410,8 +9422,7 @@ kernel void linear_gemm_mma(
             const uint j0 = i0 >= word_count ? i0 - word_count : i0;
             const uint j1 = j0 + 1u >= word_count ? j0 + 1u - word_count : j0 + 1u;
             const uint j2 = j1 + 1u >= word_count ? j1 + 1u - word_count : j1 + 1u;
-            const uint gbase = 2u * ((t / NTILES) * params.tile_columns +
-                                     (group.x * NTILES + (t % NTILES))) * word_count;
+            const uint gbase = mma_tile_gbase(t / NTILES, group.x * NTILES + (t % NTILES), params, word_count);
             pre[3u * jw + 0u] = trellis_word(packed + gbase, j0);
             pre[3u * jw + 1u] = trellis_word(packed + gbase, j1);
             pre[3u * jw + 2u] = trellis_word(packed + gbase, j2);
@@ -9430,8 +9441,7 @@ kernel void linear_gemm_mma(
                 uint kk = i / OUTS;
                 uint n = i % OUTS;
                 uint t = (kk / 16u) * NTILES + (n / 16u);
-                uint gbase = 2u * ((kbase / 16u + t / NTILES) * params.tile_columns +
-                                   group.x * NTILES + (t % NTILES)) * word_count;
+                uint gbase = mma_tile_gbase(kbase / 16u + t / NTILES, group.x * NTILES + (t % NTILES), params, word_count);
                 uint state = fractional_window(packed + gbase, (kk & 15u) * 16u + (n & 15u), fractional_bits);
                 bstage[kk * BSTRIDE + n] = half(decode_state(state, params.codebook));
             }
@@ -9542,8 +9552,7 @@ kernel void linear_gemm_mma(
                 const uint j0 = i0 >= word_count ? i0 - word_count : i0;
                 const uint j1 = j0 + 1u >= word_count ? j0 + 1u - word_count : j0 + 1u;
                 const uint j2 = j1 + 1u >= word_count ? j1 + 1u - word_count : j1 + 1u;
-                const uint gbase = 2u * (((kbase + KCHUNK) / 16u + t / NTILES) * params.tile_columns +
-                                     (group.x * NTILES + (t % NTILES))) * word_count;
+                const uint gbase = mma_tile_gbase((kbase + KCHUNK) / 16u + t / NTILES, group.x * NTILES + (t % NTILES), params, word_count);
                 pre[3u * jw + 0u] = trellis_word(packed + gbase, j0);
                 pre[3u * jw + 1u] = trellis_word(packed + gbase, j1);
                 pre[3u * jw + 2u] = trellis_word(packed + gbase, j2);
@@ -9718,9 +9727,7 @@ kernel void linear_gemm_mma_regpipe(
             const uint j1 = j0 + 1u >= word_count ? j0 + 1u - word_count : j0 + 1u; \
             const uint j2 = j1 + 1u >= word_count ? j1 + 1u - word_count : j1 + 1u; \
             const uint gbase =                                                     \
-                2u * (((kt) + t / NTILES) * params.tile_columns +                  \
-                     (group.x * NTILES + (t % NTILES))) *                           \
-                word_count;                                                        \
+                mma_tile_gbase((kt) + t / NTILES, group.x * NTILES + (t % NTILES), params, word_count); \
             pre[3u * jw + 0u] = trellis_word(packed + gbase, j0);                   \
             pre[3u * jw + 1u] = trellis_word(packed + gbase, j1);                   \
             pre[3u * jw + 2u] = trellis_word(packed + gbase, j2);                   \

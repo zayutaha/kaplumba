@@ -361,6 +361,8 @@ pub struct QuantizationConfig {
     pub out_scales: String,
     pub codebook: String,
     #[serde(default)]
+    pub layout: Option<String>,
+    #[serde(default)]
     pub tensor_storage: BTreeMap<String, TensorStorage>,
 }
 
