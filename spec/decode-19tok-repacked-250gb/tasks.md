@@ -60,10 +60,25 @@
   - Intent: Wire finalize pipeline into `encode_ishizuki_gemv_named`, test `linear_gemv_ishizuki_k3_colmajor_u4` with 128-byte aligned loads across 384-byte chunks (4 tiles).
   - Result: Finalize pipeline wired and tested in `repacked_golden.rs`. `u4` vector loading achieved 95.8 GB/s on `q_proj` (+41% over baseline 67.9 GB/s) and 153.5 GB/s on `up_proj` (+13.5%). Split-K 4 evaluated on `o_proj`: adds 60 reduction dispatches per token, creating command buffer dispatch overhead. Inner-loop threadgroup barriers identified as throughput killer; barrier-free K-loop restored.
 
-- [ ] **T7.6: Activation fusion and non-linear overhead reduction**
+- [x] **T7.6.1: Direct MCG specialization and full-attn Q+K fusion** (`4b7c528`)
   - Files: `crates/kernels/src/linear.metal`, `crates/engine/src/model.rs`
-  - Intent: Fuse `gated_gelu` into `fused2` or write directly to avoid global memory roundtrips through `scratch.gate` and `scratch.up`.
+  - Intent: Eliminate runtime `decode_state` branch in inner K loops by calling `decode_state_mcg` directly. Fuse Q + K in full-attention layers using `encode_gemv_fused2`.
+  - Result: Zero branches in unrolled inner loops across all colmajor kernels. Q and K fused in full-attention decode layers. Verified bit-exact ("The capital of France is Paris.").
+
+- [x] **T7.6.2: Fused MLP activation pipeline (`fused2_mlp`)** (`0288b49`)
+  - Files: `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`, `crates/engine/src/model.rs`
+  - Intent: Merge `gate_up` GEMV, Hadamard output transform, and `gated_gelu` into `encode_gemv_fused2_mlp`. Output directly to `scratch.activated`.
+  - Result: Eliminated `scratch.gate` and `scratch.up` buffers from global DRAM (20.6 MB roundtrips per token eliminated). Eliminated 120 kernel dispatches per token. Measured steady-state forward step dropped from 85.5 ms to 81.0 ms (saving 4.5 ms per token). 100% bit-exact greedy match verified.
+
+- [ ] **T7.6.3: Fast zero-copy argmax in `generate_gpu`**
+  - Files: `crates/engine/src/generate.rs`
+  - Intent: Eliminate the 262,144 element `f16 -> f32` conversion and heap `Vec` allocations on every token step. Use direct integer/half comparisons on `scratch.capped` or `logits` slice.
   - Test: Real model greedy text matches baseline.
+
+- [ ] **T7.6.4: Contiguous 4-tile unrolled GEMV (`contig4`) evaluation**
+  - Files: `crates/kernels/src/linear.rs`, `crates/engine/examples/bench_colmajor.rs`
+  - Intent: Wire `linear_gemv_ishizuki_k3_colmajor_contig4` into `linear.rs` and benchmark across all layer projection shapes.
+  - Test: Microbenchmarks report bandwidth and latency comparison against baseline colmajor.
 
 - [ ] **T8: End-to-end decode benchmark and acceptance validation**
   - Files: `spec/decode-19tok-repacked-250gb/implementation_notes.md`

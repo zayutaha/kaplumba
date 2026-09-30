@@ -279,16 +279,22 @@ where
     // temperature > 0 the sampled token is not the argmax and the fragility
     // number would describe a decision the engine did not make.
     let greedy = config.sampler.temperature == 0.0;
+    let track_margin = greedy && std::env::var_os("KAPLUMBA_MARGIN").is_some();
     for step in 0..config.max_new_tokens {
-        let last_logits = logits
-            .iter()
-            .map(|value| half::f16::from_bits(*value).to_f32())
-            .collect::<Vec<_>>();
-        let token = sampler.sample(&last_logits)?;
-        if greedy {
-            // `last_logits` is the f32 view; `argmax_with_margin` wants the fp16
-            // bits, and re-deriving them from `logits` keeps one definition of
-            // "the row" rather than two that can drift.
+        let token = if greedy {
+            argmax_logits(&logits)
+        } else {
+            let last_logits = logits
+                .iter()
+                .map(|value| half::f16::from_bits(*value).to_f32())
+                .collect::<Vec<_>>();
+            sampler.sample(&last_logits)?
+        };
+        if track_margin {
+            let last_logits = logits
+                .iter()
+                .map(|value| half::f16::from_bits(*value).to_f32())
+                .collect::<Vec<_>>();
             margins.record(generated_ids.len(), margin_from_f32(&last_logits));
         }
         if generated_ids.is_empty() {
