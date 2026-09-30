@@ -70,6 +70,12 @@ pub struct MetalEncoder<'q> {
     /// Encoded dispatches in the current command buffer. A buffer is committed
     /// once it reaches `MAX_DISPATCHES_PER_BUFFER`.
     dispatches: u32,
+    /// Every dispatch encoded over this encoder's lifetime, across all command
+    /// buffers. `dispatches` is reset by `rearm`, so it cannot answer "how many
+    /// dispatches did this forward issue" -- which is the number a fusion is
+    /// measured against, since each dispatch costs a launch plus an inter-
+    /// dispatch bubble. Exposed by [`Self::dispatches_encoded`].
+    dispatches_total: usize,
     /// Whether `encoder` has been ended. Every path that ends it goes through
     /// [`Self::end`], so this cannot drift from reality, and [`Drop`] uses it to
     /// end an encoder that an error path left open — which Metal traps on.
@@ -218,6 +224,7 @@ impl<'q> MetalEncoder<'q> {
             queue,
             in_flight: Vec::new(),
             dispatches: 0,
+            dispatches_total: 0,
             ended: false,
             command_buffers: 1,
             stamped: Vec::new(),
@@ -283,6 +290,18 @@ impl<'q> MetalEncoder<'q> {
     /// report tens, not one.
     pub fn command_buffers_created(&self) -> usize {
         self.command_buffers
+    }
+
+    /// Every compute dispatch encoded over this encoder's lifetime.
+    ///
+    /// This is the denominator a kernel fusion is measured on. A decode step
+    /// issues ~1400 of them, and the non-GEMV ones are small enough that the
+    /// inter-dispatch bubble, not the kernel, is a material share of the step:
+    /// measured own time for the non-GEMV kernels is 7.45 ms against an
+    /// uninstrumented step of ~81.5 ms, so ~5.4 ms of the non-GEMV tax is
+    /// launch latency that only fewer dispatches can remove.
+    pub fn dispatches_encoded(&self) -> usize {
+        self.dispatches_total
     }
 
     /// Encode a 1D dispatch of `threads` threads into the current command buffer.
@@ -442,6 +461,7 @@ impl<'q> MetalEncoder<'q> {
     /// full, bounding how much work any single buffer carries.
     fn tick(&mut self) -> Result<(), KernelError> {
         self.dispatches += 1;
+        self.dispatches_total += 1;
         if self.dispatches >= self.max_dispatches {
             self.roll()?;
         }

@@ -139,8 +139,8 @@ pub fn prefill_chunk() -> usize {
     })
 }
 
-/// Decode command buffers created, and decode steps run, since the process
-/// started.
+/// Decode command buffers created, decode dispatches encoded, and decode steps
+/// run, since the process started.
 ///
 /// A process-wide counter rather than a field on [`TextModel`], because the only
 /// thing that wants it is the `KAPLUMBA_COUNT_BUFFERS` diagnostic, and adding a
@@ -149,25 +149,53 @@ pub fn prefill_chunk() -> usize {
 ///
 /// Relaxed ordering: a diagnostic tally with no synchronisation to carry, whose
 /// only reader is a human after the run has finished.
-fn decode_counters() -> (&'static AtomicUsize, &'static AtomicUsize) {
+fn decode_counters() -> (
+    &'static AtomicUsize,
+    &'static AtomicUsize,
+    &'static AtomicUsize,
+) {
     static BUFFERS: AtomicUsize = AtomicUsize::new(0);
+    static DISPATCHES: AtomicUsize = AtomicUsize::new(0);
     static STEPS: AtomicUsize = AtomicUsize::new(0);
-    (&BUFFERS, &STEPS)
+    (&BUFFERS, &DISPATCHES, &STEPS)
 }
 
-/// Command buffers per decode step over the process's lifetime, if
-/// `KAPLUMBA_COUNT_BUFFERS` is set.
+/// Command buffers and dispatches per decode step over the process's lifetime,
+/// if `KAPLUMBA_COUNT_BUFFERS` is set.
+///
+/// The dispatch tally is the denominator a fusion is judged on: measured own
+/// time for the non-GEMV kernels is 7.45 ms against an uninstrumented step of
+/// ~81.5 ms, so a large part of what the remaining non-GEMV time costs is
+/// per-dispatch launch latency, and that is only removable by issuing fewer.
 pub fn report_buffers_per_step() {
     if std::env::var_os("KAPLUMBA_COUNT_BUFFERS").is_none() {
         return;
     }
-    let (buffers, steps) = decode_counters();
+    let (buffers, dispatches, steps) = decode_counters();
     let buffers = buffers.load(Ordering::Relaxed);
+    let dispatches = dispatches.load(Ordering::Relaxed);
     let steps = steps.load(Ordering::Relaxed);
     eprintln!(
-        "BUFFERS total={buffers} steps={steps} per_step={:.2}",
-        buffers as f64 / steps.max(1) as f64
+        "BUFFERS total={buffers} steps={steps} per_step={:.2} | DISPATCHES total={dispatches} \
+         steps={steps} per_step={:.1}",
+        buffers as f64 / steps.max(1) as f64,
+        dispatches as f64 / steps.max(1) as f64,
     );
+}
+
+/// Fold one decode step's encoder tallies into the process-wide counters.
+///
+/// Must be called before the encoder is committed, since `commit_and_wait`
+/// consumes it. No-ops unless `KAPLUMBA_COUNT_BUFFERS` is set, so the common
+/// path pays one env lookup per step and nothing else.
+pub(crate) fn record_decode_step_tallies(encoder: &MetalEncoder) {
+    if std::env::var_os("KAPLUMBA_COUNT_BUFFERS").is_none() {
+        return;
+    }
+    let (buffers, dispatches, steps) = decode_counters();
+    buffers.fetch_add(encoder.command_buffers_created(), Ordering::Relaxed);
+    dispatches.fetch_add(encoder.dispatches_encoded(), Ordering::Relaxed);
+    steps.fetch_add(1, Ordering::Relaxed);
 }
 
 #[derive(Debug, Error)]
@@ -2994,10 +3022,8 @@ impl TextModel {
             return Err(error);
         }
         // Read the tally BEFORE `commit_and_wait`, which consumes the encoder.
-        if decode_step && std::env::var_os("KAPLUMBA_COUNT_BUFFERS").is_some() {
-            let (buffers, steps) = decode_counters();
-            buffers.fetch_add(encoder.command_buffers_created(), Ordering::Relaxed);
-            steps.fetch_add(1, Ordering::Relaxed);
+        if decode_step {
+            record_decode_step_tallies(&encoder);
         }
         let started = std::time::Instant::now();
         if decode_step {

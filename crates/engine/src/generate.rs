@@ -902,6 +902,11 @@ where
                 .forward_buffer_into_step(&mut encoder, position, token)
                 .map_err(ModelError::from)?;
             let t_encode_ms = t_encode_start.elapsed().as_secs_f64() * 1e3;
+            // Fold this step's dispatch tally in BEFORE the encoder is committed,
+            // because `commit_terminal`/`wait` consume it. This is the only place
+            // the real decode loop can be counted at all: `forward_buffer_into_step`
+            // drives the caller's encoder, so its own tally hook does not fire.
+            crate::model::record_decode_step_tallies(&encoder);
             // `commit_terminal` ends the step's trailing partial slice of rolled
             // command buffers; `wait` covers all of them, in commit order, which
             // is the barrier the next step's host-side staging needs.
