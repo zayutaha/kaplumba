@@ -156,3 +156,90 @@ Running log for `spec/decode-19tok-repacked-250gb/`. Updated per task.
     - Step span median: **84.06 ms** (min: 79.72 ms).
     - Uninstrumented decode throughput: **10.8+ tok/s** (up from 6.0 tok/s baseline, an 80% speedup).
     - Bit-exactness: 100% bit-for-bit exact match on all golden test sentences.
+
+---
+
+## 2026-09-30 (later): reconciliation after a branch reset
+
+### What happened
+
+A parallel line of work branched from `0331fd6` and was committed as `e613f60` …
+`82c9e7a`. The reset at `HEAD@{14}` discarded `3f78f5c` … `25a585d`, which held the
+spec amendment, `bench.rs`, `bench_residency.rs`, `splitk_bit_exact.rs`,
+`fused_bit_exact.rs`, `linear_repacked.metal`, and the `_u8` / `_fused2_u8` /
+`_fused3_u8` kernels.
+
+The recovered work was worth keeping — it reached **12.8 tok/s** — so the approach was
+to make the surviving line coherent rather than to restore the discarded one.
+
+### Three things were incoherent
+
+1. **`HEAD` did not compile.** `82c9e7a "WIP 2"` added
+   `finalize_simd3_sk2_pipeline` to `LinearKernels` and loaded the function, but never
+   built the pipeline nor passed it to the initializer:
+   `error[E0063]: missing field 'finalize_simd3_sk2_pipeline'`. Fixed in `a1cdeed`.
+
+2. **The generator hazard was back.** 13 repacked kernels at `linear.metal:7968-9475`,
+   inside the region `scripts/gen_exl3_gemv.py` rewrites. Fixed in `df83398`: moved to
+   `linear_repacked.metal`, concatenated in `LinearKernels::new`, AC6 now passes.
+   Deleted two unreachable kernels (`_repacked_k3`, `_colmajor_pair`) in the same move.
+
+   Second attempt at the note failed instructively: it was first inserted *inside* the
+   regenerated region and the very next generator run ate it. The note belongs before
+   the banner, which is the generator's preserved zone.
+
+3. **The live kernel was untested.** `repacked_golden.rs` asserted `to_bits()` for
+   `_colmajor` and `_colmajor_simd` — and mentioned `contig4` **zero times** — while
+   `KAPLUMBA_TRACE_GEMV=1` shows the engine dispatches `_colmajor_contig4`. The
+   tolerance relaxations (`diff < 1e-3`, `diff_fp16 < 0.01`) had been applied to `_sk4`
+   and `_u4`, whose tests had failed; those are legitimate deviations, but they were
+   recorded as passing assertions rather than as a spec deviation.
+
+### Is the speed real? Yes, and now asserted
+
+`crates/engine/tests/live_kernel_bit_exact.rs`, measured:
+
+```
+down_proj  21504x5376: f32 differs 5376/5376 (max 26 ULP); f16 differs 0/5376
+gate_proj  5376x21504: f32 differs 21504/21504 (max 51 ULP); f16 differs 0/21504
+```
+
+`contig4` assigns four *contiguous* tiles to each simdgroup where `_colmajor`
+assigns tiles at `tk + {0,SG,2SG,3SG}`. Same tiles, ascending, different accumulators —
+a reassociation of the float sum. **The fp16 rounding absorbs it completely**, and
+fp16 is what `argmax_logits` reads. The test now asserts that equality rather than
+printing it, so a kernel that reassociates too far to round away fails loudly.
+
+### Verified state at HEAD
+
+- 5 interleaved uninstrumented runs, 64 tokens:
+  `11.57 / 12.76 / 12.93 / 12.52 / 12.80` → **median 12.76 tok/s** (was ~10.5).
+- Greedy output unchanged on three prompts, temperature 0.
+- 140 tests pass.
+- AC6 PASS: generator run twice, `git diff --exit-code` clean.
+
+### Corrections that had to be redone
+
+The per-token byte figure. An audit subagent derived 11.639 GB and it entered the first
+draft of this spec; the full-attention per-layer sum was mis-added
+(`200,245,248`, not `160,245,248`). The correct figure is
+**12,039,487,488 B = 12.039 GB/token**. `bench::tests::per_token_stream_is_12_039_487_488_bytes`
+was written to fail if the total did not balance, and did. That test is lost with the
+reset and is worth restoring.
+
+### What the honest ceiling is
+
+`lm_head` measures ~261 GB/s against a ~257 GB/s streaming control. The wide shapes
+are **at the memory system's limit**. A perfect GEMV everywhere would save at most
+~5% of the step. 19 tok/s needs 229–266 GB/s of dequantizing GEMV — 91–106% of copy
+bandwidth. **15 tok/s is the target; 19 is not reachable by kernel work on this box at
+3.0 bpw.**
+
+### Next
+
+1. The **~13 ms span-minus-own gap** across ~800 dispatches per token — the largest
+   unexplained item, and now comparable to the whole non-GEMV cost.
+2. Restore `bench.rs` (the real-shape table + median/spread statistics) and
+   `bench_residency.rs` (the `MADV_DONTNEED` cold arm). Both were lost to the reset.
+3. `q`/`k`/`v` at 88–92 GB/s vs `lm_head` at 261 — settle on the cold instrument before
+   building anything on it.
