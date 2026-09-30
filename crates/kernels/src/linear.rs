@@ -1956,27 +1956,27 @@ impl LinearKernels {
         )?;
         let blocks_a = to_u32(out_features_a / 128, "output dimension a")?;
         encoder.dispatch_1d(
-            &self.finalize_pipeline,
+            &self.finalize_simd_pipeline,
             &[Some(raw_a), Some(output_signs_a), Some(output_a)],
             &blocks_a.to_le_bytes(),
-            u64::from(blocks_a),
-            64,
+            u64::from(blocks_a) * 32,
+            32,
         )?;
         let blocks_b = to_u32(out_features_b / 128, "output dimension b")?;
         encoder.dispatch_1d(
-            &self.finalize_pipeline,
+            &self.finalize_simd_pipeline,
             &[Some(raw_b), Some(output_signs_b), Some(output_b)],
             &blocks_b.to_le_bytes(),
-            u64::from(blocks_b),
-            64,
+            u64::from(blocks_b) * 32,
+            32,
         )?;
         let blocks_c = to_u32(out_features_c / 128, "output dimension c")?;
         encoder.dispatch_1d(
-            &self.finalize_pipeline,
+            &self.finalize_simd_pipeline,
             &[Some(raw_c), Some(output_signs_c), Some(output_c)],
             &blocks_c.to_le_bytes(),
-            u64::from(blocks_c),
-            64,
+            u64::from(blocks_c) * 32,
+            32,
         )
     }
 
