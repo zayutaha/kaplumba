@@ -11,6 +11,23 @@ use crate::exl3::{Exl3Codebook, Exl3Rate, KernelError};
 
 const SOURCE: &str = include_str!("linear.metal");
 
+/// Repacked column-major / fused / split-K GEMV kernels.
+///
+/// Kept out of `linear.metal` because that file is partly generated:
+/// `scripts/gen_exl3_gemv.py` rewrites everything between
+/// `linear_gemv_exl3_k1(` and `kernel void linear_gemv(`, which is where these
+/// kernels used to sit. Concatenated onto `SOURCE` so they still share one
+/// `decode_state` and one compilation rather than becoming a second library.
+const REPACKED_SOURCE: &str = include_str!("linear_repacked.metal");
+
+fn combined_source() -> String {
+    let mut combined = String::with_capacity(SOURCE.len() + REPACKED_SOURCE.len() + 1);
+    combined.push_str(SOURCE);
+    combined.push('\n');
+    combined.push_str(REPACKED_SOURCE);
+    combined
+}
+
 /// Length of the decode-matvec pipeline table: index 0 is unused, then one slot
 /// per `(codebook, aligned, bits)` triple -- 3 x 2 x 8 = 48, plus the unused
 /// index 0. See [`LinearKernels::exl3_gemv_index`] for the layout.
@@ -343,7 +360,7 @@ impl LinearKernels {
         let device = Device::system_default().ok_or(KernelError::DeviceUnavailable)?;
         let options = CompileOptions::new();
         let library = device
-            .new_library_with_source(SOURCE, &options)
+            .new_library_with_source(&combined_source(), &options)
             .map_err(KernelError::Shader)?;
         let input_function = library
             .get_function("linear_input_transform", None)
