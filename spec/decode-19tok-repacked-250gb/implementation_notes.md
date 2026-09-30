@@ -256,3 +256,50 @@ bandwidth. **15 tok/s is the target; 19 is not reachable by kernel work on this 
    `bench_residency.rs` (the `MADV_DONTNEED` cold arm). Both were lost to the reset.
 3. `q`/`k`/`v` at 88–92 GB/s vs `lm_head` at 261 — settle on the cold instrument before
    building anything on it.
+
+### Recovered from the reset, and what it settled
+
+`bench.rs` (14 tests), `bench_residency.rs`, and the two bit-exactness tests were
+recovered from the reflog and re-pointed at the kernels that actually exist. Only the
+*addition-only* files were taken — no commit that touched `linear.metal`,
+`linear.rs` or `model.rs` was replayed, because that would have clobbered the fusion
+work. `bench.rs` needed `pub mod bench;` re-added to `lib.rs`.
+
+**`bench_residency` measured, 7 rounds, three shapes, three backings:**
+
+| shape | kernel | resident | file | file_cold |
+|---|---|---:|---:|---:|
+| `sliding/q` 5376×8192 | colmajor | 153.2 | 157.6 | 159.5 |
+| | contig4 | 167.8 | 165.7 | 166.6 |
+| `full/q` 5376×16384 | colmajor | 175.4 | 175.5 | 177.3 |
+| | contig4 | 175.9 | 176.4 | 176.1 |
+| `full/kv` 5376×2048 | colmajor | 126.1 | 123.8 | 121.4 |
+| | contig4 | 124.4 | 125.4 | 126.3 |
+
+**Three findings, and one of them closes a spec open question.**
+
+1. **`MADV_DONTNEED` is the whole variance story.** `sliding/q` / colmajor: spread
+   0.379 resident, 0.700 file, **0.930 file_cold**. Cold reading is 1.04x the
+   resident *median* and has a third of the spread. Every instrument in this repo
+   should evict; the noise was never the machine, it was a warm cache being read as
+   bandwidth.
+
+2. **Weight backing makes no difference.** file/resident is 1.03x, 1.00x, 0.98x — i.e.
+   within noise. The engine's mmap'd, file-backed weights (`weights.rs:983,1036`) are
+   not a handicap versus a resident `new_buffer_with_data`. That hypothesis is dead,
+   measured, not argued.
+
+3. **`contig4` is a real but modest win, and only on narrow shapes.** 1.10x resident /
+   1.05x file / **1.04x cold** on `sliding/q` (512 tile rows); 1.00x on `full/q`
+   (1024 tile rows) and 0.99-1.04x on `full/kv`. So the contiguous-tile change earns
+   ~4% where the grid is narrow and nothing where it is wide — consistent with it
+   being a latency-hiding effect rather than a bandwidth effect.
+
+**`full/kv` no longer collapses.** It read 57 GB/s in the original `bench_gemv` and 22%
+of streaming on the first `bench_residency` run; here it is **121-126 GB/s**. That gap
+is now attributed: it was the cached-working-set arm of `bench_gemv`, not a property
+of the shape. Spec §7 question 2 is answered — there is no narrow-shape bandwidth
+anomaly to chase.
+
+Also fixed: the instrument's summary line still looked up a `_u8` kernel that no longer
+exists and printed `0.00x`. Now compares `contig4/colmajor`.
