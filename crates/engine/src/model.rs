@@ -2893,6 +2893,7 @@ impl TextModel {
         // and must not be able to enter a decode total.
         let decode_step = token_ids.len() == 1;
         if decode_step {
+            encoder.set_max_dispatches(2500);
             crate::decode_profile::begin_step(&mut encoder, |encoder| {
                 self.calibration_dispatch(encoder)
             })?;

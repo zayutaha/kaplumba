@@ -87,6 +87,7 @@ pub struct MetalEncoder<'q> {
     /// list of already-committed buffers costs no GPU memory (a finished
     /// buffer releases its resources).
     stamped: Vec<(String, CommandBuffer)>,
+    max_dispatches: u32,
 }
 
 /// `MTLCommandBuffer` GPU timestamps, which metal-rs 0.33 does not bind even
@@ -220,7 +221,13 @@ impl<'q> MetalEncoder<'q> {
             ended: false,
             command_buffers: 1,
             stamped: Vec::new(),
+            max_dispatches: max_dispatches_per_buffer(),
         })
+    }
+
+    /// Override the dispatch limit before rolling to a new command buffer.
+    pub fn set_max_dispatches(&mut self, max: u32) {
+        self.max_dispatches = max;
     }
 
     /// A fresh command buffer and the compute encoder on it, both retained.
@@ -435,7 +442,7 @@ impl<'q> MetalEncoder<'q> {
     /// full, bounding how much work any single buffer carries.
     fn tick(&mut self) -> Result<(), KernelError> {
         self.dispatches += 1;
-        if self.dispatches >= max_dispatches_per_buffer() {
+        if self.dispatches >= self.max_dispatches {
             self.roll()?;
         }
         Ok(())
