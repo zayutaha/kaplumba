@@ -390,6 +390,178 @@ fn argmax_logits(logits: &[u16]) -> u32 {
     best as u32
 }
 
+/// The argmax with `skip` excluded, using `argmax_logits`'s exact tie rule.
+///
+/// Deliberately a second pass over the same row with the same comparison, rather
+/// than a single pass tracking a runner-up. A fused version has to decide what
+/// "second" means when several entries share the top value, and every one of
+/// those decisions is a place the fragility number could quietly disagree with
+/// the token that was actually emitted. This way the runner-up is by
+/// construction the argmax the sampler would have picked had the winner been
+/// absent, which is the only definition that means anything here.
+fn argmax_excluding(logits: &[u16], skip: usize) -> u32 {
+    let mut best = usize::MAX;
+    for index in 0..logits.len() {
+        if index == skip {
+            continue;
+        }
+        if best == usize::MAX
+            || half::f16::from_bits(logits[index]).to_f32()
+                > half::f16::from_bits(logits[best]).to_f32()
+        {
+            best = index;
+        }
+    }
+    assert!(best != usize::MAX, "a 1-entry vocabulary has no runner-up");
+    best as u32
+}
+
+/// How far the greedy decision was from flipping, in units of the fp16 ulp at
+/// the winning logit.
+///
+/// This is the measurement that makes "decode is reproducible" a claim instead
+/// of an observation. The logits are fp16 over a 262,144-entry vocabulary, so at
+/// a winning logit of ~28 the representable step is 2^(4-10) = 0.015625. Any
+/// top-2 gap below one ulp means a single rounding decision in the last matvec
+/// would emit a different token, and a run of N tokens is only as reproducible
+/// as its smallest margin.
+///
+/// Reported in ulps rather than in logits because the absolute gap is
+/// meaningless on its own: 0.01 is a comfortable margin at logit 4 and a coin
+/// flip at logit 28. This is also why an fp32 accumulator difference that is far
+/// below the fp16 grid can still change the output — which is the mechanism
+/// behind the FMA-contraction defect found in `spec/decode-bandwidth-240gb`
+/// (T2), where re-association moved 2 of 21,504 outputs by one ulp.
+#[derive(Clone, Copy, Debug)]
+pub struct ArgmaxMargin {
+    pub token: u32,
+    /// Winning logit, fp32 view of the fp16 row.
+    pub top: f32,
+    /// Runner-up logit.
+    pub runner_up: f32,
+    /// `(top - runner_up)`, fp32.
+    pub gap: f32,
+    /// `gap` in units of the fp16 ulp at `top`. `<= 1.0` means one rounding
+    /// decision could change the token.
+    pub ulps: f32,
+}
+
+/// The fp16 ulp at `value`: `2^(exponent - 10)`, with fp16's 10 explicit
+/// mantissa bits. Subnormals and zero are floored at `f32::MIN_POSITIVE`'s ulp
+/// so the divisor is never zero and the ratio stays finite.
+fn fp16_ulp(value: f32) -> f32 {
+    if !value.is_finite() || value == 0.0 {
+        return f32::from_bits(1 << 23); // f32::MIN_POSITIVE
+    }
+    let exponent = value.abs().log2().floor() as i32;
+    // fp16 max exponent is 15; anything above is not a value this format can
+    // hold, so clamp rather than produce a denormal-flushing subnormal.
+    let exponent = exponent.clamp(-14, 15);
+    2.0f32.powi(exponent - 10)
+}
+
+/// `argmax_logits` plus the distance to the runner-up.
+pub fn argmax_with_margin(logits: &[u16]) -> ArgmaxMargin {
+    assert!(
+        logits.len() >= 2,
+        "a margin needs a runner-up, so the vocabulary needs two entries"
+    );
+    let token = argmax_logits(logits);
+    let runner_up = argmax_excluding(logits, token as usize);
+    let top = half::f16::from_bits(logits[token as usize]).to_f32();
+    let second = half::f16::from_bits(logits[runner_up as usize]).to_f32();
+    let gap = top - second;
+    ArgmaxMargin {
+        token,
+        top,
+        runner_up: second,
+        gap,
+        ulps: gap / fp16_ulp(top),
+    }
+}
+
+/// Collects the per-step margin so a run can report its own fragility.
+///
+/// Gated on `KAPLUMBA_MARGIN=1`. The cost when off is one `Once` read, because
+/// a 262,144-entry second pass per step is real work and this is a diagnostic,
+/// not something the hot path should carry.
+struct MarginLog {
+    enabled: bool,
+    steps: Vec<(usize, ArgmaxMargin)>,
+}
+
+impl MarginLog {
+    fn new() -> Self {
+        Self {
+            enabled: std::env::var("KAPLUMBA_MARGIN").is_ok_and(|v| v != "0"),
+            steps: Vec::new(),
+        }
+    }
+
+    fn record(&mut self, step: usize, margin: ArgmaxMargin) {
+        if self.enabled {
+            self.steps.push((step, margin));
+        }
+    }
+
+    /// Per-step lines, then a summary naming the tightest step.
+    ///
+    /// The summary is the number that matters and it is reported as a *worst
+    /// case*, because a run is reproducible exactly when its least decisive
+    /// step is decisive. A median margin would be the wrong statistic and would
+    /// hide exactly the step anyone needs to look at.
+    fn report(&self) {
+        if !self.enabled || self.steps.is_empty() {
+            return;
+        }
+        for (step, margin) in &self.steps {
+            eprintln!(
+                "MARGIN step={step} token={} top={:.6} runner_up={} gap={:.6} ulps={:.3}",
+                margin.token, margin.top, margin.runner_up, margin.gap, margin.ulps
+            );
+        }
+        let (worst_step, worst) = self
+            .steps
+            .iter()
+            .min_by(|a, b| {
+                a.1.ulps
+                    .partial_cmp(&b.1.ulps)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .expect("non-empty by the guard above");
+        let ties = self.steps.iter().filter(|(_, m)| m.ulps <= 0.0).count();
+        let within_ulp = self.steps.iter().filter(|(_, m)| m.ulps <= 1.0).count();
+        let median = {
+            let mut v: Vec<f32> = self.steps.iter().map(|(_, m)| m.ulps).collect();
+            v.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            v[v.len() / 2]
+        };
+        eprintln!(
+            "MARGIN-SUMMARY steps={} min_ulps={:.3} at_step={} (token={}) median_ulps={:.3} \
+             within_1_ulp={} exact_ties={}",
+            self.steps.len(),
+            worst.ulps,
+            worst_step,
+            worst.token,
+            median,
+            within_ulp,
+            ties
+        );
+        if ties > 0 {
+            eprintln!(
+                "MARGIN-WARN {ties} step(s) have an exact fp16 tie at the top; the token is \
+                 decided by lowest index and any perturbation of the winner flips it"
+            );
+        } else if within_ulp > 0 {
+            eprintln!(
+                "MARGIN-NOTE {within_ulp} step(s) decided within one fp16 ulp; reproducible only \
+                 because no arithmetic on this path is nondeterministic, not because the margin \
+                 is comfortable"
+            );
+        }
+    }
+}
+
 /// Greedy decode over the fully GPU-resident forward path.
 ///
 /// One step per barrier: the argmax is taken on the host off the single softcapped
@@ -461,6 +633,10 @@ where
     let mut stopped_on_eos = false;
     let prompt_len = prompt_ids.len();
     let queue = model.forward_queue();
+    // `KAPLUMBA_MARGIN=1`: per-step distance from the greedy decision flipping,
+    // in fp16 ulps. See `argmax_with_margin`. This is the measurement that makes
+    // "decode reproduces" a claim rather than an observation.
+    let mut margins = MarginLog::new();
 
     let result = (|| -> Result<(), GenerationError> {
         let prefill_started = Instant::now();
@@ -486,6 +662,7 @@ where
         let mut logits = model.last_logits();
         loop {
             let token = argmax_logits(&logits);
+            margins.record(generated_ids.len(), argmax_with_margin(&logits));
             if generated_ids.is_empty() {
                 ttft_duration = request_started.elapsed();
             }
@@ -555,6 +732,7 @@ where
     // `KAPLUMBA_COUNT_BUFFERS`: command buffers per decode step. The tally lives
     // in `forward_buffer`, the only scope that holds the encoder.
     crate::model::report_buffers_per_step();
+    margins.report();
 
     let decode_steps = generated_ids.len().saturating_sub(1);
     Ok(GenerationResult {
@@ -581,7 +759,7 @@ where
 mod tests {
     use half::f16;
 
-    use super::argmax_logits;
+    use super::{argmax_logits, argmax_with_margin, fp16_ulp};
 
     fn row(values: &[f32]) -> Vec<u16> {
         values.iter().map(|v| f16::from_f32(*v).to_bits()).collect()
@@ -628,5 +806,166 @@ mod tests {
         // The softcap's 30.0 ceiling is exactly representable and is the largest
         // value the head can produce.
         assert_eq!(argmax_logits(&row(&[30.0, 29.999, 30.0])), 0);
+    }
+
+    // ---- argmax_with_margin: the fragility instrument ----
+    //
+    // The failure mode of this instrument is a *plausible number*, not a crash:
+    // a margin off by a factor of a thousand, or computed against the wrong
+    // logit, looks like a real measurement and would be filed as one. So the
+    // teeth checks below assert a *divergence* from the wrong reading rather than
+    // only the right value — see `fp16_ulp_is_pinned_to_the_mantissa_width` and
+    // `one_ulp_gap_reads_as_one_ulp_not_as_thousands`.
+
+    /// The ulp divisor has to be the ulp *at the winning logit*, not a constant.
+    /// `2^(e-10)` for fp16's 10 mantissa bits, where `2^e <= |top| < 2^(e+1)`.
+    ///
+    /// Worked check on the 16.0 boundary, because it is the one that is easy to
+    /// get wrong: 16.0 = 1.0 x 2^4, so e = 4 and ulp = 2^-6 = 0.015625 — the
+    /// next representable value is 16.015625. The `2^-7` it is easy to write is
+    /// ulp(8.0). This test was written with that error and failed; see
+    /// `spec/decode-bandwidth-240gb/implementation_notes.md`.
+    #[test]
+    fn fp16_ulp_tracks_the_exponent_band() {
+        assert_eq!(fp16_ulp(1.0), 0.0009765625); // 2^-10
+        assert_eq!(fp16_ulp(1.999), 0.0009765625);
+        assert_eq!(fp16_ulp(2.0), 0.001953125); // 2^-9
+        assert_eq!(fp16_ulp(8.0), 0.0078125); // 2^-7
+        assert_eq!(fp16_ulp(16.0), 0.015625); // 2^-6, NOT 2^-7
+        assert_eq!(fp16_ulp(28.5), 0.015625); // 2^-6, the measured band
+        assert_eq!(fp16_ulp(30.0), 0.015625);
+        assert_eq!(fp16_ulp(0.0), f32::MIN_POSITIVE); // divisor never zero
+        assert_eq!(fp16_ulp(f32::NAN), f32::MIN_POSITIVE);
+        assert_eq!(fp16_ulp(-28.5), 0.015625); // sign-independent
+        // The 16.0 boundary from both sides: 16.0 is the *first* value of the
+        // [16,32) band, so the value immediately below it is in [8,16) and has a
+        // half-sized ulp. This is the exact step where `fp16_ulp` must change.
+        assert_eq!(fp16_ulp(16.0), 0.015625);
+        assert_eq!(fp16_ulp(16.0 - 0.015625), 0.0078125); // 15.984375, band [8,16)
+        assert_eq!(fp16_ulp(15.999), 0.0078125);
+        assert_eq!(fp16_ulp(16.0 - 1e-4), 0.0078125); // just under the boundary
+    }
+
+    /// Teeth check: an exponent offset of -8 (as if fp16 had 8 mantissa bits)
+    /// makes every band assertion above fail by exactly 4x.
+    ///
+    /// Asserted as a divergence so the test states what it guards — the value is
+    /// pinned to the fp16 *mantissa width*, not merely to something monotonic in
+    /// the exponent. A looser approximation would pass a smaller version of this.
+    #[test]
+    fn fp16_ulp_is_pinned_to_the_mantissa_width() {
+        let correct = fp16_ulp(28.5);
+        let wrong_width = 2.0f32.powi(4 - 8); // 8 mantissa bits -> 2^-4
+        assert_eq!(correct, 0.015625);
+        assert_eq!(wrong_width, 0.0625);
+        assert!((wrong_width / correct - 4.0).abs() < 1e-6);
+        assert_ne!(correct, wrong_width);
+    }
+
+    /// A comfortable margin reports a large ulp count, and reports the *same*
+    /// token `argmax_logits` does. The two must never disagree: if they do, the
+    /// fragility number is describing a decision the engine did not make.
+    #[test]
+    fn margin_agrees_with_argmax_and_scales_the_gap() {
+        let m = argmax_with_margin(&row(&[1.0, 20.0, 2.0]));
+        assert_eq!(m.token, argmax_logits(&row(&[1.0, 20.0, 2.0])));
+        assert_eq!(m.top, 20.0);
+        assert_eq!(m.runner_up, 2.0);
+        assert_eq!(m.gap, 18.0);
+        // 18 / 0.015625 = 1152
+        assert!((m.ulps - 1152.0).abs() < 1e-3, "ulps was {}", m.ulps);
+    }
+
+    /// The number the instrument exists for: a one-ulp gap must report ~1.0.
+    ///
+    /// The failure mode guarded is a *smaller* divisor. Using the fp32 ulp at
+    /// 28.5 (3.4e-6) instead of the fp16 one (0.015625) divides by ~4600x less and
+    /// reports ~4600 ulps for a coin flip — which reads as enormous safety. Both
+    /// readings appear below so the test asserts their divergence, not a constant
+    /// that a wrong formula could satisfy in both places at once.
+    #[test]
+    fn one_ulp_gap_reads_as_one_ulp_not_as_thousands() {
+        let top = 28.5f32;
+        let fp16_step = fp16_ulp(top);
+        let m = argmax_with_margin(&row(&[top, top - fp16_step, 0.0]));
+        assert_eq!(m.token, 0);
+        assert!(
+            (m.ulps - 1.0).abs() < 1e-3,
+            "a one-ulp gap must read as 1.0 ulp, got {}",
+            m.ulps
+        );
+        let fp32_ulp = top * 2.0f32.powi(-23);
+        let wrong = m.gap / fp32_ulp;
+        assert!(
+            wrong > 1000.0,
+            "the wrong divisor must be obviously different, got {wrong}"
+        );
+        assert!((m.ulps - wrong).abs() > 1000.0);
+    }
+
+    /// An exact fp16 tie is the maximally fragile step and must report 0.0, not a
+    /// tiny positive number. With top-1 and top-2 equal, `gap` is exactly 0.
+    #[test]
+    fn exact_tie_reports_zero_ulps() {
+        let m = argmax_with_margin(&row(&[7.0, 7.0, 7.0]));
+        assert_eq!(m.token, 0, "ties resolve to the lowest index");
+        assert_eq!(m.gap, 0.0);
+        assert_eq!(m.ulps, 0.0);
+    }
+
+    /// fp16 quantisation is the whole reason this instrument exists, so the test
+    /// has to show that two **distinct f32** values can collapse to the same fp16
+    /// and that the margin reports a tie rather than the f32 gap.
+    ///
+    /// The perturbation has to be sized between the two grids: at 28.5 the f32 ulp
+    /// is 2^-19 = 1.9e-6 and the fp16 ulp is 0.015625, so `1e-5` is ~5 f32 ulps
+    /// (distinct values) and 1/1500th of an fp16 ulp (same fp16). `1e-9`, which
+    /// this test was first written with, does not even survive the *f32* add and
+    /// fails `assert_ne!` on the f32 values rather than testing anything.
+    #[test]
+    fn fp16_quantisation_is_visible_as_a_zero_margin() {
+        let a = 28.5f32;
+        let b = 28.5f32 + 1e-5;
+        assert_ne!(a, b, "must be two distinct f32 values");
+        let (fa, fb) = (f16::from_f32(a), f16::from_f32(b));
+        assert_eq!(fa.to_bits(), fb.to_bits(), "...that are the same fp16");
+        let zero = f16::from_f32(0.0).to_bits();
+        let m = argmax_with_margin(&[fa.to_bits(), fb.to_bits(), zero]);
+        assert_eq!(m.ulps, 0.0, "a collapsed pair is an exact tie");
+        assert_eq!(m.gap, 0.0);
+    }
+
+    /// Negative logits, and a case where the runner-up is the LAST entry rather
+    /// than an early one — the scan must not stop early.
+    #[test]
+    fn margin_handles_negative_and_late_runner_up() {
+        let m = argmax_with_margin(&row(&[-30.0, -29.0, -28.0, -1.0, -28.0]));
+        assert_eq!(m.token, 3);
+        assert_eq!(m.runner_up, -28.0);
+        assert_eq!(m.gap, 27.0);
+        // -1.0 is in [0.5,1) so ulp is 2^-11 = 0.00048828125; but the divisor uses
+        // |top| = 1.0 -> 2^-10.
+        assert!((m.ulps - 27.0 / fp16_ulp(1.0)).abs() < 1e-3);
+    }
+
+    /// All-negative row where the winner is the first entry: the fragile case a
+    /// fused runner-up tracker gets wrong.
+    #[test]
+    fn margin_when_winner_is_index_zero_and_others_are_lower() {
+        let m = argmax_with_margin(&row(&[-0.5, -30.0, -2.0]));
+        assert_eq!(m.token, 0);
+        assert_eq!(m.runner_up, -2.0);
+        assert_eq!(m.gap, 1.5);
+        // |top| in [0.25,0.5) -> 2^-12.
+        assert!((m.ulps - 1.5 / fp16_ulp(-0.5)).abs() < 1e-3);
+    }
+
+    /// A one-entry row has no runner-up and must say so rather than inventing one.
+    /// The whole instrument is meaningless without a runner-up, so a silent
+    /// fallback here would produce a fabricated margin.
+    #[test]
+    #[should_panic(expected = "needs two entries")]
+    fn margin_rejects_a_single_entry_row() {
+        let _ = argmax_with_margin(&row(&[42.0]));
     }
 }
