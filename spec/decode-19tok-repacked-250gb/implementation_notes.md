@@ -991,3 +991,144 @@ signature surfaces as `LinearKernels::new()` returning `KernelError::Shader` and
 "the kernels do not work", not as a typo on line 1641. If the whole Metal test suite
 goes red at once, map the concatenated `program_source` line number back to the `.metal`
 file before looking at anything else.
+
+---
+
+## T7.6.13: Single-pass decode attention (built, measured, bit-exact, off by default)
+
+The decode path dispatches two kernels per layer (`crates/kernels/src/attention.rs:329` ->
+`encode_online_attention_split`): `attention_decode_split_{dim,ratio}` on
+`splits * kv_heads` workgroups, then `attention_decode_combine_{dim}` on
+`q_heads * head_dim` threads. The alternative is one dispatch holding the whole
+reduction in-threadgroup, which is what omlx's `omlx_sdpa_decode` does
+(Apache-2.0, `decode_fast/csrc/sdpa_decode_kernels.h:42-110`, single pass,
+`simd_sum`, no partials round trip).
+
+Added `attention_decode_single_{256_2,512_8}` — the two model shapes only, since
+the host only selects it after `gqa_index` has resolved — behind
+`KAPLUMBA_DECODE_SINGLE_PASS`, **default off**. `model.rs` and `generate.rs` are
+untouched; the arm is inside the existing `encode_online_attention_split`.
+
+### The crossover is 64 keys, and that is structural, not a coincidence
+
+64 is exactly `ATTENTION_MIN_KEYS_PER_SPLIT`, i.e. exactly where `decode_splits`
+already returns 1. So the window where single-pass wins is precisely the window
+where the split path is not splitting:
+
+| keys | splits | sliding split+comb / single | full split+comb / single |
+|---|---|---|---|
+| 16 | 1 | 0.0125 / 0.0109 ms = **1.141x** | 0.0205 / 0.0187 = **1.098x** |
+| 64 | 1 | 0.0290 / 0.0274 = **1.059x** | 0.0531 / 0.0514 = **1.034x** |
+| 65 | 2 | 0.0206 / 0.0303 = **0.682x** | 0.0360 / 0.0574 = **0.627x** |
+| 128 | 2 | 0.0294 / 0.0507 = **0.579x** | 0.0537 / 0.0984 = **0.546x** |
+| 256 | 4 | 0.0305 / 0.0976 = **0.313x** | 0.0544 / 0.1930 = **0.282x** |
+| 512 | 8 | 0.0384 / 0.1979 = **0.194x** | 0.0601 / 0.3854 = **0.156x** |
+| 1024 | 16 | 0.0592 / 0.4673 = **0.127x** | 0.1188 / 0.8253 = **0.144x** |
+| 8192 | 16 | — | 1.1568 / 8.1841 = **0.141x** |
+
+GPU-clocked own_ms (`commit_stamped_and_wait` + `take_gpu_stamps`, the same
+measurement `KAPLUMBA_GPU_PROFILE=1` reports), median of 9 **interleaved**
+samples after 3 warm-ups, one pass per command buffer. Per-sample spread was
+0.0002-0.0074 ms on the winning side and up to 0.31 ms on the losing side at
+long context, so the 0.13x-0.19x gaps are far outside the noise and the 1.03x-1.14x
+gaps are at or just above it.
+
+**Why**: both paths move *exactly the same DRAM bytes*. A workgroup owns one kv
+head and its `q_heads / kv_heads` simdgroups read that head's K and V out of one
+L1, so a split never duplicates a byte — verified by the byte column being
+identical for both arms at every key count. The only terms in the cost model are
+(a) one extra dispatch plus a `splits * q_heads * (head_dim + 2)` float round
+trip, saved by single-pass, and (b) the whole `splits` factor of occupancy, paid
+by it. At `splits == 1` (b) is zero, so (a) is all that is left and it is worth
+3-14%. At `splits == 2` (b) is already worth 30-45% and (a) cannot come close.
+
+### Negative result: the sliding window does not make this viable at all times
+
+The hypothesis worth checking was that because the sliding layers cap context at
+1024, single-pass might be usable there permanently. It is not, and by a lot:
+at the 1024-key cap it runs **7.9x slower** (0.127x). A bounded KV context bounds
+the *work*, not the *parallelism requirement* — and the parallelism requirement
+is set by `kv_heads`, which is 16 (sliding) and 4 (full). Four workgroups cannot
+fill twenty cores however little work each has. This is the same lesson as
+T7.6.10's `KAPLUMBA_DECODE_SPLITS` note (64 workgroups quantises badly on 20
+cores), arriving from the opposite direction.
+
+### End-to-end value: ~0.025 ms/token, and only for the first 64 tokens
+
+60 dispatches x ~0.4 us saved per dispatch. The roadmap line estimated 1.5 ms
+(`tasks.md` T7.6.13), which had already been revised to 0.21 ms; the measured
+figure is **~0.025 ms/token**, another ~8x below that. Against a 74.01 ms/step
+this is 0.03%, below the 4-12% run-to-run spread AGENTS.md 10.5 records for this
+box, so **it is not measurable end to end** and the tok/s figure must not be
+quoted as changed.
+
+Left **off by default** for that reason: a 0.03% win confined to the first 64
+tokens of a conversation is not worth changing the production decode path for.
+`KAPLUMBA_DECODE_SINGLE_PASS=1` turns it on; `=<n>` sweeps the threshold.
+
+### Bit-exactness: exact at `splits == 1`, and *only* there
+
+`crates/engine/tests/attention_single_pass_bit_exact.rs`, 7 tests, all passing:
+
+* `to_bits()` identical on **294912/294912** fp16 elements, both model shapes x
+  12 key counts (1, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256 — every
+  boundary in the dispatch decision, not a sample).
+* `splits == 8` is **not** bit-exact: 6/49152 elements differ, worst 1 fp16 ULP,
+  worst relative 9.7e-4, and 0 of 4 shape/count combinations happened to be
+  exact. The combine's `sum_i exp(m_i - M) * O_i` interleaves its rescale across
+  splits in a different association order from the split body's per-tile
+  `s = s * ms + simd_sum(w)`. No single-pass kernel can match that, which is why
+  the gate is `key_count <= 64` and never wider.
+* Exactness at `splits == 1` is structural: it is literally
+  `attention_gqa_body<HEAD_DIM, NSG, false>` — the same template the prefill entry
+  points instantiate — so there is no second copy of the loop that could drift.
+  And the combine, reducing one partial, collapses to `O / l` with
+  `exp(m - m) == 1.0f`.
+
+### A `DIVIDE` template parameter was added, measured useless, and removed
+
+The combine's epilogue is a *division* (`acc / s`); the prefill/split body's is a
+*reciprocal multiply* (`acc * (1 / s)`). Different f32 operations, so on the
+reasoning that exactness required reproducing the operation, a `DIVIDE` template
+parameter was added to `attention.metal` to select the division.
+
+**It was unnecessary: 0 of 294912 fp16 elements differ between the two
+epilogues.** The fp16 store absorbs it. The parameter was removed rather than
+carried as an unjustified code path, and the measurement is recorded as
+`the_reciprocal_multiply_is_absorbed_by_the_fp16_store` in the test and as a note
+on the template in `attention.metal`, so the next person does not re-derive it.
+
+Two other things that had to be checked rather than assumed, both now asserted:
+`exp(0.0f) == 1.0f` exactly on this device (the whole `splits == 1` collapse rests
+on it), and a one-element 1-ULP value perturbation being *invisible* — 0 of 8192
+outputs move, because that element contributes `w * v` with `w ~ 1/256`. Even 256
+1-ULP flips in one value row are invisible; the fail-first arm has to sign-flip a
+whole row to move the output. That is a property of the kernel worth knowing: a
+one-element value flip is below the fp16 noise floor and must never be used as a
+sabotage.
+
+### Fail-first (AGENTS.md 3.4)
+
+Verified by sabotage, not asserted. Injecting a 1-element swap into
+`attention_gqa_body` **inside the single-pass macro only** (leaving prefill and
+split untouched) made the exactness test fail immediately and diagnosably:
+
+```
+NOT bit-exact: sliding 32q/16kv/d256 w1024 @1 keys, element 0/8192:
+  split+combine(splits=1) 4.8950195e-1 (0x37d5) vs single-pass 4.9682617e-1 (0x37f3);
+  ULP distance 30
+```
+
+and `the_reciprocal_multiply_is_absorbed_by_the_fp16_store` failed with it, so the
+test detects a wrong kernel rather than comparing two wrong things. Sabotage
+reverted and the suite re-run green. Two further arms are permanent:
+`the_comparison_detects_a_reduction_order_change` (splits 1 vs 8 on one kernel,
+2/24576 elements move) establishes that the compared quantity is
+order-sensitive, which is what makes the exactness claim non-vacuous; and the
+flipped-input arm above.
+
+### AC6 clean
+
+`scripts/gen_exl3_gemv.py` twice: `git status --short` identical both times, no
+`linear*.metal` churn. `attention_metal` (4) + `attention_shapes` (1) +
+`kaplumba-kernels --lib` (19) + the new file (7) all pass.

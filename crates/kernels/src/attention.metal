@@ -716,6 +716,20 @@ static inline float2 unpack_half2(uint packed) {
 //   output      PARTIALS: one unnormalised (m, l, O) row per split in `partials`
 //               prefill: the normalised output row
 //
+// A `DIVIDE` template parameter was tried here and reverted, because the
+// single-pass decode kernel (`attention_decode_single_*`) has to be bit-identical
+// to `attention_decode_split` with `splits == 1` followed by
+// `attention_decode_combine`, and the combine's epilogue is a *division*
+// (`denominator > 0.0f ? numerator / denominator : 0.0f`) where this loop ends in
+// a *reciprocal multiply* (`acc * (1 / s)`) -- different f32 operations.
+// MEASURED (`crates/engine/tests/attention_single_pass_bit_exact.rs`,
+// `the_reciprocal_multiply_is_absorbed_by_the_fp16_store`): the two epilogues
+// produce **bit-identical fp16 on 294912 of 294912 elements**, both model shapes
+// and twelve key counts. The fp16 store absorbs it, so the parameter bought
+// nothing and was removed instead of carried as an unjustified code path. The
+// note stays because the reasoning is not obvious and the next person to
+// "correct" the epilogue should know it was tried and measured.
+//
 // Splitting must not change the scan: the host derives `key_count` from
 // `GpuKvCache::key_count(full_attention)`, which for the sliding rings is
 // `min(next_position, capacity)` -- exactly the live window -- and each split
@@ -978,6 +992,40 @@ static void attention_decode_combine_body(
             params, tid, tgid, wbuf, qfbuf);                                   \
     }
 
+// Single-pass decode: one threadgroup per (query, kv head), the whole live KV
+// window in one threadgroup, normalised output written in place.
+//
+// This is `KAPLUMBA_FA_GQA` under a second name, deliberately. With `splits == 1`
+// the split kernel's key range is `[0, key_count)` -- the range this body scans --
+// and `attention_decode_combine` then reduces a single partial, so reusing the
+// body verbatim is what makes the two bit-identical rather than merely
+// mathematically equivalent. Reusing it is also why the epilogue is the
+// reciprocal multiply the prefill kernel has rather than the combine's division:
+// measured, the fp16 store absorbs the difference (see the `DIVIDE` note above).
+//
+// The cost of dropping the combine pass is `kv_heads` workgroups instead of
+// `splits * kv_heads`, i.e. the whole `splits` factor of parallelism. The saving
+// is one dispatch and one `splits * q_heads * (head_dim + 2)` float round trip
+// through the partials buffer. Which side wins is a measurement, not an
+// argument: see `ATTENTION_SINGLE_PASS_MAX_KEYS` in `attention.rs`.
+#define KAPLUMBA_FA_SINGLE(NAME, HEAD_DIM, NSG)                                \
+    kernel void NAME(                                                          \
+        const device half *queries [[buffer(0)]],                              \
+        const device half *keys [[buffer(1)]],                                 \
+        const device half *values [[buffer(2)]],                               \
+        const device uint *query_positions [[buffer(3)]],                      \
+        const device uint *key_positions [[buffer(4)]],                         \
+        device half *output [[buffer(5)]],                                     \
+        constant AttentionParams &params [[buffer(6)]],                        \
+        uint tid [[thread_position_in_threadgroup]],                           \
+        uint tgid [[threadgroup_position_in_grid]]) {                          \
+        threadgroup float wbuf[2 * (NSG) * 32];                                \
+        threadgroup float qfbuf[(NSG) * (HEAD_DIM)];                           \
+        attention_gqa_body<HEAD_DIM, NSG, false>(queries, keys, values,        \
+            query_positions, key_positions, output, (device float *)output,    \
+            params, tid, tgid, wbuf, qfbuf);                                   \
+    }
+
 // Decode: same body, one workgroup per (split, kv head), partial output. The
 // partial buffer takes the output slot's index because the kernel has no
 // normalised output to write.
@@ -1027,5 +1075,14 @@ KAPLUMBA_FA_DECODE(attention_decode_split_512_1, 512, 1)
 KAPLUMBA_FA_DECODE(attention_decode_split_512_2, 512, 2)
 KAPLUMBA_FA_DECODE(attention_decode_split_512_4, 512, 4)
 KAPLUMBA_FA_DECODE(attention_decode_split_512_8, 512, 8)
+// Single-pass decode. Only the two shapes the model uses are instantiated
+// (256/NSG=2 on the 50 sliding layers, 512/NSG=8 on the 10 full ones), because
+// the host only ever selects it for those: `decode_single_pass_max_keys` is
+// reached from `encode_online_attention_split`, which has already resolved
+// `gqa_index` and falls back to the prefill kernels for anything else. Adding
+// the other six would be six more pipeline compilations for dispatches nothing
+// can reach.
+KAPLUMBA_FA_SINGLE(attention_decode_single_256_2, 256, 2)
+KAPLUMBA_FA_SINGLE(attention_decode_single_512_8, 512, 8)
 KAPLUMBA_FA_COMBINE(attention_decode_combine_256, 256)
 KAPLUMBA_FA_COMBINE(attention_decode_combine_512, 512)

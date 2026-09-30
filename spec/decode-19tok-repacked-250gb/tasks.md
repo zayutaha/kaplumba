@@ -162,10 +162,17 @@
   - Intent: Merge post-attention residual add, pre-FFN RMS norm, and Hadamard gate input transform into a single dispatch per layer, eliminating 120 dispatches per token.
   - Estimated impact: ~2.0 ms. **REVISED BY MEASUREMENT: 120 dispatches x 3.5 us = ~0.42 ms, not 2.0 ms.** Note this one also removes a `scratch.proj`-width DRAM round trip (5376 fp16 x 2 = 10.5 KB per layer, 0.63 MB/token), which at 250 GB/s is ~2.5 us of *bandwidth*, so the dispatch saving dominates.
 
-- [ ] **T7.6.13: Attention Fast-Path Single Dispatch for Short Decode Context**
-  - Files: `crates/kernels/src/attention.rs`, `crates/engine/src/model.rs`
-  - Intent: When decode KV context length is < 64 (splits == 1), bypass split pipelines (`decode_split_pipelines` + `decode_combine`), dispatching single-pass attention directly.
-  - Estimated impact: ~1.5 ms reduction in step latency. **REVISED BY MEASUREMENT: 60 dispatches x 3.5 us = ~0.21 ms, not 1.5 ms — a 7x overestimate, and this line was the one T7.6.10's revision pass left un-revised.** This is the only remaining roadmap item not covered by the measured 3.5 us calibration, so verify the dispatch count with `MetalEncoder::dispatches_total` before building: if the fast path removes more or fewer than 60, the saving scales proportionally. `attention` is also the one non-GEMV kernel with real own time (2.31 ms of the 72.6 ms profile), so a saving *larger* than 0.21 ms is possible here in a way it is not for the other two — measure, do not assume.
+- [x] **T7.6.13: Attention Fast-Path Single Dispatch for Short Decode Context** — **built, measured, bit-exact, NOT enabled by default**
+  - Files: `crates/kernels/src/attention.metal`, `crates/kernels/src/attention.rs`, `crates/engine/tests/attention_single_pass_bit_exact.rs`. `model.rs`/`generate.rs` untouched: the arm lives inside the existing `encode_online_attention_split`.
+  - New kernel `attention_decode_single_{256_2,512_8}` (the two model shapes only), gated by `KAPLUMBA_DECODE_SINGLE_PASS`, **default off**.
+  - Intent was as written: bypass split+combine when the decode KV context is short enough that one threadgroup can hold the reduction.
+  - **MEASURED, and the roadmap's 1.5 ms estimate was wrong by ~15x.** Per-layer GPU-clocked own_ms, median of 9 interleaved samples after 3 warm-ups:
+    - Crossover is **64 keys**, exactly `ATTENTION_MIN_KEYS_PER_SPLIT` and therefore exactly where `decode_splits` already returns 1. Below it the two paths launch the *identical* grid and single-pass wins by only the combine dispatch: **1.059x** (sliding) / **1.034x** (full) at 64 keys, 1.14x / 1.10x at 16 keys.
+    - At 65 keys `decode_splits` returns 2 and single-pass is already **0.68x** (sliding) / **0.63x** (full) — it loses immediately and by a widening margin: 0.31x at 256, 0.19x at 512, **0.127x at the sliding layers' 1024-key cap**; 0.28x / 0.16x / **0.141x** for the full layers at 256 / 512 / 8192.
+    - End-to-end value: 60 dispatches x ~0.4 us = **~0.025 ms/token**, not 0.21 ms and nowhere near 1.5 ms. It applies only to the first 64 tokens of a conversation.
+  - **Bit-exact at `splits == 1`, and only there.** `to_bits()` identical on **294912/294912** fp16 elements across both shapes x 12 key counts. At `splits == 8` it is *not* bit-exact (6/49152 elements, worst 1 fp16 ULP) — the combine's cross-split rescale is a different association — so the gate is `key_count <= 64` and never anything wider.
+  - Left **off by default** because a 0.025 ms/token window that only covers the first 64 tokens is not worth changing the production decode path for. `KAPLUMBA_DECODE_SINGLE_PASS=1` enables it.
+  - **Negative result worth keeping:** the sliding window capping context at 1024 for 50 of 60 layers does *not* make single-pass viable at all times, which was the hypothesis to check. A bounded KV context bounds the *work*, not the *parallelism need* — and the parallelism need is set by `kv_heads` (16 and 4 workgroups), which is exactly the number of cores-scale units the split path multiplies.
 
 - [ ] **T8: End-to-end decode benchmark and acceptance validation**
   - Files: `spec/decode-19tok-repacked-250gb/implementation_notes.md`
