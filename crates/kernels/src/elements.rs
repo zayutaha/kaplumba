@@ -67,6 +67,26 @@ struct RopeParams {
     proportional: u32,
 }
 
+/// Params for `norm_rope_qkv`, which does Q/K weighted-norm + RoPE and V
+/// unweighted-norm in a single dispatch.
+///
+/// Field order and types mirror the Metal struct exactly; it is a
+/// `constant`-address-space `NormRopeQkvParams` and the two must agree byte for
+/// byte. There is no token field: this is the single-token decode form, and the
+/// one caller that could pass more (prefill) does not.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct NormRopeQkvParams {
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    offset: u32,
+    eps: f32,
+    theta: f32,
+    partial_factor: f32,
+    proportional: u32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ScalarParams {
@@ -175,6 +195,9 @@ pub struct ElementKernels {
     gelu_pipeline: ComputePipelineState,
     gated_gelu_pipeline: ComputePipelineState,
     rope_pipeline: ComputePipelineState,
+    /// Q/K norm+RoPE and V norm in one dispatch, replacing the five-dispatch
+    /// sequence. Decode only: it assumes one token, so `offset` is the position.
+    norm_rope_qkv_pipeline: ComputePipelineState,
     softcap_pipeline: ComputePipelineState,
     cache_append_pipeline: ComputePipelineState,
     embedding_buffer_pipeline: ComputePipelineState,
@@ -235,6 +258,15 @@ impl ElementKernels {
     }
     /// Threads per group for the threadgroup-per-row norms.
     const NORM_GROUP_THREADS: u64 = 256;
+    /// Largest `head_dim` `norm_rope_qkv` accepts.
+    ///
+    /// Bounded by the kernel's `threadgroup float normed_shared[512]`, which has
+    /// to hold a whole normalised head because the rotation reads the partner
+    /// column that a different lane wrote. 512 is the model's full-attention head
+    /// dim, so nothing in this model is excluded by the check; the bound exists so
+    /// a larger head fails loudly at the call instead of scribbling past the
+    /// threadgroup array.
+    const NORM_STAGING_MAX: usize = 512;
 
     pub fn new() -> Result<Self, KernelError> {
         let device = Device::system_default().ok_or(KernelError::DeviceUnavailable)?;
@@ -258,6 +290,7 @@ impl ElementKernels {
         let gelu_pipeline = pipeline(&device, &library, "gelu_tanh")?;
         let gated_gelu_pipeline = pipeline(&device, &library, "gated_gelu")?;
         let rope_pipeline = pipeline(&device, &library, "rope")?;
+        let norm_rope_qkv_pipeline = pipeline(&device, &library, "norm_rope_qkv")?;
         let softcap_pipeline = pipeline(&device, &library, "softcap")?;
         let cache_append_pipeline = pipeline(&device, &library, "cache_append")?;
         let embedding_buffer_pipeline = pipeline(&device, &library, "embedding_scaled_buffer")?;
@@ -283,6 +316,7 @@ impl ElementKernels {
             gelu_pipeline,
             gated_gelu_pipeline,
             rope_pipeline,
+            norm_rope_qkv_pipeline,
             softcap_pipeline,
             cache_append_pipeline,
             embedding_buffer_pipeline,
@@ -948,6 +982,89 @@ impl ElementKernels {
         )
     }
 
+    /// Encode the fused Q/K norm+RoPE and V norm, replacing
+    /// `encode_rms_norm` x2 + `encode_rms_norm_unweighted` + `encode_rope` x2.
+    ///
+    /// Bit-identical to that sequence, not merely close: the kernel reproduces
+    /// the fp16 rounding the separate norms write and the separate `rope` reads
+    /// back, and reduces the sum of squares in the same order. See the comment on
+    /// `norm_rope_qkv` in `elements.metal` -- the `float(half(...))` and the
+    /// strided accumulation are both load-bearing, and removing either makes the
+    /// output differ.
+    ///
+    /// `head_dim` is 256 on sliding layers and 512 on full-attention layers; both
+    /// are handled by the same kernel through its strided loops.
+    ///
+    /// Dispatch is one threadgroup per head, `NORM_GROUP_THREADS` wide. That is
+    /// a hard requirement, not a preference: the reduction tree inside is
+    /// wired to 256 lanes, and a different width would sum the head in a
+    /// different order and stop matching the reference norms.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_norm_rope_qkv(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        q: &Buffer,
+        k: &Buffer,
+        v: &Buffer,
+        q_weight: &Buffer,
+        k_weight: &Buffer,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        offset: usize,
+        theta: f32,
+        partial_factor: f32,
+        proportional: bool,
+        eps: f32,
+    ) -> Result<(), KernelError> {
+        if q_heads == 0
+            || kv_heads == 0
+            || head_dim == 0
+            || !head_dim.is_multiple_of(2)
+            || head_dim > Self::NORM_STAGING_MAX
+        {
+            return Err(KernelError::InvalidInput(format!(
+                "norm_rope_qkv needs non-zero head counts, an even head_dim, and \
+                 head_dim <= {} (the kernel's threadgroup staging array)",
+                Self::NORM_STAGING_MAX
+            )));
+        }
+        if !theta.is_finite() || theta <= 0.0 || !eps.is_finite() || eps <= 0.0 {
+            return Err(KernelError::InvalidInput(
+                "norm_rope_qkv theta and eps must be finite and positive".to_string(),
+            ));
+        }
+        if proportional
+            && (!partial_factor.is_finite() || partial_factor <= 0.0 || partial_factor > 1.0)
+        {
+            return Err(KernelError::InvalidInput(
+                "proportional RoPE factor must be in (0, 1]".to_string(),
+            ));
+        }
+        let params = NormRopeQkvParams {
+            q_heads: to_u32(q_heads, "norm_rope_qkv q head count")?,
+            kv_heads: to_u32(kv_heads, "norm_rope_qkv kv head count")?,
+            head_dim: to_u32(head_dim, "norm_rope_qkv head dimension")?,
+            offset: to_u32(offset, "norm_rope_qkv offset")?,
+            eps,
+            theta,
+            partial_factor,
+            proportional: u32::from(proportional),
+        };
+        // q_heads + 2 * kv_heads: one group per Q head, per K head and per V head.
+        // `checked_product`/`checked_add` are the overflow-reporting helpers the
+        // rest of this file uses for every other shape computation.
+        let kv_and_v = checked_product(kv_heads, 2, "norm_rope_qkv K and V head count")?;
+        let groups = checked_add(q_heads, kv_and_v, "norm_rope_qkv threadgroup count")?;
+        encoder.dispatch_groups(
+            &self.norm_rope_qkv_pipeline,
+            &[Some(q), Some(k), Some(v), Some(q_weight), Some(k_weight)],
+            params_bytes(&params),
+            groups as u64,
+            Self::NORM_GROUP_THREADS,
+        )
+    }
+
     pub fn encode_softcap(
         &self,
         encoder: &mut crate::encoder::MetalEncoder,
@@ -1263,6 +1380,11 @@ fn validate_norm(
 
 fn checked_product(left: usize, right: usize, name: &str) -> Result<usize, KernelError> {
     left.checked_mul(right)
+        .ok_or_else(|| KernelError::InvalidInput(format!("{name} overflows")))
+}
+
+fn checked_add(left: usize, right: usize, name: &str) -> Result<usize, KernelError> {
+    left.checked_add(right)
         .ok_or_else(|| KernelError::InvalidInput(format!("{name} overflows")))
 }
 

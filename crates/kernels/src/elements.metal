@@ -596,3 +596,171 @@ kernel void spin_burn(device float *out [[buffer(0)]],
     }
     out[tid] = acc;
 }
+
+// Q/K: weighted RMSNorm then RoPE. V: unweighted RMSNorm only, no RoPE.
+//
+// WHY FUSED, AND WHAT THE BIT-EXACTNESS DEPENDS ON
+// --------------------------------------------------
+// The unfused path is five dispatches per layer (3 norms + 2 ropes). They are
+// strictly elementwise and the fp16 buffer between them is a *rounding* step,
+// not information the next kernel needs, so they fuse -- PROVIDED the fused
+// kernel reproduces that rounding. It does, and it is the whole difficulty:
+//
+//   rms_norm_weighted_tg writes  half(input * inverse * weight)   <- fp16
+//   rope                         reads float(that half)            <- widened
+//
+// Carrying the normed value in an fp32 register across the rotation instead
+// skips the narrowing, and `half(lo*cos - hi*sin)` is not a function of
+// `half(half(a)*c - half(half(b))*s)` in general: the two differ by up to half
+// an fp16 ULP on almost every rotated element. So the normed value is rounded
+// to fp16 HERE (`normed_shared[i] = float(half(normed))`) before the rotation
+// reads it, which is the same value `rope` would have read back from DRAM.
+//
+// The reduction must also match. `rms_norm_weighted_tg` accumulates a strided
+// partial per lane and then a tree, so a single-value-per-lane kernel (which is
+// what a naive fusion writes) sums the head in a DIFFERENT ORDER and gets a
+// different `rsqrt`. The strided loop below is character-for-character the one
+// in `rms_norm_weighted_tg` / `rms_norm_unweighted_tg`, and the host dispatches
+// 256 threads per group, which is `NORM_GROUP_THREADS`, so every partial sum
+// and every tree step agrees. That is what makes this bit-identical rather than
+// merely close.
+//
+// The rotation is one thread per PAIR, never per column, for the reason
+// documented on `rope` (elements.metal:337): the partner column belongs to a
+// different thread, and a per-column mapping is a cross-warp race on an
+// in-place buffer. The staged values live in threadgroup memory and are fully
+// written before the barrier, so the rotation reads only the staging array and
+// writes only `target` -- no thread ever reads what another wrote.
+//
+// The non-rotated tail needs BOTH halves. A column is unrotated iff its pair is
+// `>= rotated_pairs`, and a pair spans columns `p` and `p + half_width`, so the
+// tail is pairs `rotated_pairs..half_width` in both halves. Copying only the low
+// half leaves the high half unwritten -- the bug the proportional path in `rope`
+// was written to avoid.
+
+struct NormRopeQkvParams {
+    uint q_heads;
+    uint kv_heads;
+    uint head_dim;
+    uint offset;
+    float eps;
+    float theta;
+    float partial_factor;
+    uint proportional;
+};
+
+// One threadgroup per head: `q_heads` groups for Q, `kv_heads` for K, and
+// `kv_heads` for V. Head dim is 256 on sliding layers and 512 on full-attention
+// layers, so the staging array is sized for 512 and both are handled by the
+// strided loops rather than by specialising the kernel twice.
+kernel void norm_rope_qkv(
+    device half *q [[buffer(0)]],
+    device half *k [[buffer(1)]],
+    device half *v [[buffer(2)]],
+    const device half *q_weight [[buffer(3)]],
+    const device half *k_weight [[buffer(4)]],
+    constant NormRopeQkvParams &params [[buffer(5)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint kv_span = params.q_heads + params.kv_heads;
+    if (tgid >= kv_span + params.kv_heads) {
+        return;
+    }
+    // `NORM_GROUP_THREADS`. The host must dispatch exactly this; the reduction
+    // tree below is hard-wired to it, exactly as `rms_norm_weighted_tg` is to
+    // the `tgdim` it is dispatched with.
+    threadgroup float partial[256];
+    // Both heads' normalized values, rounded to fp16, staged so the rotation
+    // reads a partner column it did not write. 512 floats = 2 KB, well inside
+    // the 32 KB threadgroup budget alongside `partial`.
+    threadgroup float normed_shared[512];
+
+    device half *target;
+    const device half *weight;
+    uint head_idx;
+    bool is_v;
+    if (tgid < params.q_heads) {
+        target = q;
+        weight = q_weight;
+        head_idx = tgid;
+        is_v = false;
+    } else if (tgid < kv_span) {
+        target = k;
+        weight = k_weight;
+        head_idx = tgid - params.q_heads;
+        is_v = false;
+    } else {
+        target = v;
+        // V is UNWEIGHTED, so `weight` is never read on this path. It is given a
+        // valid buffer rather than null anyway: a speculative load of a null
+        // device pointer is a fault, and "the compiler must not hoist this" is
+        // not a property to rely on.
+        weight = q_weight;
+        head_idx = tgid - kv_span;
+        is_v = true;
+    }
+
+    const uint count = params.head_dim;
+    const uint base = head_idx * count;
+
+    // Sum of squares, in the same order as `rms_norm_weighted_tg`.
+    float sum = 0.0f;
+    for (uint i = lid; i < count; i += tgdim) {
+        const float value = float(target[base + i]);
+        sum += value * value;
+    }
+    partial[lid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            partial[lid] += partial[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inverse = rsqrt(partial[0] / float(count) + params.eps);
+
+    if (is_v) {
+        // `rms_norm_unweighted_tg`: no weight, no RoPE, straight store.
+        for (uint i = lid; i < count; i += tgdim) {
+            target[base + i] = half(float(target[base + i]) * inverse);
+        }
+        return;
+    }
+
+    // Weighted norm, ROUNDED TO FP16 before the rotation reads it. The
+    // `float(half(...))` is load-bearing; see the note at the top of the kernel.
+    for (uint i = lid; i < count; i += tgdim) {
+        const float normed = float(target[base + i]) * inverse * float(weight[i]);
+        normed_shared[i] = float(half(normed));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint half_width = count / 2u;
+    // Same expression as `rope`, deliberately without the host-side
+    // `.min(half_width)`: `partial_factor <= 1` already bounds this by
+    // `half_width`, and matching the sibling kernel is what keeps the rotated
+    // span identical.
+    const uint rotated_pairs = params.proportional != 0u
+        ? uint(params.partial_factor * float(count) / 2.0f)
+        : half_width;
+
+    for (uint pair = lid; pair < rotated_pairs; pair += tgdim) {
+        const float exponent = 2.0f * float(pair) / float(count);
+        const float angle = float(params.offset) / pow(params.theta, exponent);
+        const float cosine = cos(angle);
+        const float sine = sin(angle);
+        const float lo = normed_shared[pair];
+        const float hi = normed_shared[pair + half_width];
+        target[base + pair] = half(lo * cosine - hi * sine);
+        target[base + pair + half_width] = half(hi * cosine + lo * sine);
+    }
+    // Non-rotated tail: both halves of every pair `rotated_pairs..half_width`.
+    // `half(float(half(x))) == half(x)`, so this is a verbatim copy of what the
+    // norm wrote, which is what `rope`'s copy branch does.
+    for (uint pair = rotated_pairs + lid; pair < half_width; pair += tgdim) {
+        target[base + pair] = half(normed_shared[pair]);
+        target[base + pair + half_width] = half(normed_shared[pair + half_width]);
+    }
+}
+

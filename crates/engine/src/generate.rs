@@ -927,7 +927,10 @@ where
             let t_wait_ms = t_wait_start.elapsed().as_secs_f64() * 1e3;
             let step_ms = step_started.elapsed().as_secs_f64() * 1e3;
             if std::env::var_os("KAPLUMBA_STEP_TRACE").is_some() {
-                eprintln!("STEP_TRACE: encode={:.2}ms wait={:.2}ms total={:.2}ms", t_encode_ms, t_wait_ms, step_ms);
+                eprintln!(
+                    "STEP_TRACE: encode={:.2}ms wait={:.2}ms total={:.2}ms",
+                    t_encode_ms, t_wait_ms, step_ms
+                );
             }
             crate::decode_profile::end_step(&mut encoder, step_ms).map_err(ModelError::from)?;
             decode_duration += Duration::from_secs_f64(step_ms / 1e3);

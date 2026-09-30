@@ -1389,18 +1389,33 @@ impl DecoderLayer {
             let packed_v = v_proj.metal_buffer.as_ref().ok_or_else(|| {
                 ModelError::InvalidWeights("v_proj has no GPU-resident weights".to_string())
             })?;
-            let q_out_signs = self.weights.q_proj.output_signs_buffer.as_ref().ok_or_else(|| {
-                ModelError::InvalidWeights("q_proj output signs are not resident".to_string())
-            })?;
-            let k_out_signs = self.weights.k_proj.output_signs_buffer.as_ref().ok_or_else(|| {
-                ModelError::InvalidWeights("k_proj output signs are not resident".to_string())
-            })?;
+            let q_out_signs = self
+                .weights
+                .q_proj
+                .output_signs_buffer
+                .as_ref()
+                .ok_or_else(|| {
+                    ModelError::InvalidWeights("q_proj output signs are not resident".to_string())
+                })?;
+            let k_out_signs = self
+                .weights
+                .k_proj
+                .output_signs_buffer
+                .as_ref()
+                .ok_or_else(|| {
+                    ModelError::InvalidWeights("k_proj output signs are not resident".to_string())
+                })?;
             let v_out_signs = v_proj.output_signs_buffer.as_ref().ok_or_else(|| {
                 ModelError::InvalidWeights("v_proj output signs are not resident".to_string())
             })?;
-            let input_signs = self.weights.q_proj.input_signs_buffer.as_ref().ok_or_else(|| {
-                ModelError::InvalidWeights("q_proj input signs are not resident".to_string())
-            })?;
+            let input_signs = self
+                .weights
+                .q_proj
+                .input_signs_buffer
+                .as_ref()
+                .ok_or_else(|| {
+                    ModelError::InvalidWeights("q_proj input signs are not resident".to_string())
+                })?;
             self.linear
                 .encode_gemv_fused3(
                     encoder,
@@ -1438,15 +1453,30 @@ impl DecoderLayer {
             let packed_k = self.weights.k_proj.metal_buffer.as_ref().ok_or_else(|| {
                 ModelError::InvalidWeights("k_proj has no GPU-resident weights".to_string())
             })?;
-            let q_out_signs = self.weights.q_proj.output_signs_buffer.as_ref().ok_or_else(|| {
-                ModelError::InvalidWeights("q_proj output signs are not resident".to_string())
-            })?;
-            let k_out_signs = self.weights.k_proj.output_signs_buffer.as_ref().ok_or_else(|| {
-                ModelError::InvalidWeights("k_proj output signs are not resident".to_string())
-            })?;
-            let input_signs = self.weights.q_proj.input_signs_buffer.as_ref().ok_or_else(|| {
-                ModelError::InvalidWeights("q_proj input signs are not resident".to_string())
-            })?;
+            let q_out_signs = self
+                .weights
+                .q_proj
+                .output_signs_buffer
+                .as_ref()
+                .ok_or_else(|| {
+                    ModelError::InvalidWeights("q_proj output signs are not resident".to_string())
+                })?;
+            let k_out_signs = self
+                .weights
+                .k_proj
+                .output_signs_buffer
+                .as_ref()
+                .ok_or_else(|| {
+                    ModelError::InvalidWeights("k_proj output signs are not resident".to_string())
+                })?;
+            let input_signs = self
+                .weights
+                .q_proj
+                .input_signs_buffer
+                .as_ref()
+                .ok_or_else(|| {
+                    ModelError::InvalidWeights("q_proj input signs are not resident".to_string())
+                })?;
             self.linear
                 .encode_gemv_fused2(
                     encoder,
@@ -1729,24 +1759,51 @@ impl DecoderLayer {
         timer.lap("pre_ffn_norm_transform");
 
         if decode && self.weights.gate_proj.permutation_mode == 1 {
-            let packed_gate = self.weights.gate_proj.metal_buffer.as_ref().ok_or_else(|| {
-                ModelError::InvalidWeights("gate_proj has no GPU-resident weights".to_string())
-            })?;
+            let packed_gate = self
+                .weights
+                .gate_proj
+                .metal_buffer
+                .as_ref()
+                .ok_or_else(|| {
+                    ModelError::InvalidWeights("gate_proj has no GPU-resident weights".to_string())
+                })?;
             let packed_up = self.weights.up_proj.metal_buffer.as_ref().ok_or_else(|| {
                 ModelError::InvalidWeights("up_proj has no GPU-resident weights".to_string())
             })?;
-            let gate_out_signs = self.weights.gate_proj.output_signs_buffer.as_ref().ok_or_else(|| {
-                ModelError::InvalidWeights("gate_proj output signs are not resident".to_string())
-            })?;
-            let up_out_signs = self.weights.up_proj.output_signs_buffer.as_ref().ok_or_else(|| {
-                ModelError::InvalidWeights("up_proj output signs are not resident".to_string())
-            })?;
-            let input_signs = self.weights.gate_proj.input_signs_buffer.as_ref().ok_or_else(|| {
-                ModelError::InvalidWeights("gate_proj input signs are not resident".to_string())
-            })?;
-            let down_input_signs = self.weights.down_proj.input_signs_buffer.as_ref().ok_or_else(|| {
-                ModelError::InvalidWeights("down_proj input signs are not resident".to_string())
-            })?;
+            let gate_out_signs = self
+                .weights
+                .gate_proj
+                .output_signs_buffer
+                .as_ref()
+                .ok_or_else(|| {
+                    ModelError::InvalidWeights(
+                        "gate_proj output signs are not resident".to_string(),
+                    )
+                })?;
+            let up_out_signs = self
+                .weights
+                .up_proj
+                .output_signs_buffer
+                .as_ref()
+                .ok_or_else(|| {
+                    ModelError::InvalidWeights("up_proj output signs are not resident".to_string())
+                })?;
+            let input_signs = self
+                .weights
+                .gate_proj
+                .input_signs_buffer
+                .as_ref()
+                .ok_or_else(|| {
+                    ModelError::InvalidWeights("gate_proj input signs are not resident".to_string())
+                })?;
+            let down_input_signs = self
+                .weights
+                .down_proj
+                .input_signs_buffer
+                .as_ref()
+                .ok_or_else(|| {
+                    ModelError::InvalidWeights("down_proj input signs are not resident".to_string())
+                })?;
             self.linear
                 .encode_gemv_fused2_mlp(
                     encoder,
