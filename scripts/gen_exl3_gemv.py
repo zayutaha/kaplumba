@@ -104,6 +104,190 @@ HEADER = '''// EXL3 decode matvec, shaped like the reference implementation.
 '''
 
 
+def two_word_is_safe(bits: int) -> tuple[bool, str]:
+    """Is the third ring word provably dead at this bit rate?
+
+    Derived, not configured, so the answer cannot drift from the arithmetic it
+    depends on. The kernel extracts, for each code ``i`` in ``0..8``::
+
+        r = i * KA + 16
+        s = (r <= 64) ? uint(A0 >> (64 - r)) : uint(B0 >> (96 - r))
+
+    and masks to 16 bits. So the A0 bits any code can touch are exactly
+    ``[64 - r_max, 63]`` where ``r_max = 7*KA + 16``, i.e. ``[48 - 7*KA, 63]``.
+
+    ``A0 = ((w0a << 32) | w0b) << sh | (w0c >> (32 - sh))``: the third word
+    ``w0c`` contributes **only** to A0 bits ``[0, sh)`` -- the low bits shifted
+    down from its top. Every bit at or above ``sh`` comes from the first two
+    words. So ``w0c`` is dead when the lowest *used* bit is at or above the
+    largest ``sh`` that occurs.
+
+    Two ways it can fail, both checked:
+      * ``r_max > 64`` -- the ``B0`` branch is taken, and ``B0`` is built from
+        ``w0b``/``w0c``, so the third word is genuinely read.
+      * ``48 - 7*KA < max(sh)`` -- some lane needs a bit below its own ``sh``,
+        so it reads into ``w0c``.
+
+    ``sh`` ranges over lanes because ``lo0 = (lane*8 + 1)*KA + RING - 16`` and
+    ``sh = lo0 % 32``; with 32 lanes the set is enumerated, not bounded.
+
+    Returns ``(safe, why)`` so a failure says which of the two conditions broke.
+    """
+    ring = 256 * bits
+    r_max = 7 * bits + 16
+    used_lo = 48 - 7 * bits
+    sh_max = max(((lane * 8 + 1) * bits + ring - 16) % 32 for lane in range(32))
+    if r_max > 64:
+        return False, f"r_max={r_max} > 64, so the B0 path reads w0c"
+    if used_lo < sh_max:
+        return False, f"lowest used A0 bit {used_lo} < max sh {sh_max}, so some lane reads w0c"
+    return True, f"used [{used_lo},63] >= max sh {sh_max}, and r_max={r_max} <= 64"
+
+
+#: Rates at which a 2-word window is provably equivalent to the 3-word one.
+#: Computed by `two_word_is_safe` rather than listed, so adding a rate to the
+#: kernel cannot outrun the proof. 3 bpw is 410 of this checkpoint's 411 tensors;
+#: 6 bpw (`lm_head`) is not in the set, which is why the family stops at 4.
+TWO_WORD_SAFE_RATES: tuple[int, ...] = tuple(
+    bits for bits in range(1, 9) if two_word_is_safe(bits)[0]
+)
+
+
+def ishizuki_two_word_kernel(preamble: str, bits: int) -> str:
+    """The `linear_gemv_ishizuki_kN_w2` kernel for one bit rate.
+
+    A *transformation* of the verbatim ishizuki source, not a re-derivation:
+    the variant is the original with the third word's contribution deleted. That
+    matters more than it sounds, because the original is transcribed from
+    ishizuki's Swift and re-deriving it here would create a second copy of the
+    window arithmetic to keep in step -- and a variant that differs from the
+    original in some *other* way would make the A/B unattributable.
+
+    The transformation is exactly three edits, and each is asserted:
+
+    1. drop ``w?c`` from the three-word load, leaving two;
+    2. drop the ``| (sh ? (w?c >> (32 - sh)) : 0)`` term from ``A?``;
+    3. drop the now-dead ``B?`` local, since with ``r_max <= 64`` no code reads
+       it and a live-looking unused local invites someone to "fix" the B0 path
+       back in.
+
+    Every other line -- the unroll, the reduction, the ``r0`` index arithmetic,
+    the threadgroup reduction -- is untouched, because those are what make the
+    output bit-exact and they are not what is being measured.
+    """
+    name = f"linear_gemv_ishizuki_k{bits}"
+    match = re.search(
+        rf"^kernel void {re.escape(name)}\((?![\w])", preamble, re.M
+    )
+    if not match:
+        raise SystemExit(f"{name} not found in the preamble; cannot emit its _w2 variant")
+    # Slice from the START of the declaration line, not from the line after it.
+    # The parameters are part of the text the substitutions below expect to find
+    # around (`const ulong ...` sits between them and the body), and the name
+    # replacement at the end rewrites `kernel void NAME(` in place -- so a slice
+    # that began after the declaration line would emit a parameter list with no
+    # `kernel void` in front of it, which the file's kernel count would not show
+    # as a new kernel at all.
+    nxt = re.search(r"^kernel void ", preamble[match.end() :], re.M)
+    assert nxt, f"no kernel after {name}"
+    body = preamble[match.start() : match.end() + nxt.start()]
+
+    # 1 + 2: the two-word load and the A0 without the third word's contribution.
+    # Both the unrolled (`w0a`/`A0`, `w1a`/`A1`) and tail (`a0`/`A0`) loops use
+    # different variable names for the same thing, so each form is matched and
+    # the count asserted rather than assumed.
+    edits: list[tuple[str, str, int]] = [
+        # Unrolled first tile: `const ulong w0a = t0[j0], w0b = t0[j1], w0c = t0[j2];`
+        (
+            r"const ulong w(\d)a = t(\d)\[j0\], w\1b = t\2\[j1\], w\1c = t\2\[j2\];",
+            r"const ulong w\1a = t\2[j0], w\1b = t\2[j1];",
+            2,
+        ),
+        # Tail loop: `const ulong a0 = t0[j0], a1 = t0[j1], a2 = t0[j2];`
+        # The digit captured is the tile index, and the three locals are `a0`,
+        # `a1`, `a2` regardless of it -- so the substitution indices differ, which
+        # is why this cannot share a pattern with the unrolled form above.
+        (
+            r"const ulong a0 = t(\d)\[j0\], a1 = t\1\[j1\], a2 = t\1\[j2\];",
+            r"const ulong a0 = t\1[j0], a1 = t\1[j1];",
+            1,
+        ),
+        # A0/A1 lose the `w0c` term; the tail A0 loses the `a2` term.
+        (
+            r"const ulong (A\d) = \(\(w(\d)a << 32\) \| w\2b\) << sh0 \| "
+            r"\(sh0 \? \(w\2c >> \(32 - sh0\)\) : 0ul\);",
+            r"const ulong \1 = ((w\2a << 32) | w\2b) << sh0;",
+            2,
+        ),
+        (
+            r"const ulong (A0) = \(\(a0 << 32\) \| a1\) << sh0 \| "
+            r"\(sh0 \? \(a2 >> \(32 - sh0\)\) : 0ul\);",
+            r"const ulong \1 = ((a0 << 32) | a1) << sh0;",
+            1,
+        ),
+    ]
+    for pattern, replacement, expected in edits:
+        body, n = re.subn(pattern, replacement, body)
+        assert n == expected, (
+            f"{name}: expected {expected} matches of {pattern!r}, got {n}. The "
+            "verbatim ishizuki source was reformatted or hand-edited, and "
+            "emitting a half-transformed kernel would silently change the "
+            "arithmetic. Do not relax this."
+        )
+    # 3: the `r <= 64u ? A0 : B0` selection. At every rate in
+    # `TWO_WORD_SAFE_RATES`, `r_max = 7*KA + 16 <= 64`, so the `B0` arm is
+    # unreachable -- and with the third load gone there is nothing to select
+    # from. The whole ternary goes, rather than keeping a dead local: leaving
+    # `B0` in place while deleting its only source is a compile error, and
+    # keeping the ternary would keep a branch the derivation says is dead.
+    #
+    # This is also why the derivation and the code cannot drift: if a future rate
+    # made the `B0` arm reachable, `two_word_is_safe` would refuse to emit the
+    # variant, so the substitution below never sees a kernel whose `B0` is live.
+    body, n = re.subn(
+        r"[ \t]*const ulong B\d = \(\(w(\d)b << 32\) \| w\1c\) << sh0;\n", "", body
+    )
+    assert n == 2, f"{name}: expected 2 unrolled dead B locals, removed {n}"
+    body, n = re.subn(
+        r"[ \t]*const ulong B0 = \(\(a1 << 32\) \| a2\) << sh0;\n", "", body
+    )
+    assert n == 1, f"{name}: expected 1 tail dead B local, removed {n}"
+    # The extraction: `(r <= 64u) ? uint(A0 >> (64u - r)) : uint(B0 >> (96u - r))`
+    # collapses to the first arm. Matched on the whole ternary -- including the
+    # `B0`/`B1` reference -- so a reformat that leaves the dead arm in place is a
+    # failed assert rather than a silently still-dead-but-present branch.
+    body, n = re.subn(
+        r"\(r <= 64u\) \? uint\((A\d) >> \(64u - r\)\) : uint\((?:A|B)\d >> \(96u - r\)\)",
+        r"uint(\1 >> (64u - r))",
+        body,
+    )
+    assert n == 3, (
+        f"{name}: expected 3 extraction ternaries to collapse, got {n}. If the "
+        "extraction was reformatted, the dead B0 arm is still in the emitted "
+        "kernel and the variant is not the two-word kernel it claims to be."
+    )
+
+    kernel = (
+        body.replace(
+            f"kernel void {name}(",
+            f"kernel void {name}_w2(\n"
+            "    // TWO-WORD WINDOW VARIANT of the verbatim ishizuki kernel above.\n"
+            "    //\n"
+            "    // Identical output, one fewer load per lane per tile: the third\n"
+            "    // ring word is provably never read at this bit rate. See\n"
+            "    // `two_word_is_safe` in scripts/gen_exl3_gemv.py for the derivation\n"
+            "    // and the two conditions that would invalidate it.\n"
+            "    //\n"
+            "    // This is a VARIANT for A/B and for the golden reference. The\n"
+            "    // engine dispatches the unsuffixed kernel unless the measurement\n"
+            "    // says otherwise; see spec/decode-bandwidth-240gb/tasks.md T6.\n",
+            1,
+        )
+        .strip()
+    )
+    return kernel
+
+
 def main() -> None:
     src = PATH.read_text()
     start = src.index(BANNER)
@@ -205,13 +389,30 @@ def main() -> None:
         r"[ \t]*acc\[q\]\[1\] \+= x0 \* v\[q\]\[4\].*?\n"
         r"[ \t]*\}"
     )
-    tmpl, n_acc = unstable_acc.subn(stable_acc, tmpl)
+    # Also match the *stable* form, so the normalisation is idempotent: the
+    # template is sliced back out of this file's own output, so on the second run
+    # it already carries the stable chain and the unstable pattern matches
+    # nothing. Matching only the unstable form made the generator non-idempotent
+    # and the count assert fire on run 2 -- correctly, since a generator that
+    # cannot run twice is a generator whose output nobody can verify. The assert
+    # below then covers both: exactly one accumulator loop must be present in
+    # whichever form, and it is re-emitted as the stable one.
+    stable_acc_re = re.compile(
+        r"[ \t]*#pragma unroll\n"
+        r"[ \t]*for \(uint q = 0u; q < NR0; \+\+q\) \{\n"
+        r"[ \t]*acc\[q\]\[0\] = fma\(x3.*?\n"
+        r"[ \t]*acc\[q\]\[1\] = fma\(x3.*?\n"
+        r"[ \t]*\}"
+    )
+    tmpl, n_unstable = unstable_acc.subn(stable_acc, tmpl)
+    tmpl, n_stable = stable_acc_re.subn(stable_acc, tmpl)
+    n_acc = n_unstable + n_stable
     assert n_acc == 1, (
-        f"expected exactly one NR0 accumulator loop in the template, got {n_acc}. "
-        "Either the loop was reindented or reformatted, or it was already "
-        "replaced -- in which case the stable form is present and this assert is "
-        "stale. Do not relax it: emitting the unstable form silently is how a "
-        "1-ulp decode difference gets shipped."
+        f"expected exactly one NR0 accumulator loop in the template, got {n_acc} "
+        f"({n_unstable} unstable, {n_stable} stable). Either the loop was "
+        "reindented or reformatted, or there is more than one. Do not relax "
+        "this: emitting the unstable form silently is how a 1-ulp decode "
+        "difference gets shipped."
     )
     # Normalise BOTH the generic and the already-specialised decode call into a
     # single placeholder, so a second run of this script derives the same template
@@ -312,6 +513,11 @@ def main() -> None:
                 .replace("DECODE", "exl3_decode8_mcg")
                 .replace("<true>", "<true>")
             )
+    # The ishizuki 2-word family. See `TWO_WORD_SAFE_RATES` for the derivation and
+    # `ishizuki_two_word_kernel` for the transformation; both are the only places
+    # that know the rule, and a test asserts the generated set matches.
+    for bits in TWO_WORD_SAFE_RATES:
+        out.append(ishizuki_two_word_kernel(preamble, bits))
     # Each generated kernel carries a trailing newline, so joining with "\n"
     # inserts a blank line between kernels and, because the template is sliced
     # back out of this block, one MORE blank line is appended on every run. The
@@ -322,8 +528,16 @@ def main() -> None:
     )
     print(
         f"generated {len(out) - 1} kernels in {PATH} "
-        f"({32} base + {8 * (len(NR0_VALUES) - 1)} NR0 variants)"
+        f"({32} base + {8 * (len(NR0_VALUES) - 1)} NR0 variants"
+        + (
+            f" + {len(TWO_WORD_SAFE_RATES)} ishizuki 2-word"
+            if TWO_WORD_SAFE_RATES
+            else ""
+        )
+        + ")"
     )
+    for bits in TWO_WORD_SAFE_RATES:
+        print(f"  ishizuki 2-word at {bits} bpw: {two_word_is_safe(bits)[1]}")
 
 
 if __name__ == "__main__":

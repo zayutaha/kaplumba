@@ -7362,6 +7362,490 @@ kernel void linear_gemv_exl3_k8_mcg_r8(
         output[out_base + lid] = s;
     }
 }
+
+
+kernel void linear_gemv_ishizuki_k1_w2(
+    // TWO-WORD WINDOW VARIANT of the verbatim ishizuki kernel above.
+    //
+    // Identical output, one fewer load per lane per tile: the third
+    // ring word is provably never read at this bit rate. See
+    // `two_word_is_safe` in scripts/gen_exl3_gemv.py for the derivation
+    // and the two conditions that would invalidate it.
+    //
+    // This is a VARIANT for A/B and for the golden reference. The
+    // engine dispatches the unsuffixed kernel unless the measurement
+    // says otherwise; see spec/decode-bandwidth-240gb/tasks.md T6.
+
+    const device ushort *packed [[buffer(0)]],
+    const device half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant const uint *shape [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    constexpr uint KA = 1u;
+    constexpr int CB = 1;
+    constexpr uint RING = 256u * KA;
+    constexpr uint WORDS = RING / 32u;
+    const uint K = shape[0];
+    const uint N = shape[1];
+    const uint tiles_n = N / 16u;
+    const uint tiles_k = K / 16u;
+    constexpr int SG = 8;
+    threadgroup float red[SG][16];
+    const uint r0 = (lane % 4u) * 2u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    // j0/j1/j2 and sh depend only on the lane, not on the tile index, so they
+    // hoist out of the tile loop. Unrolling by two then keeps six weight words
+    // in flight per lane, which is worth ~27% on the full layer.
+    for (uint tn = tgid; tn < tiles_n; tn += ntg) {
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint lo0 = (lane * 8u + 1u) * 1u + RING - 16u;
+    const uint sh0 = lo0 % 32u;
+    const uint hi0 = lo0 / 32u;
+    const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
+    const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
+    const uint j2 = j1 + 1u >= WORDS ? j1 + 1u - WORDS : j1 + 1u;
+    const device uint *column = (const device uint *)packed + tn * WORDS;
+    const uint stride = tiles_n * WORDS;
+    uint tk = sg;
+    for (; tk + SG < tiles_k; tk += 2u * SG) {
+        float v[8];
+        const device uint *t0 = column + (tk + 0 * SG) * stride;
+        const ulong w0a = t0[j0], w0b = t0[j1];
+        const ulong A0 = ((w0a << 32) | w0b) << sh0;
+        const device half *xr0 = x + (tk + 0 * SG) * 16u + r0;
+        const float p00 = float(xr0[0]), p01 = float(xr0[1]);
+        const float p02 = float(xr0[8]), p03 = float(xr0[9]);
+        const device uint *t1 = column + (tk + 1 * SG) * stride;
+        const ulong w1a = t1[j0], w1b = t1[j1];
+        const ulong A1 = ((w1a << 32) | w1b) << sh0;
+        const device half *xr1 = x + (tk + 1 * SG) * 16u + r0;
+        const float p10 = float(xr1[0]), p11 = float(xr1[1]);
+        const float p12 = float(xr1[8]), p13 = float(xr1[9]);
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = uint(A0 >> (64u - r));
+            v[i] = decode_state(s & 0xffffu, CB);
+        }
+        acc0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+        acc1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = uint(A1 >> (64u - r));
+            v[i] = decode_state(s & 0xffffu, CB);
+        }
+        acc0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+        acc1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+    }
+
+    for (; tk < tiles_k; tk += SG) {
+        const device uint *t0 = column + tk * stride;
+        const ulong a0 = t0[j0], a1 = t0[j1];
+        const ulong A0 = ((a0 << 32) | a1) << sh0;
+        const device half *xr0 = x + tk * 16u + r0;
+        const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
+        float v[8];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = uint(A0 >> (64u - r));
+            v[i] = decode_state(s & 0xffffu, CB);
+        }
+        acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
+        acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float sum = 0.0f;
+        for (int g = 0; g < SG; ++g) {
+            sum += red[g][lid];
+        }
+        y[tn * 16u + lid] = sum;
+    }
+        // `red` is reused by the next output tile, so it must be drained first.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+
+kernel void linear_gemv_ishizuki_k2_w2(
+    // TWO-WORD WINDOW VARIANT of the verbatim ishizuki kernel above.
+    //
+    // Identical output, one fewer load per lane per tile: the third
+    // ring word is provably never read at this bit rate. See
+    // `two_word_is_safe` in scripts/gen_exl3_gemv.py for the derivation
+    // and the two conditions that would invalidate it.
+    //
+    // This is a VARIANT for A/B and for the golden reference. The
+    // engine dispatches the unsuffixed kernel unless the measurement
+    // says otherwise; see spec/decode-bandwidth-240gb/tasks.md T6.
+
+    const device ushort *packed [[buffer(0)]],
+    const device half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant const uint *shape [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    constexpr uint KA = 2u;
+    constexpr int CB = 1;
+    constexpr uint RING = 256u * KA;
+    constexpr uint WORDS = RING / 32u;
+    const uint K = shape[0];
+    const uint N = shape[1];
+    const uint tiles_n = N / 16u;
+    const uint tiles_k = K / 16u;
+    constexpr int SG = 8;
+    threadgroup float red[SG][16];
+    const uint r0 = (lane % 4u) * 2u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    // j0/j1/j2 and sh depend only on the lane, not on the tile index, so they
+    // hoist out of the tile loop. Unrolling by two then keeps six weight words
+    // in flight per lane, which is worth ~27% on the full layer.
+    for (uint tn = tgid; tn < tiles_n; tn += ntg) {
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint lo0 = (lane * 8u + 1u) * 2u + RING - 16u;
+    const uint sh0 = lo0 % 32u;
+    const uint hi0 = lo0 / 32u;
+    const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
+    const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
+    const uint j2 = j1 + 1u >= WORDS ? j1 + 1u - WORDS : j1 + 1u;
+    const device uint *column = (const device uint *)packed + tn * WORDS;
+    const uint stride = tiles_n * WORDS;
+    uint tk = sg;
+    for (; tk + SG < tiles_k; tk += 2u * SG) {
+        float v[8];
+        const device uint *t0 = column + (tk + 0 * SG) * stride;
+        const ulong w0a = t0[j0], w0b = t0[j1];
+        const ulong A0 = ((w0a << 32) | w0b) << sh0;
+        const device half *xr0 = x + (tk + 0 * SG) * 16u + r0;
+        const float p00 = float(xr0[0]), p01 = float(xr0[1]);
+        const float p02 = float(xr0[8]), p03 = float(xr0[9]);
+        const device uint *t1 = column + (tk + 1 * SG) * stride;
+        const ulong w1a = t1[j0], w1b = t1[j1];
+        const ulong A1 = ((w1a << 32) | w1b) << sh0;
+        const device half *xr1 = x + (tk + 1 * SG) * 16u + r0;
+        const float p10 = float(xr1[0]), p11 = float(xr1[1]);
+        const float p12 = float(xr1[8]), p13 = float(xr1[9]);
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = uint(A0 >> (64u - r));
+            v[i] = decode_state(s & 0xffffu, CB);
+        }
+        acc0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+        acc1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = uint(A1 >> (64u - r));
+            v[i] = decode_state(s & 0xffffu, CB);
+        }
+        acc0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+        acc1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+    }
+
+    for (; tk < tiles_k; tk += SG) {
+        const device uint *t0 = column + tk * stride;
+        const ulong a0 = t0[j0], a1 = t0[j1];
+        const ulong A0 = ((a0 << 32) | a1) << sh0;
+        const device half *xr0 = x + tk * 16u + r0;
+        const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
+        float v[8];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = uint(A0 >> (64u - r));
+            v[i] = decode_state(s & 0xffffu, CB);
+        }
+        acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
+        acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float sum = 0.0f;
+        for (int g = 0; g < SG; ++g) {
+            sum += red[g][lid];
+        }
+        y[tn * 16u + lid] = sum;
+    }
+        // `red` is reused by the next output tile, so it must be drained first.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+
+kernel void linear_gemv_ishizuki_k3_w2(
+    // TWO-WORD WINDOW VARIANT of the verbatim ishizuki kernel above.
+    //
+    // Identical output, one fewer load per lane per tile: the third
+    // ring word is provably never read at this bit rate. See
+    // `two_word_is_safe` in scripts/gen_exl3_gemv.py for the derivation
+    // and the two conditions that would invalidate it.
+    //
+    // This is a VARIANT for A/B and for the golden reference. The
+    // engine dispatches the unsuffixed kernel unless the measurement
+    // says otherwise; see spec/decode-bandwidth-240gb/tasks.md T6.
+
+    const device ushort *packed [[buffer(0)]],
+    const device half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant const uint *shape [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    constexpr uint KA = 3u;
+    constexpr int CB = 1;
+    constexpr uint RING = 256u * KA;
+    constexpr uint WORDS = RING / 32u;
+    const uint K = shape[0];
+    const uint N = shape[1];
+    const uint tiles_n = N / 16u;
+    const uint tiles_k = K / 16u;
+    constexpr int SG = 8;
+    threadgroup float red[SG][16];
+    const uint r0 = (lane % 4u) * 2u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    // j0/j1/j2 and sh depend only on the lane, not on the tile index, so they
+    // hoist out of the tile loop. Unrolling by two then keeps six weight words
+    // in flight per lane, which is worth ~27% on the full layer.
+    for (uint tn = tgid; tn < tiles_n; tn += ntg) {
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint lo0 = (lane * 8u + 1u) * 3u + RING - 16u;
+    const uint sh0 = lo0 % 32u;
+    const uint hi0 = lo0 / 32u;
+    const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
+    const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
+    const uint j2 = j1 + 1u >= WORDS ? j1 + 1u - WORDS : j1 + 1u;
+    const device uint *column = (const device uint *)packed + tn * WORDS;
+    const uint stride = tiles_n * WORDS;
+    uint tk = sg;
+    for (; tk + SG < tiles_k; tk += 2u * SG) {
+        float v[8];
+        const device uint *t0 = column + (tk + 0 * SG) * stride;
+        const ulong w0a = t0[j0], w0b = t0[j1];
+        const ulong A0 = ((w0a << 32) | w0b) << sh0;
+        const device half *xr0 = x + (tk + 0 * SG) * 16u + r0;
+        const float p00 = float(xr0[0]), p01 = float(xr0[1]);
+        const float p02 = float(xr0[8]), p03 = float(xr0[9]);
+        const device uint *t1 = column + (tk + 1 * SG) * stride;
+        const ulong w1a = t1[j0], w1b = t1[j1];
+        const ulong A1 = ((w1a << 32) | w1b) << sh0;
+        const device half *xr1 = x + (tk + 1 * SG) * 16u + r0;
+        const float p10 = float(xr1[0]), p11 = float(xr1[1]);
+        const float p12 = float(xr1[8]), p13 = float(xr1[9]);
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = uint(A0 >> (64u - r));
+            v[i] = decode_state(s & 0xffffu, CB);
+        }
+        acc0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+        acc1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = uint(A1 >> (64u - r));
+            v[i] = decode_state(s & 0xffffu, CB);
+        }
+        acc0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+        acc1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+    }
+
+    for (; tk < tiles_k; tk += SG) {
+        const device uint *t0 = column + tk * stride;
+        const ulong a0 = t0[j0], a1 = t0[j1];
+        const ulong A0 = ((a0 << 32) | a1) << sh0;
+        const device half *xr0 = x + tk * 16u + r0;
+        const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
+        float v[8];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = uint(A0 >> (64u - r));
+            v[i] = decode_state(s & 0xffffu, CB);
+        }
+        acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
+        acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float sum = 0.0f;
+        for (int g = 0; g < SG; ++g) {
+            sum += red[g][lid];
+        }
+        y[tn * 16u + lid] = sum;
+    }
+        // `red` is reused by the next output tile, so it must be drained first.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+
+kernel void linear_gemv_ishizuki_k4_w2(
+    // TWO-WORD WINDOW VARIANT of the verbatim ishizuki kernel above.
+    //
+    // Identical output, one fewer load per lane per tile: the third
+    // ring word is provably never read at this bit rate. See
+    // `two_word_is_safe` in scripts/gen_exl3_gemv.py for the derivation
+    // and the two conditions that would invalidate it.
+    //
+    // This is a VARIANT for A/B and for the golden reference. The
+    // engine dispatches the unsuffixed kernel unless the measurement
+    // says otherwise; see spec/decode-bandwidth-240gb/tasks.md T6.
+
+    const device ushort *packed [[buffer(0)]],
+    const device half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant const uint *shape [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    constexpr uint KA = 4u;
+    constexpr int CB = 1;
+    constexpr uint RING = 256u * KA;
+    constexpr uint WORDS = RING / 32u;
+    const uint K = shape[0];
+    const uint N = shape[1];
+    const uint tiles_n = N / 16u;
+    const uint tiles_k = K / 16u;
+    constexpr int SG = 8;
+    threadgroup float red[SG][16];
+    const uint r0 = (lane % 4u) * 2u;
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+
+    // j0/j1/j2 and sh depend only on the lane, not on the tile index, so they
+    // hoist out of the tile loop. Unrolling by two then keeps six weight words
+    // in flight per lane, which is worth ~27% on the full layer.
+    for (uint tn = tgid; tn < tiles_n; tn += ntg) {
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const uint lo0 = (lane * 8u + 1u) * 4u + RING - 16u;
+    const uint sh0 = lo0 % 32u;
+    const uint hi0 = lo0 / 32u;
+    const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
+    const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
+    const uint j2 = j1 + 1u >= WORDS ? j1 + 1u - WORDS : j1 + 1u;
+    const device uint *column = (const device uint *)packed + tn * WORDS;
+    const uint stride = tiles_n * WORDS;
+    uint tk = sg;
+    for (; tk + SG < tiles_k; tk += 2u * SG) {
+        float v[8];
+        const device uint *t0 = column + (tk + 0 * SG) * stride;
+        const ulong w0a = t0[j0], w0b = t0[j1];
+        const ulong A0 = ((w0a << 32) | w0b) << sh0;
+        const device half *xr0 = x + (tk + 0 * SG) * 16u + r0;
+        const float p00 = float(xr0[0]), p01 = float(xr0[1]);
+        const float p02 = float(xr0[8]), p03 = float(xr0[9]);
+        const device uint *t1 = column + (tk + 1 * SG) * stride;
+        const ulong w1a = t1[j0], w1b = t1[j1];
+        const ulong A1 = ((w1a << 32) | w1b) << sh0;
+        const device half *xr1 = x + (tk + 1 * SG) * 16u + r0;
+        const float p10 = float(xr1[0]), p11 = float(xr1[1]);
+        const float p12 = float(xr1[8]), p13 = float(xr1[9]);
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = uint(A0 >> (64u - r));
+            v[i] = decode_state(s & 0xffffu, CB);
+        }
+        acc0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+        acc1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = uint(A1 >> (64u - r));
+            v[i] = decode_state(s & 0xffffu, CB);
+        }
+        acc0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+        acc1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+    }
+
+    for (; tk < tiles_k; tk += SG) {
+        const device uint *t0 = column + tk * stride;
+        const ulong a0 = t0[j0], a1 = t0[j1];
+        const ulong A0 = ((a0 << 32) | a1) << sh0;
+        const device half *xr0 = x + tk * 16u + r0;
+        const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
+        float v[8];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint r = i * KA + 16u;
+            const uint s = uint(A0 >> (64u - r));
+            v[i] = decode_state(s & 0xffffu, CB);
+        }
+        acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
+        acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
+    }
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float sum = 0.0f;
+        for (int g = 0; g < SG; ++g) {
+            sum += red[g][lid];
+        }
+        y[tn * 16u + lid] = sum;
+    }
+        // `red` is reused by the next output tile, so it must be drained first.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
 kernel void linear_gemv(
     const device ushort *packed [[buffer(0)]],
     const device half *input [[buffer(1)]],
