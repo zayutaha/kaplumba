@@ -317,7 +317,7 @@ where
             limit: config.context_limit,
         })?;
         let decode_started = Instant::now();
-        logits = model.forward_buffer(&[token], &[position])?;
+        model.forward_buffer_into_vec(&[token], &[position], &mut logits)?;
         let step_ms = decode_started.elapsed().as_secs_f64() * 1e3;
         if std::env::var_os("KAPLUMBA_STEP_TRACE").is_some() {
             eprintln!("GPU_STEP_TRACE: forward_buffer={:.2}ms", step_ms);
@@ -415,10 +415,11 @@ pub fn run_benchmark(
 
 fn argmax_logits(logits: &[u16]) -> u32 {
     let mut best = 0;
+    let mut best_val = half::f16::from_bits(logits[0]).to_f32();
     for index in 1..logits.len() {
-        if half::f16::from_bits(logits[index]).to_f32()
-            > half::f16::from_bits(logits[best]).to_f32()
-        {
+        let val = half::f16::from_bits(logits[index]).to_f32();
+        if val > best_val {
+            best_val = val;
             best = index;
         }
     }

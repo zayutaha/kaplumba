@@ -484,6 +484,9 @@ impl<'q> MetalEncoder<'q> {
     /// also applies back-pressure in submission order, and taking the buffers
     /// out of the vector means a panic mid-drain cannot drop the tail.
     pub fn flush_and_wait(&mut self) -> Result<(), KernelError> {
+        if self.dispatches == 0 && self.in_flight.is_empty() {
+            return Ok(());
+        }
         self.end();
         self.command_buffer.commit();
         for buffer in std::mem::take(&mut self.in_flight) {

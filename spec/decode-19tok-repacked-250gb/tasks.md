@@ -95,8 +95,14 @@
   - Intent: Merge `down_proj` input transform into `gate_up_gelu` output, eliminating `scratch.activated` DRAM writes and 60 dispatches. Fuse Q, K, V finalize into single-dispatch `linear_finalize_simd3`.
   - Result: 100% bit-exact greedy decode verified. Total kernel time down to 70.7 ms/step.
 
+- [x] **T7.6.8: Host pipeline & decode warmup optimization (eliminate 1.27s JIT stall and empty buffer flush)**
+  - Files: `crates/kernels/src/encoder.rs`, `crates/engine/src/model.rs`, `crates/engine/src/generate.rs`, `crates/engine/src/exl3.rs`
+  - Intent: Eliminate the 1.27s Metal JIT shader compilation penalty on the first decode step via `warmup_decode` at model load. Skip empty command buffer commits in `flush_and_wait`. Optimize `argmax_logits` comparison loop and reuse `logits` vector in-place via `forward_buffer_into_vec`. Fix shift overflow in `pack_integer_windows`.
+  - Result: Step 0 dropped from 1,277 ms to 69.9 ms. Decode throughput boosted from 12.39 tok/s to 14.04 tok/s. TTFT dropped from 3.23s to 1.23s. 100% bit-exact golden output verified.
+
 - [ ] **T8: End-to-end decode benchmark and acceptance validation**
   - Files: `spec/decode-19tok-repacked-250gb/implementation_notes.md`
   - Intent: Measure end-to-end tok/s using `scripts/gpuq run` across reference prompts.
   - Acceptance: Pure autoregressive decode throughput characterization against physical 250+ GB/s ceiling.
+
 

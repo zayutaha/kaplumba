@@ -2845,7 +2845,14 @@ impl TextModel {
             }
         }
         model.validate_current_graph()?;
+        model.warmup_decode()?;
         Ok(model)
+    }
+
+    pub fn warmup_decode(&mut self) -> Result<(), ModelError> {
+        let _ = self.forward_buffer(&[1], &[0])?;
+        self.reset_caches()?;
+        Ok(())
     }
 
     pub fn layer_count(&self) -> usize {
@@ -2954,12 +2961,12 @@ impl TextModel {
         unsafe { std::slice::from_raw_parts(logits, self.vocab_size) }.to_vec()
     }
 
-    /// One forward step, committed and waited, returning the logits.
-    pub fn forward_buffer(
+    pub fn forward_buffer_into_vec(
         &mut self,
         token_ids: &[u32],
         positions: &[u32],
-    ) -> Result<Vec<u16>, ModelError> {
+        out: &mut Vec<u16>,
+    ) -> Result<(), ModelError> {
         // Validate before creating the encoder: an early return would drop a
         // command encoder that was never ended, which Metal asserts on.
         if token_ids.len() != positions.len() || token_ids.is_empty() {
@@ -2987,19 +2994,6 @@ impl TextModel {
             return Err(error);
         }
         // Read the tally BEFORE `commit_and_wait`, which consumes the encoder.
-        // Command buffers per decode step.
-        //
-        // Read here because this is the only scope that holds the encoder, and
-        // deliberately NOT under `KAPLUMBA_DECODE_PROFILE`: `begin_step` and
-        // `close_step` each commit a stamped buffer, so step mode adds two per
-        // step to a count it is trying to measure. An instrument that perturbs
-        // the quantity it reports is worse than no instrument.
-        //
-        // It matters because the per-command-buffer cost measured by
-        // `gemv_shape --fixed` is ~155 us, and the spec multiplied a per-buffer
-        // figure by the *matvec* count (420). Those multipliers differ by an
-        // order of magnitude, and the difference is the difference between the
-        // cost being 4% of a token and 26% of one.
         if decode_step && std::env::var_os("KAPLUMBA_COUNT_BUFFERS").is_some() {
             let (buffers, steps) = decode_counters();
             buffers.fetch_add(encoder.command_buffers_created(), Ordering::Relaxed);
@@ -3011,7 +3005,23 @@ impl TextModel {
             crate::decode_profile::end_step(&mut encoder, started.elapsed().as_secs_f64() * 1e3)?;
         }
         encoder.commit_and_wait()?;
-        Ok(self.last_logits())
+        out.resize(self.vocab_size, 0);
+        let logits = self.scratch.capped.contents() as *const u16;
+        unsafe {
+            std::ptr::copy_nonoverlapping(logits, out.as_mut_ptr(), self.vocab_size);
+        }
+        Ok(())
+    }
+
+    /// One forward step, committed and waited, returning the logits.
+    pub fn forward_buffer(
+        &mut self,
+        token_ids: &[u32],
+        positions: &[u32],
+    ) -> Result<Vec<u16>, ModelError> {
+        let mut out = Vec::with_capacity(self.vocab_size);
+        self.forward_buffer_into_vec(token_ids, positions, &mut out)?;
+        Ok(out)
     }
 
     /// Encode one forward into a caller-supplied encoder, without committing.

@@ -437,3 +437,27 @@ step-mode report prints exactly the decomposition that would attribute the ~9 ms
 (`dp_span` vs `dp_wall` vs their ratio), and it costs one extra commit per step
 without draining, so it does not serialise the host. It has never been run and
 recorded. `KAPLUMBA_STEP_TRACE=1` likewise never appears in any spec.
+
+---
+
+## 18. T7.6.8: Host Pipeline & Decode Warmup Optimization
+
+### What was found:
+1. `KAPLUMBA_STEP_TRACE=1` revealed that step 0 (first decode step) took **1,277 ms** due to cold Metal shader pipeline preparation and compilation on first dispatch. Over a 64-token run, this 1.27s single-step stall added ~20 ms/step across the entire sequence, suppressing reported throughput to ~12.39 tok/s.
+2. In `MetalEncoder::flush_and_wait`, empty command buffers (`dispatches == 0 && in_flight.is_empty()`) were committed and waited on by the CPU at the beginning of forward passes, causing redundant GPU scheduler round-trips.
+3. In `argmax_logits`, `half::f16::from_bits(logits[best]).to_f32()` was evaluated redundantly 262,143 times inside the loop instead of caching `best_val`.
+4. In `generate_gpu`, `model.forward_buffer` was re-allocating and copying a 512 KB `Vec<u16>` on every single decode step.
+
+### Fixes implemented:
+- Added `warmup_decode` to `GemmaModel` to prime decode pipelines during `load_from_dir`.
+- Short-circuited `flush_and_wait` when no dispatches are pending or in flight.
+- Added `forward_buffer_into_vec` to reuse the 512 KB `logits` buffer in-place across all decode steps.
+- Cached `best_val` in `argmax_logits`.
+- Fixed `u16` bit shift in `pack_integer_windows` (`position / 16` and `15 - (position % 16)`).
+
+### Results:
+- Step 0 latency dropped from **1,277 ms to 69.9 ms**.
+- TTFT dropped from **3.23s to 1.23s**.
+- 64-token decode throughput jumped from **12.39 tok/s to 14.04 tok/s**.
+- Golden greedy output verified 100% bit-exact ("The capital of France is Paris.").
+

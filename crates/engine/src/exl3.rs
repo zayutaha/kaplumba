@@ -346,7 +346,7 @@ fn pack_integer_windows(windows: &[u16], bits: u8) -> Result<Vec<u16>, Exl3Error
     let mut packed = vec![0_u16; 16 * ka];
     for (position, value) in ring.iter().enumerate() {
         if *value != 0 {
-            packed[position / 32] |= 1u16 << (31 - (position % 32));
+            packed[position / 16] |= 1u16 << (15 - (position % 16));
         }
     }
     Ok(packed)
