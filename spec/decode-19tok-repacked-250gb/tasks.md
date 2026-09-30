@@ -100,3 +100,39 @@
   - Intent: Measure end-to-end tok/s using `scripts/gpuq run` across reference prompts.
   - Acceptance: Pure autoregressive decode throughput characterization against physical 250+ GB/s ceiling.
 
+## T14 — 32 codes per lane (halve the 2.667× request amplification)
+
+Sole route to 15 tok/s. Each lever in this group is worth **+3.13 tok/s alone**; the
+`+8` previously attributed to the non-GEMV group was a double count (see spec §5).
+Sequenced probe-first on purpose: the 1.333× prediction extrapolates a law fitted at two
+points, and plan §4.3 explains why that is not good enough to build against.
+
+- [ ] **T14.1: Microbenchmark probe for the `D = 32` load pattern** (AC7)
+  - Files: `crates/kernels/src/linear_repacked.metal` (new `*_d32_probe` kernels, garbage output), `crates/kernels/src/linear.rs` (dispatch arm), `crates/engine/examples/probe_d32.rs` (harness)
+  - Intent: Issue 8 lanes × 4 words per 16×16 tile with the real `decode_state_mcg` body, on the 11 real shapes, cold via `MADV_DONTNEED`, interleaved A/B against `_contig4`. Report the per-shape request-rate ratio.
+  - Test: the harness must compute the ratio from measured ns, and a unit test must assert the *predicted* ratio is 2.667/1.333 = 2.0 from first principles. **Sabotage-verified**: break the probe's word index and confirm the ratio moves; a probe that cannot fail is not evidence (AGENTS.md §3.4).
+  - **Gate:** median ratio within 1.6× of 2.0. Otherwise T14.2 is **cancelled** and the amplification law is recorded as a 2-point coincidence.
+
+- [ ] **T14.2: Implement `D = 32` GEMV, 4 tiles per simdgroup** (AC8 prerequisite)
+  - Files: `crates/kernels/src/linear_repacked.metal`, `crates/kernels/src/linear.rs`
+  - Intent: The real kernel. 8 lanes/tile, `uint4` + `uint2` for the straddling lane, 32 decodes/lane into 2 accumulators, `simd_shuffle_xor` 1/2/4 within an 8-lane group, threadgroup reduce across 8 simdgroups, 64 outputs per threadgroup.
+  - Test: `cargo test -p kaplumba-engine --test live_kernel_bit_exact` extended to all 9 real decode shapes; `fused_bit_exact.rs` (fused vs **independent** `encode_gemv`) re-run for the fused2/fused3 paths, since those now cover 4 tiles per simdgroup.
+  - Must be **sabotage-verified** in both directions: an off-by-one in the tile-to-lane map must fail the test, and the f32 reference must be allowed to differ.
+
+- [ ] **T14.3: Assert fp16 bit-identity on all 9 real shapes** (AC8)
+  - Files: `crates/engine/tests/live_kernel_bit_exact.rs`
+  - Intent: `to_bits()` equality of the **fp16** output of `D = 32` vs `_contig4` on every real decode shape. f32 divergence is expected (up to ~51 ULP is the `_contig4` precedent) and recorded, not gated.
+  - **All 9 or nothing.** No env var, no partial rollout, no "ship it and measure quality later" — this repo has no perplexity/KKL instrument, so greedy-output identity on 5 prompts is the only downstream gate and it cannot detect a small argmax-flip rate.
+  - Sabotage-verified by perturbing one accumulation order and confirming the fp16 assertion fires.
+
+- [ ] **T14.4: Per-shape A/B and env-gated wiring** (AC9, AC10)
+  - Files: `crates/kernels/src/linear.rs` (`ishizuki_gemv_pipeline` arm, env var **default off**), `crates/engine/examples/bench_residency.rs` (all 11 `bench.rs:SHAPES` shapes for both kernels)
+  - Intent: Report every shape for both kernels, interleaved, medians and spread. **Narrow-shape regressions are expected and reported, not hidden**: 4 tiles/simdgroup means `down_proj` 336 → 84 threadgroups, 4.2 waves on 20 cores instead of 16.8. Then decide go/no-go on the whole table.
+  - Test: `KAPLUMBA_TRACE_GEMV=1` re-run in both configurations to prove which kernel dispatches (AC10) — the historical failure here was a golden test asserting kernels that did not run. AC6 re-verified: generator ×2, `git diff` clean.
+
+- [ ] **T15: Attribute and reduce the ~8.9 ms host/dispatch gap**
+  - Files: `crates/engine/src/decode_profile.rs`, `crates/engine/src/generate.rs`, `crates/engine/src/model.rs`
+  - Intent: First *measure* it — step mode's `dp_span_over_wall` has never been recorded in any file in this repo. Then attack what it shows: the `model.rs:3192` empty commit+wait, the terminal argmax barrier, ~1407 dispatches/step, and the unconditional `argmax_with_margin` at `generate.rs:867` (legacy path only; the default path guards it correctly).
+  - Worth **+3.21 tok/s** and, unlike T14, does not depend on the amplification law at all. This is the fallback if AC7 fails.
+
+

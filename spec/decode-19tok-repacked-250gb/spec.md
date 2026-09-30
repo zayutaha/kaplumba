@@ -92,6 +92,32 @@ cannot be quoted on this box.
    across >= 5 interleaved runs, with spread reported.
 6. **AC6** The repacked kernels live **outside** `scripts/gen_exl3_gemv.py`'s rewrite
    region, verified by running the generator twice and confirming `git diff` is clean.
+7. **AC7 (T14.1 — the probe decides, not the prediction).** A standalone probe kernel
+   issues the `D = 32` load pattern (8 lanes × 4 words per 16×16 tile) with the real
+   `decode_state_mcg` body and writes deliberately garbage output. Measured against
+   `_contig4` on the same shapes with `MADV_DONTNEED` eviction before every round, it
+   reports a per-shape request-rate ratio. **If the median ratio is not within 1.6× of
+   the predicted 2.667/1.333 = 2.0, T14.2 is cancelled and the amplification law is
+   recorded as a 2-point coincidence rather than a law.** The probe must also be
+   sabotage-verified (AGENTS.md §3.4): a probe that cannot fail proves nothing.
+8. **AC8 (T14.3 — the quality gate, strict).** `D = 32`'s **fp16 output is
+   bit-identical to `_contig4` on all 9 real decode shapes** (sliding and full ×
+   `q`/`k`/`v`/`o`/`gate`/`up`/`down`, plus `lm_head` at 6 bpw). This is `to_bits()`
+   equality, not a tolerance. f32 divergence is expected and permitted — `_contig4`
+   itself differs from `_colmajor` by up to 51 ULP while its fp16 is identical (§6.5) —
+   but the fp16 identity is **asserted, and AC8 failing cancels T14.4**. No env var, no
+   partial rollout: all 9 or nothing.
+9. **AC9 (T14.4 — per-shape deltas, regressions included).** `bench_residency` reports
+   every one of the 11 shapes in `bench.rs:SHAPES` for both kernels, interleaved, with
+   medians and spread. Narrow shapes are **expected to regress** — 4 tiles per simdgroup
+   means 4× fewer threadgroups, so `down_proj` goes 336 → 84 (4.2 waves on 20 cores
+   instead of 16.8). The table is reported as measured; a narrow-shape regression is
+   recorded, not hidden and not used to justify a width threshold by assertion.
+10. **AC10 (T14.4 — wiring is inert by default).** The new kernel is selected by an
+    env var that **defaults off**, so `_contig4` remains the live path at HEAD. AC3
+    (`KAPLUMBA_TRACE_GEMV=1`) is re-run to prove which kernel dispatches in each
+    configuration — the previous golden test asserted kernels that did not run, and that
+    failure must not recur.
 
 ## 5. Withdrawn claims (recorded, not deleted)
 
@@ -105,6 +131,12 @@ cannot be quoted on this box.
 | "12 GB = full model weight footprint" | `implementation_notes.md` T1 | **Wrong.** Checkpoint is 16.03 GB; streamed matvec bytes are 12.039 GB. And a 12 GB linear sweep is not the real access pattern: decode is a 60-deep **dependent** chain of ~43 MB GEMVs. |
 | "Deeper K-unroll (`_u8`) gives +24%" | T12 | **Withdrawn as an effect.** It gave 1.01–1.03× on the cold instrument and −0.55%/+0.62% in-engine. The 1.24× came from a `bench_gemv` arm measuring a partly-cached working set. The kernels are kept (bit-exact, neutral) but they are not a lever. |
 | "Split-K raises narrow-shape bandwidth" | T12 | **Unavailable under the no-quality-loss rule.** Measured 3–5 ULP from the reference on every shape, because it reassociates a float sum. |
+| "The bit-plane repacker is the remaining untried lever" | `implementation_notes.md` §6.6 draft | **Withdrawn — it is lossy, not a layout change.** `extract_ishizuki_lane_codes` (`exl3.rs:664-681`) keeps `s & 0x7`, the lane's own 3 bits, while `decode_state_mcg` consumes a **16-bit window** of which **13 bits survive** `0x8fff8fff`. The single `imul` mixes all 16 before any masking, so 3 bits of input yields *different dequant*, not imprecise dequant. `repack_trellis_3bpw_tensor` is dead code with zero callers and must not be revived as-is. |
+| "2.0 bpw → 18.1 tok/s" | `decode-bandwidth-240gb/spec.md:274` | **Void.** Scales bytes by 2/3 while holding the 3-bpw rate constant. Under this repo's own amplification law (§6.7) `bytes ÷ rate` is invariant for 1–4 bpw, so the predicted gain is **exactly zero**. |
+| "oMLX 2.25 bpw → 26 tok/s" | `decode-bandwidth-240gb/tasks.md:119-120` | **Void.** 2.25 is not an EXL3 rate at all — it is oMLX's oQ2+gs64. This repo's fractional set is 1.5/2.5/3.5 (`exl3.rs:57`). |
+| "~13 ms span-minus-own gap" | old §6.3 | **Withdrawn — my arithmetic error.** Differenced step-mode `span` against kernel-mode `own`, and step-mode `own` is documented as *not a decode cost*. Corrected in §6.3. |
+| "~42 command buffers per decode step" | `decode_profile.rs:21`, `generate.rs:893` | **Stale.** A derived census gives **1407 dispatches/step**; since 1407 < `max_dispatches` (2500), `tick()` never rolls and a step commits **2 command buffers, one empty**. `MAX_IN_FLIGHT` is never engaged. Derived from the call graph, not yet measured — `KAPLUMBA_COUNT_BUFFERS=1` settles it. |
+| "Killing the 16.9 ms of non-GEMV + host overhead is worth +8 tok/s" | T14 planning table | **Double-counted.** +8.54 is the *combined* T14+T15 figure and was sitting in T15's delta column. Each lever alone is worth **+3.13** (T14) and **+3.21** (T15). 20 tok/s needs both to land completely; neither alone reaches it. |
 
 **The 2.67× figure was real but mislabelled.** 64 lane-loads per warp per tile touch
 24 distinct words — that is 2.67× **L1 request amplification**, not DRAM byte
@@ -158,22 +190,45 @@ at the memory system's limit, so a perfect GEMV would save at most ~5% of the st
 Three predecessor specs reached the same conclusion (`decode-19tok`, `decode-20tok`,
 `decode-bandwidth-240gb`).
 
-### 6.3 Where the remaining ~13 ms is
+### 6.3 Where the 72.6 ms of kernel time is
 
-From `KAPLUMBA_DECODE_PROFILE=kernel` at HEAD, per step (own time ≈ 71 ms, span ≈ 78 ms):
+Fresh `KAPLUMBA_DECODE_PROFILE=kernel` at HEAD, 119 steps, per token:
 
-| kernel | ms/step | note |
-|---|---:|---|
-| `gate_up_gelu` | 27.4 | fused MLP; at ~190 GB/s |
-| `down_proj` | 14.3 | ~181 GB/s |
-| `qkv_proj` | 9.2 | narrow grid |
-| `o_proj` | 6.9 | narrow grid |
-| `head/gemv` | 4.1 | ~261 GB/s — at the ceiling |
-| non-GEMV (norm/rope/attention/gelu) | ~6.8 | |
+| kernel | ms/token | % | derived GB/s |
+|---|---:|---:|---:|
+| `gate_up_gelu` | 27.71 | 38.4% | 187.7 |
+| `down_proj` | 14.49 | 20.1% | 179.5 |
+| `qkv_proj` | 9.28 | 12.9% | 178.0 |
+| `o_proj` | 6.82 | 9.5% | 169.5 |
+| `head/gemv` (6 bpw) | 4.22 | 5.9% | **250.5** |
+| `attention` | 2.31 | 3.2% | |
+| `qk_proj` | 2.09 | 2.9% | |
+| norm/rope/cache (7 rows) | 5.13 | 7.1% | |
+| **total kernel own** | **72.6** | | |
 
-Plus a **~13 ms span-minus-own gap** — inter-kernel scheduling latency across ~800
-dispatches per token. That gap is now comparable to the entire non-GEMV cost and is
-the single largest unexplained item.
+**The "~13 ms span-minus-own gap" previously recorded here was an arithmetic error of
+mine, and is withdrawn.** It differenced `span` from **step** mode against `own` from
+**kernel** mode. `decode_profile.rs:36-37` states that step-mode `own` covers "only the
+two boundary buffers, so it is small and **not a decode cost**". The two instruments
+also do not commute: kernel mode stamps ~665 command buffers per step where the
+uninstrumented path commits 1-2, so up to ~2.3 ms of the non-GEMV figure may be the
+profiler distorting what it measures.
+
+| instrument | own | span | wall | tok/s |
+|---|---:|---:|---:|---:|
+| step (clock; undistorted) | 71.3 *not a decode cost* | 73.8 | 71.8 | 10.92 |
+| kernel (attribution; wall inflated by drains) | 72.6 | 83.5 | — | 9.16 |
+| uninstrumented | — | — | ~81.5 | 12.27 |
+
+So: **kernel own ≈ 95% of an uninstrumented step, and the host/dispatch gap is ≈ 8.9
+ms/token** — not 13 ms. That 8.9 ms is *not yet attributed*; `dp_span_over_wall` has
+never once been recorded in any file in this repo (§7.1).
+
+`gate_up_gelu` has no meaningful headroom: 5.202 GB of weight streaming against
+30.97 MB of everything else, so deleting **all** non-weight traffic saves ≤ 0.155 ms
+(0.56%). Its epilogue moves 64 B/thread at ~0.88 FLOP/B, ~2.5% of the machine's ridge
+point, so it is latency-bound. `scratch.gate`/`scratch.up` are already dead at HEAD
+(`6327c84`); the live intermediate is fp32 `raw`/`raw_b` at 20.6 MB/token.
 
 ### 6.4 What was measured to get here
 
@@ -214,17 +269,101 @@ actually governs the output.
 The split-K kernels (`_sk4`, `contig4_sk2`/`_sk4`) reassociate similarly and are **not
 on the decode path**. The `linear_repacked.metal` header says so explicitly.
 
+### 6.6 The amplification law, and the one untried lever
+
+A 3 bpw tile is `256·3/8 = 24` distinct `u32` words. The live kernel has 32 lanes each
+issuing **2** scalar `uint` loads (`linear_repacked.metal:1006-1009`), so a warp
+requests **64** loads for 24 words — **2.667× request amplification**, DRAM traffic
+1.00×. At 6 bpw a tile is 48 words and the kernel issues 96 loads — **2.000×**.
+
+| rate | lane-loads | distinct words | amplification | measured |
+|---|---:|---:|---:|---:|
+| 3 bpw (layers) | 64 | 24 | 2.667 | **187.7 GB/s** |
+| 6 bpw (`lm_head`) | 96 | 48 | 2.000 | **250.5 GB/s** |
+
+```
+predicted 3 bpw = 250.5 × 2.000/2.667 = 187.9 GB/s
+measured  gate_up_gelu               = 187.7 GB/s        fit error 0.1%
+```
+
+`lm_head` is a fair comparator: it is **not** colmajor (`model.rs:2829-2848` sets
+`permutation_mode = 1` only on the seven per-layer linears), so it takes the row-major
+`_w2` arm with 16384 threadgroups — same op mix, same `decode_state` body, same memory
+system. The exact redundancy is 8 words loaded by two lanes each: lanes 3, 7, 11 … 31
+load the same `j0` as the lane below, so **16 of 64 load slots are exact duplicates**.
+
+Three attacks on that 2.667× were built and **all failed**: `simd_shuffle` cooperative
+loads 180.5 → 146.5; `_u4` 384-byte `uint4` staging 180.5 → 173.7; threadgroup ring
+staging 118.8 vs 119.5 (no change).
+
+**T14 attacks it by changing the lane→code assignment: 32 codes per lane instead of 8.**
+With `D` codes per lane a lane's codes occupy `3D` consecutive ring bits and it needs
+`3D + 13` bits, i.e. `ceil((3D+13)/32)` words. For `D = 32`: 8 lanes per tile, 4 words
+each, `8×4 = 32` lane-loads for 24 words = **1.333×**. And because `96·L mod 32 == 0`
+for every lane, **every window starts on a word boundary** — the 4 funnel shifts of the
+`D = 8` kernel (`sh0 ∈ {19,11,3,27}`, period 4 in `lane`) collapse to one constant.
+
+Because 8 lanes no longer fill a 32-lane simdgroup, one simdgroup must cover **4 output
+tiles** (lanes 0-7 → tile 0, 8-15 → tile 1, …), each lane doing 32 decodes into 2
+accumulators. That is a restructure, not a 60-line edit, and it is why T14.1 probes
+before T14.2 builds.
+
+**The ALU is not the limit, and that is measured twice with the opposite sign to
+intuition.** Removing the dequant arithmetic makes the kernel **slower**: the `_nod`
+stub gives 3 bpw 167.3 → **122.7** (−26.7%), 4 bpw 217.1 → 206.3, 8 bpw 222.5 → 219.2;
+and a four-probe sweep on `gate_proj` gives no-decode 115.1 vs baseline 124.7. Deleting
+59% of the ALU work costs throughput because the decode's dependent chains were
+accidentally supplying the ILP that hides load latency. "Cheaper dequant" is ruled out.
+
+### 6.7 Lowering bpw below 3.0 buys exactly zero time
+
+Derived from the same law: a rate-`K` tile is `8K` words and the kernel still issues
+`8/KA`… concretely `amp = 64/(8K) = 8/K`, so
+
+| rate | bytes ∝ | amp | predicted GB/s | ms/token, layer stack |
+|---|---:|---:|---:|---:|
+| 1 bpw | ×1/3 | 8.000 | 62.6 | 58.5 |
+| 2 bpw | ×2/3 | 4.000 | 125.3 | 58.5 |
+| **3 bpw (now)** | ×1 | 2.667 | **187.9** | **58.5** |
+| 4 bpw | ×4/3 | 2.000 | 250.5 | 58.5 |
+
+**`bytes ÷ rate` is exactly invariant for 1–4 bpw.** Supported by a measurement against
+itself: `decode-bandwidth-240gb/tasks.md:18-22` — the same 5376×21504 matrix takes
+**0.2616 ms at 3 bpw and 0.2035 ms at 4 bpw**. Bytes up 33%, time down 22%.
+
+This **voids** the repo's "2.0 bpw → 18.1 tok/s" figure
+(`decode-bandwidth-240gb/spec.md:274`), which scaled bytes by 2/3 while holding the
+3-bpw rate constant. Under this repo's own law a 2-bpw model runs at ~125 GB/s:
+7.955/125.3 = 63.5 ms, i.e. **no gain**. The whole "lower the bit width" family is dead
+on this kernel. Confirmed against the checkpoint: every one of the 411 quantized
+modules is `bits_per_weight: 3` except `lm_head` at 6, `safetensors.rs:577-588` enforces
+that uniformity, and `exl3.rs:57` offers only integer 1-8 plus fractional 1.5/2.5/3.5 —
+**there is no 2-bpw decode measurement in this repo, and none is expected to help.**
+
 ## 7. Open questions
 
-1. The **~13 ms span-minus-own gap** across ~800 dispatches per token. Is it
-   inter-kernel scheduling latency, CPU-side encode, or both? This is now the
-   largest single item and is not yet attributed.
-2. `q`/`k`/`v` sit at 88–92 GB/s on `bench_gemv` while `lm_head` reaches 261. That
-   gap does **not** appear in `bench_residency`, so it may be an artifact of the
-   cached-working-set arm rather than a real effect. Must be settled on the cold
-   instrument before anything is built on it.
-3. AC1 and AC5 must be measured in **separate GPU sessions** — the 12 GB probe
-   buffer and the ~11.7 GiB model cannot coexist on 24 GiB.
+1. **The ≈ 8.9 ms host/dispatch gap.** Corrected from the withdrawn "~13 ms" (§6.3).
+   Kernel own time is ~95% of an uninstrumented step, so the gap is real but
+   *unattributed*. The instrument that would attribute it — step mode's
+   `dp_span_over_wall` / `dp_span_minus_wall` — **has never been recorded in any file in
+   this repo** (`grep -rln "dp_span_over_wall\|dp_span_minus_wall" spec/` returns
+   nothing), as has `KAPLUMBA_STEP_TRACE=1`. It costs one extra commit per step without
+   draining, so it does not serialise the host. **T15.**
+2. **Is the amplification law a law or a 2-point coincidence?** It is fitted at exactly
+   two points (amp 2.667 measured 187.7; amp 2.000 measured 250.5) and `D = 32` predicts
+   amp 1.333, **outside both**. There is also no 1-bpw or 2-bpw decode measurement in
+   this repo, and §6.7 predicts time/token is *invariant* across 1–4 bpw, which is a
+   strong and falsifiable claim resting on one measured pair (3 bpw 0.2616 ms vs 4 bpw
+   0.2035 ms). **AC7 settles the first half; `gemv_shape` at rates 1 and 2 settles the
+   second in ~10 minutes.**
+3. **Command buffers per step.** The "2 buffers, one empty" figure is derived from the
+   call graph, not measured. `KAPLUMBA_COUNT_BUFFERS=1` settles it in one command.
+4. `q`/`k`/`v` sat at 88–92 GB/s on `bench_gemv` while `lm_head` reached 261. That gap
+   **does not appear** in `bench_residency` (121–126 GB/s for `full/kv`), so it was an
+   artifact of the cached-working-set arm. **Closed** — recorded in
+   `implementation_notes.md`; do not rebuild on it.
+5. AC1 and AC5 must be measured in **separate GPU sessions** — the 12 GB probe buffer
+   and the ~11.7 GiB model cannot coexist on 24 GiB.
 
 ## 8. Supersession
 
