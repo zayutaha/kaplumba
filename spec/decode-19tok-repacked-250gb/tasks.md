@@ -105,20 +105,45 @@
   - Intent: Benchmark Split-K vs contiguous 4-tile (`contig4`) layout. Gate Split-K behind `KAPLUMBA_USE_SK=1` because wide/medium matrices already saturate 20 GPU cores (134 SIMD groups/core) and Split-K incurs DRAM roundtrips and smaller reduction loops. Optimize `decode_state_mcg` with direct `half2` vector bitcast.
   - Result: Eliminating Split-K reduction roundtrips dropped forward step latency from ~80.9 ms to ~69.8-70.4 ms (decode speed jumped from 12.35 tok/s to 14.02 tok/s). `half2` bitcast replaced scalar shifts/masks across 32 dequant calls per loop step. 0 FP16 diffs in `live_kernel_bit_exact` and `fused_bit_exact`.
 
-- [ ] **T7.6.10: Fused QKV Norm & RoPE dispatch (`norm_rope_qkv`)**
-  - Files: `crates/kernels/src/elements.metal`, `crates/kernels/src/elements.rs`, `crates/engine/src/model.rs`
-  - Intent: Combine `q_norm + q_rope`, `k_norm + k_rope`, and `v_norm` into a single 32-threadgroup kernel dispatch per layer, cutting 240 kernel dispatches per token across 60 layers and eliminating DRAM roundtrips for unrotated projections.
-  - Estimated impact: ~3.5-4.5 ms reduction in step latency.
+- [x] **T7.6.10a: Count dispatches, not just command buffers** (`021067c`)
+  - Files: `crates/kernels/src/encoder.rs`, `crates/engine/src/model.rs`, `crates/engine/src/generate.rs`
+  - Intent: A fusion is measured on dispatches removed, and the only counter was `command_buffers_created()`. Under `KAPLUMBA_DECODE_PROFILE` the stamped boundaries dominate it (a 48-step profiled run reported 730 buffers/step against 1407 real dispatches), so it cannot answer the question.
+  - Result: `MetalEncoder::dispatches_total`, folded per decode step and printed by the existing `KAPLUMBA_COUNT_BUFFERS` diagnostic. The tally for the real decode loop must be taken in `generate.rs` — `forward_buffer_into_step` drives the CALLER's encoder, so `model.rs`'s own hook never fires for it — and before `commit_terminal`, which consumes the encoder. **Baseline: 1407 dispatches/token, 13.26-13.32 tok/s.**
+
+- [x] **T7.6.10b: `norm_rope_qkv` kernel, rewritten and proven bit-exact** (`479d720`)
+  - Files: `crates/kernels/src/elements.metal`, `crates/kernels/src/elements.rs`, `crates/engine/tests/norm_rope_qkv_bit_exact.rs`
+  - Intent: Finish and verify the kernel a previous pass wrote but never wired.
+  - Result: **The kernel as written was wrong in three ways**, each of which the test was confirmed to catch (see the failure modes below):
+    1. `const float val = target[base + lid]` with no strided loop, so `head_dim 512` (the 10 full-attention layers) summed only the first 256 columns. The 50 sliding layers (256) happened to be right.
+    2. It staged the normed value in an fp32 register across the rotation, skipping the fp16 rounding the separate norm writes. `rope` reads that half back, so the fused kernel was computing a *different function*. **This is the fusion's whole difficulty and the reason the obvious version is not bit-exact.**
+    3. The unrotated tail copied only the low half, leaving the high half of every tail pair unwritten — the same bug `rope` itself once had (`elements.metal:363`).
+  - Rewritten to mirror the reference exactly: strided sum of squares in `rms_norm_weighted_tg`'s order with the 256-lane tree; `normed_shared[i] = float(half(normed))` (load-bearing); `threadgroup float normed_shared[512]` so both head dims work unrolled; one thread per PAIR, strided, for both the rotation and the tail; V unweighted with no RoPE.
+  - **Sabotage evidence** (AGENTS.md §3.4 — each applied, run, and reverted; the kernel is byte-identical to its pre-sabotage state):
+    | sabotage | result |
+    |---|---|
+    | drop `float(half(normed))` | 328/1024 differ, worst 19 ULP, first at head 0 column 2 |
+    | `partial[lid] = (lid==0) ? sum : 0` | 8192/8192 differ, worst 9266 ULP |
+    | drop the tail's high half | exactly 256 elements at column 192; poison test independently reports 256/1024 unwritten, `rotated_pairs 64` |
+  - **The poison test was itself wrong on first write and is worth recording.** It uploaded real input OVER a poison sentinel, then asserted the sentinel did not survive — which can never happen, so it passed *while the tail was being dropped*. It now makes the INPUT the poison (all `0x7bff`, weights 1.0), so a written column comes out near 1.0 and an unwritten one is still `0x7bff`. Verified it fails under sabotage before being trusted.
+  - 7 shape cases: both head dims, both rope modes, offsets 0/5/11/37/1023, proportional 0.5 and 0.75 (both leave an unrotated tail). 3/3 tests pass.
+
+- [x] **T7.6.10c: Wire `norm_rope_qkv` into the decode path** (`9d4c44c`)
+  - Files: `crates/engine/src/model.rs`
+  - Intent: Five dispatches per layer (3 head-width norms + 2 ropes) → one.
+  - Result: Gated on `decode`. Prefill keeps the five-dispatch path for two load-bearing reasons: `norm_rope_qkv` has no token axis so `offset` IS the position, and the reference norms switch to the per-row kernel above `THREADGROUP_NORM_MAX_ROWS` (8192), which a 1024-row × 32-head prefill chunk crosses — a different reduction order is a different `rsqrt`.
+  - `KAPLUMBA_NO_NORM_ROPE_QKV` restores the old path so the A/B runs from ONE binary; two rebuilt binaries differ by build layout alone and this box drifts 10%+ run to run.
+  - **MEASURED** (same binary, flag A/B, 96 greedy tokens, 4 interleaved pairs): unfused 1407 dispatches/token, median 13.215 tok/s (75.67 ms/step), spread 1.1%; fused 1167 dispatches/token, median 13.299 tok/s (75.19 ms/step), spread 0.9%. **Delta -0.48 ms/step, +0.64%** — 240 dispatches/token removed, exactly 4 × 60 layers as predicted. The time delta is *inside* the spread, so see the negative result note below.
+  - **BIT-EXACTNESS, end to end**: full stdout over 128 greedy tokens byte-identical between arms, sha256 `2fff2c970b611f64c4a485d8a3a3dc719a0f03293a3f48c167f4dff5466795b2` for both, including the `--show-ids` token list. A single fp16 ULP anywhere in the 60-layer forward would change that list.
 
 - [ ] **T7.6.11: Fused Down Finalize + Post-FFN Residual & Layer Scale**
   - Files: `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`, `crates/engine/src/model.rs`
   - Intent: Combine `linear_finalize_simd` and `encode_rms_norm_residual_layer_scale` into a single kernel dispatch (`linear_finalize_simd_with_residual_scale`), eliminating 60 dispatches and `scratch.proj` DRAM buffer traffic.
-  - Estimated impact: ~2.0 ms reduction in step latency.
+  - Estimated impact: ~2.0 ms reduction in step latency. **See the T7.6.10 result before starting: the measured marginal value of a dispatch on this box is ~0.002 ms, so 60 dispatches is ~0.12 ms, not 2.0 ms.**
 
 - [ ] **T7.6.12: Fused Post-Attention Norm, Residual, and Gate Input Transform**
   - Files: `crates/kernels/src/elements.metal`, `crates/kernels/src/elements.rs`, `crates/engine/src/model.rs`
   - Intent: Merge post-attention residual add, pre-FFN RMS norm, and Hadamard gate input transform into a single dispatch per layer, eliminating 120 dispatches per token.
-  - Estimated impact: ~2.0 ms reduction in step latency.
+  - Estimated impact: ~2.0 ms reduction in step latency. **Revise against the measured marginal dispatch cost, as above.**
 
 - [ ] **T7.6.13: Attention Fast-Path Single Dispatch for Short Decode Context**
   - Files: `crates/kernels/src/attention.rs`, `crates/engine/src/model.rs`
