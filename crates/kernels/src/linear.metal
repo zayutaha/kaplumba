@@ -565,6 +565,103 @@ kernel void linear_finalize_gated_gelu_simd(
     activated[base + 96u] = half(gelu_tanh_value(g3) * u3);
 }
 
+kernel void linear_finalize_gated_gelu_and_down_input_transform(
+    const device float *raw_gate [[buffer(0)]],
+    const device half *gate_signs [[buffer(1)]],
+    const device float *raw_up [[buffer(2)]],
+    const device half *up_signs [[buffer(3)]],
+    const device half *down_input_signs [[buffer(4)]],
+    device half *transformed [[buffer(5)]],
+    constant uint &blocks [[buffer(6)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= blocks * 32u) {
+        return;
+    }
+    const uint lane = gid & 31u;
+    const uint base = (gid >> 5) * 128u + lane;
+
+    float g0 = raw_gate[base];
+    float g1 = raw_gate[base + 32u];
+    float g2 = raw_gate[base + 64u];
+    float g3 = raw_gate[base + 96u];
+    transform_simd(g0, g1, g2, g3, lane);
+    g0 *= float(gate_signs[base]);
+    g1 *= float(gate_signs[base + 32u]);
+    g2 *= float(gate_signs[base + 64u]);
+    g3 *= float(gate_signs[base + 96u]);
+
+    float u0 = raw_up[base];
+    float u1 = raw_up[base + 32u];
+    float u2 = raw_up[base + 64u];
+    float u3 = raw_up[base + 96u];
+    transform_simd(u0, u1, u2, u3, lane);
+    u0 *= float(up_signs[base]);
+    u1 *= float(up_signs[base + 32u]);
+    u2 *= float(up_signs[base + 64u]);
+    u3 *= float(up_signs[base + 96u]);
+
+    float v0 = float(half(gelu_tanh_value(g0) * u0)) * float(down_input_signs[base]);
+    float v1 = float(half(gelu_tanh_value(g1) * u1)) * float(down_input_signs[base + 32u]);
+    float v2 = float(half(gelu_tanh_value(g2) * u2)) * float(down_input_signs[base + 64u]);
+    float v3 = float(half(gelu_tanh_value(g3) * u3)) * float(down_input_signs[base + 96u]);
+
+    transform_simd(v0, v1, v2, v3, lane);
+
+    transformed[base] = half(v0);
+    transformed[base + 32u] = half(v1);
+    transformed[base + 64u] = half(v2);
+    transformed[base + 96u] = half(v3);
+}
+
+kernel void linear_finalize_simd3(
+    const device float *raw_a [[buffer(0)]],
+    const device half *signs_a [[buffer(1)]],
+    device half *out_a [[buffer(2)]],
+    const device float *raw_b [[buffer(3)]],
+    const device half *signs_b [[buffer(4)]],
+    device half *out_b [[buffer(5)]],
+    const device float *raw_c [[buffer(6)]],
+    const device half *signs_c [[buffer(7)]],
+    device half *out_c [[buffer(8)]],
+    constant const uint *blocks_abc [[buffer(9)]],
+    uint gid [[thread_position_in_grid]]) {
+    const uint block_idx = gid >> 5;
+    const uint lane = gid & 31u;
+    const uint ba = blocks_abc[0];
+    const uint bb = blocks_abc[1];
+    const uint bc = blocks_abc[2];
+
+    const device float *raw;
+    const device half *signs;
+    device half *out;
+    uint local_block;
+
+    if (block_idx < ba) {
+        raw = raw_a; signs = signs_a; out = out_a;
+        local_block = block_idx;
+    } else if (block_idx < ba + bb) {
+        raw = raw_b; signs = signs_b; out = out_b;
+        local_block = block_idx - ba;
+    } else if (block_idx < ba + bb + bc) {
+        raw = raw_c; signs = signs_c; out = out_c;
+        local_block = block_idx - (ba + bb);
+    } else {
+        return;
+    }
+
+    const uint base = local_block * 128u + lane;
+    float v0 = raw[base];
+    float v1 = raw[base + 32u];
+    float v2 = raw[base + 64u];
+    float v3 = raw[base + 96u];
+    transform_simd(v0, v1, v2, v3, lane);
+    out[base] = half(v0 * float(signs[base]));
+    out[base + 32u] = half(v1 * float(signs[base + 32u]));
+    out[base + 64u] = half(v2 * float(signs[base + 64u]));
+    out[base + 96u] = half(v3 * float(signs[base + 96u]));
+}
+
+
 // EXL3 decode matvec, shaped like the reference implementation.
 //
 // Thread mapping follows the trellis rather than the output:

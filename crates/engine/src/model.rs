@@ -1702,6 +1702,9 @@ impl DecoderLayer {
             let input_signs = self.weights.gate_proj.input_signs_buffer.as_ref().ok_or_else(|| {
                 ModelError::InvalidWeights("gate_proj input signs are not resident".to_string())
             })?;
+            let down_input_signs = self.weights.down_proj.input_signs_buffer.as_ref().ok_or_else(|| {
+                ModelError::InvalidWeights("down_proj input signs are not resident".to_string())
+            })?;
             self.linear
                 .encode_gemv_fused2_mlp(
                     encoder,
@@ -1713,7 +1716,8 @@ impl DecoderLayer {
                     self.weights.up_proj.metal_offset,
                     self.weights.up_proj.out_features,
                     up_out_signs,
-                    &scratch.activated,
+                    Some(down_input_signs),
+                    &scratch.transformed,
                     &scratch.normed,
                     input_signs,
                     &scratch.transformed,
@@ -1725,6 +1729,17 @@ impl DecoderLayer {
                 .map_err(ModelError::Kernel)?;
             profile.stamp(encoder, &format!("{}gate_up_gelu", prefix()))?;
             timer.lap("gate_up_gelu");
+            self.encode_linear(
+                encoder,
+                &self.weights.down_proj,
+                &scratch.transformed,
+                &scratch.proj,
+                tokens,
+                scratch,
+                true,
+            )?;
+            profile.stamp(encoder, &format!("{}down_proj", prefix()))?;
+            timer.lap("down_proj");
         } else {
             self.encode_linear(
                 encoder,
@@ -1757,18 +1772,18 @@ impl DecoderLayer {
             )?;
             profile.stamp(encoder, &format!("{}gated_gelu", prefix()))?;
             timer.lap("gated_gelu");
+            self.encode_linear(
+                encoder,
+                &self.weights.down_proj,
+                &scratch.activated,
+                &scratch.proj,
+                tokens,
+                scratch,
+                false,
+            )?;
+            profile.stamp(encoder, &format!("{}down_proj", prefix()))?;
+            timer.lap("down_proj");
         }
-        self.encode_linear(
-            encoder,
-            &self.weights.down_proj,
-            &scratch.activated,
-            &scratch.proj,
-            tokens,
-            scratch,
-            false,
-        )?;
-        profile.stamp(encoder, &format!("{}down_proj", prefix()))?;
-        timer.lap("down_proj");
         self.hidden_norm(
             encoder,
             &self.gpu_weights.post_ffn_norm,

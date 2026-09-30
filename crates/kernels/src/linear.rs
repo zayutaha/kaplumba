@@ -235,7 +235,9 @@ pub struct LinearKernels {
     gemv_pipeline: ComputePipelineState,
     finalize_pipeline: ComputePipelineState,
     finalize_simd_pipeline: ComputePipelineState,
+    finalize_simd3_pipeline: ComputePipelineState,
     finalize_gated_gelu_pipeline: ComputePipelineState,
+    finalize_gated_gelu_and_down_input_pipeline: ComputePipelineState,
     input_rows_pipeline: ComputePipelineState,
     gemv_tiled_pipeline: ComputePipelineState,
     /// Tensor-core prefill GEMM (`linear_gemm_mma`): dequantize the EXL3 weights
@@ -353,8 +355,14 @@ impl LinearKernels {
         let finalize_simd_function = library
             .get_function("linear_finalize_simd", None)
             .map_err(KernelError::Shader)?;
+        let finalize_simd3_function = library
+            .get_function("linear_finalize_simd3", None)
+            .map_err(KernelError::Shader)?;
         let finalize_gated_gelu_function = library
             .get_function("linear_finalize_gated_gelu_simd", None)
+            .map_err(KernelError::Shader)?;
+        let finalize_gated_gelu_and_down_input_function = library
+            .get_function("linear_finalize_gated_gelu_and_down_input_transform", None)
             .map_err(KernelError::Shader)?;
         let input_rows_function = library
             .get_function("linear_input_rows", None)
@@ -472,8 +480,14 @@ impl LinearKernels {
         let finalize_simd_pipeline = device
             .new_compute_pipeline_state_with_function(&finalize_simd_function)
             .map_err(KernelError::Pipeline)?;
+        let finalize_simd3_pipeline = device
+            .new_compute_pipeline_state_with_function(&finalize_simd3_function)
+            .map_err(KernelError::Pipeline)?;
         let finalize_gated_gelu_pipeline = device
             .new_compute_pipeline_state_with_function(&finalize_gated_gelu_function)
+            .map_err(KernelError::Pipeline)?;
+        let finalize_gated_gelu_and_down_input_pipeline = device
+            .new_compute_pipeline_state_with_function(&finalize_gated_gelu_and_down_input_function)
             .map_err(KernelError::Pipeline)?;
         let input_rows_pipeline = device
             .new_compute_pipeline_state_with_function(&input_rows_function)
@@ -533,7 +547,9 @@ impl LinearKernels {
             gemv_pipeline,
             finalize_pipeline,
             finalize_simd_pipeline,
+            finalize_simd3_pipeline,
             finalize_gated_gelu_pipeline,
+            finalize_gated_gelu_and_down_input_pipeline,
             input_rows_pipeline,
             gemv_tiled_pipeline,
             gemm_mma_pipeline,
@@ -1825,7 +1841,8 @@ impl LinearKernels {
         offset_up: u64,
         out_features_up: usize,
         up_out_signs: &Buffer,
-        activated: &Buffer,
+        down_input_signs: Option<&Buffer>,
+        activated_or_transformed: &Buffer,
         input: &Buffer,
         input_signs: &Buffer,
         transformed: &Buffer,
@@ -1871,19 +1888,36 @@ impl LinearKernels {
             256,
         )?;
         let blocks = to_u32(out_features_gate / 128, "features dimension")?;
-        encoder.dispatch_1d(
-            &self.finalize_gated_gelu_pipeline,
-            &[
-                Some(raw_gate),
-                Some(gate_out_signs),
-                Some(raw_up),
-                Some(up_out_signs),
-                Some(activated),
-            ],
-            &blocks.to_le_bytes(),
-            u64::from(blocks) * 32,
-            32,
-        )
+        if let Some(down_signs) = down_input_signs {
+            encoder.dispatch_1d(
+                &self.finalize_gated_gelu_and_down_input_pipeline,
+                &[
+                    Some(raw_gate),
+                    Some(gate_out_signs),
+                    Some(raw_up),
+                    Some(up_out_signs),
+                    Some(down_signs),
+                    Some(activated_or_transformed),
+                ],
+                &blocks.to_le_bytes(),
+                u64::from(blocks) * 32,
+                32,
+            )
+        } else {
+            encoder.dispatch_1d(
+                &self.finalize_gated_gelu_pipeline,
+                &[
+                    Some(raw_gate),
+                    Some(gate_out_signs),
+                    Some(raw_up),
+                    Some(up_out_signs),
+                    Some(activated_or_transformed),
+                ],
+                &blocks.to_le_bytes(),
+                u64::from(blocks) * 32,
+                32,
+            )
+        }
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1955,27 +1989,25 @@ impl LinearKernels {
             256,
         )?;
         let blocks_a = to_u32(out_features_a / 128, "output dimension a")?;
-        encoder.dispatch_1d(
-            &self.finalize_simd_pipeline,
-            &[Some(raw_a), Some(output_signs_a), Some(output_a)],
-            &blocks_a.to_le_bytes(),
-            u64::from(blocks_a) * 32,
-            32,
-        )?;
         let blocks_b = to_u32(out_features_b / 128, "output dimension b")?;
-        encoder.dispatch_1d(
-            &self.finalize_simd_pipeline,
-            &[Some(raw_b), Some(output_signs_b), Some(output_b)],
-            &blocks_b.to_le_bytes(),
-            u64::from(blocks_b) * 32,
-            32,
-        )?;
         let blocks_c = to_u32(out_features_c / 128, "output dimension c")?;
+        let blocks_abc = [blocks_a, blocks_b, blocks_c];
+        let total_blocks = (blocks_a + blocks_b + blocks_c) as u64;
         encoder.dispatch_1d(
-            &self.finalize_simd_pipeline,
-            &[Some(raw_c), Some(output_signs_c), Some(output_c)],
-            &blocks_c.to_le_bytes(),
-            u64::from(blocks_c) * 32,
+            &self.finalize_simd3_pipeline,
+            &[
+                Some(raw_a),
+                Some(output_signs_a),
+                Some(output_a),
+                Some(raw_b),
+                Some(output_signs_b),
+                Some(output_b),
+                Some(raw_c),
+                Some(output_signs_c),
+                Some(output_c),
+            ],
+            params_bytes(&blocks_abc),
+            total_blocks * 32,
             32,
         )
     }
