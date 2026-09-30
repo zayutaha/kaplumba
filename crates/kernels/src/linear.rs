@@ -491,6 +491,9 @@ impl LinearKernels {
         let finalize_gated_gelu_pipeline = device
             .new_compute_pipeline_state_with_function(&finalize_gated_gelu_function)
             .map_err(KernelError::Pipeline)?;
+        let finalize_simd3_sk2_pipeline = device
+            .new_compute_pipeline_state_with_function(&finalize_simd3_sk2_function)
+            .map_err(KernelError::Pipeline)?;
         let finalize_gated_gelu_and_down_input_pipeline = device
             .new_compute_pipeline_state_with_function(&finalize_gated_gelu_and_down_input_function)
             .map_err(KernelError::Pipeline)?;
@@ -557,6 +560,7 @@ impl LinearKernels {
             finalize_pipeline,
             finalize_simd_pipeline,
             finalize_simd3_pipeline,
+            finalize_simd3_sk2_pipeline,
             finalize_gated_gelu_pipeline,
             finalize_gated_gelu_and_down_input_pipeline,
             input_rows_pipeline,
