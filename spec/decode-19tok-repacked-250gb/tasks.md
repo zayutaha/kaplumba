@@ -10,10 +10,10 @@
   - Intent: Sabotage read loop count in probe to verify checksum mismatch fires.
   - Result: Sabotaged run altered checksum (`0x739adf40` vs `0xa8c277a0`), confirming failure detection. Reverted and verified.
 
-- [ ] **T3: Design and implement offline model repacking binary**
+- [x] **T3: Design and implement offline model repacking binary**
   - Files: `crates/engine/src/bin/repack_model.rs`, `crates/engine/src/exl3.rs`
   - Intent: Read `Gxma` safetensors, reformat 3 bpw trellis data into coalesced lane-aligned layout, write to `~/.kaplumba/models/Gxma-repacked`. Ensure single-copy limit.
-  - Test: Verify converted safetensors exists, file metadata matches, original files untouched.
+  - Result: Successfully repacked 410 trellis tensors across 2 shards (16.03 GB) in 12.1s with `"layout": "colmajor"`. Original files untouched. Destination matches byte layout. Single copy rule respected.
 
 - [x] **T4: Correctness test for repacked format**
   - Files: `crates/engine/tests/repacked_golden.rs`
