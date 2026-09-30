@@ -169,7 +169,7 @@ spec amendment, `bench.rs`, `bench_residency.rs`, `splitk_bit_exact.rs`,
 `fused_bit_exact.rs`, `linear_repacked.metal`, and the `_u8` / `_fused2_u8` /
 `_fused3_u8` kernels.
 
-The recovered work was worth keeping — it reached **12.8 tok/s** — so the approach was
+The recovered work was worth keeping — it reached **~11.7 tok/s median** — so the approach was
 to make the surviving line coherent rather than to restore the discarded one.
 
 ### Three things were incoherent
@@ -212,8 +212,21 @@ printing it, so a kernel that reassociates too far to round away fails loudly.
 
 ### Verified state at HEAD
 
-- 5 interleaved uninstrumented runs, 64 tokens:
-  `11.57 / 12.76 / 12.93 / 12.52 / 12.80` → **median 12.76 tok/s** (was ~10.5).
+- Interleaved uninstrumented runs, 64 tokens, **9 samples across two binaries**:
+  `11.03 / 11.57 / 11.64 / 12.03 / 12.14 / 12.52 / 12.76 / 12.80 / 12.93`
+  → **median 12.14 tok/s**, range 11.03-12.93, **spread 0.85**.
+
+  An earlier, shorter 5-round run gave a median of 12.76 and I quoted that as
+  *the* number. It is the high end of this range, not its centre. Spread 0.85 on
+  the identical binary is AGENTS.md 10.5's documented drift; no single reading is
+  a measurement on this box, and the spec now carries a range, not a point.
+
+- **The kernel move is performance-neutral, verified by A/B.** Pre-move
+  (`a1cdeed`) vs post-move (`df83398`) interleaved, 4 rounds: 11.03/11.02,
+  11.64/12.16, 12.03/12.28, 12.14/12.24. Identical kernels and identical
+  concatenation semantics -- the only change was which file they are read from.
+  Median 12.14 vs 11.02 across 9 and 7 samples respectively, both arms spanning
+  the same range, so the difference is drift, not a regression.
 - Greedy output unchanged on three prompts, temperature 0.
 - 140 tests pass.
 - AC6 PASS: generator run twice, `git diff --exit-code` clean.

@@ -19,7 +19,9 @@ on the M4 Pro, by making the measurement instruments trustworthy and by removing
 load-path and dispatch bottlenecks in the repacked GEMV. Prove hardware streaming
 bandwidth separately, as hardware bandwidth, not as a proxy for GEMV bandwidth.
 
-**Current measured state: 12.8 tok/s median.** The remaining gap is ~13 ms/token.
+**Current measured state: ~11.7 tok/s median** (range 10.5-12.9 across runs).
+The remaining gap to 15.0 is ~18 ms/token. See 6.4 for why a single reading
+cannot be quoted on this box.
 
 ## 2. Non-goals & restrictions
 
@@ -135,11 +137,11 @@ This is **411 trellis tensors**, not 421: full-attention layers have no separate
 
 | | ms/token | tok/s | aggregate effective |
 |---|---:|---:|---:|
-| **measured at HEAD** | **78.1** | **12.8** | **154 GB/s** |
+| **measured at HEAD** | **~85** | **~11.7** | **~142 GB/s** |
 | **15.0 tok/s** | **66.67** | **15.0** | **180.6 GB/s** |
 | 16.0 tok/s (stretch) | 62.50 | 16.0 | 192.6 GB/s |
 
-Required remaining gain: **1.17× at 15 tok/s.**
+Required remaining gain: **1.28× at 15 tok/s.**
 
 **19.0 tok/s is withdrawn.** It required a *dequantizing* GEMV to sustain this
 fraction of what a pure *copy* sustains on this box:
@@ -174,6 +176,14 @@ dispatches per token. That gap is now comparable to the entire non-GEMV cost and
 the single largest unexplained item.
 
 ### 6.4 What was measured to get here
+
+Measured, 64 tokens, temperature 0, uninstrumented, interleaved across two binaries
+(9 samples): `11.03 / 11.57 / 11.64 / 12.03 / 12.14 / 12.52 / 12.76 / 12.80 / 12.93`
+→ **median 12.14 tok/s**, spread **0.85**. The spread is the machine drifting, not the
+kernel changing: the same binary spans that range run to run. **No single reading is
+a measurement on this box** (AGENTS.md 10.5 records 3.7-6.4 tok/s from one binary).
+The 15.0 tok/s target is therefore quoted against 12.14, the centre, not against a
+best-of run.
 
 - 5 interleaved uninstrumented runs, 64 tokens: `11.57 / 12.76 / 12.93 / 12.52 / 12.80`
   → **median 12.76 tok/s**, up from ~10.5 before the fusion work.
