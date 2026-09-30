@@ -840,6 +840,10 @@ where
     // `KAPLUMBA_SEGMENTS=1`: decode rate bucketed by context length, so a run
     // says whether per-token cost grows as the KV does. See `SegmentLog`.
     let mut segments = SegmentLog::new();
+    // Where pipeline compilation stood when load finished. `warmup_decode`
+    // armed this; if a step compiles something, the assert below says so by
+    // name rather than leaving it inside a tok/s figure.
+    let load_mark = kaplumba_kernels::pipeline_audit::armed_mark().unwrap_or(0);
 
     let result = (|| -> Result<(), GenerationError> {
         let prefill_started = Instant::now();
@@ -891,8 +895,11 @@ where
             encoder.set_max_dispatches(2500);
             // `KAPLUMBA_DECODE_PROFILE=step`: two stamped boundaries around the
             // step, so its duration on the GPU timeline can be read. The span
-            // between them covers the ~42 rolled buffers in between, because one
+            // between them covers any buffers rolled in between, because one
             // Metal queue executes its command buffers in commit order.
+            // (Corrected: this used to say "~42 rolled buffers". Stale -- with
+            // `set_max_dispatches(2500)` above and 1167 dispatches/token,
+            // `tick()` never rolls, so the step commits 2 buffers, one empty.)
             crate::decode_profile::begin_step(&mut encoder, |encoder| {
                 model.calibration_dispatch(encoder)
             })
@@ -935,6 +942,12 @@ where
             crate::decode_profile::end_step(&mut encoder, step_ms).map_err(ModelError::from)?;
             decode_duration += Duration::from_secs_f64(step_ms / 1e3);
             segments.record(generated_ids.len(), position, step_ms);
+            // The measurement hazard this guards: a kernel compiled inside this
+            // loop charges Metal's shader build to `step_ms`, which is the
+            // number `decode_tokens_per_second` is made of. Checked AFTER the
+            // step is timed, so the panic cannot be mistaken for a slow step --
+            // and gated, so a default run pays one relaxed atomic load.
+            kaplumba_kernels::pipeline_audit::assert_no_builds_since(load_mark);
             logits = model.last_logits();
         }
 
@@ -952,6 +965,16 @@ where
     // `KAPLUMBA_COUNT_BUFFERS`: command buffers per decode step. The tally lives
     // in `forward_buffer`, the only scope that holds the encoder.
     crate::model::report_buffers_per_step();
+    // `KAPLUMBA_PIPELINE_AUDIT`: what was compiled, when, and whether any of it
+    // happened inside the loop above. Printed here, after the loop, so the
+    // `late_builds` field is a statement about the whole timed region rather
+    // than about whichever step happened to sample it.
+    if load_mark != 0 && std::env::var_os("KAPLUMBA_PIPELINE_AUDIT").is_some() {
+        eprintln!(
+            "{}",
+            kaplumba_kernels::pipeline_audit::audit_line_with_mark("after-decode", load_mark)
+        );
+    }
     margins.report();
     segments.finish();
     segments.report();

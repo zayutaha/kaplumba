@@ -865,9 +865,16 @@ kernel void burn(device float* out [[buffer(0)]],
         let Some((_device, queue, pipeline, out)) = burn_context() else {
             return;
         };
-        // One decode step of a 31B-class model at 1 query encodes ~2100
-        // dispatches (measured: 42 command buffers per step in
-        // `forward_buffer_into_step`).
+        // A decode-sized step of a 31B-class model at 1 query. The constant is
+        // only a scale choice for this rolling test; the real figure is
+        // 1407 dispatches/token (1167 after T7.6.10c), measured via
+        // `MetalEncoder::dispatches_total`.
+        //
+        // (Corrected: this comment claimed "measured: 42 command buffers per
+        // step in `forward_buffer_into_step`". That was stale and circular --
+        // 42 is exactly 2100/50, i.e. this constant divided by the default
+        // budget. `forward_buffer_into_step` calls `set_max_dispatches(2500)`,
+        // so it never rolls at all and commits 2 buffers, one of them empty.)
         const DECODE_DISPATCHES: usize = 2100;
         let mut encoder = MetalEncoder::new(&queue).expect("encoder");
         for _ in 0..DECODE_DISPATCHES {

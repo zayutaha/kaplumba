@@ -3,7 +3,9 @@
 Running log for `spec/decode-19tok-repacked-250gb/`. Updated per task.
 
 ## Baseline & Context
-- Target: 19+ tok/s decode, 250+ GB/s streaming bandwidth.
+- Target: **15+** tok/s decode, 250+ GB/s streaming bandwidth. (Header corrected from
+  19; 19 is excluded by arithmetic — see `spec.md` §6.2. The number is under review and
+  is the user's call, see `spec.md` R6.)
 - Model: Gemma 4 31B (`~/.kaplumba/models/Gxma/Gxma`), EXL3 3.0 bpw.
 - Measured baseline: ~11.2 tok/s on current Ishizuki 2-word kernel (`3230f24`).
 - Physical DRAM theoretical peak: 273 GB/s (Apple M4 Pro).
@@ -25,7 +27,8 @@ Running log for `spec/decode-19tok-repacked-250gb/`. Updated per task.
     - th=81920, tg=512: **254.0 GB/s median** (93.0% peak), **255.4 GB/s best**.
   - **12 GB Buffer (Full Model Weight Footprint):**
     - th=81920, tg=512: **250.5 GB/s median** (91.8% peak), **253.2 GB/s best**.
-- **Conclusion:** Hardware DRAM streaming bandwidth CAN exceed 250 GB/s on Apple M4 Pro when 128-bit aligned vector loads (`uint4`) are used with high thread occupancy. The previous 239-244 GB/s ceiling was an artifact of 4-byte scalar loads and thread configuration.
+- **Conclusion:** Hardware DRAM streaming bandwidth CAN exceed 250 GB/s on Apple M4 Pro when 128-bit aligned vector loads (`uint4`) are used with high thread occupancy.
+- ~~The previous 239-244 GB/s ceiling was an artifact of 4-byte scalar loads and thread configuration.~~ **WITHDRAWN (`spec.md` §5).** **Unsupported.** That figure came from `examples/conc.rs` (since deleted) and the predecessor spec already reconciled it as a *different shape*, not a narrower load. **Load width is a closed axis**: `decode-bandwidth-handover/spec.md:236` records "8/16/32 B all ~227-238". The conclusion above stands on its own measurement; the causal claim about the old ceiling does not, and it is the premise the withdrawn `_vec128` / `_u4` work rested on.
 
 ## T4 & T5: Column-Major Trellis GEMV (Elimination of Strided Striding)
 - Baseline row-major layout `[tiles_k, tiles_n, 48]` causes each threadgroup along N to jump by `tiles_n * 96` bytes on every single K step (up to 129 KB jumps).
@@ -72,6 +75,13 @@ Running log for `spec/decode-19tok-repacked-250gb/`. Updated per task.
    - Finding: Default `MAX_DISPATCHES_PER_BUFFER = 50` was chunking each 480-dispatch decode step into 10 separate Metal command buffers.
    - Result: Host submission latency and multi-buffer synchronization inflated per-token time to ~169 ms (5.91 tok/s).
    - Solution: Increasing dispatch budget per buffer for decode steps to 2500 commits the entire 60-layer pass in a single command buffer, immediately dropping step latency to **83.9 ms GPU own time (11.46 tok/s)**.
+   - **STALE — this finding is now measured and it is smaller than described.** A decode
+     step issues **1407 dispatches** (1167 after T7.6.10c), and since that is below
+     `max_dispatches = 2500`, `tick()` **never fires `roll()`**: the step commits **2
+     command buffers, one of them empty**, not one, and `MAX_IN_FLIGHT` is never
+     engaged. The "~169 ms / 5.91 tok/s" before-state is real but was measured against
+     the pre-fusion dispatch count; the useful part of this entry is the *method*
+     (raise `max_dispatches` for decode), not the number.
 
 5. **Profiler Distortion Finding (`KAPLUMBA_DECODE_PROFILE=kernel`):**
    - Observation: When `KAPLUMBA_DECODE_PROFILE=kernel` was enabled, decode throughput dropped from 11.46 tok/s to 0.7-2.2 tok/s.
@@ -84,6 +94,16 @@ Running log for `spec/decode-19tok-repacked-250gb/`. Updated per task.
    - Amplification factor: $128 / 96 = \mathbf{1.333\times}$.
    - Physical DRAM bus: Measured effective weight throughput of **188.4 GB/s** means the physical hardware DRAM bus is transferring $188.4 \times 1.333 = \mathbf{251.2\text{ GB/s}}$ (92% of theoretical peak 273 GB/s).
    - Path to 250+ GB/s effective weight bandwidth: Group 4 consecutive tiles along K into $4 \times 96\text{ bytes} = 384\text{ bytes} = \mathbf{3 \times 128\text{ bytes}}$ (6 full 64-byte cache lines) and issue 16-byte aligned vector loads (`uint4`), eliminating the $1.333\times$ hardware overhead completely.
+   > **⚠️ THE ENTIRE BLOCK ABOVE (§6) IS WITHDRAWN AS A CAUSAL CLAIM. Read `spec.md` §5.**
+   > The burst mechanism is wrong: a colmajor column is 32,256 B = 252×128, fully
+   > consumed, and consecutive K-tiles are gapless at 96 B stride with 128 B-aligned
+   > column bases (`exl3.rs:750-753`, `linear.metal:7780-7781`). No measurement or
+   > citation for the 128-byte burst exists in this repo or in `reference/omlx`.
+   > The $188.4 \times 1.333 = 251.2$ line is a fit to 92% of 273, not a diagnosis.
+   > The `_u4` "path" was built (T7.5) and **measured 180.5 → 173.7 GB/s on `gate_up` —
+   > a loss.** The T14 `D=32` follow-up (halving amplification directly) was **0.288–0.918×
+   > on all 11 shapes.** Both are dead. The tile math in the first three bullets is
+   > correct; the conclusion drawn from it is not.
 
 7. **Ground-Truth Decode Breakdown (Measured via `KAPLUMBA_DECODE_PROFILE=kernel KAPLUMBA_DECODE_PROFILE_WARMUP=1`):**
    - Steady-state decode step is **85.7 – 86.5 ms** (11.6 tok/s).
@@ -95,8 +115,22 @@ Running log for `spec/decode-19tok-repacked-250gb/`. Updated per task.
      - `head/gemv` (1 dispatch, 6 bpw): **4.17 ms** (4.4%)
      - Non-linear ops (`rms_norm`, `attention`, `rope`, `gated_gelu`, `residual`): **7.04 ms** (7.4%)
    - Key finding: 87.8 ms out of 94.8 ms is in linear projections.
-   - At 188 GB/s across all layers, the total weight transfer (9.88 GB) takes $9.88 / 188 = \mathbf{52.5\text{ ms}}$ ($\mathbf{19.0\text{ tok/s}}$).
-   - At 250 GB/s across all layers, the total weight transfer takes $9.88 / 250 = \mathbf{39.5\text{ ms}}$ ($\mathbf{25.3\text{ tok/s}}$).
+   - ~~At 188 GB/s across all layers, the total weight transfer (9.88 GB) takes 52.5 ms (19.0 tok/s).~~
+   - ~~At 250 GB/s across all layers, the total weight transfer takes 39.5 ms (25.3 tok/s).~~
+   - **BOTH LINES WITHDRAWN — the byte count is wrong by 22% and the conclusions are
+     excluded.** Three separate errors, each independently fatal:
+     1. **9.88 GB is wrong. The correct figure is 12.039 GB/token** (`spec.md` §6.1,
+        `12,039,487,488` B). The full-attention per-layer sum was mis-added. A 9.88 GB
+        denominator understates every bandwidth figure derived from it.
+     2. **The arithmetic does not follow from the corrected number either.** 12.039/188 =
+        64.0 ms (13.2 tok/s), not 52.5. And 12.039/250 = 48.1 ms, not 39.5.
+     3. **The 188 GB/s "ceiling" was a fit**, reverse-engineered to land on 92% of 273
+        via the withdrawn 1.333× burst story (`spec.md` §5). It is not a measurement.
+     4. **19.0 and 25.3 tok/s are both excluded.** 19 needs 264–283 GB/s of
+        *dequantizing* GEMV (105–113% of a pure copy, `spec.md` §6.2). 25.3 tok/s would
+        need 31.5 ms, i.e. the weights alone in 31.5 ms = **382 GB/s** — 1.5x a memcpy.
+     **Do not carry any tok/s figure out of this block.** The current, measured state is
+     13.511 tok/s (`spec.md` §6.4).
 
 8. **Grid Under-Subscription on Narrow Layers (Solved by Split-K 4):**
    - On `q_proj 5376x5376` and `o_proj 5376x5376`:
@@ -151,11 +185,18 @@ Running log for `spec/decode-19tok-repacked-250gb/`. Updated per task.
     - Combined 3 separate finalize dispatches for Q, K, and V into a single SIMD dispatch (`linear_finalize_simd3`), eliminating 100 kernel dispatches per token.
     - 100% bit-exact greedy decode verified. Total kernel own time dropped to **70.73 ms**.
 
-17. **Current Performance Status:**
+17. **Current Performance Status (SUPERSEDED — this snapshot is from the 70.73 ms build;**
+    **the current build is at 74.01 ms/step and 13.511 tok/s. Kept for the progression.)**
     - Kernel own time: **70.73 ms** (effective 165 GB/s sustained across all 60 layers).
     - Step span median: **84.06 ms** (min: 79.72 ms).
     - Uninstrumented decode throughput: **10.8+ tok/s** (up from 6.0 tok/s baseline, an 80% speedup).
     - Bit-exactness: 100% bit-for-bit exact match on all golden test sentences.
+    - **STALE — do not quote the "10.8+ tok/s" or the "165 GB/s".** Both are unpaired
+      single readings on a box that drifts 4–12% across unpaired samples (§20.7). The
+      figure of record is **13.511 tok/s / 74.01 ms/step / 162.6 GB/s aggregate**, from
+      16 interleaved pairs with a paired t of 6.80 on 14 df (`spec.md` §6.4). The
+      "80% speedup" is also measured against a 6.0 tok/s baseline that was itself read
+      off a 480-dispatch/step build, so the ratio is not a controlled comparison.
 
 ---
 
@@ -248,14 +289,36 @@ are **at the memory system's limit**. A perfect GEMV everywhere would save at mo
 bandwidth. **15 tok/s is the target; 19 is not reachable by kernel work on this box at
 3.0 bpw.**
 
+> **Superseded twice, both times by measurement — the conclusion survives, the numbers
+> do not.**
+> - The 229–266 GB/s range was computed before the non-GEMV own time was measured
+>   properly. With non-GEMV at 7.0–10.1 ms, 19 tok/s demands **264–283 GB/s**, i.e.
+>   **105–113%** of a pure copy. See `spec.md` §6.2 for the full table.
+> - **"15 tok/s is the target" is now itself unreachable by the plan.** The remaining
+>   fusion budget is 0.8 ms, which reaches 13.67 tok/s, and 15.0 needs 7.35 ms. What
+>   remains is the 64.6 ms of GEMV, where four mechanisms have failed. **The target
+>   number is under review and is the user's call** (`spec.md` R6).
+
 ### Next
 
-1. The **~13 ms span-minus-own gap** across ~800 dispatches per token — the largest
-   unexplained item, and now comparable to the whole non-GEMV cost.
-2. Restore `bench.rs` (the real-shape table + median/spread statistics) and
-   `bench_residency.rs` (the `MADV_DONTNEED` cold arm). Both were lost to the reset.
-3. `q`/`k`/`v` at 88–92 GB/s vs `lm_head` at 261 — settle on the cold instrument before
-   building anything on it.
+> **All three items below are DONE or CLOSED. Kept verbatim as the state at that date;
+> see the resolution under each one.** Current next steps are at the end of this file.
+
+1. ~~The **~13 ms span-minus-own gap** across ~800 dispatches per token — the largest
+   unexplained item, and now comparable to the whole non-GEMV cost.~~
+   **RESOLVED AS AN ARITHMETIC ERROR** (see "where the 72.6 ms actually is" below): the
+   13 ms differenced step-mode `span` against kernel-mode `own`, and step-mode `own` is
+   documented as *not a decode cost*. The replacement "~9 ms" is itself cross-instrument
+   and does not survive the current build. Both dispatch counts here are also wrong:
+   **1407 measured** (1167 after T7.6.10c), not "~800".
+2. ~~Restore `bench.rs` (the real-shape table + median/spread statistics) and
+   `bench_residency.rs` (the `MADV_DONTNEED` cold arm). Both were lost to the reset.~~
+   **DONE** — both recovered from the reflog and re-pointed at `_contig4`; results in
+   the "Recovered from the reset" section below.
+3. ~~`q`/`k`/`v` at 88–92 GB/s vs `lm_head` at 261 — settle on the cold instrument before
+   building anything on it.~~ **CLOSED** — it does not reproduce on the cold arm
+   (`bench_residency`: 121–126 GB/s for `full/kv`). It was the cached-working-set arm of
+   `bench_gemv`. `spec.md` §7.4 is marked closed. Do not rebuild on it.
 
 ### Recovered from the reset, and what it settled
 
@@ -328,6 +391,21 @@ boundary buffers, so it is small and **not a decode cost**". Correct figures:
 
 So kernel own time is ~95% of the step and the host gap is ~9 ms, not 13.
 
+> **⚠️ THE "~9 ms" IS ALSO CROSS-INSTRUMENT AND DOES NOT SURVIVE THE CURRENT BUILD.**
+> It differences `own` from the **distorted** kernel instrument (whose wall is
+> inflated by drains) against `wall` from an **uninstrumented** run. Two different
+> builds, two different instruments, and the kernel-mode row is internally inconsistent
+> (9.16 tok/s × 83.5 ms = 109 ms, not 83.5).
+>
+> On the current build the two numbers are `dpk_own_ms_per_token` = **71.644** (§20.2,
+> 96 tokens) and T7.6.10c's uninstrumented **74.01 ms/step** — which leaves **2.37 ms**,
+> not 9. A 6.5 ms improvement nobody has recorded, from 240 dispatches × 3.5 us = 0.84
+> ms plus whatever T7.6.8/9 bought. **Do not carry either number.** The instrument that
+> settles it — step mode's `dp_span_over_wall` / `dp_span_minus_wall` — has never once
+> been recorded in any file in this repo, and `KAPLUMBA_STEP_TRACE=1` likewise never
+> appears in any spec. It costs one extra commit per step without draining. **Run it
+> before planning anything against a gap number** (`spec.md` §7.1).
+
 ### The 1.333x was real after all — as REQUEST amplification, not DRAM burst
 
 This is the finding that matters, and it inverts the earlier withdrawal. Agent 3 found
@@ -372,10 +450,35 @@ prize in the kernels, and it is bounded by the 2.667x request rate, not by DRAM.
 
 Three attacks on the amplification were already measured and **failed**:
 `simd_shuffle` cooperative loads 180.5 -> 146.5; `_u4` 384-byte `uint4` loads 180.5 ->
-173.7 on gate_up; threadgroup ring staging 118.8 vs 119.5 (no change). The remaining
-untried lever is the bit-plane layout at `exl3.rs:687-726`, which makes each lane's
-three codes a single byte in three coalesced 32-byte-per-warp loads — that attacks the
-2.667x directly and is dead code today.
+173.7 on gate_up; threadgroup ring staging 118.8 vs 119.5 (no change).
+
+> **⚠️ The next paragraph was WRITTEN HERE AND HAS SINCE BEEN FALSIFIED TWICE. Both the
+> claim and the retraction are kept, because the sequence is the lesson.**
+>
+> ~~The remaining untried lever is the bit-plane layout at `exl3.rs:687-726`...~~
+> **WITHDRAWN — it is lossy, not a layout change.** `extract_ishizuki_lane_codes`
+> (`exl3.rs:664-681`) keeps `s & 0x7`, the lane's own 3 bits, while `decode_state_mcg`
+> consumes a **16-bit window** of which **13 bits survive** the `0x8fff8fff` mask. The
+> single `imul` mixes all 16 bits *before* any masking, so 3 bits of input yields
+> **different dequant**, not imprecise dequant. `repack_trellis_3bpw_tensor` is dead code
+> with zero callers and **must not be revived as-is**; making it bit-exact means keeping
+> the 13 discarded bits, which reconstructs the 24-word layout it was meant to replace.
+> It was never on the decode path, so nothing was lost by not building it.
+>
+> **And the amplification law above is a two-point coincidence.** The 0.1% fit
+> (187.9 predicted / 187.7 measured) does not extrapolate: `D = 32`, which halves byte
+> amplification 2.667 → 1.333 directly, ran **0.288–0.918× `_contig4` on all 11 real
+> shapes**, cold, 9 rounds, interleaved. Mechanism: a tile needs `256/D` lanes, so a
+> 32-lane simdgroup covers `D/8` output tiles and the grid becomes `tiles_n / D`;
+> `full/kv` has 128 output tiles, so `D=32` launches **4 threadgroups on 20 cores**. The
+> per-shape ordering is monotone in `tiles_n` — a starved grid, not a bandwidth wall.
+> The load path is not the wall either: the two probe arms fetched identical 128 B and
+> differed only in requests (22 vs 32), and the **22-request arm was slower on all 11
+> shapes by 2.6–8.1%**. Three points — 187.7, 148.7, 250.5 — and no single law fits them.
+>
+> **What is actually left: latency and occupancy.** Bytes, requests, ALU (removing decode
+> makes the kernel *slower*, −26.7%) and page backing (file/resident 0.98–1.03×) are all
+> ruled out by measurement. See `spec.md` §6.6.
 
 ### The ALU is not the problem, and that is measured, not argued
 
@@ -404,15 +507,27 @@ latency-bound, not bandwidth-bound, and costs ~0.15-0.27 ms/token total.
 intermediate is `raw`/`raw_b` in **fp32**, 20.6 MB/token, not the 5.2 MB the notes
 claimed.
 
-### Dispatch structure: the "~42 buffers/step" is stale
+### Dispatch structure: the "~42 buffers/step" is stale — **NOW MEASURED**
 
-Derived census: **1407 dispatches per step**, and since `1407 < max_dispatches(2500)`,
-`tick()` never fires `roll()` and the step commits **2 command buffers, one of them
-empty** — not 42. `MAX_IN_FLIGHT` is never engaged. The `~2100 dispatches` constant at
-`encoder.rs:846` and the `42 buffers/step` comments at `decode_profile.rs:21`,
-`generate.rs:893` and `spec/decode-bandwidth-240gb` all predate `set_max_dispatches`
-and the fused kernels. **Derived from the call graph, not yet measured** —
-`KAPLUMBA_COUNT_BUFFERS=1` settles it in one command.
+Derived census: **1407 dispatches per step** (**1167 after T7.6.10c**), and since
+`1407 < max_dispatches(2500)`, `tick()` never fires `roll()` and the step commits
+**2 command buffers, one of them empty** — not 42. `MAX_IN_FLIGHT` is never engaged.
+The `~2100 dispatches` constant at `encoder.rs:868` and the `42 buffers/step` comments
+at `decode_profile.rs:19`, `generate.rs:893` all predate `set_max_dispatches` and the
+fused kernels.
+
+**The dispatch count is now a measurement** — T7.6.10a added
+`MetalEncoder::dispatches_total` and recorded 1407/token (13.26–13.32 tok/s), then
+1167/token (13.511 tok/s) after the fusion. The 2-buffers-one-empty figure itself is
+still derived from the call graph; `KAPLUMBA_COUNT_BUFFERS=1` settles it in one
+command. The three code comments carrying "~42" have been corrected.
+
+> **Consequence that matters for planning, established in §20.1:** 1407 dispatches ×
+> 3.5 us = 4.9 ms of pure launch/bubble latency per step, and the 1167 remaining ×
+> 3.5 us = 4.1 ms. That is the *total* remaining fusion prize on this axis — not the
+> 5.5 ms the §19.4 roadmap claimed, and not the 0.8 ms that roadmap's surviving items
+> are worth. It is also roughly the size of the unattributed host gap in §7.1, which is
+> the strongest hint that the two are the same thing.
 
 Two real serialisation points per step, and the host **cannot** run ahead:
 `model.rs:3192` commits an empty buffer and waits against a provably idle queue (it
@@ -496,6 +611,31 @@ This eliminated scalar shifts and masks across 32 dequant calls per loop iterati
 `KAPLUMBA_GPU_PROFILE=1` injects 665 command buffer boundaries per step, inflating execution time by 5x due to GPU pipeline flushes and draining. For true hardware execution times, use `KAPLUMBA_DECODE_PROFILE=step` or `KAPLUMBA_STEP_TRACE=1`.
  
 ### 19.4 The 12.8 ms Non-Linear Tax and Fusion Roadmap to 19+ tok/s
+> **⚠️ EVERY ESTIMATE IN THIS BLOCK IS ~5–10× TOO HIGH, AND THE HEADLINE IS UNREACHABLE.**
+> Measured in §20.1: `norm_rope_qkv` removed 240 dispatches and saved **0.84 ms**, i.e.
+> **3.5 us per dispatch** — not the 3.5–4.5 ms predicted below. A dispatch costs
+> **latency, not work**: `dpk_own_ms_per_token` was 71.649 → 71.644 across that change.
+>
+> | item | claimed here | **measured / re-derived** |
+> |---|---:|---:|
+> | `norm_rope_qkv` (240 dispatches) | 3.5–4.5 ms | **0.84 ms** ✅ measured |
+> | T7.6.11 (60 dispatches) | 2.0 ms | **0.21 ms** |
+> | T7.6.12 (120 dispatches) | 2.0 ms | **0.42 ms** |
+> | T7.6.13 (60 dispatches) | 1.5 ms | **0.21 ms** |
+> | **total** | **9.0 ms** | **~0.8 ms** |
+> | projected step | 46.5–50.0 ms (20.0–21.5 tok/s) | **73.2 ms (13.67 tok/s)** |
+>
+> The original estimates assumed a dispatch's *own kernel time*. That assumption is
+> **falsified**: the fused and unfused kernels do the same arithmetic over the same
+> bytes and their own time is identical to three decimal places. Only the boundaries
+> went away. **Never estimate a fusion from the kernel time it absorbs.**
+>
+> The 46.5–50.0 ms projection also requires the 64.6 ms of GEMV to move, and it cannot:
+> every mechanism tried for the 3 bpw rate has failed (§6.6 above, `spec.md` §6.6).
+> **19 tok/s is excluded by arithmetic** — it needs 264–283 GB/s of dequantizing GEMV,
+> 105–113% of a pure copy (`spec.md` §6.2). This block is kept verbatim as a record of
+> the estimate that was wrong, and as the calibration point for the one that was right.
+
 Dissecting the current 68.2-70.4 ms forward decode step:
 - **Linear GEMV Projections:**
   - `gate_up`: 27.6 ms
@@ -541,6 +681,14 @@ dispatch-fusion budget is **~0.8 ms**, which cannot reach the 52.6 ms target
 (19 tok/s) on its own — the target needs the 55.5 ms of GEMV time to move, not
 the 12.8 ms of non-linear tax. The §19.4 projection of "46.5-50.0 ms/step" is
 **not reachable by fusion** and should not be planned against.
+
+> **Stronger, and the number to plan against: 0.8 ms lands at 13.67 tok/s, which does
+> not reach 15.0 either.** 1167 dispatches × 3.5 us = 4.1 ms is the *total* remaining
+> launch-latency prize on this axis if every dispatch could be removed; the roadmap's
+> three items are 240 of those. 15.0 tok/s needs −7.35 ms. So the gate is not a fusion
+> target at all — it is a GEMV target, and §6.6 records that the GEMV has four
+> measured failures and no surviving hypothesis. **19 is not merely unreachable by
+> fusion; it is excluded outright** (`spec.md` §6.2).
 
 ### 20.2 The saving is NOT saved kernel work -- it is bubble
 

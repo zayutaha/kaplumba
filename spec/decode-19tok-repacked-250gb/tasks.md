@@ -1,4 +1,13 @@
-# Tasks: Decode 19+ tok/s and 250+ GB/s via Repacked Weights
+# Tasks: Decode 15+ tok/s and 250+ GB/s via Repacked Weights
+
+> **Title corrected from 19 to 15** (the target was lowered in `spec.md`'s header; this
+> file's title and T8's acceptance line were never updated and would send a future
+> agent back to 19). **T8's acceptance line is corrected below.** The target *number*
+> itself is unchanged and remains the user's call — see `spec.md` R6's pending-decision
+> note.
+>
+> **T7.6.11–13 are budgeted at 3.5 us per dispatch removed** (`spec.md` §9), not at
+> kernel time. T7.6.13 carried no revision note and is fixed here.
 
 - [x] **T1: Create synthetic memory bandwidth probe harness** (`8a77fac`)
   - Files: `crates/engine/examples/probe_bw_250gb.rs`, `crates/kernels/src/bw_probe.metal`
@@ -40,25 +49,29 @@
   - Intent: Allow `MetalEncoder` to configure `max_dispatches = 2500` for decode steps without requiring env var, while preserving 50 for prefill.
   - Result: Added `set_max_dispatches` on `MetalEncoder`. Configured in `model.rs` and `generate.rs`. Verified: decode commits in single command buffer automatically, sustaining steady-state 86.2 ms/token (11.6 tok/s). All kernel tests pass.
 
-- [x] **T7.2: Vector coalescing & Split-K investigation**
+- [x] **T7.2: Vector coalescing & Split-K investigation** — **CANCELLED, results superseded**
   - Files: `crates/kernels/src/linear.metal`, `crates/engine/examples/bench_colmajor.rs`
   - Intent: Test 128-byte coalesced SIMD loads and Split-K 4 to address memory controller gather and grid under-subscription.
   - Result: `linear_gemv_ishizuki_k3_colmajor_simd` achieved 128.1 GB/s on 5376x5376 (+18% over baseline 108.5 GB/s). `linear_gemv_ishizuki_k3_colmajor_sk4` (Split-K 4) increased throughput to 142.6 GB/s (+31% over baseline) by expanding grid from 336 to 1344 threadgroups. On wide shapes (`gate_up 5376x43008`), baseline colmajor is optimal at 189.3 GB/s.
+  - **Superseded on both halves, measured.** (a) *Split-K is unavailable under the no-quality-loss rule* — it measured 3–5 ULP from the reference on every shape (`spec.md` §5), and in-engine it was **slower** (T7.6.9: contig4 188.2 vs sk4 168.1 on `gate_up`). The "+31%" came from a partly-cached working set, the same artifact that inflated T12's "+24%". (b) *The `_simd` coalescing arm is the `simd_shuffle` family*, which measured **180.5 → 146.5 GB/s on `up_proj`** when A/B'd properly — the win is on the 5376×5376 shape only and does not survive on a wide one. Both kernels are dead on the decode path.
 
-- [x] **T7.3: Implement and verify SIMD coalesced GEMV kernel**
+- [x] **T7.3: Implement and verify SIMD coalesced GEMV kernel** — **CANCELLED**
   - Files: `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`, `crates/engine/tests/repacked_golden.rs`
   - Intent: Register `linear_gemv_ishizuki_k3_colmajor_simd`, verify against CPU reference.
   - Result: Verified 100% bit-exact across all 512 elements against original Ishizuki reference dequantizer.
+  - **Bit-exactness is real and is not the problem; performance is.** The kernel is not on the decode path: `simd_shuffle` cooperative loads measured **180.5 → 146.5 GB/s** on `up_proj` because dynamic per-lane shuffles serialize through the SIMD crossbar (`implementation_notes.md` finding 1). Cancel the task; the verification method is worth reusing, the kernel is not worth shipping.
 
 - [x] **T7.4: Measure full model decode breakdown and identify remaining gap**
   - Files: `spec/decode-19tok-repacked-250gb/implementation_notes.md`
   - Intent: Dissect 85.7 ms steady-state decode step via `KAPLUMBA_DECODE_PROFILE=kernel`.
-  - Result: Verified per-step breakdown: `gate_up_proj` 35.58 ms, `down_proj` 18.37 ms, `qkv_proj` 19.94 ms, `o_proj` 9.74 ms, `head/gemv` 4.17 ms, non-linear ops 7.04 ms. Total linear projections: 87.8 ms. At 188 GB/s full-model bandwidth, theoretical floor is 52.5 ms (19.0 tok/s).
+  - Result: Verified per-step breakdown: `gate_up_proj` 35.58 ms, `down_proj` 18.37 ms, `qkv_proj` 19.94 ms, `o_proj` 9.74 ms, `head/gemv` 4.17 ms, non-linear ops 7.04 ms. Total linear projections: 87.8 ms.
+  - **Corrected:** the original line ended "At 188 GB/s full-model bandwidth, theoretical floor is 52.5 ms (19.0 tok/s)." **Both halves are withdrawn.** The weight traffic is **12.039 GB/token**, not the 9.88 GB that number assumed, so 12.039/188 = 64.0 ms, not 52.5 — and 19 tok/s is excluded outright (`spec.md` §6.2; AC1's 188 GB/s "ceiling" was itself a fit to land on 92% of 273). The `87.8 ms` vs `85.7 ms` inconsistency above is a per-kernel-sum vs whole-step difference; the current profile is in `spec.md` §6.3.
 
 - [x] **T7.5: Implement vector coalescing, finalize wiring, and Split-K investigation**
   - Files: `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`, `crates/engine/tests/repacked_golden.rs`, `crates/engine/examples/bench_colmajor.rs`
   - Intent: Wire finalize pipeline into `encode_ishizuki_gemv_named`, test `linear_gemv_ishizuki_k3_colmajor_u4` with 128-byte aligned loads across 384-byte chunks (4 tiles).
   - Result: Finalize pipeline wired and tested in `repacked_golden.rs`. `u4` vector loading achieved 95.8 GB/s on `q_proj` (+41% over baseline 67.9 GB/s) and 153.5 GB/s on `up_proj` (+13.5%). Split-K 4 evaluated on `o_proj`: adds 60 reduction dispatches per token, creating command buffer dispatch overhead. Inner-loop threadgroup barriers identified as throughput killer; barrier-free K-loop restored.
+  - **CANCELLED, and the "+41%" does not survive.** `_u4` is the 384-byte `uint4` staging attack on the amplification thesis, and A/B on the real shape gives **180.5 → 173.7 GB/s on `gate_up` — a loss** (`spec.md` §6.6). The `q_proj` +41% is a narrow-shape, partly-cached-arm number, the same artifact as T12's withdrawn +24%. **This is the load-width axis that the withdrawn 128-byte-burst thesis was built on**, and it is now closed three ways: `_u4` (uint4) loses, `_u8` (deeper unroll) is 1.01–1.03×, and `D=32` (1.333× amplification) is 0.288–0.918× on all 11 shapes. **The kernels are not on the decode path.**
 
 - [x] **T7.6.1: Direct MCG specialization and full-attn Q+K fusion** (`4b7c528`)
   - Files: `crates/kernels/src/linear.metal`, `crates/engine/src/model.rs`
@@ -99,11 +112,13 @@
   - Files: `crates/kernels/src/encoder.rs`, `crates/engine/src/model.rs`, `crates/engine/src/generate.rs`, `crates/engine/src/exl3.rs`
   - Intent: Eliminate the 1.27s Metal JIT shader compilation penalty on the first decode step via `warmup_decode` at model load. Skip empty command buffer commits in `flush_and_wait`. Optimize `argmax_logits` comparison loop and reuse `logits` vector in-place via `forward_buffer_into_vec`. Fix shift overflow in `pack_integer_windows`.
   - Result: Step 0 dropped from 1,277 ms to 69.9 ms. Decode throughput boosted from 12.39 tok/s to 14.04 tok/s. TTFT dropped from 3.23s to 1.23s. 100% bit-exact golden output verified.
+  - **Superseded — the 14.04 tok/s was a single-arm reading on a drifting box, not a measurement.** AGENTS.md 10.5 records 3.7–6.4 tok/s from *one* binary on this box, and §20.7 of the notes records 4–12% spread across 16 *unpaired* samples. A single before/after pair cannot resolve a 13% effect. The real current figure, from a 16-pair interleaved A/B with sign test p = 0.0005, is **13.511 tok/s** (T7.6.10c). The 14.04 is inside the historical range (12.14 median, 12.76 median, 12.50 median across other sessions) and should not be quoted as a result.
 
 - [x] **T7.6.9: Split-K gating and MCG ALU half2 vector optimization**
   - Files: `crates/kernels/src/linear.rs`, `crates/kernels/src/linear.metal`, `crates/kernels/src/linear_repacked.metal`
   - Intent: Benchmark Split-K vs contiguous 4-tile (`contig4`) layout. Gate Split-K behind `KAPLUMBA_USE_SK=1` because wide/medium matrices already saturate 20 GPU cores (134 SIMD groups/core) and Split-K incurs DRAM roundtrips and smaller reduction loops. Optimize `decode_state_mcg` with direct `half2` vector bitcast.
   - Result: Eliminating Split-K reduction roundtrips dropped forward step latency from ~80.9 ms to ~69.8-70.4 ms (decode speed jumped from 12.35 tok/s to 14.02 tok/s). `half2` bitcast replaced scalar shifts/masks across 32 dequant calls per loop step. 0 FP16 diffs in `live_kernel_bit_exact` and `fused_bit_exact`.
+  - **The 12.35 → 14.02 tok/s figure is unpaired and does not survive the evidence standard.** Same failure mode as T7.6.8: two arm readings on a box that drifts 4–12% across unpaired samples. What *is* solid here is the **isolated A/B behind it** (`implementation_notes.md` §19.1, one binary, interleaved): contig4 **188.2** vs sk4 **168.1** GB/s on `gate_up`, 177.4 vs 176.7 on `down_proj`, 150.6 vs 140.2 on `q_proj` — contig4 wins every shape, which is why Split-K is gated off. The `half2` bitcast is separately verified bit-exact (0 fp16 diffs). Quote §19.1, not the tok/s delta.
 
 - [x] **T7.6.10a: Count dispatches, not just command buffers** (`021067c`)
   - Files: `crates/kernels/src/encoder.rs`, `crates/engine/src/model.rs`, `crates/engine/src/generate.rs`
@@ -150,11 +165,13 @@
 - [ ] **T7.6.13: Attention Fast-Path Single Dispatch for Short Decode Context**
   - Files: `crates/kernels/src/attention.rs`, `crates/engine/src/model.rs`
   - Intent: When decode KV context length is < 64 (splits == 1), bypass split pipelines (`decode_split_pipelines` + `decode_combine`), dispatching single-pass attention directly.
-  - Estimated impact: ~1.5 ms reduction in step latency.
+  - Estimated impact: ~1.5 ms reduction in step latency. **REVISED BY MEASUREMENT: 60 dispatches x 3.5 us = ~0.21 ms, not 1.5 ms — a 7x overestimate, and this line was the one T7.6.10's revision pass left un-revised.** This is the only remaining roadmap item not covered by the measured 3.5 us calibration, so verify the dispatch count with `MetalEncoder::dispatches_total` before building: if the fast path removes more or fewer than 60, the saving scales proportionally. `attention` is also the one non-GEMV kernel with real own time (2.31 ms of the 72.6 ms profile), so a saving *larger* than 0.21 ms is possible here in a way it is not for the other two — measure, do not assume.
 
 - [ ] **T8: End-to-end decode benchmark and acceptance validation**
   - Files: `spec/decode-19tok-repacked-250gb/implementation_notes.md`
   - Intent: Measure end-to-end tok/s using `scripts/gpuq run` across reference prompts.
-  - Acceptance: Pure autoregressive decode throughput >= 19.0 tok/s (<= 52.6 ms/step) against physical 250+ GB/s ceiling with 100% bit-exact greedy generation.
+  - Acceptance: Pure autoregressive decode throughput **>= 15.0 tok/s (<= 66.7 ms/step)** against the physical 250+ GB/s ceiling with 100% bit-exact greedy generation, by the paired method in AC5 (>= 16 interleaved pairs, median + spread + paired test).
+  - **Corrected from ">= 19.0 tok/s (<= 52.6 ms/step)".** 19 was withdrawn in the spec header; 19 is additionally excluded by arithmetic (`spec.md` §6.2: 19 tok/s needs 264–283 GB/s of *dequantizing* GEMV, i.e. 105–113% of a pure copy). **Current: 13.511 tok/s (74.01 ms/step, 1167 dispatches/token, T7.6.10c, 16 pairs, spread 4.1%).**
+  - The target number is under review and is the user's call — see `spec.md` R6. The remaining fusion budget (T7.6.11–13) is ~0.8 ms, which reaches 13.67.
 
 

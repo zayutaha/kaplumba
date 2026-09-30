@@ -16,9 +16,16 @@
 //! * `step` — **two** command-buffer boundaries per decode step (one opening,
 //!   one closing) and nothing else. `close.end - open.start` is the whole
 //!   step's duration on the GPU timeline: the intermediate rolled buffers
-//!   (`MAX_DISPATCHES_PER_BUFFER = 50` dispatches each, ~42 of them for a
-//!   31B-class step) are executed in commit order between the two, so the span
-//!   covers all of them without stamping any. Cost: one extra commit per step.
+//!   (`MAX_DISPATCHES_PER_BUFFER = 50` dispatches each) are executed in commit
+//!   order between the two, so the span covers all of them without stamping any.
+//!   Cost: one extra commit per step.
+//!
+//!   (Corrected: an earlier version of this comment said "~42 of them for a
+//!   31B-class step". That is stale. A decode step now issues 1407 dispatches
+//!   -- 1167 after T7.6.10c -- and callers set `max_dispatches(2500)`, so
+//!   `tick()` never rolls and the step commits 2 command buffers, one of them
+//!   empty. The rolling path below is still what prefill and any caller that
+//!   leaves the default 50 in place exercise.)
 //!   This is the clock.
 //! * `kernel` — stamps every existing per-kernel boundary and accumulates
 //!   across steps into one report instead of printing a table per token. This
