@@ -128,14 +128,7 @@ fn the_two_word_window_is_bit_identical_to_the_three_word_original() {
                 continue;
             }
             let (a, b) = run_pair(
-                &device,
-                &kernels,
-                &queue,
-                in_f,
-                out_f,
-                bits,
-                &original,
-                &variant,
+                &device, &kernels, &queue, in_f, out_f, bits, &original, &variant,
             );
             compared += 1;
             if a != b {
@@ -198,7 +191,11 @@ fn run_pair(
         for (code, slot) in states.iter_mut().enumerate() {
             *slot = matvec_golden::states_for(tile, code, bits);
         }
-        packed.extend(kaplumba_engine::exl3::pack_integer_states(&states, bits).unwrap().0);
+        packed.extend(
+            kaplumba_engine::exl3::pack_integer_states(&states, bits)
+                .unwrap()
+                .0,
+        );
     }
     let packed_b = device.new_buffer_with_data(
         packed.as_ptr() as *const std::ffi::c_void,

@@ -444,6 +444,73 @@ fn run_named(rig: &Rig, case: &Case, name: &str, passes: usize) -> f64 {
 /// start, so a clock ramp shows up as a *ratio* that moves, not as a number that
 /// moves -- which is the difference between a visible problem and a confident
 /// wrong answer.
+/// The T6 sweep: 3-word window against 2-word, on the **live** ishizuki kernel.
+///
+/// Interleaved for the reason `nr0_sweep` gives, and with a further wrinkle: the
+/// two arms differ by a *load*, so a clock ramp would move them together and the
+/// ratio would survive it — but a *thermal* or contention difference would not,
+/// and would show up as a ratio. Reporting the ratio against a baseline
+/// re-measured every round is what makes the ratio trustworthy, and printing the
+/// absolute medians alongside it is what makes a suspiciously stable ratio
+/// checkable.
+fn w2_sweep(rig: &Rig, shape: &Shape) {
+    let case = Case::build(rig, shape.in_f, shape.out_f, shape.rate);
+    let passes = ((300e6 / case.bytes).ceil() as usize).clamp(4, 64);
+    let bits = shape.rate;
+    let names: Vec<(String, String)> = vec![
+        (
+            "3-word".to_string(),
+            format!("linear_gemv_ishizuki_k{bits}"),
+        ),
+        (
+            "2-word".to_string(),
+            format!("linear_gemv_ishizuki_k{bits}_w2"),
+        ),
+    ];
+    for (_, name) in &names {
+        if rig.kernels.ishizuki_gemv_pipeline_by_name(name).is_none() {
+            println!("  skipping {name}: not in the library");
+            return;
+        }
+    }
+    for (_, name) in &names {
+        let _ = run_named(rig, &case, name, passes);
+    }
+    let rounds = 7;
+    let mut samples: Vec<Vec<f64>> = vec![Vec::with_capacity(rounds); names.len()];
+    for _ in 0..rounds {
+        for (index, (_, name)) in names.iter().enumerate() {
+            samples[index].push(run_named(rig, &case, name, passes));
+        }
+    }
+    let mb = case.bytes / 1e6;
+    println!(
+        "\n  {} x{} @ {}bpw = {mb:.1} MB, {rounds} interleaved rounds of {passes} passes",
+        shape.in_f, shape.out_f, shape.rate
+    );
+    println!(
+        "    {:<10}{:>10}{:>10}{:>10}{:>10}",
+        "window", "med ms", "GB/s", "vs 3-word", "vs 240"
+    );
+    let base = {
+        let mut s = samples[0].clone();
+        median(&mut s)
+    };
+    for (index, (label, _)) in names.iter().enumerate() {
+        let mut s = samples[index].clone();
+        let mut sorted = s.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+        let m = median(&mut s);
+        let gbps = mb / 1e3 / (m / 1e3);
+        println!(
+            "    {label:<10}{m:>10.4}{gbps:>10.1}{:>9.3}x{:>9.0}%   spread {:.2}x",
+            base / m,
+            100.0 * gbps / 240.0,
+            sorted[0] / sorted[sorted.len() - 1],
+        );
+    }
+}
+
 fn nr0_sweep(rig: &Rig, shape: &Shape) {
     let case = Case::build(rig, shape.in_f, shape.out_f, shape.rate);
     let passes = ((300e6 / case.bytes).ceil() as usize).clamp(4, 64);
@@ -502,6 +569,7 @@ fn main() {
         .position(|a| a == "--only")
         .map(|i| args[i + 1].clone());
     let nr0 = args.iter().any(|a| a == "--nr0");
+    let w2 = args.iter().any(|a| a == "--w2");
 
     let device = Device::system_default().expect("Metal device");
     let kernels = LinearKernels::shared().expect("kernels");
@@ -529,6 +597,56 @@ fn main() {
 
     if selftest {
         run_selftest(&rig);
+        return;
+    }
+
+    if w2 {
+        // gate/up/down carry 65% of a decode token's bytes; q_proj is a mid-size
+        // sliding projection; down_proj is the 16x-more-k axis, where the k loop
+        // is long and the window is re-read every iteration -- so if the extra
+        // load were costing anything, it would show most there. lm_head is 6 bpw
+        // and has no 2-word variant (the derivation excludes it), which is itself
+        // worth printing: it is the one shape where the lever provably does not
+        // apply.
+        for shape in [
+            Shape {
+                name: "gate_proj",
+                in_f: 5376,
+                out_f: 21504,
+                rate: 3,
+            },
+            Shape {
+                name: "up_proj",
+                in_f: 5376,
+                out_f: 21504,
+                rate: 3,
+            },
+            Shape {
+                name: "down_proj",
+                in_f: 21504,
+                out_f: 5376,
+                rate: 3,
+            },
+            Shape {
+                name: "o_proj slide",
+                in_f: 5376,
+                out_f: 8192,
+                rate: 3,
+            },
+            Shape {
+                name: "k_proj slide",
+                in_f: 5376,
+                out_f: 4096,
+                rate: 3,
+            },
+        ] {
+            w2_sweep(&rig, &shape);
+        }
+        println!(
+            "\n  6 bpw (lm_head) has no 2-word variant: two_word_is_safe reports \
+             KA=6 as used [6,63] < max sh 22, so word 3 IS read there. That is the \
+             derivation, not an omission."
+        );
         return;
     }
 

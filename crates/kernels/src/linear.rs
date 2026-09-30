@@ -1120,6 +1120,30 @@ impl LinearKernels {
         if bits < 1 || bits > 8 || packed_offset % 4 != 0 {
             return None;
         }
+        // The 2-word window where it is provably equivalent, unless asked for the
+        // 3-word form by name.
+        //
+        // Selected by looking the `_w2` name up in the map, so the dispatch
+        // decision and the kernel that exists cannot disagree: a rate with no
+        // `_w2` kernel simply falls through to the 3-word slot, which is why 6 bpw
+        // (`lm_head`) is unaffected rather than broken. The alternative — a
+        // parallel `bool` per rate — is a second list to keep in step with the
+        // generator, and would fail open (dispatching a kernel that does not
+        // exist) rather than closed.
+        //
+        // `KAPLUMBA_ISHIZUKI_3WORD=1` restores the original. It exists because the
+        // variant is bit-identical by construction *and* verified on the hardware,
+        // so there is no correctness reason to want the old form — only an
+        // attribution reason, when re-measuring a number that was taken before
+        // this landed.
+        if !env_flag("KAPLUMBA_ISHIZUKI_3WORD") {
+            if let Some(pipeline) = self
+                .ishizuki_gemv_by_name
+                .get(&format!("linear_gemv_ishizuki_k{bits}_w2"))
+            {
+                return Some(pipeline);
+            }
+        }
         self.ishizuki_gemv_pipelines[bits as usize].as_ref()
     }
 
@@ -1519,13 +1543,17 @@ impl LinearKernels {
         // eight codes, 256-thread groups, and enough threads to fill the GPU.
         // This is the real decode path; `gemv_buffer` routes the same way.
         if let Some(pipeline) = self.ishizuki_gemv_pipeline(rate, packed_offset) {
-            Self::trace_gemv(&format!(
-                "linear_gemv_ishizuki_k{}",
-                match rate {
-                    Exl3Rate::Integer(bits) => bits,
-                    _ => 0,
-                }
-            ));
+            // Trace the name that was *actually selected*, not one reconstructed
+            // from the rate: the trace exists to answer "which kernel ran", and a
+            // reconstructed name would keep answering the old question correctly
+            // while the answer changed.
+            Self::trace_gemv(
+                self.ishizuki_gemv_by_name
+                    .iter()
+                    .find(|(_, candidate)| std::ptr::eq(*candidate, pipeline))
+                    .map(|(name, _)| name.as_str())
+                    .unwrap_or("linear_gemv_ishizuki_k<unknown>"),
+            );
             self.encode_ishizuki_gemv(
                 encoder,
                 pipeline,
