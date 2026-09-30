@@ -977,8 +977,7 @@ impl LinearKernels {
             || !request.out_features.is_multiple_of(16)
         {
             return Err(KernelError::InvalidInput(
-                "linear dimensions must be non-zero multiples of 128 (output of 16)"
-                    .to_string(),
+                "linear dimensions must be non-zero multiples of 128 (output of 16)".to_string(),
             ));
         }
         let in_features = request.in_features;

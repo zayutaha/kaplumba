@@ -79,7 +79,10 @@ fn reference(input: &[u16], input_signs: &[u16]) -> Vec<u16> {
             *value *= scale;
         }
     }
-    values.iter().map(|value| f16::from_f32(*value).to_bits()).collect()
+    values
+        .iter()
+        .map(|value| f16::from_f32(*value).to_bits())
+        .collect()
 }
 
 /// Run the kernel over `in_features / 128` blocks and return the output bits.
@@ -139,7 +142,9 @@ fn gpu(input: &[u16], input_signs: &[u16], in_features: usize) -> Vec<u16> {
             in_features + index,
         );
     }
-    (0..in_features).map(|index| unsafe { *words.add(index) }).collect()
+    (0..in_features)
+        .map(|index| unsafe { *words.add(index) })
+        .collect()
 }
 
 fn check(in_features: usize, seed: u32) {
@@ -148,7 +153,14 @@ fn check(in_features: usize, seed: u32) {
         .map(|index| spread_half(&words[index * 4..index * 4 + 4]))
         .collect();
     let input_signs: Vec<u16> = (0..in_features)
-        .map(|index| f16::from_f32(if words[index * 4 + 3] % 2 == 0 { -1.0 } else { 1.0 }).to_bits())
+        .map(|index| {
+            f16::from_f32(if words[index * 4 + 3] % 2 == 0 {
+                -1.0
+            } else {
+                1.0
+            })
+            .to_bits()
+        })
         .collect();
 
     let expected = reference(&input, &input_signs);
@@ -221,9 +233,19 @@ fn input_transform_is_deterministic_and_block_local() {
         .map(|index| spread_half(&words[index * 4..index * 4 + 4]))
         .collect();
     let input_signs: Vec<u16> = (0..in_features)
-        .map(|index| f16::from_f32(if words[index * 4 + 3] % 2 == 0 { -1.0 } else { 1.0 }).to_bits())
+        .map(|index| {
+            f16::from_f32(if words[index * 4 + 3] % 2 == 0 {
+                -1.0
+            } else {
+                1.0
+            })
+            .to_bits()
+        })
         .collect();
-    assert_eq!(gpu(&input, &input_signs, in_features), gpu(&input, &input_signs, in_features));
+    assert_eq!(
+        gpu(&input, &input_signs, in_features),
+        gpu(&input, &input_signs, in_features)
+    );
 
     // Block locality: changing one sign in block 20 must leave every other
     // block's output bits alone. A kernel whose lane mapping crossed blocks
@@ -233,11 +255,20 @@ fn input_transform_is_deterministic_and_block_local() {
     perturbed[20 * 128 + 7] ^= 0x8000;
     let before = gpu(&input, &input_signs, in_features);
     let after = gpu(&input, &perturbed, in_features);
-    let changed: Vec<usize> = (0..in_features).filter(|i| before[*i] != after[*i]).collect();
+    let changed: Vec<usize> = (0..in_features)
+        .filter(|i| before[*i] != after[*i])
+        .collect();
     assert_eq!(
-        changed.iter().filter(|i| **i < 20 * 128 || **i >= 21 * 128).count(),
+        changed
+            .iter()
+            .filter(|i| **i < 20 * 128 || **i >= 21 * 128)
+            .count(),
         0,
         "flipping one sign inside block 20 changed {changed:?}, which is outside it",
     );
-    assert_eq!(reference(&input, &perturbed), after, "perturbed run not bit-exact");
+    assert_eq!(
+        reference(&input, &perturbed),
+        after,
+        "perturbed run not bit-exact"
+    );
 }

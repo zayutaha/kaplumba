@@ -175,7 +175,10 @@ impl Tickets {
         let mut index = 0usize;
         if let Ok(text) = std::fs::read_to_string(&self.path) {
             for line in text.lines() {
-                let pid = line.split_whitespace().next().and_then(|p| p.parse::<u32>().ok());
+                let pid = line
+                    .split_whitespace()
+                    .next()
+                    .and_then(|p| p.parse::<u32>().ok());
                 if let Some(p) = pid {
                     if p == self.me {
                         return index + 1;
@@ -394,22 +397,26 @@ mod tests {
         assert!(text.contains("#2"), "position missing: {text}");
         assert!(text.contains("75"), "exit code missing: {text}");
         assert!(text.contains("0.8s"), "waited missing: {text}");
-        assert!(text.contains("kaplumba-test-gpu.lock"), "path missing: {text}");
+        assert!(
+            text.contains("kaplumba-test-gpu.lock"),
+            "path missing: {text}"
+        );
     }
 
     #[test]
     fn queue_prunes_dead_pids_and_keeps_live_ones() {
-        let path = std::env::temp_dir().join(format!(
-            "kaplumba-queue-test-{}.queue",
-            std::process::id()
-        ));
+        let path =
+            std::env::temp_dir().join(format!("kaplumba-queue-test-{}.queue", std::process::id()));
         // A pid that cannot exist, and our own (definitely alive).
         let seed = format!("4294967294 1 dead\n{} 1 alive\n", std::process::id());
         let _ = std::fs::write(&path, seed);
         let t = Tickets::join(path.clone());
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(!text.contains("4294967294"), "dead pid survived: {text}");
-        assert!(text.contains(&std::process::id().to_string()), "live pid pruned: {text}");
+        assert!(
+            text.contains(&std::process::id().to_string()),
+            "live pid pruned: {text}"
+        );
         // We are the only live waiter, so we are first.
         assert_eq!(t.position(), 1);
         t.leave();

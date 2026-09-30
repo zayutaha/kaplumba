@@ -22,13 +22,7 @@ fn stamp(label: &str, own_ms: f64, gap_ms: f64, start_s: f64) -> GpuStamp {
 fn row(report: &str, kernel: &str) -> (u64, f64, f64) {
     let line = report
         .lines()
-        .find(|line| {
-            line.trim_start().starts_with(kernel)
-                && line
-                    .split_whitespace()
-                    .count()
-                    == 4
-        })
+        .find(|line| line.trim_start().starts_with(kernel) && line.split_whitespace().count() == 4)
         .unwrap_or_else(|| panic!("no row for {kernel} in:\n{report}"));
     let fields: Vec<&str> = line.split_whitespace().collect();
     assert_eq!(fields[0], kernel, "wrong row picked: {line}");
@@ -47,7 +41,10 @@ fn disabled_profile_absorbs_nothing() {
     // so the non-profiling path stays free of profiling work.
     profile.ingest(&[stamp("layer00/q_proj", 5.0, 0.0, 0.0)]);
     let report = profile.render();
-    assert!(report.contains("sum of per-kernel GPU own_ms = 0.000 ms"), "{report}");
+    assert!(
+        report.contains("sum of per-kernel GPU own_ms = 0.000 ms"),
+        "{report}"
+    );
     assert!(report.contains("0.000 ms   inter-boundary gap"), "{report}");
 }
 
@@ -142,7 +139,11 @@ fn calibration_batch_keeps_the_stamps_it_swallows_with_it() {
     assert_eq!(row(&profile.render(), "chunk/greedy_pick"), (1, 4.0, 4.0));
     // The real work is neither in the calibration samples nor in the totals twice.
     assert!(profile.render().contains("own_ms = 12.000 ms"));
-    assert!(!profile.render().contains("WARNING"), "{}", profile.render());
+    assert!(
+        !profile.render().contains("WARNING"),
+        "{}",
+        profile.render()
+    );
 }
 
 #[test]

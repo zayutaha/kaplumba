@@ -175,7 +175,9 @@ impl AttentionKernels {
             .new_library_with_source(SOURCE, &options)
             .map_err(KernelError::Shader)?;
         let mut extra = |name: &str| -> Result<ComputePipelineState, KernelError> {
-            let f = library.get_function(name, None).map_err(KernelError::Shader)?;
+            let f = library
+                .get_function(name, None)
+                .map_err(KernelError::Shader)?;
             device
                 .new_compute_pipeline_state_with_function(&f)
                 .map_err(KernelError::Pipeline)
@@ -195,9 +197,8 @@ impl AttentionKernels {
                 decode_split_pipelines.push(extra(&decode_split_pipeline_name(head_dim, nsg))?);
             }
         }
-        let attention_gqa_pipelines: [ComputePipelineState; GQA_PIPELINES] = attention_gqa_pipelines
-            .try_into()
-            .map_err(|_| {
+        let attention_gqa_pipelines: [ComputePipelineState; GQA_PIPELINES] =
+            attention_gqa_pipelines.try_into().map_err(|_| {
                 KernelError::Pipeline("unexpected transposed attention pipeline count".to_string())
             })?;
         let decode_split_pipelines: [ComputePipelineState; GQA_PIPELINES] =

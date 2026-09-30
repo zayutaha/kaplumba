@@ -4,13 +4,21 @@ use half::f16;
 use kaplumba_kernels::attention::{AttentionKernels, AttentionRequest};
 
 fn vals(n: usize, seed: f32) -> Vec<u16> {
-    (0..n).map(|i| f16::from_f32(((i as f32 + seed) * 0.037).sin()).to_bits()).collect()
+    (0..n)
+        .map(|i| f16::from_f32(((i as f32 + seed) * 0.037).sin()).to_bits())
+        .collect()
 }
 
 fn reference(
-    q: &[u16], k: &[u16], v: &[u16],
-    qp: &[u32], kp: &[u32],
-    qh: usize, kvh: usize, hd: usize, window: usize,
+    q: &[u16],
+    k: &[u16],
+    v: &[u16],
+    qp: &[u32],
+    kp: &[u32],
+    qh: usize,
+    kvh: usize,
+    hd: usize,
+    window: usize,
 ) -> Vec<f32> {
     let groups = qh / kvh;
     let queries = qp.len();
@@ -21,8 +29,12 @@ fn reference(
             let kh = h / groups;
             let mut scores = Vec::new();
             for ki in 0..keys {
-                if kp[ki] > qp[qi] { continue; }
-                if window != 0 && (qp[qi] - kp[ki]) as usize >= window { continue; }
+                if kp[ki] > qp[qi] {
+                    continue;
+                }
+                if window != 0 && (qp[qi] - kp[ki]) as usize >= window {
+                    continue;
+                }
                 let mut s = 0.0f32;
                 for d in 0..hd {
                     s += f16::from_bits(q[(qi * qh + h) * hd + d]).to_f32()
@@ -30,7 +42,10 @@ fn reference(
                 }
                 scores.push((ki, s));
             }
-            let max = scores.iter().map(|(_, s)| *s).fold(f32::NEG_INFINITY, f32::max);
+            let max = scores
+                .iter()
+                .map(|(_, s)| *s)
+                .fold(f32::NEG_INFINITY, f32::max);
             let mut acc = vec![0.0f32; hd];
             let mut total = 0.0f32;
             for (ki, s) in &scores {
@@ -57,10 +72,16 @@ fn check(name: &str, qh: usize, kvh: usize, hd: usize, window: usize, tokens: us
     let kp: Vec<u32> = (0..tokens as u32).collect();
     let got = kernels
         .online_attention(AttentionRequest {
-            queries: &q, keys: &k, values: &v,
-            query_positions: &qp, key_positions: &kp,
-            q_heads: qh, kv_heads: kvh, head_dim: hd,
-            scale: 1.0, window,
+            queries: &q,
+            keys: &k,
+            values: &v,
+            query_positions: &qp,
+            key_positions: &kp,
+            q_heads: qh,
+            kv_heads: kvh,
+            head_dim: hd,
+            scale: 1.0,
+            window,
         })
         .expect("attention");
     let want = reference(&q, &k, &v, &qp, &kp, qh, kvh, hd, window);
@@ -68,7 +89,10 @@ fn check(name: &str, qh: usize, kvh: usize, hd: usize, window: usize, tokens: us
     for (i, w) in want.iter().enumerate() {
         worst = worst.max((f16::from_bits(got[i]).to_f32() - w).abs());
     }
-    println!("{name:34} worst={worst:.6} {}", if worst < 2e-2 { "OK" } else { "MISMATCH" });
+    println!(
+        "{name:34} worst={worst:.6} {}",
+        if worst < 2e-2 { "OK" } else { "MISMATCH" }
+    );
     assert!(worst < 2e-2, "{name} worst {worst}");
 }
 

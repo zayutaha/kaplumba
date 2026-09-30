@@ -1,8 +1,9 @@
 pub mod config;
+pub mod decode_profile;
 pub mod exl3;
 pub mod generate;
-pub mod gpu_lock;
 pub mod gpu_cache;
+pub mod gpu_lock;
 pub mod kv_cache;
 pub mod metal;
 pub mod metrics;

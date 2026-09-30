@@ -1,5 +1,5 @@
 //! Validate the CPU EXL3 decode against ishizuki's reference fixture.
-use kaplumba_engine::exl3::{decode_tile, BitRate, Codebook};
+use kaplumba_engine::exl3::{BitRate, Codebook, decode_tile};
 
 const FIX: &str = "/var/folders/tp/wz3877_s1z756p1kcsz3_d4h0000gn/T/opencode/ishizuki/Tests/IshizukiKitTests/Fixtures/exl3-reference.safetensors";
 
@@ -17,7 +17,10 @@ fn main() {
         ("r7c2", BitRate::Integer(7), Codebook::Mul1),
         ("r8c0", BitRate::Integer(8), Codebook::Plain),
     ];
-    println!("{:8} {:>10} {:>10}  verdict", "case", "maxdelta", "mean|exp|");
+    println!(
+        "{:8} {:>10} {:>10}  verdict",
+        "case", "maxdelta", "mean|exp|"
+    );
     for (name, rate, cb) in cases {
         let trellis = read(&bytes, 8 + n, &hdr, &format!("{name}.trellis"));
         let exp = read_f32(&bytes, 8 + n, &hdr, &format!("{name}.expected"));
@@ -45,14 +48,22 @@ fn main() {
         mag /= exp.len() as f32;
         println!(
             "{name:8} {worst:10.6} {mag:10.6}  {}",
-            if worst == 0.0 { "BIT-EXACT" } else { "MISMATCH" }
+            if worst == 0.0 {
+                "BIT-EXACT"
+            } else {
+                "MISMATCH"
+            }
         );
     }
 }
 
 fn shape3(hdr: &serde_json::Value, name: &str) -> (usize, usize, usize) {
     let s = &hdr[name]["shape"];
-    (s[0].as_u64().unwrap() as usize, s[1].as_u64().unwrap() as usize, s[2].as_u64().unwrap() as usize)
+    (
+        s[0].as_u64().unwrap() as usize,
+        s[1].as_u64().unwrap() as usize,
+        s[2].as_u64().unwrap() as usize,
+    )
 }
 
 fn read(bytes: &[u8], base: usize, hdr: &serde_json::Value, name: &str) -> Vec<u16> {

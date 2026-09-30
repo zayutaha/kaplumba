@@ -33,8 +33,14 @@ fn resident_memory_proof() {
     println!("MEM scratch_resident   = {:>8.3} GiB", gib(scratch));
     println!("MEM engine_allocated   = {:>8.2} GiB", gib(engine_total));
     const BUDGET: u64 = 18 * 1_073_741_824;
-    assert!(weights > 14_000_000_000, "weights should be ~14.9 GiB, got {weights}");
-    assert!(engine_total < BUDGET, "engine allocation must fit 18 GiB budget");
+    assert!(
+        weights > 14_000_000_000,
+        "weights should be ~14.9 GiB, got {weights}"
+    );
+    assert!(
+        engine_total < BUDGET,
+        "engine allocation must fit 18 GiB budget"
+    );
     drop(model);
 
     // 2. What the kernel charges, per Apple. Run the real binary so the number
@@ -47,12 +53,24 @@ fn resident_memory_proof() {
             .find(|dir| dir.join("Cargo.toml").is_file() && dir.join("crates").is_dir())
             .expect("workspace root")
             .to_path_buf();
-        workspace.join("target/release/kaplumba").to_string_lossy().into_owned()
+        workspace
+            .join("target/release/kaplumba")
+            .to_string_lossy()
+            .into_owned()
     });
     let out = std::process::Command::new("/usr/bin/time")
         .arg("-l")
         .arg(&exe)
-        .args(["--model", &path, "--prompt", "Hi", "--max-new-tokens", "8", "--temperature", "0"])
+        .args([
+            "--model",
+            &path,
+            "--prompt",
+            "Hi",
+            "--max-new-tokens",
+            "8",
+            "--temperature",
+            "0",
+        ])
         .output()
         .unwrap_or_else(|e| panic!("failed to run {exe}: {e}"));
     let stderr = String::from_utf8_lossy(&out.stderr);
@@ -70,13 +88,22 @@ fn resident_memory_proof() {
         })
         .expect("no 'peak memory footprint' line from /usr/bin/time -l");
 
-    println!("MEM ru_maxrss          = {:>8.2} GiB", gib(measure_rss().unwrap()));
-    println!("MEM phys_footprint     = {:>8.2} GiB   <- the real figure", gib(footprint));
+    println!(
+        "MEM ru_maxrss          = {:>8.2} GiB",
+        gib(measure_rss().unwrap())
+    );
+    println!(
+        "MEM phys_footprint     = {:>8.2} GiB   <- the real figure",
+        gib(footprint)
+    );
     println!(
         "MEM metal_hidden       = {:>8.2} GiB   (footprint - ru_maxrss)",
         gib(footprint.saturating_sub(measure_rss().unwrap()))
     );
-    println!("MEM budget_18GiB       = used {:.2} GiB of 18.00 GiB", gib(footprint));
+    println!(
+        "MEM budget_18GiB       = used {:.2} GiB of 18.00 GiB",
+        gib(footprint)
+    );
 
     assert!(footprint > 0);
     assert!(

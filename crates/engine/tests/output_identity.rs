@@ -15,7 +15,10 @@ use std::process::Command;
 
 const CASES: &[(&str, &str)] = &[
     ("Hi", "Hello! How can I help you today?"),
-    ("What is the capital of France?", "The capital of France is Paris."),
+    (
+        "What is the capital of France?",
+        "The capital of France is Paris.",
+    ),
     ("Count from one to five.", "1, 2, 3, 4, 5"),
     (
         "Name three primary colors.",
@@ -35,7 +38,10 @@ fn binary() -> String {
             .find(|dir| dir.join("Cargo.toml").is_file() && dir.join("crates").is_dir())
             .expect("workspace root")
             .to_path_buf();
-        workspace.join("target/release/kaplumba").to_string_lossy().into_owned()
+        workspace
+            .join("target/release/kaplumba")
+            .to_string_lossy()
+            .into_owned()
     })
 }
 

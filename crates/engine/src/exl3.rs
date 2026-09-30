@@ -256,14 +256,17 @@ fn unpack_integer(packed: &[u16], bits: u8) -> Result<Vec<u16>, Exl3Error> {
         let lo = (lane * 8 + 1) * ka + ring - 16;
         let i0 = (lo / 32) as usize;
         let shift = lo % 32;
-        let j0 = if i0 >= word_count { i0 - word_count } else { i0 };
+        let j0 = if i0 >= word_count {
+            i0 - word_count
+        } else {
+            i0
+        };
         let j1 = (j0 + 1) % word_count;
         let j2 = (j1 + 1) % word_count;
         let w0 = u64::from(words[j0]);
         let w1 = u64::from(words[j1]);
         let w2 = u64::from(words[j2]);
-        let a = ((w0 << 32) | w1) << shift
-            | if shift != 0 { w2 >> (32 - shift) } else { 0 };
+        let a = ((w0 << 32) | w1) << shift | if shift != 0 { w2 >> (32 - shift) } else { 0 };
         let c = ((w1 << 32) | w2) << shift;
         for i in 0..8_u32 {
             let r = i * ka + 16;

@@ -81,9 +81,11 @@ fn build_copies(
         .map(|c| {
             let mut packed = Vec::with_capacity(tiles * 16 * bits as usize);
             for tile in 0..tiles as u64 {
-                let (words, _) =
-                    kaplumba_engine::exl3::pack_integer_states(&tile_states(bits, tile + c as u64 * 1_000_003), bits)
-                        .expect("pack");
+                let (words, _) = kaplumba_engine::exl3::pack_integer_states(
+                    &tile_states(bits, tile + c as u64 * 1_000_003),
+                    bits,
+                )
+                .expect("pack");
                 packed.extend(words);
             }
             device.new_buffer_with_data(
@@ -106,7 +108,10 @@ fn free_gib() -> f64 {
     let text = String::from_utf8_lossy(&out.stdout);
     let line = text.lines().find(|l| l.contains("PhysMem")).unwrap_or("");
     let before = line.split("unused").next().unwrap_or("").trim_end();
-    let head = before.rsplit(|c: char| c == ' ' || c == ',').next().unwrap_or("");
+    let head = before
+        .rsplit(|c: char| c == ' ' || c == ',')
+        .next()
+        .unwrap_or("");
     let tok: String = head
         .chars()
         .take_while(|c| c.is_ascii_digit() || *c == '.')
@@ -229,8 +234,30 @@ fn main() {
         // part and have produced false results in this project before.
         let warm_until = Instant::now() + std::time::Duration::from_millis(1500);
         while Instant::now() < warm_until {
-            one_pass(&kernels, &generic, &weights, &input, &input_signs, &output_signs, in_f, out_f, bits, &mut cursor);
-            one_pass(&kernels, &special, &weights, &input, &input_signs, &output_signs, in_f, out_f, bits, &mut cursor);
+            one_pass(
+                &kernels,
+                &generic,
+                &weights,
+                &input,
+                &input_signs,
+                &output_signs,
+                in_f,
+                out_f,
+                bits,
+                &mut cursor,
+            );
+            one_pass(
+                &kernels,
+                &special,
+                &weights,
+                &input,
+                &input_signs,
+                &output_signs,
+                in_f,
+                out_f,
+                bits,
+                &mut cursor,
+            );
         }
 
         let mut a = Vec::with_capacity(samples);
@@ -238,10 +265,32 @@ fn main() {
         for _ in 0..samples {
             // Interleaved. Never a block of A then a block of B.
             let t = Instant::now();
-            one_pass(&kernels, &generic, &weights, &input, &input_signs, &output_signs, in_f, out_f, bits, &mut cursor);
+            one_pass(
+                &kernels,
+                &generic,
+                &weights,
+                &input,
+                &input_signs,
+                &output_signs,
+                in_f,
+                out_f,
+                bits,
+                &mut cursor,
+            );
             a.push(t.elapsed().as_secs_f64());
             let t = Instant::now();
-            one_pass(&kernels, &special, &weights, &input, &input_signs, &output_signs, in_f, out_f, bits, &mut cursor);
+            one_pass(
+                &kernels,
+                &special,
+                &weights,
+                &input,
+                &input_signs,
+                &output_signs,
+                in_f,
+                out_f,
+                bits,
+                &mut cursor,
+            );
             b.push(t.elapsed().as_secs_f64());
         }
         let sa = Stat::of(bytes, a);

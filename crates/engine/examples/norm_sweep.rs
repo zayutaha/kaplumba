@@ -126,7 +126,11 @@ fn time(
         e.set_buffer(0, Some(input), 0);
         e.set_buffer(1, Some(weight), 0);
         e.set_buffer(2, Some(output), 0);
-        e.set_bytes(3, params_bytes.len() as u64, params_bytes.as_ptr() as *const _);
+        e.set_bytes(
+            3,
+            params_bytes.len() as u64,
+            params_bytes.as_ptr() as *const _,
+        );
         e.dispatch_thread_groups(
             metal::MTLSize::new(groups, 1, 1),
             metal::MTLSize::new(tpg, 1, 1),
@@ -180,13 +184,35 @@ fn main() {
         println!("== rms_norm rows={rows} width={width} ==");
         let f = lib.get_function("norm_per_row", None).unwrap();
         let p = device.new_compute_pipeline_state_with_function(&f).unwrap();
-        let ms = time(&queue, &p, &input, &weight, &output, rows, width, rows as u64, 64, 50);
+        let ms = time(
+            &queue,
+            &p,
+            &input,
+            &weight,
+            &output,
+            rows,
+            width,
+            rows as u64,
+            64,
+            50,
+        );
         println!("  per_row              {ms:>9.4} ms");
         for g in [32u64, 64, 128, 256, 512] {
             let name = format!("norm_tg{g}");
             let f = lib.get_function(&name, None).unwrap();
             let p = device.new_compute_pipeline_state_with_function(&f).unwrap();
-            let ms = time(&queue, &p, &input, &weight, &output, rows, width, rows as u64, g, 50);
+            let ms = time(
+                &queue,
+                &p,
+                &input,
+                &weight,
+                &output,
+                rows,
+                width,
+                rows as u64,
+                g,
+                50,
+            );
             println!("  tg G={g:<4}          {ms:>9.4} ms");
         }
         for g in [128u64, 256, 512, 1024] {
@@ -194,7 +220,9 @@ fn main() {
             let f = lib.get_function(&name, None).unwrap();
             let p = device.new_compute_pipeline_state_with_function(&f).unwrap();
             let groups = (rows as u64).div_ceil(g / 32);
-            let ms = time(&queue, &p, &input, &weight, &output, rows, width, groups, g, 50);
+            let ms = time(
+                &queue, &p, &input, &weight, &output, rows, width, groups, g, 50,
+            );
             println!("  rpg G={g:<4} (4 rows) {ms:>8.4} ms");
         }
     }

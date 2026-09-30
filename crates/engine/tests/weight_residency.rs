@@ -96,7 +96,11 @@ fn bulk_read_mostly_tensors_are_mapped_by_default() {
 fn resident_weights_escape_hatch_puts_everything_in_the_arena() {
     // asserts via a child process; see `child_resident_weights_are_in_the_arena`
     let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--ignored", "--exact", "child_resident_weights_are_in_the_arena"])
+        .args([
+            "--ignored",
+            "--exact",
+            "child_resident_weights_are_in_the_arena",
+        ])
         .env(CHILD, "1")
         .env("KAPLUMBA_RESIDENT_WEIGHTS", "1")
         .status()

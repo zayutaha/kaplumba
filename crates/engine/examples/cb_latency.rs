@@ -55,7 +55,10 @@ fn main() {
             cb.commit();
             cb.wait_until_completed();
         }
-        println!("trivial commit+wait: {:.4} ms/CB", t.elapsed().as_secs_f64() * 1e3 / n as f64);
+        println!(
+            "trivial commit+wait: {:.4} ms/CB",
+            t.elapsed().as_secs_f64() * 1e3 / n as f64
+        );
     }
 
     // 2. same but waitless: commit, no wait (pure submit cost)
@@ -63,9 +66,7 @@ fn main() {
         let f = lib.get_function("trivial", None).unwrap();
         let p = device.new_compute_pipeline_state_with_function(&f).unwrap();
         let n = 200;
-        let cbs: Vec<_> = (0..n)
-            .map(|_| queue.new_command_buffer())
-            .collect();
+        let cbs: Vec<_> = (0..n).map(|_| queue.new_command_buffer()).collect();
         let t = Instant::now();
         for cb in &cbs {
             let e = cb.new_compute_command_encoder();
@@ -75,7 +76,10 @@ fn main() {
             e.end_encoding();
             cb.commit();
         }
-        println!("trivial commit-only: {:.4} ms/CB", t.elapsed().as_secs_f64() * 1e3 / n as f64);
+        println!(
+            "trivial commit-only: {:.4} ms/CB",
+            t.elapsed().as_secs_f64() * 1e3 / n as f64
+        );
         for cb in &cbs {
             cb.wait_until_completed();
         }
@@ -100,7 +104,10 @@ fn main() {
             e.set_compute_pipeline_state(&p);
             e.set_buffer(0, Some(&out), 0);
             e.set_buffer(1, Some(&iters_buf), 0);
-            e.dispatch_thread_groups(metal::MTLSize::new(2048, 1, 1), metal::MTLSize::new(32, 1, 1));
+            e.dispatch_thread_groups(
+                metal::MTLSize::new(2048, 1, 1),
+                metal::MTLSize::new(32, 1, 1),
+            );
             e.end_encoding();
             cb.commit();
             cb.wait_until_completed();

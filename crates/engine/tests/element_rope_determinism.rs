@@ -29,7 +29,10 @@ fn rope_in_place(
     passes: usize,
 ) -> Vec<u16> {
     let kernels = ElementKernels::shared().expect("element kernels");
-    let q = device.new_buffer((input.len() * 2) as u64, MTLResourceOptions::StorageModeShared);
+    let q = device.new_buffer(
+        (input.len() * 2) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
     unsafe {
         std::ptr::copy_nonoverlapping(input.as_ptr(), q.contents() as *mut u16, input.len());
     }
@@ -71,8 +74,14 @@ fn rope_out_of_place(
     offset: usize,
 ) -> Vec<u16> {
     let kernels = ElementKernels::shared().expect("element kernels");
-    let src = device.new_buffer((input.len() * 2) as u64, MTLResourceOptions::StorageModeShared);
-    let dst = device.new_buffer((input.len() * 2) as u64, MTLResourceOptions::StorageModeShared);
+    let src = device.new_buffer(
+        (input.len() * 2) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let dst = device.new_buffer(
+        (input.len() * 2) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
     unsafe {
         std::ptr::copy_nonoverlapping(input.as_ptr(), src.contents() as *mut u16, input.len());
     }
@@ -83,16 +92,16 @@ fn rope_out_of_place(
             &mut encoder,
             &src,
             &dst,
-                RopeBufferRequest {
-                    tokens,
-                    heads,
-                    head_dim,
-                    offset,
-                    theta: 10000.0,
-                    partial_factor: 1.0,
-                    proportional: false,
-                },
-            )
+            RopeBufferRequest {
+                tokens,
+                heads,
+                head_dim,
+                offset,
+                theta: 10000.0,
+                partial_factor: 1.0,
+                proportional: false,
+            },
+        )
         .expect("encode_rope");
     encoder.commit_and_wait().expect("commit");
     let mut out = Vec::with_capacity(input.len());
@@ -142,8 +151,7 @@ fn element_rope_in_place_matches_out_of_place_bitwise() {
              after one aliased pass: {differing} of {n} elements differ, first at {worst_at} \
              (expected bits {:#06x}, got {:#06x}). This is the cross-warp race: a thread \
              writing output[c] before its partner read input[c].",
-            want[worst_at],
-            got[worst_at],
+            want[worst_at], got[worst_at],
         );
     }
 }

@@ -4,7 +4,7 @@ use metal::Buffer;
 use thiserror::Error;
 
 use kaplumba_kernels::attention::{
-    decode_partial_elements, AttentionEncodeRequest, AttentionKernels, AttentionRequest,
+    AttentionEncodeRequest, AttentionKernels, AttentionRequest, decode_partial_elements,
 };
 use kaplumba_kernels::elements::{ElementKernels, RopeBufferRequest, RopeRequest};
 use kaplumba_kernels::encoder::MetalEncoder;
@@ -512,7 +512,6 @@ impl DecoderLayerWeights {
 /// also absorbs that layer's `flush_and_wait`, so it reads far larger than its
 /// neighbours; that is a host-timing artefact, not a hotspot.
 pub struct OpTimer<'t> {
-
     map: &'t mut std::collections::BTreeMap<&'static str, f64>,
     last: std::time::Instant,
     on: bool,
@@ -520,7 +519,11 @@ pub struct OpTimer<'t> {
 
 impl<'t> OpTimer<'t> {
     fn new(map: &'t mut std::collections::BTreeMap<&'static str, f64>, on: bool) -> Self {
-        Self { map, last: std::time::Instant::now(), on }
+        Self {
+            map,
+            last: std::time::Instant::now(),
+            on,
+        }
     }
 
     pub fn lap(&mut self, name: &'static str) {
@@ -611,6 +614,43 @@ fn env_flag(name: &str) -> bool {
     value
 }
 
+/// Cached `usize` switch, for the measurement aids that take a count. Read once
+/// for the same reason as [`env_flag`], and parsed once so a malformed value
+/// cannot be re-parsed per layer.
+fn env_usize(name: &str) -> usize {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, usize>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(value) = cache.get(name) {
+        return *value;
+    }
+    let value = std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .unwrap_or(0);
+    cache.insert(name.to_string(), value);
+    value
+}
+
+/// [`env_usize`], clamped into a `u32` for a shader parameter.
+fn env_u32(name: &str) -> Option<u32> {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<String, u32>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+    let mut cache = cache.lock().unwrap_or_else(|error| error.into_inner());
+    if let Some(value) = cache.get(name) {
+        return Some(*value);
+    }
+    let value = std::env::var(name)
+        .ok()
+        .and_then(|raw| raw.trim().parse::<u32>().ok());
+    if let Some(value) = value {
+        cache.insert(name.to_string(), value);
+    }
+    value
+}
+
 /// Per-kernel GPU time, accumulated across every chunk of one forward pass.
 ///
 /// This is the real profiler. `KAPLUMBA_PROFILE_PHASES` (and [`OpTimer`]) measure
@@ -686,6 +726,34 @@ impl GpuProfile {
         self.enabled
     }
 
+    /// Per-kernel own time for this forward, as `(name, invocations, own_ms)`,
+    /// in name order.
+    ///
+    /// Exists for `KAPLUMBA_DECODE_PROFILE=kernel`, which accumulates a decode
+    /// step's table into one process-wide report instead of printing a table per
+    /// generated token. The per-kernel detail is private, so without this the
+    /// accumulator could only be handed a total and the mode would be
+    /// indistinguishable from `step`.
+    pub fn kernel_rows(&self) -> Vec<(String, u64, f64)> {
+        self.by_kernel
+            .iter()
+            .map(|(name, (count, own))| (name.clone(), *count, *own))
+            .collect()
+    }
+
+    /// `first stamped start`, `last stamped end` on the GPU timeline, if any
+    /// stamp came back. The span between them is the forward's duration with
+    /// the gaps a per-boundary stamp introduces left *inside* it, so it is
+    /// reported rather than used as a stopwatch.
+    pub fn gpu_span_s(&self) -> Option<(f64, f64)> {
+        self.first_start_s.zip(self.last_end_s)
+    }
+
+    /// Sum of every stamped buffer's own GPU time for this forward.
+    pub fn own_ms(&self) -> f64 {
+        self.total_own_ms
+    }
+
     /// End the current command buffer under `label` and continue on a fresh one,
     /// so the label's GPU duration can be read back later.
     ///
@@ -694,11 +762,7 @@ impl GpuProfile {
     /// Metal command queue executes them one after the other. That is why the
     /// table reports own-time per boundary (still correct) and treats the
     /// inter-boundary gap as profiler overhead.
-    pub fn stamp(
-        &mut self,
-        encoder: &mut MetalEncoder,
-        label: &str,
-    ) -> Result<(), ModelError> {
+    pub fn stamp(&mut self, encoder: &mut MetalEncoder, label: &str) -> Result<(), ModelError> {
         if !self.enabled {
             return Ok(());
         }
@@ -748,8 +812,14 @@ impl GpuProfile {
             }
             self.total_own_ms += stamp.own_ms;
             self.total_gap_ms += stamp.gap_ms;
-            self.first_start_s = Some(self.first_start_s.map_or(stamp.start_s, |s: f64| s.min(stamp.start_s)));
-            self.last_end_s = Some(self.last_end_s.map_or(stamp.end_s, |e: f64| e.max(stamp.end_s)));
+            self.first_start_s = Some(
+                self.first_start_s
+                    .map_or(stamp.start_s, |s: f64| s.min(stamp.start_s)),
+            );
+            self.last_end_s = Some(
+                self.last_end_s
+                    .map_or(stamp.end_s, |e: f64| e.max(stamp.end_s)),
+            );
         }
     }
 
@@ -830,9 +900,9 @@ impl GpuProfile {
                 .map_or(0.0, |(end, start)| (end - start) * 1e3),
         ));
         match (self.empty_commit_ms, self.one_dispatch_ms) {
-            (None, None) => out.push_str(
-                "overhead: unavailable (GPU clock returned no plausible sample)\n",
-            ),
+            (None, None) => {
+                out.push_str("overhead: unavailable (GPU clock returned no plausible sample)\n")
+            }
             (empty, one) => {
                 let ms = |value: Option<f64>| match value {
                     Some(value) => format!("{value:.4} ms"),
@@ -882,9 +952,7 @@ impl GpuProfile {
         layer_rows.sort_by(|a, b| b.2.total_cmp(a.2).then_with(|| a.0.cmp(b.0)));
         if !layer_rows.is_empty() {
             let layer_total: f64 = layer_rows.iter().map(|row| row.2).sum();
-            let fastest = layer_rows
-                .last()
-                .map_or(0.0, |row| *row.2);
+            let fastest = layer_rows.last().map_or(0.0, |row| *row.2);
             out.push_str(&format!(
                 "  per-layer: {} layers, sum {:.3} ms, slowest {} {:.3} ms, fastest {} {:.3} ms\n",
                 layer_rows.len(),
@@ -1110,7 +1178,15 @@ impl DecoderLayer {
             return Ok(());
         }
         self.elements
-            .encode_rms_norm(encoder, input, weight, output, rows, self.config.hidden_size, eps)
+            .encode_rms_norm(
+                encoder,
+                input,
+                weight,
+                output,
+                rows,
+                self.config.hidden_size,
+                eps,
+            )
             .map_err(ModelError::from)
     }
 
@@ -1133,17 +1209,65 @@ impl DecoderLayer {
         // decode step can be measured directly. Output is meaningless with this
         // on; it exists only to answer "where does the 793 ms go".
         if env_flag("KAPLUMBA_LINEARS_ONLY") {
-            self.encode_linear(encoder, &self.weights.q_proj, input, &scratch.q, tokens, scratch, false)?;
-            self.encode_linear(encoder, &self.weights.k_proj, input, &scratch.k, tokens, scratch, false)?;
+            self.encode_linear(
+                encoder,
+                &self.weights.q_proj,
+                input,
+                &scratch.q,
+                tokens,
+                scratch,
+                false,
+            )?;
+            self.encode_linear(
+                encoder,
+                &self.weights.k_proj,
+                input,
+                &scratch.k,
+                tokens,
+                scratch,
+                false,
+            )?;
             if let Some(v) = &self.weights.v_proj {
                 self.encode_linear(encoder, v, input, &scratch.v, tokens, scratch, false)?;
             }
-            self.encode_linear(encoder, &self.weights.o_proj, &scratch.q, output, tokens, scratch, false)?;
+            self.encode_linear(
+                encoder,
+                &self.weights.o_proj,
+                &scratch.q,
+                output,
+                tokens,
+                scratch,
+                false,
+            )?;
             let gate = &scratch.gate;
             let up = &scratch.up;
-            self.encode_linear(encoder, &self.weights.gate_proj, input, gate, tokens, scratch, false)?;
-            self.encode_linear(encoder, &self.weights.up_proj, input, up, tokens, scratch, false)?;
-            self.encode_linear(encoder, &self.weights.down_proj, up, output, tokens, scratch, false)?;
+            self.encode_linear(
+                encoder,
+                &self.weights.gate_proj,
+                input,
+                gate,
+                tokens,
+                scratch,
+                false,
+            )?;
+            self.encode_linear(
+                encoder,
+                &self.weights.up_proj,
+                input,
+                up,
+                tokens,
+                scratch,
+                false,
+            )?;
+            self.encode_linear(
+                encoder,
+                &self.weights.down_proj,
+                up,
+                output,
+                tokens,
+                scratch,
+                false,
+            )?;
             // Stamp the bypassed layers too, or their GPU time would silently
             // vanish from the totals and the table would under-report.
             profile.stamp(encoder, &format!("{}linears_only", prefix()))?;
@@ -1302,11 +1426,8 @@ impl DecoderLayer {
         // window and are left alone.
         if full {
             let device = system_device()?;
-            self.gpu_cache.ensure_capacity(
-                &device,
-                offset + tokens,
-                config.max_sequence_len,
-            )?;
+            self.gpu_cache
+                .ensure_capacity(&device, offset + tokens, config.max_sequence_len)?;
         }
         let capacity = self.gpu_cache.capacity();
         let slot = self.gpu_cache.reserve(offset, tokens, full)?;
@@ -1360,20 +1481,20 @@ impl DecoderLayer {
         // already fills the machine with `queries * q_heads` threads, so it keeps
         // the serial kernel.
         let attention_request = AttentionEncodeRequest {
-                queries: &scratch.q,
-                keys: self.gpu_cache.keys(),
-                values: self.gpu_cache.values(),
-                query_positions: &scratch.query_positions,
-                key_positions: self.gpu_cache.positions(),
-                output: &scratch.attended,
-                queries_count: tokens,
-                q_heads: config.q_heads,
-                kv_heads: config.kv_heads,
-                head_dim,
-                key_count,
-                scale: 1.0,
-                window,
-            };
+            queries: &scratch.q,
+            keys: self.gpu_cache.keys(),
+            values: self.gpu_cache.values(),
+            query_positions: &scratch.query_positions,
+            key_positions: self.gpu_cache.positions(),
+            output: &scratch.attended,
+            queries_count: tokens,
+            q_heads: config.q_heads,
+            kv_heads: config.kv_heads,
+            head_dim,
+            key_count,
+            scale: 1.0,
+            window,
+        };
         if tokens == 1 {
             self.attention.encode_online_attention_split(
                 encoder,
@@ -1381,7 +1502,8 @@ impl DecoderLayer {
                 &scratch.attn_partials,
             )?;
         } else {
-            self.attention.encode_online_attention(encoder, attention_request)?;
+            self.attention
+                .encode_online_attention(encoder, attention_request)?;
         }
         profile.stamp(encoder, &format!("{}attention", prefix()))?;
         timer.lap("attention");
@@ -1426,7 +1548,12 @@ impl DecoderLayer {
         // gate and up read the same activation too -- decode only, for the
         // reason given above the q/k/v transform.
         if decode {
-            self.encode_input_transform(encoder, &self.weights.gate_proj, &scratch.normed, scratch)?;
+            self.encode_input_transform(
+                encoder,
+                &self.weights.gate_proj,
+                &scratch.normed,
+                scratch,
+            )?;
         }
         profile.stamp(encoder, &format!("{}pre_ffn_norm_transform", prefix()))?;
         timer.lap("pre_ffn_norm_transform");
@@ -1629,7 +1756,11 @@ impl DecoderLayer {
         let tokens = positions.len();
         trace.push(("input", rms(input)));
         let normalized = self.elements.rms_norm(
-            input, &self.weights.input_norm, tokens, self.config.hidden_size, self.config.rms_norm_eps,
+            input,
+            &self.weights.input_norm,
+            tokens,
+            self.config.hidden_size,
+            self.config.rms_norm_eps,
         )?;
         trace.push(("input_norm", rms(&normalized)));
         let q = self.run_linear(&self.weights.q_proj, &normalized, tokens)?;
@@ -1642,26 +1773,73 @@ impl DecoderLayer {
             k.clone()
         };
         trace.push(("raw_v", rms(&raw_v)));
-        let q = self.elements.rms_norm(&q, &self.weights.q_norm, tokens * self.config.q_heads, self.config.head_dim, self.config.rms_norm_eps)?;
+        let q = self.elements.rms_norm(
+            &q,
+            &self.weights.q_norm,
+            tokens * self.config.q_heads,
+            self.config.head_dim,
+            self.config.rms_norm_eps,
+        )?;
         trace.push(("q_norm", rms(&q)));
-        let k = self.elements.rms_norm(&k, &self.weights.k_norm, tokens * self.config.kv_heads, self.config.head_dim, self.config.rms_norm_eps)?;
+        let k = self.elements.rms_norm(
+            &k,
+            &self.weights.k_norm,
+            tokens * self.config.kv_heads,
+            self.config.head_dim,
+            self.config.rms_norm_eps,
+        )?;
         trace.push(("k_norm", rms(&k)));
-        let v = self.elements.rms_norm_unweighted(&raw_v, tokens * self.config.kv_heads, self.config.head_dim, self.config.rms_norm_eps)?;
+        let v = self.elements.rms_norm_unweighted(
+            &raw_v,
+            tokens * self.config.kv_heads,
+            self.config.head_dim,
+            self.config.rms_norm_eps,
+        )?;
         trace.push(("v_norm", rms(&v)));
         let offset = positions[0] as usize;
-        let q = self.elements.rope(RopeRequest { input: &q, tokens, heads: self.config.q_heads, head_dim: self.config.head_dim, offset, theta: self.config.rope_theta, partial_factor: self.config.rope_partial_factor, proportional: self.config.rope_mode == RopeMode::Proportional })?;
-        let k = self.elements.rope(RopeRequest { input: &k, tokens, heads: self.config.kv_heads, head_dim: self.config.head_dim, offset, theta: self.config.rope_theta, partial_factor: self.config.rope_partial_factor, proportional: self.config.rope_mode == RopeMode::Proportional })?;
+        let q = self.elements.rope(RopeRequest {
+            input: &q,
+            tokens,
+            heads: self.config.q_heads,
+            head_dim: self.config.head_dim,
+            offset,
+            theta: self.config.rope_theta,
+            partial_factor: self.config.rope_partial_factor,
+            proportional: self.config.rope_mode == RopeMode::Proportional,
+        })?;
+        let k = self.elements.rope(RopeRequest {
+            input: &k,
+            tokens,
+            heads: self.config.kv_heads,
+            head_dim: self.config.head_dim,
+            offset,
+            theta: self.config.rope_theta,
+            partial_factor: self.config.rope_partial_factor,
+            proportional: self.config.rope_mode == RopeMode::Proportional,
+        })?;
         trace.push(("rope", rms(&q)));
         self.append_cache(&k, &v, positions)?;
         let attended = self.run_attention(&q, positions)?;
         trace.push(("attention", rms(&attended)));
         let attended = self.run_linear(&self.weights.o_proj, &attended, tokens)?;
         trace.push(("o_proj", rms(&attended)));
-        let attended = self.elements.rms_norm(&attended, &self.weights.post_attention_norm, tokens, self.config.hidden_size, self.config.rms_norm_eps)?;
+        let attended = self.elements.rms_norm(
+            &attended,
+            &self.weights.post_attention_norm,
+            tokens,
+            self.config.hidden_size,
+            self.config.rms_norm_eps,
+        )?;
         trace.push(("post_attn_norm", rms(&attended)));
         let mut output = self.elements.residual_add(input, &attended)?;
         trace.push(("residual1", rms(&output)));
-        let normalized = self.elements.rms_norm(&output, &self.weights.pre_ffn_norm, tokens, self.config.hidden_size, self.config.rms_norm_eps)?;
+        let normalized = self.elements.rms_norm(
+            &output,
+            &self.weights.pre_ffn_norm,
+            tokens,
+            self.config.hidden_size,
+            self.config.rms_norm_eps,
+        )?;
         let gate = self.run_linear(&self.weights.gate_proj, &normalized, tokens)?;
         let up = self.run_linear(&self.weights.up_proj, &normalized, tokens)?;
         trace.push(("gate_proj", rms(&gate)));
@@ -1669,11 +1847,19 @@ impl DecoderLayer {
         trace.push(("gated_gelu", rms(&activated)));
         let mlp = self.run_linear(&self.weights.down_proj, &activated, tokens)?;
         trace.push(("down_proj", rms(&mlp)));
-        let mlp = self.elements.rms_norm(&mlp, &self.weights.post_ffn_norm, tokens, self.config.hidden_size, self.config.rms_norm_eps)?;
+        let mlp = self.elements.rms_norm(
+            &mlp,
+            &self.weights.post_ffn_norm,
+            tokens,
+            self.config.hidden_size,
+            self.config.rms_norm_eps,
+        )?;
         trace.push(("post_ffn_norm", rms(&mlp)));
         output = self.elements.residual_add(&output, &mlp)?;
         trace.push(("residual2", rms(&output)));
-        let output = self.elements.layer_scale(&output, self.weights.layer_scalar)?;
+        let output = self
+            .elements
+            .layer_scale(&output, self.weights.layer_scalar)?;
         trace.push(("layer_scale", rms(&output)));
         Ok((output, trace))
     }
@@ -2027,9 +2213,19 @@ pub struct TextModel {
     final_norm_buffer: Buffer,
     scratch: ForwardScratch,
     scratch_tokens: usize,
+    /// MEASUREMENT AID: destination for the injected `spin_burn` dispatch, and
+    /// the thread count it is dispatched with. Allocated lazily, and only when
+    /// `KAPLUMBA_DECODE_INJECT` asks for it, so a normal process does not carry
+    /// it. Sized by nothing but [`Self::SPIN_THREADS`], so it does not grow with
+    /// context length (AGENTS.md §8).
+    spin_scratch: Option<Buffer>,
 }
 
 impl TextModel {
+    /// Threads the injected `spin_burn` dispatch runs. Wide enough to fill the
+    /// GPU's cores several times over, so the loop's cost is set by `iters` and
+    /// the clock rather than by occupancy.
+    const SPIN_THREADS: u64 = 4096;
     pub fn new(
         embedding: Vec<u16>,
         layers: Vec<DecoderLayer>,
@@ -2112,8 +2308,10 @@ impl TextModel {
             q_max = q_max.max(layer.config.q_heads * layer.config.head_dim);
             kv_max = kv_max.max(layer.config.kv_heads * layer.config.head_dim);
             inter = inter.max(layer.config.intermediate_size);
-            attn_partials = attn_partials
-                .max(decode_partial_elements(layer.config.q_heads, layer.config.head_dim));
+            attn_partials = attn_partials.max(decode_partial_elements(
+                layer.config.q_heads,
+                layer.config.head_dim,
+            ));
         }
         let scratch = ForwardScratch::new(
             1,
@@ -2142,6 +2340,7 @@ impl TextModel {
             final_norm_buffer,
             scratch,
             scratch_tokens: 1,
+            spin_scratch: None,
         })
     }
 
@@ -2499,6 +2698,11 @@ impl TextModel {
                 "token id {token} is outside the vocabulary"
             )));
         }
+        // NOTE: deliberately *not* bracketed by `decode_profile::begin_step` /
+        // `close_step`. `generate.rs` owns that bracket for the real decode loop
+        // -- it has to, because it is the only caller that knows the host wall
+        // time of the step -- and a bracket here as well would stamp four
+        // boundaries and record two steps, one of them a slice of the other.
         self.forward_buffer_into(&[token], &[position], encoder)?;
         Ok(())
     }
@@ -2530,11 +2734,26 @@ impl TextModel {
         }
         let queue = self.forward_queue.clone();
         let mut encoder = MetalEncoder::new(&queue)?;
+        // `KAPLUMBA_DECODE_PROFILE=step` brackets a single-token forward with
+        // two stamped boundaries so its GPU-timeline duration can be read. Only
+        // a one-token forward is a decode step; a prefill is timed by its caller
+        // and must not be able to enter a decode total.
+        let decode_step = token_ids.len() == 1;
+        if decode_step {
+            crate::decode_profile::begin_step(&mut encoder, |encoder| {
+                self.calibration_dispatch(encoder)
+            })?;
+        }
         // On any error the encoder is left un-ended, which Metal asserts on at
         // dealloc, so abandon it explicitly before propagating.
         if let Err(error) = self.forward_buffer_into(token_ids, positions, &mut encoder) {
             encoder.abandon();
             return Err(error);
+        }
+        let started = std::time::Instant::now();
+        if decode_step {
+            crate::decode_profile::close_step(&mut encoder)?;
+            crate::decode_profile::end_step(&mut encoder, started.elapsed().as_secs_f64() * 1e3)?;
         }
         encoder.commit_and_wait()?;
         Ok(self.last_logits())
@@ -2585,8 +2804,18 @@ impl TextModel {
         // generated token, so it takes the second switch: with that unset, a
         // decode step does no profiling work at all rather than paying for
         // measurements nobody reads.
-        let profile = env_flag("KAPLUMBA_GPU_PROFILE")
-            && (token_ids.len() > 1 || env_flag("KAPLUMBA_GPU_PROFILE_DECODE"));
+        //
+        // `KAPLUMBA_DECODE_PROFILE=kernel` is the third way in, and it exists
+        // because the two switches above cannot measure a decode step: with
+        // only the first set, every table a decode run prints is the PREFILL's,
+        // whose own_ms sum is a function of the prompt and so is flat in
+        // `--max-new-tokens`. This mode stamps the step and hands the table to
+        // the decode accumulator instead of printing it per token.
+        let decode_kernel = token_ids.len() == 1
+            && crate::decode_profile::mode() == crate::decode_profile::Mode::Kernel;
+        let profile = decode_kernel
+            || (env_flag("KAPLUMBA_GPU_PROFILE")
+                && (token_ids.len() > 1 || env_flag("KAPLUMBA_GPU_PROFILE_DECODE")));
         let mut gpu = GpuProfile::new(profile);
         gpu.tokens = token_ids.len();
         gpu.layers = self.layers.len();
@@ -2624,7 +2853,14 @@ impl TextModel {
             // Drain the tail before printing: the last boundaries are still
             // retained, and a partial report would under-count.
             gpu.drain(encoder)?;
-            self.report_gpu_profile(&gpu);
+            if decode_kernel {
+                // One decode step's kernels, accumulated across every step into
+                // a single report. See `decode_profile`.
+                let span = gpu.gpu_span_s().map(|(start, end)| (end - start) * 1e3);
+                crate::decode_profile::record_kernel_step(span, gpu.own_ms(), gpu.kernel_rows());
+            } else {
+                self.report_gpu_profile(&gpu);
+            }
         }
         result
     }
@@ -2666,8 +2902,7 @@ impl TextModel {
         // (KAPLUMBA_LINEARS_ONLY / KAPLUMBA_SKIP_ATTENTION); any other gap is
         // still an error.
         if positions[0] as usize != self.gpu_next_position()
-            && !(env_flag("KAPLUMBA_LINEARS_ONLY")
-                || env_flag("KAPLUMBA_SKIP_ATTENTION"))
+            && !(env_flag("KAPLUMBA_LINEARS_ONLY") || env_flag("KAPLUMBA_SKIP_ATTENTION"))
         {
             return Err(ModelError::InvalidInput(
                 "positions must begin at the current cache position".to_string(),
@@ -2743,6 +2978,33 @@ impl TextModel {
         let vocab = self.vocab_size;
         let scale = (hidden as f32).sqrt();
 
+        // MEASUREMENT AID: a deliberately slow dispatch inside the chunk, so a
+        // timing instrument can be shown to resolve a cost injected into the
+        // region it claims to measure. `KAPLUMBA_DECODE_INJECT=<dispatches>`
+        // with `KAPLUMBA_DECODE_INJECT_ITERS=<n>` (default 4096 threads x
+        // 200000 iterations per dispatch). The decode accumulator records the
+        // injection in its report, and the host wall clock gives the injected
+        // cost without reference to the instrument, so the two can be compared.
+        let inject = if tokens == 1 {
+            env_usize("KAPLUMBA_DECODE_INJECT")
+        } else {
+            0
+        };
+        if inject > 0 {
+            self.ensure_spin_scratch()?;
+            let scratch = self
+                .spin_scratch
+                .as_ref()
+                .ok_or_else(|| ModelError::InvalidConfig("spin scratch is absent".to_string()))?;
+            self.elements.encode_spin_burn(
+                encoder,
+                scratch,
+                inject,
+                env_u32("KAPLUMBA_DECODE_INJECT_ITERS").unwrap_or(200_000),
+                Self::SPIN_THREADS,
+            )?;
+        }
+
         // Layer 0 consumes the embedding, then layers ping-pong between the two
         // hidden buffers. Input/output never alias within a layer.
         let embedding_buffer = self
@@ -2814,7 +3076,10 @@ impl TextModel {
         if profile {
             let mut total_us = 0.0;
             for (name, us) in &op_us {
-                eprintln!("  ENCODE {name:<22} {:>9.2} ms  (host submit, not GPU)", us / 1e3);
+                eprintln!(
+                    "  ENCODE {name:<22} {:>9.2} ms  (host submit, not GPU)",
+                    us / 1e3
+                );
                 total_us += *us;
             }
             eprintln!(
@@ -2895,7 +3160,10 @@ impl TextModel {
     /// available without a scratch buffer of its own. Source and destination are
     /// the same address, so the calibration cannot perturb any data the forward
     /// goes on to read.
-    fn calibration_dispatch(&self, encoder: &mut MetalEncoder) -> Result<(), ModelError> {
+    pub(crate) fn calibration_dispatch(
+        &self,
+        encoder: &mut MetalEncoder,
+    ) -> Result<(), ModelError> {
         self.elements
             .encode_copy(
                 encoder,
@@ -2930,9 +3198,13 @@ impl TextModel {
             // Nothing encoded: pure command-buffer overhead. Stamping an empty
             // encoder is legal (end_encoding on an encoder with no dispatches),
             // and that is exactly the boundary cost we want to price.
-            encoder.commit_stamped("cal/empty").map_err(ModelError::from)?;
+            encoder
+                .commit_stamped("cal/empty")
+                .map_err(ModelError::from)?;
             self.calibration_dispatch(encoder)?;
-            encoder.commit_stamped("cal/one").map_err(ModelError::from)?;
+            encoder
+                .commit_stamped("cal/one")
+                .map_err(ModelError::from)?;
             if (index + 1) % BATCH == 0 {
                 let stamps = encoder.take_gpu_stamps();
                 let (batch_empty, batch_one) = profile.ingest_calibration(&stamps);
@@ -3028,8 +3300,10 @@ impl TextModel {
             q_max = q_max.max(layer.config.q_heads * layer.config.head_dim);
             kv_max = kv_max.max(layer.config.kv_heads * layer.config.head_dim);
             inter = inter.max(layer.config.intermediate_size);
-            attn_partials = attn_partials
-                .max(decode_partial_elements(layer.config.q_heads, layer.config.head_dim));
+            attn_partials = attn_partials.max(decode_partial_elements(
+                layer.config.q_heads,
+                layer.config.head_dim,
+            ));
         }
         self.scratch = ForwardScratch::new(
             tokens,
@@ -3044,20 +3318,47 @@ impl TextModel {
         Ok(())
     }
 
+    /// Allocate the `spin_burn` destination on first use.
+    ///
+    /// 16 KiB: `SPIN_THREADS` floats. Fixed size, independent of the model and
+    /// of the context length, which is what AGENTS.md §8 requires of any buffer
+    /// this engine holds. Private storage: the kernel only writes it and nothing
+    /// ever reads it, so there is no reason to make it host-visible.
+    fn ensure_spin_scratch(&mut self) -> Result<(), ModelError> {
+        if self.spin_scratch.is_none() {
+            let device = system_device()?;
+            self.spin_scratch = Some(device.new_buffer(
+                Self::SPIN_THREADS * std::mem::size_of::<f32>() as u64,
+                metal::MTLResourceOptions::StorageModePrivate,
+            ));
+        }
+        Ok(())
+    }
+
     /// Bytes this engine has deliberately allocated and keeps resident.
     ///
     /// This is the figure the 18 GB budget is about: checkpoint weights, KV
     /// caches, activation scratch, and embedding. It is independent of what the
     /// kernel's `phys_footprint` happens to charge at any instant.
     pub fn allocated_bytes(&self) -> u64 {
-        let weights = self._checkpoint_weights.as_ref().map_or(0, TextWeights::resident_bytes);
-        let kv: usize = self.layers.iter().map(|layer| layer.gpu_cache.resident_bytes()).sum();
+        let weights = self
+            ._checkpoint_weights
+            .as_ref()
+            .map_or(0, TextWeights::resident_bytes);
+        let kv: usize = self
+            .layers
+            .iter()
+            .map(|layer| layer.gpu_cache.resident_bytes())
+            .sum();
         weights + kv as u64 + self.scratch.resident_bytes()
     }
 
     /// Per-component breakdown of [`Self::allocated_bytes`].
     pub fn allocation_breakdown(&self) -> (u64, u64, u64) {
-        let weights = self._checkpoint_weights.as_ref().map_or(0, TextWeights::resident_bytes);
+        let weights = self
+            ._checkpoint_weights
+            .as_ref()
+            .map_or(0, TextWeights::resident_bytes);
         let kv: u64 = self
             .layers
             .iter()
@@ -3095,9 +3396,7 @@ impl TextModel {
     pub fn embedding(&self, token_ids: &[u32]) -> Vec<u16> {
         let mut output = vec![0_u16; token_ids.len() * self.hidden_size];
         let source_ptr: *const u16 = if let Some(buffer) = &self.embedding_buffer {
-            unsafe {
-                (buffer.contents() as *const u16).add(self.embedding_offset as usize / 2)
-            }
+            unsafe { (buffer.contents() as *const u16).add(self.embedding_offset as usize / 2) }
         } else {
             self.embedding.as_ptr()
         };
@@ -3131,12 +3430,7 @@ impl TextModel {
     }
 
     /// Run a single layer on the host path. Diagnostic only.
-    pub fn forward_layer(
-        &mut self,
-        index: usize,
-        hidden: &[u16],
-        positions: &[u32],
-    ) -> Vec<u16> {
+    pub fn forward_layer(&mut self, index: usize, hidden: &[u16], positions: &[u32]) -> Vec<u16> {
         self.layers[index].forward(hidden, positions).unwrap()
     }
 
@@ -3287,9 +3581,7 @@ fn load_quantized_linear(
     } else {
         weights
             .zero_copy_tensor_buffer(&trellis_name)?
-            .ok_or_else(|| {
-                ModelError::InvalidWeights(format!("{trellis_name} is not resident"))
-            })?
+            .ok_or_else(|| ModelError::InvalidWeights(format!("{trellis_name} is not resident")))?
     };
     let packed_len = weights
         .tensors()

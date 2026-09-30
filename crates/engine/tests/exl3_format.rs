@@ -138,7 +138,8 @@ fn pack_trellis_produces_a_readable_ring() {
         let (_, windows) = pack_integer_states(&states(bits, 17), bits).unwrap();
         let packed = pack_trellis(&windows, BitRate::Integer(bits)).unwrap();
         assert_eq!(packed.len(), 16 * bits as usize, "bits={bits}");
-        let decoded = kaplumba_engine::exl3::unpack_trellis(&packed, BitRate::Integer(bits)).unwrap();
+        let decoded =
+            kaplumba_engine::exl3::unpack_trellis(&packed, BitRate::Integer(bits)).unwrap();
         assert_eq!(decoded.len(), 256, "bits={bits}");
     }
 }

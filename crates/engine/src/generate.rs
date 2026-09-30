@@ -5,10 +5,10 @@ use thiserror::Error;
 use crate::metrics::{
     BenchmarkPlan, BenchmarkResult, MetricsError, RunMetrics, benchmark_result, measure_rss,
 };
-use kaplumba_kernels::encoder::MetalEncoder;
 use crate::model::{ModelError, TextModel};
 use crate::sampler::{Sampler, SamplerConfig, SamplerError};
 use crate::tokenizer::{GemmaTokenizer, TokenizerError};
+use kaplumba_kernels::encoder::MetalEncoder;
 
 pub const DEFAULT_CONTEXT_LIMIT: usize = 8192;
 
@@ -253,6 +253,11 @@ where
     let prefill_started = Instant::now();
     let mut logits = model.forward_buffer(&prompt_ids, &positions)?;
     let prefill_duration = prefill_started.elapsed();
+    // Timed here, on the same clock as the decode steps below, and added to
+    // nothing: a decode total that absorbed the prefill would be flat in
+    // `--max-new-tokens`, which is how the prefill table came to be read as a
+    // decode table.
+    crate::decode_profile::record_prefill(prefill_duration.as_secs_f64() * 1e3, prompt_ids.len());
     let mut decode_duration = Duration::ZERO;
     let mut ttft_duration = Duration::ZERO;
     let mut generated_ids = Vec::with_capacity(config.max_new_tokens);
@@ -304,6 +309,10 @@ where
         decode_steps as f64 / decode_duration.as_secs_f64()
     };
     let _ = vocab_size;
+    // One report for the whole run, after the loop. The accumulator latches
+    // `printed`, so if both this entry point and `generate_gpu_greedy` reach it
+    // in one process only the first produces a table.
+    crate::decode_profile::report();
     Ok(GenerationResult {
         text,
         prompt_tokens: prompt_ids.len(),
@@ -462,6 +471,11 @@ where
         // `prefill_duration` honest -- it now covers the GPU, not just the host.
         prefill.commit_and_wait().map_err(ModelError::from)?;
         prefill_duration = prefill_started.elapsed();
+        // Timed here, on the same clock as the decode steps below, and added to
+        // nothing: a decode total that absorbed the prefill would be flat in
+        // `--max-new-tokens`, which is how the prefill table came to be read as
+        // a decode table.
+        crate::decode_profile::record_prefill(prefill_duration.as_secs_f64() * 1e3, prompt_len);
 
         // Read after the wait: the prefill's last row is the first generated
         // token's logits, and reading it earlier returns the previous row.
@@ -484,20 +498,42 @@ where
                 break;
             }
             let position = prompt_len + generated_ids.len() - 1;
-            let position = u32::try_from(position).map_err(|_| GenerationError::ContextExceeded {
-                limit: config.context_limit,
-            })?;
+            let position =
+                u32::try_from(position).map_err(|_| GenerationError::ContextExceeded {
+                    limit: config.context_limit,
+                })?;
             let step_started = Instant::now();
             let mut encoder = MetalEncoder::new(&queue).map_err(ModelError::from)?;
+            // `KAPLUMBA_DECODE_PROFILE=step`: two stamped boundaries around the
+            // step, so its duration on the GPU timeline can be read. The span
+            // between them covers the ~42 rolled buffers in between, because one
+            // Metal queue executes its command buffers in commit order.
+            crate::decode_profile::begin_step(&mut encoder, |encoder| {
+                model.calibration_dispatch(encoder)
+            })
+            .map_err(ModelError::from)?;
             model
                 .forward_buffer_into_step(&mut encoder, position, token)
                 .map_err(ModelError::from)?;
             // `commit_terminal` ends the step's trailing partial slice of rolled
             // command buffers; `wait` covers all of them, in commit order, which
             // is the barrier the next step's host-side staging needs.
-            encoder.commit_terminal().map_err(ModelError::from)?;
-            encoder.wait();
-            decode_duration += step_started.elapsed();
+            //
+            // In `step` mode the closing commit is stamped and waited inside
+            // `close_step`, because a terminal commit does not park its buffer
+            // where `GPUEndTime` can be read; `wait` then has nothing left to
+            // cover and does not touch the fresh buffer `close_step` re-armed.
+            let step_mode =
+                crate::decode_profile::active_mode() == crate::decode_profile::Mode::Step;
+            if step_mode {
+                crate::decode_profile::close_step(&mut encoder).map_err(ModelError::from)?;
+            } else {
+                encoder.commit_terminal().map_err(ModelError::from)?;
+                encoder.wait();
+            }
+            let step_ms = step_started.elapsed().as_secs_f64() * 1e3;
+            crate::decode_profile::end_step(&mut encoder, step_ms).map_err(ModelError::from)?;
+            decode_duration += Duration::from_secs_f64(step_ms / 1e3);
             logits = model.last_logits();
         }
 
@@ -508,6 +544,10 @@ where
         Ok(())
     })();
     result?;
+
+    // One report for the whole run, after the loop: printed per step it would be
+    // N tables of the same thing and unreadable.
+    crate::decode_profile::report();
 
     let decode_steps = generated_ids.len().saturating_sub(1);
     Ok(GenerationResult {

@@ -101,7 +101,11 @@ fn tiles_are_all_distinct() {
         let total = 64_u64 * 64;
         let mut tiles = Vec::with_capacity(total as usize);
         for tile in 0..total {
-            tiles.push(pack_integer_states(&tile_states(bits, tile), bits).unwrap().0);
+            tiles.push(
+                pack_integer_states(&tile_states(bits, tile), bits)
+                    .unwrap()
+                    .0,
+            );
         }
         // Adjacent tiles must differ (catches a period-1 or period-8 generator,
         // which is the historical failure).
@@ -192,12 +196,7 @@ struct Fixture {
 }
 
 impl Fixture {
-    fn new(
-        packed: &[u16],
-        in_features: usize,
-        out_features: usize,
-        bits: u8,
-    ) -> Fixture {
+    fn new(packed: &[u16], in_features: usize, out_features: usize, bits: u8) -> Fixture {
         let device = Device::system_default().expect("Metal device");
         Fixture {
             input: X[..in_features]
@@ -244,12 +243,7 @@ impl Fixture {
     /// the kernel chosen by name instead of by `(codebook, aligned, bits)`, so
     /// both kernels under test see an identical input transform, an identical
     /// reduction and an identical finalize, and differ only in the decode call.
-    fn run_named(
-        &self,
-        kernels: &LinearKernels,
-        kernel: &str,
-        codebook: Exl3Codebook,
-    ) -> Vec<u32> {
+    fn run_named(&self, kernels: &LinearKernels, kernel: &str, codebook: Exl3Codebook) -> Vec<u32> {
         let out = kernels
             .gemv_buffer_named(kernel, self.request(codebook))
             .unwrap_or_else(|e| panic!("dispatch {kernel}: {e}"));
@@ -332,7 +326,9 @@ fn mcg_decode_body_is_a_faithful_transcription() {
         let mut report = String::new();
         for (i, (x, y)) in la.iter().zip(lb.iter()).enumerate() {
             if x != y {
-                report.push_str(&format!("  line {i}:\n    generic:     {x}\n    specialised: {y}\n"));
+                report.push_str(&format!(
+                    "  line {i}:\n    generic:     {x}\n    specialised: {y}\n"
+                ));
             }
         }
         if la.len() != lb.len() {
@@ -397,8 +393,11 @@ fn mcg_specialisation_is_bit_exact() {
         );
 
         // The generic kernel: runtime `codebook`, codebook 1 == MCG.
-        let generic =
-            fixture.run_named(&kernels, &format!("linear_gemv_exl3_k{bits}"), Exl3Codebook::Mcg);
+        let generic = fixture.run_named(
+            &kernels,
+            &format!("linear_gemv_exl3_k{bits}"),
+            Exl3Codebook::Mcg,
+        );
         // The specialised kernel: MCG folded to a compile-time constant.
         let special = fixture.run_named(
             &kernels,
@@ -441,7 +440,7 @@ fn codebook_matches_cpu_within_tolerance() {
     let in_features = 512;
     let out_features = 512;
     let bits = 3_u8;
-    let packed = packed_matrix(bits, 32u64*32);
+    let packed = packed_matrix(bits, 32u64 * 32);
     let fixture = Fixture::new(&packed, in_features, out_features, bits);
 
     let matrix = reconstruct_matrix(

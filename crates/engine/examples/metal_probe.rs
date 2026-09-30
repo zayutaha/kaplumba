@@ -89,6 +89,10 @@ fn main() {
         "A=identity, B known: {}/{} elements correct -> {}",
         ok.iter().filter(|v| **v).count(),
         n,
-        if ok.iter().all(|v| *v) { "PASS" } else { "FAIL" }
+        if ok.iter().all(|v| *v) {
+            "PASS"
+        } else {
+            "FAIL"
+        }
     );
 }

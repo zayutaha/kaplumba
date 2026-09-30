@@ -106,9 +106,9 @@ pub fn rope_threads(
     } else {
         0
     };
-    rotated.checked_add(tail).ok_or_else(|| {
-        KernelError::InvalidInput("RoPE thread count overflowed".to_string())
-    })
+    rotated
+        .checked_add(tail)
+        .ok_or_else(|| KernelError::InvalidInput("RoPE thread count overflowed".to_string()))
 }
 
 #[derive(Clone, Copy)]
@@ -169,6 +169,8 @@ pub struct ElementKernels {
     embedding_buffer_pipeline: ComputePipelineState,
     copy_last_row_pipeline: ComputePipelineState,
     copy_buffer_pipeline: ComputePipelineState,
+    /// MEASUREMENT AID. See [`Self::encode_spin_burn`].
+    spin_burn_pipeline: ComputePipelineState,
 }
 
 impl ElementKernels {
@@ -232,8 +234,7 @@ impl ElementKernels {
         let embedding_pipeline = pipeline(&device, &library, "embedding_scaled")?;
         let rms_norm_weighted_pipeline = pipeline(&device, &library, "rms_norm_weighted")?;
         let rms_norm_unweighted_pipeline = pipeline(&device, &library, "rms_norm_unweighted")?;
-        let rms_norm_weighted_tg_pipeline =
-            pipeline(&device, &library, "rms_norm_weighted_tg")?;
+        let rms_norm_weighted_tg_pipeline = pipeline(&device, &library, "rms_norm_weighted_tg")?;
         let rms_norm_unweighted_tg_pipeline =
             pipeline(&device, &library, "rms_norm_unweighted_tg")?;
         let greedy_pick_pipeline = pipeline(&device, &library, "greedy_pick")?;
@@ -248,6 +249,7 @@ impl ElementKernels {
         let embedding_buffer_pipeline = pipeline(&device, &library, "embedding_scaled_buffer")?;
         let copy_last_row_pipeline = pipeline(&device, &library, "copy_last_row")?;
         let copy_buffer_pipeline = pipeline(&device, &library, "copy_buffer")?;
+        let spin_burn_pipeline = pipeline(&device, &library, "spin_burn")?;
         let queue = device.new_command_queue();
         Ok(Self {
             device,
@@ -270,6 +272,7 @@ impl ElementKernels {
             embedding_buffer_pipeline,
             copy_last_row_pipeline,
             copy_buffer_pipeline,
+            spin_burn_pipeline,
         })
     }
 
@@ -1025,6 +1028,47 @@ impl ElementKernels {
             count as u64,
             64,
         )
+    }
+
+    /// Encode `dispatches` copies of a deliberately slow kernel, so a timing
+    /// instrument can be shown to resolve a cost injected into the region it
+    /// claims to measure.
+    ///
+    /// This exists because a profiler that cannot fail has no coverage claim. The
+    /// kernel is a dependent FMA loop with no memory traffic, so its cost is set
+    /// by `iters` and the machine's clock alone; comparing the instrument's
+    /// number against the host wall clock therefore gives a real cross-check
+    /// rather than a tautology.
+    ///
+    /// `out` must hold at least `threads` floats. The binding list is
+    /// `&[Some(out), None]` on purpose: `dispatch_1d` packs the trailing
+    /// `params` bytes at index `bindings.len()`, and the kernel reads its trip
+    /// count from `buffer(2)`, so the list must have two entries. See the
+    /// `spin_burn` comment in `elements.metal` for why the wrong index fails
+    /// silently rather than loudly.
+    pub fn encode_spin_burn(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        out: &Buffer,
+        dispatches: usize,
+        iters: u32,
+        threads: u64,
+    ) -> Result<(), KernelError> {
+        if dispatches == 0 || threads == 0 || threads > u32::MAX as u64 {
+            return Err(KernelError::InvalidInput(
+                "spin_burn dispatch and thread counts must be non-zero".to_string(),
+            ));
+        }
+        for _ in 0..dispatches {
+            encoder.dispatch_1d(
+                &self.spin_burn_pipeline,
+                &[Some(out), None],
+                &iters.to_le_bytes(),
+                threads,
+                64,
+            )?;
+        }
+        Ok(())
     }
 
     fn make_output(&self, elements: usize) -> Result<Buffer, KernelError> {

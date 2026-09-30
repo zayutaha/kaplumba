@@ -4,7 +4,7 @@
 //! ka-bit slots. Brute force says every code is a contiguous ka-bit read with no
 //! collisions, which means the state -> slot map is a bijection. This finds it.
 
-use kaplumba_engine::exl3::{unpack_trellis, pack_integer_states, BitRate};
+use kaplumba_engine::exl3::{BitRate, pack_integer_states, unpack_trellis};
 
 fn main() {
     for ka in [1u8, 2, 3, 4, 5, 6, 7, 8] {
@@ -16,7 +16,10 @@ fn main() {
             })
             .collect();
         let (packed, windows) = pack_integer_states(&states, ka).unwrap();
-        assert_eq!(unpack_trellis(&packed, BitRate::Integer(ka)).unwrap(), windows);
+        assert_eq!(
+            unpack_trellis(&packed, BitRate::Integer(ka)).unwrap(),
+            windows
+        );
 
         let words: Vec<u32> = packed
             .chunks_exact(2)
@@ -45,7 +48,9 @@ fn main() {
             }
         }
         match rotation {
-            Some(k) => println!("ka={ka}: frame_off={off:>2}  state s -> slot (s + {k:>3}) mod 256"),
+            Some(k) => {
+                println!("ka={ka}: frame_off={off:>2}  state s -> slot (s + {k:>3}) mod 256")
+            }
             None => println!("ka={ka}: frame_off={off} NO ROTATION"),
         }
     }

@@ -8,13 +8,25 @@ fn main() {
     let sel = safetensors::load_text_selection(root, index).unwrap();
     let ctx = MetalContext::new().unwrap();
     let w = TextWeights::load_dedicated(root, &sel, ctx, u64::MAX).unwrap();
-    for n in ["model.language_model.embed_tokens.weight", "lm_head.trellis",
-              "model.language_model.layers.0.self_attn.q_proj.trellis"] {
+    for n in [
+        "model.language_model.embed_tokens.weight",
+        "lm_head.trellis",
+        "model.language_model.layers.0.self_attn.q_proj.trellis",
+    ] {
         match w.tensor(n) {
-            Some(t) => println!("{n}\n   spans={} converted={} start={} end={} bytes={}",
-                t.spans.len(), t.converted_from_bf16, t.start, t.end, t.end-t.start),
+            Some(t) => println!(
+                "{n}\n   spans={} converted={} start={} end={} bytes={}",
+                t.spans.len(),
+                t.converted_from_bf16,
+                t.start,
+                t.end,
+                t.end - t.start
+            ),
             None => println!("{n}: absent"),
         }
     }
-    println!("resident_bytes = {:.2} GiB", w.resident_bytes() as f64 / 1073741824.0);
+    println!(
+        "resident_bytes = {:.2} GiB",
+        w.resident_bytes() as f64 / 1073741824.0
+    );
 }

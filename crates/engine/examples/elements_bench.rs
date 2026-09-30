@@ -9,8 +9,8 @@
 use half::f16;
 use kaplumba_kernels::elements::ElementKernels;
 use kaplumba_kernels::encoder::MetalEncoder;
-use kaplumba_kernels::linear::{LinearEncodeRequest, LinearKernels};
 use kaplumba_kernels::exl3::{Exl3Codebook, Exl3Rate};
+use kaplumba_kernels::linear::{LinearEncodeRequest, LinearKernels};
 use metal::{Device, MTLResourceOptions};
 use std::time::Instant;
 
@@ -120,57 +120,39 @@ fn main() {
     };
 
     println!("== prefill shapes, 256 tokens ==");
-    let t_norm = bench(
-        "rms_norm 256x5376 (one dispatch)",
-        &queue,
-        200,
-        &mut |e| {
-            elements
-                .encode_rms_norm(e, &x, &w, &y, tokens, HIDDEN, 1e-5)
-                .unwrap();
-        },
-    );
-    let t_rope = bench(
-        "rope 256tok x 32 heads x 256 dim",
-        &queue,
-        200,
-        &mut |e| {
-            elements
-                .encode_rope(
-                    e,
-                    &q,
-                    &q,
-                    kaplumba_kernels::elements::RopeBufferRequest {
-                        tokens,
-                        heads: 32,
-                        head_dim: 256,
-                        offset: 0,
-                        theta: 1_000_000.0,
-                        partial_factor: 1.0,
-                        proportional: false,
-                    },
-                )
-                .unwrap();
-        },
-    );
-    let t_gelu = bench(
-        "gated_gelu 256x21504",
-        &queue,
-        200,
-        &mut |e| {
-            elements
-                .encode_gated_gelu(e, &gate, &up, &act, tokens * INTER)
-                .unwrap();
-        },
-    );
-    let t_res = bench(
-        "residual_add 256x5376",
-        &queue,
-        200,
-        &mut |e| {
-            elements.encode_residual_add(e, &x, &y, &y, tokens * HIDDEN).unwrap();
-        },
-    );
+    let t_norm = bench("rms_norm 256x5376 (one dispatch)", &queue, 200, &mut |e| {
+        elements
+            .encode_rms_norm(e, &x, &w, &y, tokens, HIDDEN, 1e-5)
+            .unwrap();
+    });
+    let t_rope = bench("rope 256tok x 32 heads x 256 dim", &queue, 200, &mut |e| {
+        elements
+            .encode_rope(
+                e,
+                &q,
+                &q,
+                kaplumba_kernels::elements::RopeBufferRequest {
+                    tokens,
+                    heads: 32,
+                    head_dim: 256,
+                    offset: 0,
+                    theta: 1_000_000.0,
+                    partial_factor: 1.0,
+                    proportional: false,
+                },
+            )
+            .unwrap();
+    });
+    let t_gelu = bench("gated_gelu 256x21504", &queue, 200, &mut |e| {
+        elements
+            .encode_gated_gelu(e, &gate, &up, &act, tokens * INTER)
+            .unwrap();
+    });
+    let t_res = bench("residual_add 256x5376", &queue, 200, &mut |e| {
+        elements
+            .encode_residual_add(e, &x, &y, &y, tokens * HIDDEN)
+            .unwrap();
+    });
     let t_gemm = bench("mma GEMM 256x5376->21504", &queue, 50, &mut |e| gemm(e));
 
     // The in-situ mix: 8 norms + 2 rope + 1 gelu + 2 residual per layer, with
@@ -181,7 +163,9 @@ fn main() {
         20,
         &mut |e| {
             for _ in 0..8 {
-                elements.encode_rms_norm(e, &x, &w, &y, tokens, HIDDEN, 1e-5).unwrap();
+                elements
+                    .encode_rms_norm(e, &x, &w, &y, tokens, HIDDEN, 1e-5)
+                    .unwrap();
             }
             for _ in 0..2 {
                 elements
@@ -201,9 +185,13 @@ fn main() {
                     )
                     .unwrap();
             }
-            elements.encode_gated_gelu(e, &gate, &up, &act, tokens * INTER).unwrap();
+            elements
+                .encode_gated_gelu(e, &gate, &up, &act, tokens * INTER)
+                .unwrap();
             for _ in 0..2 {
-                elements.encode_residual_add(e, &x, &y, &y, tokens * HIDDEN).unwrap();
+                elements
+                    .encode_residual_add(e, &x, &y, &y, tokens * HIDDEN)
+                    .unwrap();
             }
             gemm(e);
         },
@@ -220,13 +208,19 @@ fn main() {
 
     println!("== decode shapes, 1 token ==");
     bench("rms_norm 1x5376", &queue, 500, &mut |e| {
-        elements.encode_rms_norm(e, &dx, &w, &dy, 1, HIDDEN, 1e-5).unwrap();
+        elements
+            .encode_rms_norm(e, &dx, &w, &dy, 1, HIDDEN, 1e-5)
+            .unwrap();
     });
     bench("gated_gelu 1x21504", &queue, 500, &mut |e| {
-        elements.encode_gated_gelu(e, &dgate, &dup, &dact, INTER).unwrap();
+        elements
+            .encode_gated_gelu(e, &dgate, &dup, &dact, INTER)
+            .unwrap();
     });
     bench("residual_add 1x5376", &queue, 500, &mut |e| {
-        elements.encode_residual_add(e, &dx, &dy, &dy, HIDDEN).unwrap();
+        elements
+            .encode_residual_add(e, &dx, &dy, &dy, HIDDEN)
+            .unwrap();
     });
     let _ = (kpos, cache, k, v, qpos);
 }

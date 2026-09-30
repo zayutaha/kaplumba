@@ -313,11 +313,8 @@ impl<'q> MetalEncoder<'q> {
         }
         self.encoder.set_compute_pipeline_state(pipeline);
         for (index, binding) in bindings.iter().enumerate() {
-            self.encoder.set_buffer(
-                index as u64,
-                Some(&**binding.buffer),
-                binding.offset,
-            );
+            self.encoder
+                .set_buffer(index as u64, Some(&**binding.buffer), binding.offset);
         }
         self.encoder.set_bytes(
             bindings.len() as u64,
@@ -385,19 +382,18 @@ impl<'q> MetalEncoder<'q> {
         }
         self.encoder.set_compute_pipeline_state(pipeline);
         for (index, binding) in bindings.iter().enumerate() {
-            self.encoder.set_buffer(
-                index as u64,
-                Some(&**binding.buffer),
-                binding.offset,
-            );
+            self.encoder
+                .set_buffer(index as u64, Some(&**binding.buffer), binding.offset);
         }
         self.encoder.set_bytes(
             bindings.len() as u64,
             params.len() as u64,
             params.as_ptr() as *const c_void,
         );
-        self.encoder
-            .dispatch_threads(MTLSize::new(threads, 1, 1), MTLSize::new(threads_per_group, 1, 1));
+        self.encoder.dispatch_threads(
+            MTLSize::new(threads, 1, 1),
+            MTLSize::new(threads_per_group, 1, 1),
+        );
         self.tick()?;
         Ok(())
     }
@@ -413,7 +409,8 @@ impl<'q> MetalEncoder<'q> {
         self.assert_live();
         self.encoder.set_compute_pipeline_state(pipeline);
         for (index, binding) in bindings.iter().enumerate() {
-            self.encoder.set_buffer(index as u64, binding.map(|value| &**value), 0);
+            self.encoder
+                .set_buffer(index as u64, binding.map(|value| &**value), 0);
         }
         self.encoder.set_bytes(
             bindings.len() as u64,
@@ -580,6 +577,66 @@ impl<'q> MetalEncoder<'q> {
         self.stamped
             .push((label.to_string(), self.command_buffer.clone()));
         self.rearm();
+        Ok(())
+    }
+
+    /// Commit the work encoded so far under `label`, wait for it and for every
+    /// rolled buffer, and park it in `stamped` for a GPU measurement.
+    ///
+    /// This exists because [`Self::commit_and_wait`] takes `self`, and a
+    /// measurement needs the buffer *after* it has completed:
+    /// `GPUStartTime` / `GPUEndTime` are undefined until then. So the only way
+    /// to time a region of work with these two primitives was to commit it
+    /// terminal and never look at it -- which is precisely how a decode step
+    /// ended up with no GPU-clock measurement at all.
+    ///
+    /// Unlike [`Self::wait`] it does not touch the fresh buffer that
+    /// `commit_stamped` re-armed: that buffer has never been committed, and
+    /// waiting on a buffer Metal never enqueued is not a documented operation.
+    /// Every buffer it does wait on is status-checked, so a failed dispatch is
+    /// still an error rather than a plausible-looking number.
+    pub fn commit_stamped_and_wait(&mut self, label: &str) -> Result<(), KernelError> {
+        self.commit_stamped(label)?;
+        for (_, buffer) in &self.stamped {
+            buffer.wait_until_completed();
+            if buffer.status() != MTLCommandBufferStatus::Completed {
+                return Err(KernelError::CommandFailed);
+            }
+        }
+        for buffer in std::mem::take(&mut self.in_flight) {
+            buffer.wait_until_completed();
+            if buffer.status() != MTLCommandBufferStatus::Completed {
+                return Err(KernelError::CommandFailed);
+            }
+        }
+        Ok(())
+    }
+
+    /// Commit the work encoded since the last commit, wait for it, and leave
+    /// the encoder terminal.
+    ///
+    /// `commit_stamped` re-arms a fresh command buffer. Dropping the encoder
+    /// then *releases that buffer without ever committing it*, and a Metal
+    /// queue that has accumulated enough uncommitted command buffers blocks in
+    /// `new_command_buffer` rather than allocating another -- which is a hang
+    /// that looks like nothing at all from the outside. Measured here: a loop
+    /// that creates one encoder per "step" and drops it after
+    /// `commit_stamped_and_wait` blocks indefinitely in `new_command_buffer`
+    /// after a few hundred steps.
+    ///
+    /// So a caller that makes a command buffer per step has to end the step
+    /// with this, not with a drop. The buffer committed here is normally empty,
+    /// which costs a few microseconds.
+    pub fn finish(&mut self) -> Result<(), KernelError> {
+        self.end();
+        self.command_buffer.commit();
+        self.command_buffer.wait_until_completed();
+        for buffer in std::mem::take(&mut self.in_flight) {
+            buffer.wait_until_completed();
+        }
+        if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(KernelError::CommandFailed);
+        }
         Ok(())
     }
 

@@ -490,3 +490,30 @@ kernel void greedy_token(const device atomic_uint *best [[buffer(0)]],
     }
     out[row] = 0xFFFFu - (*(const device uint *)best) % 0x10000u;
 }
+
+// MEASUREMENT AID: a deliberately slow dispatch, used to prove that a timing
+// instrument can see a cost injected into the region it claims to measure.
+//
+// A profiler that cannot resolve an injected cost has no coverage claim behind
+// it, and this project's decode tables were believed for a long time before
+// anyone checked that they could fail. `iters` is a runtime trip count; the loop
+// carries a data dependency so it cannot be hoisted, and the result is written so
+// the dispatch cannot be elided as dead.
+//
+// `iters` is at `buffer(2)`, not `buffer(1)`: `MetalEncoder::dispatch_1d` binds
+// the caller's buffer list at indices 0..n and then packs the trailing `params`
+// bytes at index n, so with one bound buffer the scalar lands at index 1. This
+// kernel is dispatched with one buffer, so it must read index 2 -- and getting
+// that wrong is silent, because an `iters` read from an unbound or
+// zero-filled index is simply 0 and the dispatch costs nothing. It did cost
+// nothing, and the only reason it was noticed is that the test comparing the
+// instrument's number against the host clock failed.
+kernel void spin_burn(device float *out [[buffer(0)]],
+                      constant uint &iters [[buffer(2)]],
+                      uint tid [[thread_position_in_grid]]) {
+    float acc = float(tid) * 1e-3f;
+    for (uint i = 0u; i < iters; ++i) {
+        acc = fma(acc, 1.0000001f, 0.25f);
+    }
+    out[tid] = acc;
+}

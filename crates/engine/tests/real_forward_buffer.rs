@@ -125,7 +125,9 @@ fn real_model_buffer_forward_matches_slice_forward() {
 fn real_model_per_layer_hidden_norms() {
     use half::f16;
     let mut model = TextModel::load_from_dir(std::path::Path::new(&model_path())).unwrap();
-    let prompt = [2_u32, 105, 2364, 107, 9259, 106, 107, 105, 4368, 107, 100, 45518, 107, 101];
+    let prompt = [
+        2_u32, 105, 2364, 107, 9259, 106, 107, 105, 4368, 107, 100, 45518, 107, 101,
+    ];
     let positions: Vec<u32> = (0..prompt.len() as u32).collect();
 
     let mut hidden = model.embedding(&prompt);
@@ -155,7 +157,9 @@ fn real_model_per_layer_hidden_norms() {
 #[ignore = "requires KAPLUMBA_TEST_MODEL; layer-internal trace"]
 fn real_model_trace_layers_53_and_59() {
     let mut model = TextModel::load_from_dir(std::path::Path::new(&model_path())).unwrap();
-    let prompt = [2_u32, 105, 2364, 107, 9259, 106, 107, 105, 4368, 107, 100, 45518, 107, 101];
+    let prompt = [
+        2_u32, 105, 2364, 107, 9259, 106, 107, 105, 4368, 107, 100, 45518, 107, 101,
+    ];
     let positions: Vec<u32> = (0..prompt.len() as u32).collect();
 
     let mut hidden = model.embedding(&prompt);
@@ -192,7 +196,9 @@ fn real_model_trace_layers_53_and_59() {
 fn real_model_top_tokens() {
     let mut model = TextModel::load_from_dir(std::path::Path::new(&model_path())).unwrap();
     model.reset_gpu_caches();
-    let prompt = [2_u32, 105, 2364, 107, 9259, 106, 107, 105, 4368, 107, 100, 45518, 107, 101];
+    let prompt = [
+        2_u32, 105, 2364, 107, 9259, 106, 107, 105, 4368, 107, 100, 45518, 107, 101,
+    ];
     let positions: Vec<u32> = (0..prompt.len() as u32).collect();
     let logits = model.forward_buffer(&prompt, &positions).unwrap();
 
@@ -208,7 +214,10 @@ fn real_model_top_tokens() {
         .take(2000)
         .map(|(_, v)| ((v - max) as f64).exp() as f32)
         .sum();
-    println!("logit max={max:.3}  top1_prob_approx={:.4}", 1.0 / sum_exp.max(1.0));
+    println!(
+        "logit max={max:.3}  top1_prob_approx={:.4}",
+        1.0 / sum_exp.max(1.0)
+    );
     for (rank, (index, value)) in scored.iter().take(10).enumerate() {
         let p = (((*value - max) as f64).exp() / sum_exp.max(1.0) as f64) as f32;
         println!("  {rank:2} id={index:6} logit={value:8.3} p={p:.4}");
@@ -266,7 +275,9 @@ fn real_model_predictability_probe() {
                 let p = (((*v - max) as f64).exp() / z) as f32;
                 format!(
                     "{}:{:.3}",
-                    tokenizer.decode_all(&[*i as u32], true).unwrap_or("?".into()),
+                    tokenizer
+                        .decode_all(&[*i as u32], true)
+                        .unwrap_or("?".into()),
                     p
                 )
             })
@@ -306,11 +317,21 @@ fn real_model_permutation_sweep() {
                 .collect();
             scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
             let max = scored[0].1;
-            let z: f64 = scored.iter().take(500).map(|(_, v)| ((*v - max) as f64).exp()).sum();
+            let z: f64 = scored
+                .iter()
+                .take(500)
+                .map(|(_, v)| ((*v - max) as f64).exp())
+                .sum();
             let top1 = 1.0 / z as f32;
             let winner = scored[0].0 as u32;
-            let text = tokenizer.decode_all(&[winner], true).unwrap_or_else(|_| "?".to_string());
-            let hit = if text.trim() == want.trim() { "HIT" } else { "   " };
+            let text = tokenizer
+                .decode_all(&[winner], true)
+                .unwrap_or_else(|_| "?".to_string());
+            let hit = if text.trim() == want.trim() {
+                "HIT"
+            } else {
+                "   "
+            };
             line.push_str(&format!("  [{hit} p={top1:.3} {:?}]", text));
             if top1 > best {
                 best = top1;

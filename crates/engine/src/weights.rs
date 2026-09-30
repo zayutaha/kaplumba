@@ -2,9 +2,9 @@ use std::collections::BTreeMap;
 use std::fs::File;
 use std::io;
 use std::os::fd::AsRawFd;
-use std::ptr::NonNull;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
+use std::ptr::NonNull;
 
 use metal::Buffer;
 use rayon::prelude::*;
@@ -547,11 +547,11 @@ impl TextWeights {
             // reads one row per token and so touches only a few KiB of the
             // 2.82 GB table. Converting up front meant holding a full anonymous
             // copy of the table for the process lifetime.
-            let offload_bf16_embedding = offload_embedding
-                && name == "model.language_model.embed_tokens.weight";
+            let offload_bf16_embedding =
+                offload_embedding && name == "model.language_model.embed_tokens.weight";
             let offload_head_trellis = offload_head && name == "lm_head.trellis";
-            let skip_copy = offload_bf16_embedding
-                || (!converted && (all_zero_copy || offload_head_trellis));
+            let skip_copy =
+                offload_bf16_embedding || (!converted && (all_zero_copy || offload_head_trellis));
             let spans = if skip_copy {
                 Vec::new()
             } else if dedicated {
@@ -717,9 +717,12 @@ impl TextWeights {
         &self,
         name: &str,
     ) -> Result<Option<(Buffer, u64)>, WeightError> {
-        let tensor = self.tensors.get(name).ok_or_else(|| WeightError::InvalidSpan {
-            name: name.to_string(),
-        })?;
+        let tensor = self
+            .tensors
+            .get(name)
+            .ok_or_else(|| WeightError::InvalidSpan {
+                name: name.to_string(),
+            })?;
         if tensor.converted_from_bf16 {
             return Ok(None);
         }
@@ -745,7 +748,11 @@ impl TextWeights {
         self.raw_view(&device, name)
     }
 
-    fn raw_view(&self, device: &metal::Device, name: &str) -> Result<Option<(Buffer, u64)>, WeightError> {
+    fn raw_view(
+        &self,
+        device: &metal::Device,
+        name: &str,
+    ) -> Result<Option<(Buffer, u64)>, WeightError> {
         let tensor = self.tensors.get(name).ok_or(WeightError::InvalidSpan {
             name: name.to_string(),
         })?;
@@ -1245,10 +1252,7 @@ mod tests {
             .expect("trellis must expose a zero-copy view");
         let (buffer, offset) = view;
         let mapped = unsafe {
-            std::slice::from_raw_parts(
-                (buffer.contents() as *const u8).add(offset as usize),
-                4,
-            )
+            std::slice::from_raw_parts((buffer.contents() as *const u8).add(offset as usize), 4)
         };
         assert_eq!(mapped.to_vec(), vec![0x34, 0x12, 0x78, 0x56]);
         fs::remove_dir_all(dir).unwrap();
