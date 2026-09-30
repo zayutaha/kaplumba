@@ -130,105 +130,115 @@ bending curve, and 3.95e12 uop/s / 238e9 B/s = 16.6 uop/B). **EXL3 runs at
 
 ## What is NOT closed, and is the actual work
 
-### 1. Per-matvec fixed latency: **59 us**, worth ~25 ms/token
+### 1. ~~Per-matvec fixed latency~~ — *CLOSED, and it was never a lever*
 
-Measured as the *intercept* of a three-point affine fit, which is the honest way
-to separate it from the streaming term — one matvec per command buffer with a
-wait measures the CPU/GPU round trip, not this (`gemv_shape.rs --selftest`,
-AFFINE check, 0.0% residual on three sizes at in=5376):
+The spec carried **79 us**, this session corrected it to **59 us**, and the
+measured answer is **~155 us per command buffer, 42 buffers per decode step**.
+All three were wrong, and wrong in three different ways:
 
-```
-t = 58.9 us + 0.00608 ms/MB      -> 164.6 GB/s streaming, 58.9 us fixed
-```
+| | claimed | actual |
+|---|---|---|
+| quantity | per matvec | **per command buffer** |
+| magnitude | 79 us, then 59 us | **117-203 us** |
+| multiplier | 420 matvecs | **42 buffers** |
 
-Reproduced at 164.6 GB/s / 58.9 us. The spec previously recorded **79 us**; the
-corrected figure is **59 us**, and 420 matvecs x 59 us = **24.8 ms of a 96 ms
-token**.
+The 59 us was a fitting artifact: a three-point fit of time against bytes with
+the pass count scaled as `1/bytes`, so a per-buffer cost is amortised differently
+at every size and lands in the **slope**. Refitting today's numbers the same way
+gives **8.1 us** — a 7x disagreement from the same instrument hours earlier,
+which is what exposed it. Measured properly (vary *pass count* at fixed bytes,
+`gemv_shape --fixed`) the overhead is flat across all five shapes, which is the
+signature of a real fixed cost: a page-walk term would scale with the buffer, a
+launch term would not.
 
-The affine fit is a *much* better instrument than the old one, and the reason is
-worth recording: requiring "2x the bytes must take 2x the time" fails at 1.62x
-on a real fixed cost, and that failure is how a correct instrument gets declared
-broken. The right statement is that time is **affine** in bytes.
+Priced: **42 × 155 us = 6.5 ms/token**, which is 29% of the 22.3 ms *host* wall
+but only **7.3% of the 89.5 ms GPU span** — and it is host time, spent while the
+GPU has 67 ms queued that the host is not waiting on. **The host runs 4.01x ahead
+of the GPU.**
 
-Still not decomposed: how much is first-touch page walk, threadgroup launch and
-loop prologue, or the tail drain. The natural fixes — more tiles per thread,
-deeper unroll — are all measured dead, so the decomposition has to come first.
-**Note this is now a question about `linear_gemv_ishizuki_k*`, not the EXL3
-family.**
+So the cost is real, it is most of the host's budget, and it is **completely
+invisible in the token time**. Closed. `MAX_DISPATCHES_PER_BUFFER` was already
+measured (50→1000, 0.4% spread) and would only move time that is off the
+critical path.
 
-### 2. Load-traffic-per-useful-byte: why 3 bpw is 40% slower than 6 bpw
+### 2. Load-traffic-per-useful-byte — *PARTIALLY CLOSED, and the rest is T7*
 
-**This is the mechanism, and it is measured on the live kernel.** Holding the
-weight bytes constant at ~43.4 MB and varying *only* the bit rate
-(`gemv_shape.rs --only "bit rate"`, medians of 9, `KAPLUMBA_TRACE_GEMV`
-confirming the kernel):
+**This was the mechanism, measured on the live kernel.** Holding weight bytes at
+~43.4 MB and varying *only* the bit rate:
 
-| rate | out_features | MB | GB/s | lane-loads per useful byte |
+| rate | out_features | MB | GB/s (pre-T6) | lane-loads per useful byte |
 |---|---|---|---|---|
 | 3 bpw | 21504 | 43.4 | **132.5** | 12 B -> 3 B = **4.0x** |
-| 4 bpw | 16384 | 44.0 | 179.8 | 12 B -> 4 B = 3.0x |
-| 6 bpw | 10752 | 43.4 | 164.5 | 12 B -> 6 B = 2.0x |
-| 8 bpw | 8192 | 44.0 | 176.3 | 12 B -> 8 B = 1.5x |
+| 4 bpw | 16384 | 44.0 | 179.8 | 3.0x |
+| 6 bpw | 10752 | 43.4 | 164.5 | 2.0x |
+| 8 bpw | 8192 | 44.0 | 176.3 | 1.5x |
 
-Identical bytes. The rate is the only thing that moved, and it moves bandwidth
-by 1.36x.
+> **These four numbers are not currently trustworthy, and the table is retained
+> only to show what the question looks like.** Re-run after T6, the same sweep
+> gives 3 bpw 146.9 (+10.9%), 4 bpw 153.7 (-14.5%), 6 bpw 182.0 (+10.6%), 8 bpw
+> 162.3 (-7.9%) — and **6 and 8 bpw cannot have changed from T6**, since no `_w2`
+> kernel is emitted above 4 bpw. They are controls, and they moved in opposite
+> directions by ~10%. Within-sweep spreads are 2.2x-3.7x. The sweep measures one
+> shape to completion at a time and therefore cannot see box drift, and the drift
+> is the same size as the effect. **Fixing this instrument is T7's first step**
+> (`spec/decode-bandwidth-handover/tasks.md` H1); the `--w2` and `--nr0` sweeps
+> in the same binary already interleave correctly and are the pattern to copy.
+>
+> What *is* trustworthy is T6's own A/B, which is interleaved with the baseline
+> re-measured every round: +6.8% to +11.2% on five shapes, and +7.0% end to end
+> over 5 paired runs.
 
-**The cause is in `exl3_decode8_mcg` / ishizuki's window: it reads a fixed three
-ring words per lane — 12 bytes — whatever `KA` is, and 8 codes at `KA` bits each
-are only `KA` bytes of information.** So the request amplification against
-distinct bytes is `12/KA`: **4x at 3 bpw, 2x at 6 bpw.** The 96 B window is
-sector-perfect (32 disjoint windows sit at the ceiling, 246.9-248.4), so DRAM
-traffic is correct and this is not wasted bandwidth — it is wasted *requests*.
+**The cause, and the fix.** The kernel read a fixed three ring words — 12 B —
+per lane whatever `KA` is, while 8 codes at `KA` bits are only `KA` bytes. But
+the extraction only ever touches A0 bits `[48-7*KA, 63]`, and the third word
+contributes only to bits `[0, sh)`. At KA=3 the largest `sh` over 32 lanes is
+**27** and the lowest used bit is `48-21 = 27`, so **the third load is never
+read**. Deleting it is bit-exact by construction.
 
-**3 bpw is 410 of the 411 tensors in this checkpoint.** That is the whole
-remaining gap, and it is why the affine asymptote at 3 bpw is 164.6 GB/s while
-`lm_head` at 6 bpw reaches 252.
+`TWO_WORD_SAFE_RATES` in `scripts/gen_exl3_gemv.py` *derives* the safe set rather
+than listing it, so a rate cannot be added without the proof. Emitted 1-4 bpw;
+excluded 5, 6 (used bits below max `sh`) and 7, 8 (the `B0` arm is live). **6 bpw
+is `lm_head`, so the one shape where the lever does not apply is the one already
+at the ceiling.**
 
-Why the obvious cures do not work, all measured: `uint4` (0.939x — the fast
-path fires for only 8/32 lanes because of the ring wrap), a 32-bit window
-rewrite (+2.4% at KA=3 but -3.7% at KA=1), and `N_R0` (+6.8% best case,
-`T2`). All of them add *streams* or widen *loads*; none of them reduces the
-requests-per-useful-byte, which is the thing that is actually limiting.
+**Result: +7.0% end to end**, bit-exact, all five reference prompts identical.
 
-**The untried direction** is to make a lane's window *word-aligned*, so 3 words
-can become 1: a lane needs 24 bits of a 32-bit word for its 8 codes at KA=3, so
-one 32-bit load could serve 8 codes instead of three. The blocker is that lane
-`l`'s codes start at bit `(l*8+1)*KA + ring - 16`, which is not 32-aligned — that
-is *why* three words are read. The EXL3 on-disk layout is fixed (the spec already
-records that no repacking reduces bytes), so this cannot be fixed by rewriting
-the file; it would have to be fixed by changing which codes a lane owns, i.e. the
-`r0`/`i` index arithmetic in the window setup. **That is the next task.**
+**And why that is only half the story.** 3→2 loads is a 33% cut in lane-loads and
+bought 7%, because the window is **sector-perfect**: word 3 was an L1 *request*,
+not a DRAM sector, and the sector-rate experiment says the wall is DRAM. So
+request count is **not free, but it is not the wall either** — and the residual
+3-vs-6 bpw gap is unexplained. That is **T7**, and it is the highest-value open
+question here.
 
-### 3. Warp-level distinct-byte yield: 4.00x redundancy
+### 3. Warp-level distinct-byte yield — *CLOSED*
 
-Per warp-iteration, `exl3_decode8_mcg`'s three ring loads issue **96 lane-loads**
-(32 lanes x 3 words) against **24 distinct words**. The window itself is
-sector-perfect, so the cost is requests, not sectors — this is the same fact as
-item 2, seen from the warp's side rather than the lane's.
-
-`N_R0 = 4` rows per thread measured **+88%** (101 -> 190 GB/s) on the
-*pre-specialisation* kernel, and **+6.8% at best** on the current one (`T2`).
-That question is now closed; see the closed-lever table.
+Per warp-iteration the three ring loads issued **96 lane-loads** against **24
+distinct words** (4.0x). This is item 2 seen from the warp's side, and T6 closed
+the actionable half of it. `N_R0 = 4` measured +88% pre-specialisation and
+**+6.8%** on the current kernel (`T2`), which is now a dead lever.
 
 ## Where this leaves the target
 
-Per-token budget at 10.0 tok/s, from the first honest per-decode-step profile
-(`KAPLUMBA_DECODE_PROFILE=kernel`, landed in `a58fa7b`; own-time sums to 97.1 ms
-against a 96.0 ms step span, so the attribution is sound):
+Per-token budget, from the first honest per-decode-step profile
+(`KAPLUMBA_DECODE_PROFILE=kernel`, landed in `a58fa7b`) **updated with T6**:
 
 ```
-7x60 layer matvecs (10.875 GB)   85 ms   at 102.7 GB/s aggregate
-  of which gate/up/down (65%)   68.5 ms at 113.9 GB/s
-lm_head (1.057 GB)                5.3 ms at 198 GB/s
-attention, norms, rope, gelu,
-  residual, cache, sampling       7.4 ms
+                                      pre-T6    post-T6
+7x60 layer matvecs (10.875 GB)         85 ms     ~78 ms
+  gate/up/down (65% of bytes)       68.5 ms    ~62 ms   (113.9 -> ~126 GB/s)
+lm_head (1.057 GB, 6 bpw)             5.3 ms     5.3 ms  (198 GB/s, unchanged)
+attention, norms, rope, gelu, cache     7.4 ms    7.4 ms
+command-buffer overhead (42 x 155 us)      -     6.5 ms  (host time, hidden)
+                                    -------   -------
+measured GPU span per token          96.0 ms   89.5 ms  = 11.2 tok/s
+host wall per token                  23.8 ms   22.3 ms  (host runs 4.01x ahead)
 ```
 
-The three big shapes are the prize: at 240 GB/s they would take 34 ms instead of
-68.5, and the whole token would be **~53 ms = 19 tok/s**. For **16 tok/s**
-(62.5 ms) the matvecs must reach ~58 ms, i.e. **1.5x**, which is exactly the
-3-vs-6 bpw gap measured in item 2. For **20 tok/s** the requirement is 263 GB/s
-and it is not available.
+The three big shapes are still the prize. At 240 GB/s they would take 34 ms
+instead of 62, and the whole token would be **~53 ms = 19 tok/s**. For **16 tok/s**
+(62.5 ms) the matvecs must reach ~58 ms, i.e. **1.5x** — exactly the 3-vs-6 bpw
+gap, of which T6 recovered about half. For **20 tok/s** the requirement is
+263 GB/s and it is not available.
 
 ## Requirements for any future bandwidth work
 

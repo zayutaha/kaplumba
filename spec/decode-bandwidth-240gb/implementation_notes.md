@@ -287,8 +287,53 @@ Also worth knowing: the host wall time for a step is 23.8 ms against a 96.0 ms
 GPU span, so the GPU is ~4x oversubscribed by the host and **the host is not the
 bottleneck**. Encoding is 25% of the step.
 
-## The measurement traps, for whoever comes next
+## The equal-bytes rate sweep cannot answer its own question
 
+The last thing measured, and the most useful negative of the session.
+
+`gemv_shape --only "bit rate"` is the table that motivates this entire spec — it
+is where "3 bpw is 40% slower than 6 bpw at equal bytes" comes from. Run before
+and after T6:
+
+```
+rate  has _w2?    pre-T6    post-T6    delta
+3 bpw   YES        132.5      146.9     +10.9%
+4 bpw   YES        179.8      153.7     -14.5%
+6 bpw   no         164.5      182.0     +10.6%
+8 bpw   no         176.3      162.3      -7.9%
+```
+
+**6 and 8 bpw cannot have changed from T6** — `TWO_WORD_SAFE_RATES` emits no `_w2`
+kernel above 4 bpw, so those rows are **controls**, and they moved +10.6% and
+-7.9%. A control that moves means the measurement is not measuring the kernel.
+Within-sweep spreads are **2.2x to 3.7x** worst-to-best.
+
+So the box drifts by >=10% between sweeps, and the drift is the same size as the
+effect being looked for. **The instrument cannot resolve a 10% effect in either
+direction**, and any conclusion drawn from it — in either direction — is
+unsupported. I had drafted the conclusion "T6 halved the gap" from this table
+before checking the controls. It does not support that.
+
+The cause is structural, not a bug: the rate sweep measures **one shape to
+completion at a time**, so any drift over the sweep is folded into the shape
+number. The `--w2` and `--nr0` sweeps in the same binary do it correctly — every
+round measures every arm once, with the baseline re-measured each round, so drift
+appears as a moving *ratio*. That is why T6's own result (+7% end to end, +6.8%
+to +11.2% microbenchmark) is trustworthy while the table it would extend is not.
+
+**Lesson, and it is the same shape as every other one in this file:** the
+instrument that produced the motivating observation is the one that had never been
+stress-tested. The fix is to copy the interleaved structure and carry a control
+arm that cannot change — here a 6 bpw shape in the same round as the 3 bpw shape,
+which gives the drift for free.
+
+Also worth recording: **the controls were only obvious because T6's safe-rate set
+is derived rather than configured.** If I had hand-written "1, 2, 3, 4" into the
+generator, there would have been no way to tell from the names alone which rows
+were supposed to be unmovable, and the control argument would not have been
+available. Deriving the set gave the experiment its own control group for free.
+
+## The measurement traps, for whoever comes next
 - **Seconds labelled as milliseconds.** `gemv_shape.rs` divided the batch time by
   `passes` and formatted the result as ms; it reported 131,512 GB/s. Its own
   PLAUSIBLE check caught it on the very first run. A self-test earns its keep

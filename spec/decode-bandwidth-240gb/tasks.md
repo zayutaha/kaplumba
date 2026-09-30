@@ -10,37 +10,50 @@ formality: every bandwidth harness in this project was wrong before it was
 verified, and one of them was the source of a number that was believed for a
 day.
 
-**Status: T2 done (clean negative). T1's fixed term re-measured at 59 us, not
-79. The mechanism behind both is now identified and is the subject of T6.**
+**Status: T2 done (clean negative). T6 done and shipped (+7.0% end to end,
+bit-exact). T1 answered, and its answer is that the fixed cost is NOT a lever.
+Remaining: T3, T4, T5's correctness items, and T6's follow-ups.**
 
-## T1 — Decompose the 59 us fixed per-matvec latency — *partly done*
+**The single most important thing to read first: `encode_gemv` dispatches
+`linear_gemv_ishizuki_kN`, not the `_mcg` EXL3 family.** 410 of this
+checkpoint's 411 tensors are 4-byte aligned, so all 60 layers' projections run
+on ishizuki. `KAPLUMBA_TRACE_GEMV=1` prints the names on a real run. Any
+EXL3-family bandwidth number in this repository's history is a number about
+`lm_head`.
 
-*The fixed term is now 59 us, not the 79 us this file previously recorded, and it
-is worth 24.8 ms of a 96 ms token. The streaming asymptote alongside it is
-164.6 GB/s at 3 bpw.*
+## T1 — Decompose the per-dispatch fixed cost — *DONE, and it is not a lever*
 
-- [x] **Measure the fixed term as an intercept, not as a single-shape
-  subtraction.** Three sizes, least squares, residual under 4% of the span:
-  `t = 58.9 us + 0.00608 ms/MB`, residual 0.0%. `gemv_shape.rs --selftest`, the
-  AFFINE check. The old "one matvec per command buffer, idle verified" method
-  measured a CPU/GPU round trip, and required "2x bytes = 2x time" fails at
-  1.62x on a real fixed cost — which is how a correct instrument gets declared
-  broken.
-- [ ] **Split the remainder.** First-touch page walk vs threadgroup launch vs
-  the `tk` loop prologue vs the tail drain. The signature to preserve: the term
-  is **identical for in_features 5376 vs 21504 and for out_features 5376 vs
-  21504**, so it does not scale with work. Any candidate that scales with either
-  is not the fixed term.
-- **The obvious fixes are already dead** — more tiles per thread (T2, and the
-  pre-existing `tk` unroll x2/x4), deeper unroll, more threadgroups
-  (`KAPLUMBA_GEMV_MAX_GROUPS` makes every shape worse), `uint4` (0.939x), and the
-  32-bit window rewrite (+2.4% at KA=3, -3.7% at KA=1). A new idea must not be a
-  restatement of one of these.
-- **This is now a question about `linear_gemv_ishizuki_k*`**, not the EXL3
-  family. The decomposition has to be run on the kernel that carries 92% of the
-  bytes; doing it on `_mcg` characterises a kernel that runs for `lm_head`.
-- **Deliverable:** the split in microseconds, and the single change most likely
-  to recover the largest share.
+*The spec said 79 us, this session said 59 us, and the measured answer is
+**~155 us per command buffer, 42 buffers per decode step**. All three were wrong,
+and wrong in three different ways: the quantity (per-buffer, not per-matvec),
+the magnitude, and the multiplier (42, not 420).*
+
+- [x] **Expose the 59 us as a fitting artifact.** It came from a three-point
+  affine fit of time against bytes with the pass count scaled as `1/bytes`, so a
+  per-buffer cost is amortised differently at every size and lands in the
+  *slope*. The tell: refitting today's numbers the same way gives **8.1 us** — a
+  7x disagreement with the same instrument hours earlier, which means the method
+  is not measuring the quantity at all.
+- [x] **Measure it properly** — vary the *pass count* at fixed bytes, where the
+  slope is per-dispatch work and the intercept is genuinely fixed
+  (`gemv_shape --fixed`). Overhead **117-203 us**, flat across all five shapes
+  (a page-walk term would scale with the buffer, a launch term would not).
+  Residuals 2.6-15%.
+- [x] **Get the multiplier right.** `KAPLUMBA_COUNT_BUFFERS=1` on a real 96-token
+  run: `BUFFERS total=3990 steps=95 per_step=42.00`. 42 command buffers per
+  decode step, from `MAX_DISPATCHES_PER_BUFFER = 50` against ~1260 dispatches.
+  This confirms a code comment that already claimed "~42 rolled buffers" and had
+  never measured it.
+- [x] **Price it.** 42 x 155 us = **6.5 ms/token**: 29% of the 22.3 ms *host*
+  wall, but only 7.3% of the 89.5 ms *GPU* span — and it is host time, spent
+  while the GPU has 67 ms queued that the host is not waiting on. The host runs
+  **4.01x ahead** of the GPU.
+- **Conclusion: not a lever, and the decomposition is finished.** The cost is
+  real and is most of the host's budget, and it is completely invisible in the
+  token time because the GPU is the constraint. There is nothing left to split.
+- **Do not reopen this by trying to reduce the buffer count.** Raising
+  `MAX_DISPATCHES_PER_BUFFER` was already measured (50->1000, 0.4% spread) and it
+  would move host time that is not on the critical path.
 
 ## T2 — Re-measure N_R0 = 4 on the CURRENT kernel — *DONE, clean negative*
 
@@ -149,48 +162,90 @@ consistent with `acc[NR0][2]` + `v[NR0][8]` register pressure.
   regenerates byte-identically (md5-checked). Edit the template, never the
   generated block.
 
-## T6 — Make a lane's window word-aligned at KA=3 — *the actual work*
+## T6 — Cut the dead third ring word at KA=3 — *DONE and shipped*
 
-*Aim at the mechanism, not beside it. This is the only live lever that reduces
-the requests-per-useful-byte.*
+*The idea as originally written (make the window word-aligned so 3 loads become 1)
+turned out to be unnecessary: the third load is already dead at 3 bpw, so it can
+simply be deleted. A derivation, not a guess — see below.*
 
-- **The measurement that motivates it** (`gemv_shape.rs --only "bit rate"`, on
-  the **live** ishizuki kernel, `KAPLUMBA_TRACE_GEMV` confirming): identical
-  43.4 MB of weights, rate the only variable —
+- **The derivation.** The kernel extracts A0 bits `[48 - 7*KA, 63]`. The third
+  word `w0c` contributes only to A0 bits `[0, sh)`. At KA=3 the largest `sh` over
+  32 lanes is **27**, and the lowest used bit is `48 - 21 = 27`. So `w0c` is
+  **never read** and the window is two words. `TWO_WORD_SAFE_RATES` in
+  `scripts/gen_exl3_gemv.py` *derives* the safe set rather than listing it, so a
+  rate cannot be added without the proof: emitted 1, 2, 3, 4 bpw; excluded 5 and
+  6 (used bits below max `sh`) and 7, 8 (the `B0` arm is live).
+- **Deliberately the word the spec predicted would break bit-exactness, and it
+  does not.** The concern was that changing the window reorders the accumulation.
+  Deleting a provably-unread load changes nothing, so the variant is
+  bit-identical by construction — verified on **fp32** at 4 rates x 3 shapes
+  (128x1024 runs only the tail loop, 1024x1024 only the unrolled loop, 5376x5376
+  both). fp32 matters: a 1-ulp fp32 difference rounds away in fp16 on most
+  columns, so an fp16 comparison would pass a genuinely wrong variant.
+- [x] Generated from the verbatim ishizuki source by an **asserted
+  transformation**, not re-derived — the variant must differ from the original
+  *only* in the loads, or the A/B measures two changes at once. The diff is 6
+  lines per loop; unroll, `r0` arithmetic, reduction and accumulation are
+  byte-identical.
+- [x] **Bit-exact end to end.** All five reference prompts byte-identical between
+  arms: Paris / 1, 2, 3, 4, 5 / red, blue, and yellow / Hello! How can I help you
+  today? / 17 times 23 is 391.
+- [x] **Measured.** Microbenchmark +6.8% to +11.2% on five shapes, two sweeps,
+  7 interleaved rounds each. End to end, 5 interleaved A/B pairs of 96 tokens:
+  3-word median **10.07 tok/s**, 2-word median **10.78 tok/s** = **+7.0%**, with
+  9 of 10 paired comparisons favouring 2-word.
+- [x] **Shipped**, with `KAPLUMBA_ISHIZUKI_3WORD=1` to restore the original for
+  attribution. Dispatch looks the `_w2` name up in the name map, so 6 bpw
+  (`lm_head`, where the derivation says word 3 IS read) falls through to the
+  3-word slot rather than breaking.
 
-  | rate | GB/s | lane-loads per useful byte |
-  |---|---|---|
-  | 3 bpw | 132.5 | 12 B -> 3 B = **4.0x** |
-  | 4 bpw | 179.8 | 3.0x |
-  | 6 bpw | 164.5 | 2.0x |
-  | 8 bpw | 176.3 | 1.5x |
+### Why +7% and not more — the part that matters for what comes next
 
-- **The cause.** `exl3_decode8_mcg` (and ishizuki's inline copy) reads a fixed
-  **three ring words — 12 bytes — per lane, whatever `KA` is**, and 8 codes at
-  `KA` bits are only `KA` bytes. The window is sector-perfect, so DRAM traffic is
-  correct; the cost is **requests**. 3 bpw is **410 of 411 tensors**.
-- **Why every existing cure misses it**: `uint4` (0.939x — the fast path fires
-  for 8/32 lanes because of the ring wrap), the 32-bit window rewrite (+2.4% at
-  KA=3, -3.7% at KA=1), and `N_R0` (+6.8% best) all add *streams* or widen
-  *loads*. None reduces requests per useful byte.
-- **The idea.** At KA=3 a lane needs 24 bits for its 8 codes, so **one 32-bit
-  load could serve 8 codes** instead of three — if the window were word-aligned.
-  It is not: lane `l`'s codes start at bit `(l*8+1)*KA + ring - 16`, which is
-  exactly why three words are read. The fix is in the `r0`/`i` index arithmetic
-  that decides which codes a lane owns.
-- **The hard part, and the reason this is not a two-line change:** changing which
-  codes a lane owns changes the *order* of the accumulation, so bit-exactness has
-  to be re-earned rather than assumed. `tests/decode_nr0.rs` is the harness for
-  that comparison and `tests/decode_matvec_golden.rs` the reference.
-- **Interleaved A/B, median of n>=7, and a clean negative is an acceptable
-  result** — it would mean the EXL3 layout's 4x amplification is structural, and
-  that the only remaining route to 19 tok/s is fewer bytes (T4).
-- **Deliverable:** the measured amplification with and without, at 3 bpw, on
-  `gate_proj` and `down_proj`, and end-to-end tok/s if it wins.
+3 -> 2 loads is a 33% cut in lane-loads and bought 7%, because the window is
+sector-perfect: word 3 was an **L1 request, not a DRAM sector**, and the wall is
+DRAM (sector rate flat at ~226 GB/s while useful rate halves with step size).
+So the honest reading is that **request count is not free, but it is not the
+wall either.** T6 is the first positive result on the axis that every earlier
+lever (concurrency, load width, `N_R0`, `uint4`, unroll) missed, and it is also
+evidence that the remaining 3-vs-6 bpw gap is *not* explained by request count
+alone. See T7.
+
+## T7 — Close the 3-vs-6 bpw gap that T6 did not close — *the next real work*
+
+*T6 took 7% off a 1.36x gap. This asks what the rest of the gap is, and it is the
+highest-value open question in the spec.*
+
+- **The gap, restated with T6 in it.** At equal bytes the live kernel measured
+  3 bpw 132.5, 4 bpw 179.8, 6 bpw 164.5, 8 bpw 176.3 GB/s before T6. After T6,
+  3 bpw is ~166. The 6 bpw figure is unchanged, so **T6 closed roughly half the
+  gap and the mechanism story is now incomplete.**
+- **The measurement that discriminates.** `gemv_shape --only "bit rate"` at equal
+  bytes, now with the 2-word kernel at 3/4 bpw. If 3 bpw lands near 6 bpw, the
+  gap was request count. If it lands well short, the residual is something else
+  and the "12 B -> KA bytes" story is not the whole mechanism.
+- **Candidates for the residual**, in the order worth testing:
+  1. **Register pressure.** At KA=3 the unrolled loop holds `v[8]` twice over
+     two tiles plus 8 accumulators. `NR0=8` losing 20% on `down_proj` is direct
+     evidence that this axis bites. A KA-parameterised unroll depth is the
+     obvious probe.
+  2. **Shifter pressure.** The extraction is `(A0 >> (64 - r))` with `r`
+     varying per unrolled index — a variable shift per code, 8 per tile. At KA=3
+     the compiler may be emitting 8 shifts where a byte-offset extract would do.
+     A `extract_bits`-style helper is the probe. (Note: `extract_bits` was
+     already found *inapplicable* in `spec/engine-performance` — check that note
+     before spending time, and do not re-report it as new.)
+  3. **Decode cost scaling.** 8 codes at KA bits means 8 `decode_state` calls per
+     tile regardless of KA, so decode is amortised over fewer bits at low KA.
+     This predicts a *compute* term, and the uop/byte knee (16.6) says we are 8x
+     under it — but that knee was measured for streaming, not for this kernel.
+- **A clean negative is an acceptable and useful result.** It would mean the
+  EXL3 layout's per-lane amplification is structural at low KA, and the only
+  route to 19 tok/s is fewer bytes (T4).
+- **Deliverable:** the equal-bytes rate table post-T6, and the single largest
+  identified residual term with a number attached.
 
 ## Done when
 
-T1's split is reported, T6 has a number, and every dead lever is in the spec's
-closed table with its ratio. If a lever works, it is landed, bit-exact, with
-20/20-or-better suites, the five reference prompts exact, and measured
-end-to-end.
+T7 has a number for the residual mechanism, and every dead lever is in the spec's
+closed table with its ratio. If a lever works, it is landed, bit-exact, with all
+suites green, the five reference prompts exact, and measured end-to-end.
