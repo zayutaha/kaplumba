@@ -661,6 +661,59 @@ kernel void linear_finalize_simd3(
     out[base + 96u] = half(v3 * float(signs[base + 96u]));
 }
 
+kernel void linear_finalize_simd3_sk2(
+    const device float *raw_a [[buffer(0)]],
+    const device half *signs_a [[buffer(1)]],
+    device half *out_a [[buffer(2)]],
+    const device float *raw_b [[buffer(3)]],
+    const device half *signs_b [[buffer(4)]],
+    device half *out_b [[buffer(5)]],
+    const device float *raw_c [[buffer(6)]],
+    const device half *signs_c [[buffer(7)]],
+    device half *out_c [[buffer(8)]],
+    constant const uint *blocks_abc [[buffer(9)]],
+    uint gid [[thread_position_in_grid]]) {
+    const uint block_idx = gid >> 5;
+    const uint lane = gid & 31u;
+    const uint ba = blocks_abc[0];
+    const uint bb = blocks_abc[1];
+    const uint bc = blocks_abc[2];
+
+    const device float *raw;
+    const device half *signs;
+    device half *out;
+    uint local_block;
+    uint local_n;
+
+    if (block_idx < ba) {
+        raw = raw_a; signs = signs_a; out = out_a;
+        local_block = block_idx;
+        local_n = ba * 128u;
+    } else if (block_idx < ba + bb) {
+        raw = raw_b; signs = signs_b; out = out_b;
+        local_block = block_idx - ba;
+        local_n = bb * 128u;
+    } else if (block_idx < ba + bb + bc) {
+        raw = raw_c; signs = signs_c; out = out_c;
+        local_block = block_idx - (ba + bb);
+        local_n = bc * 128u;
+    } else {
+        return;
+    }
+
+    const uint base = local_block * 128u + lane;
+    float v0 = raw[base] + raw[local_n + base];
+    float v1 = raw[base + 32u] + raw[local_n + base + 32u];
+    float v2 = raw[base + 64u] + raw[local_n + base + 64u];
+    float v3 = raw[base + 96u] + raw[local_n + base + 96u];
+    transform_simd(v0, v1, v2, v3, lane);
+    out[base] = half(v0 * float(signs[base]));
+    out[base + 32u] = half(v1 * float(signs[base + 32u]));
+    out[base + 64u] = half(v2 * float(signs[base + 64u]));
+    out[base + 96u] = half(v3 * float(signs[base + 96u]));
+}
+
+
 
 // EXL3 decode matvec, shaped like the reference implementation.
 //
@@ -8546,6 +8599,164 @@ kernel void linear_gemv_ishizuki_k3_fused3(
         y[tn * 16u + lid] = sum;
     }
 }
+
+kernel void linear_gemv_ishizuki_k3_fused3_sk2(
+    const device ushort *packed_a [[buffer(0)]],
+    const device ushort *packed_b [[buffer(1)]],
+    const device ushort *packed_c [[buffer(2)]],
+    const device half *x [[buffer(3)]],
+    device float *y_a [[buffer(4)]],
+    device float *y_b [[buffer(5)]],
+    device float *y_c [[buffer(6)]],
+    constant const uint *shape [[buffer(7)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    constexpr uint KA = 3u;
+    constexpr int CB = 1;
+    constexpr uint RING = 256u * KA;
+    constexpr uint WORDS = RING / 32u;
+    const uint K = shape[0];
+    const uint N_a = shape[1];
+    const uint N_b = shape[2];
+    const uint N_c = shape[3];
+    const uint tiles_a = N_a / 16u;
+    const uint tiles_b = N_b / 16u;
+    const uint tiles_c = N_c / 16u;
+    const uint total_tiles = tiles_a + tiles_b + tiles_c;
+    const uint tiles_k = K / 16u;
+    constexpr int SG = 8;
+    constexpr uint SK = 2u;
+    threadgroup float red[SG][16];
+    const uint r0 = (lane % 4u) * 2u;
+
+    const uint lo0 = (lane * 8u + 1u) * 3u + RING - 16u;
+    const uint sh0 = lo0 % 32u;
+    const uint hi0 = lo0 / 32u;
+    const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
+    const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
+
+    const uint tg_tile = tgid % total_tiles;
+    const uint sk = tgid / total_tiles;
+    if (sk >= SK) return;
+
+    const device ushort *packed;
+    device float *y;
+    uint tn;
+    uint N_curr;
+
+    if (tg_tile < tiles_a) {
+        packed = packed_a;
+        y = y_a;
+        tn = tg_tile;
+        N_curr = N_a;
+    } else if (tg_tile < tiles_a + tiles_b) {
+        packed = packed_b;
+        y = y_b;
+        tn = tg_tile - tiles_a;
+        N_curr = N_b;
+    } else {
+        packed = packed_c;
+        y = y_c;
+        tn = tg_tile - (tiles_a + tiles_b);
+        N_curr = N_c;
+        if (tn >= tiles_c) return;
+    }
+
+    const uint k_per_split = ((tiles_k / SK) / 32u) * 32u;
+    const uint k_start = sk * k_per_split;
+    const uint k_end = (sk == SK - 1u) ? tiles_k : (k_start + k_per_split);
+
+    float acc0 = 0.0f;
+    float acc1 = 0.0f;
+    const device uint *column = (const device uint *)packed + tn * (tiles_k * WORDS);
+    const uint stride = WORDS;
+
+    const uint step = SG * 4u;
+    const uint k_unroll_end = k_start + ((k_end - k_start) / step) * step;
+
+    uint tk = k_start + sg * 4u;
+    for (; tk < k_unroll_end; tk += step) {
+        const device uint *t0 = column + (tk + 0u) * stride;
+        const device uint *t1 = column + (tk + 1u) * stride;
+        const device uint *t2 = column + (tk + 2u) * stride;
+        const device uint *t3 = column + (tk + 3u) * stride;
+
+        const ulong w0a = t0[j0], w0b = t0[j1];
+        const ulong w1a = t1[j0], w1b = t1[j1];
+        const ulong w2a = t2[j0], w2b = t2[j1];
+        const ulong w3a = t3[j0], w3b = t3[j1];
+
+        const ulong A0 = ((w0a << 32) | w0b) << sh0;
+        const ulong A1 = ((w1a << 32) | w1b) << sh0;
+        const ulong A2 = ((w2a << 32) | w2b) << sh0;
+        const ulong A3 = ((w3a << 32) | w3b) << sh0;
+
+        const device half *xr0 = x + (tk + 0u) * 16u + r0;
+        const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
+        const device half *xr1 = x + (tk + 1u) * 16u + r0;
+        const float p10 = float(xr1[0]), p11 = float(xr1[1]), p12 = float(xr1[8]), p13 = float(xr1[9]);
+        const device half *xr2 = x + (tk + 2u) * 16u + r0;
+        const float p20 = float(xr2[0]), p21 = float(xr2[1]), p22 = float(xr2[8]), p23 = float(xr2[9]);
+        const device half *xr3 = x + (tk + 3u) * 16u + r0;
+        const float p30 = float(xr3[0]), p31 = float(xr3[1]), p32 = float(xr3[8]), p33 = float(xr3[9]);
+
+        float v0[8], v1[8], v2[8], v3[8];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint rad = i * KA + 16u;
+            v0[i] = decode_state_mcg(uint(A0 >> (64u - rad)) & 0xffffu);
+            v1[i] = decode_state_mcg(uint(A1 >> (64u - rad)) & 0xffffu);
+            v2[i] = decode_state_mcg(uint(A2 >> (64u - rad)) & 0xffffu);
+            v3[i] = decode_state_mcg(uint(A3 >> (64u - rad)) & 0xffffu);
+        }
+
+        acc0 += p00 * v0[0] + p01 * v0[1] + p02 * v0[2] + p03 * v0[3];
+        acc1 += p00 * v0[4] + p01 * v0[5] + p02 * v0[6] + p03 * v0[7];
+        acc0 += p10 * v1[0] + p11 * v1[1] + p12 * v1[2] + p13 * v1[3];
+        acc1 += p10 * v1[4] + p11 * v1[5] + p12 * v1[6] + p13 * v1[7];
+        acc0 += p20 * v2[0] + p21 * v2[1] + p22 * v2[2] + p23 * v2[3];
+        acc1 += p20 * v2[4] + p21 * v2[5] + p22 * v2[6] + p23 * v2[7];
+        acc0 += p30 * v3[0] + p31 * v3[1] + p32 * v3[2] + p33 * v3[3];
+        acc1 += p30 * v3[4] + p31 * v3[5] + p32 * v3[6] + p33 * v3[7];
+    }
+
+    for (tk = k_unroll_end + sg; tk < k_end; tk += SG) {
+        const device uint *t0 = column + tk * stride;
+        const ulong a0 = t0[j0], a1 = t0[j1];
+        const ulong A0 = ((a0 << 32) | a1) << sh0;
+        const device half *xr0 = x + tk * 16u + r0;
+        const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
+        float v[8];
+        #pragma unroll
+        for (uint i = 0; i < 8u; ++i) {
+            const uint rad = i * KA + 16u;
+            v[i] = decode_state_mcg(uint(A0 >> (64u - rad)) & 0xffffu);
+        }
+        acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
+        acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
+    }
+
+    acc0 += simd_shuffle_xor(acc0, 1u);
+    acc0 += simd_shuffle_xor(acc0, 2u);
+    acc1 += simd_shuffle_xor(acc1, 1u);
+    acc1 += simd_shuffle_xor(acc1, 2u);
+    if (lane % 4u == 0u) {
+        red[sg][lane / 4u] = acc0;
+        red[sg][lane / 4u + 8u] = acc1;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (lid < 16u) {
+        float sum = 0.0f;
+        for (int g = 0; g < SG; ++g) {
+            sum += red[g][lid];
+        }
+        y[(sk * N_curr) + tn * 16u + lid] = sum;
+    }
+}
+
 
 kernel void linear_gemv_ishizuki_k3_colmajor_stream(
     const device ushort *packed [[buffer(0)]],

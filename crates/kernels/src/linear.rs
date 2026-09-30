@@ -236,6 +236,7 @@ pub struct LinearKernels {
     finalize_pipeline: ComputePipelineState,
     finalize_simd_pipeline: ComputePipelineState,
     finalize_simd3_pipeline: ComputePipelineState,
+    finalize_simd3_sk2_pipeline: ComputePipelineState,
     finalize_gated_gelu_pipeline: ComputePipelineState,
     finalize_gated_gelu_and_down_input_pipeline: ComputePipelineState,
     input_rows_pipeline: ComputePipelineState,
@@ -358,6 +359,9 @@ impl LinearKernels {
             .map_err(KernelError::Shader)?;
         let finalize_simd3_function = library
             .get_function("linear_finalize_simd3", None)
+            .map_err(KernelError::Shader)?;
+        let finalize_simd3_sk2_function = library
+            .get_function("linear_finalize_simd3_sk2", None)
             .map_err(KernelError::Shader)?;
         let finalize_gated_gelu_function = library
             .get_function("linear_finalize_gated_gelu_simd", None)
