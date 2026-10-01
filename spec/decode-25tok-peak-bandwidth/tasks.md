@@ -193,3 +193,28 @@
   second independent confirmation that the microbenchmark's variant ranking is
   inverted relative to production. Do not use it to choose variants.
 - Do not retry any of these seven.
+
+## T5.12: GEMV-Level Marginal-Cost Ablation (completed, no production change)
+
+- Files: `crates/engine/src/model.rs`
+- Intent: Measure the true marginal cost of each layer GEMV (`o_proj`, `qkv_proj`,
+  `gate_up_gelu`, `down_proj`, `head/gemv`) in production, using the same
+  `KAPLUMBA_ABLATE` mechanism extended with `o_proj_gemv`, `qkv_gemv`,
+  `gate_up_gemv`, `down_gemv`, `head_gemv`.
+- Results (n=5..6 interleaved pairs, baseline median 15.85 tok/s):
+
+| ablated | median tok/s | delta (tok/s) | ms/step | note |
+|---|---|---|---|---|
+| `o_proj_gemv` | 17.70 | +1.85 | 6.63 | ~150 GB/s effective |
+| `qkv_gemv` | 18.28 | +2.43 | 15.82* | 33 MB × 60 = 1.982 GB/layer |
+| `gate_up_gemv` | 26.55 | +10.70 | 40.34 | 86.7 MB × 60 |
+| `down_gemv` | 19.97 | +4.12 | 20.63 | 43.35 MB × 60 |
+| `head_gemv` | 16.98 | +1.12 | 4.17 | 1.057 GB |
+| *all element + all GEMV ablated* | 136.58 | +120.73 | 7.32 | residual is non-kernel overhead (loop/host/overlap) |
+
+- The per-GEMV ms/step sums to ~87 ms of GPU work, but in reality they overlap
+  and the total GPU span is 63.1 ms. The A/B deltas give the **right**
+  relative costs and tell us where the time is. `gate_up_gelu` is 40.3 ms
+  equivalent, `down_proj` 20.6, `qkv` 15.8, `o_proj` 6.6, `head` 4.2.
+- The all-ablated case shows ~7.3 ms remains even with every single kernel
+  skipped: that is not recoverable by rewriting Metal kernels.

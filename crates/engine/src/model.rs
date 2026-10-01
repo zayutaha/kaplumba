@@ -1432,6 +1432,9 @@ impl DecoderLayer {
                 .ok_or_else(|| {
                     ModelError::InvalidWeights("q_proj input signs are not resident".to_string())
                 })?;
+            if kaplumba_kernels::ablated("qkv_gemv") {
+                // KAPLUMBA_ABLATE=qkv_gemv: timing-only.
+            } else {
             self.linear
                 .encode_gemv_fused3(
                     encoder,
@@ -1460,6 +1463,7 @@ impl DecoderLayer {
                     true,
                 )
                 .map_err(ModelError::Kernel)?;
+            }
             profile.stamp(encoder, &format!("{}qkv_proj", prefix()))?;
             timer.lap("qkv_proj");
         } else if decode && self.weights.q_proj.permutation_mode == 1 {
@@ -1858,6 +1862,12 @@ impl DecoderLayer {
 // no-SK's 175.5 (-12%), which is exactly the "short K cannot amortise a fixed
 // per-threadgroup cost, long K wants the extra parallelism" shape. These flags
 // test each projection in isolation, which the combined flag could not.
+// `KAPLUMBA_ABLATE=o_proj_gemv` skips this layer's o_proj matvec dispatch
+// entirely. The result is garbage; what it measures is o_proj's exact marginal
+// wall-clock cost in production, which no profiler reading and no bandwidth
+// ratio can give on its own.
+let o_gemv_ablated = kaplumba_kernels::ablated("o_proj_gemv");
+
 let use_sk4 = env_flag("KAPLUMBA_O_SK4")
                 && self.weights.o_proj.permutation_mode == 1
                 && self.weights.o_proj.out_features % 32 == 0
@@ -1870,7 +1880,9 @@ let use_sk4 = env_flag("KAPLUMBA_O_SK4")
                 && self.weights.o_proj.out_features % 32 == 0
                 && matches!(self.weights.o_proj.rate, Exl3Rate::Integer(3));
 
-            if use_sk4 {
+            if o_gemv_ablated {
+                // KAPLUMBA_ABLATE=o_proj_gemv: timing-only, see the flag's note.
+            } else if use_sk4 {
                 self.linear
                     .encode_gemv_raw_sk4(
                         encoder,
@@ -2110,6 +2122,9 @@ let use_sk4 = env_flag("KAPLUMBA_O_SK4")
                 .ok_or_else(|| {
                     ModelError::InvalidWeights("down_proj input signs are not resident".to_string())
                 })?;
+            if kaplumba_kernels::ablated("gate_up_gemv") {
+                // KAPLUMBA_ABLATE=gate_up_gemv: timing-only.
+            } else {
             self.linear
                 .encode_gemv_fused2_mlp(
                     encoder,
@@ -2132,6 +2147,7 @@ let use_sk4 = env_flag("KAPLUMBA_O_SK4")
                     true,
                 )
                 .map_err(ModelError::Kernel)?;
+            }
             profile.stamp(encoder, &format!("{}gate_up_gelu", prefix()))?;
             timer.lap("gate_up_gelu");
             let packed_down = self
@@ -2165,7 +2181,9 @@ let use_sk4 = env_flag("KAPLUMBA_O_SK4")
                 && self.weights.down_proj.out_features % 32 == 0
                 && matches!(self.weights.down_proj.rate, Exl3Rate::Integer(3));
 
-            if use_sk4 {
+            if kaplumba_kernels::ablated("down_gemv") {
+                // KAPLUMBA_ABLATE=down_gemv: timing-only.
+            } else if use_sk4 {
                 self.linear
                     .encode_gemv_raw_sk4(
                         encoder,
@@ -4226,6 +4244,9 @@ impl TextModel {
             self.lm_head.output_signs_buffer.as_ref().ok_or_else(|| {
                 ModelError::InvalidWeights("lm head signs not resident".to_string())
             })?;
+        if kaplumba_kernels::ablated("head_gemv") {
+            // KAPLUMBA_ABLATE=head_gemv: timing-only.
+        } else {
         self.linear.encode_gemv(
             encoder,
             LinearEncodeRequest {
@@ -4245,6 +4266,7 @@ impl TextModel {
                 pretransformed: false,
             },
         )?;
+        }
         // The 262,144-wide vocabulary projection is the single largest kernel in
         // the chunk after the layer GEMMs, so it gets its own boundary rather
         // than hiding inside the head's phase total.
