@@ -2878,7 +2878,7 @@ impl LinearKernels {
             ],
             params_bytes(&params),
             1,
-            256,
+            1024,
         )
     }
 
@@ -2913,7 +2913,7 @@ impl LinearKernels {
             ],
             params_bytes(&params),
             1,
-            256,
+            1024,
         )
     }
 
@@ -3028,7 +3028,7 @@ impl LinearKernels {
             ],
             params_bytes(&params),
             1,
-            256,
+            1024,
         )
     }
 
@@ -3067,7 +3067,7 @@ impl LinearKernels {
             ],
             params_bytes(&params),
             1,
-            256,
+            1024,
         )
     }
 

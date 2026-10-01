@@ -273,3 +273,22 @@ With CPU-GPU submission serialization completely removed (0 ms idle gap), the to
   - Reverted `encode_gemv_raw_sk2` default to `2col_sk2`.
   - `1col_sk2` available via `KAPLUMBA_SK2_1COL=1` env flag.
   - `2col_sk2` available via `KAPLUMBA_SK2_2COL=1` env flag (now the default).
+
+---
+
+## 17. Task T5.6 Log (1024-Thread Finalize Kernels)
+
+- **Implementation**:
+  - Increased threadgroup size from 256 to 1024 threads (8→32 warps) for all 4 finalize kernels: `linear_finalize_and_post_ffn_norm_scale_sk2/sk4` and `linear_finalize_o_proj_and_pre_ffn_transform_sk2/sk4`.
+  - Changed `threadgroup float partial[256]` to `partial[1024]`.
+  - Changed block loop stride from `b += 8u` to `b += 32u` (32 simdgroups).
+  - Changed apply-phase stride from `i += 256u` to `i += 1024u`.
+  - **Bit-exactness preservation**: For sum-of-squares phases, threads 0-255 use the same stride-256 pattern as the 256-thread original; threads 256-1023 contribute 0. The 1024-thread tree reduction (starting at stride=512) is bit-identical to the 256-thread original because adding 0 to a float doesn't change it.
+  - Updated 4 dispatch sites from `(1, 256)` to `(1, 1024)`.
+- **Verification**:
+  - Golden prompt bit-exact: "Paris".
+  - All tests pass: `live_kernel_bit_exact` 1/1, `fused_bit_exact` 3/3, `repacked_golden` 2/2, `argmax_engine_parity` 3/3, `norm_rope_qkv_bit_exact` 4/4.
+- **A/B Measurement (N=8)**:
+  - 256-thread finalize: median **15.634 tok/s** (range 15.609–15.655).
+  - 1024-thread finalize: median **15.838 tok/s** (range 15.770–15.867).
+  - **Improvement: +0.204 tok/s (+1.3%).** The ranges don't overlap, so this is a real improvement.

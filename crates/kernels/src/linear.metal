@@ -641,12 +641,13 @@ kernel void linear_finalize_and_post_ffn_norm_scale_sk2(
     uint lid [[thread_position_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]]) {
-    
+
     threadgroup half proj_shared[5376];
-    threadgroup float partial[256];
+    threadgroup float partial[1024];
     const uint n = params.width;
-    
-    for (uint b = sg; b < params.blocks; b += 8u) {
+
+    // Phase 1: Load and transform (all 1024 threads across 32 simdgroups)
+    for (uint b = sg; b < params.blocks; b += 32u) {
         const uint base = b * 128u + lane;
         float v0 = raw[base] + raw[base + n];
         float v1 = raw[base + 32u] + raw[base + 32u + n];
@@ -659,25 +660,31 @@ kernel void linear_finalize_and_post_ffn_norm_scale_sk2(
         proj_shared[base + 96u] = half(v3 * float(output_signs[base + 96u]));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
+
+    // Phase 2: Sum-of-squares — threads 0-255 use the same stride-256 order as
+    // the 256-thread version; threads 256-1023 contribute 0 so the tree
+    // reduction over 1024 partials is bit-identical to the 256-thread original.
     float sum = 0.0f;
-    for (uint i = lid; i < params.width; i += 256u) {
-        const float val = float(proj_shared[i]);
-        sum += val * val;
+    if (lid < 256u) {
+        for (uint i = lid; i < params.width; i += 256u) {
+            const float val = float(proj_shared[i]);
+            sum += val * val;
+        }
     }
     partial[lid] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+
+    for (uint stride = 512u; stride > 0u; stride >>= 1u) {
         if (lid < stride) {
             partial[lid] += partial[lid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    
+
     const float inverse = rsqrt(partial[0] / float(params.width) + params.eps);
-    
-    for (uint i = lid; i < params.width; i += 256u) {
+
+    // Phase 3: Apply norm (all 1024 threads)
+    for (uint i = lid; i < params.width; i += 1024u) {
         const float normed = float(proj_shared[i]) * inverse * float(weight[i]);
         const float res = float(residual[i]) + normed;
         output[i] = half(res * params.scale);
@@ -694,12 +701,12 @@ kernel void linear_finalize_and_post_ffn_norm_scale_sk4(
     uint lid [[thread_position_in_threadgroup]],
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]]) {
-    
+
     threadgroup half proj_shared[5376];
-    threadgroup float partial[256];
+    threadgroup float partial[1024];
     const uint n = params.width;
-    
-    for (uint b = sg; b < params.blocks; b += 8u) {
+
+    for (uint b = sg; b < params.blocks; b += 32u) {
         const uint base = b * 128u + lane;
         float v0 = raw[base] + raw[base + n] + raw[base + 2u * n] + raw[base + 3u * n];
         float v1 = raw[base + 32u] + raw[base + 32u + n] + raw[base + 32u + 2u * n] + raw[base + 32u + 3u * n];
@@ -712,25 +719,27 @@ kernel void linear_finalize_and_post_ffn_norm_scale_sk4(
         proj_shared[base + 96u] = half(v3 * float(output_signs[base + 96u]));
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
+
     float sum = 0.0f;
-    for (uint i = lid; i < params.width; i += 256u) {
-        const float val = float(proj_shared[i]);
-        sum += val * val;
+    if (lid < 256u) {
+        for (uint i = lid; i < params.width; i += 256u) {
+            const float val = float(proj_shared[i]);
+            sum += val * val;
+        }
     }
     partial[lid] = sum;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+
+    for (uint stride = 512u; stride > 0u; stride >>= 1u) {
         if (lid < stride) {
             partial[lid] += partial[lid + stride];
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
-    
+
     const float inverse = rsqrt(partial[0] / float(params.width) + params.eps);
-    
-    for (uint i = lid; i < params.width; i += 256u) {
+
+    for (uint i = lid; i < params.width; i += 1024u) {
         const float normed = float(proj_shared[i]) * inverse * float(weight[i]);
         const float res = float(residual[i]) + normed;
         output[i] = half(res * params.scale);
@@ -894,12 +903,12 @@ kernel void linear_finalize_o_proj_and_pre_ffn_transform_sk2(
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]]) {
 
-    threadgroup float partial[256];
+    threadgroup float partial[1024];
     threadgroup half shared_buf[5376];
     const uint n = params.width;
 
     // Step 1: Finalize o_proj into shared_buf (5376 halfs) with sk2 reduction
-    for (uint b = sg; b < params.blocks; b += 8u) {
+    for (uint b = sg; b < params.blocks; b += 32u) {
         const uint base = b * 128u + lane;
         float v0 = raw[base] + raw[base + n];
         float v1 = raw[base + 32u] + raw[base + 32u + n];
@@ -913,23 +922,25 @@ kernel void linear_finalize_o_proj_and_pre_ffn_transform_sk2(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Step 2: RMS norm 1 (post_attn_norm)
+    // Step 2: RMS norm 1 (post_attn_norm) — threads 0-255 preserve 256-thread order
     float sum1 = 0.0f;
-    for (uint i = lid; i < params.width; i += 256u) {
-        const float val = float(shared_buf[i]);
-        sum1 += val * val;
+    if (lid < 256u) {
+        for (uint i = lid; i < params.width; i += 256u) {
+            const float val = float(shared_buf[i]);
+            sum1 += val * val;
+        }
     }
     partial[lid] = sum1;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+    for (uint stride = 512u; stride > 0u; stride >>= 1u) {
         if (lid < stride) partial[lid] += partial[lid + stride];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     const float inv1 = rsqrt(partial[0] / float(params.width) + params.eps);
 
-    // Step 3: Add residual and store hidden_b
+    // Step 3: Add residual and store hidden_b (all 1024 threads)
     float sum2 = 0.0f;
-    for (uint i = lid; i < params.width; i += 256u) {
+    for (uint i = lid; i < params.width; i += 1024u) {
         const float normed1 = float(shared_buf[i]) * inv1 * float(post_attn_norm[i]);
         const half hb = half(float(residual[i]) + normed1);
         hidden_b[i] = hb;
@@ -938,14 +949,14 @@ kernel void linear_finalize_o_proj_and_pre_ffn_transform_sk2(
     }
     partial[lid] = sum2;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+    for (uint stride = 512u; stride > 0u; stride >>= 1u) {
         if (lid < stride) partial[lid] += partial[lid + stride];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     const float inv2 = rsqrt(partial[0] / float(params.width) + params.eps);
 
     // Step 4: Pre-FFN norm + gate input transform into transformed
-    for (uint b = sg; b < params.blocks; b += 8u) {
+    for (uint b = sg; b < params.blocks; b += 32u) {
         const uint base = b * 128u + lane;
         float v0 = float(half(float(shared_buf[base]) * inv2 * float(pre_ffn_norm[base]))) * float(gate_input_signs[base]);
         float v1 = float(half(float(shared_buf[base + 32u]) * inv2 * float(pre_ffn_norm[base + 32u]))) * float(gate_input_signs[base + 32u]);
@@ -973,12 +984,12 @@ kernel void linear_finalize_o_proj_and_pre_ffn_transform_sk4(
     uint lane [[thread_index_in_simdgroup]],
     uint sg [[simdgroup_index_in_threadgroup]]) {
 
-    threadgroup float partial[256];
+    threadgroup float partial[1024];
     threadgroup half shared_buf[5376];
     const uint n = params.width;
 
     // Step 1: Finalize o_proj into shared_buf (5376 halfs) with sk4 reduction
-    for (uint b = sg; b < params.blocks; b += 8u) {
+    for (uint b = sg; b < params.blocks; b += 32u) {
         const uint base = b * 128u + lane;
         float v0 = raw[base] + raw[base + n] + raw[base + 2u * n] + raw[base + 3u * n];
         float v1 = raw[base + 32u] + raw[base + 32u + n] + raw[base + 32u + 2u * n] + raw[base + 32u + 3u * n];
@@ -992,23 +1003,25 @@ kernel void linear_finalize_o_proj_and_pre_ffn_transform_sk4(
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // Step 2: RMS norm 1 (post_attn_norm)
+    // Step 2: RMS norm 1 (post_attn_norm) — threads 0-255 preserve 256-thread order
     float sum1 = 0.0f;
-    for (uint i = lid; i < params.width; i += 256u) {
-        const float val = float(shared_buf[i]);
-        sum1 += val * val;
+    if (lid < 256u) {
+        for (uint i = lid; i < params.width; i += 256u) {
+            const float val = float(shared_buf[i]);
+            sum1 += val * val;
+        }
     }
     partial[lid] = sum1;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+    for (uint stride = 512u; stride > 0u; stride >>= 1u) {
         if (lid < stride) partial[lid] += partial[lid + stride];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     const float inv1 = rsqrt(partial[0] / float(params.width) + params.eps);
 
-    // Step 3: Add residual and store hidden_b
+    // Step 3: Add residual and store hidden_b (all 1024 threads)
     float sum2 = 0.0f;
-    for (uint i = lid; i < params.width; i += 256u) {
+    for (uint i = lid; i < params.width; i += 1024u) {
         const float normed1 = float(shared_buf[i]) * inv1 * float(post_attn_norm[i]);
         const half hb = half(float(residual[i]) + normed1);
         hidden_b[i] = hb;
@@ -1017,14 +1030,14 @@ kernel void linear_finalize_o_proj_and_pre_ffn_transform_sk4(
     }
     partial[lid] = sum2;
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+    for (uint stride = 512u; stride > 0u; stride >>= 1u) {
         if (lid < stride) partial[lid] += partial[lid + stride];
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
     const float inv2 = rsqrt(partial[0] / float(params.width) + params.eps);
 
     // Step 4: Pre-FFN norm + gate input transform into transformed
-    for (uint b = sg; b < params.blocks; b += 8u) {
+    for (uint b = sg; b < params.blocks; b += 32u) {
         const uint base = b * 128u + lane;
         float v0 = float(half(float(shared_buf[base]) * inv2 * float(pre_ffn_norm[base]))) * float(gate_input_signs[base]);
         float v1 = float(half(float(shared_buf[base + 32u]) * inv2 * float(pre_ffn_norm[base + 32u]))) * float(gate_input_signs[base + 32u]);
