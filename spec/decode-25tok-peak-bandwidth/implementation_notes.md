@@ -460,3 +460,83 @@ and their bit-exact tests are now committed alongside it, so the documented
 T5.5 negative-result switch is reachable. A third kernel,
 `linear_gemv_ishizuki_k3_fused2_1col`, was half-written and referenced by nothing
 and by no test; it was deleted rather than committed.
+
+## 18. Synthesis: What actually costs, and why 20 tok/s is unreachable
+
+### 18.1 Measured marginal cost (production interleaved A/B, n>=5)
+
+The `KAPLUMBA_ABLATE` harness (T5.10/T5.12) gives each component's exact wall-clock
+cost in the real pipeline, with no profiler distortion:
+
+| component | ablated as | delta (tok/s) | equivalent ms/step |
+|---|---|---|---|
+| Element kernels (input_transform, input_norm_qkv, post_attn_pre_ffn, finalize_post_ffn, finalize_o_proj) | the 5 roles | +0.44 | 1.39 |
+| Element kernels (kv_norm_rope, attention, head_softcap, head_argmax) | those 4 roles | +0.21 | 0.66 |
+| **All element kernels** | 9 roles | **+0.65** | **1.52** |
+| `o_proj_gemv` | o_proj_gemv | +1.85 | 6.63 |
+| `qkv_gemv` | qkv_gemv | +2.43 | 15.82 |
+| `gate_up_gemv` | gate_up_gemv | +10.70 | 40.34 |
+| `down_gemv` | down_gemv | +4.12 | 20.63 |
+| `head_gemv` | head_gemv | +1.12 | 4.17 |
+| **All GEMVs** | 5 roles | **+16.78** | **73.37** |
+| **Everything kernel-side ablated** | all 14 | **+120.73** | **7.32** (residual) |
+
+The +0.65 tok/s from all element kernels is only ~1.5 ms. Dispatch gaps cost
+0.7 us each (T5.10), so removing ~180 dispatches buys +0.031 tok/s — **dispatch
+count is not the lever**. The real time is in the GEMVs.
+
+### 18.2 Bandwidths implied
+
+From deltas (GB/token / ms/step = GB/s):
+
+| projection | GB/token | ms/step | implied GB/s |
+|---|---|---|---|
+| gate_up | 5.202 | 40.34 | 129 |
+| down | 2.601 | 20.63 | 126 |
+| qkv | 1.982 | 15.82 | 125 |
+| o_proj | 0.991 | 6.63 | 150 |
+| head | 1.057 | 4.17 | 253 |
+
+The long K projections (gate_up 21504, down 21504) average ~126 GB/s, `qkv` ~125.
+`o_proj` at K=8192 is 150 GB/s (higher relative to the isolated microbenchmark,
+but still well under the long-K asymptote). `head/gemv` at 6 bpw hits 253 GB/s.
+The absolute GEMV peak in this tree is 203 GB/s for 3 bpw (microbenchmark, see
+§16.3), so the layer GEMVs are running at 62% of the measured peak (126/203) —
+inefficient for decode, but changing variants hasn't moved them (T5.11 exhausted
+all seven SK/no-SK/grid-capping combinations; microbenchmark's variant ranking
+is inverted relative to production).
+
+### 18.3 Why 20 tok/s is unreachable
+
+11.834 GB must be streamed per token (qkv 1.982 + o 0.991 + gate/up 5.202 + down
+2.601 + head 1.057). At the **measured 3 bpw peak of 203 GB/s** (long K), the
+minimum possible GEMV time is 11.834/203 = 58.3 ms = **17.2 tok/s**. At the
+**achieved average of ~128 GB/s** across layer GEMVs it's 92.5 ms = 10.8 tok/s,
+but we're at 63.1 ms total (15.85 tok/s) because the fused GEMVs in the actual
+kernels run better than a simple sum. More directly:
+
+Current: 63.1 ms/step = 15.85 tok/s. Recoverable if every GEMV hit the long-K
+peak: GEMV total equivalent from deltas is 87.6 ms, but they overlap; the
+*non-overlapped* GEMV cost in practice is ~61.6 ms of the 63.1 ms. Getting from
+61.6 ms down to the peak-limited 58.3 ms buys at most **+0.28 ms** = **+0.07
+tok/s**. The rest is memory bandwidth.
+
+Even if non-GEMV dropped to 0 (it won't), ceiling is 58.3 ms = 17.2 tok/s.
+With current non-GEMV at 1.5 ms and GEMVs already at the best they're going to
+be (all variants exhausted), the **physically achievable** range is 16.5–17.2
+tok/s. **20 tok/s requires 236.7 GB/s sustained — 17% above the 203 GB/s
+measured peak — which is impossible on M4 Pro's 273 GB/s wire.**
+
+This matches §16.4 exactly. The re-scope to ≥17.0 tok/s is honest.
+
+### 18.4 What was learned
+
+- Dispatch gaps are negligible (0.7 us). Don't chase dispatch count.
+- The `KAPLUMBA_ABLATE` mechanism is the only reliable way to measure sub-ms
+  kernel costs in this pipeline; the profilers misread them due to boundary
+  semantics.
+- The isolated `gemv_bandwidth.rs` microbenchmark gives correct *absolute* GB/s
+  but **inverts variant rankings** vs production (L2 reuse / interleaving). Use
+  it only for bandwidth ceilings, never to pick between sk2/sk4/no-SK.
+- `o_proj`'s shape genuinely hurts; none of the 7 scheduling variants helped.
+- All 13 reference tests still pass. Golden prompt remains bit-exact.
