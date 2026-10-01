@@ -302,6 +302,7 @@ pub struct LinearKernels {
     pub post_attn_pre_ffn_transform_pipeline: ComputePipelineState,
     pub finalize_o_proj_and_pre_ffn_transform_pipeline: ComputePipelineState,
     pub finalize_o_proj_and_pre_ffn_transform_sk2_pipeline: ComputePipelineState,
+    pub finalize_o_proj_and_pre_ffn_transform_sk4_pipeline: ComputePipelineState,
     pub input_norm_and_qkv_transform_pipeline: ComputePipelineState,
     input_rows_pipeline: ComputePipelineState,
     gemv_tiled_pipeline: ComputePipelineState,
@@ -570,6 +571,11 @@ impl LinearKernels {
             &library,
             "linear_finalize_o_proj_and_pre_ffn_transform_sk2",
         )?;
+        let finalize_o_proj_and_pre_ffn_transform_sk4_pipeline = pipeline_audit::build(
+            &device,
+            &library,
+            "linear_finalize_o_proj_and_pre_ffn_transform_sk4",
+        )?;
         let input_norm_and_qkv_transform_pipeline = pipeline_audit::build(
             &device,
             &library,
@@ -626,6 +632,7 @@ impl LinearKernels {
             post_attn_pre_ffn_transform_pipeline,
             finalize_o_proj_and_pre_ffn_transform_pipeline,
             finalize_o_proj_and_pre_ffn_transform_sk2_pipeline,
+            finalize_o_proj_and_pre_ffn_transform_sk4_pipeline,
             input_norm_and_qkv_transform_pipeline,
             input_rows_pipeline,
             gemv_tiled_pipeline,
@@ -2953,6 +2960,45 @@ impl LinearKernels {
         };
         encoder.dispatch_groups(
             &self.finalize_o_proj_and_pre_ffn_transform_sk2_pipeline,
+            &[
+                Some(raw),
+                Some(o_out_signs),
+                Some(post_attn_norm),
+                Some(residual),
+                Some(hidden_b),
+                Some(pre_ffn_norm),
+                Some(gate_input_signs),
+                Some(transformed),
+            ],
+            params_bytes(&params),
+            1,
+            256,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_finalize_o_proj_and_pre_ffn_transform_sk4(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        raw: &Buffer,
+        o_out_signs: &Buffer,
+        post_attn_norm: &Buffer,
+        residual: &Buffer,
+        hidden_b: &Buffer,
+        pre_ffn_norm: &Buffer,
+        gate_input_signs: &Buffer,
+        transformed: &Buffer,
+        width: usize,
+        eps: f32,
+    ) -> Result<(), KernelError> {
+        let blocks = to_u32(width / 128, "post_attn blocks")?;
+        let params = PostAttnPreFfnParams {
+            width: to_u32(width, "post_attn width")?,
+            blocks,
+            eps,
+        };
+        encoder.dispatch_groups(
+            &self.finalize_o_proj_and_pre_ffn_transform_sk4_pipeline,
             &[
                 Some(raw),
                 Some(o_out_signs),

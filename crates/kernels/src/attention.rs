@@ -200,6 +200,7 @@ pub struct AttentionRequest<'a> {
 
 /// GPU-resident attention request: every buffer is caller-owned so attention
 /// can be encoded into the same command buffer as the rest of the layer.
+#[derive(Clone, Copy)]
 pub struct AttentionEncodeRequest<'a> {
     pub queries: &'a Buffer,
     pub keys: &'a Buffer,

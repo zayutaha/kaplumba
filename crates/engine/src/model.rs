@@ -1743,11 +1743,23 @@ impl DecoderLayer {
             window,
         };
         if tokens == 1 {
-            self.attention.encode_online_attention_split(
-                encoder,
-                attention_request,
-                &scratch.attn_partials,
-            )?;
+            let use_single_pass = !env_flag("KAPLUMBA_NO_SINGLE_PASS")
+                && key_count <= kaplumba_kernels::attention::ATTENTION_SINGLE_PASS_MAX_KEYS;
+            let mut dispatched = false;
+            if use_single_pass {
+                if let Some(index) = kaplumba_kernels::attention::decode_gqa_index(head_dim, config.q_heads, config.kv_heads) {
+                    if self.attention.encode_decode_single_pass(encoder, attention_request, index).is_ok() {
+                        dispatched = true;
+                    }
+                }
+            }
+            if !dispatched {
+                self.attention.encode_online_attention_split(
+                    encoder,
+                    attention_request,
+                    &scratch.attn_partials,
+                )?;
+            }
         } else {
             self.attention
                 .encode_online_attention(encoder, attention_request)?;
@@ -1799,12 +1811,50 @@ impl DecoderLayer {
                 )
                 .map_err(ModelError::Kernel)?;
 
-            let use_sk2 = !env_flag("KAPLUMBA_NO_SK2")
+            let use_sk4 = env_flag("KAPLUMBA_O_SK4")
                 && self.weights.o_proj.permutation_mode == 1
                 && self.weights.o_proj.out_features % 32 == 0
                 && matches!(self.weights.o_proj.rate, Exl3Rate::Integer(3));
 
-            if use_sk2 {
+            let use_sk2 = !use_sk4
+                && !env_flag("KAPLUMBA_NO_SK2")
+                && self.weights.o_proj.permutation_mode == 1
+                && self.weights.o_proj.out_features % 32 == 0
+                && matches!(self.weights.o_proj.rate, Exl3Rate::Integer(3));
+
+            if use_sk4 {
+                self.linear
+                    .encode_gemv_raw_sk4(
+                        encoder,
+                        packed_o,
+                        self.weights.o_proj.metal_offset,
+                        self.weights.o_proj.permutation_mode,
+                        self.weights.o_proj.rate,
+                        self.weights.o_proj.in_features,
+                        self.weights.o_proj.out_features,
+                        &scratch.transformed,
+                        &scratch.raw,
+                    )
+                    .map_err(ModelError::Kernel)?;
+                profile.stamp(encoder, &format!("{}o_proj", prefix()))?;
+                timer.lap("o_proj");
+
+                self.linear
+                    .encode_finalize_o_proj_and_pre_ffn_transform_sk4(
+                        encoder,
+                        &scratch.raw,
+                        o_out_signs,
+                        &self.gpu_weights.post_attention_norm,
+                        input,
+                        &scratch.hidden_b,
+                        &self.gpu_weights.pre_ffn_norm,
+                        gate_input_signs,
+                        &scratch.transformed,
+                        self.config.hidden_size,
+                        eps,
+                    )
+                    .map_err(ModelError::Kernel)?;
+            } else if use_sk2 {
                 self.linear
                     .encode_gemv_raw_sk2(
                         encoder,
@@ -4150,18 +4200,25 @@ impl TextModel {
         // the chunk after the layer GEMMs, so it gets its own boundary rather
         // than hiding inside the head's phase total.
         profile.stamp(encoder, "head/gemv")?;
-        self.elements.encode_softcap(
-            encoder,
-            &self.scratch.logits,
-            &self.scratch.capped,
-            vocab,
-            self.final_softcap,
-        )?;
-        profile.stamp(encoder, "head/softcap")?;
+        let skip_softcap = (next_token_out.is_some() || host_token_out.is_some())
+            && !env_flag("KAPLUMBA_FORCE_SOFTCAP");
+        let argmax_src = if skip_softcap {
+            &self.scratch.logits
+        } else {
+            self.elements.encode_softcap(
+                encoder,
+                &self.scratch.logits,
+                &self.scratch.capped,
+                vocab,
+                self.final_softcap,
+            )?;
+            profile.stamp(encoder, "head/softcap")?;
+            &self.scratch.capped
+        };
         self.elements
             .encode_argmax(
                 encoder,
-                &self.scratch.capped,
+                argmax_src,
                 &self.scratch.argmax_keys,
                 vocab,
             )
