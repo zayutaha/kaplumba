@@ -18,19 +18,39 @@ and recorded as a negative (AC6).
 
 ---
 
-- [ ] **T2a: o_proj warmstart kernel (if T1 passes)**
+- [x] **T2a: o_proj warmstart kernel (if T1 passes)** — **❌ NEGATIVE, REVERTED**
   - Files: `crates/kernels/src/linear_repacked.metal`, `crates/kernels/src/linear.rs`,
-    `crates/engine/src/model.rs`, `crates/engine/tests/live_kernel_bit_exact.rs`
+    `crates/engine/src/model.rs`, `crates/engine/tests/warmstart_starvation.rs`
   - Intent: Implement `linear_gemv_ishizuki_k3_colmajor_2col_sk2_warmstart` with
     `device atomic_uint attn_done` spin-wait. Dispatch it BEFORE the attention
     kernel in `forward_buffer`, so Metal's scheduler can overlap them.
     The kernel begins loading weight tiles from DRAM immediately but waits for
     `attn_done` before reading `x[]` (the attention output).
-  - Testing:
-    - Bit-exact: o_proj output identical to baseline (`live_kernel_bit_exact`).
-    - Sabotage: remove the flag wait → output must be wrong (attention not done).
-    - A/B: interleaved 8-pair measurement. Must beat 15.85 tok/s baseline.
-  - Commit: `spec/decode-20tps: T2a o_proj warmstart kernel`
+  - **RESULT: the kernel compiled, loaded, and killed the engine at load.**
+    `invalid layer configuration: Metal command buffer failed during warmup
+    decode`. See §3 of the implementation notes for the sweep.
+  - **Gate FAILED on the mechanism, not on the arithmetic.** The spin is what
+    breaks, and it breaks at *every* grid size: see
+    `crates/engine/tests/warmstart_starvation.rs`, which is the evidence and
+    which is kept.
+  - **Do not retry the spin.** `tasks.md`'s T2b is the spec's own answer and is
+    now unblocked: an `MTLEvent` is a *hardware* wait, so it orders the same
+    two dispatches with no thread spinning, which is precisely the thing that
+    saturates the memory pipe here.
+
+---
+
+- [ ] **T2a-cleanup: remove the reverted warm-start path**
+  - Files: `crates/kernels/src/linear_repacked.metal`,
+    `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`,
+    `crates/engine/src/model.rs`
+  - Intent: `LinearKernels::new` builds *every* `linear_gemv_ishizuki_*` in the
+    library, so a reverted kernel still costs a pipeline compile at load. Delete
+    the warm-start GEMV, the signal kernel, the encoders and the `attn_*` scratch
+    buffers rather than leaving dead code that the audit counts as live.
+  - Testing: full suite green; `KAPLUMBA_PIPELINE_AUDIT=1` pipeline count back
+    to its pre-T2a value.
+  - Commit: `spec/decode-20tps: T2a-cleanup drop reverted warm-start path`
 
 ---
 
