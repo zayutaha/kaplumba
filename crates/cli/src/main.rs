@@ -1,4 +1,5 @@
 mod args;
+mod chat;
 mod report;
 
 use std::env;
@@ -53,6 +54,9 @@ fn run() -> Result<(), String> {
     let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
     let tokenizer =
         GemmaTokenizer::from_model_dir(&arguments.model_path).map_err(|error| error.to_string())?;
+    if arguments.chat {
+        return chat::run(&arguments, &mut model, &tokenizer, load_ms);
+    }
     if arguments.benchmark {
         let prompt_ids =
             fixed_benchmark_prompt(&tokenizer, 2048).map_err(|error| error.to_string())?;

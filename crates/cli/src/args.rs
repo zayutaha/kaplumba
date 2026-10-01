@@ -38,6 +38,9 @@ pub struct CliArgs {
     pub show_ids: bool,
     pub show_metrics: bool,
     pub benchmark: bool,
+    /// Interactive multi-turn chat: read lines from stdin, keep the KV cache
+    /// across turns. Rejects `--prompt`/`--prompt-file`/`--benchmark`.
+    pub chat: bool,
     /// Use the legacy host-slice forward path instead of the GPU-resident one.
     pub legacy_path: bool,
 }
@@ -60,6 +63,7 @@ impl CliArgs {
         let mut show_ids = false;
         let mut show_metrics = false;
         let mut benchmark = false;
+        let mut chat = false;
         let mut legacy_path = false;
         while let Some(argument) = args.next() {
             match argument.as_str() {
@@ -67,6 +71,7 @@ impl CliArgs {
                 "--show-ids" => show_ids = true,
                 "--metrics" => show_metrics = true,
                 "--benchmark" => benchmark = true,
+                "--chat" => chat = true,
                 "--legacy-path" => legacy_path = true,
                 "--model" => model_path = PathBuf::from(value(&mut args, "--model")?),
                 "--prompt" => prompt = Some(value(&mut args, "--prompt")?),
@@ -108,6 +113,11 @@ impl CliArgs {
                 "choose only one of --prompt and --prompt-file".to_string(),
             ));
         }
+        if chat && (prompt.is_some() || prompt_file.is_some() || benchmark) {
+            return Err(ArgsError::Invalid(
+                "--chat takes its prompts from stdin; drop --prompt, --prompt-file and --benchmark".to_string(),
+            ));
+        }
         if max_new_tokens == 0 {
             return Err(ArgsError::Invalid(
                 "--max-new-tokens must be greater than zero".to_string(),
@@ -138,6 +148,7 @@ impl CliArgs {
             show_ids,
             show_metrics,
             benchmark,
+            chat,
             legacy_path,
         }))
     }
@@ -172,7 +183,7 @@ impl CliArgs {
 }
 
 pub fn help_text() -> &'static str {
-    "Usage: kaplumba [--model PATH] [--prompt TEXT | --prompt-file PATH] [options]\n\nOptions:\n  --prompt TEXT              Use TEXT as the user prompt\n  --prompt-file PATH         Read the user prompt from PATH\n  --model PATH               Model directory (default: ~/.kaplumba/models/Gxma/Gxma)\n  --max-new-tokens N         Maximum generated tokens (default: 128)\n  --temperature VALUE        Sampling temperature; 0 selects greedy (default: 1.0)\n  --top-k N                  Keep the top K logits (default: 64)\n  --top-p VALUE              Nucleus probability threshold (default: 0.95)\n  --seed N                   Deterministic sampling seed\n  --show-ids                 Print diagnostic token IDs separately\n  --metrics                  Print timing and memory metrics\n  --benchmark                Run the fixed 2k/8-warmup/128-token benchmark\n  -h, --help                 Show this help\n"
+    "Usage: kaplumba [--model PATH] [--prompt TEXT | --prompt-file PATH] [options]\n\nOptions:\n  --prompt TEXT              Use TEXT as the user prompt\n  --prompt-file PATH         Read the user prompt from PATH\n  --model PATH               Model directory (default: ~/.kaplumba/models/Gxma/Gxma)\n  --max-new-tokens N         Maximum generated tokens (default: 128)\n  --temperature VALUE        Sampling temperature; 0 selects greedy (default: 1.0)\n  --top-k N                  Keep the top K logits (default: 64)\n  --top-p VALUE              Nucleus probability threshold (default: 0.95)\n  --seed N                   Deterministic sampling seed\n  --show-ids                 Print diagnostic token IDs separately\n  --metrics                  Print timing and memory metrics\n  --benchmark                Run the fixed 2k/8-warmup/128-token benchmark\n  --chat                     Interactive multi-turn chat on stdin (no --prompt)\n  -h, --help                 Show this help\n"
 }
 
 fn value<I>(arguments: &mut I, name: &str) -> Result<String, ArgsError>
@@ -267,5 +278,23 @@ mod tests {
         assert_eq!(parsed.read_prompt().unwrap(), "a");
         let empty = CliArgs::parse(args(&["--prompt", " "])).unwrap().unwrap();
         assert!(matches!(empty.read_prompt(), Err(ArgsError::Invalid(_))));
+    }
+
+    #[test]
+    fn chat_flag_and_conflicts() {
+        let parsed = CliArgs::parse(args(&["--chat"])).unwrap().unwrap();
+        assert!(parsed.chat);
+        assert!(matches!(
+            CliArgs::parse(args(&["--chat", "--prompt", "a"])),
+            Err(ArgsError::Invalid(_))
+        ));
+        assert!(matches!(
+            CliArgs::parse(args(&["--chat", "--prompt-file", "p"])),
+            Err(ArgsError::Invalid(_))
+        ));
+        assert!(matches!(
+            CliArgs::parse(args(&["--chat", "--benchmark"])),
+            Err(ArgsError::Invalid(_))
+        ));
     }
 }
