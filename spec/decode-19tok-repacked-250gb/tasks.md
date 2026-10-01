@@ -196,3 +196,8 @@
   - Intent: Replace 64-bit `((w0a << 32) | w0b) << sh0` barrel shift emulation in `contig4`, `fused2`, and `fused3` with pure 32-bit funnel shifts `(wa << sh0) | (wb >> rsh0)`.
   - Result: Proved `sh0 \in {19, 27, 3, 11}` is strictly odd and non-zero across all lanes, precomputing `rsh0 = 32u - sh0`. Replaced 64-bit registers and instruction pairs with single-cycle 32-bit shifts. Measured steady-state step latency dropped to 65.0 - 65.4 ms/step (15.35 tok/s sustained). End-to-end 64-token throughput reached 14.97 tok/s. 100% bit-exact across `repacked_golden`, `live_kernel_bit_exact`, and `fused_bit_exact`.
 
+- [x] **T7.6.16: Dual-column threadgroup GEMV (`linear_gemv_ishizuki_k3_colmajor_2col`)**
+  - Files: `crates/kernels/src/linear_repacked.metal`, `crates/kernels/src/linear.rs`, `crates/engine/tests/live_kernel_bit_exact.rs`
+  - Intent: Co-compute 2 output tiles of N per threadgroup (32 output channels) in repacked GEMV. Reuses loaded input vector `x` across both columns, halving `x` loads and ALU conversions.
+  - Result: Added `linear_gemv_ishizuki_k3_colmajor_2col` in `linear_repacked.metal` with dual-column accumulation and parallel threadgroup reduction across SIMD lane pairs. Wired into `encode_gemv_raw` and `encode_ishizuki_gemv_named`. Verified 100% bit-exact (0/5376, 0/21504, 0/5376 fp16 diffs). Sabotage verified (reduction tampering detected with 84/5376 diffs). Regression tests `fused_bit_exact` (3/3) and `repacked_golden` (2/2) passed.
+

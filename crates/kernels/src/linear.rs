@@ -1148,6 +1148,7 @@ impl LinearKernels {
         let is_stream = name.ends_with("_stream");
         let is_sk2 = name.ends_with("_sk2");
         let is_sk4 = name.ends_with("_sk4");
+        let is_2col = name.ends_with("_2col");
         if is_stream {
             let tiles = (request.out_features / 16) as u64;
             let groups = (tiles + 7) / 8;
@@ -1226,6 +1227,24 @@ impl LinearKernels {
                 u64::from(output_blocks) * 32,
                 32,
             );
+        } else if is_2col {
+            let pairs = (request.out_features / 32) as u64;
+            let groups = pairs.min(gemv_max_groups()).max(1);
+            let shape_values = [
+                to_u32(request.in_features, "input dimension")?,
+                to_u32(request.out_features, "output dimension")?,
+            ];
+            encoder.dispatch_1d_offset(
+                pipeline,
+                &[
+                    TensorRef::new(request.packed, request.packed_offset),
+                    TensorRef::new(request.transformed, 0),
+                    TensorRef::new(request.raw, 0),
+                ],
+                params_bytes(&shape_values),
+                groups * 256,
+                256,
+            )?;
         } else {
             self.encode_ishizuki_gemv(
                 encoder,
@@ -1916,6 +1935,31 @@ impl LinearKernels {
             queries: 1,
             perm_mode,
         };
+        if perm_mode == 1 && out_features % 32 == 0 && !env_flag("KAPLUMBA_NO_2COL") {
+            if let Exl3Rate::Integer(bits) = rate {
+                let name = format!("linear_gemv_ishizuki_k{bits}_colmajor_2col");
+                if let Some(pipeline) = self.ishizuki_gemv_by_name.get(&name) {
+                    Self::trace_gemv(&name);
+                    let shape_values = [
+                        to_u32(in_features, "input dimension")?,
+                        to_u32(out_features, "output dimension")?,
+                    ];
+                    let pairs = (out_features / 32) as u64;
+                    let groups = pairs.min(gemv_max_groups()).max(1);
+                    return encoder.dispatch_1d_offset(
+                        pipeline,
+                        &[
+                            TensorRef::new(packed, packed_offset),
+                            TensorRef::new(transformed, 0),
+                            TensorRef::new(raw, 0),
+                        ],
+                        params_bytes(&shape_values),
+                        groups * 256,
+                        256,
+                    );
+                }
+            }
+        }
 
         if let Some(pipeline) = self.ishizuki_gemv_pipeline(rate, packed_offset, perm_mode) {
             // Trace the name that was *actually selected*, not one reconstructed

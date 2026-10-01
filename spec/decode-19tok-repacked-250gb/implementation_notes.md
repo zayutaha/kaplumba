@@ -1736,3 +1736,22 @@ static inline void extract_v_mcg_32(uint wa, uint wb, uint sh0, uint rsh0, threa
   - `qkv_proj`: 11.28 ms -> 8.71 ms.
   - Steady-state decode step: **65.0 - 65.4 ms/step (15.35 tok/s sustained)**.
   - Overall 64-token generation throughput reached **14.97 tok/s**.
+
+---
+
+## 23. Dual-Column Threadgroup Tiling (T7.6.16)
+
+### 23.1 Motivation & Arithmetic Intensity
+In single-column GEMV, each threadgroup computes 1 tile of N (16 output channels). For `down_proj` ($K=21504, N=5376$), there are 336 threadgroups. Each threadgroup independently reads the 43 KB input vector $x$, causing 14.45 MB of $x$ memory loads across the grid and placing high pressure on GPU L2/SLC cache.
+
+### 23.2 Architecture of `linear_gemv_ishizuki_k3_colmajor_2col`
+In `crates/kernels/src/linear_repacked.metal`, `linear_gemv_ishizuki_k3_colmajor_2col` assigns 2 column tiles ($tn_0$ and $tn_1 = tn_0 + 1$, 32 outputs total) to each threadgroup:
+1. Loads $x$ (`xr0..xr3`, 16 floats) **once** per 4 unrolled sub-tiles and reuses across both columns.
+2. Accumulates in 4 float registers (`acc0_0, acc0_1, acc1_0, acc1_1`).
+3. Uses parallel reduction across SIMD lane pairs: threads 0..15 reduce column 0, while threads 16..31 reduce column 1 concurrently.
+4. Gated on `perm_mode == 1 && out_features % 32 == 0 && !env_flag("KAPLUMBA_NO_2COL")` in `encode_gemv_raw`.
+
+### 23.3 Verification & Sabotage Proof
+- **Bit-exactness**: `live_kernel_bit_exact` passes with 0/5376 (`down_proj`), 0/21504 (`gate_proj`), and 0/5376 (`o_proj`) FP16 diffs against the reference.
+- **Sabotage proof**: Modified `sum += red[col_idx][g][out_lane]` to `sum += (g == 0 ? red[col_idx][g][out_lane] : 0.0f)`. Test failed immediately with `down_proj 21504x5376: 2col fp16 diff count: 84/5376` (exit code 101). Reverted and confirmed clean pass.
+- **Regressions**: `fused_bit_exact` (3/3) and `repacked_golden` (2/2) passed cleanly.
