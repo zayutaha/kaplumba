@@ -2105,12 +2105,31 @@ impl LinearKernels {
                 );
             }
         }
-        let pipeline = self
-            .ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2")
-            .ok_or_else(|| {
-                KernelError::InvalidInput("missing linear_gemv_ishizuki_k3_fused2".to_string())
-            })?;
-        let groups = tiles_a + tiles_b;
+        let (pipeline, groups) = if out_features_a == out_features_b && !env_flag("KAPLUMBA_NO_FUSED2_CO") {
+            if let Some(pipe) = self.ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2_co") {
+                (pipe, tiles_a)
+            } else {
+                (
+                    self.ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2")
+                        .ok_or_else(|| {
+                            KernelError::InvalidInput(
+                                "missing linear_gemv_ishizuki_k3_fused2".to_string(),
+                            )
+                        })?,
+                    tiles_a + tiles_b,
+                )
+            }
+        } else {
+            (
+                self.ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2")
+                    .ok_or_else(|| {
+                        KernelError::InvalidInput(
+                            "missing linear_gemv_ishizuki_k3_fused2".to_string(),
+                        )
+                    })?,
+                tiles_a + tiles_b,
+            )
+        };
         encoder.dispatch_1d_offset(
             pipeline,
             &[
@@ -2233,12 +2252,32 @@ impl LinearKernels {
                 }
             }
         }
-        let pipeline = self
-            .ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2")
-            .ok_or_else(|| {
-                KernelError::InvalidInput("missing linear_gemv_ishizuki_k3_fused2".to_string())
-            })?;
-        let groups = tiles_a + tiles_b;
+        let (pipeline, groups) = if out_features_gate == out_features_up && !env_flag("KAPLUMBA_NO_FUSED2_CO") {
+            if let Some(pipe) = self.ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2_co") {
+                Self::trace_gemv("linear_gemv_ishizuki_k3_fused2_co (mlp)");
+                (pipe, tiles_a)
+            } else {
+                (
+                    self.ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2")
+                        .ok_or_else(|| {
+                            KernelError::InvalidInput(
+                                "missing linear_gemv_ishizuki_k3_fused2".to_string(),
+                            )
+                        })?,
+                    tiles_a + tiles_b,
+                )
+            }
+        } else {
+            (
+                self.ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2")
+                    .ok_or_else(|| {
+                        KernelError::InvalidInput(
+                            "missing linear_gemv_ishizuki_k3_fused2".to_string(),
+                        )
+                    })?,
+                tiles_a + tiles_b,
+            )
+        };
         encoder.dispatch_1d_offset(
             pipeline,
             &[

@@ -431,6 +431,165 @@ kernel void linear_gemv_ishizuki_k3_fused2(
     }
 }
 
+kernel void linear_gemv_ishizuki_k3_fused2_co(
+    const device ushort *packed_a [[buffer(0)]],
+    const device ushort *packed_b [[buffer(1)]],
+    const device half *x [[buffer(2)]],
+    device float *y_a [[buffer(3)]],
+    device float *y_b [[buffer(4)]],
+    constant const uint *shape [[buffer(5)]], // [K, N_a, N_b]
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    constexpr uint KA = 3u;
+    constexpr int CB = 1;
+    constexpr uint RING = 256u * KA;
+    constexpr uint WORDS = RING / 32u;
+    const uint K = shape[0];
+    const uint N_a = shape[1];
+    const uint tiles_a = N_a / 16u;
+    const uint tiles_k = K / 16u;
+    constexpr int SG = 8;
+    threadgroup float red[2][SG][16];
+    const uint r0 = (lane % 4u) * 2u;
+
+    const uint lo0 = (lane * 8u + 1u) * 3u + RING - 16u;
+    const uint sh0 = lo0 % 32u;
+    const uint rsh0 = 32u - sh0;
+    const uint hi0 = lo0 / 32u;
+    const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
+    const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
+
+    for (uint tn = tgid; tn < tiles_a; tn += ntg) {
+        float acc_a0 = 0.0f;
+        float acc_a1 = 0.0f;
+        float acc_b0 = 0.0f;
+        float acc_b1 = 0.0f;
+
+        const device uint *col_a = (const device uint *)packed_a + tn * (tiles_k * WORDS);
+        const device uint *col_b = (const device uint *)packed_b + tn * (tiles_k * WORDS);
+        const uint stride = WORDS;
+
+        const uint step = SG * 4u;
+        const uint k_unroll_end = (tiles_k / step) * step;
+
+        uint tk = sg * 4u;
+        for (; tk < k_unroll_end; tk += step) {
+            const device half *xr0 = x + (tk + 0u) * 16u + r0;
+            const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
+            const device half *xr1 = x + (tk + 1u) * 16u + r0;
+            const float p10 = float(xr1[0]), p11 = float(xr1[1]), p12 = float(xr1[8]), p13 = float(xr1[9]);
+            const device half *xr2 = x + (tk + 2u) * 16u + r0;
+            const float p20 = float(xr2[0]), p21 = float(xr2[1]), p22 = float(xr2[8]), p23 = float(xr2[9]);
+            const device half *xr3 = x + (tk + 3u) * 16u + r0;
+            const float p30 = float(xr3[0]), p31 = float(xr3[1]), p32 = float(xr3[8]), p33 = float(xr3[9]);
+
+            const device uint *t0_a = col_a + (tk + 0u) * stride;
+            const device uint *t1_a = col_a + (tk + 1u) * stride;
+            const device uint *t2_a = col_a + (tk + 2u) * stride;
+            const device uint *t3_a = col_a + (tk + 3u) * stride;
+
+            const device uint *t0_b = col_b + (tk + 0u) * stride;
+            const device uint *t1_b = col_b + (tk + 1u) * stride;
+            const device uint *t2_b = col_b + (tk + 2u) * stride;
+            const device uint *t3_b = col_b + (tk + 3u) * stride;
+
+            const uint w0a_a = t0_a[j0], w0b_a = t0_a[j1];
+            const uint w1a_a = t1_a[j0], w1b_a = t1_a[j1];
+            const uint w2a_a = t2_a[j0], w2b_a = t2_a[j1];
+            const uint w3a_a = t3_a[j0], w3b_a = t3_a[j1];
+
+            const uint w0a_b = t0_b[j0], w0b_b = t0_b[j1];
+            const uint w1a_b = t1_b[j0], w1b_b = t1_b[j1];
+            const uint w2a_b = t2_b[j0], w2b_b = t2_b[j1];
+            const uint w3a_b = t3_b[j0], w3b_b = t3_b[j1];
+
+            float v0_a[8], v1_a[8], v2_a[8], v3_a[8];
+            extract_v_mcg_32(w0a_a, w0b_a, sh0, rsh0, v0_a);
+            extract_v_mcg_32(w1a_a, w1b_a, sh0, rsh0, v1_a);
+            extract_v_mcg_32(w2a_a, w2b_a, sh0, rsh0, v2_a);
+            extract_v_mcg_32(w3a_a, w3b_a, sh0, rsh0, v3_a);
+
+            acc_a0 += p00 * v0_a[0] + p01 * v0_a[1] + p02 * v0_a[2] + p03 * v0_a[3];
+            acc_a1 += p00 * v0_a[4] + p01 * v0_a[5] + p02 * v0_a[6] + p03 * v0_a[7];
+            acc_a0 += p10 * v1_a[0] + p11 * v1_a[1] + p12 * v1_a[2] + p13 * v1_a[3];
+            acc_a1 += p10 * v1_a[4] + p11 * v1_a[5] + p12 * v1_a[6] + p13 * v1_a[7];
+            acc_a0 += p20 * v2_a[0] + p21 * v2_a[1] + p22 * v2_a[2] + p23 * v2_a[3];
+            acc_a1 += p20 * v2_a[4] + p21 * v2_a[5] + p22 * v2_a[6] + p23 * v2_a[7];
+            acc_a0 += p30 * v3_a[0] + p31 * v3_a[1] + p32 * v3_a[2] + p33 * v3_a[3];
+            acc_a1 += p30 * v3_a[4] + p31 * v3_a[5] + p32 * v3_a[6] + p33 * v3_a[7];
+
+            float v0_b[8], v1_b[8], v2_b[8], v3_b[8];
+            extract_v_mcg_32(w0a_b, w0b_b, sh0, rsh0, v0_b);
+            extract_v_mcg_32(w1a_b, w1b_b, sh0, rsh0, v1_b);
+            extract_v_mcg_32(w2a_b, w2b_b, sh0, rsh0, v2_b);
+            extract_v_mcg_32(w3a_b, w3b_b, sh0, rsh0, v3_b);
+
+            acc_b0 += p00 * v0_b[0] + p01 * v0_b[1] + p02 * v0_b[2] + p03 * v0_b[3];
+            acc_b1 += p00 * v0_b[4] + p01 * v0_b[5] + p02 * v0_b[6] + p03 * v0_b[7];
+            acc_b0 += p10 * v1_b[0] + p11 * v1_b[1] + p12 * v1_b[2] + p13 * v1_b[3];
+            acc_b1 += p10 * v1_b[4] + p11 * v1_b[5] + p12 * v1_b[6] + p13 * v1_b[7];
+            acc_b0 += p20 * v2_b[0] + p21 * v2_b[1] + p22 * v2_b[2] + p23 * v2_b[3];
+            acc_b1 += p20 * v2_b[4] + p21 * v2_b[5] + p22 * v2_b[6] + p23 * v2_b[7];
+            acc_b0 += p30 * v3_b[0] + p31 * v3_b[1] + p32 * v3_b[2] + p33 * v3_b[3];
+            acc_b1 += p30 * v3_b[4] + p31 * v3_b[5] + p32 * v3_b[6] + p33 * v3_b[7];
+        }
+
+        for (tk = k_unroll_end + sg; tk < tiles_k; tk += SG) {
+            const device half *xr0 = x + tk * 16u + r0;
+            const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
+
+            const device uint *t0_a = col_a + tk * stride;
+            const uint a0_a = t0_a[j0], a1_a = t0_a[j1];
+            float v_a[8];
+            extract_v_mcg_32(a0_a, a1_a, sh0, rsh0, v_a);
+            acc_a0 += p0 * v_a[0] + p1 * v_a[1] + p2 * v_a[2] + p3 * v_a[3];
+            acc_a1 += p0 * v_a[4] + p1 * v_a[5] + p2 * v_a[6] + p3 * v_a[7];
+
+            const device uint *t0_b = col_b + tk * stride;
+            const uint a0_b = t0_b[j0], a1_b = t0_b[j1];
+            float v_b[8];
+            extract_v_mcg_32(a0_b, a1_b, sh0, rsh0, v_b);
+            acc_b0 += p0 * v_b[0] + p1 * v_b[1] + p2 * v_b[2] + p3 * v_b[3];
+            acc_b1 += p0 * v_b[4] + p1 * v_b[5] + p2 * v_b[6] + p3 * v_b[7];
+        }
+
+        acc_a0 += simd_shuffle_xor(acc_a0, 1u);
+        acc_a0 += simd_shuffle_xor(acc_a0, 2u);
+        acc_a1 += simd_shuffle_xor(acc_a1, 1u);
+        acc_a1 += simd_shuffle_xor(acc_a1, 2u);
+
+        acc_b0 += simd_shuffle_xor(acc_b0, 1u);
+        acc_b0 += simd_shuffle_xor(acc_b0, 2u);
+        acc_b1 += simd_shuffle_xor(acc_b1, 1u);
+        acc_b1 += simd_shuffle_xor(acc_b1, 2u);
+
+        if (lane % 4u == 0u) {
+            red[0][sg][lane / 4u] = acc_a0;
+            red[0][sg][lane / 4u + 8u] = acc_a1;
+            red[1][sg][lane / 4u] = acc_b0;
+            red[1][sg][lane / 4u + 8u] = acc_b1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid < 32u) {
+            const uint tensor_idx = lid / 16u;
+            const uint out_lane = lid % 16u;
+            float sum = 0.0f;
+            for (int g = 0; g < SG; ++g) {
+                sum += red[tensor_idx][g][out_lane];
+            }
+            if (tensor_idx == 0u) {
+                y_a[tn * 16u + out_lane] = sum;
+            } else {
+                y_b[tn * 16u + out_lane] = sum;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 kernel void linear_gemv_ishizuki_k3_fused2_sk2(
     const device ushort *packed_a [[buffer(0)]],
     const device ushort *packed_b [[buffer(1)]],
@@ -1264,10 +1423,20 @@ kernel void linear_gemv_ishizuki_k3_colmajor_2col(
             const device uint *t2_0 = col0 + (tk + 2u) * stride;
             const device uint *t3_0 = col0 + (tk + 3u) * stride;
 
+            const device uint *t0_1 = col1 + (tk + 0u) * stride;
+            const device uint *t1_1 = col1 + (tk + 1u) * stride;
+            const device uint *t2_1 = col1 + (tk + 2u) * stride;
+            const device uint *t3_1 = col1 + (tk + 3u) * stride;
+
             const uint w0a_0 = t0_0[j0], w0b_0 = t0_0[j1];
             const uint w1a_0 = t1_0[j0], w1b_0 = t1_0[j1];
             const uint w2a_0 = t2_0[j0], w2b_0 = t2_0[j1];
             const uint w3a_0 = t3_0[j0], w3b_0 = t3_0[j1];
+
+            const uint w0a_1 = t0_1[j0], w0b_1 = t0_1[j1];
+            const uint w1a_1 = t1_1[j0], w1b_1 = t1_1[j1];
+            const uint w2a_1 = t2_1[j0], w2b_1 = t2_1[j1];
+            const uint w3a_1 = t3_1[j0], w3b_1 = t3_1[j1];
 
             float v0_0[8], v1_0[8], v2_0[8], v3_0[8];
             extract_v_mcg_32(w0a_0, w0b_0, sh0, rsh0, v0_0);
@@ -1283,16 +1452,6 @@ kernel void linear_gemv_ishizuki_k3_colmajor_2col(
             acc0_1 += p20 * v2_0[4] + p21 * v2_0[5] + p22 * v2_0[6] + p23 * v2_0[7];
             acc0_0 += p30 * v3_0[0] + p31 * v3_0[1] + p32 * v3_0[2] + p33 * v3_0[3];
             acc0_1 += p30 * v3_0[4] + p31 * v3_0[5] + p32 * v3_0[6] + p33 * v3_0[7];
-
-            const device uint *t0_1 = col1 + (tk + 0u) * stride;
-            const device uint *t1_1 = col1 + (tk + 1u) * stride;
-            const device uint *t2_1 = col1 + (tk + 2u) * stride;
-            const device uint *t3_1 = col1 + (tk + 3u) * stride;
-
-            const uint w0a_1 = t0_1[j0], w0b_1 = t0_1[j1];
-            const uint w1a_1 = t1_1[j0], w1b_1 = t1_1[j1];
-            const uint w2a_1 = t2_1[j0], w2b_1 = t2_1[j1];
-            const uint w3a_1 = t3_1[j0], w3b_1 = t3_1[j1];
 
             float v0_1[8], v1_1[8], v2_1[8], v3_1[8];
             extract_v_mcg_32(w0a_1, w0b_1, sh0, rsh0, v0_1);

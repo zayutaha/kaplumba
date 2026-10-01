@@ -53,9 +53,9 @@ fn live_kernel_contig4_is_bit_exact_against_colmajor() {
         eprintln!("no Metal device; skipping");
         return;
     };
-    let Ok(kernels) = LinearKernels::new() else {
-        eprintln!("LinearKernels unavailable; skipping");
-        return;
+    let kernels = match LinearKernels::new() {
+        Ok(k) => k,
+        Err(e) => panic!("LinearKernels error: {e:?}"),
     };
     let queue = device.new_command_queue().to_owned();
 
