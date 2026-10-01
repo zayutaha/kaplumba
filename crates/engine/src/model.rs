@@ -3794,6 +3794,35 @@ impl TextModel {
         // whose own_ms sum is a function of the prompt and so is flat in
         // `--max-new-tokens`. This mode stamps the step and hands the table to
         // the decode accumulator instead of printing it per token.
+        //
+        // A one-token forward reads its input from the decode slot buffers
+        // (`active_token_ids(1)` / `active_query_positions(1)`), which only
+        // the pipelined path stages (`forward_step_pipelined` writes
+        // `token_ids_decode[slot]` before encoding). The host-staged copy in
+        // `forward_chunk` runs only for `tokens > 1`, so a single-token call
+        // through this entry point used to embed whatever the slot buffers
+        // still held -- fresh allocations read as zero, so every non-pipelined
+        // decode step embedded token 0 at position 0 and degenerated into
+        // first-token-right followed by one repeated token. That silently
+        // broke `--temperature > 0`, `KAPLUMBA_NO_PIPELINE`, and any caller of
+        // `forward_buffer_into_vec` with one token. Stage the single token and
+        // position here, into the slot the embedding is about to read.
+        //
+        // No `flush_and_wait`: this entry point's callers hold the barrier.
+        // `forward_buffer_into_vec` ended its previous call with
+        // `commit_and_wait`, so nothing is in flight; `forward_buffer_into_step`
+        // documents the barrier as its caller's duty. The pipelined path calls
+        // `forward_chunk` directly and never comes through here, so its
+        // overlap is untouched.
+        if token_ids.len() == 1 {
+            let slot = self.scratch.active_slot % 2;
+            unsafe {
+                let token_ptr = self.scratch.token_ids_decode[slot].contents() as *mut u32;
+                *token_ptr = token_ids[0];
+                let position_ptr = self.scratch.query_positions_decode[slot].contents() as *mut u32;
+                *position_ptr = positions[0];
+            }
+        }
         let decode_kernel = token_ids.len() == 1
             && crate::decode_profile::mode() == crate::decode_profile::Mode::Kernel;
         let profile = decode_kernel

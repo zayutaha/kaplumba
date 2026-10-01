@@ -99,6 +99,25 @@ pub fn render_next_turn(tokenizer: &GemmaTokenizer, text: &str) -> Result<Vec<u3
     Ok(tokenizer.encode_text(&delta)?)
 }
 
+/// Pure context-limit arithmetic, so the 8192 boundary is unit-testable
+/// without prefilling 8192 tokens on a GPU. Exactly at the limit fits; one
+/// over does not.
+pub fn fits_in_context(
+    used: usize,
+    need: usize,
+    max_new_tokens: usize,
+    limit: usize,
+) -> Result<(), ChatError> {
+    if used + need + max_new_tokens > limit {
+        return Err(ChatError::ContextOverflow {
+            used,
+            need: need + max_new_tokens,
+            limit,
+        });
+    }
+    Ok(())
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ChatRole {
     User,
@@ -245,13 +264,7 @@ impl<'a> ChatSession<'a> {
         };
         let base = self.model.gpu_next_position();
         let need = ids.len();
-        if base + need + self.max_new_tokens > self.context_limit {
-            return Err(ChatError::ContextOverflow {
-                used: base,
-                need: need + self.max_new_tokens,
-                limit: self.context_limit,
-            });
-        }
+        fits_in_context(base, need, self.max_new_tokens, self.context_limit)?;
         let positions: Vec<u32> = (0..need as u32).map(|i| base as u32 + i).collect();
         let mut logits = Vec::new();
         self.model
@@ -327,4 +340,23 @@ impl ChatError {
 /// Re-export for callers that build a session with default limits.
 pub fn default_context_limit() -> usize {
     DEFAULT_CONTEXT_LIMIT
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{fits_in_context, ChatError};
+
+    #[test]
+    fn context_limit_boundary() {
+        // Exactly at 8192 fits; one over does not. The error carries the
+        // counts the tool reports instead of truncating.
+        assert!(fits_in_context(8000, 100, 92, 8192).is_ok());
+        assert!(fits_in_context(8000, 100, 93, 8192).is_err());
+        match fits_in_context(8000, 100, 93, 8192) {
+            Err(ChatError::ContextOverflow { used, need, limit }) => {
+                assert_eq!((used, need, limit), (8000, 193, 8192));
+            }
+            _ => panic!("expected ContextOverflow"),
+        }
+    }
 }

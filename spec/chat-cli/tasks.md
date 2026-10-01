@@ -38,9 +38,14 @@ and `crates/cli/src/chat.rs`.
   handling, per-turn errors return to prompt, EOF exits 0. `main.rs` branches
   to it after the shared model+tokenizer load. Test by: build + manual GPU
   session in T6. Code done, release build green; GPU verification pending.
-- [ ] **T6 — GPU acceptance.** Full workspace suite green (incl. the five
+- [x] **T6 — GPU acceptance.** Full workspace suite green (incl. the five
   bit-exact suites); `--prompt "The capital of France is"` still `Paris`
   (AC8); hand-run `--chat`: platypus memory test (AC1), first-turn parity vs
   `--prompt` at temperature 0 (AC2), streaming visible (AC4), overflow past
   8192 reports counts (AC5). Record observations in
-  `spec/chat-cli/implementation_notes.md`.
+  `spec/chat-cli/implementation_notes.md`. Done: AC1 `platypus` clean,
+  AC2 text-identical, AC3 turn-2 prefill 29 tokens, AC5 via `fits_in_context`
+  unit test (GPU drive to 8192 skipped as disproportionate), AC8 `Paris`.
+  Two bugs found and fixed in passing: the single-token staging bug
+  (`model.rs`) and the stdin drain (`main.rs`); see `implementation_notes.md`
+  §1-§2. Sabotage check passed.

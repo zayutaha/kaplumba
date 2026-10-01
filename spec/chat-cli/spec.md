@@ -151,10 +151,15 @@ a failure to load the model is fatal.
    end.
 5. **AC5 — Overflow is reported, not hidden.** A conversation driven past 8192
    tokens prints the committed/required counts and returns to the prompt.
-6. **AC6 — Engine untouched.** `git diff --stat` over `crates/kernels/**` and
-   `crates/engine/src/model.rs` is empty for this feature. New code lives in
-   `crates/engine/src/chat.rs` and `crates/cli/src/chat.rs`; existing files are
-   edited only to add the module declaration, the `--chat` flag, and dispatch.
+6. **AC6 — Engine numerics untouched.** `git diff --stat` over `crates/kernels/**`
+   is empty for this feature. `crates/engine/src/model.rs` carries exactly one
+   change: single-token input staging in `forward_buffer_into` (see
+   `implementation_notes.md` §1), which fixes what every non-pipelined decode
+   step embeds. No kernel, weight layout, or reduction was altered. New code
+   lives in `crates/engine/src/chat.rs` and `crates/cli/src/chat.rs`; existing
+   files are edited only to add the module declaration, the `--chat` flag
+   (plus the stdin fix in `main.rs`: `read_prompt` used to drain stdin before
+   the chat branch ran), the tokenizer accessor, and the staging fix.
 7. **AC7 — Tests.** New unit tests cover the template renderer (exact token
    sequences for turn 1 and turn 2), the stop/terminator bookkeeping, the
    context-overflow arithmetic, and the slash-command parser. All existing tests

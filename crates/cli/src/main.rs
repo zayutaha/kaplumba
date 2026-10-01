@@ -43,7 +43,7 @@ fn run() -> Result<(), String> {
         print!("{}", help_text());
         return Ok(());
     };
-    let prompt = if arguments.benchmark {
+    let prompt = if arguments.benchmark || arguments.chat {
         String::new()
     } else {
         arguments.read_prompt().map_err(|error| error.to_string())?
