@@ -60,10 +60,12 @@ impl GpuKvCache {
             .checked_mul(stream_len)
             .ok_or(GpuCacheError::ShapeOverflow)?;
         let key_bytes = (elements * 2) as u64;
-        let keys = device.new_buffer(key_bytes, MTLResourceOptions::StorageModeShared);
-        let values = device.new_buffer(key_bytes, MTLResourceOptions::StorageModeShared);
+        let options = MTLResourceOptions::StorageModeShared
+            | MTLResourceOptions::HazardTrackingModeUntracked;
+        let keys = device.new_buffer(key_bytes, options);
+        let values = device.new_buffer(key_bytes, options);
         let positions =
-            device.new_buffer((capacity * 4) as u64, MTLResourceOptions::StorageModeShared);
+            device.new_buffer((capacity * 4) as u64, options);
         // Empty slots must read as "no position" (all bits set) so the attention
         // kernel's window check discards them; Metal does not promise zeroed
         // contents for a freshly created buffer.
@@ -180,10 +182,12 @@ impl GpuKvCache {
         let target = target.min(max_capacity);
 
         let new_bytes = (target * self.stream_len * 2 * 2) as u64;
-        let new_keys = device.new_buffer(new_bytes, MTLResourceOptions::StorageModeShared);
-        let new_values = device.new_buffer(new_bytes, MTLResourceOptions::StorageModeShared);
+        let options = MTLResourceOptions::StorageModeShared
+            | MTLResourceOptions::HazardTrackingModeUntracked;
+        let new_keys = device.new_buffer(new_bytes, options);
+        let new_values = device.new_buffer(new_bytes, options);
         let new_positions =
-            device.new_buffer((target * 4) as u64, MTLResourceOptions::StorageModeShared);
+            device.new_buffer((target * 4) as u64, options);
 
         // Carry the live prefix over. Full caches only hold valid entries in the
         // low slots, so the copy is a straight prefix copy; sliding caches never

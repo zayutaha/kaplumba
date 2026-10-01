@@ -228,6 +228,19 @@ With CPU-GPU submission serialization completely removed (0 ms idle gap), the to
   - 32-token counting prompt achieved **15.751 tok/s** (63.4 ms/step), lifting throughput from 15.33 tok/s (+0.42 tok/s).
   - Memory residency: 7.86 GiB resident, well within the 12.0 GiB budget.
 
+---
+
+## 14. Extension Log (Untracked Hazard Tracking & Burst Load Upfront)
+
+- **Implementation**:
+  - Configured `MTLResourceOptions::HazardTrackingModeUntracked` across KV cache buffers in `crates/engine/src/gpu_cache.rs`, `ForwardScratch` buffers, and sign/norm buffers in `crates/engine/src/model.rs`. Eliminates driver runtime hazard tracking overhead during rapid step execution.
+  - Made `fused2_2col` the active default for `encode_gemv_fused2_mlp` without requiring environment flags.
+  - Updated `linear_gemv_ishizuki_k3_fused2_2col`, `linear_gemv_ishizuki_k3_colmajor_2col_sk2`, `linear_gemv_ishizuki_k3_colmajor_2col_sk4`, and `linear_gemv_ishizuki_k3_fused3_2col` to burst-load all words across Col 0 and Col 1 upfront before ALU extraction.
+- **Verification**:
+  - Bit-exactness verified with `live_kernel_bit_exact` and `repacked_golden` (100% pass, 0 diffs).
+  - Release benchmark achieved **15.783 tok/s** (63.36 ms/step) with 8.08 GiB resident memory.
+
+
 
 
 

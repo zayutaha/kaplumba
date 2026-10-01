@@ -462,7 +462,8 @@ fn u16_device_buffer(values: &[u16]) -> Result<Buffer, ModelError> {
     Ok(device.new_buffer_with_data(
         values.as_ptr() as *const std::ffi::c_void,
         std::mem::size_of_val(values) as u64,
-        metal::MTLResourceOptions::StorageModeShared,
+        metal::MTLResourceOptions::StorageModeShared
+            | metal::MTLResourceOptions::HazardTrackingModeUntracked,
     ))
 }
 
@@ -2740,7 +2741,8 @@ impl ForwardScratch {
             ));
         }
         let device = system_device()?;
-        let options = metal::MTLResourceOptions::StorageModeShared;
+        let options = metal::MTLResourceOptions::StorageModeShared
+            | metal::MTLResourceOptions::HazardTrackingModeUntracked;
         let f32_elements = |rows: usize, width: usize| -> Result<Buffer, ModelError> {
             let bytes = rows
                 .checked_mul(width)
