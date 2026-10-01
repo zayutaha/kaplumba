@@ -88,3 +88,45 @@
   - Files: `spec/decode-25tok-peak-bandwidth/implementation_notes.md`
   - Intent: Measure steady-state tok/s and latency across 16 interleaved A/B pairs using `scripts/gpuq try -- ./target/release/kaplumba`.
   - Testing: Prove AC1 ($\ge 20.0 - 25.0$ tok/s, $\le 40 - 50$ ms/step), AC2 (bit-exact greedy text), AC3 (0 test regressions), and AC5 ($\le 12.0$ GiB resident memory).
+
+---
+
+## T5.8: Decode Dispatch Census (completed, tooling only)
+
+- Files: none (used the existing `KAPLUMBA_COUNT_BUFFERS` diagnostic)
+- Intent: Before attacking the non-GEMV remainder, establish how many dispatches
+  a decode step actually issues, since dispatch gap is the only mechanism
+  available for work that is not bandwidth.
+- Result: **749 dispatches per decode step, 1 command buffer per step.**
+  `KAPLUMBA_DECODE_PROFILE=kernel` accounts for 546 of them (9 per layer plus
+  the head epilogue); the remaining ~203 are `encode_input_transform` calls that
+  have no `profile.stamp` after them, so they are attributed to whichever label
+  happens to follow. Per layer the census is: `norm_transform`, `qkv_proj`
+  (or `qk_proj` on the 10 full-attention layers), `kv_norm_rope_cache`,
+  `attention`, o_proj input transform, o_proj GEMV, o_proj finalize,
+  gate_up input transform, `gate_up_gelu`, down_proj input transform,
+  `down_proj`, `post_ffn_out` = ~12.4.
+- **Noted defect in the profiler's labels**: `profile.stamp(label)` attributes the
+  interval *ending* at that stamp to `label`, so each label covers the dispatches
+  issued *before* it. Any per-kernel number read off this profiler is shifted by
+  one interval relative to the kernel it names. Totals and relative shares are
+  unaffected; absolute per-kernel attributions should be treated as belonging to
+  the kernel *after* the named one.
+
+## T5.9: Bandwidth Ceiling Analysis (completed, no code change)
+
+- Files: `spec/decode-25tok-peak-bandwidth/implementation_notes.md` §16
+- Intent: Establish whether the spec's 20 tok/s acceptance criterion is reachable
+  on this hardware before spending further effort on it.
+- Result: **It is not.** See §16.4. 11.834 GB of weights must be streamed per
+  generated token; 20 tok/s (50.0 ms) therefore requires 236.7 GB/s sustained,
+  which is 87% of the 273 GB/s wire peak. The best 3-bpw EXL3 GEMV measured on
+  this box is **203 GB/s** (`colmajor_2col_sk4`, K=21504), and `head/gemv`'s
+  257 GB/s is not a better kernel — it is 6 bpw, so each 16x16 trellis tile is
+  192 B instead of 96 B and the same fixed per-threadgroup cost is amortised over
+  twice the bytes. GB/s was measured flat in N from 4096 to 43008, so there is no
+  large-N version of this trick. With *zero* non-GEMV overhead the ceiling is
+  11.834/0.203 = 58.3 ms = **17.2 tok/s**; we are at 63.1 ms.
+- **Revised realistic target: 16.5-17.5 tok/s.** AC1 (>= 20 tok/s) should be
+  formally re-scoped by the user before more performance work is planned against
+  it. Do not silently reinterpret it.
