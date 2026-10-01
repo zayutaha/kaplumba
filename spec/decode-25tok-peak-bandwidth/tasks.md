@@ -25,6 +25,11 @@
   - Intent: Group sub-steps along Column A/0 contiguously into 384-byte chunks in `fused2_co` and `colmajor_2col` to sustain hardware streaming prefetch. Wire CLI `generate_gpu` directly to `generate_gpu_greedy` at temperature 0, set `max_dispatches(2500)` unconditionally, and gate experimental `regpipe` to prevent prefill hangs.
   - Testing: Bit-exact tests pass 6/6 (`fused_bit_exact` 3/3, `live_kernel_bit_exact` 1/1, `repacked_golden` 2/2); golden text outputs "Paris" with TTFT 1325 ms; 32-token decode achieves 14.72 tok/s.
 
+- [x] **T4.2: Quad-Column (4col) GEMV Gating & M4 Pro Occupancy Characterization**
+  - Files: `crates/kernels/src/linear_repacked.metal`, `crates/kernels/src/linear.rs`, `crates/engine/tests/live_kernel_bit_exact.rs`
+  - Intent: Implement `linear_gemv_ishizuki_k3_colmajor_4col` and `linear_gemv_ishizuki_k3_fused2_co4` to evaluate 64-channel tiling. A/B measured on M4 Pro: 4col yielded 14.01 tok/s vs 2col at 14.62 tok/s (-4.2%) due to halving grid size to 84 threadgroups (4.2 TGs/core across 20 cores, starving DRAM latency hiding). Gated 4col behind `KAPLUMBA_4COL` and `KAPLUMBA_FUSED2_CO4` while preserving 2col as default.
+  - Testing: `live_kernel_bit_exact` passes with 0 diffs against reference; deliberate sabotage fails with exit 101. Baseline 14.58 tok/s preserved.
+
 - [ ] **T5: Concurrent Multi-Queue Overlap (Attention + GEMV)**
   - Files: `crates/engine/src/model.rs`, `crates/kernels/src/encoder.rs`
   - Intent: Overlap Attention KV-cache streaming on a secondary Metal command queue with GEMV dequantization on the primary queue using `MTLEvent` synchronization to absorb the 3.2 ms attention latency.

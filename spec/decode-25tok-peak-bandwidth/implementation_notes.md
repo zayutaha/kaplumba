@@ -111,4 +111,26 @@
   - Golden prompt ("The capital of France is") evaluated end-to-end: outputs **Paris** cleanly with TTFT 1325 ms.
   - 32-token decode test on "Explain the theory of relativity in detail.": **14.72 tok/s** sustained (up from 13.0 tok/s and beating 14.5 tok/s baseline).
 
+---
+
+## 8. Task T4.2 Log (Quad-Column 4col Gating & M4 Pro Occupancy Findings)
+
+- **Implementation**:
+  - Implemented `linear_gemv_ishizuki_k3_colmajor_4col` and `linear_gemv_ishizuki_k3_fused2_co4` in `crates/kernels/src/linear_repacked.metal`.
+  - Added dispatch routing in `crates/kernels/src/linear.rs` under explicit env flags: `KAPLUMBA_4COL` and `KAPLUMBA_FUSED2_CO4`.
+  - Added unit test coverage in `crates/engine/tests/live_kernel_bit_exact.rs` comparing 4col directly against the reference kernel.
+- **A/B Measurement on Apple M4 Pro (Negative Result Recorded)**:
+  - 2col baseline (`linear_gemv_ishizuki_k3_colmajor_2col`): **14.58 - 14.72 tok/s** (67.9 ms/step).
+  - 4col test (`linear_gemv_ishizuki_k3_colmajor_4col`): **14.01 tok/s** (71.3 ms/step, -4.2% slower).
+  - **Root Cause Analysis**:
+    - Widening to 64 outputs per threadgroup halves the grid size (e.g. for `down_proj`, 168 threadgroups drop to 84).
+    - Across 20 GPU cores on M4 Pro, 84 threadgroups is only 4.2 threadgroups per core.
+    - This starves GPU core SIMD group occupancy, preventing the hardware scheduler from hiding DRAM fetch latency during misses, while simultaneously doubling accumulator register pressure (8 float accumulators per lane).
+  - **Resolution**:
+    - Gated `colmajor_4col` and `fused2_co4` behind explicit opt-in flags (`KAPLUMBA_4COL` / `KAPLUMBA_FUSED2_CO4`).
+    - Kept `colmajor_2col` and `fused2_co` as the active defaults, ensuring 14.58+ tok/s baseline is preserved.
+- **Verification**:
+  - `live_kernel_bit_exact` passes with 0 diffs.
+  - Clean greedy baseline verified: "Paris" bit-exact, 14.584 tok/s.
+
 

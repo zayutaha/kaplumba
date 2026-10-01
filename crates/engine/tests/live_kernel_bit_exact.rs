@@ -80,10 +80,12 @@ fn live_kernel_contig4_is_bit_exact_against_colmajor() {
         let raw_live = device.new_buffer((out_f * 4 * 4) as u64, MTLResourceOptions::StorageModeShared);
         let raw_sk2 = device.new_buffer((out_f * 4 * 4) as u64, MTLResourceOptions::StorageModeShared);
         let raw_2col = device.new_buffer((out_f * 4 * 4) as u64, MTLResourceOptions::StorageModeShared);
+        let raw_4col = device.new_buffer((out_f * 4 * 4) as u64, MTLResourceOptions::StorageModeShared);
         let out_ref = device.new_buffer((out_f * 2) as u64, MTLResourceOptions::StorageModeShared);
         let out_live = device.new_buffer((out_f * 2) as u64, MTLResourceOptions::StorageModeShared);
         let out_sk2 = device.new_buffer((out_f * 2) as u64, MTLResourceOptions::StorageModeShared);
         let out_2col = device.new_buffer((out_f * 2) as u64, MTLResourceOptions::StorageModeShared);
+        let out_4col = device.new_buffer((out_f * 2) as u64, MTLResourceOptions::StorageModeShared);
 
         let run = |kernel: &str, raw: &Buffer, out: &Buffer| -> (Vec<u32>, Vec<u16>) {
             let mut e = MetalEncoder::new(&queue).expect("encoder");
@@ -163,6 +165,18 @@ fn live_kernel_contig4_is_bit_exact_against_colmajor() {
         assert_eq!(
             ref_f16, _2col_f16,
             "{label}: 2col fp16 output differs from reference in {_2col_diff} elements"
+        );
+
+        let (_4col_f32, _4col_f16) = run(
+            "linear_gemv_ishizuki_k3_colmajor_4col",
+            &raw_4col,
+            &out_4col,
+        );
+        let _4col_diff = ref_f16.iter().zip(&_4col_f16).filter(|(a, b)| a != b).count();
+        println!("{label}: 4col fp16 diff count: {_4col_diff}/{}", ref_f16.len());
+        assert_eq!(
+            ref_f16, _4col_f16,
+            "{label}: 4col fp16 output differs from reference in {_4col_diff} elements"
         );
 
         let first = ref_f32.iter().zip(&live_f32).position(|(a, b)| a != b);
