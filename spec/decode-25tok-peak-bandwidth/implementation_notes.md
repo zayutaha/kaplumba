@@ -77,3 +77,20 @@
     - `fused_bit_exact`: 3/3 passed.
   - End-to-end greedy decode: 100% bit-exact ("Paris").
   - 32-token decode throughput increased from 13.03 tok/s to **14.42 tok/s** (+10.8% speedup).
+
+---
+
+## 6. Task T4 Log (Device-side Argmax Integration)
+
+- **Implementation**:
+  - Replaced broken 16-bit underflowing greedy pick with slot-partitioned device reduction `argmax_slots` across 4 slots of 65,536 elements in `crates/kernels/src/elements.metal`.
+  - Added `argmax_clear` and `encode_argmax` in `crates/kernels/src/elements.rs`.
+  - Sized `scratch.argmax_keys` as a 16-byte shared buffer in `crates/engine/src/model.rs`.
+  - In `crates/engine/src/generate.rs`, updated greedy decode to read `model.last_token()` directly off the 4 u32 device keys, eliminating the 512 KiB copy (`last_logits()`) and 262,144 CPU iterations on every non-margin step.
+- **Verification & Sabotage Testing**:
+  - Integration test `crates/engine/tests/argmax_engine_parity.rs` verifies device argmax matches `argmax_logits` across full vocabulary and tests boundary cases (0, 1, 65535, 65536, 131072, 262143).
+  - Deliberately sabotaged test assertion: confirmed immediate failure with exit code 101.
+  - Reverted sabotage: test passes cleanly 2/2.
+  - Full suite passes: `argmax_engine_parity` (2/2), `fused_bit_exact` (3/3), `live_kernel_bit_exact` (1/1), `repacked_golden` (2/2) — total 8/8 passed.
+  - End-to-end greedy decode: 100% bit-exact ("Paris" and "The theory of relativity is not one single theory...").
+

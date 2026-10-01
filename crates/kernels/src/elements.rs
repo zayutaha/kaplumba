@@ -203,6 +203,9 @@ pub struct ElementKernels {
     embedding_buffer_pipeline: ComputePipelineState,
     copy_last_row_pipeline: ComputePipelineState,
     copy_buffer_pipeline: ComputePipelineState,
+    /// Device-side argmax pipelines with 16-bit slot partitioning.
+    argmax_clear_pipeline: ComputePipelineState,
+    argmax_slots_pipeline: ComputePipelineState,
     /// MEASUREMENT AID. See [`Self::encode_spin_burn`].
     spin_burn_pipeline: ComputePipelineState,
 }
@@ -296,6 +299,8 @@ impl ElementKernels {
         let embedding_buffer_pipeline = pipeline(&device, &library, "embedding_scaled_buffer")?;
         let copy_last_row_pipeline = pipeline(&device, &library, "copy_last_row")?;
         let copy_buffer_pipeline = pipeline(&device, &library, "copy_buffer")?;
+        let argmax_clear_pipeline = pipeline(&device, &library, "argmax_clear")?;
+        let argmax_slots_pipeline = pipeline(&device, &library, "argmax_slots")?;
         let spin_burn_pipeline = pipeline(&device, &library, "spin_burn")?;
         let queue = device.new_command_queue();
         Ok(Self {
@@ -322,6 +327,8 @@ impl ElementKernels {
             embedding_buffer_pipeline,
             copy_last_row_pipeline,
             copy_buffer_pipeline,
+            argmax_clear_pipeline,
+            argmax_slots_pipeline,
             spin_burn_pipeline,
         })
     }
@@ -813,6 +820,43 @@ impl ElementKernels {
             &row.to_le_bytes(),
             1,
             1,
+        )
+    }
+
+    /// Encode device-side argmax reduction over logits into `best` (one u32 per 65536 elements).
+    pub fn encode_argmax(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        logits: &Buffer,
+        best: &Buffer,
+        vocab: usize,
+    ) -> Result<(), KernelError> {
+        let slots = vocab.div_ceil(65536);
+        encoder.dispatch_1d(
+            &self.argmax_clear_pipeline,
+            &[Some(best)],
+            &(slots as u32).to_le_bytes(),
+            32,
+            32,
+        )?;
+        let per_slot = 128u64;
+        let groups = per_slot * slots as u64;
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct ArgmaxParams {
+            count: u32,
+            per_slot: u32,
+        }
+        let params = ArgmaxParams {
+            count: to_u32(vocab, "vocab size")?,
+            per_slot: per_slot as u32,
+        };
+        encoder.dispatch_groups(
+            &self.argmax_slots_pipeline,
+            &[Some(logits), Some(best)],
+            params_bytes(&params),
+            groups,
+            256,
         )
     }
 
@@ -1406,4 +1450,21 @@ fn read_u16_buffer(buffer: &Buffer) -> Result<Vec<u16>, KernelError> {
         return Err(KernelError::CommandFailed);
     }
     Ok(unsafe { std::slice::from_raw_parts(pointer, length / size_of::<u16>()) }.to_vec())
+}
+
+/// Decode winning token index from the 16-bit packed slot keys.
+///
+/// Each key stores the 16-bit float value order in the high 16 bits, and
+/// `0xFFFF - in_slot_index` in the low 16 bits.
+pub fn decode_argmax_token(keys: &[u32]) -> u32 {
+    let mut best_slot = 0usize;
+    let mut best = keys[0];
+    for slot in 1..keys.len() {
+        if (keys[slot] >> 16) > (best >> 16) {
+            best = keys[slot];
+            best_slot = slot;
+        }
+    }
+    let in_slot = 0xFFFFu32.wrapping_sub(best & 0xFFFF);
+    (best_slot as u32) * 65536 + in_slot
 }

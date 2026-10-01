@@ -2588,16 +2588,8 @@ pub struct ForwardScratch {
     /// (split, query head), so `splits * q_heads * (head_dim + 2)` floats. Sized
     /// once from the layer shapes, never from a key count.
     pub attn_partials: Buffer,
-    // There is deliberately no greedy-pick scratch here. The device-side pick
-    // it fed (`ElementKernels::encode_greedy_pick`, whose `greedy_key` packs
-    // `0xFFFF - index` into 16 bits) is wrong for this model's 262,144-entry
-    // vocabulary: every index at or past 65,536 underflows that subtraction, the
-    // packed key stops being ordered, and the "winner" is a low token id rather
-    // than the largest logit. Measured on the real checkpoint: the host's argmax
-    // over the same `capped` buffer is index 9,259 at 28.5, while the device's
-    // reduction returns key 0xFFFFFFFF, i.e. index 0. Greedy decode therefore
-    // takes the argmax on the host, off `capped`, which is the only path that has
-    // ever produced correct text.
+    /// Device-side argmax keys: 4 words (one u32 per 65,536 elements).
+    pub argmax_keys: Buffer,
 }
 
 impl ForwardScratch {
@@ -2672,6 +2664,10 @@ impl ForwardScratch {
             // replacement is fixed-size and independent of context length, per
             // AGENTS.md §8; 1.05 MB at 16 splits x 32 heads x 512 dims.
             attn_partials: f32_elements(1, attn_partials)?,
+            argmax_keys: device.new_buffer(
+                (vocab.div_ceil(65536) * 4).max(16) as u64,
+                options,
+            ),
         })
     }
 
@@ -2696,6 +2692,7 @@ impl ForwardScratch {
             &self.logits,
             &self.capped,
             &self.attn_partials,
+            &self.argmax_keys,
         ]
         .iter()
         .map(|buffer| buffer.length())
@@ -3342,6 +3339,18 @@ impl TextModel {
         unsafe { std::slice::from_raw_parts(logits, self.vocab_size) }.to_vec()
     }
 
+    /// Read winning greedy token from device-side argmax keys.
+    pub fn last_token(&self) -> u32 {
+        let slots = self.vocab_size.div_ceil(65536);
+        let keys = unsafe {
+            std::slice::from_raw_parts(
+                self.scratch.argmax_keys.contents() as *const u32,
+                slots,
+            )
+        };
+        kaplumba_kernels::elements::decode_argmax_token(keys)
+    }
+
     pub fn forward_buffer_into_vec(
         &mut self,
         token_ids: &[u32],
@@ -3927,6 +3936,15 @@ impl TextModel {
             self.final_softcap,
         )?;
         profile.stamp(encoder, "head/softcap")?;
+        self.elements
+            .encode_argmax(
+                encoder,
+                &self.scratch.capped,
+                &self.scratch.argmax_keys,
+                vocab,
+            )
+            .map_err(ModelError::Kernel)?;
+        profile.stamp(encoder, "head/argmax")?;
         Ok(())
     }
 

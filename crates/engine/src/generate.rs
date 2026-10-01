@@ -886,12 +886,13 @@ where
         // a decode table.
         crate::decode_profile::record_prefill(prefill_duration.as_secs_f64() * 1e3, prompt_len);
 
-        // Read after the wait: the prefill's last row is the first generated
-        // token's logits, and reading it earlier returns the previous row.
-        let mut logits = model.last_logits();
-        loop {
-            let token = argmax_logits(&logits);
+        // Read after the wait: the prefill's device argmax yields the first generated token.
+        let mut token = model.last_token();
+        if margins.enabled {
+            let logits = model.last_logits();
             margins.record(generated_ids.len(), argmax_with_margin(&logits));
+        }
+        loop {
             if generated_ids.is_empty() {
                 ttft_duration = request_started.elapsed();
             }
@@ -970,7 +971,11 @@ where
             // step is timed, so the panic cannot be mistaken for a slow step --
             // and gated, so a default run pays one relaxed atomic load.
             kaplumba_kernels::pipeline_audit::assert_no_builds_since(load_mark);
-            logits = model.last_logits();
+            token = model.last_token();
+            if margins.enabled {
+                let logits = model.last_logits();
+                margins.record(generated_ids.len(), argmax_with_margin(&logits));
+            }
         }
 
         if let Some(chunk) = detokenizer.finish()? {
