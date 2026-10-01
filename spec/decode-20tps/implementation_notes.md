@@ -134,7 +134,81 @@ dispatch boundary, which the spin design was at least honest about.
 
 ---
 
-## 2. Task T1 Log: Concurrent Threadgroup Scheduling Feasibility
+## 4. Task T2b RESULT: ❌ NEGATIVE. Two bandwidth-bound kernels cannot overlap.
+
+T2b is the spec's own fallback for T2a, so it got built — as a measurement
+first, because a dual-queue restructure of the decode path is invasive and
+there was a cheap way to find out whether it could possibly pay.
+
+**Test:** `crates/engine/tests/concurrent_stream_economics.rs`. Median of 7,
+interleaved arms, each stream reading 402.7 MB from a single 768 MB allocation:
+
+| arm | ms |
+|---|---|
+| half 0 alone | 0.610 |
+| half 1 alone | 0.620 |
+| serial (both, one queue) | 1.049 |
+| concurrent (2 queues + `MTLEvent`) | 1.025 |
+| perfect-hiding floor (`max` of the two alone) | 0.620 |
+
+- `concurrent / floor = 1.555-1.654` → overlap hides **nothing**.
+- `serial / concurrent = 0.930-1.023` → the hardware wait is a **wash**.
+
+**The reason is arithmetic, not mechanics.** R1's premise is that `o_proj`'s
+deficit is a *ramp* it never finishes (K=8192 → 120.7 GB/s vs K=21504 → 199.3
+GB/s, `gemv_bandwidth.rs`), and that hiding the ramp against attention recovers
+it. But attention streams the KV cache at the same order of magnitude
+(16.8 MB vs `o_proj`'s 16.5 MB per layer), so both kernels are bandwidth-bound.
+Bandwidth is shared and fixed, and the byte count is identical whether they
+overlap or not. **There is no third resource to exploit.** Hiding a ramp requires
+a partner that is *not* saturating the pipe, and attention is.
+
+This also explains T2a's failure mechanistically rather than as an
+implementation defect: the spin-wait version was trying to buy latency hiding
+with the one resource (memory bandwidth) that both kernels already want.
+
+**So R1 as written — "overlap `o_proj`'s prefetch with attention" — is not
+achievable on this hardware by any mechanism.** T2a (spin) and T2b (hardware
+wait) bracket the design space: the only two ways to have one dispatch wait on
+another's output. Both measured negative, for the same underlying reason.
+
+**Sabotage evidence (AC4).** Removing the second stream's dispatch entirely
+drops `concurrent/floor` to 0.981 and trips both ratio assertions. The in-test
+10×-lighter second stream trips at 1.125 against the 1.2 threshold, so the
+threshold is tight enough to discriminate rather than passing vacuously. Two
+earlier sabotages passed *incorrectly* — both edited `concurrent()`, which
+delegates to `concurrent_scaled()` and was therefore dead code. Worth recording:
+the sabotage passed because it changed nothing, and only reading the diff caught
+it.
+
+**Harness defects found and fixed en route, all recorded in the test's header.**
+Two are worth keeping in mind for any future bandwidth work on this box:
+
+1. **`StorageModeShared` measured 804 GB/s on a 273 GB/s wire.** The host had
+   written the buffer recently enough that the pages stayed resident and partly
+   cacheable. Private storage is mandatory for a bandwidth measurement whose data
+   the host never reads back — which is the case for every production weight read.
+2. **GPU clock ramp put the first arm at low clock.** Calibration brought 1134 →
+   628 GB/s. Still 2.3× over the wire, so *absolute* bandwidth remains
+   untrustworthy in this harness and the test asserts only on **ratios**, where
+   the scaling error cancels. I did not identify the remaining cause; it does not
+   affect the ratios, and it is stated in the test rather than papered over.
+3. First version also allocated separate 192 MiB shared buffers per stream and
+   **segfaulted** on teardown.
+
+`serial >= sum(alone)` held after calibration, which is the self-consistency
+check that these kernels are genuinely bandwidth-bound rather than launch-bound.
+
+**What R1 would need instead.** Since bandwidth is the binding constraint and
+both kernels want it, the only remaining lever is *bytes*, not overlap. The
+options are the ten closed dead ends plus their opposites — fewer bytes per token
+(repack, lower bpw) — not scheduling. That is outside this spec's scope
+(`spec.md:23` forbids retrying the closed dead ends) and is where
+`decode-3bpw-amplification` already recorded that 199 GB/s is the 3 bpw floor.
+
+---
+
+## 5. Task T1 Log: Concurrent Threadgroup Scheduling Feasibility
 
 - **Test**: `crates/engine/tests/concurrent_tg_feasibility.rs`
 - **Objective**: Verify whether Apple Metal compute command encoder schedules threadgroups from separate dispatches within the same command buffer concurrently without CPU intervention, or if dispatches serialize strictly.

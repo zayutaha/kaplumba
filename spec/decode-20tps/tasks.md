@@ -54,17 +54,26 @@ and recorded as a negative (AC6).
 
 ---
 
-- [ ] **T2b: Dual-queue attention/o_proj overlap (if T1 fails)**
+- [x] **T2b: Dual-queue attention/o_proj overlap (if T1 fails)** — **❌ NEGATIVE, NOT BUILT**
   - Files: `crates/kernels/src/encoder.rs`, `crates/engine/src/model.rs`
   - Intent: Add secondary `MTLCommandQueue` + `MTLEvent`. Dispatch attention on
     secondary queue. Primary queue dispatches o_proj after qkv but before
     attention completes. MTLEvent E1 (qkv_done) gates attention start,
     E2 (attn_done) gates o_proj's input read.
-  - Testing:
-    - Bit-exact: greedy output identical.
-    - Poison test: run ≥ 1000 decode steps, assert bit-identical tokens every step.
-    - A/B measurement.
-  - Commit: `spec/decode-20tps: T2b dual-queue attention/o_proj overlap`
+  - **RESULT: not built, because the economics say it cannot pay.**
+    `crates/engine/tests/concurrent_stream_economics.rs` measures it, median of 7
+    interleaved:
+    - `concurrent / floor = 1.55-1.65` — overlap hides essentially NOTHING.
+    - `serial / concurrent = 0.93-1.02` — the hardware wait is a wash vs serial.
+  - **Why, in one line:** `o_proj` and attention are BOTH bandwidth-bound, and
+    bandwidth is a shared fixed resource, so overlapping them moves the same
+    bytes in the same time. R1's premise was hiding a *ramp*, which needs a
+    partner that is not itself saturating the pipe. See implementation notes §4.
+  - **Sabotage evidence:** removing the second stream's dispatch drops
+    `concurrent/floor` to 0.981 and trips both assertions; the in-test 10× lighter
+    second stream trips at 1.125 against a 1.2 threshold. The assertions
+    discriminate.
+  - Commit: `spec/decode-20tps: T2b overlap economics — negative, not built`
 
 ---
 
