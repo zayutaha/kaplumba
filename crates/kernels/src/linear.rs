@@ -1175,10 +1175,12 @@ impl LinearKernels {
         }
         let is_2col_sk4 = name.ends_with("_2col_sk4");
         let is_2col_sk2 = name.ends_with("_2col_sk2");
+        let is_1col_sk2 = name.ends_with("_1col_sk2");
         let is_stream = name.ends_with("_stream");
-        let is_sk2 = name.ends_with("_sk2") && !is_2col_sk2;
+        let is_sk2 = name.ends_with("_sk2") && !is_2col_sk2 && !is_1col_sk2;
         let is_sk4 = name.ends_with("_sk4") && !is_2col_sk4;
         let is_2col = name.ends_with("_2col");
+        let is_1col = name.ends_with("_1col");
         if is_2col_sk4 {
             let pairs = ((request.out_features / 16) / 2) as u64;
             let groups = pairs * 4;
@@ -1317,6 +1319,54 @@ impl LinearKernels {
                 u64::from(output_blocks) * 32,
                 32,
             );
+        } else if is_1col_sk2 {
+            let tiles = (request.out_features / 16) as u64;
+            let groups = tiles * 2;
+            let shape_values = [
+                to_u32(request.in_features, "input dimension")?,
+                to_u32(request.out_features, "output dimension")?,
+            ];
+            encoder.dispatch_1d_offset(
+                pipeline,
+                &[
+                    TensorRef::new(request.packed, request.packed_offset),
+                    TensorRef::new(request.transformed, 0),
+                    TensorRef::new(request.raw, 0),
+                ],
+                params_bytes(&shape_values),
+                groups * 256,
+                256,
+            )?;
+            let output_blocks = to_u32(request.out_features / 128, "output dimension")?;
+            return encoder.dispatch_1d(
+                &self.finalize_simd_sk2_pipeline,
+                &[
+                    Some(request.raw),
+                    Some(request.output_signs),
+                    Some(request.output),
+                ],
+                &output_blocks.to_le_bytes(),
+                u64::from(output_blocks) * 32,
+                32,
+            );
+        } else if is_1col {
+            let tiles = (request.out_features / 16) as u64;
+            let groups = tiles.min(gemv_max_groups()).max(1);
+            let shape_values = [
+                to_u32(request.in_features, "input dimension")?,
+                to_u32(request.out_features, "output dimension")?,
+            ];
+            encoder.dispatch_1d_offset(
+                pipeline,
+                &[
+                    TensorRef::new(request.packed, request.packed_offset),
+                    TensorRef::new(request.transformed, 0),
+                    TensorRef::new(request.raw, 0),
+                ],
+                params_bytes(&shape_values),
+                groups * 256,
+                256,
+            )?;
         } else if is_2col {
             let pairs = (request.out_features / 32) as u64;
             let groups = pairs.min(gemv_max_groups()).max(1);
@@ -2161,9 +2211,15 @@ impl LinearKernels {
         if perm_mode == 1 && out_features % 32 == 0 {
             if let Exl3Rate::Integer(bits) = rate {
                 let use_contig4 = env_flag("KAPLUMBA_SK2_CONTIG4");
+                let use_1col = env_flag("KAPLUMBA_SK2_1COL");
                 let (name, groups) = if use_contig4 {
                     (
                         format!("linear_gemv_ishizuki_k{bits}_colmajor_contig4_sk2"),
+                        ((out_features / 16) as u64) * 2,
+                    )
+                } else if use_1col {
+                    (
+                        format!("linear_gemv_ishizuki_k{bits}_colmajor_1col_sk2"),
                         ((out_features / 16) as u64) * 2,
                     )
                 } else {

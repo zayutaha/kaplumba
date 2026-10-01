@@ -67,10 +67,11 @@
   - Intent: Eliminate the separate `cache_append` dispatch in decode across all 60 layers (60 dispatches saved per token) by writing normalized and rotated Q/K/V elements directly into `key_cache`, `value_cache`, and `position_cache` in-place.
   - Testing: Sabotage tested on assertion in `norm_rope_qkv_cache_is_bit_identical_to_separate_append` (exit code 101 on intentional corruption); full test passes cleanly 4/4; golden prompt bit-exact ("Paris"); 32-token decode achieves 15.67 tok/s.
 
-- [ ] **T5.5: 1-Column Sequential Streaming GEMV (`linear_gemv_ishizuki_k3_colmajor_1col`)**
-  - Files: `crates/kernels/src/linear_repacked.metal`, `crates/kernels/src/linear.rs`, `crates/engine/src/model.rs`, `crates/engine/tests/live_kernel_bit_exact.rs`
+- [x] **T5.5: 1-Column Sequential Streaming GEMV (`linear_gemv_ishizuki_k3_colmajor_1col`) — NEGATIVE RESULT**
+  - Files: `crates/kernels/src/linear_repacked.metal`, `crates/kernels/src/linear.rs`, `crates/engine/tests/live_kernel_bit_exact.rs`
   - Intent: Eliminate 32 KB DRAM page/bank thrashing across 20 cores in `o_proj` and `gate_up` by streaming 1 column (16 outputs per threadgroup) purely sequentially. Slashes register usage by 50% and doubles `o_proj` grid size to 336 threadgroups (16.8 TGs/core) and 672 threadgroups with SK=2 (33.6 TGs/core), lifting `o_proj` from 86 GB/s toward 220+ GB/s (saving ~3.3 ms).
   - Testing: Bit-exact verification in `live_kernel_bit_exact` with deliberate sabotage test; benchmark `o_proj` latency and overall decode throughput.
+  - **Result: NEGATIVE.** `1col_sk2` is bit-exact (0 diffs vs reference) but **slower** than `2col_sk2`. Interleaved A/B (N=8 pairs): `1col_sk2` median 15.477 tok/s (range 15.452–15.521), `2col_sk2` median 15.634 tok/s (range 15.609–15.655). `2col_sk2` wins by ~0.16 tok/s (~1%). The previous agent made `1col_sk2` the default without benchmarking; reverted to `2col_sk2` as default. `1col_sk2` remains available via `KAPLUMBA_SK2_1COL=1`.
 
 - [ ] **T5.6: Parallel Multi-Threadgroup Finalize & Fused Post-FFN / Pre-Layer RMSNorm**
   - Files: `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`, `crates/engine/src/model.rs`

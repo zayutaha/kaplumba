@@ -253,3 +253,23 @@ With CPU-GPU submission serialization completely removed (0 ms idle gap), the to
   - Sabotaged test: injected deliberate corruption into `norm_rope_qkv_cache` rotation store (`+ 1.0f`), verified test failed with exit code 101, reverted sabotage, and confirmed 100% clean pass across all 4 tests in `norm_rope_qkv_bit_exact`.
   - Golden prompt generated bit-exact "Paris".
   - Multi-token decode benchmark achieved 15.67 tok/s with resident memory strictly $\le 12$ GiB.
+
+---
+
+## 16. Task T5.5 Log (1-Column Sequential Streaming GEMV — Negative Result)
+
+- **Implementation**:
+  - Implemented `linear_gemv_ishizuki_k3_colmajor_1col`, `_1col_sk2`, and `fused2_1col` in `crates/kernels/src/linear_repacked.metal`.
+  - Added dispatch routing in `crates/kernels/src/linear.rs` for `is_1col` and `is_1col_sk2` branches in `encode_ishizuki_gemv_named`.
+  - Added bit-exactness tests in `crates/engine/tests/live_kernel_bit_exact.rs` for both `1col` and `1col_sk2`.
+- **Verification**:
+  - Bit-exactness verified: `live_kernel_bit_exact` passes with 0 diffs for both `1col` and `1col_sk2` across all 3 shapes (down_proj, gate_proj, o_proj).
+  - Golden prompt bit-exact: "Paris".
+- **A/B Measurement (N=8 interleaved pairs)**:
+  - `1col_sk2` (previous agent's default): median **15.477 tok/s** (range 15.452–15.521, spread 0.069).
+  - `2col_sk2` (reverted default): median **15.634 tok/s** (range 15.609–15.655, spread 0.046).
+  - **Result: `2col_sk2` wins by ~0.16 tok/s (~1%).** The previous agent made `1col_sk2` the default without benchmarking.
+- **Resolution**:
+  - Reverted `encode_gemv_raw_sk2` default to `2col_sk2`.
+  - `1col_sk2` available via `KAPLUMBA_SK2_1COL=1` env flag.
+  - `2col_sk2` available via `KAPLUMBA_SK2_2COL=1` env flag (now the default).
