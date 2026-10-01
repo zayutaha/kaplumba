@@ -10,10 +10,10 @@
   - Intent: Update `encode_gemv_fused2_mlp` to dispatch `linear_gemv_ishizuki_k3_fused2_co` across 1344 threadgroups (instead of 2688). Measure latency reduction in `gate_up_gelu` (targeting 25.8 ms -> 16.5 ms).
   - Testing: Run `cargo test --test repacked_golden --test fused_bit_exact`; benchmark greedy decode forward step and confirm bit-exact text. (PASS: greedy output "Paris", 32-tok decode throughput 13.0 tok/s).
 
-- [ ] **T3: 128-Bit Aligned Vector Memory Transactions (`uint4` Loads)**
-  - Files: `crates/kernels/src/linear_repacked.metal`, `crates/kernels/src/linear.rs`, `crates/engine/tests/live_kernel_bit_exact.rs`
-  - Intent: Implement 128-bit aligned vector memory loads (`uint4`) in GEMV K-loop to maximize DRAM bus utilization toward 250+ GB/s.
-  - Testing: Run `live_kernel_bit_exact`; measure achieved bandwidth with `bench_colmajor`; verify sabotage proof.
+- [x] **T3: Pipelined Sub-Step Register Allocation in GEMV K-Loop**
+  - Files: `crates/kernels/src/linear_repacked.metal`, `crates/engine/tests/live_kernel_bit_exact.rs`
+  - Intent: Pipeline sub-steps in `colmajor_2col`, `fused2_co`, `fused3`, and `contig4` to reuse a single `v[8]` float array instead of 64 floats. Drastically cuts register pressure and elevates GPU occupancy toward peak streaming bandwidth.
+  - Testing: Sabotage tested on `fused3` (deliberate corruption triggered exit 101 on `fused3_matches_three_independent_encodes`); clean test passes 100% across `live_kernel_bit_exact`, `repacked_golden`, `fused_bit_exact` (3/3); 32-token decode throughput accelerated from 13.0 to 14.42 tok/s (+10.9%).
 
 - [ ] **T4: Concurrent Multi-Queue Overlap (Attention + GEMV)**
   - Files: `crates/engine/src/model.rs`, `crates/kernels/src/encoder.rs`

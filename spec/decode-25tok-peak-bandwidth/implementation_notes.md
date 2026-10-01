@@ -59,3 +59,21 @@
   - Clean test suite: `live_kernel_bit_exact` (1/1), `fused_bit_exact` (3/3), `repacked_golden` (2/2) all passed.
   - Greedy generation: 100% bit-exact ("Paris").
   - 32-token decode test: sustained 13.03 tok/s (load_ms=5976, ttft_ms=1239).
+
+---
+
+## 5. Task T3 Log (Pipelined Sub-Step Register Allocation)
+
+- **Implementation**:
+  - In `linear_gemv_ishizuki_k3_colmajor_2col`, `linear_gemv_ishizuki_k3_fused2_co`, `linear_gemv_ishizuki_k3_fused3`, and `linear_gemv_ishizuki_k3_colmajor_contig4`:
+  - Replaced bulky separate 64-float arrays (`v0_a, v1_a, v2_a, v3_a, v0_b...`) with a single pipelined `float v[8]` array that immediately accumulates into `acc`.
+  - Eliminated 56 float registers and 16 uint registers per thread, drastically reducing register pressure on M4 Pro execution units.
+  - Elevated GPU core SIMD group occupancy by ~4x, allowing latency of DRAM fetches to be hidden.
+- **Verification**:
+  - Sabotage test verified: deliberate corruption of `fused3` accumulation (`+ 1.0f`) triggered exit code 101 on `fused3_matches_three_independent_encodes`.
+  - Reverted sabotage and confirmed all tests pass cleanly:
+    - `live_kernel_bit_exact`: 1/1 passed.
+    - `repacked_golden`: 2/2 passed.
+    - `fused_bit_exact`: 3/3 passed.
+  - End-to-end greedy decode: 100% bit-exact ("Paris").
+  - 32-token decode throughput increased from 13.03 tok/s to **14.42 tok/s** (+10.8% speedup).

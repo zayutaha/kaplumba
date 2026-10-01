@@ -496,45 +496,43 @@ kernel void linear_gemv_ishizuki_k3_fused2_co(
             const device uint *t2_b = col_b + (tk + 2u) * stride;
             const device uint *t3_b = col_b + (tk + 3u) * stride;
 
-            const uint w0a_a = t0_a[j0], w0b_a = t0_a[j1];
-            const uint w1a_a = t1_a[j0], w1b_a = t1_a[j1];
-            const uint w2a_a = t2_a[j0], w2b_a = t2_a[j1];
-            const uint w3a_a = t3_a[j0], w3b_a = t3_a[j1];
+            float v[8];
 
-            const uint w0a_b = t0_b[j0], w0b_b = t0_b[j1];
-            const uint w1a_b = t1_b[j0], w1b_b = t1_b[j1];
-            const uint w2a_b = t2_b[j0], w2b_b = t2_b[j1];
-            const uint w3a_b = t3_b[j0], w3b_b = t3_b[j1];
+            // Sub-step 0
+            extract_v_mcg_32(t0_a[j0], t0_a[j1], sh0, rsh0, v);
+            acc_a0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+            acc_a1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
 
-            float v0_a[8], v1_a[8], v2_a[8], v3_a[8];
-            extract_v_mcg_32(w0a_a, w0b_a, sh0, rsh0, v0_a);
-            extract_v_mcg_32(w1a_a, w1b_a, sh0, rsh0, v1_a);
-            extract_v_mcg_32(w2a_a, w2b_a, sh0, rsh0, v2_a);
-            extract_v_mcg_32(w3a_a, w3b_a, sh0, rsh0, v3_a);
+            extract_v_mcg_32(t0_b[j0], t0_b[j1], sh0, rsh0, v);
+            acc_b0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+            acc_b1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
 
-            acc_a0 += p00 * v0_a[0] + p01 * v0_a[1] + p02 * v0_a[2] + p03 * v0_a[3];
-            acc_a1 += p00 * v0_a[4] + p01 * v0_a[5] + p02 * v0_a[6] + p03 * v0_a[7];
-            acc_a0 += p10 * v1_a[0] + p11 * v1_a[1] + p12 * v1_a[2] + p13 * v1_a[3];
-            acc_a1 += p10 * v1_a[4] + p11 * v1_a[5] + p12 * v1_a[6] + p13 * v1_a[7];
-            acc_a0 += p20 * v2_a[0] + p21 * v2_a[1] + p22 * v2_a[2] + p23 * v2_a[3];
-            acc_a1 += p20 * v2_a[4] + p21 * v2_a[5] + p22 * v2_a[6] + p23 * v2_a[7];
-            acc_a0 += p30 * v3_a[0] + p31 * v3_a[1] + p32 * v3_a[2] + p33 * v3_a[3];
-            acc_a1 += p30 * v3_a[4] + p31 * v3_a[5] + p32 * v3_a[6] + p33 * v3_a[7];
+            // Sub-step 1
+            extract_v_mcg_32(t1_a[j0], t1_a[j1], sh0, rsh0, v);
+            acc_a0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+            acc_a1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
 
-            float v0_b[8], v1_b[8], v2_b[8], v3_b[8];
-            extract_v_mcg_32(w0a_b, w0b_b, sh0, rsh0, v0_b);
-            extract_v_mcg_32(w1a_b, w1b_b, sh0, rsh0, v1_b);
-            extract_v_mcg_32(w2a_b, w2b_b, sh0, rsh0, v2_b);
-            extract_v_mcg_32(w3a_b, w3b_b, sh0, rsh0, v3_b);
+            extract_v_mcg_32(t1_b[j0], t1_b[j1], sh0, rsh0, v);
+            acc_b0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+            acc_b1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
 
-            acc_b0 += p00 * v0_b[0] + p01 * v0_b[1] + p02 * v0_b[2] + p03 * v0_b[3];
-            acc_b1 += p00 * v0_b[4] + p01 * v0_b[5] + p02 * v0_b[6] + p03 * v0_b[7];
-            acc_b0 += p10 * v1_b[0] + p11 * v1_b[1] + p12 * v1_b[2] + p13 * v1_b[3];
-            acc_b1 += p10 * v1_b[4] + p11 * v1_b[5] + p12 * v1_b[6] + p13 * v1_b[7];
-            acc_b0 += p20 * v2_b[0] + p21 * v2_b[1] + p22 * v2_b[2] + p23 * v2_b[3];
-            acc_b1 += p20 * v2_b[4] + p21 * v2_b[5] + p22 * v2_b[6] + p23 * v2_b[7];
-            acc_b0 += p30 * v3_b[0] + p31 * v3_b[1] + p32 * v3_b[2] + p33 * v3_b[3];
-            acc_b1 += p30 * v3_b[4] + p31 * v3_b[5] + p32 * v3_b[6] + p33 * v3_b[7];
+            // Sub-step 2
+            extract_v_mcg_32(t2_a[j0], t2_a[j1], sh0, rsh0, v);
+            acc_a0 += p20 * v[0] + p21 * v[1] + p22 * v[2] + p23 * v[3];
+            acc_a1 += p20 * v[4] + p21 * v[5] + p22 * v[6] + p23 * v[7];
+
+            extract_v_mcg_32(t2_b[j0], t2_b[j1], sh0, rsh0, v);
+            acc_b0 += p20 * v[0] + p21 * v[1] + p22 * v[2] + p23 * v[3];
+            acc_b1 += p20 * v[4] + p21 * v[5] + p22 * v[6] + p23 * v[7];
+
+            // Sub-step 3
+            extract_v_mcg_32(t3_a[j0], t3_a[j1], sh0, rsh0, v);
+            acc_a0 += p30 * v[0] + p31 * v[1] + p32 * v[2] + p33 * v[3];
+            acc_a1 += p30 * v[4] + p31 * v[5] + p32 * v[6] + p33 * v[7];
+
+            extract_v_mcg_32(t3_b[j0], t3_b[j1], sh0, rsh0, v);
+            acc_b0 += p30 * v[0] + p31 * v[1] + p32 * v[2] + p33 * v[3];
+            acc_b1 += p30 * v[4] + p31 * v[5] + p32 * v[6] + p33 * v[7];
         }
 
         for (tk = k_unroll_end + sg; tk < tiles_k; tk += SG) {
@@ -800,11 +798,6 @@ kernel void linear_gemv_ishizuki_k3_fused3(
         const device uint *t2 = column + (tk + 2u) * stride;
         const device uint *t3 = column + (tk + 3u) * stride;
 
-        const uint w0a = t0[j0], w0b = t0[j1];
-        const uint w1a = t1[j0], w1b = t1[j1];
-        const uint w2a = t2[j0], w2b = t2[j1];
-        const uint w3a = t3[j0], w3b = t3[j1];
-
         const device half *xr0 = x + (tk + 0u) * 16u + r0;
         const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
         const device half *xr1 = x + (tk + 1u) * 16u + r0;
@@ -814,20 +807,22 @@ kernel void linear_gemv_ishizuki_k3_fused3(
         const device half *xr3 = x + (tk + 3u) * 16u + r0;
         const float p30 = float(xr3[0]), p31 = float(xr3[1]), p32 = float(xr3[8]), p33 = float(xr3[9]);
 
-        float v0[8], v1[8], v2[8], v3[8];
-        extract_v_mcg_32(w0a, w0b, sh0, rsh0, v0);
-        extract_v_mcg_32(w1a, w1b, sh0, rsh0, v1);
-        extract_v_mcg_32(w2a, w2b, sh0, rsh0, v2);
-        extract_v_mcg_32(w3a, w3b, sh0, rsh0, v3);
+        float v[8];
+        extract_v_mcg_32(t0[j0], t0[j1], sh0, rsh0, v);
+        acc0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+        acc1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
 
-        acc0 += p00 * v0[0] + p01 * v0[1] + p02 * v0[2] + p03 * v0[3];
-        acc1 += p00 * v0[4] + p01 * v0[5] + p02 * v0[6] + p03 * v0[7];
-        acc0 += p10 * v1[0] + p11 * v1[1] + p12 * v1[2] + p13 * v1[3];
-        acc1 += p10 * v1[4] + p11 * v1[5] + p12 * v1[6] + p13 * v1[7];
-        acc0 += p20 * v2[0] + p21 * v2[1] + p22 * v2[2] + p23 * v2[3];
-        acc1 += p20 * v2[4] + p21 * v2[5] + p22 * v2[6] + p23 * v2[7];
-        acc0 += p30 * v3[0] + p31 * v3[1] + p32 * v3[2] + p33 * v3[3];
-        acc1 += p30 * v3[4] + p31 * v3[5] + p32 * v3[6] + p33 * v3[7];
+        extract_v_mcg_32(t1[j0], t1[j1], sh0, rsh0, v);
+        acc0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+        acc1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+
+        extract_v_mcg_32(t2[j0], t2[j1], sh0, rsh0, v);
+        acc0 += p20 * v[0] + p21 * v[1] + p22 * v[2] + p23 * v[3];
+        acc1 += p20 * v[4] + p21 * v[5] + p22 * v[6] + p23 * v[7];
+
+        extract_v_mcg_32(t3[j0], t3[j1], sh0, rsh0, v);
+        acc0 += p30 * v[0] + p31 * v[1] + p32 * v[2] + p33 * v[3];
+        acc1 += p30 * v[4] + p31 * v[5] + p32 * v[6] + p33 * v[7];
     }
 
     for (tk = k_unroll_end + sg; tk < tiles_k; tk += SG) {
@@ -1299,12 +1294,6 @@ kernel void linear_gemv_ishizuki_k3_colmajor_contig4(
             const device uint *t1 = column + (tk + 1u) * stride;
             const device uint *t2 = column + (tk + 2u) * stride;
             const device uint *t3 = column + (tk + 3u) * stride;
-
-            const uint w0a = t0[j0], w0b = t0[j1];
-            const uint w1a = t1[j0], w1b = t1[j1];
-            const uint w2a = t2[j0], w2b = t2[j1];
-            const uint w3a = t3[j0], w3b = t3[j1];
-
             const device half *xr0 = x + (tk + 0u) * 16u + r0;
             const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
             const device half *xr1 = x + (tk + 1u) * 16u + r0;
@@ -1314,20 +1303,22 @@ kernel void linear_gemv_ishizuki_k3_colmajor_contig4(
             const device half *xr3 = x + (tk + 3u) * 16u + r0;
             const float p30 = float(xr3[0]), p31 = float(xr3[1]), p32 = float(xr3[8]), p33 = float(xr3[9]);
 
-            float v0[8], v1[8], v2[8], v3[8];
-            extract_v_mcg_32(w0a, w0b, sh0, rsh0, v0);
-            extract_v_mcg_32(w1a, w1b, sh0, rsh0, v1);
-            extract_v_mcg_32(w2a, w2b, sh0, rsh0, v2);
-            extract_v_mcg_32(w3a, w3b, sh0, rsh0, v3);
+            float v[8];
+            extract_v_mcg_32(t0[j0], t0[j1], sh0, rsh0, v);
+            acc0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+            acc1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
 
-            acc0 += p00 * v0[0] + p01 * v0[1] + p02 * v0[2] + p03 * v0[3];
-            acc1 += p00 * v0[4] + p01 * v0[5] + p02 * v0[6] + p03 * v0[7];
-            acc0 += p10 * v1[0] + p11 * v1[1] + p12 * v1[2] + p13 * v1[3];
-            acc1 += p10 * v1[4] + p11 * v1[5] + p12 * v1[6] + p13 * v1[7];
-            acc0 += p20 * v2[0] + p21 * v2[1] + p22 * v2[2] + p23 * v2[3];
-            acc1 += p20 * v2[4] + p21 * v2[5] + p22 * v2[6] + p23 * v2[7];
-            acc0 += p30 * v3[0] + p31 * v3[1] + p32 * v3[2] + p33 * v3[3];
-            acc1 += p30 * v3[4] + p31 * v3[5] + p32 * v3[6] + p33 * v3[7];
+            extract_v_mcg_32(t1[j0], t1[j1], sh0, rsh0, v);
+            acc0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+            acc1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+
+            extract_v_mcg_32(t2[j0], t2[j1], sh0, rsh0, v);
+            acc0 += p20 * v[0] + p21 * v[1] + p22 * v[2] + p23 * v[3];
+            acc1 += p20 * v[4] + p21 * v[5] + p22 * v[6] + p23 * v[7];
+
+            extract_v_mcg_32(t3[j0], t3[j1], sh0, rsh0, v);
+            acc0 += p30 * v[0] + p31 * v[1] + p32 * v[2] + p33 * v[3];
+            acc1 += p30 * v[4] + p31 * v[5] + p32 * v[6] + p33 * v[7];
         }
 
         for (tk = k_unroll_end + sg; tk < tiles_k; tk += SG) {
@@ -1428,45 +1419,43 @@ kernel void linear_gemv_ishizuki_k3_colmajor_2col(
             const device uint *t2_1 = col1 + (tk + 2u) * stride;
             const device uint *t3_1 = col1 + (tk + 3u) * stride;
 
-            const uint w0a_0 = t0_0[j0], w0b_0 = t0_0[j1];
-            const uint w1a_0 = t1_0[j0], w1b_0 = t1_0[j1];
-            const uint w2a_0 = t2_0[j0], w2b_0 = t2_0[j1];
-            const uint w3a_0 = t3_0[j0], w3b_0 = t3_0[j1];
+            float v[8];
 
-            const uint w0a_1 = t0_1[j0], w0b_1 = t0_1[j1];
-            const uint w1a_1 = t1_1[j0], w1b_1 = t1_1[j1];
-            const uint w2a_1 = t2_1[j0], w2b_1 = t2_1[j1];
-            const uint w3a_1 = t3_1[j0], w3b_1 = t3_1[j1];
+            // Sub-step 0
+            extract_v_mcg_32(t0_0[j0], t0_0[j1], sh0, rsh0, v);
+            acc0_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+            acc0_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
 
-            float v0_0[8], v1_0[8], v2_0[8], v3_0[8];
-            extract_v_mcg_32(w0a_0, w0b_0, sh0, rsh0, v0_0);
-            extract_v_mcg_32(w1a_0, w1b_0, sh0, rsh0, v1_0);
-            extract_v_mcg_32(w2a_0, w2b_0, sh0, rsh0, v2_0);
-            extract_v_mcg_32(w3a_0, w3b_0, sh0, rsh0, v3_0);
+            extract_v_mcg_32(t0_1[j0], t0_1[j1], sh0, rsh0, v);
+            acc1_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+            acc1_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
 
-            acc0_0 += p00 * v0_0[0] + p01 * v0_0[1] + p02 * v0_0[2] + p03 * v0_0[3];
-            acc0_1 += p00 * v0_0[4] + p01 * v0_0[5] + p02 * v0_0[6] + p03 * v0_0[7];
-            acc0_0 += p10 * v1_0[0] + p11 * v1_0[1] + p12 * v1_0[2] + p13 * v1_0[3];
-            acc0_1 += p10 * v1_0[4] + p11 * v1_0[5] + p12 * v1_0[6] + p13 * v1_0[7];
-            acc0_0 += p20 * v2_0[0] + p21 * v2_0[1] + p22 * v2_0[2] + p23 * v2_0[3];
-            acc0_1 += p20 * v2_0[4] + p21 * v2_0[5] + p22 * v2_0[6] + p23 * v2_0[7];
-            acc0_0 += p30 * v3_0[0] + p31 * v3_0[1] + p32 * v3_0[2] + p33 * v3_0[3];
-            acc0_1 += p30 * v3_0[4] + p31 * v3_0[5] + p32 * v3_0[6] + p33 * v3_0[7];
+            // Sub-step 1
+            extract_v_mcg_32(t1_0[j0], t1_0[j1], sh0, rsh0, v);
+            acc0_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+            acc0_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
 
-            float v0_1[8], v1_1[8], v2_1[8], v3_1[8];
-            extract_v_mcg_32(w0a_1, w0b_1, sh0, rsh0, v0_1);
-            extract_v_mcg_32(w1a_1, w1b_1, sh0, rsh0, v1_1);
-            extract_v_mcg_32(w2a_1, w2b_1, sh0, rsh0, v2_1);
-            extract_v_mcg_32(w3a_1, w3b_1, sh0, rsh0, v3_1);
+            extract_v_mcg_32(t1_1[j0], t1_1[j1], sh0, rsh0, v);
+            acc1_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+            acc1_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
 
-            acc1_0 += p00 * v0_1[0] + p01 * v0_1[1] + p02 * v0_1[2] + p03 * v0_1[3];
-            acc1_1 += p00 * v0_1[4] + p01 * v0_1[5] + p02 * v0_1[6] + p03 * v0_1[7];
-            acc1_0 += p10 * v1_1[0] + p11 * v1_1[1] + p12 * v1_1[2] + p13 * v1_1[3];
-            acc1_1 += p10 * v1_1[4] + p11 * v1_1[5] + p12 * v1_1[6] + p13 * v1_1[7];
-            acc1_0 += p20 * v2_1[0] + p21 * v2_1[1] + p22 * v2_1[2] + p23 * v2_1[3];
-            acc1_1 += p20 * v2_1[4] + p21 * v2_1[5] + p22 * v2_1[6] + p23 * v2_1[7];
-            acc1_0 += p30 * v3_1[0] + p31 * v3_1[1] + p32 * v3_1[2] + p33 * v3_1[3];
-            acc1_1 += p30 * v3_1[4] + p31 * v3_1[5] + p32 * v3_1[6] + p33 * v3_1[7];
+            // Sub-step 2
+            extract_v_mcg_32(t2_0[j0], t2_0[j1], sh0, rsh0, v);
+            acc0_0 += p20 * v[0] + p21 * v[1] + p22 * v[2] + p23 * v[3];
+            acc0_1 += p20 * v[4] + p21 * v[5] + p22 * v[6] + p23 * v[7];
+
+            extract_v_mcg_32(t2_1[j0], t2_1[j1], sh0, rsh0, v);
+            acc1_0 += p20 * v[0] + p21 * v[1] + p22 * v[2] + p23 * v[3];
+            acc1_1 += p20 * v[4] + p21 * v[5] + p22 * v[6] + p23 * v[7];
+
+            // Sub-step 3
+            extract_v_mcg_32(t3_0[j0], t3_0[j1], sh0, rsh0, v);
+            acc0_0 += p30 * v[0] + p31 * v[1] + p32 * v[2] + p33 * v[3];
+            acc0_1 += p30 * v[4] + p31 * v[5] + p32 * v[6] + p33 * v[7];
+
+            extract_v_mcg_32(t3_1[j0], t3_1[j1], sh0, rsh0, v);
+            acc1_0 += p30 * v[0] + p31 * v[1] + p32 * v[2] + p33 * v[3];
+            acc1_1 += p30 * v[4] + p31 * v[5] + p32 * v[6] + p33 * v[7];
         }
 
         for (tk = k_unroll_end + sg; tk < tiles_k; tk += SG) {
