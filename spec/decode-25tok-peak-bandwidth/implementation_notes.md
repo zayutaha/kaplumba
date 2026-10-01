@@ -240,8 +240,16 @@ With CPU-GPU submission serialization completely removed (0 ms idle gap), the to
   - Bit-exactness verified with `live_kernel_bit_exact` and `repacked_golden` (100% pass, 0 diffs).
   - Release benchmark achieved **15.783 tok/s** (63.36 ms/step) with 8.08 GiB resident memory.
 
+---
 
+## 15. Task T5.4 Log (Fused Q/K/V RMSNorm + RoPE + KV Cache Append: `norm_rope_qkv_cache`)
 
-
-
-
+- **Implementation**:
+  - Implemented `norm_rope_qkv_cache` in `crates/kernels/src/elements.metal` and `encode_norm_rope_qkv_cache` in `crates/kernels/src/elements.rs`.
+  - Directly fuses Q/K/V RMSNorm and Rotary Positional Embeddings with storing rotated K and V into `key_cache`, `value_cache`, and `position_cache` in-place on device.
+  - Eliminates 60 separate `cache_append` dispatches per token during decode (`tokens == 1`) in `crates/engine/src/model.rs`. Gated behind `KAPLUMBA_NO_NORM_ROPE_CACHE`.
+- **Verification & Sabotage Discipline**:
+  - Implemented unit test `norm_rope_qkv_cache_is_bit_identical_to_separate_append` in `crates/engine/tests/norm_rope_qkv_bit_exact.rs`.
+  - Sabotaged test: injected deliberate corruption into `norm_rope_qkv_cache` rotation store (`+ 1.0f`), verified test failed with exit code 101, reverted sabotage, and confirmed 100% clean pass across all 4 tests in `norm_rope_qkv_bit_exact`.
+  - Golden prompt generated bit-exact "Paris".
+  - Multi-token decode benchmark achieved 15.67 tok/s with resident memory strictly $\le 12$ GiB.

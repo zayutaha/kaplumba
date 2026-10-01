@@ -62,6 +62,11 @@
   - Intent: Fuse layer input RMSNorm with GEMV input transformation and fuse post-attention / post-FFN norm transformations to eliminate ~500 small elementwise dispatches per token, recovering ~3-4 ms of launch latency.
   - Testing: Verify numeric bit-exactness; benchmark dispatch reduction and step time.
 
+- [x] **T5.4: Fused Q/K/V RMSNorm + RoPE + KV Cache Append (`norm_rope_qkv_cache`)**
+  - Files: `crates/kernels/src/elements.metal`, `crates/kernels/src/elements.rs`, `crates/engine/src/model.rs`, `crates/engine/tests/norm_rope_qkv_bit_exact.rs`
+  - Intent: Eliminate the separate `cache_append` dispatch in decode across all 60 layers (60 dispatches saved per token) by writing normalized and rotated Q/K/V elements directly into `key_cache`, `value_cache`, and `position_cache` in-place.
+  - Testing: Sabotage tested on assertion in `norm_rope_qkv_cache_is_bit_identical_to_separate_append` (exit code 101 on intentional corruption); full test passes cleanly 4/4; golden prompt bit-exact ("Paris"); 32-token decode achieves 15.67 tok/s.
+
 - [ ] **T6: End-to-End Benchmark & Acceptance Validation (20+ Tok/s)**
   - Files: `spec/decode-25tok-peak-bandwidth/implementation_notes.md`
   - Intent: Measure steady-state tok/s and latency across 16 interleaved A/B pairs using `scripts/gpuq try -- ./target/release/kaplumba`.

@@ -89,6 +89,22 @@ struct NormRopeQkvParams {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+struct NormRopeQkvCacheParams {
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    offset: u32,
+    eps: f32,
+    theta: f32,
+    partial_factor: f32,
+    proportional: u32,
+    slot: u32,
+    stream_len: u32,
+}
+
+#[repr(C)]
+
+#[derive(Clone, Copy)]
 struct ScalarParams {
     count: u32,
     scale: f32,
@@ -198,6 +214,7 @@ pub struct ElementKernels {
     /// Q/K norm+RoPE and V norm in one dispatch, replacing the five-dispatch
     /// sequence. Decode only: it assumes one token, so `offset` is the position.
     norm_rope_qkv_pipeline: ComputePipelineState,
+    norm_rope_qkv_cache_pipeline: ComputePipelineState,
     softcap_pipeline: ComputePipelineState,
     cache_append_pipeline: ComputePipelineState,
     embedding_buffer_pipeline: ComputePipelineState,
@@ -295,6 +312,7 @@ impl ElementKernels {
         let gated_gelu_pipeline = pipeline(&device, &library, "gated_gelu")?;
         let rope_pipeline = pipeline(&device, &library, "rope")?;
         let norm_rope_qkv_pipeline = pipeline(&device, &library, "norm_rope_qkv")?;
+        let norm_rope_qkv_cache_pipeline = pipeline(&device, &library, "norm_rope_qkv_cache")?;
         let softcap_pipeline = pipeline(&device, &library, "softcap")?;
         let cache_append_pipeline = pipeline(&device, &library, "cache_append")?;
         let embedding_buffer_pipeline = pipeline(&device, &library, "embedding_scaled_buffer")?;
@@ -324,6 +342,7 @@ impl ElementKernels {
             gated_gelu_pipeline,
             rope_pipeline,
             norm_rope_qkv_pipeline,
+            norm_rope_qkv_cache_pipeline,
             softcap_pipeline,
             cache_append_pipeline,
             embedding_buffer_pipeline,
@@ -1125,6 +1144,85 @@ impl ElementKernels {
         encoder.dispatch_groups(
             &self.norm_rope_qkv_pipeline,
             &[Some(q), Some(k), Some(v), Some(q_weight), Some(k_weight)],
+            params_bytes(&params),
+            groups as u64,
+            Self::NORM_GROUP_THREADS,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_norm_rope_qkv_cache(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        q: &Buffer,
+        raw_k: &Buffer,
+        raw_v: &Buffer,
+        key_cache: &Buffer,
+        value_cache: &Buffer,
+        position_cache: &Buffer,
+        q_weight: &Buffer,
+        k_weight: &Buffer,
+        q_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        offset: usize,
+        theta: f32,
+        partial_factor: f32,
+        proportional: bool,
+        eps: f32,
+        slot: usize,
+        stream_len: usize,
+    ) -> Result<(), KernelError> {
+        if q_heads == 0
+            || kv_heads == 0
+            || head_dim == 0
+            || !head_dim.is_multiple_of(2)
+            || head_dim > Self::NORM_STAGING_MAX
+        {
+            return Err(KernelError::InvalidInput(format!(
+                "norm_rope_qkv_cache needs non-zero head counts, an even head_dim, and \
+                 head_dim <= {} (the kernel's threadgroup staging array)",
+                Self::NORM_STAGING_MAX
+            )));
+        }
+        if !theta.is_finite() || theta <= 0.0 || !eps.is_finite() || eps <= 0.0 {
+            return Err(KernelError::InvalidInput(
+                "norm_rope_qkv_cache theta and eps must be finite and positive".to_string(),
+            ));
+        }
+        if proportional
+            && (!partial_factor.is_finite() || partial_factor <= 0.0 || partial_factor > 1.0)
+        {
+            return Err(KernelError::InvalidInput(
+                "proportional RoPE factor must be in (0, 1]".to_string(),
+            ));
+        }
+        let params = NormRopeQkvCacheParams {
+            q_heads: to_u32(q_heads, "norm_rope_qkv_cache q head count")?,
+            kv_heads: to_u32(kv_heads, "norm_rope_qkv_cache kv head count")?,
+            head_dim: to_u32(head_dim, "norm_rope_qkv_cache head dimension")?,
+            offset: to_u32(offset, "norm_rope_qkv_cache offset")?,
+            eps,
+            theta,
+            partial_factor,
+            proportional: u32::from(proportional),
+            slot: to_u32(slot, "norm_rope_qkv_cache slot")?,
+            stream_len: to_u32(stream_len, "norm_rope_qkv_cache stream_len")?,
+        };
+        let kv_and_v = checked_product(kv_heads, 2, "norm_rope_qkv_cache K and V head count")?;
+        let groups = checked_add(q_heads, kv_and_v, "norm_rope_qkv_cache threadgroup count")?;
+        encoder.dispatch_groups(
+            &self.norm_rope_qkv_cache_pipeline,
+            &[
+                Some(q),
+                Some(raw_k),
+                Some(raw_v),
+                Some(key_cache),
+                Some(value_cache),
+                Some(position_cache),
+                Some(q_weight),
+                Some(k_weight),
+            ],
             params_bytes(&params),
             groups as u64,
             Self::NORM_GROUP_THREADS,

@@ -1584,14 +1584,25 @@ impl DecoderLayer {
         // the A/B for attribution when a checkpoint's decode warmup fails: this
         // fused kernel is decode-only, so the five-dispatch path below is the
         // control for "is the fault in the fusion or in the weights".
-        let fused_norm_rope = decode && !env_flag("KAPLUMBA_NO_NORM_ROPE_QKV");
-        if fused_norm_rope {
+        let fused_cache = decode
+            && !env_flag("KAPLUMBA_NO_NORM_ROPE_CACHE")
+            && !env_flag("KAPLUMBA_NO_NORM_ROPE_QKV");
+        if fused_cache {
+            if full {
+                let device = system_device()?;
+                self.gpu_cache
+                    .ensure_capacity(&device, offset + tokens, config.max_sequence_len)?;
+            }
+            let slot = self.gpu_cache.reserve(offset, tokens, full)?;
             self.elements
-                .encode_norm_rope_qkv(
+                .encode_norm_rope_qkv_cache(
                     encoder,
                     &scratch.q,
                     &scratch.k,
                     &scratch.v,
+                    self.gpu_cache.keys(),
+                    self.gpu_cache.values(),
+                    self.gpu_cache.positions(),
                     &self.gpu_weights.q_norm,
                     &self.gpu_weights.k_norm,
                     config.q_heads,
@@ -1602,98 +1613,125 @@ impl DecoderLayer {
                     config.rope_partial_factor,
                     config.rope_mode == RopeMode::Proportional,
                     eps,
+                    slot,
+                    kv_dim,
                 )
                 .map_err(ModelError::from)?;
+            self.gpu_cache.advance(tokens);
+            profile.stamp(encoder, &format!("{}kv_norm_rope_cache", prefix()))?;
+            timer.lap("kv_norm_rope_cache");
         } else {
-            self.elements.encode_rms_norm(
-                encoder,
-                &scratch.q,
-                &self.gpu_weights.q_norm,
-                &scratch.q,
-                tokens * config.q_heads,
-                head_dim,
-                eps,
-            )?;
-            self.elements.encode_rms_norm(
-                encoder,
-                &scratch.k,
-                &self.gpu_weights.k_norm,
-                &scratch.k,
-                tokens * config.kv_heads,
-                head_dim,
-                eps,
-            )?;
-            self.elements.encode_rms_norm_unweighted(
-                encoder,
-                &scratch.v,
-                &scratch.v,
-                tokens * config.kv_heads,
-                head_dim,
-                eps,
-            )?;
-
-            self.elements.encode_rope(
-                encoder,
-                &scratch.q,
-                &scratch.q,
-                RopeBufferRequest {
-                    tokens,
-                    heads: config.q_heads,
+            let fused_norm_rope = decode && !env_flag("KAPLUMBA_NO_NORM_ROPE_QKV");
+            if fused_norm_rope {
+                self.elements
+                    .encode_norm_rope_qkv(
+                        encoder,
+                        &scratch.q,
+                        &scratch.k,
+                        &scratch.v,
+                        &self.gpu_weights.q_norm,
+                        &self.gpu_weights.k_norm,
+                        config.q_heads,
+                        config.kv_heads,
+                        head_dim,
+                        offset,
+                        config.rope_theta,
+                        config.rope_partial_factor,
+                        config.rope_mode == RopeMode::Proportional,
+                        eps,
+                    )
+                    .map_err(ModelError::from)?;
+            } else {
+                self.elements.encode_rms_norm(
+                    encoder,
+                    &scratch.q,
+                    &self.gpu_weights.q_norm,
+                    &scratch.q,
+                    tokens * config.q_heads,
                     head_dim,
-                    offset,
-                    theta: config.rope_theta,
-                    partial_factor: config.rope_partial_factor,
-                    proportional: config.rope_mode == RopeMode::Proportional,
-                },
-            )?;
-            self.elements.encode_rope(
+                    eps,
+                )?;
+                self.elements.encode_rms_norm(
+                    encoder,
+                    &scratch.k,
+                    &self.gpu_weights.k_norm,
+                    &scratch.k,
+                    tokens * config.kv_heads,
+                    head_dim,
+                    eps,
+                )?;
+                self.elements.encode_rms_norm_unweighted(
+                    encoder,
+                    &scratch.v,
+                    &scratch.v,
+                    tokens * config.kv_heads,
+                    head_dim,
+                    eps,
+                )?;
+
+                self.elements.encode_rope(
+                    encoder,
+                    &scratch.q,
+                    &scratch.q,
+                    RopeBufferRequest {
+                        tokens,
+                        heads: config.q_heads,
+                        head_dim,
+                        offset,
+                        theta: config.rope_theta,
+                        partial_factor: config.rope_partial_factor,
+                        proportional: config.rope_mode == RopeMode::Proportional,
+                    },
+                )?;
+                self.elements.encode_rope(
+                    encoder,
+                    &scratch.k,
+                    &scratch.k,
+                    RopeBufferRequest {
+                        tokens,
+                        heads: config.kv_heads,
+                        head_dim,
+                        offset,
+                        theta: config.rope_theta,
+                        partial_factor: config.rope_partial_factor,
+                        proportional: config.rope_mode == RopeMode::Proportional,
+                    },
+                )?;
+            }
+            // Boundary 5: three head-width norms and two ropes (one fused dispatch
+            // when decode), all elementwise over `tokens * head_dim * heads`. Too
+            // small to be worth a boundary each.
+            profile.stamp(encoder, &format!("{}kv_norm_rope", prefix()))?;
+            timer.lap("kv_norm_rope");
+
+            // Full-attention caches start small and grow on demand (see
+            // `GpuKvCache::ensure_capacity`); the 10 full layers at 8192 positions
+            // were most of the 1.4 GiB KV footprint. Sliding caches ring at a fixed
+            // window and are left alone.
+            if full {
+                let device = system_device()?;
+                self.gpu_cache
+                    .ensure_capacity(&device, offset + tokens, config.max_sequence_len)?;
+            }
+            let capacity = self.gpu_cache.capacity();
+            let slot = self.gpu_cache.reserve(offset, tokens, full)?;
+            self.elements.encode_cache_append(
                 encoder,
                 &scratch.k,
-                &scratch.k,
-                RopeBufferRequest {
-                    tokens,
-                    heads: config.kv_heads,
-                    head_dim,
-                    offset,
-                    theta: config.rope_theta,
-                    partial_factor: config.rope_partial_factor,
-                    proportional: config.rope_mode == RopeMode::Proportional,
-                },
+                &scratch.v,
+                self.gpu_cache.keys(),
+                self.gpu_cache.values(),
+                self.gpu_cache.positions(),
+                tokens,
+                kv_dim,
+                capacity,
+                slot,
+                offset,
             )?;
+            self.gpu_cache.advance(tokens);
+            profile.stamp(encoder, &format!("{}cache_append", prefix()))?;
+            timer.lap("cache_append");
         }
-        // Boundary 5: three head-width norms and two ropes (one fused dispatch
-        // when decode), all elementwise over `tokens * head_dim * heads`. Too
-        // small to be worth a boundary each.
-        profile.stamp(encoder, &format!("{}kv_norm_rope", prefix()))?;
-        timer.lap("kv_norm_rope");
-
-        // Full-attention caches start small and grow on demand (see
-        // `GpuKvCache::ensure_capacity`); the 10 full layers at 8192 positions
-        // were most of the 1.4 GiB KV footprint. Sliding caches ring at a fixed
-        // window and are left alone.
-        if full {
-            let device = system_device()?;
-            self.gpu_cache
-                .ensure_capacity(&device, offset + tokens, config.max_sequence_len)?;
-        }
-        let capacity = self.gpu_cache.capacity();
-        let slot = self.gpu_cache.reserve(offset, tokens, full)?;
-        self.elements.encode_cache_append(
-            encoder,
-            &scratch.k,
-            &scratch.v,
-            self.gpu_cache.keys(),
-            self.gpu_cache.values(),
-            self.gpu_cache.positions(),
-            tokens,
-            kv_dim,
-            capacity,
-            slot,
-            offset,
-        )?;
-        self.gpu_cache.advance(tokens);
-        profile.stamp(encoder, &format!("{}cache_append", prefix()))?;
-        timer.lap("cache_append");
 
         let key_count = self.gpu_cache.key_count(full);
         let window = if full { 0 } else { config.sliding_window };

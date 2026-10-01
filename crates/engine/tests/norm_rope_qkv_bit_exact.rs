@@ -525,3 +525,152 @@ fn norm_rope_qkv_rejects_invalid_shapes() {
         "norm_rope_qkv rejected a non-proportional request over its unused partial_factor"
     );
 }
+
+#[test]
+fn norm_rope_qkv_cache_is_bit_identical_to_separate_append() {
+    let device = metal::Device::system_default().expect("no metal device");
+    let kernels = ElementKernels::shared().expect("element kernels");
+    let queue = device.new_command_queue();
+
+    for case in cases() {
+        let q_len = case.q_heads * case.head_dim;
+        let kv_len = case.kv_heads * case.head_dim;
+        let q_in = pseudo_half(q_len, 0x1111);
+        let k_in = pseudo_half(kv_len, 0x2222);
+        let v_in = pseudo_half(kv_len, 0x3333);
+        let qw = pseudo_half(case.head_dim, 0x4444);
+        let kw = pseudo_half(case.head_dim, 0x5555);
+
+        let capacity = 32usize;
+        let slot = 3usize;
+
+        // --- Arm 1: Reference (norm_rope_qkv + cache_append) ---
+        let q_ref = upload(&device, &q_in);
+        let k_ref = upload(&device, &k_in);
+        let v_ref = upload(&device, &v_in);
+        let qw_buf = upload(&device, &qw);
+        let kw_buf = upload(&device, &kw);
+
+        let key_cache_ref = device.new_buffer(
+            (capacity * kv_len * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let val_cache_ref = device.new_buffer(
+            (capacity * kv_len * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let pos_cache_ref = device.new_buffer(
+            (capacity * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let mut encoder = MetalEncoder::new(&queue).expect("encoder");
+        kernels
+            .encode_norm_rope_qkv(
+                &mut encoder,
+                &q_ref,
+                &k_ref,
+                &v_ref,
+                &qw_buf,
+                &kw_buf,
+                case.q_heads,
+                case.kv_heads,
+                case.head_dim,
+                case.offset,
+                THETA,
+                case.partial_factor,
+                case.proportional,
+                EPS,
+            )
+            .expect("norm_rope_qkv");
+        kernels
+            .encode_cache_append(
+                &mut encoder,
+                &k_ref,
+                &v_ref,
+                &key_cache_ref,
+                &val_cache_ref,
+                &pos_cache_ref,
+                1,
+                kv_len,
+                capacity,
+                slot,
+                case.offset,
+            )
+            .expect("cache_append");
+        encoder.flush_and_wait().expect("wait");
+
+        // --- Arm 2: Fused norm_rope_qkv_cache ---
+        let q_fused = upload(&device, &q_in);
+        let raw_k = upload(&device, &k_in);
+        let raw_v = upload(&device, &v_in);
+        let key_cache_fused = device.new_buffer(
+            (capacity * kv_len * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let val_cache_fused = device.new_buffer(
+            (capacity * kv_len * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let pos_cache_fused = device.new_buffer(
+            (capacity * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+
+        let mut encoder2 = MetalEncoder::new(&queue).expect("encoder2");
+        kernels
+            .encode_norm_rope_qkv_cache(
+                &mut encoder2,
+                &q_fused,
+                &raw_k,
+                &raw_v,
+                &key_cache_fused,
+                &val_cache_fused,
+                &pos_cache_fused,
+                &qw_buf,
+                &kw_buf,
+                case.q_heads,
+                case.kv_heads,
+                case.head_dim,
+                case.offset,
+                THETA,
+                case.partial_factor,
+                case.proportional,
+                EPS,
+                slot,
+                kv_len,
+            )
+            .expect("norm_rope_qkv_cache");
+        encoder2.flush_and_wait().expect("wait2");
+
+        // --- Bit-exact comparison ---
+        let q_ref_bits = download(&q_ref, q_len);
+        let q_fused_bits = download(&q_fused, q_len);
+        assert_eq!(q_ref_bits, q_fused_bits, "Q bits mismatch for case {}", case.name);
+
+        let k_cache_ref_bits = download(&key_cache_ref, capacity * kv_len);
+        let k_cache_fused_bits = download(&key_cache_fused, capacity * kv_len);
+        assert_eq!(
+            k_cache_ref_bits, k_cache_fused_bits,
+            "Key cache mismatch for case {}",
+            case.name
+        );
+
+        let v_cache_ref_bits = download(&val_cache_ref, capacity * kv_len);
+        let v_cache_fused_bits = download(&val_cache_fused, capacity * kv_len);
+        assert_eq!(
+            v_cache_ref_bits, v_cache_fused_bits,
+            "Value cache mismatch for case {}",
+            case.name
+        );
+
+        let pos_ref = unsafe {
+            std::slice::from_raw_parts(pos_cache_ref.contents() as *const u32, capacity)
+        };
+        let pos_fused = unsafe {
+            std::slice::from_raw_parts(pos_cache_fused.contents() as *const u32, capacity)
+        };
+        assert_eq!(pos_ref, pos_fused, "Position cache mismatch for case {}", case.name);
+    }
+}
+

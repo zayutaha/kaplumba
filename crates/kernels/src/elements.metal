@@ -842,3 +842,121 @@ kernel void norm_rope_qkv(
     }
 }
 
+struct NormRopeQkvCacheParams {
+    uint q_heads;
+    uint kv_heads;
+    uint head_dim;
+    uint offset;
+    float eps;
+    float theta;
+    float partial_factor;
+    uint proportional;
+    uint slot;
+    uint stream_len;
+};
+
+kernel void norm_rope_qkv_cache(
+    device half *q [[buffer(0)]],
+    const device half *raw_k [[buffer(1)]],
+    const device half *raw_v [[buffer(2)]],
+    device half *key_cache [[buffer(3)]],
+    device half *value_cache [[buffer(4)]],
+    device uint *position_cache [[buffer(5)]],
+    const device half *q_weight [[buffer(6)]],
+    const device half *k_weight [[buffer(7)]],
+    constant NormRopeQkvCacheParams &params [[buffer(8)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    const uint kv_span = params.q_heads + params.kv_heads;
+    if (tgid >= kv_span + params.kv_heads) {
+        return;
+    }
+    threadgroup float partial[256];
+    threadgroup float normed_shared[512];
+
+    const device half *src;
+    device half *dst;
+    const device half *weight;
+    uint head_idx;
+    bool is_v;
+    if (tgid < params.q_heads) {
+        src = q;
+        dst = q;
+        weight = q_weight;
+        head_idx = tgid;
+        is_v = false;
+    } else if (tgid < kv_span) {
+        src = raw_k;
+        dst = key_cache + params.slot * params.stream_len;
+        weight = k_weight;
+        head_idx = tgid - params.q_heads;
+        is_v = false;
+    } else {
+        src = raw_v;
+        dst = value_cache + params.slot * params.stream_len;
+        weight = q_weight;
+        head_idx = tgid - kv_span;
+        is_v = true;
+    }
+
+    const uint count = params.head_dim;
+    const uint base = head_idx * count;
+
+    // Sum of squares, in the same order as `rms_norm_weighted_tg`.
+    float sum = 0.0f;
+    for (uint i = lid; i < count; i += tgdim) {
+        const float value = float(src[base + i]);
+        sum += value * value;
+    }
+    partial[lid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            partial[lid] += partial[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inverse = rsqrt(partial[0] / float(count) + params.eps);
+
+    if (is_v) {
+        // `rms_norm_unweighted_tg`: no weight, no RoPE, straight store.
+        for (uint i = lid; i < count; i += tgdim) {
+            dst[base + i] = half(float(src[base + i]) * inverse);
+        }
+        return;
+    }
+
+    // Weighted norm, ROUNDED TO FP16 before the rotation reads it.
+    for (uint i = lid; i < count; i += tgdim) {
+        const float normed = float(src[base + i]) * inverse * float(weight[i]);
+        normed_shared[i] = float(half(normed));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    const uint half_width = count / 2u;
+    const uint rotated_pairs = params.proportional != 0u
+        ? uint(params.partial_factor * float(count) / 2.0f)
+        : half_width;
+
+    for (uint pair = lid; pair < rotated_pairs; pair += tgdim) {
+        const float exponent = 2.0f * float(pair) / float(count);
+        const float angle = float(params.offset) / pow(params.theta, exponent);
+        const float cosine = cos(angle);
+        const float sine = sin(angle);
+        const float lo = normed_shared[pair];
+        const float hi = normed_shared[pair + half_width];
+        dst[base + pair] = half(lo * cosine - hi * sine);
+        dst[base + pair + half_width] = half(hi * cosine + lo * sine);
+    }
+    for (uint pair = rotated_pairs + lid; pair < half_width; pair += tgdim) {
+        dst[base + pair] = half(normed_shared[pair]);
+        dst[base + pair + half_width] = half(normed_shared[pair + half_width]);
+    }
+
+    if (tgid == params.q_heads && lid == 0u) {
+        position_cache[params.slot] = params.offset;
+    }
+}
+
+
