@@ -297,8 +297,11 @@ pub struct LinearKernels {
     finalize_gated_gelu_and_down_input_pipeline: ComputePipelineState,
     finalize_gated_gelu_and_down_input_sk2_pipeline: ComputePipelineState,
     pub finalize_and_post_ffn_norm_scale_pipeline: ComputePipelineState,
+    pub finalize_and_post_ffn_norm_scale_sk2_pipeline: ComputePipelineState,
+    pub finalize_and_post_ffn_norm_scale_sk4_pipeline: ComputePipelineState,
     pub post_attn_pre_ffn_transform_pipeline: ComputePipelineState,
     pub finalize_o_proj_and_pre_ffn_transform_pipeline: ComputePipelineState,
+    pub finalize_o_proj_and_pre_ffn_transform_sk2_pipeline: ComputePipelineState,
     pub input_norm_and_qkv_transform_pipeline: ComputePipelineState,
     input_rows_pipeline: ComputePipelineState,
     gemv_tiled_pipeline: ComputePipelineState,
@@ -542,6 +545,16 @@ impl LinearKernels {
             &library,
             "linear_finalize_and_post_ffn_norm_scale",
         )?;
+        let finalize_and_post_ffn_norm_scale_sk2_pipeline = pipeline_audit::build(
+            &device,
+            &library,
+            "linear_finalize_and_post_ffn_norm_scale_sk2",
+        )?;
+        let finalize_and_post_ffn_norm_scale_sk4_pipeline = pipeline_audit::build(
+            &device,
+            &library,
+            "linear_finalize_and_post_ffn_norm_scale_sk4",
+        )?;
         let post_attn_pre_ffn_transform_pipeline = pipeline_audit::build(
             &device,
             &library,
@@ -551,6 +564,11 @@ impl LinearKernels {
             &device,
             &library,
             "linear_finalize_o_proj_and_pre_ffn_transform",
+        )?;
+        let finalize_o_proj_and_pre_ffn_transform_sk2_pipeline = pipeline_audit::build(
+            &device,
+            &library,
+            "linear_finalize_o_proj_and_pre_ffn_transform_sk2",
         )?;
         let input_norm_and_qkv_transform_pipeline = pipeline_audit::build(
             &device,
@@ -603,8 +621,11 @@ impl LinearKernels {
             finalize_gated_gelu_and_down_input_pipeline,
             finalize_gated_gelu_and_down_input_sk2_pipeline,
             finalize_and_post_ffn_norm_scale_pipeline,
+            finalize_and_post_ffn_norm_scale_sk2_pipeline,
+            finalize_and_post_ffn_norm_scale_sk4_pipeline,
             post_attn_pre_ffn_transform_pipeline,
             finalize_o_proj_and_pre_ffn_transform_pipeline,
+            finalize_o_proj_and_pre_ffn_transform_sk2_pipeline,
             input_norm_and_qkv_transform_pipeline,
             input_rows_pipeline,
             gemv_tiled_pipeline,
@@ -1145,11 +1166,73 @@ impl LinearKernels {
                 )));
             }
         }
+        let is_2col_sk4 = name.ends_with("_2col_sk4");
+        let is_2col_sk2 = name.ends_with("_2col_sk2");
         let is_stream = name.ends_with("_stream");
-        let is_sk2 = name.ends_with("_sk2");
-        let is_sk4 = name.ends_with("_sk4");
+        let is_sk2 = name.ends_with("_sk2") && !is_2col_sk2;
+        let is_sk4 = name.ends_with("_sk4") && !is_2col_sk4;
         let is_2col = name.ends_with("_2col");
-        if is_stream {
+        if is_2col_sk4 {
+            let pairs = ((request.out_features / 16) / 2) as u64;
+            let groups = pairs * 4;
+            let shape_values = [
+                to_u32(request.in_features, "input dimension")?,
+                to_u32(request.out_features, "output dimension")?,
+            ];
+            encoder.dispatch_1d_offset(
+                pipeline,
+                &[
+                    TensorRef::new(request.packed, request.packed_offset),
+                    TensorRef::new(request.transformed, 0),
+                    TensorRef::new(request.raw, 0),
+                ],
+                params_bytes(&shape_values),
+                groups * 256,
+                256,
+            )?;
+            let output_blocks = to_u32(request.out_features / 128, "output dimension")?;
+            return encoder.dispatch_1d(
+                &self.finalize_simd_sk4_pipeline,
+                &[
+                    Some(request.raw),
+                    Some(request.output_signs),
+                    Some(request.output),
+                ],
+                &output_blocks.to_le_bytes(),
+                u64::from(output_blocks) * 32,
+                32,
+            );
+        } else if is_2col_sk2 {
+            let pairs = ((request.out_features / 16) / 2) as u64;
+            let groups = pairs * 2;
+            let shape_values = [
+                to_u32(request.in_features, "input dimension")?,
+                to_u32(request.out_features, "output dimension")?,
+            ];
+            encoder.dispatch_1d_offset(
+                pipeline,
+                &[
+                    TensorRef::new(request.packed, request.packed_offset),
+                    TensorRef::new(request.transformed, 0),
+                    TensorRef::new(request.raw, 0),
+                ],
+                params_bytes(&shape_values),
+                groups * 256,
+                256,
+            )?;
+            let output_blocks = to_u32(request.out_features / 128, "output dimension")?;
+            return encoder.dispatch_1d(
+                &self.finalize_simd_sk2_pipeline,
+                &[
+                    Some(request.raw),
+                    Some(request.output_signs),
+                    Some(request.output),
+                ],
+                &output_blocks.to_le_bytes(),
+                u64::from(output_blocks) * 32,
+                32,
+            );
+        } else if is_stream {
             let tiles = (request.out_features / 16) as u64;
             let groups = (tiles + 7) / 8;
             let shape_values = [
@@ -2056,6 +2139,92 @@ impl LinearKernels {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn encode_gemv_raw_sk2(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        packed: &Buffer,
+        packed_offset: u64,
+        perm_mode: u32,
+        rate: Exl3Rate,
+        in_features: usize,
+        out_features: usize,
+        transformed: &Buffer,
+        raw: &Buffer,
+    ) -> Result<(), KernelError> {
+        if perm_mode == 1 && out_features % 32 == 0 {
+            if let Exl3Rate::Integer(bits) = rate {
+                let name = format!("linear_gemv_ishizuki_k{bits}_colmajor_2col_sk2");
+                if let Some(pipeline) = self.ishizuki_gemv_by_name.get(&name) {
+                    Self::trace_gemv(&name);
+                    let shape_values = [
+                        to_u32(in_features, "input dimension")?,
+                        to_u32(out_features, "output dimension")?,
+                    ];
+                    let pairs = ((out_features / 16) / 2) as u64;
+                    let groups = pairs * 2;
+                    return encoder.dispatch_1d_offset(
+                        pipeline,
+                        &[
+                            TensorRef::new(packed, packed_offset),
+                            TensorRef::new(transformed, 0),
+                            TensorRef::new(raw, 0),
+                        ],
+                        params_bytes(&shape_values),
+                        groups * 256,
+                        256,
+                    );
+                }
+            }
+        }
+        Err(KernelError::InvalidInput(
+            "missing sk2 pipeline for gemv_raw_sk2".to_string(),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_gemv_raw_sk4(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        packed: &Buffer,
+        packed_offset: u64,
+        perm_mode: u32,
+        rate: Exl3Rate,
+        in_features: usize,
+        out_features: usize,
+        transformed: &Buffer,
+        raw: &Buffer,
+    ) -> Result<(), KernelError> {
+        if perm_mode == 1 && out_features % 32 == 0 {
+            if let Exl3Rate::Integer(bits) = rate {
+                let name = format!("linear_gemv_ishizuki_k{bits}_colmajor_2col_sk4");
+                if let Some(pipeline) = self.ishizuki_gemv_by_name.get(&name) {
+                    Self::trace_gemv(&name);
+                    let shape_values = [
+                        to_u32(in_features, "input dimension")?,
+                        to_u32(out_features, "output dimension")?,
+                    ];
+                    let pairs = ((out_features / 16) / 2) as u64;
+                    let groups = pairs * 4;
+                    return encoder.dispatch_1d_offset(
+                        pipeline,
+                        &[
+                            TensorRef::new(packed, packed_offset),
+                            TensorRef::new(transformed, 0),
+                            TensorRef::new(raw, 0),
+                        ],
+                        params_bytes(&shape_values),
+                        groups * 256,
+                        256,
+                    );
+                }
+            }
+        }
+        Err(KernelError::InvalidInput(
+            "missing sk4 pipeline for gemv_raw_sk4".to_string(),
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn encode_gemv_fused2(
         &self,
         encoder: &mut crate::encoder::MetalEncoder,
@@ -2308,7 +2477,27 @@ impl LinearKernels {
                 }
             }
         }
-        let (pipeline, groups) = if out_features_gate == out_features_up && !env_flag("KAPLUMBA_NO_FUSED2_CO") {
+        let (pipeline, groups) = if env_flag("KAPLUMBA_FUSED2_2COL")
+            && out_features_gate % 32 == 0
+            && out_features_up % 32 == 0
+        {
+            if let Some(pipe) =
+                self.ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2_2col")
+            {
+                Self::trace_gemv("linear_gemv_ishizuki_k3_fused2_2col (mlp)");
+                (pipe, (tiles_a + tiles_b) / 2)
+            } else {
+                (
+                    self.ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2")
+                        .ok_or_else(|| {
+                            KernelError::InvalidInput(
+                                "missing linear_gemv_ishizuki_k3_fused2".to_string(),
+                            )
+                        })?,
+                    tiles_a + tiles_b,
+                )
+            }
+        } else if out_features_gate == out_features_up && !env_flag("KAPLUMBA_NO_FUSED2_CO") {
             if out_features_gate % 32 == 0 && env_flag("KAPLUMBA_FUSED2_CO4") {
                 if let Some(pipe) = self.ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2_co4") {
                     Self::trace_gemv("linear_gemv_ishizuki_k3_fused2_co4 (mlp)");
@@ -2591,6 +2780,76 @@ impl LinearKernels {
     }
 
     #[allow(clippy::too_many_arguments)]
+    pub fn encode_finalize_and_post_ffn_norm_scale_sk2(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        raw: &Buffer,
+        output_signs: &Buffer,
+        weight: &Buffer,
+        residual: &Buffer,
+        output: &Buffer,
+        width: usize,
+        eps: f32,
+        scale: f32,
+    ) -> Result<(), KernelError> {
+        let blocks = to_u32(width / 128, "finalize blocks")?;
+        let params = FinalizeNormScaleParams {
+            width: to_u32(width, "finalize width")?,
+            blocks,
+            eps,
+            scale,
+        };
+        encoder.dispatch_groups(
+            &self.finalize_and_post_ffn_norm_scale_sk2_pipeline,
+            &[
+                Some(raw),
+                Some(output_signs),
+                Some(weight),
+                Some(residual),
+                Some(output),
+            ],
+            params_bytes(&params),
+            1,
+            256,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_finalize_and_post_ffn_norm_scale_sk4(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        raw: &Buffer,
+        output_signs: &Buffer,
+        weight: &Buffer,
+        residual: &Buffer,
+        output: &Buffer,
+        width: usize,
+        eps: f32,
+        scale: f32,
+    ) -> Result<(), KernelError> {
+        let blocks = to_u32(width / 128, "finalize blocks")?;
+        let params = FinalizeNormScaleParams {
+            width: to_u32(width, "finalize width")?,
+            blocks,
+            eps,
+            scale,
+        };
+        encoder.dispatch_groups(
+            &self.finalize_and_post_ffn_norm_scale_sk4_pipeline,
+            &[
+                Some(raw),
+                Some(output_signs),
+                Some(weight),
+                Some(residual),
+                Some(output),
+            ],
+            params_bytes(&params),
+            1,
+            256,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     pub fn encode_post_attn_pre_ffn_transform(
         &self,
         encoder: &mut crate::encoder::MetalEncoder,
@@ -2650,6 +2909,45 @@ impl LinearKernels {
         };
         encoder.dispatch_groups(
             &self.finalize_o_proj_and_pre_ffn_transform_pipeline,
+            &[
+                Some(raw),
+                Some(o_out_signs),
+                Some(post_attn_norm),
+                Some(residual),
+                Some(hidden_b),
+                Some(pre_ffn_norm),
+                Some(gate_input_signs),
+                Some(transformed),
+            ],
+            params_bytes(&params),
+            1,
+            256,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_finalize_o_proj_and_pre_ffn_transform_sk2(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        raw: &Buffer,
+        o_out_signs: &Buffer,
+        post_attn_norm: &Buffer,
+        residual: &Buffer,
+        hidden_b: &Buffer,
+        pre_ffn_norm: &Buffer,
+        gate_input_signs: &Buffer,
+        transformed: &Buffer,
+        width: usize,
+        eps: f32,
+    ) -> Result<(), KernelError> {
+        let blocks = to_u32(width / 128, "post_attn blocks")?;
+        let params = PostAttnPreFfnParams {
+            width: to_u32(width, "post_attn width")?,
+            blocks,
+            eps,
+        };
+        encoder.dispatch_groups(
+            &self.finalize_o_proj_and_pre_ffn_transform_sk2_pipeline,
             &[
                 Some(raw),
                 Some(o_out_signs),

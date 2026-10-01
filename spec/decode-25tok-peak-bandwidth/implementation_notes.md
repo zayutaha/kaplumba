@@ -206,6 +206,29 @@ With CPU-GPU submission serialization completely removed (0 ms idle gap), the to
 - **T5.3**: Elementwise Fusion & Prologue Inlining:
   - Inlining input RMSNorm with GEMV input transformation and fusing post-attention / post-FFN norm transformations to eliminate ~500 dispatches, recovering ~3-4 ms.
 
+---
+
+## 13. Task T5.2 Log (Split-K down_proj & o_proj, Sequential fused2_2col Streaming)
+
+- **Implementation**:
+  - Implemented `linear_gemv_ishizuki_k3_colmajor_2col_sk2` and `_sk4` in `crates/kernels/src/linear_repacked.metal`.
+  - Implemented fused Split-K reduction in `linear_finalize_and_post_ffn_norm_scale_sk2` and `linear_finalize_o_proj_and_pre_ffn_transform_sk2` in `crates/kernels/src/linear.metal` (reduces intermediate floats in registers before RMSNorm/transformations, avoiding auxiliary buffers and global sync barriers).
+  - Wired `down_proj` and `o_proj` through Split-K=2 in `crates/engine/src/model.rs`.
+  - Enabled sequential 2-column streaming (`fused2_2col`) for `gate_up` to eliminate cache-line thrashing between two 345 MB matrices.
+- **Key Findings & Negative Results**:
+  - **down_proj ($K=21504, N=5376$)**: Split-K=2 doubles threadgroups from 168 to 336 (16.8 TGs/core across 20 cores), saturating memory latency hiding and dropping latency from 14.2 ms to 11.5 ms (-2.7 ms). Split-K=4 (672 threadgroups) yielded identical throughput (15.65 vs 15.63 tok/s), proving occupancy is fully saturated at SK=2.
+  - **o_proj ($K=4096, N=5376$)**: Split-K=2 doubles threadgroups from 168 to 336, dropping latency from 6.6 ms to 5.8 ms (-0.8 ms).
+  - **gate_up ($K=5376, N=21504$) Negative Result**: With 1344 threadgroups already (67.2 TGs/core), Split-K does not improve occupancy; setting SK on `gate_up` degraded throughput from 15.65 down to 14.61 tok/s (-1.04 tok/s) due to reduction overhead. Abandoned Split-K on `gate_up`.
+  - **fused2_co4 vs fused2_2col on gate_up**: `fused2_co4` gave 15.46 tok/s; `fused2_2col` gave 15.65 tok/s (+0.19 tok/s) because `fused2_2col` avoids simultaneous cache-line contention between two 345 MB weight matrices.
+- **Verification & Sabotage Discipline**:
+  - Sabotage tested `linear_gemv_ishizuki_k3_colmajor_2col_sk2` by injecting `acc0_0 += 1.0f` into accumulator: `live_kernel_bit_exact` immediately failed with exit code 101 (`down_proj 21504x5376: 2col_sk2 fp16 diff count: 1344/5376`). Reverted sabotage and verified 100% clean pass (0/5376 diffs).
+  - Full test suite passed 100% (`live_kernel_bit_exact` 1/1, `fused_bit_exact` 3/3, `argmax_engine_parity` 3/3, `repacked_golden` 2/2).
+- **Measurement Results**:
+  - Golden prompt bit-exact: "The capital of France is" -> "Paris" (TTFT 1319 ms).
+  - 32-token counting prompt achieved **15.751 tok/s** (63.4 ms/step), lifting throughput from 15.33 tok/s (+0.42 tok/s).
+  - Memory residency: 7.86 GiB resident, well within the 12.0 GiB budget.
+
+
 
 
 

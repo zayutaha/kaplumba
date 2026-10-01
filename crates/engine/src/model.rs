@@ -1798,38 +1798,77 @@ impl DecoderLayer {
                 )
                 .map_err(ModelError::Kernel)?;
 
-            self.linear
-                .encode_gemv_raw(
-                    encoder,
-                    packed_o,
-                    self.weights.o_proj.metal_offset,
-                    self.weights.o_proj.permutation_mode,
-                    self.weights.o_proj.rate,
-                    self.weights.o_proj.codebook,
-                    self.weights.o_proj.in_features,
-                    self.weights.o_proj.out_features,
-                    &scratch.transformed,
-                    &scratch.raw,
-                )
-                .map_err(ModelError::Kernel)?;
-            profile.stamp(encoder, &format!("{}o_proj", prefix()))?;
-            timer.lap("o_proj");
+            let use_sk2 = !env_flag("KAPLUMBA_NO_SK2")
+                && self.weights.o_proj.permutation_mode == 1
+                && self.weights.o_proj.out_features % 32 == 0
+                && matches!(self.weights.o_proj.rate, Exl3Rate::Integer(3));
 
-            self.linear
-                .encode_finalize_o_proj_and_pre_ffn_transform(
-                    encoder,
-                    &scratch.raw,
-                    o_out_signs,
-                    &self.gpu_weights.post_attention_norm,
-                    input,
-                    &scratch.hidden_b,
-                    &self.gpu_weights.pre_ffn_norm,
-                    gate_input_signs,
-                    &scratch.transformed,
-                    self.config.hidden_size,
-                    eps,
-                )
-                .map_err(ModelError::Kernel)?;
+            if use_sk2 {
+                self.linear
+                    .encode_gemv_raw_sk2(
+                        encoder,
+                        packed_o,
+                        self.weights.o_proj.metal_offset,
+                        self.weights.o_proj.permutation_mode,
+                        self.weights.o_proj.rate,
+                        self.weights.o_proj.in_features,
+                        self.weights.o_proj.out_features,
+                        &scratch.transformed,
+                        &scratch.raw,
+                    )
+                    .map_err(ModelError::Kernel)?;
+                profile.stamp(encoder, &format!("{}o_proj", prefix()))?;
+                timer.lap("o_proj");
+
+                self.linear
+                    .encode_finalize_o_proj_and_pre_ffn_transform_sk2(
+                        encoder,
+                        &scratch.raw,
+                        o_out_signs,
+                        &self.gpu_weights.post_attention_norm,
+                        input,
+                        &scratch.hidden_b,
+                        &self.gpu_weights.pre_ffn_norm,
+                        gate_input_signs,
+                        &scratch.transformed,
+                        self.config.hidden_size,
+                        eps,
+                    )
+                    .map_err(ModelError::Kernel)?;
+            } else {
+                self.linear
+                    .encode_gemv_raw(
+                        encoder,
+                        packed_o,
+                        self.weights.o_proj.metal_offset,
+                        self.weights.o_proj.permutation_mode,
+                        self.weights.o_proj.rate,
+                        self.weights.o_proj.codebook,
+                        self.weights.o_proj.in_features,
+                        self.weights.o_proj.out_features,
+                        &scratch.transformed,
+                        &scratch.raw,
+                    )
+                    .map_err(ModelError::Kernel)?;
+                profile.stamp(encoder, &format!("{}o_proj", prefix()))?;
+                timer.lap("o_proj");
+
+                self.linear
+                    .encode_finalize_o_proj_and_pre_ffn_transform(
+                        encoder,
+                        &scratch.raw,
+                        o_out_signs,
+                        &self.gpu_weights.post_attention_norm,
+                        input,
+                        &scratch.hidden_b,
+                        &self.gpu_weights.pre_ffn_norm,
+                        gate_input_signs,
+                        &scratch.transformed,
+                        self.config.hidden_size,
+                        eps,
+                    )
+                    .map_err(ModelError::Kernel)?;
+            }
             profile.stamp(encoder, &format!("{}post_attn_pre_ffn_transform", prefix()))?;
             timer.lap("post_attn_pre_ffn_transform");
         } else {
@@ -2015,36 +2054,109 @@ impl DecoderLayer {
                     )
                 })?;
 
-            self.linear
-                .encode_gemv_raw(
-                    encoder,
-                    packed_down,
-                    self.weights.down_proj.metal_offset,
-                    self.weights.down_proj.permutation_mode,
-                    self.weights.down_proj.rate,
-                    self.weights.down_proj.codebook,
-                    self.weights.down_proj.in_features,
-                    self.weights.down_proj.out_features,
-                    &scratch.transformed,
-                    &scratch.raw,
-                )
-                .map_err(ModelError::Kernel)?;
-            profile.stamp(encoder, &format!("{}down_proj", prefix()))?;
-            timer.lap("down_proj");
+            let use_sk4 = env_flag("KAPLUMBA_SK4")
+                && self.weights.down_proj.permutation_mode == 1
+                && self.weights.down_proj.out_features % 32 == 0
+                && matches!(self.weights.down_proj.rate, Exl3Rate::Integer(3));
 
-            self.linear
-                .encode_finalize_and_post_ffn_norm_scale(
-                    encoder,
-                    &scratch.raw,
-                    down_out_signs,
-                    &self.gpu_weights.post_ffn_norm,
-                    &scratch.hidden_b,
-                    output,
-                    self.config.hidden_size,
-                    eps,
-                    self.weights.layer_scalar,
-                )
-                .map_err(ModelError::Kernel)?;
+            let use_sk2 = !use_sk4
+                && !env_flag("KAPLUMBA_NO_SK2")
+                && self.weights.down_proj.permutation_mode == 1
+                && self.weights.down_proj.out_features % 32 == 0
+                && matches!(self.weights.down_proj.rate, Exl3Rate::Integer(3));
+
+            if use_sk4 {
+                self.linear
+                    .encode_gemv_raw_sk4(
+                        encoder,
+                        packed_down,
+                        self.weights.down_proj.metal_offset,
+                        self.weights.down_proj.permutation_mode,
+                        self.weights.down_proj.rate,
+                        self.weights.down_proj.in_features,
+                        self.weights.down_proj.out_features,
+                        &scratch.transformed,
+                        &scratch.raw,
+                    )
+                    .map_err(ModelError::Kernel)?;
+                profile.stamp(encoder, &format!("{}down_proj", prefix()))?;
+                timer.lap("down_proj");
+
+                self.linear
+                    .encode_finalize_and_post_ffn_norm_scale_sk4(
+                        encoder,
+                        &scratch.raw,
+                        down_out_signs,
+                        &self.gpu_weights.post_ffn_norm,
+                        &scratch.hidden_b,
+                        output,
+                        self.config.hidden_size,
+                        eps,
+                        self.weights.layer_scalar,
+                    )
+                    .map_err(ModelError::Kernel)?;
+            } else if use_sk2 {
+                self.linear
+                    .encode_gemv_raw_sk2(
+                        encoder,
+                        packed_down,
+                        self.weights.down_proj.metal_offset,
+                        self.weights.down_proj.permutation_mode,
+                        self.weights.down_proj.rate,
+                        self.weights.down_proj.in_features,
+                        self.weights.down_proj.out_features,
+                        &scratch.transformed,
+                        &scratch.raw,
+                    )
+                    .map_err(ModelError::Kernel)?;
+                profile.stamp(encoder, &format!("{}down_proj", prefix()))?;
+                timer.lap("down_proj");
+
+                self.linear
+                    .encode_finalize_and_post_ffn_norm_scale_sk2(
+                        encoder,
+                        &scratch.raw,
+                        down_out_signs,
+                        &self.gpu_weights.post_ffn_norm,
+                        &scratch.hidden_b,
+                        output,
+                        self.config.hidden_size,
+                        eps,
+                        self.weights.layer_scalar,
+                    )
+                    .map_err(ModelError::Kernel)?;
+            } else {
+                self.linear
+                    .encode_gemv_raw(
+                        encoder,
+                        packed_down,
+                        self.weights.down_proj.metal_offset,
+                        self.weights.down_proj.permutation_mode,
+                        self.weights.down_proj.rate,
+                        self.weights.down_proj.codebook,
+                        self.weights.down_proj.in_features,
+                        self.weights.down_proj.out_features,
+                        &scratch.transformed,
+                        &scratch.raw,
+                    )
+                    .map_err(ModelError::Kernel)?;
+                profile.stamp(encoder, &format!("{}down_proj", prefix()))?;
+                timer.lap("down_proj");
+
+                self.linear
+                    .encode_finalize_and_post_ffn_norm_scale(
+                        encoder,
+                        &scratch.raw,
+                        down_out_signs,
+                        &self.gpu_weights.post_ffn_norm,
+                        &scratch.hidden_b,
+                        output,
+                        self.config.hidden_size,
+                        eps,
+                        self.weights.layer_scalar,
+                    )
+                    .map_err(ModelError::Kernel)?;
+            }
             profile.stamp(encoder, &format!("{}post_ffn_out", prefix()))?;
             timer.lap("post_ffn_out");
         } else {

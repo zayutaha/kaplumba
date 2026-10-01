@@ -52,10 +52,10 @@
   - Intent: Double-buffer decode staging (`query_positions_decode`, `token_ids_decode`, `host_tokens`), bypass host wait barrier `encoder.flush_and_wait()?` during decode (`tokens == 1`), dispatch GPU device-side token reduction (`encode_argmax_to_token`), and pipeline step $N+1$ submission ahead of waiting on step $N$. Add `retract` to `GpuKvCache` for clean early rollback on EOS.
   - Testing: Verified bit-exact output on golden prompt ("Paris", `stopped_on_eos=true`, 15.49 tok/s); verified multi-token generation on counting prompt (" 4, 5, 6, 7, 8, 9, 10, 11, 12, 13", 32 tokens, 15.33 tok/s); model resident memory strictly $\le 12$ GiB (measured 7.56 GiB); `embed_tokens` kept permanently resident without reloading.
 
-- [ ] **T5.2: MLP & Down-Proj Optimization (Split-K & Memory Coalescing)**
-  - Files: `crates/kernels/src/linear_repacked.metal`, `crates/kernels/src/linear.rs`, `crates/engine/src/model.rs`
-  - Intent: Optimize `down_proj` ($K=21504, N=5376$) and `gate_up` ($K=5376, N=21504$) which consume 39.7 ms of the remaining 65.2 ms GPU execution time. Evaluate 2-way Split-K reduction for `down_proj` to double threadgroup occupancy from 168 to 336 threadgroups across 20 M4 Pro GPU cores.
-  - Testing: Bit-exact verification against reference; A/B benchmark latency measurement.
+- [x] **T5.2: MLP & Down-Proj Optimization (Split-K & Memory Coalescing)**
+  - Files: `crates/kernels/src/linear_repacked.metal`, `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`, `crates/engine/src/model.rs`, `crates/engine/tests/live_kernel_bit_exact.rs`
+  - Intent: Optimize `down_proj` ($K=21504, N=5376$) and `o_proj` ($K=4096, N=5376$) using Split-K=2 to double threadgroup occupancy from 168 to 336 threadgroups across 20 M4 Pro GPU cores, and fuse reduction into post-FFN/pre-FFN norm scaling kernels. Use sequential 2-column streaming (`fused2_2col`) for `gate_up` to prevent cache thrashing.
+  - Testing: Sabotage verified on `2col_sk2` (intentional corruption in accumulator fails with exit 101); full test suite passes (`live_kernel_bit_exact` 1/1, `fused_bit_exact` 3/3, `argmax_engine_parity` 3/3, `repacked_golden` 2/2); golden prompt bit-exact ("Paris"); 32-token decode throughput lifts to 15.75 tok/s (up from 15.33 tok/s), memory resident 7.86 GiB.
 
 - [ ] **T5.3: RMSNorm Prologue Fusion & Dispatch Consolidation**
   - Files: `crates/kernels/src/elements.metal`, `crates/kernels/src/elements.rs`, `crates/engine/src/model.rs`

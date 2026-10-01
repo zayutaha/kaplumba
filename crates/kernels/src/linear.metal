@@ -631,6 +631,112 @@ kernel void linear_finalize_and_post_ffn_norm_scale(
     }
 }
 
+kernel void linear_finalize_and_post_ffn_norm_scale_sk2(
+    const device float *raw [[buffer(0)]],
+    const device half *output_signs [[buffer(1)]],
+    const device half *weight [[buffer(2)]],
+    const device half *residual [[buffer(3)]],
+    device half *output [[buffer(4)]],
+    constant FinalizeNormScaleParams &params [[buffer(5)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+    
+    threadgroup half proj_shared[5376];
+    threadgroup float partial[256];
+    const uint n = params.width;
+    
+    for (uint b = sg; b < params.blocks; b += 8u) {
+        const uint base = b * 128u + lane;
+        float v0 = raw[base] + raw[base + n];
+        float v1 = raw[base + 32u] + raw[base + 32u + n];
+        float v2 = raw[base + 64u] + raw[base + 64u + n];
+        float v3 = raw[base + 96u] + raw[base + 96u + n];
+        transform_simd(v0, v1, v2, v3, lane);
+        proj_shared[base] = half(v0 * float(output_signs[base]));
+        proj_shared[base + 32u] = half(v1 * float(output_signs[base + 32u]));
+        proj_shared[base + 64u] = half(v2 * float(output_signs[base + 64u]));
+        proj_shared[base + 96u] = half(v3 * float(output_signs[base + 96u]));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    float sum = 0.0f;
+    for (uint i = lid; i < params.width; i += 256u) {
+        const float val = float(proj_shared[i]);
+        sum += val * val;
+    }
+    partial[lid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            partial[lid] += partial[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    
+    const float inverse = rsqrt(partial[0] / float(params.width) + params.eps);
+    
+    for (uint i = lid; i < params.width; i += 256u) {
+        const float normed = float(proj_shared[i]) * inverse * float(weight[i]);
+        const float res = float(residual[i]) + normed;
+        output[i] = half(res * params.scale);
+    }
+}
+
+kernel void linear_finalize_and_post_ffn_norm_scale_sk4(
+    const device float *raw [[buffer(0)]],
+    const device half *output_signs [[buffer(1)]],
+    const device half *weight [[buffer(2)]],
+    const device half *residual [[buffer(3)]],
+    device half *output [[buffer(4)]],
+    constant FinalizeNormScaleParams &params [[buffer(5)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+    
+    threadgroup half proj_shared[5376];
+    threadgroup float partial[256];
+    const uint n = params.width;
+    
+    for (uint b = sg; b < params.blocks; b += 8u) {
+        const uint base = b * 128u + lane;
+        float v0 = raw[base] + raw[base + n] + raw[base + 2u * n] + raw[base + 3u * n];
+        float v1 = raw[base + 32u] + raw[base + 32u + n] + raw[base + 32u + 2u * n] + raw[base + 32u + 3u * n];
+        float v2 = raw[base + 64u] + raw[base + 64u + n] + raw[base + 64u + 2u * n] + raw[base + 64u + 3u * n];
+        float v3 = raw[base + 96u] + raw[base + 96u + n] + raw[base + 96u + 2u * n] + raw[base + 96u + 3u * n];
+        transform_simd(v0, v1, v2, v3, lane);
+        proj_shared[base] = half(v0 * float(output_signs[base]));
+        proj_shared[base + 32u] = half(v1 * float(output_signs[base + 32u]));
+        proj_shared[base + 64u] = half(v2 * float(output_signs[base + 64u]));
+        proj_shared[base + 96u] = half(v3 * float(output_signs[base + 96u]));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    float sum = 0.0f;
+    for (uint i = lid; i < params.width; i += 256u) {
+        const float val = float(proj_shared[i]);
+        sum += val * val;
+    }
+    partial[lid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            partial[lid] += partial[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    
+    const float inverse = rsqrt(partial[0] / float(params.width) + params.eps);
+    
+    for (uint i = lid; i < params.width; i += 256u) {
+        const float normed = float(proj_shared[i]) * inverse * float(weight[i]);
+        const float res = float(residual[i]) + normed;
+        output[i] = half(res * params.scale);
+    }
+}
+
 struct PostAttnPreFfnParams {
     uint width;
     uint blocks;
@@ -720,6 +826,85 @@ kernel void linear_finalize_o_proj_and_pre_ffn_transform(
         float v1 = raw[base + 32u];
         float v2 = raw[base + 64u];
         float v3 = raw[base + 96u];
+        transform_simd(v0, v1, v2, v3, lane);
+        shared_buf[base] = half(v0 * float(o_out_signs[base]));
+        shared_buf[base + 32u] = half(v1 * float(o_out_signs[base + 32u]));
+        shared_buf[base + 64u] = half(v2 * float(o_out_signs[base + 64u]));
+        shared_buf[base + 96u] = half(v3 * float(o_out_signs[base + 96u]));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // Step 2: RMS norm 1 (post_attn_norm)
+    float sum1 = 0.0f;
+    for (uint i = lid; i < params.width; i += 256u) {
+        const float val = float(shared_buf[i]);
+        sum1 += val * val;
+    }
+    partial[lid] = sum1;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) partial[lid] += partial[lid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inv1 = rsqrt(partial[0] / float(params.width) + params.eps);
+
+    // Step 3: Add residual and store hidden_b
+    float sum2 = 0.0f;
+    for (uint i = lid; i < params.width; i += 256u) {
+        const float normed1 = float(shared_buf[i]) * inv1 * float(post_attn_norm[i]);
+        const half hb = half(float(residual[i]) + normed1);
+        hidden_b[i] = hb;
+        shared_buf[i] = hb;
+        sum2 += float(hb) * float(hb);
+    }
+    partial[lid] = sum2;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) partial[lid] += partial[lid + stride];
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inv2 = rsqrt(partial[0] / float(params.width) + params.eps);
+
+    // Step 4: Pre-FFN norm + gate input transform into transformed
+    for (uint b = sg; b < params.blocks; b += 8u) {
+        const uint base = b * 128u + lane;
+        float v0 = float(half(float(shared_buf[base]) * inv2 * float(pre_ffn_norm[base]))) * float(gate_input_signs[base]);
+        float v1 = float(half(float(shared_buf[base + 32u]) * inv2 * float(pre_ffn_norm[base + 32u]))) * float(gate_input_signs[base + 32u]);
+        float v2 = float(half(float(shared_buf[base + 64u]) * inv2 * float(pre_ffn_norm[base + 64u]))) * float(gate_input_signs[base + 64u]);
+        float v3 = float(half(float(shared_buf[base + 96u]) * inv2 * float(pre_ffn_norm[base + 96u]))) * float(gate_input_signs[base + 96u]);
+        transform_simd(v0, v1, v2, v3, lane);
+        transformed[base] = half(v0);
+        transformed[base + 32u] = half(v1);
+        transformed[base + 64u] = half(v2);
+        transformed[base + 96u] = half(v3);
+    }
+}
+
+kernel void linear_finalize_o_proj_and_pre_ffn_transform_sk2(
+    const device float *raw [[buffer(0)]],
+    const device half *o_out_signs [[buffer(1)]],
+    const device half *post_attn_norm [[buffer(2)]],
+    const device half *residual [[buffer(3)]],
+    device half *hidden_b [[buffer(4)]],
+    const device half *pre_ffn_norm [[buffer(5)]],
+    const device half *gate_input_signs [[buffer(6)]],
+    device half *transformed [[buffer(7)]],
+    constant PostAttnPreFfnParams &params [[buffer(8)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+
+    threadgroup float partial[256];
+    threadgroup half shared_buf[5376];
+    const uint n = params.width;
+
+    // Step 1: Finalize o_proj into shared_buf (5376 halfs) with sk2 reduction
+    for (uint b = sg; b < params.blocks; b += 8u) {
+        const uint base = b * 128u + lane;
+        float v0 = raw[base] + raw[base + n];
+        float v1 = raw[base + 32u] + raw[base + 32u + n];
+        float v2 = raw[base + 64u] + raw[base + 64u + n];
+        float v3 = raw[base + 96u] + raw[base + 96u + n];
         transform_simd(v0, v1, v2, v3, lane);
         shared_buf[base] = half(v0 * float(o_out_signs[base]));
         shared_buf[base + 32u] = half(v1 * float(o_out_signs[base + 32u]));
