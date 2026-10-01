@@ -267,6 +267,28 @@ fn assert_eq_bits(label: &str, reference: &[u16], actual: &[u16]) {
 /// So one vector proves nothing. A hundred thousand fp16 elements across
 /// `SEEDS` independent vectors is a different claim, and it is the one that
 /// makes "the reduction order is preserved" mean something.
+///
+/// ## What has actually been sabotaged, and what has not (measured)
+///
+/// A test-coverage claim is not a claim until the code has been broken and seen
+/// to fail (AGENTS.md §3). Two changes were made and both trip this test with a
+/// diagnosable message:
+///
+/// | sabotage | observed failure |
+/// |---|---|
+/// | layer L's `lid < 256u` guard widened to `lid < 1024u` | seed 0 residual stream: **5245 of 5376** differ, first `0x3D44` vs `0x3C51` |
+/// | layer L+1's per-thread accumulation stride `256u` -> `255u` | seed 0 next-layer normed: **5101 of 5376** differ, first `0x3BE0` vs `0x3BDE` |
+///
+/// One change that **looks** like a reduction reorder but is not one, recorded
+/// because it is a trap for the next person: widening layer L+1's tree from
+/// `stride = 128` to `stride = 512` **passes**, and it must. Only threads
+/// `0..255` accumulate anything — the guard is `lid < 256u` — so
+/// `partial[256..1023]` holds exact zeros and the extra tree levels add `0.0f`,
+/// which is a no-op in IEEE-754. Same reason layer L's 1024-thread tree is
+/// bit-identical to the 256-thread original it replaced.
+///
+/// The distinction that matters for coverage: a sabotage must change *which
+/// values are grouped*, not *how many zeros are added at the top of the tree*.
 #[test]
 fn cross_layer_fusion_is_bit_identical_to_the_two_dispatches_it_replaces() {
     let Some(device) = Device::system_default() else {

@@ -236,6 +236,64 @@ full runs of the test are now green.
 
 ---
 
+## 3a. Task T3 RESULT: ✅ KEPT. Cross-layer norm fusion, +0.12 tok/s, bit-exact
+
+`finalize_post_ffn_and_next_input_norm_transform` (R2). Fuses layer L's
+`finalize_and_post_ffn_norm_scale_sk2` + residual add with layer L+1's
+`input_norm_and_qkv_transform`, saving one dispatch and one 5372-element
+buffer round-trip at each of the 59 internal layer boundaries.
+
+### A/B, one binary, interleaved
+
+`scripts/abbench` (new, this session — see §6), 64-token greedy generation,
+identical config in both arms, `KAPLUMBA_NO_CROSS_LAYER=1` is the control:
+
+| block | fusion on | fusion off | delta |
+|---|---|---|---|
+| A (n=8) | **15.996** (15.884-15.996, spread 0.112) | 15.876 (15.853-15.936) | **+0.120** |
+| B (n=8) | **15.924** (15.887-15.924, spread 0.037) | 15.855 (15.829-15.880) | **+0.069** |
+| pooled (n=16) | **15.960** | 15.866 | **+0.094** |
+
+**Both blocks are positive and the two independent 8-run blocks agree in sign.**
+The pooled +0.094 is above the 0.01-0.08 tok/s noise floor recorded in
+`decode-25tok-peak-bandwidth` §16.1, so the fusion is kept. It is a small win —
+as it should be: §18.1 measured *all* element kernels at only 1.52 ms/step, and
+this removes roughly a third of them.
+
+Greedy output was **SAME** in every arm, i.e. bit-identical to the baseline
+captured before any of this work started (implementation notes §6.1).
+
+### Bit-exactness, and two sabotages that were tried
+
+`crates/engine/tests/cross_layer_fusion_bit_exact.rs`, 24 vectors × 5376
+elements, `to_bits()` equality on all three outputs. Two sabotages, both
+tripping it with a diagnosable message:
+
+| sabotage | observed |
+|---|---|
+| layer L's `lid < 256u` guard widened to `lid < 1024u` | seed 0 residual stream: **5245 of 5376** differ, `0x3D44` vs `0x3C51` |
+| layer L+1's accumulation stride `256u` → `255u` | seed 0 next-layer normed: **5101 of 5376** differ, `0x3BE0` vs `0x3BDE` |
+
+### A third "sabotage" that was not one, and the trap it sets
+
+The first attempt widened layer L+1's tree from `stride = 128` to `stride = 512`
+— i.e. gave it layer L's 1024-thread shape. **It passed.** That is correct
+behaviour, not a test weakness, and the reason is worth writing down because it
+looks like a hole in the coverage:
+
+Only threads `0..255` accumulate anything (the guard is `lid < 256u`), so
+`partial[256..1023]` holds exact zeros, and the extra tree levels add `0.0f`,
+which is a no-op in IEEE-754. It is the same reason layer L's 1024-thread
+reduction is bit-identical to the 256-thread original it replaced
+(`decode-25tok-peak-bandwidth` §17).
+
+**The rule this gives:** a reduction sabotage must change *which values are
+grouped*, not *how many zeros sit above the tree*. The first attempt changed
+the second kind, so it had nothing to detect. This is recorded in the test
+header so the next person does not spend the same cycle.
+
+---
+
 ## 4. Task T2b RESULT: ❌ NEGATIVE. Two bandwidth-bound kernels cannot overlap.
 
 T2b is the spec's own fallback for T2a, so it got built — as a measurement

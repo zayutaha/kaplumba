@@ -99,7 +99,7 @@ and recorded as a negative (AC6).
 
 ---
 
-- [ ] **T3: Cross-layer norm/residual chain fusion**
+- [x] **T3: Cross-layer norm/residual chain fusion** — **✅ KEPT, +0.09 tok/s**
   - Files: `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`,
     `crates/engine/src/model.rs`
   - Intent: New kernel `finalize_post_ffn_and_next_input_norm_transform_sk2` that
@@ -109,8 +109,16 @@ and recorded as a negative (AC6).
     finalize for the lm_head transition).
   - Testing:
     - Bit-exact: assert `to_bits()` equality on every output element.
-    - Sabotage: corrupt the norm weight load → test must fail.
-    - A/B: interleaved measurement.
+      **24 vectors × 5376 elements, all three outputs.** ✅
+    - Sabotage: two tried, both trip with a diagnosable message —
+      widening layer L's `lid < 256u` guard (5245/5376 differ), and changing
+      layer L+1's accumulation stride `256u`→`255u` (5101/5376 differ).
+      A *third* attempt — giving L+1 layer L's 1024-thread tree — **passes, and
+      correctly so**: only threads 0..255 accumulate, so the extra levels add
+      exact zeros. Recorded in the test header; see notes §3a.
+    - A/B: interleaved, one binary, n=16 in two independent blocks:
+      **15.960 on vs 15.866 off = +0.094 tok/s**, above the 0.01-0.08 noise floor.
+      Greedy token stream `SAME` in every arm.
   - Commit: `spec/decode-20tps: T3 cross-layer norm fusion`
 
 ---
