@@ -1,4 +1,5 @@
 pub mod bench;
+pub mod chat;
 pub mod config;
 pub mod decode_profile;
 pub mod exl3;

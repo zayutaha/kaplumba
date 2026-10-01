@@ -84,6 +84,14 @@ impl GemmaTokenizer {
         Ok(Self { inner, media_ids })
     }
 
+    /// Vocabulary id for a literal piece (e.g. a chat-template marker), if the
+    /// tokenizer knows it as a token. Used by the chat renderer to resolve
+    /// markers without re-tokenizing them, and to fail loudly at startup if a
+    /// checkpoint ever renumbers them.
+    pub fn token_id(&self, piece: &str) -> Option<u32> {
+        self.inner.token_to_id(piece)
+    }
+
     pub fn encode_prompt(&self, prompt: &str) -> Result<Vec<u32>, TokenizerError> {
         if prompt.is_empty() {
             return Err(TokenizerError::EmptyPrompt);
@@ -116,8 +124,7 @@ impl GemmaTokenizer {
         Ok(ids)
     }
 
-    pub fn encode_text(&self, text: &str) -> Result<Vec<u32>, TokenizerError> {
-        if text.is_empty() {
+    pub fn encode_text(&self, text: &str) -> Result<Vec<u32>, TokenizerError> {        if text.is_empty() {
             return Err(TokenizerError::EmptyPrompt);
         }
         if [
