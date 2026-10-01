@@ -1069,7 +1069,8 @@ impl ShardReader {
         let buffer = device.new_buffer_with_bytes_no_copy(
             aligned as *const std::ffi::c_void,
             (end - aligned) as u64,
-            metal::MTLResourceOptions::StorageModeShared,
+            metal::MTLResourceOptions::StorageModeShared
+                | metal::MTLResourceOptions::HazardTrackingModeUntracked,
             None,
         );
         Ok((buffer, delta as u64))

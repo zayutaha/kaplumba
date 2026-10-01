@@ -103,6 +103,23 @@ fn gemv_max_groups() -> u64 {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
+pub struct FinalizeNormScaleParams {
+    pub width: u32,
+    pub blocks: u32,
+    pub eps: f32,
+    pub scale: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct PostAttnPreFfnParams {
+    pub width: u32,
+    pub blocks: u32,
+    pub eps: f32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
 struct LinearParams {
     in_features: u32,
     out_features: u32,
@@ -279,6 +296,10 @@ pub struct LinearKernels {
     finalize_gated_gelu_sk2_pipeline: ComputePipelineState,
     finalize_gated_gelu_and_down_input_pipeline: ComputePipelineState,
     finalize_gated_gelu_and_down_input_sk2_pipeline: ComputePipelineState,
+    pub finalize_and_post_ffn_norm_scale_pipeline: ComputePipelineState,
+    pub post_attn_pre_ffn_transform_pipeline: ComputePipelineState,
+    pub finalize_o_proj_and_pre_ffn_transform_pipeline: ComputePipelineState,
+    pub input_norm_and_qkv_transform_pipeline: ComputePipelineState,
     input_rows_pipeline: ComputePipelineState,
     gemv_tiled_pipeline: ComputePipelineState,
     /// Tensor-core prefill GEMM (`linear_gemm_mma`): dequantize the EXL3 weights
@@ -516,6 +537,26 @@ impl LinearKernels {
             &library,
             "linear_finalize_gated_gelu_and_down_input_transform_sk2",
         )?;
+        let finalize_and_post_ffn_norm_scale_pipeline = pipeline_audit::build(
+            &device,
+            &library,
+            "linear_finalize_and_post_ffn_norm_scale",
+        )?;
+        let post_attn_pre_ffn_transform_pipeline = pipeline_audit::build(
+            &device,
+            &library,
+            "post_attn_pre_ffn_transform",
+        )?;
+        let finalize_o_proj_and_pre_ffn_transform_pipeline = pipeline_audit::build(
+            &device,
+            &library,
+            "linear_finalize_o_proj_and_pre_ffn_transform",
+        )?;
+        let input_norm_and_qkv_transform_pipeline = pipeline_audit::build(
+            &device,
+            &library,
+            "input_norm_and_qkv_transform",
+        )?;
         let input_rows_pipeline = pipeline_audit::build(&device, &library, "linear_input_rows")?;
         let gemv_tiled_pipeline = pipeline_audit::build(&device, &library, "linear_gemv_tiled")?;
         let gemm_mma_pipeline = pipeline_audit::build(&device, &library, "linear_gemm_mma")?;
@@ -561,6 +602,10 @@ impl LinearKernels {
             finalize_gated_gelu_sk2_pipeline,
             finalize_gated_gelu_and_down_input_pipeline,
             finalize_gated_gelu_and_down_input_sk2_pipeline,
+            finalize_and_post_ffn_norm_scale_pipeline,
+            post_attn_pre_ffn_transform_pipeline,
+            finalize_o_proj_and_pre_ffn_transform_pipeline,
+            input_norm_and_qkv_transform_pipeline,
             input_rows_pipeline,
             gemv_tiled_pipeline,
             gemm_mma_pipeline,
@@ -1747,16 +1792,6 @@ impl LinearKernels {
         validate_encode(in_features, out_features, rate, codebook)?;
         let input_blocks = to_u32(in_features / 128, "input dimension")?;
         let output_blocks = to_u32(out_features / 128, "output dimension")?;
-        let params = LinearParams {
-            in_features: to_u32(in_features, "input dimension")?,
-            out_features: to_u32(out_features, "output dimension")?,
-            tile_columns: to_u32(out_features / 16, "tile column count")?,
-            packed_words: to_u32(rate.packed_words(), "packed shape")?,
-            rate: rate.encoded(),
-            codebook: codebook.encoded(),
-            queries: 1,
-            perm_mode,
-        };
         if !pretransformed {
             encoder.dispatch_1d(
                 &self.input_pipeline,
@@ -1836,6 +1871,52 @@ impl LinearKernels {
             }
         }
 
+        self.encode_gemv_raw(
+            encoder,
+            packed,
+            packed_offset,
+            perm_mode,
+            rate,
+            codebook,
+            in_features,
+            out_features,
+            transformed,
+            raw,
+        )?;
+        encoder.dispatch_1d(
+            &self.finalize_simd_pipeline,
+            &[Some(raw), Some(output_signs), Some(output)],
+            &output_blocks.to_le_bytes(),
+            u64::from(output_blocks) * 32,
+            32,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_gemv_raw(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        packed: &Buffer,
+        packed_offset: u64,
+        perm_mode: u32,
+        rate: Exl3Rate,
+        codebook: Exl3Codebook,
+        in_features: usize,
+        out_features: usize,
+        transformed: &Buffer,
+        raw: &Buffer,
+    ) -> Result<(), KernelError> {
+        let params = LinearParams {
+            in_features: to_u32(in_features, "input dimension")?,
+            out_features: to_u32(out_features, "output dimension")?,
+            tile_columns: to_u32(out_features / 16, "tile column count")?,
+            packed_words: to_u32(rate.packed_words(), "packed shape")?,
+            rate: rate.encoded(),
+            codebook: codebook.encoded(),
+            queries: 1,
+            perm_mode,
+        };
+
         if let Some(pipeline) = self.ishizuki_gemv_pipeline(rate, packed_offset, perm_mode) {
             // Trace the name that was *actually selected*, not one reconstructed
             // from the rate: the trace exists to answer "which kernel ran", and a
@@ -1902,13 +1983,7 @@ impl LinearKernels {
                 64,
             )?;
         }
-        encoder.dispatch_1d(
-            &self.finalize_simd_pipeline,
-            &[Some(raw), Some(output_signs), Some(output)],
-            &output_blocks.to_le_bytes(),
-            u64::from(output_blocks) * 32,
-            32,
-        )
+        Ok(())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -2300,6 +2375,150 @@ impl LinearKernels {
             params_bytes(&blocks_abc),
             total_blocks * 32,
             32,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_finalize_and_post_ffn_norm_scale(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        raw: &Buffer,
+        output_signs: &Buffer,
+        weight: &Buffer,
+        residual: &Buffer,
+        output: &Buffer,
+        width: usize,
+        eps: f32,
+        scale: f32,
+    ) -> Result<(), KernelError> {
+        let blocks = to_u32(width / 128, "finalize blocks")?;
+        let params = FinalizeNormScaleParams {
+            width: to_u32(width, "finalize width")?,
+            blocks,
+            eps,
+            scale,
+        };
+        encoder.dispatch_groups(
+            &self.finalize_and_post_ffn_norm_scale_pipeline,
+            &[
+                Some(raw),
+                Some(output_signs),
+                Some(weight),
+                Some(residual),
+                Some(output),
+            ],
+            params_bytes(&params),
+            1,
+            256,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_post_attn_pre_ffn_transform(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        proj: &Buffer,
+        post_attn_norm: &Buffer,
+        residual: &Buffer,
+        hidden_b: &Buffer,
+        pre_ffn_norm: &Buffer,
+        gate_input_signs: &Buffer,
+        transformed: &Buffer,
+        width: usize,
+        eps: f32,
+    ) -> Result<(), KernelError> {
+        let blocks = to_u32(width / 128, "post_attn blocks")?;
+        let params = PostAttnPreFfnParams {
+            width: to_u32(width, "post_attn width")?,
+            blocks,
+            eps,
+        };
+        encoder.dispatch_groups(
+            &self.post_attn_pre_ffn_transform_pipeline,
+            &[
+                Some(proj),
+                Some(post_attn_norm),
+                Some(residual),
+                Some(hidden_b),
+                Some(pre_ffn_norm),
+                Some(gate_input_signs),
+                Some(transformed),
+            ],
+            params_bytes(&params),
+            1,
+            256,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_finalize_o_proj_and_pre_ffn_transform(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        raw: &Buffer,
+        o_out_signs: &Buffer,
+        post_attn_norm: &Buffer,
+        residual: &Buffer,
+        hidden_b: &Buffer,
+        pre_ffn_norm: &Buffer,
+        gate_input_signs: &Buffer,
+        transformed: &Buffer,
+        width: usize,
+        eps: f32,
+    ) -> Result<(), KernelError> {
+        let blocks = to_u32(width / 128, "post_attn blocks")?;
+        let params = PostAttnPreFfnParams {
+            width: to_u32(width, "post_attn width")?,
+            blocks,
+            eps,
+        };
+        encoder.dispatch_groups(
+            &self.finalize_o_proj_and_pre_ffn_transform_pipeline,
+            &[
+                Some(raw),
+                Some(o_out_signs),
+                Some(post_attn_norm),
+                Some(residual),
+                Some(hidden_b),
+                Some(pre_ffn_norm),
+                Some(gate_input_signs),
+                Some(transformed),
+            ],
+            params_bytes(&params),
+            1,
+            256,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_input_norm_and_qkv_transform(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        input: &Buffer,
+        input_norm: &Buffer,
+        q_input_signs: &Buffer,
+        normed: &Buffer,
+        transformed: &Buffer,
+        width: usize,
+        eps: f32,
+    ) -> Result<(), KernelError> {
+        let blocks = to_u32(width / 128, "input_norm blocks")?;
+        let params = PostAttnPreFfnParams {
+            width: to_u32(width, "input_norm width")?,
+            blocks,
+            eps,
+        };
+        encoder.dispatch_groups(
+            &self.input_norm_and_qkv_transform_pipeline,
+            &[
+                Some(input),
+                Some(input_norm),
+                Some(q_input_signs),
+                Some(normed),
+                Some(transformed),
+            ],
+            params_bytes(&params),
+            1,
+            256,
         )
     }
 

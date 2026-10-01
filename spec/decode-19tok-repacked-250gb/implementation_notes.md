@@ -1487,3 +1487,202 @@ boundaries, so its wall times are inflated and its own_ms shares are not),
 - **The other session's `git add -A` swept up my `generate.rs` change** into
   `9cd57a7`. So part of this work is already committed under someone else's
   message. Check before assuming a line is uncommitted.
+
+---
+
+## 21. The (K-split x threads-per-threadgroup) dispatch table, swept
+
+### 21.1 What this closes, and what prompted it
+
+TensorFold (MIT, `/tmp/kaplumba-refs/TensorFold`) hard-codes three offline-tuned
+`(NT, W, PF)` cells at `src/tensorfold/cuda/exl3/experts_grouped.cuh:336-339` and
+picks a `(SK, WK)` pair per shape at `src/tensorfold/cuda/exl3/linear.py:30-45`:
+
+```python
+def plan(k, n, blocks=192, min_tiles=8):
+    kt, nb = k // 16, n // 128
+    sk, wk = (1, 8) if nb >= 64 else (1, 4)
+    if nb < 64:
+        while nb * sk < blocks and sk < 64: sk *= 2
+    while (wk > 4 or sk > 1) and (kt % (sk*wk) or kt//(sk*wk) < min_tiles): ...
+```
+
+Their own note: on the 27B packs, rows 8 and 16 of the 3-bit shapes, "the split a
+shape alone picks is 3-19% off the best cell of the (K split, warps) grid." That
+grid had never been built here. This section builds it.
+
+**Tool:** `crates/engine/examples/sweep_geom.rs`, kernels in
+`crates/kernels/src/colmajor_sweep.metal`, loader `crates/kernels/src/sweep.rs`,
+generator `crates/kernels/examples/gen_colmajor_sweep.rs` (Rust, per AGENTS.md §8).
+
+**Method.** 10 column-major 3 bpw shapes x 4 K-splits x 3 threadgroup widths =
+**120 cells**. Each cell: median of **11 interleaved rounds**, grid rotated one
+cell per round so drift lands on every cell, 4 GB working set (~20x the 208 MiB
+L2) as whole copies of the tensor with the byte offset cycled per dispatch so no
+round can be answered from cache. The split-K **reduction is inside the timed
+region** — an alternative reading of T7.6.9 is that it lost because the arm was
+charged for the reduction, or not; here it is charged, once.
+
+### 21.2 The table (median GB/s; the engine default is SK=1, TG=256)
+
+| shape | K-tiles | tile rows | SK1/TG256 | best cell | best GB/s | **gap** | worst spread |
+|---|---:|---:|---:|---|---:|---:|---:|
+| `sliding/q` | 336 | 512 | **172.6** | sk1_t256 | 172.6 | **+0.0%** | 0.969 |
+| `sliding/k` | 336 | 256 | **161.3** | sk1_t256 | 161.3 | **+0.0%** | 0.934 |
+| `sliding/v` | 336 | 256 | **161.1** | sk1_t256 | 161.1 | **+0.0%** | 0.950 |
+| `sliding/o` | 512 | 336 | **173.7** | sk1_t256 | 173.7 | **+0.0%** | 0.960 |
+| `sliding/gate` | 336 | 1344 | **183.2** | sk1_t256 | 183.2 | **+0.0%** | 0.964 |
+| `sliding/up` | 336 | 1344 | 179.8 | sk1_t128 | 183.2 | +1.9% | 0.971 |
+| `sliding/down` | 1344 | 336 | 181.8 | sk1_t512 | 183.9 | +1.1% | 0.961 |
+| `full/q` | 336 | 1024 | 178.4 | sk2_t128 | 180.1 | +0.9% | 0.961 |
+| `full/kv` | 336 | 128 | 134.6 | sk2_t256 | 141.5 | **+5.1%** | 0.921 |
+| `full/o` | 1024 | 336 | 179.5 | sk2_t256 | 180.6 | +0.6% | 0.966 |
+
+`lm_head` is **not** in this table: 6 bpw and row-major, so a different kernel
+family, and 16384 tile rows is already 819 waves at SK=1. TensorFold's own rule
+sends a shape that wide to SK=1 for the same reason.
+
+**The engine's default is the best cell on 7 of 10 shapes.** The other three are
++0.6%, +0.9% and (for the narrowest shape, 128 tile rows) +5.1%.
+
+**TG at SK=1 is nearly flat, and never a lever.** Against the engine's TG=256,
+TG=128 loses on 8 of 10 shapes (by 0.1–5.1%) and TG=512 loses on 6 of 10 (by
+0.5–3.2%), winning on 4. The whole TG axis spans **−5.1% to +1.9%** — inside the
+0.92 repeatability floor's own uncertainty for the larger gaps, and worth nothing
+on any shape.
+
+**Split-K at high SK is the one unambiguous loser.** `sk8_t512` is the worst or
+second-worst cell on every shape (−9.0% to −36.7%), and `sk8_t256` is behind on
+all 10 (−2.6% to −18.8%). `sk8_t512` is the *worst* cell outright on 6 of 10.
+The exceptions are all at the **wide** end and all modest: `sliding/up` at
+`sk1_t128` +1.9%, `full/kv` at `sk1_t512` +1.7%, `sliding/down` at `sk1_t512`
++1.1%.
+
+So the shape of the grid is: **more threads per threadgroup and more K-splits
+both cost**, monotonically, and the engine already sits at the good end of both
+axes. `sk8_t512` is 16 simdgroups each reducing 16 partial sums through shared
+memory for a single 16-row output tile — the reduction is not paid back.
+
+### 21.3 The projection: is per-shape autotuning worth it?
+
+```
+(a) one global config (SK=1, TG=256): 61.63 ms/token of matvec
+(b) per-shape best cell from table:   61.16 ms/token
+difference: 0.76%
+```
+
+Weighted by `reads_per_token x weight_bytes` (`sliding/q,k,v,o` 50x,
+`gate,up,down` 60x, `full/q,kv,o` 10x), so this is already the byte-weighted
+number, not a per-shape average.
+
+**0.76% is below the ~2% bar, so a table is not worth maintaining for it.** And
+the end-to-end figure is *smaller* than 0.76%, because the 60 layers are a
+dependent chain and a GEMV that is 5% faster on `full/kv` moves a step by
+0.4% × (4.1 MB x 10 / 12.04 GB). Against §20's measured **3.5 us per dispatch**,
+the honest ranking of remaining levers is unchanged: this axis is worth ~0.47 ms
+of a 74 ms step in the best case, against ~0.8 ms for all remaining dispatch
+fusion combined.
+
+TensorFold's 3-19% is a statement about **their** grid on **their** hardware
+(132 SMs, `blocks=192` in `plan()`), not about this one. On 20 GPU cores a
+shape with 512 tile rows is already 25 waves at SK=1; there is no occupancy
+starvation left for a K-split to fix. **Their heuristic is not wrong here, it is
+inapplicable** — and running it would have been a regression, since it sends
+`sliding/o`, `sliding/down` and `full/o` to SK=8 x 4 warps.
+
+### 21.4 TensorFold's `min_tiles=8` guard vs our split rule (the cheaper alternative)
+
+Their guard: reject a `(SK, WK)` whose `kt // (SK*WK)` is under 8. Ours is
+`contig4_sk2`/`contig4_sk4`'s:
+
+```metal
+const uint k_per_split = ((tiles_k / SK) / 32u) * 32u;   // floor to 32, no floor
+```
+
+**Does any shape hit the degenerate case? No.** A zero-width split needs
+`tiles_k / SK < 32`; the smallest `tiles_k` here is 336 and `336/8 = 42`, so no
+shape produces an empty split at SK ∈ {2,4,8}. The sweep kernels use
+`ceil(tiles_k / SK)` instead, which is what `linear_gemv_ishizuki_k3_colmajor_sk4`
+already did; `contig4_sk2`/`_sk4` do not.
+
+**But the rounding remainder is real and it is the whole story.** At
+`tiles_k = 336` (six of ten shapes):
+
+| SK | our widths | widest/narrowest | tiles/simdgroup at TG=512 |
+|---|---|---:|---:|
+| 2 | `[160, 176]` | 1.1x | 10.0 |
+| 4 | `[64, 64, 64, 144]` | **2.2x** | 4.0 |
+| 8 | `[32, 32, 32, 32, 32, 32, 32, 112]` | **3.5x** | **2.0** |
+
+So a split-K cell here is bounded by its slowest threadgroup, which at SK=8 runs
+**3.5x** the work of the others, and at `TG=512` leaves each simdgroup **2
+K-tiles** — the direct analogue of TensorFold's `min_tiles=8`, which they reject
+this configuration for. This is the mechanism behind §21.2's SK=8 losses and is
+a second, independent reason the axis is closed: even if a K-split were worth
+having on some shape, **this rule would have to be fixed first**, and
+`ceil`-splitting is the fix (already present in the non-`_contig4` `_sk4`).
+
+Only `sliding/down` (1344 K-tiles) and `full/o` (1024) clear `min_tiles=8` at
+SK=8 x TG=512, with 10.0 and 8.0.
+
+### 21.5 T7.6.9 confirmed across a wider grid, with one exception
+
+§19.1 measured split-K on **three** shapes and found it slower on all of them
+(`gate_up 168.1` vs `contig4 188.2`). Swept over 10 shapes and 4 splits, with the
+reduction inside the timing window:
+
+- **Split-K never wins by a meaningful margin on any shape wide enough to
+  matter.** On the 9 shapes with ≥ 256 tile rows, the best non-default cell is
+  between −0.7% and **+1.9%**; the three that beat the default do so at
+  `sk2_t128` / `sk1_t128` / `sk1_t512` by 0.9%, 1.9% and 1.1%, i.e. at or inside
+  the noise. At SK ≥ 4 every one of the 10 shapes is behind.
+- **The one exception is `full/kv`** (128 tile rows, 6.4 waves at SK=1, the
+  narrowest shape in the model): SK=2 x TG=256 at 141.5 vs 134.6 GB/s,
+  **+5.1%**. This is the one place TensorFold's occupancy argument has real
+  content on this hardware, and it is also the one shape where the grid is
+  genuinely under-filled. It is worth 4.1 MB x 10 = 41 MB/token of 12.04 GB, so
+  **+0.17% of the step** — real, reproducible (confirmed across four independent
+  11-round and 21-round measurements), and not worth a dispatch arm.
+- **§19.1's `sk4` number replicates.** It measured `gate_up` split-K 4 at
+  `168.1` GB/s against `contig4 188.2`; this sweep, with `ceil` splits and the
+  reduction inside the timing window, measures `sliding/gate` `sk4_t256` at
+  **167.0** against `sk1_t256` **183.2**. Same shape, same verdict, and the
+  `ceil` rule does **not** rescue split-K on a wide shape — it still loses 9%.
+  So the `floor-to-32` remainder (§21.4) is a real defect worth fixing, but it is
+  **not** where `full/kv`'s win comes from, and fixing it does not reopen the axis.
+  The two `sk1` figures differ by 2.6% (`188.2` vs `183.2`) on a different
+  working-set size, which is the normal between-run drift of §10.5 and not
+  meaningful.
+
+### 21.6 Things that cost time and are worth not rediscovering
+
+- **MSL gives a non-kernel function no `using namespace metal;`**, and forbids
+  declaring a `threadgroup` variable in one. A shared body therefore needs an
+  explicit `using namespace metal;` and takes `threadgroup float *` as a
+  parameter, passed as `&red[0][0]` (a 2D threadgroup array does not decay).
+  Templates work; `template <uint SK, uint TG>` on a `static inline` is how the
+  12 entry points share one body.
+- **`decode_state_mcg` takes 16 bits, not 3.** The kernel does
+  `decode_state_mcg(uint(A >> (64-rad)) & 0xffff)`. Using
+  `exl3::extract_ishizuki_lane_codes` (which masks to `& 0x7`, because its caller
+  is the bit-plane repacker) for a CPU reference is 100% wrong and presents as a
+  broken kernel. Caught by the 1e-3 relative gate.
+- **The codebook copy in `colmajor_sweep.metal` is deliberate** (MSL has no include
+  path through `newLibraryWithSource`, and a shared header means editing the
+  generated `linear.metal`). `gemv_sweep_mcg_probe` proves it is the same function
+  every run: 0/256 states differ from `exl3::decode_state`, worst 0.50 fp16 ULP.
+  That residual is the **shipped** kernel's fp16 `half2` add, not drift.
+- **`gpuq`'s lock does not cover this example.** `gpuq try` exits 75 only when
+  the *engine* declines; a benchmark is not the engine, so `gpuq try -- <bench>`
+  runs regardless of a 12 GB model load beside it. A contended sweep does not
+  fail — it returns plausible medians at a 0.4 spread with a fabricated "+34%
+  gap" (observed). **`scripts/sweep_idle` gates on `gpuq status` + a 0.92
+  repeatability floor per cell** and re-measures on rejection; that is what makes
+  this table trustworthy, not the fact that `gpuq` said idle.
+- **Calibrate with 16 iterations, not 4.** At 4 the per-launch cost dominates and
+  the iteration count comes out ~3x high, which on the smallest shape yields a
+  17 ms "40 ms" round.
+- **Discard a warm-up round.** Without it the first three cells' first sample
+  read 58.1 / 86.9 / 110.5 GB/s against a steady state of 126 / 134 / 135, and
+  those were the *only* two cells in the entire sweep to fall below the
+  repeatability floor. It looked exactly like contention.

@@ -50,6 +50,19 @@
 //                                        result stays in the notes.
 //   linear_gemv_ishizuki_k3_colmajor_pair  no Rust caller.
 
+static inline void extract_v_mcg_fast(ulong A, thread float v[8]) {
+    const uint A_hi = uint(A >> 32);
+    const uint A_lo = uint(A);
+    v[0] = decode_state_mcg((A_hi >> 16) & 0xffffu);
+    v[1] = decode_state_mcg((A_hi >> 13) & 0xffffu);
+    v[2] = decode_state_mcg((A_hi >> 10) & 0xffffu);
+    v[3] = decode_state_mcg((A_hi >> 7) & 0xffffu);
+    v[4] = decode_state_mcg((A_hi >> 4) & 0xffffu);
+    v[5] = decode_state_mcg((A_hi >> 1) & 0xffffu);
+    v[6] = decode_state_mcg(((A_hi << 2) | (A_lo >> 30)) & 0xffffu);
+    v[7] = decode_state_mcg(((A_hi << 5) | (A_lo >> 27)) & 0xffffu);
+}
+
 kernel void linear_gemv_ishizuki_k3_colmajor(
     const device ushort *packed [[buffer(0)]],
     const device half *x [[buffer(1)]],
@@ -365,14 +378,10 @@ kernel void linear_gemv_ishizuki_k3_fused2(
         const float p30 = float(xr3[0]), p31 = float(xr3[1]), p32 = float(xr3[8]), p33 = float(xr3[9]);
 
         float v0[8], v1[8], v2[8], v3[8];
-        #pragma unroll
-        for (uint i = 0; i < 8u; ++i) {
-            const uint rad = i * KA + 16u;
-            v0[i] = decode_state_mcg(uint(A0 >> (64u - rad)) & 0xffffu);
-            v1[i] = decode_state_mcg(uint(A1 >> (64u - rad)) & 0xffffu);
-            v2[i] = decode_state_mcg(uint(A2 >> (64u - rad)) & 0xffffu);
-            v3[i] = decode_state_mcg(uint(A3 >> (64u - rad)) & 0xffffu);
-        }
+        extract_v_mcg_fast(A0, v0);
+        extract_v_mcg_fast(A1, v1);
+        extract_v_mcg_fast(A2, v2);
+        extract_v_mcg_fast(A3, v3);
 
         acc0 += p00 * v0[0] + p01 * v0[1] + p02 * v0[2] + p03 * v0[3];
         acc1 += p00 * v0[4] + p01 * v0[5] + p02 * v0[6] + p03 * v0[7];
@@ -391,12 +400,7 @@ kernel void linear_gemv_ishizuki_k3_fused2(
         const device half *xr0 = x + tk * 16u + r0;
         const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
         float v[8];
-        #pragma unroll
-        for (uint i = 0; i < 8u; ++i) {
-            const uint rad = i * KA + 16u;
-            const uint s = uint(A0 >> (64u - rad));
-            v[i] = decode_state_mcg(s & 0xffffu);
-        }
+        extract_v_mcg_fast(A0, v);
         acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
         acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
     }
@@ -648,14 +652,10 @@ kernel void linear_gemv_ishizuki_k3_fused3(
         const float p30 = float(xr3[0]), p31 = float(xr3[1]), p32 = float(xr3[8]), p33 = float(xr3[9]);
 
         float v0[8], v1[8], v2[8], v3[8];
-        #pragma unroll
-        for (uint i = 0; i < 8u; ++i) {
-            const uint rad = i * KA + 16u;
-            v0[i] = decode_state_mcg(uint(A0 >> (64u - rad)) & 0xffffu);
-            v1[i] = decode_state_mcg(uint(A1 >> (64u - rad)) & 0xffffu);
-            v2[i] = decode_state_mcg(uint(A2 >> (64u - rad)) & 0xffffu);
-            v3[i] = decode_state_mcg(uint(A3 >> (64u - rad)) & 0xffffu);
-        }
+        extract_v_mcg_fast(A0, v0);
+        extract_v_mcg_fast(A1, v1);
+        extract_v_mcg_fast(A2, v2);
+        extract_v_mcg_fast(A3, v3);
 
         acc0 += p00 * v0[0] + p01 * v0[1] + p02 * v0[2] + p03 * v0[3];
         acc1 += p00 * v0[4] + p01 * v0[5] + p02 * v0[6] + p03 * v0[7];
@@ -674,12 +674,7 @@ kernel void linear_gemv_ishizuki_k3_fused3(
         const device half *xr0 = x + tk * 16u + r0;
         const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
         float v[8];
-        #pragma unroll
-        for (uint i = 0; i < 8u; ++i) {
-            const uint rad = i * KA + 16u;
-            const uint s = uint(A0 >> (64u - rad));
-            v[i] = decode_state_mcg(s & 0xffffu);
-        }
+        extract_v_mcg_fast(A0, v);
         acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
         acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
     }
@@ -1162,14 +1157,10 @@ kernel void linear_gemv_ishizuki_k3_colmajor_contig4(
             const float p30 = float(xr3[0]), p31 = float(xr3[1]), p32 = float(xr3[8]), p33 = float(xr3[9]);
 
             float v0[8], v1[8], v2[8], v3[8];
-            #pragma unroll
-            for (uint i = 0; i < 8u; ++i) {
-                const uint rad = i * KA + 16u;
-                v0[i] = decode_state_mcg(uint(A0 >> (64u - rad)) & 0xffffu);
-                v1[i] = decode_state_mcg(uint(A1 >> (64u - rad)) & 0xffffu);
-                v2[i] = decode_state_mcg(uint(A2 >> (64u - rad)) & 0xffffu);
-                v3[i] = decode_state_mcg(uint(A3 >> (64u - rad)) & 0xffffu);
-            }
+            extract_v_mcg_fast(A0, v0);
+            extract_v_mcg_fast(A1, v1);
+            extract_v_mcg_fast(A2, v2);
+            extract_v_mcg_fast(A3, v3);
 
             acc0 += p00 * v0[0] + p01 * v0[1] + p02 * v0[2] + p03 * v0[3];
             acc1 += p00 * v0[4] + p01 * v0[5] + p02 * v0[6] + p03 * v0[7];
@@ -1188,12 +1179,7 @@ kernel void linear_gemv_ishizuki_k3_colmajor_contig4(
             const device half *xr0 = x + tk * 16u + r0;
             const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
             float v[8];
-            #pragma unroll
-            for (uint i = 0; i < 8u; ++i) {
-                const uint rad = i * KA + 16u;
-                const uint s = uint(A0 >> (64u - rad));
-                v[i] = decode_state_mcg(s & 0xffffu);
-            }
+            extract_v_mcg_fast(A0, v);
             acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
             acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
         }

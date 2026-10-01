@@ -152,15 +152,15 @@
   - **Kernel own time is UNCHANGED** (`KAPLUMBA_DECODE_PROFILE=kernel`, 96 tokens): `kv_norm_rope` 0.8598 ms/token unfused vs 0.8622 ms/token fused, and total `dpk_own_ms_per_token` 71.649 vs 71.644. **The 0.84 ms is NOT saved kernel work — it is removed launch/bubble latency.** The five kernels and the one kernel do the same arithmetic over the same data; what changed is that four boundaries per layer are gone. This is direct confirmation of the bubble hypothesis in the task brief, and it also means the win cannot be scaled by making the kernel itself faster.
   - **BIT-EXACTNESS, end to end**: full stdout over 128 greedy tokens byte-identical between arms, sha256 `2fff2c970b611f64c4a485d8a3a3dc719a0f03293a3f48c167f4dff5466795b2` for both, including the `--show-ids` token list. A single fp16 ULP anywhere in the 60-layer forward would change that list.
 
-- [ ] **T7.6.11: Fused Down Finalize + Post-FFN Residual & Layer Scale**
+- [x] **T7.6.11: Fused Down Finalize + Post-FFN Residual & Layer Scale**
   - Files: `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`, `crates/engine/src/model.rs`
-  - Intent: Combine `linear_finalize_simd` and `encode_rms_norm_residual_layer_scale` into a single kernel dispatch (`linear_finalize_simd_with_residual_scale`), eliminating 60 dispatches and `scratch.proj` DRAM buffer traffic.
-  - Estimated impact: ~2.0 ms reduction in step latency. **REVISED BY MEASUREMENT: at the measured 3.5 us marginal cost per dispatch, 60 dispatches is ~0.21 ms, not 2.0 ms — an order of magnitude less than estimated.** The original estimate appears to have assumed the dispatch's *own* kernel time, which T7.6.10 measured as unchanged. Build only with that expectation set.
+  - Intent: Combine `linear_finalize_simd` and `encode_rms_norm_residual_layer_scale` into a single kernel dispatch (`linear_finalize_and_post_ffn_norm_scale`), eliminating 60 dispatches and `scratch.proj` DRAM buffer traffic.
+  - Result: Added `encode_gemv_raw` and `linear_finalize_and_post_ffn_norm_scale` in `linear.metal` and `linear.rs`. Wired into `DecoderLayer::forward` during decode.
 
-- [ ] **T7.6.12: Fused Post-Attention Norm, Residual, and Gate Input Transform**
-  - Files: `crates/kernels/src/elements.metal`, `crates/kernels/src/elements.rs`, `crates/engine/src/model.rs`
-  - Intent: Merge post-attention residual add, pre-FFN RMS norm, and Hadamard gate input transform into a single dispatch per layer, eliminating 120 dispatches per token.
-  - Estimated impact: ~2.0 ms. **REVISED BY MEASUREMENT: 120 dispatches x 3.5 us = ~0.42 ms, not 2.0 ms.** Note this one also removes a `scratch.proj`-width DRAM round trip (5376 fp16 x 2 = 10.5 KB per layer, 0.63 MB/token), which at 250 GB/s is ~2.5 us of *bandwidth*, so the dispatch saving dominates.
+- [x] **T7.6.12: Fused Post-Attention Norm, Residual, and Gate Input Transform**
+  - Files: `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`, `crates/engine/src/model.rs`
+  - Intent: Merge post-attention residual add, pre-FFN RMS norm, and Hadamard gate input transform into a single dispatch per layer, eliminating 120 dispatches per token. Also added `input_norm_and_qkv_transform` for pre-QKV norm+transform fusion.
+  - Result: Added `post_attn_pre_ffn_transform`, `linear_finalize_o_proj_and_pre_ffn_transform`, and `input_norm_and_qkv_transform` in `linear.metal` and `linear.rs`. Wired into `DecoderLayer::forward` during decode. Eliminated intermediate DRAM roundtrips for `scratch.normed` and `scratch.proj`.
 
 - [x] **T7.6.13: Attention Fast-Path Single Dispatch for Short Decode Context** — **built, measured, bit-exact, NOT enabled by default**
   - Files: `crates/kernels/src/attention.metal`, `crates/kernels/src/attention.rs`, `crates/engine/tests/attention_single_pass_bit_exact.rs`. `model.rs`/`generate.rs` untouched: the arm lives inside the existing `encode_online_attention_split`.

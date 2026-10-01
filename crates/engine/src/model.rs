@@ -1349,27 +1349,41 @@ impl DecoderLayer {
         // whether the shared input transform below is worth issuing.
         let decode = tokens == 1;
 
-        self.hidden_norm(
-            encoder,
-            &self.gpu_weights.input_norm,
-            input,
-            &scratch.normed,
-            tokens,
-            eps,
-        )?;
-
-        // q, k and v all read `scratch.normed`, so transform it once and let the
-        // three matvecs share it. That was 3 of the 7 input transforms a layer
-        // issued, each a tiny dependent dispatch in front of a large one.
-        //
-        // Decode only. The prefill matmul runs `linear_input_rows` first, which
-        // rewrites all `queries * in_features` elements of `transformed` from the
-        // input and its signs (linear.metal, `linear_input_rows`), so whatever
-        // this left there is overwritten before anything reads it: 2 dispatches
-        // per layer per chunk of pure waste. `PrefillEncodeRequest` has no
-        // `pretransformed` field precisely because the prefill never reuses it.
-        if decode {
-            self.encode_input_transform(encoder, &self.weights.q_proj, &scratch.normed, scratch)?;
+        if decode && self.weights.q_proj.permutation_mode == 1 {
+            let q_input_signs = self
+                .weights
+                .q_proj
+                .input_signs_buffer
+                .as_ref()
+                .ok_or_else(|| {
+                    ModelError::InvalidWeights(
+                        "q_proj input signs are not resident".to_string(),
+                    )
+                })?;
+            self.linear
+                .encode_input_norm_and_qkv_transform(
+                    encoder,
+                    input,
+                    &self.gpu_weights.input_norm,
+                    q_input_signs,
+                    &scratch.normed,
+                    &scratch.transformed,
+                    self.config.hidden_size,
+                    eps,
+                )
+                .map_err(ModelError::Kernel)?;
+        } else {
+            self.hidden_norm(
+                encoder,
+                &self.gpu_weights.input_norm,
+                input,
+                &scratch.normed,
+                tokens,
+                eps,
+            )?;
+            if decode {
+                self.encode_input_transform(encoder, &self.weights.q_proj, &scratch.normed, scratch)?;
+            }
         }
         // Boundary 1 of 15. The input norm -- and, in decode, the shared
         // transform it precedes -- is elementwise over `tokens * hidden` and
@@ -1740,68 +1754,177 @@ impl DecoderLayer {
         profile.stamp(encoder, &format!("{}attention", prefix()))?;
         timer.lap("attention");
 
-        self.encode_linear(
-            encoder,
-            &self.weights.o_proj,
-            &scratch.attended,
-            &scratch.proj,
-            tokens,
-            scratch,
-            false,
-        )?;
-        profile.stamp(encoder, &format!("{}o_proj", prefix()))?;
-        timer.lap("o_proj");
-        if decode {
-            self.elements.encode_rms_norm_residual(
-                encoder,
-                &scratch.proj,
-                &self.gpu_weights.post_attention_norm,
-                input,
-                &scratch.hidden_b,
-                tokens,
-                self.config.hidden_size,
-                eps,
-            )?;
+        if decode
+            && self.weights.o_proj.permutation_mode == 1
+            && self.weights.gate_proj.permutation_mode == 1
+        {
+            let packed_o = self.weights.o_proj.metal_buffer.as_ref().ok_or_else(|| {
+                ModelError::InvalidWeights("o_proj has no GPU-resident weights".to_string())
+            })?;
+            let o_input_signs = self
+                .weights
+                .o_proj
+                .input_signs_buffer
+                .as_ref()
+                .ok_or_else(|| {
+                    ModelError::InvalidWeights("o_proj input signs are not resident".to_string())
+                })?;
+            let o_out_signs = self
+                .weights
+                .o_proj
+                .output_signs_buffer
+                .as_ref()
+                .ok_or_else(|| {
+                    ModelError::InvalidWeights("o_proj output signs are not resident".to_string())
+                })?;
+            let gate_input_signs = self
+                .weights
+                .gate_proj
+                .input_signs_buffer
+                .as_ref()
+                .ok_or_else(|| {
+                    ModelError::InvalidWeights(
+                        "gate_proj input signs are not resident".to_string(),
+                    )
+                })?;
+
+            self.linear
+                .encode_input_transform(
+                    encoder,
+                    &scratch.attended,
+                    o_input_signs,
+                    &scratch.transformed,
+                    self.weights.o_proj.in_features,
+                )
+                .map_err(ModelError::Kernel)?;
+
+            self.linear
+                .encode_gemv_raw(
+                    encoder,
+                    packed_o,
+                    self.weights.o_proj.metal_offset,
+                    self.weights.o_proj.permutation_mode,
+                    self.weights.o_proj.rate,
+                    self.weights.o_proj.codebook,
+                    self.weights.o_proj.in_features,
+                    self.weights.o_proj.out_features,
+                    &scratch.transformed,
+                    &scratch.raw,
+                )
+                .map_err(ModelError::Kernel)?;
+            profile.stamp(encoder, &format!("{}o_proj", prefix()))?;
+            timer.lap("o_proj");
+
+            self.linear
+                .encode_finalize_o_proj_and_pre_ffn_transform(
+                    encoder,
+                    &scratch.raw,
+                    o_out_signs,
+                    &self.gpu_weights.post_attention_norm,
+                    input,
+                    &scratch.hidden_b,
+                    &self.gpu_weights.pre_ffn_norm,
+                    gate_input_signs,
+                    &scratch.transformed,
+                    self.config.hidden_size,
+                    eps,
+                )
+                .map_err(ModelError::Kernel)?;
+            profile.stamp(encoder, &format!("{}post_attn_pre_ffn_transform", prefix()))?;
+            timer.lap("post_attn_pre_ffn_transform");
         } else {
+            self.encode_linear(
+                encoder,
+                &self.weights.o_proj,
+                &scratch.attended,
+                &scratch.proj,
+                tokens,
+                scratch,
+                false,
+            )?;
+            profile.stamp(encoder, &format!("{}o_proj", prefix()))?;
+            timer.lap("o_proj");
+            if decode && self.weights.gate_proj.permutation_mode == 1 {
+                let gate_input_signs = self
+                    .weights
+                    .gate_proj
+                    .input_signs_buffer
+                    .as_ref()
+                    .ok_or_else(|| {
+                        ModelError::InvalidWeights(
+                            "gate_proj input signs are not resident".to_string(),
+                        )
+                    })?;
+                self.linear
+                    .encode_post_attn_pre_ffn_transform(
+                        encoder,
+                        &scratch.proj,
+                        &self.gpu_weights.post_attention_norm,
+                        input,
+                        &scratch.hidden_b,
+                        &self.gpu_weights.pre_ffn_norm,
+                        gate_input_signs,
+                        &scratch.transformed,
+                        self.config.hidden_size,
+                        eps,
+                    )
+                    .map_err(ModelError::Kernel)?;
+                profile.stamp(encoder, &format!("{}post_attn_pre_ffn_transform", prefix()))?;
+                timer.lap("post_attn_pre_ffn_transform");
+            } else {
+            if decode {
+                self.elements.encode_rms_norm_residual(
+                    encoder,
+                    &scratch.proj,
+                    &self.gpu_weights.post_attention_norm,
+                    input,
+                    &scratch.hidden_b,
+                    tokens,
+                    self.config.hidden_size,
+                    eps,
+                )?;
+            } else {
+                self.hidden_norm(
+                    encoder,
+                    &self.gpu_weights.post_attention_norm,
+                    &scratch.proj,
+                    &scratch.normed,
+                    tokens,
+                    eps,
+                )?;
+                self.elements.encode_residual_add(
+                    encoder,
+                    input,
+                    &scratch.normed,
+                    &scratch.hidden_b,
+                    elements,
+                )?;
+            }
+            profile.stamp(encoder, &format!("{}post_attn_norm_res", prefix()))?;
+            timer.lap("post_attn_norm_res");
             self.hidden_norm(
                 encoder,
-                &self.gpu_weights.post_attention_norm,
-                &scratch.proj,
+                &self.gpu_weights.pre_ffn_norm,
+                &scratch.hidden_b,
                 &scratch.normed,
                 tokens,
                 eps,
             )?;
-            self.elements.encode_residual_add(
-                encoder,
-                input,
-                &scratch.normed,
-                &scratch.hidden_b,
-                elements,
-            )?;
-        }
-        profile.stamp(encoder, &format!("{}post_attn_norm_res", prefix()))?;
-        timer.lap("post_attn_norm_res");
-        self.hidden_norm(
-            encoder,
-            &self.gpu_weights.pre_ffn_norm,
-            &scratch.hidden_b,
-            &scratch.normed,
-            tokens,
-            eps,
-        )?;
 
-        // gate and up read the same activation too -- decode only, for the
-        // reason given above the q/k/v transform.
-        if decode {
-            self.encode_input_transform(
-                encoder,
-                &self.weights.gate_proj,
-                &scratch.normed,
-                scratch,
-            )?;
+            // gate and up read the same activation too -- decode only, for the
+            // reason given above the q/k/v transform.
+            if decode {
+                self.encode_input_transform(
+                    encoder,
+                    &self.weights.gate_proj,
+                    &scratch.normed,
+                    scratch,
+                )?;
+            }
+            profile.stamp(encoder, &format!("{}pre_ffn_norm_transform", prefix()))?;
+            timer.lap("pre_ffn_norm_transform");
         }
-        profile.stamp(encoder, &format!("{}pre_ffn_norm_transform", prefix()))?;
-        timer.lap("pre_ffn_norm_transform");
+        }
 
         if decode && self.weights.gate_proj.permutation_mode == 1 {
             let packed_gate = self
@@ -1873,17 +1996,57 @@ impl DecoderLayer {
                 .map_err(ModelError::Kernel)?;
             profile.stamp(encoder, &format!("{}gate_up_gelu", prefix()))?;
             timer.lap("gate_up_gelu");
-            self.encode_linear(
-                encoder,
-                &self.weights.down_proj,
-                &scratch.transformed,
-                &scratch.proj,
-                tokens,
-                scratch,
-                true,
-            )?;
+            let packed_down = self
+                .weights
+                .down_proj
+                .metal_buffer
+                .as_ref()
+                .ok_or_else(|| {
+                    ModelError::InvalidWeights("down_proj has no GPU-resident weights".to_string())
+                })?;
+            let down_out_signs = self
+                .weights
+                .down_proj
+                .output_signs_buffer
+                .as_ref()
+                .ok_or_else(|| {
+                    ModelError::InvalidWeights(
+                        "down_proj output signs are not resident".to_string(),
+                    )
+                })?;
+
+            self.linear
+                .encode_gemv_raw(
+                    encoder,
+                    packed_down,
+                    self.weights.down_proj.metal_offset,
+                    self.weights.down_proj.permutation_mode,
+                    self.weights.down_proj.rate,
+                    self.weights.down_proj.codebook,
+                    self.weights.down_proj.in_features,
+                    self.weights.down_proj.out_features,
+                    &scratch.transformed,
+                    &scratch.raw,
+                )
+                .map_err(ModelError::Kernel)?;
             profile.stamp(encoder, &format!("{}down_proj", prefix()))?;
             timer.lap("down_proj");
+
+            self.linear
+                .encode_finalize_and_post_ffn_norm_scale(
+                    encoder,
+                    &scratch.raw,
+                    down_out_signs,
+                    &self.gpu_weights.post_ffn_norm,
+                    &scratch.hidden_b,
+                    output,
+                    self.config.hidden_size,
+                    eps,
+                    self.weights.layer_scalar,
+                )
+                .map_err(ModelError::Kernel)?;
+            profile.stamp(encoder, &format!("{}post_ffn_out", prefix()))?;
+            timer.lap("post_ffn_out");
         } else {
             self.encode_linear(
                 encoder,
@@ -1928,44 +2091,46 @@ impl DecoderLayer {
             profile.stamp(encoder, &format!("{}down_proj", prefix()))?;
             timer.lap("down_proj");
         }
-        if decode {
-            self.elements.encode_rms_norm_residual_layer_scale(
-                encoder,
-                &scratch.proj,
-                &self.gpu_weights.post_ffn_norm,
-                &scratch.hidden_b,
-                output,
-                tokens,
-                self.config.hidden_size,
-                eps,
-                self.weights.layer_scalar,
-            )?;
-        } else {
-            self.hidden_norm(
-                encoder,
-                &self.gpu_weights.post_ffn_norm,
-                &scratch.proj,
-                &scratch.proj,
-                tokens,
-                eps,
-            )?;
-            self.elements.encode_residual_add(
-                encoder,
-                &scratch.hidden_b,
-                &scratch.proj,
-                output,
-                elements,
-            )?;
-            self.elements.encode_layer_scale(
-                encoder,
-                output,
-                output,
-                elements,
-                self.weights.layer_scalar,
-            )?;
+        if !(decode && self.weights.gate_proj.permutation_mode == 1) {
+            if decode {
+                self.elements.encode_rms_norm_residual_layer_scale(
+                    encoder,
+                    &scratch.proj,
+                    &self.gpu_weights.post_ffn_norm,
+                    &scratch.hidden_b,
+                    output,
+                    tokens,
+                    self.config.hidden_size,
+                    eps,
+                    self.weights.layer_scalar,
+                )?;
+            } else {
+                self.hidden_norm(
+                    encoder,
+                    &self.gpu_weights.post_ffn_norm,
+                    &scratch.proj,
+                    &scratch.proj,
+                    tokens,
+                    eps,
+                )?;
+                self.elements.encode_residual_add(
+                    encoder,
+                    &scratch.hidden_b,
+                    &scratch.proj,
+                    output,
+                    elements,
+                )?;
+                self.elements.encode_layer_scale(
+                    encoder,
+                    output,
+                    output,
+                    elements,
+                    self.weights.layer_scalar,
+                )?;
+            }
+            profile.stamp(encoder, &format!("{}post_ffn_out", prefix()))?;
+            timer.lap("post_ffn_out");
         }
-        profile.stamp(encoder, &format!("{}post_ffn_out", prefix()))?;
-        timer.lap("post_ffn_out");
         Ok(())
     }
 
