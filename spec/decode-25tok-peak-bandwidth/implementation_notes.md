@@ -292,3 +292,171 @@ With CPU-GPU submission serialization completely removed (0 ms idle gap), the to
   - 256-thread finalize: median **15.634 tok/s** (range 15.609–15.655).
   - 1024-thread finalize: median **15.838 tok/s** (range 15.770–15.867).
   - **Improvement: +0.204 tok/s (+1.3%).** The ranges don't overlap, so this is a real improvement.
+
+---
+
+## 16. Baseline, Profilers Reconciled, and the Bandwidth Ceiling
+
+This section replaces the per-kernel numbers that earlier sections quote. They
+moved 2x between runs and contradicted themselves; the causes were found and are
+recorded here so nobody re-derives them.
+
+### 16.1 A trustworthy baseline
+
+`scripts/gpuq try -- ./target/release/kaplumba --model ~/.kaplumba/models/Gxma-repacked
+--prompt "Count from 1 to 50: 1, 2, 3," --max-new-tokens 32 --temperature 0 --metrics`,
+interleaved A B A B ... , identical config in both arms:
+
+```
+A  n=5  median=15.849  min=15.847  max=15.874  spread=0.027
+B  n=5  median=15.839  min=15.826  max=15.902  spread=0.076
+```
+
+**Two arms running the same binary differ by 0.010 tok/s.** So the noise floor of
+this harness is ~0.01-0.08 tok/s and **anything above 0.1 tok/s is signal**. The
+historical readings of 15.33/15.41/15.46/15.49/15.61-15.84 from "the same binary"
+were different code, not thermal drift -- re-running HEAD gives 15.85 with a
+spread of 0.03. **T5.2's claimed 15.33 -> 15.75 was not established**, and neither
+was any other single before/after pair in this spec.
+
+### 16.2 Two profilers, and which one to believe
+
+- `KAPLUMBA_GPU_PROFILE=1` attributes time to named **output buffers**. A fused
+  kernel that writes q, k and v therefore appears as three rows, and it splits
+  gate/up by something that is not shape (gate and up are identical shapes and
+  get 337.985 vs 418.373). Derived from it, qkv looks like 90 GB/s, which is
+  wrong. **Do not use it for per-projection bandwidth.**
+- `KAPLUMBA_DECODE_PROFILE=kernel` labels by **role** and survives fusion
+  (`gate_up_gelu`, `qkv_proj`, `o_proj`, `down_proj`). Calibrating it against
+  `head/gemv` -- one big kernel where the profiler is accurate because the
+  arithmetic checks out (1.057 GB / 4.12 ms = 257 GB/s) -- gives a scale factor
+  of 1.71 between its `own_ms` and real ms. **This is the profiler to use.**
+
+Authoritative table (`own_ms/step`, total 108.6, real step 63.1 ms):
+
+| role | own_ms/step | share | MB/layer | own_ms/MB | implied GB/s |
+|---|---|---|---|---|---|
+| gate_up_gelu | 43.90 | 40.4% | 86.70 | 0.4340 | ~204 |
+| down_proj | 20.26 | 18.7% | 43.35 | 0.4272 | ~200 |
+| o_proj | 12.35 | 11.4% | 16.52 | **0.8575** | **~100** |
+| head/gemv | 4.12 | 3.8% | 1057 MB | - | 257 |
+| qkv_proj | 14.43 | 13.4% | 33.04 | 0.4368 | ~196 |
+
+qkv, gate_up and down_proj are all within 9% of each other. **Only `o_proj` is an
+outlier, at half the bandwidth, and it is 11% of GPU time.** Earlier notes that
+flagged "qkv at 90 GB/s" were reading the broken profiler.
+
+### 16.3 New tool: `crates/engine/tests/gemv_bandwidth.rs`
+
+End-to-end tok/s cannot separate "this kernel is slow" from "this shape is
+small", and a 7.5 s model load per data point is too slow to iterate. This
+microbenchmark runs the real dispatch paths on synthetic buffers. Three things
+were needed to make its numbers mean anything, each of which was a wrong
+measurement first:
+
+1. **GPU clock, not wall clock.** metal-rs 0.33 has no timing-info descriptor,
+   so `GPUStartTime` reads back as zero; the engine reaches those selectors
+   through its own `CommandBufferGpuTiming` trait. A wall-clock first version was
+   *launch-bound at every point* -- ~44 us of CPU per dispatch against ~50 us of
+   GPU work, so it measured the CPU and reported 1600-2000 GB/s.
+2. **`set_max_dispatches(u32::MAX)`.** The encoder rolls to a fresh command
+   buffer every `max_dispatches` and `commit_stamped` only parks the *current*
+   one, so without this the GPU span covered a fraction of the work and reported
+   up to 6500 GB/s.
+3. **Rotating buffers, >=192 MiB working set.** Production streams 10.78 GB of
+   distinct weights per token; re-reading one matrix repeatedly can be served
+   from L2 and reports bandwidth the real workload never sees.
+
+**Validation:** `colmajor_2col_sk2` at K=21504, N=5376 measures **199.3 GB/s**,
+against 200 GB/s derived from production for `down_proj`. And at K=8192 it
+measures 120.7 GB/s, against ~100-120 for `o_proj`. It reproduces both production
+anchors, so its *absolute* numbers are trustworthy.
+
+Result (N=5376, the o_proj/down_proj output width):
+
+| K | sk2 | no split-K | sk4 |
+|---|---|---|---|
+| 4096 | 39.2 | 148.0 | 160.3 |
+| 8192 (**o_proj**) | **120.7** | 170.6 | **183.3** |
+| 16384 | 159.2 | 167.3 | 197.3 |
+| 21504 (**down_proj**) | 199.3 | 175.5 | 203.0 |
+| 32768 | 195.0 | 171.9 | 202.5 |
+
+Efficiency is a monotone function of K and is **flat in N** (K=5376: 168 GB/s at
+N=4096, 179 at N=8192, 177.5 at N=21504, 179.3 at N=43008). So a short K means
+each threadgroup's stream is too short to amortise its fixed per-threadgroup cost
+(ramp, `red[2][8][16]` epilogue, grid-stride loop). That is the mechanism
+behind `o_proj`'s 2x deficit -- it is intrinsic to the shape, not a bug in its
+kernel.
+
+**The microbenchmark must NOT be used to choose between kernel variants.**
+It says sk4 at K=8192 is 52% faster than sk2 and that no-split-K is 41% faster;
+production says the opposite for both (`KAPLUMBA_O_SK4=1` 15.781 vs 15.818;
+`KAPLUMBA_NO_SK2=1` 15.271 vs 15.816). Confirmed by profiling `o_proj` directly:
+production `o_proj` own_ms is **172.9 on sk2 and 211.1 on sk4**, while the
+microbenchmark had sk4 far ahead. The isolated benchmark re-reads a small set of
+buffers back to back, which is not the interleaved 10.78 GB stream production
+sees. **Production tok/s from interleaved A/B is the only arbiter**; the
+microbenchmark is for absolute bandwidth and for the shape/K sweep.
+
+### 16.4 The ceiling: 20 tok/s needs 237 GB/s sustained
+
+Bytes per generated token, from `config.json` (hidden 5376, intermediate 21504,
+60 layers, 32 q heads x 256, 16 kv heads x 256, vocab 262144, 3 bpw weights,
+6 bpw lm_head):
+
+```
+q 8192x5376 + k 4096x5376 + v 4096x5376 = 33.04 MB
+o_proj        5376x8192                = 16.52 MB
+gate + up     21504x5376 x2            = 86.70 MB
+down          5376x21504               = 43.35 MB
+                                  layer  = 179.61 MB
+                                  x60    = 10.777 GB
+lm_head 262144x5376 at 6 bpw          =  1.057 GB
+                                  total = 11.834 GB / token
+```
+
+| target | ms/step | required sustained bandwidth | as % of 273 GB/s wire |
+|---|---|---|---|
+| current 15.85 tok/s | 63.1 | 187.5 GB/s | 69% |
+| 20 tok/s | 50.0 | **236.7 GB/s** | **87%** |
+| 23 tok/s (wire bound, zero overhead) | 43.4 | 273 GB/s | 100% |
+
+The **best 3-bpw EXL3 GEMV measured on this box is 203 GB/s** (`colmajor_2col_sk4`
+at K=21504). `head/gemv` reaches 257 GB/s = 94% of wire, but it is **6 bpw**, so
+each 16x16 trellis tile is 192 bytes instead of 96: the same fixed per-threadgroup
+cost is amortised over twice the bytes. That is why it looks better, and it is
+not a template for the layer GEMVs -- GB/s was flat in N everywhere it was
+measured, so there is no large-N trick.
+
+**Therefore 20 tok/s requires every layer GEMV to beat the best 3-bpw kernel
+currently in the tree by 17%, while also spending zero time on attention, norms,
+cache writes and dispatch.** At the measured 3-bpw peak of 203 GB/s the absolute
+ceiling with *zero* non-GEMV overhead is 11.834/0.203 = 58.3 ms = **17.2 tok/s**;
+we are at 63.1 ms, so the recoverable amount is the ~4.8 ms of non-GEMV work.
+
+**This spec's 20 tok/s acceptance criterion is not reachable on M4 Pro.** The
+realistic target is 16.5-17.5 tok/s. Recorded here rather than quietly dropped;
+the decision to re-scope belongs to the user.
+
+### 16.5 Production A/B results this session
+
+| config | median tok/s | vs baseline |
+|---|---|---|
+| baseline (HEAD 223ea09) | 15.849 | - |
+| `KAPLUMBA_NO_SK2=1` (o_proj -> colmajor_2col) | 15.271 | **-0.58** |
+| `KAPLUMBA_SK2_CONTIG4=1` | 15.513 | **-0.31** |
+| `KAPLUMBA_O_SK4=1` | 15.781 | -0.04 |
+
+All three attempts to fix `o_proj` by changing its split-K failed in production
+even though two of them look like large wins in isolation. Do not retry these.
+
+### 16.6 Repo hygiene fixed
+
+HEAD (`223ea09`) referenced `linear_gemv_ishizuki_k3_colmajor_1col_sk2` from
+`linear.rs` but did not contain that kernel -- setting `KAPLUMBA_SK2_1COL=1` on
+the committed tree would have crashed in `newFunctionWithName`. The 1col kernels
+and their bit-exact tests are now committed alongside it, so the documented
+T5.5 negative-result switch is reachable. A third kernel,
+`linear_gemv_ishizuki_k3_fused2_1col`, was half-written and referenced by nothing
+and by no test; it was deleted rather than committed.

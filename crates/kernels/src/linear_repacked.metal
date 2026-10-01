@@ -2205,6 +2205,205 @@ kernel void linear_gemv_ishizuki_k3_colmajor_2col(
     }
 }
 
+kernel void linear_gemv_ishizuki_k3_colmajor_1col(
+    const device ushort *packed [[buffer(0)]],
+    const device half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant const uint *shape [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    constexpr uint KA = 3u;
+    constexpr int CB = 1;
+    constexpr uint RING = 256u * KA;
+    constexpr uint WORDS = RING / 32u;
+    const uint K = shape[0];
+    const uint N = shape[1];
+    const uint tiles_n = N / 16u;
+    const uint tiles_k = K / 16u;
+    constexpr int SG = 8;
+    threadgroup float red[SG][16];
+    const uint r0 = (lane % 4u) * 2u;
+
+    const uint lo0 = (lane * 8u + 1u) * 3u + RING - 16u;
+    const uint sh0 = lo0 % 32u;
+    const uint rsh0 = 32u - sh0;
+    const uint hi0 = lo0 / 32u;
+    const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
+    const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
+
+    for (uint tn = tgid; tn < tiles_n; tn += ntg) {
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+
+        const device uint *col0 = (const device uint *)packed + tn * (tiles_k * WORDS);
+        const uint stride = WORDS;
+
+        const uint step = SG * 2u;
+        const uint k_unroll_end = (tiles_k / step) * step;
+
+        uint tk = sg * 2u;
+        for (; tk < k_unroll_end; tk += step) {
+            const device half *xr0 = x + (tk + 0u) * 16u + r0;
+            const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
+            const device half *xr1 = x + (tk + 1u) * 16u + r0;
+            const float p10 = float(xr1[0]), p11 = float(xr1[1]), p12 = float(xr1[8]), p13 = float(xr1[9]);
+
+            const device uint *t0_0 = col0 + (tk + 0u) * stride;
+            const device uint *t1_0 = col0 + (tk + 1u) * stride;
+
+            float v[8];
+
+            const uint w0_0_0 = t0_0[j0], w0_0_1 = t0_0[j1];
+            const uint w1_0_0 = t1_0[j0], w1_0_1 = t1_0[j1];
+
+            extract_v_mcg_32(w0_0_0, w0_0_1, sh0, rsh0, v);
+            acc0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+            acc1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+
+            extract_v_mcg_32(w1_0_0, w1_0_1, sh0, rsh0, v);
+            acc0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+            acc1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+        }
+
+        for (tk = k_unroll_end + sg; tk < tiles_k; tk += SG) {
+            const device half *xr0 = x + tk * 16u + r0;
+            const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
+            const device uint *t0_0 = col0 + tk * stride;
+            const uint a0 = t0_0[j0], a1 = t0_0[j1];
+            float v[8];
+            extract_v_mcg_32(a0, a1, sh0, rsh0, v);
+            acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
+            acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
+        }
+
+        acc0 += simd_shuffle_xor(acc0, 1u);
+        acc0 += simd_shuffle_xor(acc0, 2u);
+        acc1 += simd_shuffle_xor(acc1, 1u);
+        acc1 += simd_shuffle_xor(acc1, 2u);
+
+        if (lane % 4u == 0u) {
+            red[sg][lane / 4u] = acc0;
+            red[sg][lane / 4u + 8u] = acc1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid < 16u) {
+            float sum = 0.0f;
+            for (int g = 0; g < SG; ++g) {
+                sum += red[g][lid];
+            }
+            y[tn * 16u + lid] = sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
+kernel void linear_gemv_ishizuki_k3_colmajor_1col_sk2(
+    const device ushort *packed [[buffer(0)]],
+    const device half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant const uint *shape [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    constexpr uint KA = 3u;
+    constexpr int CB = 1;
+    constexpr uint RING = 256u * KA;
+    constexpr uint WORDS = RING / 32u;
+    const uint K = shape[0];
+    const uint N = shape[1];
+    const uint tiles_n = N / 16u;
+    const uint tiles_k = K / 16u;
+    constexpr int SG = 8;
+    constexpr uint SK = 2u;
+    threadgroup float red[SG][16];
+    const uint r0 = (lane % 4u) * 2u;
+
+    const uint lo0 = (lane * 8u + 1u) * 3u + RING - 16u;
+    const uint sh0 = lo0 % 32u;
+    const uint rsh0 = 32u - sh0;
+    const uint hi0 = lo0 / 32u;
+    const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
+    const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
+
+    const uint total_groups = tiles_n * SK;
+    for (uint tg = tgid; tg < total_groups; tg += ntg) {
+        const uint tn = tg % tiles_n;
+        const uint sk = tg / tiles_n;
+
+        const uint k_per_split = tiles_k / SK;
+        const uint k_start = sk * k_per_split;
+        const uint k_end = k_start + k_per_split;
+
+        float acc0 = 0.0f;
+        float acc1 = 0.0f;
+
+        const device uint *col0 = (const device uint *)packed + tn * (tiles_k * WORDS);
+        const uint stride = WORDS;
+
+        const uint step = SG * 2u;
+        const uint k_unroll_end = k_start + ((k_end - k_start) / step) * step;
+
+        uint tk = k_start + sg * 2u;
+        for (; tk < k_unroll_end; tk += step) {
+            const device half *xr0 = x + (tk + 0u) * 16u + r0;
+            const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
+            const device half *xr1 = x + (tk + 1u) * 16u + r0;
+            const float p10 = float(xr1[0]), p11 = float(xr1[1]), p12 = float(xr1[8]), p13 = float(xr1[9]);
+
+            const device uint *t0_0 = col0 + (tk + 0u) * stride;
+            const device uint *t1_0 = col0 + (tk + 1u) * stride;
+
+            float v[8];
+
+            const uint w0_0_0 = t0_0[j0], w0_0_1 = t0_0[j1];
+            const uint w1_0_0 = t1_0[j0], w1_0_1 = t1_0[j1];
+
+            extract_v_mcg_32(w0_0_0, w0_0_1, sh0, rsh0, v);
+            acc0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+            acc1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+
+            extract_v_mcg_32(w1_0_0, w1_0_1, sh0, rsh0, v);
+            acc0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+            acc1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+        }
+
+        for (tk = k_unroll_end + sg; tk < k_end; tk += SG) {
+            const device half *xr0 = x + tk * 16u + r0;
+            const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
+            const device uint *t0_0 = col0 + tk * stride;
+            const uint a0 = t0_0[j0], a1 = t0_0[j1];
+            float v[8];
+            extract_v_mcg_32(a0, a1, sh0, rsh0, v);
+            acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
+            acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
+        }
+
+        acc0 += simd_shuffle_xor(acc0, 1u);
+        acc0 += simd_shuffle_xor(acc0, 2u);
+        acc1 += simd_shuffle_xor(acc1, 1u);
+        acc1 += simd_shuffle_xor(acc1, 2u);
+
+        if (lane % 4u == 0u) {
+            red[sg][lane / 4u] = acc0;
+            red[sg][lane / 4u + 8u] = acc1;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid < 16u) {
+            float sum = 0.0f;
+            for (int g = 0; g < SG; ++g) {
+                sum += red[g][lid];
+            }
+            y[sk * N + tn * 16u + lid] = sum;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
+
 kernel void linear_gemv_ishizuki_k3_colmajor_2col_sk2(
     const device ushort *packed [[buffer(0)]],
     const device half *x [[buffer(1)]],
