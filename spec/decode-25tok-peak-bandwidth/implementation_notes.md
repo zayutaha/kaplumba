@@ -163,5 +163,49 @@
   - Clean test suites pass 100%: `fused_bit_exact` (3/3), `argmax_engine_parity` (3/3), `live_kernel_bit_exact` (1/1), `repacked_golden` (2/2).
   - Greedy generation bit-exact ("Paris"); TTFT 1313-1325 ms; model resident memory strictly below 8.0 GiB.
 
+---
+
+## 11. Task T5.1 Log (Zero-Bubble Pipelined Step Submission & GPU-side Token Hand-off)
+
+- **Implementation**:
+  - Double-buffered scratch staging in `ForwardScratch`: `query_positions_decode: [Buffer; 2]`, `token_ids_decode: [Buffer; 2]`, and `host_tokens: Buffer` (33 KiB total allocated, resident footprint unchanged at 7.56 GiB).
+  - Bypassed host serialization barrier `encoder.flush_and_wait()?` during decode (`tokens == 1`): slots are ping-ponged between step $N$ and $N+1$, so host memory writes never race with GPU kernel execution.
+  - Implemented `forward_step_pipelined` in `crates/engine/src/model.rs`:
+    - Reads active slot input `token_ids_decode[slot]` and `query_positions_decode[slot]`.
+    - Dispatches `encode_argmax_to_token` on GPU at step conclusion, writing the winning token directly to `token_ids_decode[1 - slot]` in device memory and to `host_tokens[step_idx]`.
+  - Refactored `generate_gpu_greedy` in `crates/engine/src/generate.rs` with 1-step pipelined loop:
+    - Encodes and commits command buffer for Step $N+1$ before waiting on Step $N$.
+    - While GPU executes Step $N+1$, CPU waits on Step $N$, reads `host_tokens[N]`, and streams detokenized text with zero inter-step GPU bubble.
+    - Added `retract` to `GpuKvCache` and `Model::retract_gpu_caches` to rollback KV cache pointer on early EOS termination.
+  - Preserved permanent mapping of `embed_tokens` (never reloaded). Model resident memory strictly $\le 12$ GiB (measured 7.56 GiB).
+- **Measurement Results**:
+  - Golden prompt ("The capital of France is") generated bit-exact `Paris` (`stopped_on_eos=true`, decode throughput **15.49 tok/s**).
+  - Multi-token counting prompt ("Count from 1 to 50: 1, 2, 3,") generated 32 tokens bit-exact (` 4, 5, 6, 7, 8, 9, 10, 11, 12, 13`), measuring **15.33 tok/s** (65.2 ms/step).
+  - Baseline floor of 14.5 tok/s is exceeded and preserved.
+
+---
+
+## 12. GPU Profile Analysis & Roadmap to 20+ Tok/s
+
+With CPU-GPU submission serialization completely removed (0 ms idle gap), the total step time of 65.2 ms is 100% GPU kernel execution time:
+1. **MLP (`gate_up_gelu` + `down_proj`): 39.70 ms (60.9% of total step time)**:
+   - `gate_up_gelu`: 25.50 ms ($K=5376, N=21504$, 1344 threadgroups).
+   - `down_proj`: 14.20 ms ($K=21504, N=5376$, only 168 threadgroups across 20 GPU cores = 8.4 TGs/core, starving memory latency hiding).
+2. **Attention & Projections: 20.67 ms (31.7%)**:
+   - `qkv_proj`: 8.58 ms
+   - `o_proj`: 6.66 ms
+   - `head/gemv`: 4.20 ms
+   - `split_attention`: 1.23 ms
+3. **Elementwise & Norms: ~4.8 ms (7.4%)**:
+   - ~500 small dispatches per token (`norm_transform`, `post_attn_pre_ffn`, `post_ffn_out`, `kv_norm_rope`, `cache_append`).
+
+**Roadmap to 20+ tok/s ($\le 50$ ms)**:
+- **T5.2**: Optimize MLP & `down_proj`:
+  - 2-way Split-K reduction for `down_proj` ($K=21504$ split into two $10752$ halves) to double threadgroup count from 168 to 336 (16.8 TGs/core), saturating DRAM streaming on M4 Pro.
+  - Evaluate 4-column tiling for `gate_up` (`linear_gemv_ishizuki_k3_fused2_co4`) where $N=21504$ has sufficient threadgroups (336 threadgroups).
+- **T5.3**: Elementwise Fusion & Prologue Inlining:
+  - Inlining input RMSNorm with GEMV input transformation and fusing post-attention / post-FFN norm transformations to eliminate ~500 dispatches, recovering ~3-4 ms.
+
+
 
 

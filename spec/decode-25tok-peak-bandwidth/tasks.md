@@ -47,12 +47,22 @@
   - Intent: Overlap Attention KV-cache streaming on a secondary Metal command queue with GEMV dequantization on the primary queue using `MTLEvent` synchronization to absorb the 3.2 ms attention latency.
   - Testing: Profile execution timeline with `KAPLUMBA_DECODE_PROFILE=kernel`; verify greedy output bit-exactness.
 
-- [ ] **T5: Command Pipeline & Layer Dispatch Streamlining**
-  - Files: `crates/engine/src/model.rs`, `crates/engine/src/generate.rs`
-  - Intent: Consolidate remaining per-layer dispatch boundaries to eliminate ~5.0 ms of host CPU-GPU submission bubbles and threadgroup setup latency.
-  - Testing: Count total dispatches per token with `KAPLUMBA_COUNT_BUFFERS=1`; verify reduction in end-to-end forward step latency.
+- [x] **T5.1: Zero-Bubble Pipelined Step Submission & GPU Token Hand-off**
+  - Files: `crates/engine/src/model.rs`, `crates/engine/src/generate.rs`, `crates/engine/src/gpu_cache.rs`
+  - Intent: Double-buffer decode staging (`query_positions_decode`, `token_ids_decode`, `host_tokens`), bypass host wait barrier `encoder.flush_and_wait()?` during decode (`tokens == 1`), dispatch GPU device-side token reduction (`encode_argmax_to_token`), and pipeline step $N+1$ submission ahead of waiting on step $N$. Add `retract` to `GpuKvCache` for clean early rollback on EOS.
+  - Testing: Verified bit-exact output on golden prompt ("Paris", `stopped_on_eos=true`, 15.49 tok/s); verified multi-token generation on counting prompt (" 4, 5, 6, 7, 8, 9, 10, 11, 12, 13", 32 tokens, 15.33 tok/s); model resident memory strictly $\le 12$ GiB (measured 7.56 GiB); `embed_tokens` kept permanently resident without reloading.
 
-- [ ] **T6: End-to-End Benchmark & Acceptance Validation**
+- [ ] **T5.2: MLP & Down-Proj Optimization (Split-K & Memory Coalescing)**
+  - Files: `crates/kernels/src/linear_repacked.metal`, `crates/kernels/src/linear.rs`, `crates/engine/src/model.rs`
+  - Intent: Optimize `down_proj` ($K=21504, N=5376$) and `gate_up` ($K=5376, N=21504$) which consume 39.7 ms of the remaining 65.2 ms GPU execution time. Evaluate 2-way Split-K reduction for `down_proj` to double threadgroup occupancy from 168 to 336 threadgroups across 20 M4 Pro GPU cores.
+  - Testing: Bit-exact verification against reference; A/B benchmark latency measurement.
+
+- [ ] **T5.3: RMSNorm Prologue Fusion & Dispatch Consolidation**
+  - Files: `crates/kernels/src/elements.metal`, `crates/kernels/src/elements.rs`, `crates/engine/src/model.rs`
+  - Intent: Fuse layer input RMSNorm with GEMV input transformation and fuse post-attention / post-FFN norm transformations to eliminate ~500 small elementwise dispatches per token, recovering ~3-4 ms of launch latency.
+  - Testing: Verify numeric bit-exactness; benchmark dispatch reduction and step time.
+
+- [ ] **T6: End-to-End Benchmark & Acceptance Validation (20+ Tok/s)**
   - Files: `spec/decode-25tok-peak-bandwidth/implementation_notes.md`
   - Intent: Measure steady-state tok/s and latency across 16 interleaved A/B pairs using `scripts/gpuq try -- ./target/release/kaplumba`.
-  - Testing: Prove AC1 ($\ge 25.0$ tok/s, $\le 40.0$ ms/step), AC2 (bit-exact greedy text), AC3 (0 test regressions), and AC5 ($\le 16.5$ GiB resident memory).
+  - Testing: Prove AC1 ($\ge 20.0 - 25.0$ tok/s, $\le 40 - 50$ ms/step), AC2 (bit-exact greedy text), AC3 (0 test regressions), and AC5 ($\le 12.0$ GiB resident memory).

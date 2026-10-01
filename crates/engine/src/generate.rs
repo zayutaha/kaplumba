@@ -905,89 +905,160 @@ where
             let logits = model.last_logits();
             margins.record(generated_ids.len(), argmax_with_margin(&logits));
         }
-        loop {
+        let pipelined = !margins.enabled
+            && crate::decode_profile::active_mode() == crate::decode_profile::Mode::Off
+            && std::env::var_os("KAPLUMBA_NO_PIPELINE").is_none();
+
+        if pipelined {
             if generated_ids.is_empty() {
                 ttft_duration = request_started.elapsed();
             }
             if config.eos_ids.contains(&token) {
                 stopped_on_eos = true;
-                break;
-            }
-            generated_ids.push(token);
-            if let Some(chunk) = detokenizer.push(token)? {
-                text.push_str(&chunk);
-                on_text(&chunk)?;
-            }
-            if generated_ids.len() == config.max_new_tokens {
-                break;
-            }
-            let position = prompt_len + generated_ids.len() - 1;
-            let position =
-                u32::try_from(position).map_err(|_| GenerationError::ContextExceeded {
-                    limit: config.context_limit,
-                })?;
-            let step_started = Instant::now();
-            let mut encoder = MetalEncoder::new(&queue).map_err(ModelError::from)?;
-            encoder.set_max_dispatches(2500);
-            // `KAPLUMBA_DECODE_PROFILE=step`: two stamped boundaries around the
-            // step, so its duration on the GPU timeline can be read. The span
-            // between them covers any buffers rolled in between, because one
-            // Metal queue executes its command buffers in commit order.
-            // (Corrected: this used to say "~42 rolled buffers". Stale -- with
-            // `set_max_dispatches(2500)` above and 1167 dispatches/token,
-            // `tick()` never rolls, so the step commits 2 buffers, one empty.)
-            crate::decode_profile::begin_step(&mut encoder, |encoder| {
-                model.calibration_dispatch(encoder)
-            })
-            .map_err(ModelError::from)?;
-            let t_encode_start = Instant::now();
-            model
-                .forward_buffer_into_step(&mut encoder, position, token)
-                .map_err(ModelError::from)?;
-            let t_encode_ms = t_encode_start.elapsed().as_secs_f64() * 1e3;
-            // Fold this step's dispatch tally in BEFORE the encoder is committed,
-            // because `commit_terminal`/`wait` consume it. This is the only place
-            // the real decode loop can be counted at all: `forward_buffer_into_step`
-            // drives the caller's encoder, so its own tally hook does not fire.
-            crate::model::record_decode_step_tallies(&encoder);
-            // `commit_terminal` ends the step's trailing partial slice of rolled
-            // command buffers; `wait` covers all of them, in commit order, which
-            // is the barrier the next step's host-side staging needs.
-            //
-            // In `step` mode the closing commit is stamped and waited inside
-            // `close_step`, because a terminal commit does not park its buffer
-            // where `GPUEndTime` can be read; `wait` then has nothing left to
-            // cover and does not touch the fresh buffer `close_step` re-armed.
-            let step_mode =
-                crate::decode_profile::active_mode() == crate::decode_profile::Mode::Step;
-            let t_wait_start = Instant::now();
-            if step_mode {
-                crate::decode_profile::close_step(&mut encoder).map_err(ModelError::from)?;
             } else {
-                encoder.commit_terminal().map_err(ModelError::from)?;
-                encoder.wait();
+                generated_ids.push(token);
+                if let Some(chunk) = detokenizer.push(token)? {
+                    text.push_str(&chunk);
+                    on_text(&chunk)?;
+                }
+
+                if generated_ids.len() < config.max_new_tokens {
+                    let total_to_generate = config.max_new_tokens - generated_ids.len();
+
+                    let pos0 = u32::try_from(prompt_len)
+                        .map_err(|_| GenerationError::ContextExceeded {
+                            limit: config.context_limit,
+                        })?;
+                    let mut enc0 = MetalEncoder::new(&queue).map_err(ModelError::from)?;
+                    enc0.set_max_dispatches(2500);
+                    model.forward_step_pipelined(&mut enc0, pos0, Some(token), 0, 0)?;
+                    crate::model::record_decode_step_tallies(&enc0);
+                    enc0.commit_terminal().map_err(ModelError::from)?;
+
+                    let mut in_flight_enc = enc0;
+                    let mut in_flight_step = 0usize;
+                    let mut in_flight_pos = pos0;
+                    let mut step_start = Instant::now();
+
+                    for step_idx in 1..total_to_generate {
+                        let slot = step_idx % 2;
+                        let pos = u32::try_from(prompt_len + step_idx)
+                            .map_err(|_| GenerationError::ContextExceeded {
+                                limit: config.context_limit,
+                            })?;
+
+                        let mut next_enc = MetalEncoder::new(&queue).map_err(ModelError::from)?;
+                        next_enc.set_max_dispatches(2500);
+                        model.forward_step_pipelined(&mut next_enc, pos, None, slot, step_idx as u32)?;
+                        crate::model::record_decode_step_tallies(&next_enc);
+                        next_enc.commit_terminal().map_err(ModelError::from)?;
+
+                        in_flight_enc.wait();
+                        let step_ms = step_start.elapsed().as_secs_f64() * 1e3;
+                        decode_duration += Duration::from_secs_f64(step_ms / 1e3);
+                        step_start = Instant::now();
+                        segments.record(generated_ids.len(), in_flight_pos, step_ms);
+                        kaplumba_kernels::pipeline_audit::assert_no_builds_since(load_mark);
+
+                        let step_token = model.read_host_token(in_flight_step);
+                        generated_ids.push(step_token);
+                        if let Some(chunk) = detokenizer.push(step_token)? {
+                            text.push_str(&chunk);
+                            on_text(&chunk)?;
+                        }
+
+                        if config.eos_ids.contains(&step_token) {
+                            stopped_on_eos = true;
+                            next_enc.wait();
+                            model.retract_gpu_caches(1);
+                            break;
+                        }
+
+                        in_flight_enc = next_enc;
+                        in_flight_step = step_idx;
+                        in_flight_pos = pos;
+                    }
+
+                    if !stopped_on_eos {
+                        in_flight_enc.wait();
+                        let step_ms = step_start.elapsed().as_secs_f64() * 1e3;
+                        decode_duration += Duration::from_secs_f64(step_ms / 1e3);
+                        segments.record(generated_ids.len(), in_flight_pos, step_ms);
+                        kaplumba_kernels::pipeline_audit::assert_no_builds_since(load_mark);
+
+                        let final_token = model.read_host_token(in_flight_step);
+                        generated_ids.push(final_token);
+                        if let Some(chunk) = detokenizer.push(final_token)? {
+                            text.push_str(&chunk);
+                            on_text(&chunk)?;
+                        }
+                        if config.eos_ids.contains(&final_token) {
+                            stopped_on_eos = true;
+                        }
+                    }
+                }
             }
-            let t_wait_ms = t_wait_start.elapsed().as_secs_f64() * 1e3;
-            let step_ms = step_started.elapsed().as_secs_f64() * 1e3;
-            if std::env::var_os("KAPLUMBA_STEP_TRACE").is_some() {
-                eprintln!(
-                    "STEP_TRACE: encode={:.2}ms wait={:.2}ms total={:.2}ms",
-                    t_encode_ms, t_wait_ms, step_ms
-                );
-            }
-            crate::decode_profile::end_step(&mut encoder, step_ms).map_err(ModelError::from)?;
-            decode_duration += Duration::from_secs_f64(step_ms / 1e3);
-            segments.record(generated_ids.len(), position, step_ms);
-            // The measurement hazard this guards: a kernel compiled inside this
-            // loop charges Metal's shader build to `step_ms`, which is the
-            // number `decode_tokens_per_second` is made of. Checked AFTER the
-            // step is timed, so the panic cannot be mistaken for a slow step --
-            // and gated, so a default run pays one relaxed atomic load.
-            kaplumba_kernels::pipeline_audit::assert_no_builds_since(load_mark);
-            token = model.last_token();
-            if margins.enabled {
-                let logits = model.last_logits();
-                margins.record(generated_ids.len(), argmax_with_margin(&logits));
+        } else {
+            loop {
+                if generated_ids.is_empty() {
+                    ttft_duration = request_started.elapsed();
+                }
+                if config.eos_ids.contains(&token) {
+                    stopped_on_eos = true;
+                    break;
+                }
+                generated_ids.push(token);
+                if let Some(chunk) = detokenizer.push(token)? {
+                    text.push_str(&chunk);
+                    on_text(&chunk)?;
+                }
+                if generated_ids.len() == config.max_new_tokens {
+                    break;
+                }
+                let position = prompt_len + generated_ids.len() - 1;
+                let position =
+                    u32::try_from(position).map_err(|_| GenerationError::ContextExceeded {
+                        limit: config.context_limit,
+                    })?;
+                let step_started = Instant::now();
+                let mut encoder = MetalEncoder::new(&queue).map_err(ModelError::from)?;
+                encoder.set_max_dispatches(2500);
+                crate::decode_profile::begin_step(&mut encoder, |encoder| {
+                    model.calibration_dispatch(encoder)
+                })
+                .map_err(ModelError::from)?;
+                let t_encode_start = Instant::now();
+                model
+                    .forward_buffer_into_step(&mut encoder, position, token)
+                    .map_err(ModelError::from)?;
+                let t_encode_ms = t_encode_start.elapsed().as_secs_f64() * 1e3;
+                crate::model::record_decode_step_tallies(&encoder);
+                let step_mode =
+                    crate::decode_profile::active_mode() == crate::decode_profile::Mode::Step;
+                let t_wait_start = Instant::now();
+                if step_mode {
+                    crate::decode_profile::close_step(&mut encoder).map_err(ModelError::from)?;
+                } else {
+                    encoder.commit_terminal().map_err(ModelError::from)?;
+                    encoder.wait();
+                }
+                let t_wait_ms = t_wait_start.elapsed().as_secs_f64() * 1e3;
+                let step_ms = step_started.elapsed().as_secs_f64() * 1e3;
+                if std::env::var_os("KAPLUMBA_STEP_TRACE").is_some() {
+                    eprintln!(
+                        "STEP_TRACE: encode={:.2}ms wait={:.2}ms total={:.2}ms",
+                        t_encode_ms, t_wait_ms, step_ms
+                    );
+                }
+                crate::decode_profile::end_step(&mut encoder, step_ms).map_err(ModelError::from)?;
+                decode_duration += Duration::from_secs_f64(step_ms / 1e3);
+                segments.record(generated_ids.len(), position, step_ms);
+                kaplumba_kernels::pipeline_audit::assert_no_builds_since(load_mark);
+                token = model.last_token();
+                if margins.enabled {
+                    let logits = model.last_logits();
+                    margins.record(generated_ids.len(), argmax_with_margin(&logits));
+                }
             }
         }
 

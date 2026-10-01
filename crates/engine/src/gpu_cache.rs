@@ -248,6 +248,10 @@ impl GpuKvCache {
         self.next_position += tokens;
     }
 
+    pub fn retract(&mut self, tokens: usize) {
+        self.next_position = self.next_position.saturating_sub(tokens);
+    }
+
     pub fn reset(&mut self) {
         self.next_position = 0;
         unsafe {

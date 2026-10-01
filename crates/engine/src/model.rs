@@ -1708,7 +1708,7 @@ impl DecoderLayer {
                     queries: &scratch.q,
                     keys: self.gpu_cache.keys(),
                     values: self.gpu_cache.values(),
-                    query_positions: &scratch.query_positions,
+                    query_positions: scratch.active_query_positions(tokens),
                     key_positions: self.gpu_cache.positions(),
                     output: &scratch.q,
                     queries_count: tokens,
@@ -1730,7 +1730,7 @@ impl DecoderLayer {
             queries: &scratch.q,
             keys: self.gpu_cache.keys(),
             values: self.gpu_cache.values(),
-            query_positions: &scratch.query_positions,
+            query_positions: scratch.active_query_positions(tokens),
             key_positions: self.gpu_cache.positions(),
             output: &scratch.attended,
             queries_count: tokens,
@@ -2577,10 +2577,13 @@ pub struct ForwardScratch {
     pub raw: Buffer,
     pub raw_b: Buffer,
     pub raw_c: Buffer,
-    /// FP16 input-transform staging, shared by every linear in the batch.
     pub transformed: Buffer,
     pub query_positions: Buffer,
     pub token_ids: Buffer,
+    pub query_positions_decode: [Buffer; 2],
+    pub token_ids_decode: [Buffer; 2],
+    pub host_tokens: Buffer,
+    pub active_slot: usize,
     pub last_hidden: Buffer,
     pub logits: Buffer,
     pub capped: Buffer,
@@ -2593,6 +2596,22 @@ pub struct ForwardScratch {
 }
 
 impl ForwardScratch {
+    pub fn active_query_positions(&self, tokens: usize) -> &Buffer {
+        if tokens == 1 {
+            &self.query_positions_decode[self.active_slot % 2]
+        } else {
+            &self.query_positions
+        }
+    }
+
+    pub fn active_token_ids(&self, tokens: usize) -> &Buffer {
+        if tokens == 1 {
+            &self.token_ids_decode[self.active_slot % 2]
+        } else {
+            &self.token_ids
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         max_tokens: usize,
@@ -2634,6 +2653,15 @@ impl ForwardScratch {
             device.new_buffer((max_tokens * std::mem::size_of::<u32>()) as u64, options);
         let token_ids =
             device.new_buffer((max_tokens * std::mem::size_of::<u32>()) as u64, options);
+        let query_positions_decode = [
+            device.new_buffer(64, options),
+            device.new_buffer(64, options),
+        ];
+        let token_ids_decode = [
+            device.new_buffer(64, options),
+            device.new_buffer(64, options),
+        ];
+        let host_tokens = device.new_buffer((8192 * std::mem::size_of::<u32>()) as u64, options);
         Ok(Self {
             max_tokens,
             hidden_a: u16_elements(max_tokens, hidden)?,
@@ -2653,6 +2681,10 @@ impl ForwardScratch {
             transformed: u16_elements(max_tokens, inter)?,
             query_positions,
             token_ids,
+            query_positions_decode,
+            token_ids_decode,
+            host_tokens,
+            active_slot: 0,
             last_hidden: u16_elements(1, hidden)?,
             logits: u16_elements(1, vocab)?,
             capped: u16_elements(1, vocab)?,
@@ -2688,6 +2720,11 @@ impl ForwardScratch {
             &self.transformed,
             &self.query_positions,
             &self.token_ids,
+            &self.query_positions_decode[0],
+            &self.query_positions_decode[1],
+            &self.token_ids_decode[0],
+            &self.token_ids_decode[1],
+            &self.host_tokens,
             &self.last_hidden,
             &self.logits,
             &self.capped,
@@ -3351,6 +3388,68 @@ impl TextModel {
         kaplumba_kernels::elements::decode_argmax_token(keys)
     }
 
+    pub fn forward_step_pipelined(
+        &mut self,
+        encoder: &mut MetalEncoder,
+        position: u32,
+        token: Option<u32>,
+        slot: usize,
+        step_idx: u32,
+    ) -> Result<(), ModelError> {
+        let slot = slot % 2;
+        let next_slot = 1 - slot;
+        self.scratch.active_slot = slot;
+        if let Some(t) = token {
+            if t as usize >= self.vocab_size {
+                return Err(ModelError::InvalidInput(format!(
+                    "token id {t} is outside the vocabulary"
+                )));
+            }
+            unsafe {
+                let token_ptr = self.scratch.token_ids_decode[slot].contents() as *mut u32;
+                *token_ptr = t;
+            }
+        }
+        unsafe {
+            let pos_ptr = self.scratch.query_positions_decode[slot].contents() as *mut u32;
+            *pos_ptr = position;
+        }
+
+        let mut gpu = GpuProfile::new(false);
+        gpu.tokens = 1;
+        gpu.layers = self.layers.len();
+        gpu.chunks = 1;
+        gpu.chunk_rows = 1;
+
+        let next_token_buffer = self.scratch.token_ids_decode[next_slot].clone();
+        let host_token_buffer = self.scratch.host_tokens.clone();
+
+        self.forward_chunk(
+            &[token.unwrap_or(0)],
+            &[position],
+            encoder,
+            &mut gpu,
+            true,
+            Some(&next_token_buffer),
+            Some(&host_token_buffer),
+            step_idx,
+        )?;
+        Ok(())
+    }
+
+    pub fn read_host_token(&self, step_idx: usize) -> u32 {
+        unsafe {
+            let ptr = self.scratch.host_tokens.contents() as *const u32;
+            *ptr.add(step_idx)
+        }
+    }
+
+    pub fn retract_gpu_caches(&mut self, tokens: usize) {
+        for layer in &mut self.layers {
+            layer.gpu_cache.retract(tokens);
+        }
+    }
+
     pub fn forward_buffer_into_vec(
         &mut self,
         token_ids: &[u32],
@@ -3476,7 +3575,7 @@ impl TextModel {
         let result: Result<(), ModelError> = if token_ids.len() <= chunk {
             gpu.chunks += 1;
             gpu.chunk_rows = token_ids.len();
-            self.forward_chunk(token_ids, positions, encoder, &mut gpu, true)
+            self.forward_chunk(token_ids, positions, encoder, &mut gpu, true, None, None, 0)
         } else {
             // Only the last chunk's logits survive this loop, so only the last
             // chunk may run the vocabulary head. `peek` is the whole test: the
@@ -3492,7 +3591,7 @@ impl TextModel {
                 gpu.chunk_rows = chunk_ids.len();
                 let last = chunks.peek().is_none();
                 if let Err(error) =
-                    self.forward_chunk(chunk_ids, chunk_positions, encoder, &mut gpu, last)
+                    self.forward_chunk(chunk_ids, chunk_positions, encoder, &mut gpu, last, None, None, 0)
                 {
                     // Report what ran before the failure rather than throwing
                     // the measurements away; then propagate.
@@ -3536,6 +3635,7 @@ impl TextModel {
     /// before the first decode step. A single-chunk prefill
     /// -- every decode step, and any prompt up to [`PREFILL_CHUNK`] tokens --
     /// takes the `true` branch and is bit-for-bit unchanged.
+    #[allow(clippy::too_many_arguments)]
     fn forward_chunk(
         &mut self,
         token_ids: &[u32],
@@ -3543,6 +3643,9 @@ impl TextModel {
         encoder: &mut MetalEncoder,
         gpu: &mut GpuProfile,
         run_head: bool,
+        next_token_out: Option<&Buffer>,
+        host_token_out: Option<&Buffer>,
+        step_idx: u32,
     ) -> Result<(), ModelError> {
         if token_ids.len() != positions.len() || token_ids.is_empty() {
             return Err(ModelError::InvalidInput(
@@ -3587,12 +3690,14 @@ impl TextModel {
         // produced two different answers. The wait costs nothing measurable --
         // the previous chunk's scratch is reused by this one regardless, so the
         // GPU had to reach that point before this chunk could start anyway.
-        encoder.flush_and_wait()?;
-        unsafe {
-            let position_ptr = self.scratch.query_positions.contents() as *mut u32;
-            std::ptr::copy_nonoverlapping(positions.as_ptr(), position_ptr, tokens);
-            let token_ptr = self.scratch.token_ids.contents() as *mut u32;
-            std::ptr::copy_nonoverlapping(token_ids.as_ptr(), token_ptr, tokens);
+        if tokens > 1 {
+            encoder.flush_and_wait()?;
+            unsafe {
+                let position_ptr = self.scratch.query_positions.contents() as *mut u32;
+                std::ptr::copy_nonoverlapping(positions.as_ptr(), position_ptr, tokens);
+                let token_ptr = self.scratch.token_ids.contents() as *mut u32;
+                std::ptr::copy_nonoverlapping(token_ids.as_ptr(), token_ptr, tokens);
+            }
         }
 
         // KAPLUMBA_PROFILE_PHASES=1 commits and waits at each phase boundary
@@ -3666,7 +3771,7 @@ impl TextModel {
             .ok_or_else(|| ModelError::InvalidConfig("model has no GPU embedding".to_string()))?;
         self.elements.encode_embedding_scaled(
             encoder,
-            &self.scratch.token_ids,
+            self.scratch.active_token_ids(tokens),
             embedding_buffer,
             &self.scratch.hidden_a,
             tokens,
@@ -3771,7 +3876,7 @@ impl TextModel {
         gpu.stamp(encoder, "chunk/copy_last_row")?;
         // `encode_lm_head` stamps its own sub-steps (head/final_norm, head/gemv,
         // head/softcap).
-        self.encode_lm_head(encoder, gpu)?;
+        self.encode_lm_head(encoder, gpu, next_token_out, host_token_out, step_idx)?;
         gpu_flush!();
         // No greedy pick is encoded here. It used to be, into
         // `scratch.token_ids[tokens]` — one element past the end of that buffer
@@ -3879,6 +3984,9 @@ impl TextModel {
         &self,
         encoder: &mut MetalEncoder,
         profile: &mut GpuProfile,
+        next_token_out: Option<&Buffer>,
+        host_token_out: Option<&Buffer>,
+        step_idx: u32,
     ) -> Result<(), ModelError> {
         let hidden = self.hidden_size;
         let vocab = self.vocab_size;
@@ -3945,6 +4053,18 @@ impl TextModel {
             )
             .map_err(ModelError::Kernel)?;
         profile.stamp(encoder, "head/argmax")?;
+        if next_token_out.is_some() || host_token_out.is_some() {
+            self.elements
+                .encode_argmax_to_token(
+                    encoder,
+                    &self.scratch.argmax_keys,
+                    next_token_out,
+                    host_token_out,
+                    step_idx,
+                )
+                .map_err(ModelError::Kernel)?;
+            profile.stamp(encoder, "head/argmax_token")?;
+        }
         Ok(())
     }
 
