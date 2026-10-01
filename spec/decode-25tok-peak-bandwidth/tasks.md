@@ -130,3 +130,66 @@
 - **Revised realistic target: 16.5-17.5 tok/s.** AC1 (>= 20 tok/s) should be
   formally re-scoped by the user before more performance work is planned against
   it. Do not silently reinterpret it.
+
+---
+
+## T5.10: Marginal-Cost Ablation Harness (completed, no production change)
+
+- Files: `crates/kernels/src/lib.rs` (`pub fn ablated`), `linear.rs`,
+  `elements.rs`, `attention.rs`, `crates/engine/src/model.rs`
+- Intent: Measure the true marginal wall-clock cost of each element kernel by
+  production interleaved A/B, because the profiler cannot resolve kernels this
+  small and end-to-end arithmetic cannot attribute cost to a role.
+- Method: `KAPLUMBA_ABLATE=<role>,...` makes an `encode_*` return `Ok(())`
+  without encoding its dispatch. Output is garbage by construction; only
+  `decode_tok_s` is read. Roles: `input_transform`, `input_norm_qkv`,
+  `post_attn_pre_ffn`, `finalize_post_ffn`, `finalize_o_proj`, `kv_norm_rope`,
+  `attention`, `head_softcap`, `head_argmax`.
+- Also added `KAPLUMBA_O_NOSK` / `KAPLUMBA_D_NOSK` (per-projection split-K
+  drop), because `KAPLUMBA_NO_SK2` moved two projections in opposite directions
+  and its -0.58 tok/s result was unattributable.
+- Results (all n=5..6 interleaved pairs, baseline median 15.83-15.88):
+
+| ablated roles | tok/s | ms/token | dispatches |
+|---|---|---|---|
+| `input_transform` | +0.031 | 0.12 | 180 |
+| the 5 fused transform/finalize roles | +0.44 | 1.39 | 300 |
+| `kv_norm_rope,attention,head_softcap,head_argmax` | +0.21 | 0.66 | 144 |
+
+- **Two conclusions that reframe the whole optimisation.** (1) A dispatch costs
+  **~0.7 us**, so encoding fewer dispatches is worth nothing -- option 1 as
+  originally scoped (fold the input transforms into the GEMV x-load, ~180
+  dispatches) is worth at most +0.03 tok/s and was abandoned. (2) The entire
+  non-GEMV element layer is **1.52 ms of a 63.1 ms step**, not the ~8.8 ms the
+  profiler implied. So the recoverable budget is GEMV, not element kernels.
+- Sabotage check: `KAPLUMBA_ABLATE=input_transform` visibly corrupts the
+  generated text (`444SSSS de laSS-S la la lSSS lSS-S`), confirming the switch
+  really removes the kernel rather than silently no-op'ing.
+
+## T5.11: o_proj Scheduling Variants, Isolated (completed, all negative)
+
+- Files: `crates/engine/src/model.rs`
+- Intent: `o_proj` is the only projection at half the bandwidth of its peers
+  (~137 vs ~219 GB/s by the `own_ms` ratio, since `o_proj`/`down_proj` own_ms
+  ratio 0.609 against a bytes ratio of 0.381 -- a 2.7 ms deficit). Six scheduling
+  variants are now exhausted, including the two the microbenchmark had
+  incorrectly predicted would win.
+- Results (interleaved A/B):
+
+| variant | median tok/s | delta |
+|---|---|---|
+| baseline | 15.83 | - |
+| `KAPLUMBA_O_NOSK=1` (o_proj only, no split-K) | 15.575 | **-0.25** |
+| `KAPLUMBA_GEMV_MAX_GROUPS=168` | 15.716 | **-0.12** |
+| `KAPLUMBA_GEMV_MAX_GROUPS=84` | 15.595 | **-0.21** |
+| `KAPLUMBA_O_SK4=1` (prior session) | 15.781 | -0.04 |
+| `KAPLUMBA_NO_SK2=1` (both, prior session) | 15.271 | -0.58 |
+| `KAPLUMBA_SK2_CONTIG4=1` (prior session) | 15.513 | -0.31 |
+
+- **Capping the grid is monotonically worse**, which kills the "fixed
+  per-threadgroup cost at short K" explanation for `o_proj`'s deficit that the
+  §16.3 K-sweep suggested. `o_proj` wants *more* threadgroups, not fewer.
+- `KAPLUMBA_O_NOSK` being -0.25 while the microbenchmark predicted +41% is the
+  second independent confirmation that the microbenchmark's variant ranking is
+  inverted relative to production. Do not use it to choose variants.
+- Do not retry any of these seven.

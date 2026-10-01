@@ -853,6 +853,9 @@ impl ElementKernels {
         best: &Buffer,
         vocab: usize,
     ) -> Result<(), KernelError> {
+        if crate::ablated("head_argmax") {
+            return Ok(());
+        }
         let slots = vocab.div_ceil(65536);
         encoder.dispatch_1d(
             &self.argmax_clear_pipeline,
@@ -1209,6 +1212,9 @@ impl ElementKernels {
             slot: to_u32(slot, "norm_rope_qkv_cache slot")?,
             stream_len: to_u32(stream_len, "norm_rope_qkv_cache stream_len")?,
         };
+        if crate::ablated("kv_norm_rope") {
+            return Ok(());
+        }
         let kv_and_v = checked_product(kv_heads, 2, "norm_rope_qkv_cache K and V head count")?;
         let groups = checked_add(q_heads, kv_and_v, "norm_rope_qkv_cache threadgroup count")?;
         encoder.dispatch_groups(
@@ -1241,6 +1247,9 @@ impl ElementKernels {
             return Err(KernelError::InvalidInput(
                 "softcap count must be non-zero and cap finite and positive".to_string(),
             ));
+        }
+        if crate::ablated("head_softcap") {
+            return Ok(());
         }
         let params = SoftcapParams {
             count: to_u32(count, "softcap length")?,

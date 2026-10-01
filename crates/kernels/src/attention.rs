@@ -726,6 +726,9 @@ impl AttentionKernels {
         encoder: &mut crate::encoder::MetalEncoder,
         request: AttentionEncodeRequest<'_>,
     ) -> Result<(), KernelError> {
+        if crate::ablated("attention") {
+            return Ok(());
+        }
         let AttentionEncodeRequest {
             queries,
             keys,

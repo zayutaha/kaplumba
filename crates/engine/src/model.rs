@@ -1849,13 +1849,23 @@ impl DecoderLayer {
                 )
                 .map_err(ModelError::Kernel)?;
 
-            let use_sk4 = env_flag("KAPLUMBA_O_SK4")
+            // `KAPLUMBA_O_NOSK` / `KAPLUMBA_D_NOSK` drop split-K for one projection only.
+//
+// `KAPLUMBA_NO_SK2` drops it for both, so its -0.58 tok/s result cannot be
+// attributed: `o_proj` and `down_proj` move in opposite directions. The
+// microbenchmark (`gemv_bandwidth.rs`, absolute GB/s only) says K=8192 no-SK is
+// 170.6 GB/s against sk2's 120.7 (+41%) while K=21504 sk2 is 199.3 against
+// no-SK's 175.5 (-12%), which is exactly the "short K cannot amortise a fixed
+// per-threadgroup cost, long K wants the extra parallelism" shape. These flags
+// test each projection in isolation, which the combined flag could not.
+let use_sk4 = env_flag("KAPLUMBA_O_SK4")
                 && self.weights.o_proj.permutation_mode == 1
                 && self.weights.o_proj.out_features % 32 == 0
                 && matches!(self.weights.o_proj.rate, Exl3Rate::Integer(3));
 
             let use_sk2 = !use_sk4
                 && !env_flag("KAPLUMBA_NO_SK2")
+                && !env_flag("KAPLUMBA_O_NOSK")
                 && self.weights.o_proj.permutation_mode == 1
                 && self.weights.o_proj.out_features % 32 == 0
                 && matches!(self.weights.o_proj.rate, Exl3Rate::Integer(3));
@@ -2150,6 +2160,7 @@ impl DecoderLayer {
 
             let use_sk2 = !use_sk4
                 && !env_flag("KAPLUMBA_NO_SK2")
+                && !env_flag("KAPLUMBA_D_NOSK")
                 && self.weights.down_proj.permutation_mode == 1
                 && self.weights.down_proj.out_features % 32 == 0
                 && matches!(self.weights.down_proj.rate, Exl3Rate::Integer(3));

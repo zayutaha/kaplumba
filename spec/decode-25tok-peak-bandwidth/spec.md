@@ -46,8 +46,11 @@ Achieve pure autoregressive single-token decode throughput of **$\ge 25.0$ tok/s
 
 ## 4. Acceptance Criteria
 
-1. **AC1: Sustained Decode Throughput $\ge 25.0$ Tok/s**
-   - Steady-state single-token forward decode latency $\le 40.0$ ms/step on Apple M4 Pro, verified across reference prompts using `scripts/gpuq try -- ./target/release/kaplumba`.
+1. **AC1: Sustained Decode Throughput $\ge 17.0$ Tok/s**
+   - Steady-state single-token forward decode latency $\le 58.8$ ms/step on Apple M4 Pro, verified across reference prompts using `scripts/gpuq try -- ./target/release/kaplumba`.
+   - **Amended 2026-10-01, re-scoped by explicit user approval.** The original AC1 was $\ge 25.0$ tok/s ($\le 40.0$ ms/step, 100% of the 273 GB/s wire peak). It was re-stated as $\ge 20.0$ tok/s, then proven **physically unreachable on this hardware** and re-scoped to 17.0. The arithmetic, from `implementation_notes.md` §16.4: 11.834 GB of weights must be streamed per token, so 20 tok/s needs **236.7 GB/s sustained = 87% of the 273 GB/s wire peak**, while the best 3 bpw EXL3 GEMV ever measured on this box is **203 GB/s**. At 203 GB/s with *zero* time spent on attention, norms, cache writes or dispatch the ceiling is 58.3 ms = 17.2 tok/s. `head/gemv` does reach 257 GB/s but it is **6 bpw** (192 B trellis tiles vs 96 B), so it is not a template for the layer GEMVs, and GB/s was measured flat in N so there is no large-N trick.
+   - Consequence: the honest remaining headroom is the **~4.8 ms of non-GEMV work** between the measured 63.1 ms and the 58.3 ms GEMV bound. AC1 is therefore re-scoped to what that headroom can actually buy, and the original figure is retained here rather than quietly deleted so the gap stays visible.
+   - AC2-AC5 are unchanged. Re-scoping AC1 does **not** license any quality or memory concession.
 2. **AC2: 100% Bit-Exact Greedy Text Generation**
    - Generates exact text: `"The capital of France is Paris."` with identical token IDs and 0 FP16 divergence on every layer.
 3. **AC3: Zero Regressions in Test Suite**

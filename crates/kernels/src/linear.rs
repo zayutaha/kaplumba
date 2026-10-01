@@ -1865,6 +1865,9 @@ impl LinearKernels {
         transformed: &Buffer,
         in_features: usize,
     ) -> Result<(), KernelError> {
+        if crate::ablated("input_transform") {
+            return Ok(());
+        }
         let input_blocks = to_u32(in_features / 128, "input dimension")?;
         encoder.dispatch_1d(
             &self.input_pipeline,
@@ -2832,6 +2835,9 @@ impl LinearKernels {
             eps,
             scale,
         };
+        if crate::ablated("finalize_post_ffn") {
+            return Ok(());
+        }
         encoder.dispatch_groups(
             &self.finalize_and_post_ffn_norm_scale_pipeline,
             &[
@@ -2867,6 +2873,9 @@ impl LinearKernels {
             eps,
             scale,
         };
+        if crate::ablated("finalize_post_ffn") {
+            return Ok(());
+        }
         encoder.dispatch_groups(
             &self.finalize_and_post_ffn_norm_scale_sk2_pipeline,
             &[
@@ -2902,6 +2911,9 @@ impl LinearKernels {
             eps,
             scale,
         };
+        if crate::ablated("finalize_post_ffn") {
+            return Ok(());
+        }
         encoder.dispatch_groups(
             &self.finalize_and_post_ffn_norm_scale_sk4_pipeline,
             &[
@@ -2937,6 +2949,9 @@ impl LinearKernels {
             blocks,
             eps,
         };
+        if crate::ablated("post_attn_pre_ffn") {
+            return Ok(());
+        }
         encoder.dispatch_groups(
             &self.post_attn_pre_ffn_transform_pipeline,
             &[
@@ -2975,6 +2990,9 @@ impl LinearKernels {
             blocks,
             eps,
         };
+        if crate::ablated("finalize_o_proj") {
+            return Ok(());
+        }
         encoder.dispatch_groups(
             &self.finalize_o_proj_and_pre_ffn_transform_pipeline,
             &[
@@ -3014,6 +3032,9 @@ impl LinearKernels {
             blocks,
             eps,
         };
+        if crate::ablated("finalize_o_proj") {
+            return Ok(());
+        }
         encoder.dispatch_groups(
             &self.finalize_o_proj_and_pre_ffn_transform_sk2_pipeline,
             &[
@@ -3053,6 +3074,9 @@ impl LinearKernels {
             blocks,
             eps,
         };
+        if crate::ablated("finalize_o_proj") {
+            return Ok(());
+        }
         encoder.dispatch_groups(
             &self.finalize_o_proj_and_pre_ffn_transform_sk4_pipeline,
             &[
@@ -3089,6 +3113,9 @@ impl LinearKernels {
             blocks,
             eps,
         };
+        if crate::ablated("input_norm_qkv") {
+            return Ok(());
+        }
         encoder.dispatch_groups(
             &self.input_norm_and_qkv_transform_pipeline,
             &[
