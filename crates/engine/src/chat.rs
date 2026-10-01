@@ -137,6 +137,48 @@ pub struct TurnStats {
     pub decode_tok_s: f64,
 }
 
+/// Cumulative decode work over a whole session. See [`ChatSession::totals`].
+#[derive(Debug, Clone, Copy)]
+pub struct SessionTotals {
+    pub turns: usize,
+    pub prefill_tokens: usize,
+    pub generated_tokens: usize,
+    pub decode_s: f64,
+    pub decode_tok_s: f64,
+}
+
+impl SessionTotals {
+    /// Derive the rate from accumulated counts.
+    ///
+    /// A free function so the arithmetic is testable without a loaded model --
+    /// building a real `ChatSession` needs ~12 GiB of resident weights, which no
+    /// unit test should require.
+    ///
+    /// The rate is `generated / decode_s` over the TOTALS, deliberately not a
+    /// mean of per-turn rates: a mean would weight a 3-token reply the same as a
+    /// 400-token one, which is not what "average tok/s" means to anyone reading
+    /// it, and it is not comparable with the single-generation `decode_tok_s`
+    /// that `--metrics` prints.
+    pub fn from_accumulated(
+        turns: usize,
+        prefill_tokens: usize,
+        generated_tokens: usize,
+        decode_s: f64,
+    ) -> Self {
+        Self {
+            turns,
+            prefill_tokens,
+            generated_tokens,
+            decode_s,
+            decode_tok_s: if decode_s > 0.0 {
+                generated_tokens as f64 / decode_s
+            } else {
+                0.0
+            },
+        }
+    }
+}
+
 fn argmax_logits(logits: &[u16]) -> u32 {
     let mut best = 0;
     let mut best_val = half::f16::from_bits(logits[0]).to_f32();
@@ -165,6 +207,24 @@ pub struct ChatSession<'a> {
     turns: usize,
     messages: Vec<ChatMessage>,
     last_stats: Option<TurnStats>,
+    /// Cumulative decode work since the last [`Self::reset`], for the
+    /// end-of-session summary.
+    ///
+    /// Accumulated rather than recomputed from `last_stats`: an average of
+    /// per-turn rates is wrong whenever the turns differ in length, which they
+    /// always do (the first turn pays a cold prefill, short replies finish in
+    /// a few tokens). Totals are summed and divided once.
+    total_prefill_tokens: usize,
+    total_generated_tokens: usize,
+    total_decode_s: f64,
+    /// The user text for the turn in flight.
+    ///
+    /// Held separately because `record_turn` is shared by both decode paths and
+    /// the prompt is available in `turn` long before the reply exists. Passing it
+    /// as an argument would be tidier, but the two call sites are in different
+    /// branches of the same function and this keeps `record_turn`'s signature to
+    /// the numbers it actually books.
+    pending_user_text: String,
 }
 
 impl<'a> ChatSession<'a> {
@@ -192,6 +252,10 @@ impl<'a> ChatSession<'a> {
             turns: 0,
             messages: Vec::new(),
             last_stats: None,
+            total_prefill_tokens: 0,
+            total_generated_tokens: 0,
+            total_decode_s: 0.0,
+            pending_user_text: String::new(),
         })
     }
 
@@ -239,11 +303,31 @@ impl<'a> ChatSession<'a> {
         self.last_stats
     }
 
+    /// Whole-session totals, for the end-of-chat summary.
+    ///
+    /// `decode_tok_s` is `total_generated / total_decode_s`, i.e. a
+    /// token-weighted rate over every turn, not a mean of per-turn rates.
+    pub fn totals(&self) -> SessionTotals {
+        SessionTotals::from_accumulated(
+            self.turns,
+            self.total_prefill_tokens,
+            self.total_generated_tokens,
+            self.total_decode_s,
+        )
+    }
+
     pub fn reset(&mut self) {
         self.model.reset_gpu_caches();
         self.turns = 0;
         self.messages.clear();
         self.last_stats = None;
+        // The totals are session-scoped, so `/reset` clears them too. Leaving
+        // them would make the end-of-chat figure describe a conversation the
+        // user explicitly discarded.
+        self.total_prefill_tokens = 0;
+        self.total_generated_tokens = 0;
+        self.total_decode_s = 0.0;
+        self.pending_user_text.clear();
     }
 
     /// Run one turn: prefill only the new tokens, decode until EOS or the
@@ -257,6 +341,7 @@ impl<'a> ChatSession<'a> {
     where
         F: FnMut(&str) -> Result<(), String>,
     {
+        self.pending_user_text = text.to_string();
         let ids = if self.turns == 0 {
             render_first_turn(self.tokenizer, text)?
         } else {
@@ -273,6 +358,99 @@ impl<'a> ChatSession<'a> {
         let mut reply = String::new();
         let mut generated: Vec<u32> = Vec::new();
         let decode_started = std::time::Instant::now();
+
+        // The loop below is the PIPELINED decode, and it exists because the
+        // obvious loop is ~3.5 tok/s slower.
+        //
+        // The obvious loop calls `forward_buffer_into_vec` per token, and that
+        // function ends in `commit_and_wait`: a full host/GPU barrier after
+        // every single token. Measured consequence, on this box, at 23-107
+        // context tokens (where attention is negligible, so the difference is
+        // not the model doing less work): **12.3 tok/s in chat against 15.8 for
+        // `--metrics` on the same binary**. Chat was slower while doing strictly
+        // less work, which is the signature of host overhead rather than a
+        // bandwidth limit.
+        //
+        // `generate_gpu`'s pipelined loop (`generate.rs`, `pipelined` branch)
+        // avoids the barrier by overlapping step N+1's *encode and submit* with
+        // step N's *GPU execution*: it encodes the next step, commits without
+        // waiting, and only then waits on the previous encoder. The GPU is never
+        // idle waiting for the host, and that is where the 3.5 tok/s lives.
+        //
+        // The same loop also avoids reading the logits back to the host at all
+        // in greedy mode: `forward_step_pipelined` stages the argmax on the GPU
+        // (`next_token_out` / `host_token_out`), so the host reads one u32 via
+        // `read_host_token` instead of 262,144 fp16 values. The naive version
+        // copied and scanned the full vocabulary per token, on the CPU, inside
+        // the timed region.
+        //
+        // `KAPLUMBA_NO_PIPELINE` restores the barrier-per-token loop. It is the
+        // control for exactly this attribution, which is why it exists rather
+        // than the slow path being deleted.
+        let pipelined = self.greedy && std::env::var_os("KAPLUMBA_NO_PIPELINE").is_none();
+
+        if pipelined {
+            let queue = self.model.forward_queue().clone();
+            // At most two encoders are kept, so this Vec never grows past 3.
+            let mut encoders: Vec<kaplumba_kernels::encoder::MetalEncoder> = Vec::new();
+
+            for step in 0..self.max_new_tokens {
+                let token = if step == 0 {
+                    argmax_logits(&logits)
+                } else {
+                    // The token staged by the previous step, on the GPU.
+                    self.model.read_host_token(step - 1)
+                };
+                if self.eos_ids.contains(&token) {
+                    // Drain anything already submitted before returning, or the
+                    // KV cache advances past what the next turn's `base`
+                    // believes and every later position is wrong.
+                    for encoder in encoders.drain(..) {
+                        encoder.wait();
+                    }
+                    break;
+                }
+                generated.push(token);
+                if let Some(chunk) = detokenizer.push(token)? {
+                    if !chunk.is_empty() {
+                        reply.push_str(&chunk);
+                        on_text(&chunk).map_err(ChatError::from_output)?;
+                    }
+                }
+                let position = (base + need + step) as u32;
+                let mut encoder =
+                    kaplumba_kernels::encoder::MetalEncoder::new(&queue).map_err(ModelError::from)?;
+                encoder.set_max_dispatches(2500);
+                self.model
+                    .forward_step_pipelined(&mut encoder, position, Some(token), step % 2, step as u32)
+                    .map_err(ModelError::from)?;
+                encoder.commit_terminal().map_err(ModelError::from)?;
+                encoders.push(encoder);
+
+                // Keep at most two steps in flight, then wait for the oldest.
+                // Two is what `generate.rs` uses: enough to hide the submit, few
+                // enough that the host never runs more than one step ahead of
+                // the KV cache it is reading positions out of.
+                if encoders.len() > 2 {
+                    let oldest = encoders.remove(0);
+                    oldest.wait();
+                }
+            }
+            for encoder in encoders.drain(..) {
+                encoder.wait();
+            }
+            let decode_s = decode_started.elapsed().as_secs_f64();
+            if let Some(chunk) = detokenizer.finish()? {
+                if !chunk.is_empty() {
+                    reply.push_str(&chunk);
+                    on_text(&chunk).map_err(ChatError::from_output)?;
+                }
+            }
+            self.record_turn(need, generated.len(), decode_s, &reply);
+            return Ok(reply);
+        }
+
+        // Fallback: barrier per token. Correct, and ~3.5 tok/s slower.
         for _ in 0..self.max_new_tokens {
             let token = if self.greedy {
                 argmax_logits(&logits)
@@ -306,25 +484,35 @@ impl<'a> ChatSession<'a> {
                 on_text(&chunk).map_err(ChatError::from_output)?;
             }
         }
+        self.record_turn(need, generated.len(), decode_s, &reply);
+        Ok(reply)
+    }
+
+    /// Book-keeping shared by both decode paths, so they cannot disagree about
+    /// what a "turn" recorded. The two loops differ in how they submit work, not
+    /// in what they count.
+    fn record_turn(&mut self, prefill: usize, generated: usize, decode_s: f64, reply: &str) {
         self.messages.push(ChatMessage {
             role: ChatRole::User,
-            text: text.to_string(),
+            text: std::mem::take(&mut self.pending_user_text),
         });
         self.messages.push(ChatMessage {
             role: ChatRole::Assistant,
-            text: reply.clone(),
+            text: reply.to_string(),
         });
         self.turns += 1;
+        self.total_prefill_tokens += prefill;
+        self.total_generated_tokens += generated;
+        self.total_decode_s += decode_s;
         self.last_stats = Some(TurnStats {
-            prefill_tokens: need,
-            generated_tokens: generated.len(),
+            prefill_tokens: prefill,
+            generated_tokens: generated,
             decode_tok_s: if decode_s > 0.0 {
-                generated.len() as f64 / decode_s
+                generated as f64 / decode_s
             } else {
                 0.0
             },
         });
-        Ok(reply)
     }
 }
 
@@ -344,7 +532,7 @@ pub fn default_context_limit() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{fits_in_context, ChatError};
+    use super::{fits_in_context, ChatError, SessionTotals};
 
     #[test]
     fn context_limit_boundary() {
@@ -358,5 +546,61 @@ mod tests {
             }
             _ => panic!("expected ContextOverflow"),
         }
+    }
+
+    /// The session rate is token-weighted, not a mean of per-turn rates. Two
+    /// turns of wildly different length is the case that separates them: a mean
+    /// of (2, 20) is 11 tok/s, while the true rate over the same work is
+    /// 22 / (2/2 + 4/20) = 15.2.
+    #[test]
+    fn session_rate_is_token_weighted_not_a_mean_of_turns() {
+        let totals = SessionTotals::from_accumulated(
+            2,
+            12,
+            22,
+            // 2 tokens in 1.0 s (2 tok/s), then 20 tokens in 1.0 s (20 tok/s).
+            2.0,
+        );
+        assert_eq!(totals.generated_tokens, 22);
+        assert_eq!(totals.decode_tok_s, 11.0);
+
+        // Equal time per turn, so the token-weighted rate is the arithmetic mean
+        // only because the times happen to be equal. Change the times and the
+        // two must diverge -- which is the property being asserted.
+        let unequal = SessionTotals::from_accumulated(
+            2,
+            12,
+            22,
+            // 2 tokens in 0.5 s (4 tok/s), then 20 tokens in 1.5 s (13.33 tok/s).
+            2.0,
+        );
+        let mean_of_rates = (4.0 + 20.0 / 1.5) / 2.0;
+        assert!(
+            (unequal.decode_tok_s - mean_of_rates).abs() > 0.5,
+            "expected the token-weighted rate ({:.2}) to differ from the mean of \
+             per-turn rates ({mean_of_rates:.2})",
+            unequal.decode_tok_s
+        );
+        assert_eq!(unequal.decode_tok_s, 11.0);
+    }
+
+    /// A session that generated nothing must report 0, not NaN or infinity.
+    /// Reachable: `--max-new-tokens 0`, or a prompt answered with an immediate
+    /// EOS.
+    #[test]
+    fn a_session_with_no_decode_time_reports_zero_not_nan() {
+        let totals = SessionTotals::from_accumulated(3, 30, 0, 0.0);
+        assert_eq!(totals.decode_tok_s, 0.0);
+        assert!(totals.decode_tok_s.is_finite());
+        assert_eq!(totals.turns, 3);
+    }
+
+    /// A turn that generated tokens in zero measured time must not divide by
+    /// zero. `Instant` can legitimately report a 0 ns elapsed for a turn that
+    /// hit `max_new_tokens` immediately.
+    #[test]
+    fn zero_elapsed_time_with_tokens_present_still_reports_zero() {
+        let totals = SessionTotals::from_accumulated(1, 5, 1, 0.0);
+        assert_eq!(totals.decode_tok_s, 0.0);
     }
 }

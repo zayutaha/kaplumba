@@ -752,6 +752,16 @@ struct PostAttnPreFfnParams {
     float eps;
 };
 
+/// T3: the two norms fused across a layer boundary differ in more than their
+/// weight pointers -- `scale` is here for layer L's `layer_scalar`, which the
+/// `input_norm_and_qkv_transform` half of the fusion does not have.
+struct CrossLayerParams {
+    uint width;
+    uint blocks;
+    float eps;
+    float scale;
+};
+
 kernel void post_attn_pre_ffn_transform(
     const device half *proj [[buffer(0)]],
     const device half *post_attn_norm [[buffer(1)]],
@@ -1043,6 +1053,152 @@ kernel void linear_finalize_o_proj_and_pre_ffn_transform_sk4(
         float v1 = float(half(float(shared_buf[base + 32u]) * inv2 * float(pre_ffn_norm[base + 32u]))) * float(gate_input_signs[base + 32u]);
         float v2 = float(half(float(shared_buf[base + 64u]) * inv2 * float(pre_ffn_norm[base + 64u]))) * float(gate_input_signs[base + 64u]);
         float v3 = float(half(float(shared_buf[base + 96u]) * inv2 * float(pre_ffn_norm[base + 96u]))) * float(gate_input_signs[base + 96u]);
+        transform_simd(v0, v1, v2, v3, lane);
+        transformed[base] = half(v0);
+        transformed[base + 32u] = half(v1);
+        transformed[base + 64u] = half(v2);
+        transformed[base + 96u] = half(v3);
+    }
+}
+
+// ===========================================================================
+// T3: cross-layer norm/residual chain fusion.
+//
+// Fuses layer L's `linear_finalize_and_post_ffn_norm_scale_sk2` (which writes
+// `output` = the residual stream handed to layer L+1) with layer L+1's
+// `input_norm_and_qkv_transform` (which reads that stream and writes `normed`
+// + `transformed`). The two dispatches are adjacent in the layer loop and the
+// intermediate `output` buffer is written by one and read by the other, so they
+// are one dispatch with the round-trip kept in registers.
+//
+// BIT-EXACTNESS -- the frozen parts, and why they are frozen.
+//
+// Two independent norm reductions are involved (layer L's post_ffn_norm over
+// `proj`, and layer L+1's input_layernorm over the residual stream). Both are
+// reproduced at the SAME width, thread count and reduction tree as the kernels
+// they replace, and both orderings are load-bearing:
+//
+//   * Layer L's reduction: 1024 threads, `partial[1024]`, tree from 512. The
+//     `lid < 256u` guard on the accumulation loop is what makes the 1024-thread
+//     tree bit-identical to the 256-thread original -- threads 256..1023
+//     contribute exact zeros, so the extra levels of the tree add nothing.
+//     `linear_finalize_and_post_ffn_norm_scale_sk2` says the same in its own
+//     header; this kernel must not "simplify" it away.
+//   * Layer L+1's reduction: 256 threads, `partial[256]`, tree from 128, as in
+//     `input_norm_and_qkv_transform`. NOT 1024. Mixing the two would reassociate
+//     the sum and change the low bits.
+//
+// Layer L+1's `input_shared` staging is kept even though `hidden` is already in
+// registers, because `input_norm_and_qkv_transform` reads its own staging copy
+// rather than the residual buffer, and reproducing it exactly is cheaper than
+// proving the two are interchangeable.
+// ===========================================================================
+
+kernel void finalize_post_ffn_and_next_input_norm_transform(
+    const device float *raw           [[buffer(0)]],
+    const device half *output_signs   [[buffer(1)]],
+    const device half *post_ffn_norm  [[buffer(2)]],
+    const device half *residual       [[buffer(3)]],
+    device half *output               [[buffer(4)]],
+    const device half *next_input_norm [[buffer(5)]],
+    const device half *next_q_signs   [[buffer(6)]],
+    device half *normed               [[buffer(7)]],
+    device half *transformed          [[buffer(8)]],
+    constant CrossLayerParams &params [[buffer(9)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]]) {
+    threadgroup half shared_buf[5376];
+    threadgroup half input_shared[5376];
+    threadgroup float partial[1024];
+    const uint n = params.width;
+
+    // ---- Layer L: split-K2 reduce + output signs --------------------------
+    for (uint b = sg; b < params.blocks; b += 32u) {
+        const uint base = b * 128u + lane;
+        float v0 = raw[base] + raw[base + n];
+        float v1 = raw[base + 32u] + raw[base + 32u + n];
+        float v2 = raw[base + 64u] + raw[base + 64u + n];
+        float v3 = raw[base + 96u] + raw[base + 96u + n];
+        transform_simd(v0, v1, v2, v3, lane);
+        shared_buf[base] = half(v0 * float(output_signs[base]));
+        shared_buf[base + 32u] = half(v1 * float(output_signs[base + 32u]));
+        shared_buf[base + 64u] = half(v2 * float(output_signs[base + 64u]));
+        shared_buf[base + 96u] = half(v3 * float(output_signs[base + 96u]));
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Layer L: post_ffn RMSNorm, 1024-thread tree from 512 --------------
+    // The `lid < 256u` guard is load-bearing; see the header.
+    float sum = 0.0f;
+    if (lid < 256u) {
+        for (uint i = lid; i < params.width; i += 256u) {
+            const float val = float(shared_buf[i]);
+            sum += val * val;
+        }
+    }
+    partial[lid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 512u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            partial[lid] += partial[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inverse = rsqrt(partial[0] / float(params.width) + params.eps);
+
+    // ---- Layer L: residual add + layer scale, and hand `output` to L+1 ----
+    // `output` is still written: the lm_head path reads it, and the profiling
+    // and ablation switches address it. What is saved is the *re-read* on the
+    // other side, not the store.
+    const float scale = params.scale;
+    for (uint i = lid; i < params.width; i += 1024u) {
+        const float normed = float(shared_buf[i]) * inverse * float(post_ffn_norm[i]);
+        const half res = half((float(residual[i]) + normed) * scale);
+        output[i] = res;
+        input_shared[i] = res;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // ---- Layer L+1: input_layernorm, 256-thread tree from 128 --------------
+    // 256 threads and a 128 tree, NOT the 1024/512 above: the two norms reduce
+    // differently and the difference is observable in the low bits.
+    float sum2 = 0.0f;
+    if (lid < 256u) {
+        for (uint i = lid; i < params.width; i += 256u) {
+            const float val = float(input_shared[i]);
+            sum2 += val * val;
+        }
+    }
+    partial[lid] = sum2;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = 128u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            partial[lid] += partial[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inv = rsqrt(partial[0] / float(params.width) + params.eps);
+
+    // ---- Layer L+1: input norm + q input-sign transform -------------------
+    // Exactly `input_norm_and_qkv_transform`'s step 3, including the fp16
+    // rounding of the normed value BEFORE the sign multiply: `n0` is a half, and
+    // `float(n0)` is what the transform consumes.
+    for (uint b = sg; b < params.blocks; b += 8u) {
+        const uint base = b * 128u + lane;
+        const half n0 = half(float(input_shared[base]) * inv * float(next_input_norm[base]));
+        const half n1 = half(float(input_shared[base + 32u]) * inv * float(next_input_norm[base + 32u]));
+        const half n2 = half(float(input_shared[base + 64u]) * inv * float(next_input_norm[base + 64u]));
+        const half n3 = half(float(input_shared[base + 96u]) * inv * float(next_input_norm[base + 96u]));
+        normed[base] = n0;
+        normed[base + 32u] = n1;
+        normed[base + 64u] = n2;
+        normed[base + 96u] = n3;
+
+        float v0 = float(n0) * float(next_q_signs[base]);
+        float v1 = float(n1) * float(next_q_signs[base + 32u]);
+        float v2 = float(n2) * float(next_q_signs[base + 64u]);
+        float v3 = float(n3) * float(next_q_signs[base + 96u]);
         transform_simd(v0, v1, v2, v3, lane);
         transformed[base] = half(v0);
         transformed[base + 32u] = half(v1);

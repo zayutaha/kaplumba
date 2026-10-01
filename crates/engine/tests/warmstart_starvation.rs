@@ -176,7 +176,25 @@ fn run(spinners: u64, ctx: &Ctx) -> (bool, f64) {
 /// The gate. A full-grid spinner that starves its own producer would make the
 /// warm-start design a GPU hang, and the engine reported exactly that. This
 /// asserts the producer is still reachable at the production grid size.
+///
+/// **`#[ignore]`d: this is a GPU-saturating stress measurement, not a test.**
+/// It dispatches 336 x 256 = 86,016 threads re-reading one 4-byte cache line in
+/// a spin loop. That is enough to peg every compute unit on the box — running it
+/// makes the machine unusable for anything else, including a real model load.
+/// The measurement it produces is already recorded in
+/// `spec/decode-20tps/implementation_notes.md` §1a (the sweep table, 18.6 s
+/// wall at the production grid). Run it deliberately:
+///
+/// ```text
+/// cargo test --release --test warmstart_starvation -- --ignored --nocapture
+/// ```
+///
+/// It is kept, rather than deleted, because it is the evidence that closed T2a,
+/// and because the spin is the mechanism a future agent would otherwise
+/// re-invent. `KAPLUMBA_PIPELINE_AUDIT`-style accidental discovery is not worth
+/// the lockup, hence the gate.
 #[test]
+#[ignore = "GPU-saturating stress measurement (86,016 spinning threads); run with --ignored"]
 fn a_full_o_proj_grid_of_spinners_does_not_starve_its_producer() {
     let Some(ctx) = context() else {
         eprintln!("no Metal device; skipping");
@@ -208,7 +226,12 @@ fn a_full_o_proj_grid_of_spinners_does_not_starve_its_producer() {
 /// assumption. Printed, not asserted: the exact crossover is a property of this
 /// GPU's occupancy, and asserting a specific number would make the test a
 /// calibration of Metal rather than of this design.
+///
+/// `#[ignore]`d for the same reason as the gate above, and more so: the sweep
+/// runs eight grids up to 672 groups = 172,032 spinning threads, ~72 s of
+/// pegged GPU. The table it prints is in the implementation notes.
 #[test]
+#[ignore = "GPU-saturating stress sweep (~72 s of pegged GPU); run with --ignored"]
 fn starvation_boundary_is_measured() {
     let Some(ctx) = context() else {
         eprintln!("no Metal device; skipping");

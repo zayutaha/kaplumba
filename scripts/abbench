@@ -1,0 +1,142 @@
+#!/bin/zsh
+# Interleaved A/B decode benchmark. One binary, arms alternate, so drift and
+# thermal effects land on both arms instead of on whichever ran second.
+#
+# Usage:
+#   scripts/abbench -n 8 -m MODEL [-e "ENV=VAL,ENV2=VAL2"] "arm label|ENVSPEC" ...
+#
+# Each arm spec is  label|ENV1=VAL1,ENV2=VAL2   (env spec may be empty).
+# Arms run in rounds: round 1 runs every arm once, round 2 again, ... so an
+# A B A B ... order is the default.
+#
+# Prints, per arm: n, median, min, max, spread of decode_tokens_per_second, and
+# the generated token-id string hash so a divergence is visible without reading
+# 64 numbers.
+#
+# Every run goes through scripts/gpuq try (exit 75 = busy, retried) because the
+# box has one GPU and 24 GiB; two loads at once thrash and invalidate the
+# numbers (AGENTS.md 10).
+#
+# spec/decode-20tps
+
+set -u
+
+BIN=${BIN:-./target/release/kaplumba}
+N=8
+MODEL=""
+PROMPT="Count from 1 to 50: 1, 2, 3,"
+MAXNEW=64
+TEMP=0
+GAP=4
+
+while getopts "n:m:p:t:g:b:" opt; do
+  case $opt in
+    n) N=$OPTARG ;;
+    m) MODEL=$OPTARG ;;
+    p) PROMPT=$OPTARG ;;
+    t) MAXNEW=$OPTARG ;;
+    g) GAP=$OPTARG ;;
+    b) BIN=$OPTARG ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+if [[ -z "$MODEL" ]]; then
+  print -u2 "abbench: -m MODEL is required"
+  exit 2
+fi
+if (( $# == 0 )); then
+  print -u2 "abbench: give at least one \"label|ENVSPEC\" arm"
+  exit 2
+fi
+
+typeset -a LABELS ENVS RESULTS
+for spec in "$@"; do
+  label="${spec%%|*}"
+  envspec="${spec#*|}"
+  LABELS+=("$label")
+  ENVS+=("$envspec")
+  RESULTS+=("")
+done
+
+# One load-and-generate. Prints "<rate> <ids>" or nothing if the GPU was busy.
+run_once() {
+  local envspec=$1
+  local tmp
+  tmp=$(mktemp -t abbench)
+  # `env -u` clears anything the caller exported, so arms do not inherit each
+  # other's flags, and `-i` would drop PATH.
+  local -a cmd
+  cmd=("$BIN" --model "$MODEL" --prompt "$PROMPT" --max-new-tokens "$MAXNEW"
+       --temperature "$TEMP" --show-ids --metrics)
+  if [[ -n "$envspec" ]]; then
+    # shellcheck disable=SC2086
+    env ${=envspec} scripts/gpuq try -- "${cmd[@]}" >"$tmp" 2>&1
+  else
+    scripts/gpuq try -- "${cmd[@]}" >"$tmp" 2>&1
+  fi
+  local rc=$?
+  if (( rc == 75 )); then
+    rm -f "$tmp"
+    return 75
+  fi
+  if (( rc != 0 )); then
+    print -u2 "abbench: run failed (exit $rc), tail:"
+    tail -3 "$tmp" >&2
+    rm -f "$tmp"
+    return 1
+  fi
+  local rate ids
+  rate=$(sed -n 's/.*decode_tok_s=\([0-9.]*\).*/\1/p' "$tmp")
+  ids=$(sed -n 's/^token_ids: //p' "$tmp")
+  if [[ -z "$rate" ]]; then
+    print -u2 "abbench: no decode_tok_s in output; tail:"
+    tail -5 "$tmp" >&2
+    rm -f "$tmp"
+    return 1
+  fi
+  print -r -- "$rate $ids"
+  rm -f "$tmp"
+}
+
+median() {
+  print -r -- "$@" | sort -g | awk '{v[NR]=$1} END {
+    if (NR % 2) print v[(NR+1)/2]; else print (v[NR/2] + v[NR/2+1]) / 2 }'
+}
+
+print -r -- "prompt tokens ~$PROMPT"
+for ((round = 1; round <= N; round++)); do
+  for ((a = 1; a <= ${#LABELS[@]}; a++)); do
+    # Retry only while the GPU is genuinely busy (75), which is a scheduling
+    # outcome. A hard failure aborts rather than silently producing n-1 points.
+    for ((attempt = 0; attempt < 40; attempt++)); do
+      out=$(run_once "${ENVS[$a]}")
+      rc=$?
+      if (( rc == 75 )); then
+        sleep 5
+        continue
+      fi
+      break
+    done
+    if (( rc != 0 )); then
+      print -u2 "abbench: giving up on arm '${LABELS[$a]}' round $round"
+      exit 1
+    fi
+    RESULTS[$a]+="$out"$'\n'
+  done
+  sleep $GAP
+done
+
+print -r -- ""
+print -r -- "arm                    n   median    min     max  spread   ids"
+for ((a = 1; a <= ${#LABELS[@]}; a++)); do
+  rates=$(print -r -- "${RESULTS[$a]}" | grep -v '^$' | cut -d' ' -f1)
+  ids=$(print -r -- "${RESULTS[$a]}" | grep -v '^$' | cut -d' ' -f2- | sort -u | wc -l | tr -d ' ')
+  n=$(print -r -- "$rates" | grep -c .)
+  med=$(median ${=rates})
+  mn=$(print -r -- "$rates" | sort -g | head -1)
+  mx=$(print -r -- "$rates" | sort -g | tail -1)
+  spread=$(awk -v a="$mn" -v b="$mx" 'BEGIN{printf "%.3f", b-a}')
+  printf '%-22s %2d  %7s %6s %6s %6s   %s\n' "${LABELS[$a]}" "$n" "$med" "$mn" "$mx" "$spread" \
+    "$([[ "$ids" == "1" ]] && echo SAME || echo "DIVERGED($ids)")"
+done

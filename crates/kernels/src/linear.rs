@@ -118,6 +118,19 @@ pub struct PostAttnPreFfnParams {
     pub eps: f32,
 }
 
+/// T3: the cross-layer fusion's parameters. Byte-identical in layout to
+/// [`FinalizeNormScaleParams`], and that is deliberate — the layer-L half of the
+/// fused kernel is the `_sk2` finalize, so reusing the struct makes it harder to
+/// change one field in the fused kernel and not the other.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct CrossLayerParams {
+    pub width: u32,
+    pub blocks: u32,
+    pub eps: f32,
+    pub scale: f32,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct LinearParams {
@@ -304,6 +317,10 @@ pub struct LinearKernels {
     pub finalize_o_proj_and_pre_ffn_transform_sk2_pipeline: ComputePipelineState,
     pub finalize_o_proj_and_pre_ffn_transform_sk4_pipeline: ComputePipelineState,
     pub input_norm_and_qkv_transform_pipeline: ComputePipelineState,
+    /// T3: layer L's finalize+post_ffn_norm+residual fused with layer L+1's
+    /// input_layernorm+q_input_transform. One dispatch, one reduction tree per
+    /// norm, both reproduced exactly from the kernels they replace.
+    cross_layer_pipeline: ComputePipelineState,
     input_rows_pipeline: ComputePipelineState,
     gemv_tiled_pipeline: ComputePipelineState,
     /// Tensor-core prefill GEMM (`linear_gemm_mma`): dequantize the EXL3 weights
@@ -581,6 +598,11 @@ impl LinearKernels {
             &library,
             "input_norm_and_qkv_transform",
         )?;
+        let cross_layer_pipeline = pipeline_audit::build(
+            &device,
+            &library,
+            "finalize_post_ffn_and_next_input_norm_transform",
+        )?;
         let input_rows_pipeline = pipeline_audit::build(&device, &library, "linear_input_rows")?;
         let gemv_tiled_pipeline = pipeline_audit::build(&device, &library, "linear_gemv_tiled")?;
         let gemm_mma_pipeline = pipeline_audit::build(&device, &library, "linear_gemm_mma")?;
@@ -634,6 +656,7 @@ impl LinearKernels {
             finalize_o_proj_and_pre_ffn_transform_sk2_pipeline,
             finalize_o_proj_and_pre_ffn_transform_sk4_pipeline,
             input_norm_and_qkv_transform_pipeline,
+            cross_layer_pipeline,
             input_rows_pipeline,
             gemv_tiled_pipeline,
             gemm_mma_pipeline,
@@ -3128,6 +3151,61 @@ impl LinearKernels {
             params_bytes(&params),
             1,
             256,
+        )
+    }
+
+    /// T3: layer L's finalize + post_ffn_norm + residual add, fused with
+    /// layer L+1's input_layernorm + q input-sign transform.
+    ///
+    /// `output` is still written. The residual stream is read by this layer's
+    /// own `o_proj` finalize on the way in and by the lm_head path at the very
+    /// end, so eliminating the store would not eliminate the data; what the
+    /// fusion removes is the round trip through it and one dispatch.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_cross_layer_finalize_and_norm(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        raw: &Buffer,
+        output_signs: &Buffer,
+        post_ffn_norm: &Buffer,
+        residual: &Buffer,
+        output: &Buffer,
+        next_input_norm: &Buffer,
+        next_q_signs: &Buffer,
+        normed: &Buffer,
+        transformed: &Buffer,
+        width: usize,
+        eps: f32,
+        scale: f32,
+    ) -> Result<(), KernelError> {
+        if crate::ablated("finalize_post_ffn") {
+            return Ok(());
+        }
+        let params = CrossLayerParams {
+            width: to_u32(width, "cross-layer width")?,
+            blocks: to_u32(width / 128, "cross-layer blocks")?,
+            eps,
+            scale,
+        };
+        // 1024 threads, because the layer-L half is the `_sk2` finalize and its
+        // 1024-thread reduction tree is what makes it bit-identical to the
+        // 256-thread original.
+        encoder.dispatch_groups(
+            &self.cross_layer_pipeline,
+            &[
+                Some(raw),
+                Some(output_signs),
+                Some(post_ffn_norm),
+                Some(residual),
+                Some(output),
+                Some(next_input_norm),
+                Some(next_q_signs),
+                Some(normed),
+                Some(transformed),
+            ],
+            params_bytes(&params),
+            1,
+            1024,
         )
     }
 

@@ -1252,6 +1252,58 @@ impl DecoderLayer {
             .map_err(ModelError::from)
     }
 
+    /// T3: does layer L's finalize subsume layer L+1's input norm?
+    ///
+    /// Every condition is a requirement, not a preference:
+    ///
+    ///   * decode only -- the fused kernel has no token axis, so a multi-token
+    ///     prefill would read `pos` and `offset` from the wrong place, and
+    ///     prefill's norms may pick a different per-row kernel for large `rows`
+    ///     (see the `norm_rope_qkv` comment above).
+    ///   * split-K2 -- the fused kernel reproduces `_sk2`'s 1024-thread
+    ///     reduction. The sk4 finalize reduces four partials in a different
+    ///     order and no-SK reduces one; neither is bit-identical to it.
+    ///   * `permutation_mode == 1` -- otherwise layer L+1 does a plain
+    ///     `hidden_norm` plus a separate transform, a different shape of work.
+    ///   * the norm and q-input-signs must be GPU-resident, since the fused
+    ///     kernel reads them as device buffers. Checked here rather than in the
+    ///     dispatcher so the answer cannot differ between the two layers that
+    ///     ask the same question.
+    pub fn cross_layer_fusion_applies(
+        &self,
+        tokens: usize,
+        next_layer: Option<&DecoderLayer>,
+    ) -> bool {
+        tokens == 1
+            && !env_flag("KAPLUMBA_NO_CROSS_LAYER")
+            && self.weights.down_proj.permutation_mode == 1
+            && self.weights.down_proj.out_features % 32 == 0
+            && matches!(self.weights.down_proj.rate, Exl3Rate::Integer(3))
+            && !env_flag("KAPLUMBA_SK4")
+            && !env_flag("KAPLUMBA_NO_SK2")
+            && !env_flag("KAPLUMBA_D_NOSK")
+            && !kaplumba_kernels::ablated("finalize_post_ffn")
+            && next_layer.is_some_and(|next| {
+                next.weights.q_proj.permutation_mode == 1
+                    && next.config.hidden_size == self.config.hidden_size
+                    && next.weights.q_proj.input_signs_buffer.is_some()
+            })
+    }
+
+    /// `next_layer` is layer L+1 and `prev_layer` is layer L-1, for T3's
+    /// cross-layer fusion. The fusion spans a boundary in both directions, so a
+    /// layer needs to know about both its neighbours: `next_layer` lets it
+    /// perform L+1's input norm inside its own finalize, and `prev_layer` tells
+    /// it that the norm it would otherwise dispatch has already been done.
+    ///
+    /// Either being `None` disables the corresponding half — prefill, the first
+    /// and last layers, and the attribution switches all rely on that.
+    ///
+    /// Passing them rather than reaching into `self.layers` is what keeps the
+    /// borrow checker out of it: `forward_chunk` iterates `self.layers[index]`
+    /// while holding `&mut self`, so the sibling layers are not reachable from
+    /// inside the method.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_buffer(
         &mut self,
         index: usize,
@@ -1259,6 +1311,8 @@ impl DecoderLayer {
         output: &Buffer,
         tokens: usize,
         scratch: &ForwardScratch,
+        prev_layer: Option<&DecoderLayer>,
+        next_layer: Option<&DecoderLayer>,
         encoder: &mut MetalEncoder,
         timer: &mut OpTimer,
         profile: &mut GpuProfile,
@@ -1349,8 +1403,17 @@ impl DecoderLayer {
         // `encode_linear` routes on exactly this predicate, so one flag says
         // whether the shared input transform below is worth issuing.
         let decode = tokens == 1;
+        // T3: whether THIS layer's input norm is already in hand, written by the
+        // previous layer's fused finalize. When it is, the dispatch below is
+        // skipped -- that is the dispatch the fusion exists to remove.
+        let input_norm_precomputed = prev_layer
+            .is_some_and(|prev| prev.cross_layer_fusion_applies(tokens, Some(self)))
+            && !env_flag("KAPLUMBA_SKIP_HIDDEN_NORMS");
 
-        if decode && self.weights.q_proj.permutation_mode == 1 {
+        if input_norm_precomputed {
+            // Nothing to do: `scratch.normed` and `scratch.transformed` were
+            // written by the previous layer's fused finalize.
+        } else if decode && self.weights.q_proj.permutation_mode == 1 {
             let q_input_signs = self
                 .weights
                 .q_proj
@@ -2230,19 +2293,57 @@ let use_sk4 = env_flag("KAPLUMBA_O_SK4")
                 profile.stamp(encoder, &format!("{}down_proj", prefix()))?;
                 timer.lap("down_proj");
 
-                self.linear
-                    .encode_finalize_and_post_ffn_norm_scale_sk2(
-                        encoder,
-                        &scratch.raw,
-                        down_out_signs,
-                        &self.gpu_weights.post_ffn_norm,
-                        &scratch.hidden_b,
-                        output,
-                        self.config.hidden_size,
-                        eps,
-                        self.weights.layer_scalar,
-                    )
-                    .map_err(ModelError::Kernel)?;
+                // T3: fuse this finalize with the NEXT layer's input norm,
+                // which is the dispatch its own input-norm boundary would
+                // otherwise issue immediately afterwards. Only when that layer
+                // has actually declared that it will skip its own norm, or the
+                // two sides would disagree and `scratch.normed` would be stale.
+                let fuse = self.cross_layer_fusion_applies(tokens, next_layer)
+                    && !env_flag("KAPLUMBA_SKIP_HIDDEN_NORMS");
+                if fuse {
+                    let next = next_layer.expect("checked above");
+                    let next_q_signs = next
+                        .weights
+                        .q_proj
+                        .input_signs_buffer
+                        .as_ref()
+                        .ok_or_else(|| {
+                            ModelError::InvalidWeights(
+                                "q_proj input signs are not resident".to_string(),
+                            )
+                        })?;
+                    self.linear
+                        .encode_cross_layer_finalize_and_norm(
+                            encoder,
+                            &scratch.raw,
+                            down_out_signs,
+                            &self.gpu_weights.post_ffn_norm,
+                            &scratch.hidden_b,
+                            output,
+                            &next.gpu_weights.input_norm,
+                            next_q_signs,
+                            &scratch.normed,
+                            &scratch.transformed,
+                            self.config.hidden_size,
+                            eps,
+                            self.weights.layer_scalar,
+                        )
+                        .map_err(ModelError::Kernel)?;
+                } else {
+                    self.linear
+                        .encode_finalize_and_post_ffn_norm_scale_sk2(
+                            encoder,
+                            &scratch.raw,
+                            down_out_signs,
+                            &self.gpu_weights.post_ffn_norm,
+                            &scratch.hidden_b,
+                            output,
+                            self.config.hidden_size,
+                            eps,
+                            self.weights.layer_scalar,
+                        )
+                        .map_err(ModelError::Kernel)?;
+                }
             } else {
                 self.linear
                     .encode_gemv_raw(
@@ -4061,12 +4162,30 @@ impl TextModel {
             } else {
                 (&self.scratch.hidden_b, &self.scratch.hidden_a)
             };
-            self.layers[index].forward_buffer(
+            // T3: the neighbours, so each layer can fuse across the boundaries with them.
+            // `None` on either side disables that half of the fusion, which is
+            // what layers 0 and 59 need (layer 0 has no predecessor, layer 59 has
+            // no successor -- its output goes to the lm_head, not to an input
+            // norm).
+            //
+            // The two `split_at_mut` calls are what make the borrows disjoint:
+            // `forward_buffer` needs `&mut` on its own layer (it advances the
+            // KV cache cursor) while holding `&` on both siblings, and indexing
+            // `self.layers[index]` cannot express that. `head`, `this` and `rest`
+            // are provably separate, which is the whole reason for splitting
+            // twice rather than once.
+            let (head, tail) = self.layers.split_at_mut(index);
+            let (this, rest) = tail.split_at_mut(1);
+            let prev_layer = head.last();
+            let next_layer = rest.first();
+            this[0].forward_buffer(
                 index,
                 input,
                 output,
                 tokens,
                 &self.scratch,
+                prev_layer,
+                next_layer,
                 encoder,
                 &mut timer,
                 gpu,

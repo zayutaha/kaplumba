@@ -25,6 +25,20 @@ impl fmt::Display for ArgsError {
 
 impl std::error::Error for ArgsError {}
 
+/// Sampling defaults, in one place so the parser and the help text cannot
+/// disagree about what a bare invocation does.
+pub const DEFAULT_TEMPERATURE: f32 = 1.0;
+pub const DEFAULT_TOP_K: usize = 64;
+pub const DEFAULT_TOP_P: f32 = 0.95;
+/// Generation budget when `--max-new-tokens` is not given.
+///
+/// 4096 is half of the 8192 context limit. It has to be: `fits_in_context`
+/// reserves the *whole* budget up front, so a default equal to the limit would
+/// make every prompt fail on the first turn (`used + need + max_new_tokens >
+/// limit` is then true for any non-empty prompt). Half leaves room for the
+/// prompt and the chat template's turn markers.
+pub const DEFAULT_MAX_NEW_TOKENS: usize = 4096;
+
 #[derive(Debug, Clone)]
 pub struct CliArgs {
     pub model_path: PathBuf,
@@ -55,10 +69,20 @@ impl CliArgs {
         let mut model_path = default_model_path();
         let mut prompt = None;
         let mut prompt_file = None;
-        let mut max_new_tokens = 128;
-        let mut temperature: f32 = 1.0;
-        let mut top_k = 64;
-        let mut top_p: f32 = 0.95;
+        let mut max_new_tokens = DEFAULT_MAX_NEW_TOKENS;
+        // Sampling defaults. The three are the usual llama.cpp-style trio and
+        // are named in one place so the parser and the `--help` text cannot
+        // drift: they are the numbers a user gets when they pass nothing, and a
+        // help string that lies about them is worse than no help string.
+        //
+        // temperature 1.0 is full-distribution sampling, top_k 64 truncates the
+        // tail, top_p 0.95 then trims within what is left. `--temperature 0`
+        // is the one that changes the code path rather than just the values --
+        // it selects greedy argmax in `ChatSession::new_greedy` -- so it is a
+        // separate decision and not part of this default.
+        let mut temperature: f32 = DEFAULT_TEMPERATURE;
+        let mut top_k = DEFAULT_TOP_K;
+        let mut top_p: f32 = DEFAULT_TOP_P;
         let mut seed = None;
         let mut show_ids = false;
         let mut show_metrics = false;
@@ -182,8 +206,27 @@ impl CliArgs {
     }
 }
 
-pub fn help_text() -> &'static str {
-    "Usage: kaplumba [--model PATH] [--prompt TEXT | --prompt-file PATH] [options]\n\nOptions:\n  --prompt TEXT              Use TEXT as the user prompt\n  --prompt-file PATH         Read the user prompt from PATH\n  --model PATH               Model directory (default: ~/.kaplumba/models/Gxma/Gxma)\n  --max-new-tokens N         Maximum generated tokens (default: 128)\n  --temperature VALUE        Sampling temperature; 0 selects greedy (default: 1.0)\n  --top-k N                  Keep the top K logits (default: 64)\n  --top-p VALUE              Nucleus probability threshold (default: 0.95)\n  --seed N                   Deterministic sampling seed\n  --show-ids                 Print diagnostic token IDs separately\n  --metrics                  Print timing and memory metrics\n  --benchmark                Run the fixed 2k/8-warmup/128-token benchmark\n  --chat                     Interactive multi-turn chat on stdin (no --prompt)\n  -h, --help                 Show this help\n"
+/// Built with `format!` so the defaults in the text come from the constants the
+/// parser uses. A hand-written string is how a help text ends up advertising
+/// numbers the code stopped using.
+pub fn help_text() -> String {
+    format!(
+        "Usage: kaplumba [--model PATH] [--prompt TEXT | --prompt-file PATH] [options]\n\n\
+         Options:\n  \
+         --prompt TEXT              Use TEXT as the user prompt\n  \
+         --prompt-file PATH         Read the user prompt from PATH\n  \
+         --model PATH               Model directory (default: ~/.kaplumba/models/Gxma/Gxma)\n  \
+         --max-new-tokens N         Maximum generated tokens (default: {DEFAULT_MAX_NEW_TOKENS})\n  \
+         --temperature VALUE        Sampling temperature; 0 selects greedy (default: {DEFAULT_TEMPERATURE})\n  \
+         --top-k N                  Keep the top K logits (default: {DEFAULT_TOP_K})\n  \
+         --top-p VALUE              Nucleus probability threshold (default: {DEFAULT_TOP_P})\n  \
+         --seed N                   Deterministic sampling seed\n  \
+         --show-ids                 Print diagnostic token IDs separately\n  \
+         --metrics                  Print timing and memory metrics\n  \
+         --benchmark                Run the fixed 2k/8-warmup/128-token benchmark\n  \
+         --chat                     Interactive multi-turn chat on stdin (no --prompt)\n  \
+         -h, --help                 Show this help\n"
+    )
 }
 
 fn value<I>(arguments: &mut I, name: &str) -> Result<String, ArgsError>
@@ -204,7 +247,11 @@ fn default_model_path() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{ArgsError, CliArgs};
+    use super::{
+        ArgsError, CliArgs, DEFAULT_MAX_NEW_TOKENS, DEFAULT_TEMPERATURE, DEFAULT_TOP_K,
+        DEFAULT_TOP_P, help_text,
+    };
+    use kaplumba_engine::generate::DEFAULT_CONTEXT_LIMIT;
 
     fn args(values: &[&str]) -> Vec<String> {
         std::iter::once("kaplumba")
@@ -278,6 +325,70 @@ mod tests {
         assert_eq!(parsed.read_prompt().unwrap(), "a");
         let empty = CliArgs::parse(args(&["--prompt", " "])).unwrap().unwrap();
         assert!(matches!(empty.read_prompt(), Err(ArgsError::Invalid(_))));
+    }
+
+    /// The help text is generated from the same constants the parser uses, so
+    /// it cannot advertise defaults the code stopped honouring. Asserted on all
+    /// four, because the failure mode is silent: the text still renders, it
+    /// just lies.
+    #[test]
+    fn help_text_reports_the_actual_defaults() {
+        let text = help_text();
+        assert!(
+            text.contains(&format!("(default: {DEFAULT_MAX_NEW_TOKENS})")),
+            "help text does not mention the max-new-tokens default of \
+             {DEFAULT_MAX_NEW_TOKENS}: {text}"
+        );
+        assert!(
+            text.contains(&format!("(default: {DEFAULT_TEMPERATURE})")),
+            "help text does not mention the temperature default of \
+             {DEFAULT_TEMPERATURE}: {text}"
+        );
+        assert!(
+            text.contains(&format!("(default: {DEFAULT_TOP_K})")),
+            "help text does not mention the top-k default of {DEFAULT_TOP_K}: {text}"
+        );
+        assert!(
+            text.contains(&format!("(default: {DEFAULT_TOP_P})")),
+            "help text does not mention the top-p default of {DEFAULT_TOP_P}: {text}"
+        );
+    }
+
+    /// A bare invocation gets the documented sampling defaults. This is the
+    /// property a user relies on when they type no flags at all.
+    #[test]
+    fn a_bare_invocation_uses_the_documented_defaults() {
+        let parsed = CliArgs::parse(args(&[])).unwrap().unwrap();
+        assert_eq!(parsed.temperature, DEFAULT_TEMPERATURE);
+        assert_eq!(parsed.top_k, DEFAULT_TOP_K);
+        assert_eq!(parsed.top_p, DEFAULT_TOP_P);
+        assert_eq!(parsed.max_new_tokens, DEFAULT_MAX_NEW_TOKENS);
+    }
+
+    /// The default generation budget must leave room in the context for a
+    /// prompt. `fits_in_context` reserves the whole budget up front, so a
+    /// default at or above the 8192 context limit would reject every prompt --
+    /// a failure at the first turn rather than at the limit.
+    #[test]
+    fn the_default_budget_leaves_room_for_a_prompt_in_the_context() {
+        assert!(
+            DEFAULT_MAX_NEW_TOKENS < DEFAULT_CONTEXT_LIMIT,
+            "a default of {DEFAULT_MAX_NEW_TOKENS} against a context limit of \
+             {DEFAULT_CONTEXT_LIMIT} cannot fit any prompt"
+        );
+        // A realistic first turn: a short prompt plus the chat template's
+        // markers is well under 1k tokens.
+        let prompt = 512;
+        assert!(
+            kaplumba_engine::chat::fits_in_context(
+                0,
+                prompt,
+                DEFAULT_MAX_NEW_TOKENS,
+                DEFAULT_CONTEXT_LIMIT,
+            )
+            .is_ok(),
+            "a {prompt}-token first turn does not fit with the default budget"
+        );
     }
 
     #[test]

@@ -34,6 +34,45 @@ pub struct Sampler {
     state: u64,
 }
 
+/// The `top_k` candidates, best first.
+///
+/// **This replaced a full `sort_by` of all 262,144 indices followed by a
+/// truncate to `top_k`.** Measured cost of that on this box: **14.66 ms per
+/// token** (`crates/engine/examples/bench_sampler.rs`), which is 23.4% of a
+/// 62.9 ms decode step. It was the entire difference between greedy's 15.9
+/// tok/s and sampling's 12.2 — not the model, not attention, the host sort.
+///
+/// `select_nth_unstable_by` partitions in O(n) instead of O(n log n). Because
+/// the comparator is a TOTAL order (ties broken by ascending index), the first
+/// `keep` entries after partitioning are exactly the set a full sort would have
+/// produced; sorting just that prefix restores the order, so everything
+/// downstream sees an identical sequence.
+///
+/// The claim that matters is the equality, not the speed: a sampler that quietly
+/// selected a different candidate set would be a silent quality regression that
+/// no throughput number would reveal. `top_k_selection_matches_a_full_sort`
+/// checks it across lengths, `top_k` values, and tie densities.
+fn top_k_order(logits: &[f32], top_k: usize) -> Vec<usize> {
+    let keep = top_k.min(logits.len());
+    let mut order = (0..logits.len()).collect::<Vec<_>>();
+    if keep < order.len() {
+        order.select_nth_unstable_by(keep, |left, right| {
+            logits[*right]
+                .partial_cmp(&logits[*left])
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| left.cmp(right))
+        });
+    }
+    order.truncate(keep);
+    order.sort_by(|left, right| {
+        logits[*right]
+            .partial_cmp(&logits[*left])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.cmp(right))
+    });
+    order
+}
+
 impl Sampler {
     pub fn new(config: SamplerConfig, seed: u64) -> Result<Self, SamplerError> {
         validate_config(config)?;
@@ -54,14 +93,9 @@ impl Sampler {
         if self.config.temperature == 0.0 {
             return Ok(argmax(logits));
         }
-        let mut order = (0..logits.len()).collect::<Vec<_>>();
-        order.sort_by(|left, right| {
-            logits[*right]
-                .partial_cmp(&logits[*left])
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left.cmp(right))
-        });
-        order.truncate(self.config.top_k.min(order.len()));
+        // `top_k_order` partitions in O(n) instead of sorting all 262,144
+        // indices. See that function for the measured cost and the reasoning.
+        let order = top_k_order(logits, self.config.top_k);
         let maximum = logits[order[0]];
         let mut weights = order
             .iter()
@@ -125,4 +159,114 @@ fn argmax(logits: &[f32]) -> u32 {
         }
     }
     best as u32
+}
+
+/// The order `sample` would have produced with the original full sort, i.e. the
+/// reference the partition is checked against.
+///
+/// Test-only, and *not* a reimplementation of anything on the hot path: it is
+/// the deleted code, kept verbatim as the oracle. `cfg(test)` rather than a
+/// `dead_code` allow, because a reference implementation that ships in the
+/// binary is one more thing to keep in sync for no benefit.
+#[cfg(test)]
+fn reference_top_k(logits: &[f32], top_k: usize) -> Vec<usize> {
+    let mut order = (0..logits.len()).collect::<Vec<_>>();
+    order.sort_by(|left, right| {
+        logits[*right]
+            .partial_cmp(&logits[*left])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.cmp(right))
+    });
+    order.truncate(top_k.min(order.len()));
+    order
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{reference_top_k, Sampler, SamplerConfig};
+
+    fn row(len: usize, distinct: usize) -> Vec<f32> {
+        // `distinct` controls how many exact TIE groups there are, which is the
+        // case a partition is most likely to get wrong: with a comparator that
+        // broke ties arbitrarily, the selected SET could differ from the sort's
+        // while the order still looked plausible.
+        (0..len)
+            .map(|index| ((index % distinct) as f32) * 0.25 - 8.0)
+            .collect()
+    }
+
+    /// The partition-based top-k must select the same SET, in the same ORDER, as
+    /// the full sort it replaced. This is a quality claim, not a speed claim: a
+    /// sampler that quietly picked a different candidate set would be a silent
+    /// output regression that no throughput number would reveal.
+    #[test]
+    fn top_k_selection_matches_a_full_sort() {
+        for len in [1_usize, 2, 63, 64, 65, 1024, 262_144] {
+            for top_k in [1_usize, 2, 63, 64, 65, 4096] {
+                for distinct in [1_usize, 3, len] {
+                    if top_k > len {
+                        continue;
+                    }
+                    let logits = row(len, distinct);
+                    let selected = super::top_k_order(&logits, top_k);
+                    assert_eq!(
+                        selected,
+                        reference_top_k(&logits, top_k),
+                        "top_k={top_k} len={len} distinct={distinct}: selection \
+                         differs from the full sort"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Every sample from a given seed must be identical before and after the
+    /// change. The RNG is a xorshift whose sequence depends only on how many
+    /// times it has been advanced, so a differing token means the selection fed
+    /// different weights to the cumulative walk.
+    #[test]
+    fn sampling_is_reproducible_for_a_fixed_seed() {
+        let logits = row(4096, 512);
+        let config = SamplerConfig {
+            temperature: 1.0,
+            top_k: 64,
+            top_p: 0.95,
+        };
+        let mut a = Sampler::new(config, 12345).expect("sampler");
+        let mut b = Sampler::new(config, 12345).expect("sampler");
+        for step in 0..200 {
+            let left = a.sample(&logits).expect("sample");
+            let right = b.sample(&logits).expect("sample");
+            assert_eq!(left, right, "two identically-seeded samplers diverged at {step}");
+        }
+    }
+
+    /// `top_k >= len` must not panic and must keep everything. `select_nth` is
+    /// only called when `keep < len`, so this is the other half of that guard.
+    #[test]
+    fn top_k_larger_than_the_row_keeps_everything() {
+        let logits = row(32, 32);
+        let order = super::top_k_order(&logits, 1000);
+        assert_eq!(order.len(), 32);
+        assert_eq!(order, reference_top_k(&logits, 1000));
+    }
+
+    /// The greedy path is untouched by the change and must still be argmax.
+    #[test]
+    fn greedy_is_argmax_and_ignores_top_k() {
+        let mut logits = vec![0.0_f32; 512];
+        logits[300] = 9.0;
+        for top_k in [1_usize, 64, 4096] {
+            let mut sampler = Sampler::new(
+                SamplerConfig {
+                    temperature: 0.0,
+                    top_k,
+                    top_p: 0.95,
+                },
+                7,
+            )
+            .expect("sampler");
+            assert_eq!(sampler.sample(&logits).expect("sample"), 300, "top_k={top_k}");
+        }
+    }
 }

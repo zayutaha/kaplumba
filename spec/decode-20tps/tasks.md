@@ -40,6 +40,28 @@ and recorded as a negative (AC6).
 
 ---
 
+- [x] **T0: triage the inherited tree (start of session)**
+  - Files: `crates/engine/tests/warmstart_starvation.rs`,
+    `crates/engine/tests/concurrent_stream_economics.rs`,
+    `spec/decode-20tps/implementation_notes.md` §2a
+  - Intent: gate the GPU-saturating stress test, fix the inherited
+    ~50%-failure in `concurrent_stream_economics`, establish a clean build and a
+    green suite before optimising anything.
+  - **RESULT:**
+    - `warmstart_starvation.rs`: both tests `#[ignore]`d (86,016 spinning
+      threads peg the GPU). It *cannot* pass — the spin times out at the
+      production grid, which is its finding.
+    - `concurrent_stream_economics.rs`: **two** absolute ratio thresholds were
+      inside this box's noise band. `serial/concurrent` measured 0.974-1.091 over
+      12 runs against a 1.05 ceiling (5/12 over) → far edge moved to 1.20, which
+      still discriminates because `serial/floor` = 1.67 is the ceiling.
+      `cheap_concurrent <= 1.2` failed 1/12 on values up to 1.244 → converted to
+      a **paired** comparison (0.60 median, 0.90 bound, max observed 0.625).
+    - Both new assertions sabotage-verified in both directions.
+  - Commit: `spec/decode-20tps: T0 triage inherited tree — gate stress test, de-flake T2b ratios`
+
+---
+
 - [ ] **T2a-cleanup: remove the reverted warm-start path**
   - Files: `crates/kernels/src/linear_repacked.metal`,
     `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`,

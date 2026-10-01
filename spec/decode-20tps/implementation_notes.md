@@ -134,6 +134,108 @@ dispatch boundary, which the spin design was at least honest about.
 
 ---
 
+## 2a. Inherited-work triage (session start)
+
+Picking up an uncommitted tree. Four things arrived, and each needed a decision
+before any optimisation could start.
+
+### 2a.1 `warmstart_starvation.rs` had to be gated before anything else
+
+Both of its tests dispatch the production `o_proj` grid of 336 x 256 = **86,016
+threads re-reading one 4-byte line in a spin loop**, and the sweep goes to 672
+groups = 172,032. That pegs every compute unit on the box; running it makes the
+machine unusable, which is exactly what happened to the previous agent's
+session. Both are now `#[ignore = ...]` with the explicit invocation
+(`cargo test --release --test warmstart_starvation -- --ignored --nocapture`) in
+the doc header, and the reason the file is kept at all — it is the evidence that
+closed T2a — is recorded next to the gate.
+
+Note that the gate test **cannot pass on this GPU**, and that is its finding
+rather than a defect: at the production grid the spin times out (§1a table), so
+`assert!(!timed_out)` is false by construction. It is kept as a measurement, and
+`#[ignore]` is the correct treatment for a test whose verdict is "this does not
+work".
+
+### 2a.2 `concurrent_stream_economics.rs` was failing ~50% of the time
+
+Inherited failure, unrelated to the pending work. The last assertion is a
+non-vacuity self-check: "the unsabotaged `serial / concurrent` must sit strictly
+inside the band, or `> 0.85` is unreachable rather than discriminating", with the
+far edge hardcoded at **1.05**.
+
+Twelve consecutive invocations (each already a median of 7 interleaved arms):
+
+```
+0.974 0.986 0.987 0.987 1.006 1.014 1.020 1.029 1.058 1.066 1.070 1.083 1.091
+```
+
+median **1.02**, range **0.12** wide, **5 of 12 above 1.05**. The ratio's true
+value is indistinguishable from 1 — which *is* the finding that closed T2b — and
+a ceiling at 1.05 sat inside the noise, so the test failed on coin flips.
+
+**Changed the far edge to 1.20**, and this is a measured change rather than a
+loosened one:
+
+- the conclusion is untouched: concurrent is a wash against serial, which is
+  what closed T2b;
+- 1.20 still discriminates *by construction*: the largest `serial / concurrent`
+  this harness can report is `serial / floor` = **1.67**, so a genuine win from
+  overlap has to land in 1.20…1.67;
+- the band is now as wide as this box can resolve, which is the honest tolerance
+  for a ratio measured at 1.02 ± 0.06.
+
+**Sabotage evidence for the new edge (AGENTS.md §3).** Both directions were
+broken on purpose and observed to fail:
+
+| sabotage | resulting ratio | observed |
+|---|---|---|
+| `/ 1.35` (pretend concurrent is 35% faster) | 0.69 | trips `serial_over_concurrent > 0.85` |
+| `* 1.35` (pretend concurrent is 35% slower) | 1.415 | trips `serial_over_concurrent < 1.20` |
+
+Note that the lower sabotage trips the *original* finding assertion, which is
+the one that matters: it says "if overlap really paid, this test would have
+caught it". A test whose ratio assertions cannot fail is the exact defect this
+repo has shipped before (`spec/engine-performance` Q11), so both were checked.
+
+### 2a.3 The same test's *other* absolute threshold was flaky too
+
+Fixing the first one exposed a second instance of the same defect, which is why
+it is worth writing down rather than patching silently: the sabotage check
+`cheap_concurrent <= 1.2` (an overlapping pair whose second stream does 1/10 the
+work must land well under the finding's 1.2 bound) failed **1 run in 12** on an
+absolute comparison. Twelve consecutive runs of the sabotage arm:
+
+```
+0.867 0.918 0.992 1.009 1.012 1.014 1.032 1.040 1.068 1.078 1.088 1.244
+```
+
+median 1.02, one excursion to 1.244. **"10x lighter" is not "free"**: the lighter
+stream still pays a dispatch and an `MTLEvent` wait, and the heavier one still
+saturates the pipe, so the ratio lands near 1.0 rather than the ~0.5 the
+original comment guessed.
+
+**Changed it to a paired comparison** — sabotage against the unsabotaged number
+measured in the *same invocation* — with a bound of 0.90. This is the same
+reason every other conclusion in the file is a ratio: a box running 15% fast or
+slow moves both arms together and cancels. Ten consecutive paired figures:
+
+```
+0.462 0.579 0.585 0.587 0.590 0.600 0.604 0.609 0.613 0.625
+```
+
+median **0.60**, max 0.625 — a 44% margin below the 0.90 bound, where the
+absolute form had none. **Sabotage-verified**: pointing the "cheap" stream at the
+same work as the real one (`concurrent_scaled(1)` instead of `(10)`) produced a
+paired figure of **1.093** and tripped the assertion, so it is reading a real
+measurement.
+
+**The transferable lesson, and it is the second time this repo has hit it:**
+*do not compare two independently-measured ratios against a shared absolute
+constant when both ratios have a ±0.1 noise band.* Pair them. Eight consecutive
+full runs of the test are now green.
+
+---
+
 ## 4. Task T2b RESULT: ❌ NEGATIVE. Two bandwidth-bound kernels cannot overlap.
 
 T2b is the spec's own fallback for T2a, so it got built — as a measurement
