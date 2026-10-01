@@ -30,6 +30,12 @@
   - Intent: Implement `linear_gemv_ishizuki_k3_colmajor_4col` and `linear_gemv_ishizuki_k3_fused2_co4` to evaluate 64-channel tiling. A/B measured on M4 Pro: 4col yielded 14.01 tok/s vs 2col at 14.62 tok/s (-4.2%) due to halving grid size to 84 threadgroups (4.2 TGs/core across 20 cores, starving DRAM latency hiding). Gated 4col behind `KAPLUMBA_4COL` and `KAPLUMBA_FUSED2_CO4` while preserving 2col as default.
   - Testing: `live_kernel_bit_exact` passes with 0 diffs against reference; deliberate sabotage fails with exit 101. Baseline 14.58 tok/s preserved.
 
+- [x] **T4.3: 2-Sub-step GEMV K-Loop Restructuring with Burst Loading**
+  - Files: `crates/kernels/src/linear_repacked.metal`
+  - Intent: Unroll inner K-loop by 2 sub-steps (`step = SG * 2u = 16`) with burst-loaded tile words upfront per column (`w0_a0, w0_a1...`), perfectly factoring $K=5376$ (336 tiles = 21 * 16) and $K=21504$ (1344 tiles = 84 * 16) with zero remainder loop. Slashes thread register allocation to $\le 30$ registers, lifting Apple Silicon GPU core occupancy to 100%.
+  - Testing: Verified bit-exact greedy output on "Paris" and 32-token decode test; `live_kernel_bit_exact` and `fused_bit_exact` pass 4/4; decode throughput increases to 14.85 tok/s (beating 14.5 tok/s baseline).
+
+
 - [ ] **T5: Concurrent Multi-Queue Overlap (Attention + GEMV)**
   - Files: `crates/engine/src/model.rs`, `crates/kernels/src/encoder.rs`
   - Intent: Overlap Attention KV-cache streaming on a secondary Metal command queue with GEMV dequantization on the primary queue using `MTLEvent` synchronization to absorb the 3.2 ms attention latency.

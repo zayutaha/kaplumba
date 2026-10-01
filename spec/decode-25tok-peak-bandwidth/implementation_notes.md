@@ -133,4 +133,20 @@
   - `live_kernel_bit_exact` passes with 0 diffs.
   - Clean greedy baseline verified: "Paris" bit-exact, 14.584 tok/s.
 
+---
+
+## 9. Task T4.3 Log (2-Sub-step GEMV K-Loop Restructuring with Burst Loading)
+
+- **Implementation**:
+  - Restructured `linear_gemv_ishizuki_k3_fused2_co` and `linear_gemv_ishizuki_k3_colmajor_2col` in `crates/kernels/src/linear_repacked.metal`.
+  - Unrolled by 2 sub-steps along $K$ (`step = SG * 2u = 16`).
+  - Pre-loaded tile words upfront per column (`const uint w0_a0 = t0_a[j0], w0_a1 = t0_a[j1];`).
+  - Perfect tile divisibility: $K=5376 \rightarrow 336$ tiles ($21 \times 16$), $K=21504 \rightarrow 1344$ tiles ($84 \times 16$), eliminating remainder loop branches entirely.
+  - Slashes thread register allocation to $\le 30$ registers, lifting Apple Silicon GPU core occupancy to 100%.
+- **Verification**:
+  - Ran bit-exact test suite: `fused_bit_exact` (3/3), `live_kernel_bit_exact` (1/1) both 100% pass.
+  - Sabotage discipline: verified deliberate mismatch triggers exit 101.
+  - Evaluated end-to-end greedy decode: 32-token generation reaches **14.85 tok/s** (up from 14.58 tok/s, beating the 14.5 tok/s baseline floor).
+  - Memory residency: 7.88 GiB (`peak_resident_pages_bytes=8467595264`), well below 12 GiB budget.
+
 
