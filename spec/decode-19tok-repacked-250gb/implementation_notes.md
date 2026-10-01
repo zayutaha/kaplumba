@@ -1686,3 +1686,53 @@ reduction inside the timing window:
   read 58.1 / 86.9 / 110.5 GB/s against a steady state of 126 / 134 / 135, and
   those were the *only* two cells in the entire sweep to fall below the
   repeatability floor. It looked exactly like contention.
+
+## 22. Elimination of 64-Bit Emulated Barrel Shifts in Production GEMV Loops
+
+### 22.1 Mechanism and Findings
+Prior to this change, `linear_gemv_ishizuki_k3_colmajor_contig4`, `linear_gemv_ishizuki_k3_fused2`, and `linear_gemv_ishizuki_k3_fused3` constructed 64-bit `ulong` values across 4 tiles in the hot loop:
+```metal
+const ulong w0a = t0[j0], w0b = t0[j1];
+const ulong A0 = ((w0a << 32) | w0b) << sh0;
+```
+Apple Silicon GPUs feature 32-bit execution units. Emulating 64-bit barrel shifts and bitwise extraction required pairs of instructions, register pressure, and multi-cycle latency, which probe `probe_contig4_load_alu.rs` attributed to ~63% of kernel execution time.
+
+### 22.2 Pure 32-Bit Funnel Shift Specialization
+Mathematical analysis of the lane bit offset:
+```metal
+lo0 = (lane * 8u + 1u) * 3u + RING - 16u;
+sh0 = lo0 % 32u;
+```
+Because `RING = 768`, `(24 * lane + 755) % 32 = (24 * lane + 19) % 32`.
+For all `lane` in `0..31`, `24 * lane % 32 \in {0, 8, 16, 24}`.
+Therefore `sh0 \in {19, 27, 3, 11}` is **strictly non-zero and odd for every SIMD lane**.
+
+This guarantees that:
+1. `rsh0 = 32u - sh0` is always in `[1, 31]` and loop-invariant per lane.
+2. `(wa << sh0) | (wb >> rsh0)` is unconditionally valid across all lanes without needing any `csel`, select instruction, or ternary branch.
+3. Native 32-bit funnel shift replaces 64-bit integer allocations:
+```metal
+static inline void extract_v_mcg_32(uint wa, uint wb, uint sh0, uint rsh0, thread float v[8]) {
+    const uint A_hi = (wa << sh0) | (wb >> rsh0);
+    const uint A_lo = wb << sh0;
+    v[0] = decode_state_mcg((A_hi >> 16) & 0xffffu);
+    v[1] = decode_state_mcg((A_hi >> 13) & 0xffffu);
+    v[2] = decode_state_mcg((A_hi >> 10) & 0xffffu);
+    v[3] = decode_state_mcg((A_hi >> 7) & 0xffffu);
+    v[4] = decode_state_mcg((A_hi >> 4) & 0xffffu);
+    v[5] = decode_state_mcg((A_hi >> 1) & 0xffffu);
+    v[6] = decode_state_mcg(((A_hi << 2) | (A_lo >> 30)) & 0xffffu);
+    v[7] = decode_state_mcg(((A_hi << 5) | (A_lo >> 27)) & 0xffffu);
+}
+```
+
+### 22.3 Verification & Measurement
+- **Unit test**: `exl3::tests::test_funnel_shift_matches_64bit` verifies bit-for-bit equivalence between `(((wa as u64) << 32) | wb as u64) << sh0` and the 32-bit funnel shift.
+- **Kernel parity**: `test_metal_gemv_repacked_bit_exact`, `live_kernel_contig4_is_bit_exact_against_colmajor`, and `fused_bit_exact` pass 100% bit-exact (0 diffs).
+- **End-to-end output**: Greedy text verified byte-identical ("The capital of France is Paris.").
+- **Throughput**:
+  - `gate_up_gelu`: 27.44 ms -> 25.84 ms (201.4 GB/s sustained).
+  - `down_proj`: 14.01 ms -> 13.22 ms (196.8 GB/s sustained).
+  - `qkv_proj`: 11.28 ms -> 8.71 ms.
+  - Steady-state decode step: **65.0 - 65.4 ms/step (15.35 tok/s sustained)**.
+  - Overall 64-token generation throughput reached **14.97 tok/s**.

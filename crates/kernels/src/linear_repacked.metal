@@ -50,6 +50,19 @@
 //                                        result stays in the notes.
 //   linear_gemv_ishizuki_k3_colmajor_pair  no Rust caller.
 
+static inline void extract_v_mcg_32(uint wa, uint wb, uint sh0, uint rsh0, thread float v[8]) {
+    const uint A_hi = (wa << sh0) | (wb >> rsh0);
+    const uint A_lo = wb << sh0;
+    v[0] = decode_state_mcg((A_hi >> 16) & 0xffffu);
+    v[1] = decode_state_mcg((A_hi >> 13) & 0xffffu);
+    v[2] = decode_state_mcg((A_hi >> 10) & 0xffffu);
+    v[3] = decode_state_mcg((A_hi >> 7) & 0xffffu);
+    v[4] = decode_state_mcg((A_hi >> 4) & 0xffffu);
+    v[5] = decode_state_mcg((A_hi >> 1) & 0xffffu);
+    v[6] = decode_state_mcg(((A_hi << 2) | (A_lo >> 30)) & 0xffffu);
+    v[7] = decode_state_mcg(((A_hi << 5) | (A_lo >> 27)) & 0xffffu);
+}
+
 static inline void extract_v_mcg_fast(ulong A, thread float v[8]) {
     const uint A_hi = uint(A >> 32);
     const uint A_lo = uint(A);
@@ -332,6 +345,7 @@ kernel void linear_gemv_ishizuki_k3_fused2(
 
     const uint lo0 = (lane * 8u + 1u) * 3u + RING - 16u;
     const uint sh0 = lo0 % 32u;
+    const uint rsh0 = 32u - sh0;
     const uint hi0 = lo0 / 32u;
     const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
     const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
@@ -358,15 +372,10 @@ kernel void linear_gemv_ishizuki_k3_fused2(
         const device uint *t2 = column + (tk + 2u) * stride;
         const device uint *t3 = column + (tk + 3u) * stride;
 
-        const ulong w0a = t0[j0], w0b = t0[j1];
-        const ulong w1a = t1[j0], w1b = t1[j1];
-        const ulong w2a = t2[j0], w2b = t2[j1];
-        const ulong w3a = t3[j0], w3b = t3[j1];
-
-        const ulong A0 = ((w0a << 32) | w0b) << sh0;
-        const ulong A1 = ((w1a << 32) | w1b) << sh0;
-        const ulong A2 = ((w2a << 32) | w2b) << sh0;
-        const ulong A3 = ((w3a << 32) | w3b) << sh0;
+        const uint w0a = t0[j0], w0b = t0[j1];
+        const uint w1a = t1[j0], w1b = t1[j1];
+        const uint w2a = t2[j0], w2b = t2[j1];
+        const uint w3a = t3[j0], w3b = t3[j1];
 
         const device half *xr0 = x + (tk + 0u) * 16u + r0;
         const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
@@ -378,10 +387,10 @@ kernel void linear_gemv_ishizuki_k3_fused2(
         const float p30 = float(xr3[0]), p31 = float(xr3[1]), p32 = float(xr3[8]), p33 = float(xr3[9]);
 
         float v0[8], v1[8], v2[8], v3[8];
-        extract_v_mcg_fast(A0, v0);
-        extract_v_mcg_fast(A1, v1);
-        extract_v_mcg_fast(A2, v2);
-        extract_v_mcg_fast(A3, v3);
+        extract_v_mcg_32(w0a, w0b, sh0, rsh0, v0);
+        extract_v_mcg_32(w1a, w1b, sh0, rsh0, v1);
+        extract_v_mcg_32(w2a, w2b, sh0, rsh0, v2);
+        extract_v_mcg_32(w3a, w3b, sh0, rsh0, v3);
 
         acc0 += p00 * v0[0] + p01 * v0[1] + p02 * v0[2] + p03 * v0[3];
         acc1 += p00 * v0[4] + p01 * v0[5] + p02 * v0[6] + p03 * v0[7];
@@ -395,12 +404,11 @@ kernel void linear_gemv_ishizuki_k3_fused2(
 
     for (tk = k_unroll_end + sg; tk < tiles_k; tk += SG) {
         const device uint *t0 = column + tk * stride;
-        const ulong a0 = t0[j0], a1 = t0[j1];
-        const ulong A0 = ((a0 << 32) | a1) << sh0;
+        const uint a0 = t0[j0], a1 = t0[j1];
         const device half *xr0 = x + tk * 16u + r0;
         const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
         float v[8];
-        extract_v_mcg_fast(A0, v);
+        extract_v_mcg_32(a0, a1, sh0, rsh0, v);
         acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
         acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
     }
@@ -594,6 +602,7 @@ kernel void linear_gemv_ishizuki_k3_fused3(
 
     const uint lo0 = (lane * 8u + 1u) * 3u + RING - 16u;
     const uint sh0 = lo0 % 32u;
+    const uint rsh0 = 32u - sh0;
     const uint hi0 = lo0 / 32u;
     const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
     const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
@@ -632,15 +641,10 @@ kernel void linear_gemv_ishizuki_k3_fused3(
         const device uint *t2 = column + (tk + 2u) * stride;
         const device uint *t3 = column + (tk + 3u) * stride;
 
-        const ulong w0a = t0[j0], w0b = t0[j1];
-        const ulong w1a = t1[j0], w1b = t1[j1];
-        const ulong w2a = t2[j0], w2b = t2[j1];
-        const ulong w3a = t3[j0], w3b = t3[j1];
-
-        const ulong A0 = ((w0a << 32) | w0b) << sh0;
-        const ulong A1 = ((w1a << 32) | w1b) << sh0;
-        const ulong A2 = ((w2a << 32) | w2b) << sh0;
-        const ulong A3 = ((w3a << 32) | w3b) << sh0;
+        const uint w0a = t0[j0], w0b = t0[j1];
+        const uint w1a = t1[j0], w1b = t1[j1];
+        const uint w2a = t2[j0], w2b = t2[j1];
+        const uint w3a = t3[j0], w3b = t3[j1];
 
         const device half *xr0 = x + (tk + 0u) * 16u + r0;
         const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
@@ -652,10 +656,10 @@ kernel void linear_gemv_ishizuki_k3_fused3(
         const float p30 = float(xr3[0]), p31 = float(xr3[1]), p32 = float(xr3[8]), p33 = float(xr3[9]);
 
         float v0[8], v1[8], v2[8], v3[8];
-        extract_v_mcg_fast(A0, v0);
-        extract_v_mcg_fast(A1, v1);
-        extract_v_mcg_fast(A2, v2);
-        extract_v_mcg_fast(A3, v3);
+        extract_v_mcg_32(w0a, w0b, sh0, rsh0, v0);
+        extract_v_mcg_32(w1a, w1b, sh0, rsh0, v1);
+        extract_v_mcg_32(w2a, w2b, sh0, rsh0, v2);
+        extract_v_mcg_32(w3a, w3b, sh0, rsh0, v3);
 
         acc0 += p00 * v0[0] + p01 * v0[1] + p02 * v0[2] + p03 * v0[3];
         acc1 += p00 * v0[4] + p01 * v0[5] + p02 * v0[6] + p03 * v0[7];
@@ -669,12 +673,11 @@ kernel void linear_gemv_ishizuki_k3_fused3(
 
     for (tk = k_unroll_end + sg; tk < tiles_k; tk += SG) {
         const device uint *t0 = column + tk * stride;
-        const ulong a0 = t0[j0], a1 = t0[j1];
-        const ulong A0 = ((a0 << 32) | a1) << sh0;
+        const uint a0 = t0[j0], a1 = t0[j1];
         const device half *xr0 = x + tk * 16u + r0;
         const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
         float v[8];
-        extract_v_mcg_fast(A0, v);
+        extract_v_mcg_32(a0, a1, sh0, rsh0, v);
         acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
         acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
     }
@@ -1117,6 +1120,7 @@ kernel void linear_gemv_ishizuki_k3_colmajor_contig4(
 
     const uint lo0 = (lane * 8u + 1u) * 3u + RING - 16u;
     const uint sh0 = lo0 % 32u;
+    const uint rsh0 = 32u - sh0;
     const uint hi0 = lo0 / 32u;
     const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
     const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
@@ -1137,15 +1141,10 @@ kernel void linear_gemv_ishizuki_k3_colmajor_contig4(
             const device uint *t2 = column + (tk + 2u) * stride;
             const device uint *t3 = column + (tk + 3u) * stride;
 
-            const ulong w0a = t0[j0], w0b = t0[j1];
-            const ulong w1a = t1[j0], w1b = t1[j1];
-            const ulong w2a = t2[j0], w2b = t2[j1];
-            const ulong w3a = t3[j0], w3b = t3[j1];
-
-            const ulong A0 = ((w0a << 32) | w0b) << sh0;
-            const ulong A1 = ((w1a << 32) | w1b) << sh0;
-            const ulong A2 = ((w2a << 32) | w2b) << sh0;
-            const ulong A3 = ((w3a << 32) | w3b) << sh0;
+            const uint w0a = t0[j0], w0b = t0[j1];
+            const uint w1a = t1[j0], w1b = t1[j1];
+            const uint w2a = t2[j0], w2b = t2[j1];
+            const uint w3a = t3[j0], w3b = t3[j1];
 
             const device half *xr0 = x + (tk + 0u) * 16u + r0;
             const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
@@ -1157,10 +1156,10 @@ kernel void linear_gemv_ishizuki_k3_colmajor_contig4(
             const float p30 = float(xr3[0]), p31 = float(xr3[1]), p32 = float(xr3[8]), p33 = float(xr3[9]);
 
             float v0[8], v1[8], v2[8], v3[8];
-            extract_v_mcg_fast(A0, v0);
-            extract_v_mcg_fast(A1, v1);
-            extract_v_mcg_fast(A2, v2);
-            extract_v_mcg_fast(A3, v3);
+            extract_v_mcg_32(w0a, w0b, sh0, rsh0, v0);
+            extract_v_mcg_32(w1a, w1b, sh0, rsh0, v1);
+            extract_v_mcg_32(w2a, w2b, sh0, rsh0, v2);
+            extract_v_mcg_32(w3a, w3b, sh0, rsh0, v3);
 
             acc0 += p00 * v0[0] + p01 * v0[1] + p02 * v0[2] + p03 * v0[3];
             acc1 += p00 * v0[4] + p01 * v0[5] + p02 * v0[6] + p03 * v0[7];
@@ -1174,12 +1173,11 @@ kernel void linear_gemv_ishizuki_k3_colmajor_contig4(
 
         for (tk = k_unroll_end + sg; tk < tiles_k; tk += SG) {
             const device uint *t0 = column + tk * stride;
-            const ulong a0 = t0[j0], a1 = t0[j1];
-            const ulong A0 = ((a0 << 32) | a1) << sh0;
+            const uint a0 = t0[j0], a1 = t0[j1];
             const device half *xr0 = x + tk * 16u + r0;
             const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
             float v[8];
-            extract_v_mcg_fast(A0, v);
+            extract_v_mcg_32(a0, a1, sh0, rsh0, v);
             acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
             acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
         }

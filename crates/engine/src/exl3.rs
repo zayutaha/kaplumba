@@ -761,6 +761,33 @@ pub fn reorder_tensor_to_colmajor(
 mod tests {
     use super::*;
 
+    #[test]
+    fn test_funnel_shift_matches_64bit() {
+        for sh0 in 0..32u32 {
+            for &(wa, wb) in &[
+                (0u32, 0u32),
+                (0xffffffff, 0xffffffff),
+                (0x12345678, 0x9abcdef0),
+                (0xdeadbeef, 0xfeedface),
+                (0x00000001, 0x80000000),
+                (0x80000000, 0x00000001),
+                (0x55555555, 0xaaaaaaaa),
+                (0xaaaaaaaa, 0x55555555),
+            ] {
+                let full = (((wa as u64) << 32) | (wb as u64)) << sh0;
+                let expected_hi = (full >> 32) as u32;
+                let expected_lo = full as u32;
+
+                let wb_hi = if sh0 != 0 { wb >> (32 - sh0) } else { 0 };
+                let actual_hi = (wa << sh0) | wb_hi;
+                let actual_lo = wb << sh0;
+
+                assert_eq!(expected_hi, actual_hi, "hi mismatch at sh0={sh0}, wa={wa:x}, wb={wb:x}");
+                assert_eq!(expected_lo, actual_lo, "lo mismatch at sh0={sh0}, wa={wa:x}, wb={wb:x}");
+            }
+        }
+    }
+
     fn integer_states(bits: u8, seed: u32) -> Vec<u16> {
         let mask = (1_u32 << bits) - 1;
         let mut value = seed;
