@@ -37,10 +37,18 @@ pub struct Sampler {
 /// The `top_k` candidates, best first.
 ///
 /// **This replaced a full `sort_by` of all 262,144 indices followed by a
-/// truncate to `top_k`.** Measured cost of that on this box: **14.66 ms per
-/// token** (`crates/engine/examples/bench_sampler.rs`), which is 23.4% of a
-/// 62.9 ms decode step. It was the entire difference between greedy's 15.9
-/// tok/s and sampling's 12.2 — not the model, not attention, the host sort.
+/// truncate to `top_k`.** Both selections timed from ONE binary on the same
+/// 262,144-wide row (`examples/bench_sampler.rs`):
+///
+/// ```text
+/// selection OLD (full sort):  14.71 ms/token
+/// selection NEW (partition):   1.89 ms/token      7.8x
+/// whole `sample()`:            2.87 ms/token      (was ~15.5)
+/// ```
+///
+/// The old cost was 23.4% of a 62.9 ms decode step, and it was the entire
+/// difference between greedy's 15.9 tok/s and sampling's 12.2 — not the model,
+/// not attention, the host sort.
 ///
 /// `select_nth_unstable_by` partitions in O(n) instead of O(n log n). Because
 /// the comparator is a TOTAL order (ties broken by ascending index), the first
@@ -52,7 +60,11 @@ pub struct Sampler {
 /// selected a different candidate set would be a silent quality regression that
 /// no throughput number would reveal. `top_k_selection_matches_a_full_sort`
 /// checks it across lengths, `top_k` values, and tie densities.
-fn top_k_order(logits: &[f32], top_k: usize) -> Vec<usize> {
+///
+/// Public so `examples/bench_sampler.rs` can time this exact function against
+/// the sort it replaced from ONE binary. A benchmark that reimplemented either
+/// side would be timing the benchmark.
+pub fn top_k_order(logits: &[f32], top_k: usize) -> Vec<usize> {
     let keep = top_k.min(logits.len());
     let mut order = (0..logits.len()).collect::<Vec<_>>();
     if keep < order.len() {
