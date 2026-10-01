@@ -244,6 +244,17 @@ where
             limit: config.context_limit,
         });
     }
+    if config.sampler.temperature == 0.0 {
+        let mut on_text = on_text;
+        return generate_gpu_greedy(
+            model,
+            tokenizer,
+            &prompt_ids,
+            config,
+            &mut move |chunk| on_text(chunk).map_err(GenerationError::Output),
+            request_started,
+        );
+    }
     model.reset_gpu_caches();
     let mut sampler = Sampler::new(config.sampler, config.seed)?;
     let mut detokenizer = crate::tokenizer::Detokenizer::new(tokenizer);
@@ -868,9 +879,11 @@ where
     let load_mark = kaplumba_kernels::pipeline_audit::armed_mark().unwrap_or(0);
 
     let result = (|| -> Result<(), GenerationError> {
+        model.reset_gpu_caches();
         let prefill_started = Instant::now();
         let positions: Vec<u32> = (0..prompt_len as u32).collect();
         let mut prefill = MetalEncoder::new(&queue).map_err(ModelError::from)?;
+        prefill.set_max_dispatches(2500);
         model
             .forward_buffer_into(prompt_ids, &positions, &mut prefill)
             .map_err(ModelError::from)?;

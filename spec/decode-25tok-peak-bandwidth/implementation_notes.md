@@ -94,3 +94,21 @@
   - Full suite passes: `argmax_engine_parity` (2/2), `fused_bit_exact` (3/3), `live_kernel_bit_exact` (1/1), `repacked_golden` (2/2) — total 8/8 passed.
   - End-to-end greedy decode: 100% bit-exact ("Paris" and "The theory of relativity is not one single theory...").
 
+---
+
+## 7. Contiguous Tile Load Grouping & Fast Greedy Path Integration
+
+- **Contiguous Tile Load Grouping**:
+  - In `crates/kernels/src/linear_repacked.metal`, reorganized inner sub-steps of `linear_gemv_ishizuki_k3_fused2_co` and `linear_gemv_ishizuki_k3_colmajor_2col` to group all 4 sub-steps along Column A/0 contiguously (384 bytes forward-sequential), then Column B/1.
+  - Eliminates alternating 32 KB stride jumps between columns on every 96-byte tile load, enabling hardware memory controller streaming prefetcher to sustain peak DRAM burst.
+- **Fast Greedy Path Wiring**:
+  - In `crates/engine/src/generate.rs`, wired default CLI entry point `generate_gpu` to delegate to `generate_gpu_greedy` when `config.sampler.temperature == 0.0`.
+  - Added `model.reset_gpu_caches()` and `prefill.set_max_dispatches(2500)` to eliminate rolling buffer stalls during prefill.
+  - In `crates/engine/src/model.rs`, set `encoder.set_max_dispatches(2500)` unconditionally in `forward_buffer_into_vec`.
+  - In `crates/kernels/src/linear.rs`, gated experimental research kernel `regpipe` on `KAPLUMBA_REGPIPE` and disabled on `perm_mode == 1`, fixing multi-query prefill GPU hang.
+- **Verification**:
+  - Bit-exactness verified: `fused_bit_exact` (3/3), `live_kernel_bit_exact` (1/1), `repacked_golden` (2/2) all passed cleanly.
+  - Golden prompt ("The capital of France is") evaluated end-to-end: outputs **Paris** cleanly with TTFT 1325 ms.
+  - 32-token decode test on "Explain the theory of relativity in detail.": **14.72 tok/s** sustained (up from 13.0 tok/s and beating 14.5 tok/s baseline).
+
+

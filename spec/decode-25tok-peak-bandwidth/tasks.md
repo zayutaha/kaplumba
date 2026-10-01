@@ -20,6 +20,11 @@
   - Intent: Eliminate host 512 KiB copy (`copy_nonoverlapping`) and 262,144 CPU float comparisons per token by running slot-partitioned device-side argmax (`argmax_slots` across 4 slots of 65,536 elements) on GPU. Host only reads 4 u32s (16 bytes) and folds them in 2 nanoseconds.
   - Testing: Sabotage tested on assertion (exit 101 on mismatch); clean test suite passes 8/8 (`argmax_engine_parity` 2/2, `fused_bit_exact` 3/3, `live_kernel_bit_exact` 1/1, `repacked_golden` 2/2); greedy generation bit-exact ("Paris"); 32-token decode test bit-exact at 14.48 tok/s.
 
+- [x] **T4.1: Contiguous Tile Load Grouping & Fast Greedy Path Integration**
+  - Files: `crates/kernels/src/linear_repacked.metal`, `crates/engine/src/generate.rs`, `crates/engine/src/model.rs`, `crates/kernels/src/linear.rs`
+  - Intent: Group sub-steps along Column A/0 contiguously into 384-byte chunks in `fused2_co` and `colmajor_2col` to sustain hardware streaming prefetch. Wire CLI `generate_gpu` directly to `generate_gpu_greedy` at temperature 0, set `max_dispatches(2500)` unconditionally, and gate experimental `regpipe` to prevent prefill hangs.
+  - Testing: Bit-exact tests pass 6/6 (`fused_bit_exact` 3/3, `live_kernel_bit_exact` 1/1, `repacked_golden` 2/2); golden text outputs "Paris" with TTFT 1325 ms; 32-token decode achieves 14.72 tok/s.
+
 - [ ] **T5: Concurrent Multi-Queue Overlap (Attention + GEMV)**
   - Files: `crates/engine/src/model.rs`, `crates/kernels/src/encoder.rs`
   - Intent: Overlap Attention KV-cache streaming on a secondary Metal command queue with GEMV dequantization on the primary queue using `MTLEvent` synchronization to absorb the 3.2 ms attention latency.

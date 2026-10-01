@@ -498,37 +498,35 @@ kernel void linear_gemv_ishizuki_k3_fused2_co(
 
             float v[8];
 
-            // Sub-step 0
+            // Col A: 4 contiguous sub-steps along K
             extract_v_mcg_32(t0_a[j0], t0_a[j1], sh0, rsh0, v);
             acc_a0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
             acc_a1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
 
-            extract_v_mcg_32(t0_b[j0], t0_b[j1], sh0, rsh0, v);
-            acc_b0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
-            acc_b1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
-
-            // Sub-step 1
             extract_v_mcg_32(t1_a[j0], t1_a[j1], sh0, rsh0, v);
             acc_a0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
             acc_a1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+
+            extract_v_mcg_32(t2_a[j0], t2_a[j1], sh0, rsh0, v);
+            acc_a0 += p20 * v[0] + p21 * v[1] + p22 * v[2] + p23 * v[3];
+            acc_a1 += p20 * v[4] + p21 * v[5] + p22 * v[6] + p23 * v[7];
+
+            extract_v_mcg_32(t3_a[j0], t3_a[j1], sh0, rsh0, v);
+            acc_a0 += p30 * v[0] + p31 * v[1] + p32 * v[2] + p33 * v[3];
+            acc_a1 += p30 * v[4] + p31 * v[5] + p32 * v[6] + p33 * v[7];
+
+            // Col B: 4 contiguous sub-steps along K
+            extract_v_mcg_32(t0_b[j0], t0_b[j1], sh0, rsh0, v);
+            acc_b0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+            acc_b1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
 
             extract_v_mcg_32(t1_b[j0], t1_b[j1], sh0, rsh0, v);
             acc_b0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
             acc_b1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
 
-            // Sub-step 2
-            extract_v_mcg_32(t2_a[j0], t2_a[j1], sh0, rsh0, v);
-            acc_a0 += p20 * v[0] + p21 * v[1] + p22 * v[2] + p23 * v[3];
-            acc_a1 += p20 * v[4] + p21 * v[5] + p22 * v[6] + p23 * v[7];
-
             extract_v_mcg_32(t2_b[j0], t2_b[j1], sh0, rsh0, v);
             acc_b0 += p20 * v[0] + p21 * v[1] + p22 * v[2] + p23 * v[3];
             acc_b1 += p20 * v[4] + p21 * v[5] + p22 * v[6] + p23 * v[7];
-
-            // Sub-step 3
-            extract_v_mcg_32(t3_a[j0], t3_a[j1], sh0, rsh0, v);
-            acc_a0 += p30 * v[0] + p31 * v[1] + p32 * v[2] + p33 * v[3];
-            acc_a1 += p30 * v[4] + p31 * v[5] + p32 * v[6] + p33 * v[7];
 
             extract_v_mcg_32(t3_b[j0], t3_b[j1], sh0, rsh0, v);
             acc_b0 += p30 * v[0] + p31 * v[1] + p32 * v[2] + p33 * v[3];
@@ -1421,37 +1419,35 @@ kernel void linear_gemv_ishizuki_k3_colmajor_2col(
 
             float v[8];
 
-            // Sub-step 0
+            // Col 0: 4 contiguous sub-steps along K
             extract_v_mcg_32(t0_0[j0], t0_0[j1], sh0, rsh0, v);
             acc0_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
             acc0_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
 
-            extract_v_mcg_32(t0_1[j0], t0_1[j1], sh0, rsh0, v);
-            acc1_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
-            acc1_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
-
-            // Sub-step 1
             extract_v_mcg_32(t1_0[j0], t1_0[j1], sh0, rsh0, v);
             acc0_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
             acc0_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+
+            extract_v_mcg_32(t2_0[j0], t2_0[j1], sh0, rsh0, v);
+            acc0_0 += p20 * v[0] + p21 * v[1] + p22 * v[2] + p23 * v[3];
+            acc0_1 += p20 * v[4] + p21 * v[5] + p22 * v[6] + p23 * v[7];
+
+            extract_v_mcg_32(t3_0[j0], t3_0[j1], sh0, rsh0, v);
+            acc0_0 += p30 * v[0] + p31 * v[1] + p32 * v[2] + p33 * v[3];
+            acc0_1 += p30 * v[4] + p31 * v[5] + p32 * v[6] + p33 * v[7];
+
+            // Col 1: 4 contiguous sub-steps along K
+            extract_v_mcg_32(t0_1[j0], t0_1[j1], sh0, rsh0, v);
+            acc1_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+            acc1_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
 
             extract_v_mcg_32(t1_1[j0], t1_1[j1], sh0, rsh0, v);
             acc1_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
             acc1_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
 
-            // Sub-step 2
-            extract_v_mcg_32(t2_0[j0], t2_0[j1], sh0, rsh0, v);
-            acc0_0 += p20 * v[0] + p21 * v[1] + p22 * v[2] + p23 * v[3];
-            acc0_1 += p20 * v[4] + p21 * v[5] + p22 * v[6] + p23 * v[7];
-
             extract_v_mcg_32(t2_1[j0], t2_1[j1], sh0, rsh0, v);
             acc1_0 += p20 * v[0] + p21 * v[1] + p22 * v[2] + p23 * v[3];
             acc1_1 += p20 * v[4] + p21 * v[5] + p22 * v[6] + p23 * v[7];
-
-            // Sub-step 3
-            extract_v_mcg_32(t3_0[j0], t3_0[j1], sh0, rsh0, v);
-            acc0_0 += p30 * v[0] + p31 * v[1] + p32 * v[2] + p33 * v[3];
-            acc0_1 += p30 * v[4] + p31 * v[5] + p32 * v[6] + p33 * v[7];
 
             extract_v_mcg_32(t3_1[j0], t3_1[j1], sh0, rsh0, v);
             acc1_0 += p30 * v[0] + p31 * v[1] + p32 * v[2] + p33 * v[3];
