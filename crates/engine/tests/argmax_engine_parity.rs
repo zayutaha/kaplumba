@@ -89,3 +89,49 @@ fn test_argmax_sabotage_detection() {
         "Sabotage must be detectable"
     );
 }
+
+#[test]
+fn test_element_kernels_encode_argmax_to_token() {
+    let device = Device::system_default().expect("Metal device");
+    let queue: CommandQueue = device.new_command_queue();
+    let elements = ElementKernels::new().expect("ElementKernels::new");
+
+    const VOCAB: usize = 262_144;
+    let slots = VOCAB.div_ceil(65536);
+    let best_buf = device.new_buffer(
+        (slots * 4) as u64,
+        MTLResourceOptions::StorageModeShared,
+    );
+    let token_out = device.new_buffer(4, MTLResourceOptions::StorageModeShared);
+    let host_tokens = device.new_buffer(16 * 4, MTLResourceOptions::StorageModeShared);
+
+    let test_indices = [0, 1, 9259, 65535, 65536, 131072, 262143];
+
+    for (step, &winner) in test_indices.iter().enumerate() {
+        let mut row = vec![f16::from_f32(-5.0).to_bits(); VOCAB];
+        row[winner] = f16::from_f32(28.5).to_bits();
+
+        let row_buf = upload(&device, &row);
+        let mut encoder = MetalEncoder::new(&queue).expect("encoder");
+        elements
+            .encode_argmax(&mut encoder, &row_buf, &best_buf, VOCAB)
+            .expect("encode_argmax");
+        elements
+            .encode_argmax_to_token(
+                &mut encoder,
+                &best_buf,
+                Some(&token_out),
+                Some(&host_tokens),
+                step as u32,
+            )
+            .expect("encode_argmax_to_token");
+        encoder.commit_and_wait().expect("commit");
+
+        let tok_val = unsafe { *(token_out.contents() as *const u32) };
+        let host_val = unsafe { *(host_tokens.contents() as *const u32).add(step) };
+
+        assert_eq!(tok_val, winner as u32);
+        assert_eq!(host_val, winner as u32);
+    }
+}
+

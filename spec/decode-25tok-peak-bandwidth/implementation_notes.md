@@ -149,4 +149,19 @@
   - Evaluated end-to-end greedy decode: 32-token generation reaches **14.85 tok/s** (up from 14.58 tok/s, beating the 14.5 tok/s baseline floor).
   - Memory residency: 7.88 GiB (`peak_resident_pages_bytes=8467595264`), well below 12 GiB budget.
 
+---
+
+## 10. Task T4.4 Log (2-Column Tiling for fused3 & fused2 + GPU Token Reduction)
+
+- **Implementation**:
+  - Implemented `linear_gemv_ishizuki_k3_fused3_2col` and `linear_gemv_ishizuki_k3_fused2_2col` in `crates/kernels/src/linear_repacked.metal`.
+  - Upgraded `encode_gemv_fused3` and `encode_gemv_fused2` in `crates/kernels/src/linear.rs` to dispatch 2-column tiling when shapes are multiples of 32.
+  - Implemented `argmax_keys_to_token` Metal kernel in `crates/kernels/src/elements.metal` and `encode_argmax_to_token` in `crates/kernels/src/elements.rs` to compute the winning token on GPU.
+- **Verification & Sabotage Discipline**:
+  - Added unit test `test_element_kernels_encode_argmax_to_token` in `crates/engine/tests/argmax_engine_parity.rs`.
+  - Sabotage tested `fused3_2col` and assertion: both fail with exit code 101.
+  - Clean test suites pass 100%: `fused_bit_exact` (3/3), `argmax_engine_parity` (3/3), `live_kernel_bit_exact` (1/1), `repacked_golden` (2/2).
+  - Greedy generation bit-exact ("Paris"); TTFT 1313-1325 ms; model resident memory strictly below 8.0 GiB.
+
+
 

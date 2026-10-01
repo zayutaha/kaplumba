@@ -206,6 +206,7 @@ pub struct ElementKernels {
     /// Device-side argmax pipelines with 16-bit slot partitioning.
     argmax_clear_pipeline: ComputePipelineState,
     argmax_slots_pipeline: ComputePipelineState,
+    argmax_keys_to_token_pipeline: ComputePipelineState,
     /// MEASUREMENT AID. See [`Self::encode_spin_burn`].
     spin_burn_pipeline: ComputePipelineState,
 }
@@ -301,6 +302,7 @@ impl ElementKernels {
         let copy_buffer_pipeline = pipeline(&device, &library, "copy_buffer")?;
         let argmax_clear_pipeline = pipeline(&device, &library, "argmax_clear")?;
         let argmax_slots_pipeline = pipeline(&device, &library, "argmax_slots")?;
+        let argmax_keys_to_token_pipeline = pipeline(&device, &library, "argmax_keys_to_token")?;
         let spin_burn_pipeline = pipeline(&device, &library, "spin_burn")?;
         let queue = device.new_command_queue();
         Ok(Self {
@@ -329,6 +331,7 @@ impl ElementKernels {
             copy_buffer_pipeline,
             argmax_clear_pipeline,
             argmax_slots_pipeline,
+            argmax_keys_to_token_pipeline,
             spin_burn_pipeline,
         })
     }
@@ -857,6 +860,25 @@ impl ElementKernels {
             params_bytes(&params),
             groups,
             256,
+        )
+    }
+
+    /// Reduce device-side argmax keys to a single token ID on GPU into `token_out`,
+    /// and optionally into `host_token_out[step_idx]`.
+    pub fn encode_argmax_to_token(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        keys: &Buffer,
+        token_out: Option<&Buffer>,
+        host_token_out: Option<&Buffer>,
+        step_idx: u32,
+    ) -> Result<(), KernelError> {
+        encoder.dispatch_1d(
+            &self.argmax_keys_to_token_pipeline,
+            &[Some(keys), token_out, host_token_out],
+            &step_idx.to_le_bytes(),
+            1,
+            1,
         )
     }
 

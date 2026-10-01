@@ -583,6 +583,32 @@ kernel void argmax_slots(const device half *logits [[buffer(0)]],
     }
 }
 
+kernel void argmax_keys_to_token(
+    constant const uint *keys [[buffer(0)]],
+    device uint *token_out [[buffer(1)]],
+    device uint *host_token_out [[buffer(2)]],
+    constant const uint &step_idx [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]]) {
+    if (lid == 0) {
+        uint best_slot = 0;
+        uint best = keys[0];
+        for (uint slot = 1; slot < 4; ++slot) {
+            if ((keys[slot] >> 16) > (best >> 16)) {
+                best = keys[slot];
+                best_slot = slot;
+            }
+        }
+        uint in_slot = 0xFFFFu - (best & 0xFFFFu);
+        uint token = best_slot * 65536u + in_slot;
+        if (token_out != nullptr) {
+            token_out[0] = token;
+        }
+        if (host_token_out != nullptr) {
+            host_token_out[step_idx] = token;
+        }
+    }
+}
+
 static inline uint greedy_key(half value, uint index) {
     return argmax_key(uint(as_type<ushort>(value)), index);
 }

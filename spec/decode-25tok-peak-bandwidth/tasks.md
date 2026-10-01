@@ -35,6 +35,12 @@
   - Intent: Unroll inner K-loop by 2 sub-steps (`step = SG * 2u = 16`) with burst-loaded tile words upfront per column (`w0_a0, w0_a1...`), perfectly factoring $K=5376$ (336 tiles = 21 * 16) and $K=21504$ (1344 tiles = 84 * 16) with zero remainder loop. Slashes thread register allocation to $\le 30$ registers, lifting Apple Silicon GPU core occupancy to 100%.
   - Testing: Verified bit-exact greedy output on "Paris" and 32-token decode test; `live_kernel_bit_exact` and `fused_bit_exact` pass 4/4; decode throughput increases to 14.85 tok/s (beating 14.5 tok/s baseline).
 
+- [x] **T4.4: 2-Column Tiling for `fused3` and `fused2` + GPU Token Reduction**
+  - Files: `crates/kernels/src/linear_repacked.metal`, `crates/kernels/src/linear.rs`, `crates/kernels/src/elements.metal`, `crates/kernels/src/elements.rs`, `crates/engine/tests/argmax_engine_parity.rs`
+  - Intent: Implement `linear_gemv_ishizuki_k3_fused3_2col` and `linear_gemv_ishizuki_k3_fused2_2col` to eliminate single-column loads in `qkv_proj` and `qk_proj`. Add `argmax_keys_to_token` GPU kernel to reduce 4-slot keys into a single token ID on device.
+  - Testing: Sabotage tested on assertion and kernel (exit 101); all test suites pass 100% (`fused_bit_exact` 3/3, `argmax_engine_parity` 3/3, `live_kernel_bit_exact` 1/1, `repacked_golden` 2/2); golden text bit-exact ("Paris").
+
+
 
 - [ ] **T5: Concurrent Multi-Queue Overlap (Attention + GEMV)**
   - Files: `crates/engine/src/model.rs`, `crates/kernels/src/encoder.rs`
