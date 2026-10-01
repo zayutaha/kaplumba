@@ -93,7 +93,73 @@ Three conclusions, all load-bearing:
 The harness's isolated 199.4 GB/s agrees with the ~196–207 GB/s measured in-engine, so
 these numbers transfer.
 
-## 4. Where the 2.667 comes from, and the derivation that replaces it
+## 3a. T1 RESULT: the lane-contiguous repack is IMPOSSIBLE. 199 GB/s is the 3 bpw floor.
+
+**The proposal in §4 below is withdrawn. Do not implement it.** §4 is kept only because
+it records the reasoning that led here, and because the *shape* of the mistake is worth
+remembering.
+
+The claim was: each lane needs 8 codes × 3 bits = 24 bits, so placing lane L's codes at
+bit offset `24·L` needs only 48 word-loads per 24-word tile (amp 2.000) at an unchanged
+96 B/tile, predicting 199 → 250 GB/s and ~+22% decode.
+
+**It cannot be done, and the reason is structural.**
+
+`decode_state_mcg` (`crates/kernels/src/linear.metal:121-126`):
+
+```metal
+value = value * 0xCBAC1FEDu;                   // multiply FIRST
+value = 0x3b603b60u ^ (value & 0x8fff8fffu);   // mask SECOND
+```
+
+The multiply precedes the mask, so **all 16 bits of the input window affect the float
+output**. Bits from neighbouring lanes leak in. A lane therefore cannot be reconstructed
+from its own 8 codes, and "24 bits per lane" was never true.
+
+Measured three independent ways, all agreeing:
+
+| method | result |
+|---|---|
+| bit-flip enumeration: flip each of the 768 ring bits, record which lanes' `decode_state_mcg` outputs change | **37 bits per lane** (min = max = 37) |
+| symbolic: `a0` bits `[27, 63]` span 37 for all 8 windows; undo `sh0`, lands across **2 words** for all 32 lanes | 2 words, unconditional |
+| **union over all 32 lanes** of influencing ring positions | **37** |
+
+The union result is the decisive one: **every lane reads the same 37-bit window, at 32
+different rotations.** 37 > 32, so each lane must read 2 words. 32 lanes × 2 = 64
+word-loads per 24-word tile = amp **2.667** — exactly what the kernel already issues.
+
+So amp is fixed by the bit rate alone, `64 / (8·KA)`:
+
+```
+3 bpw: 64/24 = 2.667      4 bpw: 64/32 = 2.000      6 bpw: 96/48 = 2.000
+```
+
+**4 and 6 bpw are faster because more words share the same 64 loads, not because the
+kernel does anything better.** At 3 bpw the kernel is already at its structural floor.
+This also retires the "ALU is 62.9% of the kernel, make `rad` compile-time for 3.6×"
+claim in `decode-19tok-repacked-250gb/implementation_notes.md:1241-1258` as a *bandwidth*
+lever: if ALU were the constraint, 6 bpw (1.5× the dequant work of 4 bpw) could not
+match it. That claim may still be true as arithmetic; it is not what limits bandwidth.
+
+**The only routes past 199 GB/s, and their prices:**
+
+1. Narrow `decode_state_mcg`'s 16-bit window to 3 bits — a different function, different
+   output. **Quality loss. Barred by the no-quality-loss rule.**
+2. Share the 37-bit overlap between lanes via `simd_shuffle` — **already measured
+   180.5 → 146.5 GB/s.** Closed (`implementation_notes.md:64-67`).
+3. Lower the bit rate — 4 bpw is a measured 6.7% loss; 2 bpw is documented
+   byte-rate-invariant at constant rate. Both closed.
+4. Stop trying to make the GEMV faster and overlap it instead. The only live option,
+   worth 0.6–1.5 ms of attention latency, not 12 ms.
+
+**Method note for the next person:** the first script I wrote tested which bits affect
+the 3-bit *codes* and returned a clean 24 — which is exactly the wrong question, and it
+"confirmed" the bad hypothesis. The test has to be run against what the kernel actually
+computes (`decode_state_mcg`'s float output), not against an intermediate quantity. Two
+of the three derivations above were only run after the first one produced a suspiciously
+convenient answer.
+
+## 4. Where the 2.667 comes from, and the derivation that replaces it [WITHDRAWN — see §3a]
 
 `crates/kernels/src/linear_repacked.metal`, shared by all four live 3 bpw kernels:
 
