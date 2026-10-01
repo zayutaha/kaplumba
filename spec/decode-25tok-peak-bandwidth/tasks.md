@@ -67,6 +67,21 @@
   - Intent: Eliminate the separate `cache_append` dispatch in decode across all 60 layers (60 dispatches saved per token) by writing normalized and rotated Q/K/V elements directly into `key_cache`, `value_cache`, and `position_cache` in-place.
   - Testing: Sabotage tested on assertion in `norm_rope_qkv_cache_is_bit_identical_to_separate_append` (exit code 101 on intentional corruption); full test passes cleanly 4/4; golden prompt bit-exact ("Paris"); 32-token decode achieves 15.67 tok/s.
 
+- [ ] **T5.5: 1-Column Sequential Streaming GEMV (`linear_gemv_ishizuki_k3_colmajor_1col`)**
+  - Files: `crates/kernels/src/linear_repacked.metal`, `crates/kernels/src/linear.rs`, `crates/engine/src/model.rs`, `crates/engine/tests/live_kernel_bit_exact.rs`
+  - Intent: Eliminate 32 KB DRAM page/bank thrashing across 20 cores in `o_proj` and `gate_up` by streaming 1 column (16 outputs per threadgroup) purely sequentially. Slashes register usage by 50% and doubles `o_proj` grid size to 336 threadgroups (16.8 TGs/core) and 672 threadgroups with SK=2 (33.6 TGs/core), lifting `o_proj` from 86 GB/s toward 220+ GB/s (saving ~3.3 ms).
+  - Testing: Bit-exact verification in `live_kernel_bit_exact` with deliberate sabotage test; benchmark `o_proj` latency and overall decode throughput.
+
+- [ ] **T5.6: Parallel Multi-Threadgroup Finalize & Fused Post-FFN / Pre-Layer RMSNorm**
+  - Files: `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`, `crates/engine/src/model.rs`
+  - Intent: Replace the 1-threadgroup bottleneck in `linear_finalize_and_post_ffn_norm_scale_sk2` and `linear_finalize_o_proj_and_pre_ffn_transform_sk2` (which leaves 19 GPU cores idle and wastes 5.34 ms) with a 42-threadgroup parallel reduction across all 20 cores, fusing Layer $L$'s finalize directly into Layer $L+1$'s input norm and transform.
+  - Testing: Bit-exact comparison against reference RMSNorm; sabotage testing; measure non-GEMV latency reduction.
+
+- [ ] **T5.7: Fused Attention Output Hadamard Transform**
+  - Files: `crates/kernels/src/attention.metal`, `crates/kernels/src/attention.rs`, `crates/engine/src/model.rs`
+  - Intent: In `online_attention_split_combine`, apply `o_input_signs` directly before storing the final attention vector into `scratch.transformed`, eliminating the standalone `input_transform` dispatch across all 60 layers (saving ~1.8 ms).
+  - Testing: Bit-exact greedy output verification on "Paris"; measure dispatch reduction.
+
 - [ ] **T6: End-to-End Benchmark & Acceptance Validation (20+ Tok/s)**
   - Files: `spec/decode-25tok-peak-bandwidth/implementation_notes.md`
   - Intent: Measure steady-state tok/s and latency across 16 interleaved A/B pairs using `scripts/gpuq try -- ./target/release/kaplumba`.
