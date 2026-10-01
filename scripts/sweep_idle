@@ -1,0 +1,92 @@
+#!/bin/zsh
+# Measure sweep_geom one shape per idle window, and keep only what is repeatable.
+#
+# Why per shape and not one pass: the box is shared (an oMLX server plus other
+# agents cycling 12 GB model loads). A ten-shape sweep takes minutes, so it is
+# near-certain to be overlapped, and a contended run does not fail -- it returns
+# plausible medians with a 0.4 spread and a fabricated "+34% gap". One shape is
+# ~30 s, which fits a gap.
+#
+# Why the spread check: `gpuq status` was idle at the start of a contended run
+# and stayed idle, because the engine's flock is held by the *engine*, and this
+# example is not the engine. Nothing but the repeatability floor distinguishes
+# the two cases from inside the process, so the floor is the gate (AGENTS.md 3.4:
+# a claim has to survive being broken).
+#
+# Usage: scripts/sweep_idle [rounds] [working_set_gb]
+#   sweep_idle sweep        -- re-measure everything, keep only clean spreads
+#   sweep_idle assemble     -- print the table from whatever is cached
+
+set -u
+cd "$(dirname "$0")/.."
+ROUNDS=${1:-11}
+ARM=${2:-4}
+DIR=${KAPLUMBA_SWEEP_DIR:-$HOME/.kaplumba/scratch}
+BIN=./target/release/examples/sweep_geom
+LOG=/private/var/folders/tp/wz3877_s1z756p1kcsz3_d4h0000gn/T/opencode
+
+# Biggest first: if the box goes busy for good, the shapes that carry the most
+# bytes per token are the ones worth having.
+SHAPES=(sliding/down sliding/up sliding/gate full/q full/o sliding/q sliding/o sliding/k sliding/v full/kv)
+
+# The engine's flock does not cover this example, so `avail` is the only
+# external signal. 12 GiB is well under the ~16 GB that leaves an arm able to
+# allocate without evicting whoever is running.
+idle() {
+    local q holder avail
+    q=$(scripts/gpuq status 2>&1)
+    holder=$(echo "$q" | head -1)
+    avail=$(echo "$q" | sed -n 3p | sed 's/[^0-9.]*\([0-9.]*\).*/\1/')
+    if echo "$holder" | grep -q "gpu: none" && [ -n "$avail" ] && [ "$(echo "$avail > 12" | bc)" = "1" ]; then
+        echo "idle, ${avail} GiB"
+        return 0
+    fi
+    echo "busy: $holder, ${avail:-?} GiB"
+    return 1
+}
+
+clean() {
+    # Every cell's worst round within 8% of its best.
+    local f="$1"
+    [ -s "$f" ] || return 1
+    awk 'NR>1 && $6 < 0.92 { bad=1 } END { exit bad ? 1 : 0 }' "$f"
+}
+
+if [ "${1:-sweep}" = "assemble" ]; then
+    $BIN "$ROUNDS" "$ARM"
+    exit $?
+fi
+
+mkdir -p "$DIR" "$LOG"
+for shape in "${SHAPES[@]}"; do
+    key=${shape//\//_}
+    # sweep_geom formats the working set with `{:.1}`, so an ARM of 4 names the
+    # file `..._4.0.txt` and a bare `4` here would silently never match -- which
+    # is exactly the bug this comment was added after: every shape measured
+    # twice and every "REJECTED" was the check reading a nonexistent file.
+    arm=$(printf '%.1f' "$ARM")
+    cache="$DIR/sweep_geom_${key}_${ROUNDS}_${arm}.txt"
+    for attempt in 1 2 3 4 5 6 7 8; do
+        state=$(idle)
+        if [[ $state != idle* ]]; then
+            echo "--- $shape attempt $attempt: $state"
+            sleep 45
+            continue
+        fi
+        rm -f "$cache"
+        echo "=== $shape attempt $attempt: measuring"
+        $BIN "$ROUNDS" "$ARM" "$shape" > "$LOG/one_$key.log" 2>&1
+        if clean "$cache"; then
+            grep -E "^(  sk|  best|    cells)" "$LOG/one_$key.log"
+            echo "    [accepted: all cells within 8% of their best round]"
+            break
+        fi
+        echo "    [REJECTED: spread below floor; contending run, discarding]"
+        grep -E "cells below" "$LOG/one_$key.log" || true
+        sleep 45
+    done
+    [ -s "$cache" ] || echo "!!! $shape: no clean measurement after 8 attempts"
+done
+
+echo "=== assembling"
+$BIN "$ROUNDS" "$ARM" 2>&1 | tee "$LOG/sweep_final.log" | grep -E "^(---|  sk|  best|    cells|  \(|    )"

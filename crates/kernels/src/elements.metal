@@ -522,17 +522,69 @@ kernel void copy_buffer(
 // 14.35 -> 22.48 tok/s, and attributes it to the serial loop "waiting on the GPU
 // twice a token, once for the step and once for the pick".
 //
-// The key packs a sortable form of the fp16 value in the high 16 bits and the
-// complement of the index in the low 16, so one unsigned max yields the largest
-// logit and, among ties, the lowest index. That makes the reduction a plain
-// atomic_max with no second pass and no comparison branching.
+// Device-side argmax with 16-bit slot partitioning (argmax_slots).
+// Fixes the 16-bit underflow in greedy_key that clobbered indices >= 65536.
+static inline uint sortable16(uint bits) {
+    return (bits & 0x8000u) != 0u ? ~bits : (bits ^ 0x8000u);
+}
+
+static inline uint value_key(uint bits) {
+    const uint EXP = (bits >> 10) & 0x1Fu;
+    const uint MAN = bits & 0x3FFu;
+    if (EXP == 0x1Fu && MAN != 0u) {
+        return 0u; // below -inf (0x03FF): NaN can never win
+    }
+    if ((bits & 0x7FFFu) == 0u) {
+        return 0x8000u; // +0.0: -0.0 folds onto it
+    }
+    return sortable16(bits);
+}
+
+#define ARGMAX_SLOT_SIZE 65536u
+
+static inline uint argmax_key(uint bits, uint index) {
+    return (value_key(bits) << 16) | ((0xFFFFu - (index & 0xFFFFu)) & 0xFFFFu);
+}
+
+struct ArgmaxParams {
+    uint count;
+    uint per_slot;
+};
+
+kernel void argmax_clear(device atomic_uint *best [[buffer(0)]],
+                         constant uint &slots [[buffer(1)]],
+                         uint tid [[thread_position_in_grid]]) {
+    if (tid < slots) {
+        atomic_store_explicit(&best[tid], 0u, memory_order_relaxed);
+    }
+}
+
+kernel void argmax_slots(const device half *logits [[buffer(0)]],
+                         device atomic_uint *best [[buffer(1)]],
+                         constant ArgmaxParams &params [[buffer(2)]],
+                         uint lid [[thread_position_in_threadgroup]],
+                         uint lane [[thread_index_in_simdgroup]],
+                         uint tgid [[threadgroup_position_in_grid]],
+                         uint tgdim [[threads_per_threadgroup]]) {
+    const uint per_slot = params.per_slot;
+    const uint slot = tgid / per_slot;
+    const uint lo = slot * ARGMAX_SLOT_SIZE;
+    const uint hi = min(lo + ARGMAX_SLOT_SIZE, params.count);
+    uint local = 0u;
+    const uint stride = per_slot * tgdim;
+    for (uint i = lo + (tgid % per_slot) * tgdim + lid; i < hi; i += stride) {
+        local = max(local, argmax_key(uint(as_type<ushort>(logits[i])), i));
+    }
+    for (uint offset = 16u; offset > 0u; offset >>= 1u) {
+        local = max(local, simd_shuffle_xor(local, offset));
+    }
+    if (lane == 0u) {
+        atomic_fetch_max_explicit(&best[slot], local, memory_order_relaxed);
+    }
+}
+
 static inline uint greedy_key(half value, uint index) {
-    const uint SIGN = 0x8000u;
-    uint bits = uint(as_type<ushort>(value));
-    // Negative floats compare backwards as unsigned integers; flip every
-    // non-negative one so the unsigned ordering matches the float ordering.
-    uint sortable = (bits & SIGN) != 0u ? ~bits : (bits ^ SIGN);
-    return (sortable << 16) | (0xFFFFu - index);
+    return argmax_key(uint(as_type<ushort>(value)), index);
 }
 
 static inline half key_to_half(uint key) {
