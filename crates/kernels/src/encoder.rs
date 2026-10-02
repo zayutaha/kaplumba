@@ -176,6 +176,12 @@ pub struct GpuStamp {
 /// into it. A 32k-context prefill that dies after ~273 s produced exactly that one
 /// line, which is enough to know *that* something failed and nothing about *what*.
 ///
+/// The status is printed with it, because `-[MTLCommandBuffer status]` *is* bound
+/// (`CommandBufferRef::status`) and needs no FFI either. It separates a genuine
+/// execution error from the other non-completed cases: on the read-page-fault
+/// campaign it reported `status=Error` every time, which is what rules out a
+/// stall or an uncommitted buffer and points at the GPU-side fault instead.
+///
 /// Naming the phase costs nothing and needs no FFI: `-[MTLCommandBuffer label]`
 /// *is* bound by metal-rs (`CommandBufferRef::label`), and callers can label the
 /// work they encode. `-[MTLCommandBuffer error]` would carry the driver's own
@@ -184,10 +190,11 @@ pub struct GpuStamp {
 /// strictly worse than the bare message, so the labels are the diagnostic.
 fn command_failed(buffer: &CommandBuffer) -> KernelError {
     let label = buffer.label();
+    let status = buffer.status();
     if label.is_empty() {
-        eprintln!("Metal command buffer failed (unlabelled)");
+        eprintln!("Metal command buffer failed (unlabelled) status={status:?}");
     } else {
-        eprintln!("Metal command buffer '{label}' failed");
+        eprintln!("Metal command buffer '{label}' failed status={status:?}");
     }
     KernelError::CommandFailed
 }
