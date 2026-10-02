@@ -123,6 +123,14 @@ and recorded as a negative (AC6).
 
 ---
 
+- [x] **T0: triage the inherited tree (start of session)** — ✅ `14570f8`
+  - `warmstart_starvation.rs` gated to `#[ignore]`. It dispatches 86,016
+    threads spinning on one cache line and made the user's machine unusable
+    when run as part of the suite. Same treatment `gemv_bandwidth.rs` gets.
+  - `concurrent_stream_economics.rs` absolute threshold de-flaked; see notes §2a.
+
+---
+
 - [ ] **T4: Remaining norm optimizations from decode-3bpw-amplification T2-T3**
   - Files: `crates/kernels/src/elements.metal`, `crates/engine/src/elements.rs`
   - Intent: Hoist second-pass `weight`/`residual` loads above the barrier in

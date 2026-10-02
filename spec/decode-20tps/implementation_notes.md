@@ -383,3 +383,56 @@ options are the ten closed dead ends plus their opposites — fewer bytes per to
   - Validates **T2a (Warmstart GEMV kernel)**: we can dispatch `o_proj` weight loading concurrent with `attention`, having `o_proj` threadgroups prefetch weight tiles into registers/L2 before attention writes the final input activation `scratch.attended`.
   - Eliminates the need for complex dual-queue `MTLEvent` host synchronization for o_proj latency hiding.
 
+
+---
+
+## 6. Delegated agent run #1: DIED INFRASTRUCTURE, not out of work
+
+A subagent was dispatched to take this spec to 32k context and ≥14 tok/s at16k
+context. It terminated with:
+
+```
+<subagent state="error"> getaddrinfo ENOTFOUND opencode.ai </subagent>
+```
+
+**That is a DNS/transport failure reaching the agent API.** It is not a
+completion, not a partial-completion marker, and not a statement about the task.
+The agent did real work first and then could not be continued.
+
+### What it completed before the transport died (3 commits)
+
+| commit | content |
+|---|---|
+| `14570f8` | T0 triage: `warmstart_starvation.rs` gated to `#[ignore]`, `concurrent_stream_economics.rs` ratio thresholds de-flaked (§2a) |
+| `40e018d` | sampler `top_k_order` O(n) partition, **14.71 → 1.89 ms/token** |
+| `121ff5b` | T3 cross-layer norm fusion **measured: +0.09 tok/s, bit-exact → KEPT** (§3a) |
+
+The sampler's 1.89 ms/token is better than the 2.78 ms measured here before
+hand-off, so it found headroom this session had not.
+
+### What it left unfinished, and the rule that follows
+
+Uncommitted at the time of the failure:
+
+- `crates/engine/tests/multi_turn_chat.rs` (521 lines, **untracked**)
+- modifications to `crates/engine/src/chat.rs` and `crates/cli/src/chat.rs`
+- a 0-byte scratch file `crates/engine/src/XXxi1lf1` (since deleted)
+
+**Untracked work does not survive an agent failure.** It survived this one only
+because the failure was visible in the same session. A failure across a session
+boundary would have left a 521-line test file that no commit referenced and that
+`git stash list` would never surface.
+
+**Rule for every delegated run in this repo: commit continuously, and treat the
+uncommitted working tree as lost.** The per-task commit discipline in
+AGENTS.md §4.2 is written for humans, but it matters *more* for agents, whose
+session can be terminated by transport at any point. This run happened to commit
+between each unit of work and that is the only reason three units of work
+survived instead of none.
+
+### A blank commit is worse than no commit
+
+The agent left the tree *building* (0 errors) but with an untracked test file.
+An agent that resumes must therefore not assume the tree is clean: `git status`
+first, and treat untracked `.rs` files under `crates/` as a work-in-progress
+marker rather than as litter.
