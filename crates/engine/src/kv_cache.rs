@@ -83,8 +83,20 @@ impl FullKvCache {
         self.stream_len
     }
 
+    /// Bytes this cache occupies: keys, values **and** the position array.
+    ///
+    /// All three vectors are allocated in [`Self::new`] and all three are live
+    /// for the cache's lifetime, so all three count. `positions` used to be
+    /// omitted, which made this the same logical object with the same name and a
+    /// different answer from `GpuKvCache::resident_bytes()`
+    /// (`gpu_cache.rs`, which counts `capacity * 4`) -- and
+    /// `tests/kv_cache.rs` pinned the omission, so the two disagreed silently
+    /// and by construction. At 16384 positions across the 10 full layers the gap
+    /// is 655,360 B; small, but it is the same defect class as the scratch
+    /// accounting that under-reported 168 MiB.
     pub fn resident_bytes(&self) -> usize {
         (self.keys.len() + self.values.len()) * size_of::<u16>()
+            + self.positions.len() * size_of::<u32>()
     }
 
     pub fn visible_positions(&self) -> Range<usize> {
@@ -245,8 +257,12 @@ impl SlidingKvCache {
         self.stream_len
     }
 
+    /// Bytes this cache occupies: keys, values **and** the position array.
+    ///
+    /// See [`FullKvCache::resident_bytes`] for why the position array counts.
     pub fn resident_bytes(&self) -> usize {
         (self.keys.len() + self.values.len()) * size_of::<u16>()
+            + self.positions.len() * size_of::<u32>()
     }
 
     pub fn visible_positions(&self) -> Range<usize> {

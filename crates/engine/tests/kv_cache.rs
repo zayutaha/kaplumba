@@ -19,7 +19,11 @@ fn full_cache_appends_chunks_and_stores_distinct_k_v() {
     assert_eq!(cache.append_chunk(0, &keys, &values).unwrap(), 0..2);
     assert_eq!(cache.len(), 2);
     assert_eq!(cache.visible_positions(), 0..2);
-    assert_eq!(cache.resident_bytes(), 4 * 4 * 2 * size_of::<u16>());
+    // keys + values + positions: 16 u16 + 16 u16 + 4 u32 = 32 + 32 + 16.
+    assert_eq!(
+        cache.resident_bytes(),
+        4 * 4 * 2 * size_of::<u16>() + 4 * size_of::<u32>()
+    );
 
     let (key, value) = stream(2, 4);
     assert_eq!(cache.append(2, &key, &value).unwrap(), 2);
@@ -112,9 +116,13 @@ fn sliding_cache_handles_multi_chunk_8k_positions() {
     assert!(cache.contains(8191));
     assert_eq!(cache.position_to_slot(7168), Some(0));
     assert_eq!(cache.position_to_slot(8191), Some(1023));
+    // 1024 positions x 4096 stream: keys and values are 1024*4096 u16 each,
+    // plus 1024 u32 of positions. The position array used to be missing from
+    // both the accounting and this assertion, which is what let the omission
+    // stand -- see `resident_bytes` in `crates/engine/src/kv_cache.rs`.
     assert_eq!(
         cache.resident_bytes(),
-        1024 * stream_len * 2 * size_of::<u16>()
+        1024 * stream_len * 2 * size_of::<u16>() + 1024 * size_of::<u32>()
     );
 }
 
@@ -129,8 +137,50 @@ fn cache_enum_preserves_layout_specific_behavior() {
     assert_eq!(sliding.visible_positions(), 0..1);
     assert_eq!(full.key_value(0).unwrap().0, key);
     assert_eq!(sliding.key_value(0).unwrap().1, value);
-    assert_eq!(full.resident_bytes(), 16);
-    assert_eq!(sliding.resident_bytes(), 8192);
+    // full: capacity 2 x stream_len 2 -> 4 u16 keys + 4 u16 values + 2 u32
+    // positions = 8 + 8 + 8 = 24. (It was asserted as 16, with the 8 bytes of
+    // positions missing, and nothing noticed.)
+    // sliding: `KvCache::sliding` is `SlidingKvCache::new`, whose capacity is
+    // the fixed 1024-position window: 1024 x 2 u16 keys + 1024 x 2 u16 values +
+    // 1024 u32 positions = 4096 + 4096 + 4096 = 12288. (Was 8192.)
+    assert_eq!(full.resident_bytes(), 24);
+    assert_eq!(sliding.resident_bytes(), 12288);
+}
+
+/// The host cache and the GPU cache hold the same logical object -- same layout,
+/// same capacity, same stream length -- so `resident_bytes()` must agree. It did
+/// not: the GPU side counted `capacity * 4` bytes of positions and the host side
+/// counted none, so every memory number derived from the host path was short by
+/// the position array, and a test asserted the short number.
+///
+/// Uses the model's real full-attention shape (4 kv heads x 512) so the omitted
+/// bytes are the ones that matter: 16384 positions is 65,536 B per layer.
+#[test]
+fn the_host_and_gpu_caches_agree_on_resident_bytes() {
+    let device = metal::Device::system_default().expect("a Metal device");
+    // (capacity, kv_heads, head_dim)
+    for (capacity, kv_heads, head_dim) in [(512usize, 4usize, 512usize), (1024, 16, 256)] {
+        let host = FullKvCache::new(capacity, kv_heads, head_dim).unwrap();
+        let gpu = kaplumba_engine::gpu_cache::GpuKvCache::new(
+            &device,
+            capacity,
+            kv_heads,
+            head_dim,
+        )
+        .unwrap();
+        assert_eq!(
+            host.stream_len(),
+            gpu.stream_len(),
+            "the two layouts disagree at ({capacity}, {kv_heads}, {head_dim})",
+        );
+        assert_eq!(
+            host.resident_bytes(),
+            gpu.resident_bytes(),
+            "host {} B vs gpu {} B at ({capacity}, {kv_heads}, {head_dim})",
+            host.resident_bytes(),
+            gpu.resident_bytes(),
+        );
+    }
 }
 
 #[test]
