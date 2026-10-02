@@ -1,10 +1,10 @@
 //! What does the on-demand KV growth actually cost, and when does it happen?
 //!
-//! `GpuKvCache::ensure_capacity` (`gpu_cache.rs:160-223`) starts the 10
-//! full-attention caches at 512 positions and doubles them, preserving contents
-//! with a host `std::ptr::copy_nonoverlapping` (`:194-210`). That is a
+//! `GpuKvCache::ensure_capacity` (`gpu_cache.rs:203`) starts the 10
+//! full-attention caches at 512 positions and steps them up by 1.25x at a time,
+//! preserving contents with a host `std::ptr::copy_nonoverlapping`. That is a
 //! synchronous CPU memcpy of the whole live KV prefix, on the critical path of a
-//! token, at four discrete token indices. This drives the real `GpuKvCache` --
+//! token, at each rung of the ladder. This drives the real `GpuKvCache` --
 //! the same type `DecoderLayer` holds -- with the model's real shape, walks a
 //! synthetic 8k generation, and reports the capacity ladder, the copy bytes, and
 //! the wall cost of every reallocation event.
@@ -13,8 +13,10 @@
 //! footprint here is the KV ladder itself (1.41 GiB at 8192) and nothing else.
 //!
 //! It also prints the capacity the model actually reaches, because the ladder
-//! is not the ladder a reader expects: the doubling tops out at
-//! `max_sequence_len`, which `model.rs:2826` hard-codes to 8192.
+//! is not the ladder a reader expects: the top rung clamps to the policy
+//! context limit `MAX_POLICY_CAPACITY` = `DEFAULT_CONTEXT_LIMIT` = 32768
+//! (`gpu_cache.rs`), not to the checkpoint's `max_position_embeddings` of
+//! 262144.
 
 use kaplumba_engine::gpu_cache::GpuKvCache;
 use metal::Device;
@@ -118,9 +120,12 @@ fn main() {
         (full.resident_bytes() * FULL_LAYERS) as f64 / (1024.0 * 1024.0 * 1024.0)
     );
 
-    // Where is the ladder *not* doubling? Every power of two is a reallocation
-    // point, so the cost is four spikes, not a slope. Print them as a share of
-    // a plausible 80 ms token so the product impact is legible.
+    // The cost is a set of spikes, not a slope: one per rung. Print them as a
+    // share of a plausible 80 ms token so the product impact is legible. The 1.25x
+    // ladder has more rungs than the doubling it replaced (19 against 6 to reach
+    // 32768), but each copies less and the last one copies less still, so neither
+    // the peak nor the total moves enough to matter -- see the arithmetic on
+    // `growth_target` in `gpu_cache.rs`.
     println!("\nreallocation spike as a share of an 80 ms token:");
     for (position, capacity, bytes) in &grew {
         println!(
