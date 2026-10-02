@@ -496,3 +496,26 @@ Modify `crates/engine/tests/gemv_bandwidth.rs` reproduction (do not commit): at 
 Decision rule: if B collapses to ~126, the gap is a working-set/cache artifact and production's 126 is the true DRAM rate for this kernel — the 199 was never achievable in production and §16.4's 17.2 tok/s ceiling stands as *optimistic*, worth re-deriving from B. If B stays ~199, the loss is elsewhere in production and the next discriminator is inserting production-like inter-kernel dispatch spacing (and per-layer interleaving of qkv/o/gate_up/down buffers at real offsets) into the microbench.
 
 Current microbench allocation (`run` in gemv_bandwidth.rs:124-135): `nbuf = (MAX_WORKING_SET / shape_bytes).clamp(2, 8)` and each buffer is `shape_bytes/2` bytes — for down_proj that is nbuf ≈ 8 × 21.7 MB ≈ 173 MiB. Run B needs only this constant changed (and the `clamp(2, 8)` raised).
+
+---
+
+## 7. KV pre-size reverted by user decision (2026-10-02)
+
+`6f7b393` pre-sized the 10 full-attention caches to 32768 positions
+(2.68 GiB resident up front), which removed the one-time stall of each
+`ensure_capacity` doubling (512→…→16384; each copy is live keys+values).
+Measured: 8-token decode window at 8.4k context 8.8→10.1 tok/s, 128-token
+window 11.8→12.6, 16k 8.4→10.3.
+
+The user directed that chat not pre-allocate the full context (CLI footprint
+was reported at ~13.7 GiB), so `894f4c0` reverts `6f7b393` and the cache
+is again allocated dynamically (double on demand, ring for sliding layers).
+Post-revert footprint at 1.2k prompt / 32 tokens, `/usr/bin/time -l`:
+`peak memory footprint = 13 024 650 984` (~12.1 GiB), i.e. the pre-size
+added roughly 1.5–2 GiB of always-resident KV, and removing it returns to
+the historical ~12–13 GiB.
+
+Consequence, stated plainly: the one-time doubling stall during prefill of
+a prompt longer than 512/1024/2048/4096 is back. It is a fixed cost per
+doubling, not per-token, and it does not change decode steady-state speed.
+`DEFAULT_CONTEXT_LIMIT` stays 32768; only the allocation policy changed.
