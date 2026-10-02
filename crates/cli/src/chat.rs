@@ -113,15 +113,28 @@ pub fn run(
     Ok(())
 }
 
-/// One line after each turn: the last turn's rate and the session's.
+/// One line after each turn: the last turn's rate, its token counts, and the
+/// session's rate.
+///
+/// The per-turn prefill/generated counts are here rather than only in `/stats`
+/// for two reasons: `/stats` is a snapshot of the *last* turn, so a long session's
+/// early turns are gone by the time anyone looks; and the counts are what you
+/// need to tell "the model got slower" from "that turn was just bigger". They
+/// also make the turn-to-turn context arithmetic checkable from the transcript
+/// alone, which `tests/multi_turn_chat.rs` relies on.
 fn print_turn_rate(session: &ChatSession) {
     let Some(stats) = session.last_stats() else {
         return;
     };
     let totals = session.totals();
     println!(
-        "[{} tok/s last turn, {:.2} tok/s session, {} turns, {} ctx]",
-        stats.decode_tok_s, totals.decode_tok_s, totals.turns, session.context_used()
+        "[{:.2} tok/s last turn, {:.2} tok/s session, turn {}: {} prefill + {} generated, {} ctx]",
+        stats.decode_tok_s,
+        totals.decode_tok_s,
+        totals.turns,
+        stats.prefill_tokens,
+        stats.generated_tokens,
+        session.context_used()
     );
 }
 

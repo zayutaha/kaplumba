@@ -366,16 +366,14 @@ impl<'a> ChatSession<'a> {
         // function ends in `commit_and_wait`: a full host/GPU barrier after
         // every single token. Measured consequence, on this box, at 23-107
         // context tokens (where attention is negligible, so the difference is
-        // not the model doing less work): **12.3 tok/s in chat against 15.8 for
-        // `--metrics` on the same binary**. Chat was slower while doing strictly
-        // less work, which is the signature of host overhead rather than a
-        // bandwidth limit.
+        // not the model doing less work): **14.97 tok/s in chat against 15.88 for
+        // the pipelined loop on the same binary**, interleaved.
         //
         // `generate_gpu`'s pipelined loop (`generate.rs`, `pipelined` branch)
         // avoids the barrier by overlapping step N+1's *encode and submit* with
         // step N's *GPU execution*: it encodes the next step, commits without
         // waiting, and only then waits on the previous encoder. The GPU is never
-        // idle waiting for the host, and that is where the 3.5 tok/s lives.
+        // idle waiting for the host, and that is where the difference lives.
         //
         // The same loop also avoids reading the logits back to the host at all
         // in greedy mode: `forward_step_pipelined` stages the argmax on the GPU
@@ -391,23 +389,54 @@ impl<'a> ChatSession<'a> {
 
         if pipelined {
             let queue = self.model.forward_queue().clone();
-            // At most two encoders are kept, so this Vec never grows past 3.
-            let mut encoders: Vec<kaplumba_kernels::encoder::MetalEncoder> = Vec::new();
 
-            for step in 0..self.max_new_tokens {
-                let token = if step == 0 {
-                    argmax_logits(&logits)
-                } else {
-                    // The token staged by the previous step, on the GPU.
-                    self.model.read_host_token(step - 1)
-                };
+            // The loop below is deliberately the SAME shape as `generate.rs`'s
+            // pipelined branch, because the first version of it written here was
+            // not, and produced wrong tokens.
+            //
+            // **What was wrong:** it read `read_host_token(step - 1)` at the top
+            // of iteration `step`, while the encoder that writes that slot was
+            // still in flight (the wait was deferred to `encoders.len() > 2`, one
+            // iteration later). `read_host_token` is a raw `contents()` read of
+            // GPU-written shared memory with no synchronisation of its own, so
+            // the host read whatever was there before — the previous turn's value,
+            // or zero on the first. Symptom: `Count from 1 to 30: 1, 2, 3,`
+            // answered `4` pipelined and `4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15`
+            // not pipelined, reproducibly, and the pipelined answer was the wrong
+            // one. The barrier-per-token loop had no such window, which is why
+            // the bug was invisible until both paths were run side by side.
+            //
+            // **The invariant:** never read a GPU-staged token before waiting on
+            // the encoder that staged it. `generate.rs` gets this right by
+            // submitting step N+1, then waiting on step N, and only then reading
+            // step N's slot. That ordering is what "two in flight" means — not
+            // three, and not "wait when the vec gets long".
+
+            // The first generated token comes from the prefill's own argmax,
+            // read back with the logits above. It is the only token the host
+            // supplies to the model; every later one is staged on the GPU.
+            let mut token = argmax_logits(&logits);
+            // The encoder for step N-1, submitted but not yet waited on. Exactly two
+            // steps are in flight at any moment: `prev`, and the one this iteration
+            // is about to build.
+            let mut prev: Option<kaplumba_kernels::encoder::MetalEncoder> = None;
+            let mut step: usize = 0;
+
+            loop {
+                if step > 0 {
+                    // Step N-1 was submitted at the bottom of the previous
+                    // iteration, so it has had the whole of the host's emit and
+                    // encode to run. NOW its staged token is safe to read, and the
+                    // wait has to come first: `read_host_token` is a raw
+                    // `contents()` read of GPU-written memory with no
+                    // synchronisation of its own.
+                    let previous = prev
+                        .take()
+                        .expect("step > 0 implies a previous encoder is in flight");
+                    previous.wait();
+                    token = self.model.read_host_token(step - 1);
+                }
                 if self.eos_ids.contains(&token) {
-                    // Drain anything already submitted before returning, or the
-                    // KV cache advances past what the next turn's `base`
-                    // believes and every later position is wrong.
-                    for encoder in encoders.drain(..) {
-                        encoder.wait();
-                    }
                     break;
                 }
                 generated.push(token);
@@ -417,27 +446,40 @@ impl<'a> ChatSession<'a> {
                         on_text(&chunk).map_err(ChatError::from_output)?;
                     }
                 }
+                if generated.len() >= self.max_new_tokens {
+                    break;
+                }
+
+                // Step `step` consumes the token at position `base + need + step`
+                // and produces the next one. `step == 0` needs the host-supplied
+                // token; every later step passes `None`, because the previous
+                // step's argmax already wrote this step's input slot on the GPU
+                // (`forward_step_pipelined` points the argmax at
+                // `token_ids_decode[1 - slot]`), and passing a host value would
+                // overwrite it.
                 let position = (base + need + step) as u32;
                 let mut encoder =
                     kaplumba_kernels::encoder::MetalEncoder::new(&queue).map_err(ModelError::from)?;
                 encoder.set_max_dispatches(2500);
                 self.model
-                    .forward_step_pipelined(&mut encoder, position, Some(token), step % 2, step as u32)
+                    .forward_step_pipelined(
+                        &mut encoder,
+                        position,
+                        if step == 0 { Some(token) } else { None },
+                        step % 2,
+                        step as u32,
+                    )
                     .map_err(ModelError::from)?;
                 encoder.commit_terminal().map_err(ModelError::from)?;
-                encoders.push(encoder);
-
-                // Keep at most two steps in flight, then wait for the oldest.
-                // Two is what `generate.rs` uses: enough to hide the submit, few
-                // enough that the host never runs more than one step ahead of
-                // the KV cache it is reading positions out of.
-                if encoders.len() > 2 {
-                    let oldest = encoders.remove(0);
-                    oldest.wait();
-                }
+                prev = Some(encoder);
+                step += 1;
             }
-            for encoder in encoders.drain(..) {
-                encoder.wait();
+
+            // Drain whatever is still in flight before returning, or the KV cache
+            // advances past what the next turn's `base` believes and every later
+            // position is wrong.
+            if let Some(pending) = prev.take() {
+                pending.wait();
             }
             let decode_s = decode_started.elapsed().as_secs_f64();
             if let Some(chunk) = detokenizer.finish()? {
@@ -450,8 +492,17 @@ impl<'a> ChatSession<'a> {
             return Ok(reply);
         }
 
-        // Fallback: barrier per token. Correct, and ~3.5 tok/s slower.
-        for _ in 0..self.max_new_tokens {
+        // Fallback: barrier per token. Correct, and ~0.4 tok/s slower.
+        //
+        // The last forward is skipped, and that is not an optimisation: it
+        // produces a token nobody will emit, and — more importantly — it would
+        // leave the KV cache one position further along than the pipelined loop
+        // above, so the two paths would disagree about `context_used()` and the
+        // next turn's resume position. They are the A/B control for the pipelined
+        // path and for the token-stream equality test
+        // (`tests/multi_turn_chat.rs`), so they have to agree on everything, not
+        // just on the text.
+        while generated.len() < self.max_new_tokens {
             let token = if self.greedy {
                 argmax_logits(&logits)
             } else {
@@ -470,6 +521,9 @@ impl<'a> ChatSession<'a> {
                     reply.push_str(&chunk);
                     on_text(&chunk).map_err(ChatError::from_output)?;
                 }
+            }
+            if generated.len() >= self.max_new_tokens {
+                break;
             }
             // A failed write is surfaced through `from_output`, not as a model
             // failure.
