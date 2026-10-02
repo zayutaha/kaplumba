@@ -13,11 +13,55 @@
 use metal::{Buffer, Device, MTLResourceOptions};
 use thiserror::Error;
 
+use crate::generate::DEFAULT_CONTEXT_LIMIT;
 use crate::kv_cache::KvCacheError;
 
 pub const EMPTY_POSITION: u32 = u32::MAX;
 
-#[derive(Debug, Error)]
+/// Hard ceiling on the capacity of a cache grown by [`GpuKvCache::ensure_capacity`],
+/// in positions.
+///
+/// **Why `DEFAULT_CONTEXT_LIMIT` and not `max_position_embeddings`.**
+/// `DecoderLayer::max_sequence_len` is set to the checkpoint's
+/// `max_position_embeddings` (`model.rs:3396`) and is handed straight to
+/// `ensure_capacity` as `max_capacity` (`model.rs:1663` and `:1783`). That field
+/// is **262144** for this checkpoint, while the policy limit the engine
+/// actually enforces before every forward is 32768 (`generate.rs:35`,
+/// `GenerationConfig::default` at `generate.rs:79`, and the CLI's own boundary
+/// test at `crates/cli/src/args.rs:376-388`). `model.rs:3381-3395` states the
+/// intent explicitly --
+///
+/// > The policy bound on how many positions that may be is
+/// > `DEFAULT_CONTEXT_LIMIT`, checked before every forward by
+/// > `fits_in_context` / `generate`, so the two cannot disagree about what is
+/// > reachable.
+///
+/// They can and do disagree. Every caller that reaches
+/// `TextModel::forward_buffer` directly -- `tests/real_forward_buffer.rs`,
+/// `tests/memory_proof.rs`, most of `crates/engine/examples/` -- never runs
+/// `fits_in_context`, so the bound is the only thing standing between a run and
+/// the full-attention KV growing to
+/// `10 layers x 262144 x (stream_len 2048 x 2 B x 2 + 4 B) = 22_324_387_840 B`
+/// = **20.79 GiB** on a 24 GiB box. `resident_limit_bytes()`
+/// (`metal.rs:4`, 18 GB) does not help: it bounds the *weight arena*, not the
+/// KV, and 18 GB is 16.76 GiB of the box anyway.
+///
+/// So the policy limit is enforced where the allocation happens, not only in the
+/// caller. That makes the two bounds structurally unable to disagree rather than
+/// merely documented as agreeing, and it is the same constant, so raising the
+/// policy raises the bound.
+///
+/// **Cost: nothing today, by construction.** No reachable path exceeds 32768
+/// positions -- `GenerationConfig::default` uses `DEFAULT_CONTEXT_LIMIT` and
+/// there is no CLI flag to raise it -- so this removes ~17.5 GiB of latent
+/// allocation exposure and changes no existing run. Raising the policy limit
+/// means raising this constant in the same commit.
+pub const MAX_POLICY_CAPACITY: usize = DEFAULT_CONTEXT_LIMIT;
+
+/// `PartialEq` so a test can assert the whole error, not just that one
+/// variant matched: the *bound* inside `PositionOutOfRange` is the thing the
+/// growth policy actually promises, and `matches!` cannot see it.
+#[derive(Debug, Error, PartialEq, Eq)]
 pub enum GpuCacheError {
     #[error("GPU cache dimensions must be non-zero")]
     InvalidDimensions,
@@ -164,12 +208,24 @@ impl GpuKvCache {
     /// front cost ~1.4 GiB of resident memory for nothing, so these start small
     /// and double here. Sliding caches are never grown: their capacity is fixed
     /// at the window size and they ring.
+    ///
+    /// `max_capacity` is the caller's *stated* bound and is clamped to
+    /// [`MAX_POLICY_CAPACITY`] before it is trusted, so no caller -- however it
+    /// obtained the number -- can grow the cache past the engine's policy
+    /// context limit. The clamp is what makes the bound load-bearing: the
+    /// caller-supplied value is `max_position_embeddings` = 262144, which at
+    /// the model's own full-attention shape is a 20.79 GiB allocation, and a
+    /// `forward_buffer` caller never passes through `fits_in_context`, the only
+    /// place that limit was previously enforced. See [`MAX_POLICY_CAPACITY`].
     pub fn ensure_capacity(
         &mut self,
         device: &Device,
         needed: usize,
         max_capacity: usize,
     ) -> Result<(), GpuCacheError> {
+        // Clamped before the bounds check, so the error names the bound that
+        // actually applies rather than the one the caller asked for.
+        let max_capacity = max_capacity.min(MAX_POLICY_CAPACITY);
         if needed <= self.capacity {
             return Ok(());
         }
