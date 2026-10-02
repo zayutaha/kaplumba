@@ -462,8 +462,10 @@ fn u16_device_buffer(values: &[u16]) -> Result<Buffer, ModelError> {
     Ok(device.new_buffer_with_data(
         values.as_ptr() as *const std::ffi::c_void,
         std::mem::size_of_val(values) as u64,
-        metal::MTLResourceOptions::StorageModeShared
-            | metal::MTLResourceOptions::HazardTrackingModeUntracked,
+        // Tracked: the norm/sign weights are read by kernels whose predecessors
+        // write scratch; Metal's hazard barrier keeps the ordering. Untracked
+        // (eed081e) dropped it. See ForwardScratch::new for the full rationale.
+        metal::MTLResourceOptions::StorageModeShared,
     ))
 }
 
@@ -2959,8 +2961,13 @@ impl ForwardScratch {
             ));
         }
         let device = system_device()?;
-        let options = metal::MTLResourceOptions::StorageModeShared
-            | metal::MTLResourceOptions::HazardTrackingModeUntracked;
+        // Tracked (default): scratch buffers (normed, attended, raw, hidden_a/b)
+        // are written by one dispatch and read by the next within the same
+        // command buffer. Untracked mode (eed081e) removed Metal's automatic
+        // inter-dispatch barrier while the encoder inserts no explicit
+        // `memoryBarrier`, so consecutive dispatches raced and produced NaN
+        // logits. Tracked restores the barrier. See gpu_cache.rs `new`.
+        let options = metal::MTLResourceOptions::StorageModeShared;
         let f32_elements = |rows: usize, width: usize| -> Result<Buffer, ModelError> {
             let bytes = rows
                 .checked_mul(width)

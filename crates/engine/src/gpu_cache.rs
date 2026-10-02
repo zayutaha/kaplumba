@@ -60,8 +60,13 @@ impl GpuKvCache {
             .checked_mul(stream_len)
             .ok_or(GpuCacheError::ShapeOverflow)?;
         let key_bytes = (elements * 2) as u64;
-        let options = MTLResourceOptions::StorageModeShared
-            | MTLResourceOptions::HazardTrackingModeUntracked;
+        // Tracked (default hazard tracking): KV keys/values are written by the
+        // qkv/kv-append dispatch and read by attention on the next dispatch in
+        // the same command buffer. Untracked mode skips Metal's automatic
+        // inter-dispatch barrier, and no explicit `memoryBarrier` replaces it,
+        // so the two dispatches raced and attention read torn keys -> NaN.
+        // Reverted from eed081e (untracked) for correctness.
+        let options = MTLResourceOptions::StorageModeShared;
         let keys = device.new_buffer(key_bytes, options);
         let values = device.new_buffer(key_bytes, options);
         let positions =
@@ -182,8 +187,9 @@ impl GpuKvCache {
         let target = target.min(max_capacity);
 
         let new_bytes = (target * self.stream_len * 2 * 2) as u64;
-        let options = MTLResourceOptions::StorageModeShared
-            | MTLResourceOptions::HazardTrackingModeUntracked;
+        // Tracked: same reason as `new` above — attention and kv-append race
+        // without Metal's hazard barrier. Reverted from eed081e.
+        let options = MTLResourceOptions::StorageModeShared;
         let new_keys = device.new_buffer(new_bytes, options);
         let new_values = device.new_buffer(new_bytes, options);
         let new_positions =
