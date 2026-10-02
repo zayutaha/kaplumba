@@ -1063,55 +1063,20 @@ pub struct DecoderLayer {
     gpu_weights: LayerGpuWeights,
 }
 
-/// Full-attention KV caches are pre-sized to the usable context window rather
-/// than doubling on demand, so the live KV never needs to be copied mid-run.
-/// `max_position_embeddings` (262144) is the model family's hard bound; the
-/// usable window is `DEFAULT_CONTEXT_LIMIT` (32768), 10 layers x 32768 x 8 KiB
-/// = 2.68 GiB, which the box can afford. Anything past the usable window is
-/// rejected by `fits_in_context` before generation starts.
-fn initial_full_cache_capacity(max_sequence_len: usize) -> usize {
-    const USABLE_CONTEXT: usize = 32768;
-    max_sequence_len.min(USABLE_CONTEXT)
-}
-
-#[cfg(test)]
-mod initial_full_cache_capacity_tests {
-    use super::initial_full_cache_capacity;
-
-    #[test]
-    fn caps_at_the_usable_window_not_the_model_bound() {
-        // The checkpoint declares 262144; the box would not survive a cache
-        // that large, so the pre-size must stop at 32768.
-        assert_eq!(initial_full_cache_capacity(262_144), 32_768);
-    }
-
-    #[test]
-    fn never_exceeds_the_checkpoint_bound() {
-        // A shorter-context checkpoint keeps its own bound.
-        assert_eq!(initial_full_cache_capacity(8_192), 8_192);
-        assert_eq!(initial_full_cache_capacity(1_024), 1_024);
-    }
-}
-
 impl DecoderLayer {
     pub fn new(config: LayerConfig, weights: DecoderLayerWeights) -> Result<Self, ModelError> {
         config.validate()?;
         weights.validate(&config)?;
         let device = system_device()?;
-        // Full-attention caches are pre-sized to the usable context window
-        // (DEFAULT_CONTEXT_LIMIT, 32768) rather than doubling on demand:
-        // `GpuKvCache::ensure_capacity` physically copies the live keys/values
-        // every time it doubles (512 -> 1024 -> ... -> 16384), and that copy
-        // is a one-time stall per growth step that shows up as a tok/s step at
-        // each doubling boundary. Pre-sizing pays the allocation once, at
-        // load, and never copies:
-        //   10 full layers x 32768 positions x 8 KiB = 2.68 GiB.
-        // Sliding caches stay fixed at their 1024-position window and ring.
-        let initial_full = initial_full_cache_capacity(config.max_sequence_len);
+        // Full-attention caches start at a small capacity and double on demand
+        // up to `max_sequence_len`; allocating the worst case up front was most
+        // of the KV footprint for conversations that only need a few hundred
+        // positions.
+        const INITIAL_FULL_CACHE: usize = 512;
         let gpu_cache = if config.full_attention {
             GpuKvCache::new(
                 &device,
-                initial_full,
+                config.max_sequence_len.min(INITIAL_FULL_CACHE),
                 config.kv_heads,
                 config.head_dim,
             )?
