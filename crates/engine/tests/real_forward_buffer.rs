@@ -420,20 +420,123 @@ fn real_model_prefill_scratch_is_independent_of_prompt_length() {
         "scratch grew to {} rows for a {PROMPT}-token prompt; chunking regressed",
         model.scratch_max_tokens()
     );
-    // The point of the check is that the scratch is a function of PREFILL_CHUNK
-    // and not of PROMPT, so the budget is per row rather than a fixed 100 MB.
-    // The scratch is ~366 KB/row and barely changes per row (93.7 MB at 256,
-    // 372 MB at 1024), so 400 KB/row is 1.09x the real figure -- tight enough
-    // to catch a new buffer, and still 22x below what a prompt-sized scratch
-    // (raw alone is 672 MiB at 8192 tokens) would need. At 1024 rows that
-    // 372 MB is a deliberate, measured trade; see PREFILL_CHUNK.
-    const BUDGET_PER_ROW: u64 = 400 * 1024;
-    let scratch = model.scratch_resident_bytes();
-    assert!(
-        scratch <= BUDGET_PER_ROW * PREFILL_CHUNK as u64,
-        "scratch is {scratch} bytes, over the {} byte budget for {PREFILL_CHUNK} rows",
-        BUDGET_PER_ROW * PREFILL_CHUNK as u64
-    );
+    check_scratch_budget(model.scratch_resident_bytes(), model.scratch_max_tokens());
     let (weights, kv, scratch) = model.allocation_breakdown();
     println!("weights={weights} kv={kv} scratch={scratch}");
+}
+
+/// Bytes the scratch really occupies at `PREFILL_CHUNK` = 1024 rows.
+///
+/// Derived from the allocation in `ForwardScratch::new` (model.rs:2978-3042) at
+/// the checkpoint's shapes (`hidden` 5376, `inter` 21504, `q_max` 32x512 =
+/// 16384, `kv_max` 16x256 = 4096, `vocab` 262144, `attn_partials`
+/// `decode_partial_elements(32, 512)` = 16x32x514 = 263,168):
+///
+/// ```text
+/// 5 x hidden x u16          55,050,240
+/// 4 x inter  x u16         176,160,768
+/// 3 x inter  x f32         264,241,152   <- raw, raw_b, raw_c
+/// q_max     x u16          33,554,432
+/// 2 x kv_max x u16          16,777,216
+/// fixed (query_positions, token_ids, staging, host_tokens,
+///        last_hidden, logits, capped, attn_partials, argmax_keys)
+///                              2,153,232
+///                            -----------
+///                            547,937,040
+/// ```
+const SCRATCH_BYTES_AT_PREFILL_CHUNK: u64 = 547_937_040;
+
+/// Per-row budget, `~10 %` above [`SCRATCH_BYTES_AT_PREFILL_CHUNK`] / 1024 =
+/// 535,094.77 B. Still 143x below what a prompt-sized scratch would need (`raw`
+/// alone is 672 MiB at 8192 tokens).
+const SCRATCH_BUDGET_BYTES_PER_ROW: u64 = 590_000;
+
+/// The budget was `400 * 1024 = 409,600` B/row, described as "1.09x the real
+/// figure" where the "real figure" was
+/// `resident_bytes() / 1024 = 354.4 KiB/row`. That number was 168 MiB light:
+/// `ForwardScratch::resident_bytes()` (model.rs:3045-3076) sums 24 buffers while
+/// `ForwardScratch::new` (model.rs:2989-2990) allocates 26. `raw_b` and `raw_c`
+/// are absent from the list and both are genuinely used --
+/// `encode_gemv_fused3` is handed `&scratch.raw, &scratch.raw_b, &scratch.raw_c`
+/// (model.rs:1525-1527, `:1582`, `:2210`). So the budget was **0.766x** the
+/// truth: it passed *because* of the omission and breaks the day that is fixed.
+///
+/// Fixed by `spec/memory-swap-cliff` F5, which replaces the hand-maintained list
+/// with one `all_buffers()` source of truth. Until then the constant here is the
+/// honest number and `scratch_resident_bytes()` is 168 MiB short of it, which is
+/// why this check has to accept both figures.
+fn check_scratch_budget(scratch: u64, max_tokens: usize) {
+    // Compile-time tripwire: the budget must stay above the derived figure, and
+    // since both are constants this is a build failure rather than a test
+    // failure. (It is how the sabotage "restore 400 KiB/row" was caught:
+    // E0080, evaluation panicked.)
+    const _: () = assert!(
+        SCRATCH_BUDGET_BYTES_PER_ROW > (SCRATCH_BYTES_AT_PREFILL_CHUNK / 1024)
+    );
+    assert!(max_tokens > 0);
+    assert!(
+        SCRATCH_BUDGET_BYTES_PER_ROW > (SCRATCH_BYTES_AT_PREFILL_CHUNK / 1024),
+        "budget {SCRATCH_BUDGET_BYTES_PER_ROW} must exceed the derived {}",
+        SCRATCH_BYTES_AT_PREFILL_CHUNK / 1024,
+    );
+    assert!(
+        scratch <= SCRATCH_BUDGET_BYTES_PER_ROW * max_tokens as u64,
+        "scratch is {scratch} bytes ({:.1} KiB/row), over the {} byte budget \
+         ({:.1} KiB/row) for {max_tokens} rows -- a new scratch buffer?",
+        scratch as f64 / 1024.0 / max_tokens as f64,
+        SCRATCH_BUDGET_BYTES_PER_ROW * max_tokens as u64,
+        SCRATCH_BUDGET_BYTES_PER_ROW as f64 / 1024.0,
+    );
+}
+
+/// The budget, without a checkpoint.
+///
+/// Two things are being asserted here and neither is obvious:
+///
+///  * the budget accepts *both* the figure `resident_bytes()` reports today
+///    (371,776,272 B, 24 buffers) and the figure actually allocated
+///    (547,937,040 B, 26 buffers), so it does not break when F5 lands, and
+///  * the old 400 KiB/row budget did **not** -- it is below the truth, which is
+///    how a budget calibrated on an under-reported measurement passes for years.
+#[test]
+fn the_scratch_budget_accepts_the_truth_and_rejects_a_new_buffer() {
+    const REPORTED_TODAY: u64 = 371_776_272;
+    const ACTUALLY_ALLOCATED: u64 = SCRATCH_BYTES_AT_PREFILL_CHUNK;
+    const OLD_BUDGET_PER_ROW: u64 = 400 * 1024;
+
+    assert_eq!(ACTUALLY_ALLOCATED - REPORTED_TODAY, 176_160_768);
+    assert_eq!(REPORTED_TODAY + 88_080_384, 459_856_656, "one raw* buffer");
+
+    // Both the reported and the true figure are inside the budget.
+    check_scratch_budget(REPORTED_TODAY, PREFILL_CHUNK);
+    check_scratch_budget(ACTUALLY_ALLOCATED, PREFILL_CHUNK);
+
+    // The old budget could not have held the truth -- it passed only because the
+    // accounting was short by 168 MiB.
+    assert!(
+        OLD_BUDGET_PER_ROW * (PREFILL_CHUNK as u64) < ACTUALLY_ALLOCATED,
+        "the premise of this test changed: 400 KiB/row would now be above the \
+         real {} bytes",
+        ACTUALLY_ALLOCATED,
+    );
+    assert!(
+        std::panic::catch_unwind(|| {
+            check_scratch_budget(
+                SCRATCH_BUDGET_BYTES_PER_ROW * (PREFILL_CHUNK as u64) + 1,
+                PREFILL_CHUNK,
+            )
+        })
+        .is_err(),
+        "the budget must reject a scratch that is over it"
+    );
+
+    // One more inter-sized f32 accumulator -- what F5's omission amounts to --
+    // must be caught.
+    assert!(
+        std::panic::catch_unwind(|| {
+            check_scratch_budget(ACTUALLY_ALLOCATED + 88_080_384, PREFILL_CHUNK)
+        })
+        .is_err(),
+        "a new 84 MiB scratch buffer must be caught by the budget"
+    );
 }
