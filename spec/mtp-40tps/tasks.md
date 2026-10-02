@@ -1,23 +1,70 @@
 # tasks — mtp-40tps
 
+Amended 2026-10-02: direction changed from mlx-vlm + downloaded target to
+**kaplumba Rust engine + local Gxma**. T4–T10 below are replaced; the audit work
+T0–T3 is kept because it is measured, not speculative.
+
+## Done (audit phase — measurements stand, they are physics)
+
 - [x] **T0** Environment audit (disk, RAM, swap, versions, `~/.omlx` settings).
-- [x] **T1** Determine the memory floor for an MLX 4-bit Gemma-4-31B target by
-      reading the safetensors headers over HTTP range requests.
-      → 17.27 GB text-only / 18.41 GB with vision.
+- [x] **T1** Memory floor for an MLX 4-bit Gemma-4-31B target: 17.27 GB text-only.
+      *Now moot — Gxma is 11.6 GiB resident.*
 - [x] **T2** Audit the mlx-vlm non-greedy MTP verification path
       (`speculative/common.py:135`, `speculative/mtp.py:182`) and prove the
       accept-on-equal rule distribution-exact on synthetic distributions.
-- [x] **T3** Measure the box's real memory ceiling for a model-sized working set
-      (MLX `mx.ones` residency probe + non-sparse mmap streaming probe) and the
-      NVMe re-read rate that sets the thrash penalty.
-- [ ] **T4** Acquire `mlx-community/gemma-4-31b-it-4bit` (18.41 GB). *In progress —
-      ~1 MB/s upstream.*
-- [ ] **T5** Build the scratch harness `mtp_bench.py`: per-token wall-clock
-      intervals, `temp`/`top_k`/`seed`/`--draft-block-size` control, token-id dump,
-      memory sampling, A/B interleave support.
-- [ ] **T6** Baseline (R2): non-speculative decode, 1024 tokens, ≥3 interleaved runs.
-- [ ] **T7** MTP (R3): same prompt/settings with the drafter.
-- [ ] **T8** Block-size / KV-size / flag sweep (R5).
-- [ ] **T9** Distribution-faithfulness test (R6).
-- [ ] **T10** Coherence / multi-turn test (R7).
-- [ ] **T11** Write-up: measured ceiling, roofline, acceptance rate, negative results.
+- [x] **T3** Measure the box's memory ceiling and the NVMe re-read rate.
+      → DRAM 222 GB/s, NVMe 22.1 GB/s, ~10 GB max wired.
+- [x] **T3b** Read the drafter's real forward pass from the installed mlx-vlm
+      (`speculative/drafters/gemma4_assistant/gemma4_assistant.py`) and the round
+      loop (`speculative/mtp.py:523`). Architecture is now known; nothing is guessed.
+
+## Gate — must be answered before any optimization work
+
+- [ ] **T4 — MEASURE REAL ACCEPTANCE RATE.** The single number that decides whether
+      this task is possible. Run the real drafter against real Gxma at
+      `temperature 1.0, top_k 64` and report accepted-per-round for K = 1, 3, 5.
+      The synthetic estimate c ≈ 0.20–0.40 would put 40 t/s out of reach; the real
+      value is unknown. **If measured acceptance cannot reach ~0.73, stop and
+      report the ceiling with roofline arithmetic** (Q1 in spec.md).
+      Requires T5 first (the drafter has to run to be measured).
+- [ ] **T5 — Drafter conversion.** Convert the MLX affine-4bit drafter
+      (`bits 4, group_size 64, mode affine`, U32-packed + `scales`/`biases`) into
+      the engine's format. Rust tool, no Python in the repo. Verify the conversion
+      against a reference and **state whether the check is bit-level or
+      distributional**.
+- [ ] **T6 — Drafter forward.** `pre_projection` (10752→1024) → 4 decoder layers
+      reading the **target's shared K/V** → `norm` → `post_projection` (1024→5376),
+      lm_head = tied `embed_tokens`. The drafter keeps **no cache of its own**
+      (`gemma4_assistant.py:104-106`); it reads the target's per-layer-type shared
+      K/V, which is why it costs no extra KV memory.
+
+## Integration
+
+- [ ] **T7 — Baseline (R2).** Non-speculative decode of Gxma, 1024 tokens,
+      ≥3 interleaved runs. Denominator for everything.
+- [ ] **T8 — Draft/verify round loop (R3).** One target forward over
+      `[bonus, cand_1..cand_k]`; accept-on-equal walk with **target and drafter RNG
+      streams kept separate** (`common.py:46-132`) — that separation is what makes
+      exactness hold.
+- [ ] **T9 — KV rollback.** Trim target KV to `accepted` on rejection, and re-slice
+      the shared-KV view the drafter reads. This is the most likely place for a
+      silent distribution skew; it needs its own test.
+- [ ] **T10 — Optimize to the bar (R5).** Draft depth, cache sizing, overlap,
+      staging. One change at a time, A/B interleaved, negatives recorded.
+
+## Proof
+
+- [ ] **T11 — Distribution faithfulness (R6).** TV distance + two-sample χ² with
+      p-values, many samples, same seed/temp/top_k, speculative vs not.
+- [ ] **T12 — Coherence (R7).** Multi-turn at temp 1.0/top_k 64: repetition,
+      truncation, EOS (`[1,106,50]`), cross-turn, vs the non-speculative baseline.
+- [ ] **T13 — Write-up.** Measured ceiling, roofline, acceptance rate, all negative
+      results with numbers.
+
+## Order and dependencies
+
+T5 → T6 → **T4 (gate)** → T7/T8 → T9 → T10 → T11/T12 → T13.
+
+T4 is a gate, not a parallel task: if real acceptance is too low, T8–T10 are wasted
+work and the answer is a roofline, not a speedup. Measure it as soon as the drafter
+runs, before building the fast path.

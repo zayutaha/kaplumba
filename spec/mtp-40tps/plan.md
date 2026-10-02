@@ -1,78 +1,129 @@
 # plan — mtp-40tps
 
-## Runtime chosen
-
-`mlx-vlm 0.6.8` / `mlx-lm 0.31.3` / `mlx 0.32.0`, installed as uv tools under
-`~/.local/share/uv/tools/`. No new venv is needed; the drafter README's
-`uv run mlx_vlm.generate --draft-kind mtp` maps to the already-installed
-`mlx_vlm.generate` entry point.
+Amended 2026-10-02: direction changed from mlx-vlm + a downloaded 18.41 GB MLX
+target to **the kaplumba Rust engine + the already-local Gxma checkpoint**. mlx-vlm
+is now read-only *reference material*, not a runtime dependency. See `spec.md` for
+the arithmetic behind the change; the short version is 11.6 GiB resident and 19
+tok/s already achieved versus 17.27 GiB and a 12.74 tok/s ceiling.
 
 ## Model layout
 
-| role | path | size | notes |
+| role | path | size | format |
 |---|---|---|---|
-| drafter | `~/.omlx/models/mlx-community/gemma-4-31B-it-qat-assistant-4bit` | 0.264 GB | `Gemma4AssistantForCausalLM`, 4 layers, `block_size=4` default, shares target K/V |
-| target | `~/hf_models/gemma-4-31b-it-4bit` (`mlx-community/gemma-4-31b-it-4bit`) | 18.41 GB on disk | `Gemma4ForConditionalGeneration`, 60 layers (48 sliding w=1024 + 12 full), hidden 5376, tie_word_embeddings, affine 4-bit g64 |
+| target | `~/.kaplumba/models/Gxma/Gxma` | 16.0 GB on disk, **11.6 GiB resident** | EXL3 3.0 bpw (`mcg` codebook + `trellis` + `suh`/`svh`); loads today |
+| drafter | `~/.omlx/models/mlx-community/gemma-4-31B-it-qat-assistant-4bit` | 0.264 GB | MLX affine-4bit `g64` (U32-packed + `scales`/`biases`) — **needs conversion** |
 
-Per-tensor byte accounting of the target (read from the four safetensors headers
-over HTTP range requests, `../opencode/hdr2.py`):
+The engine cannot read MLX affine format, so converting the drafter is a real task
+(T5), not a file copy.
+
+## Drafter architecture — read from installed mlx-vlm, not guessed
+
+From `mlx_vlm/speculative/drafters/gemma4_assistant/gemma4_assistant.py`:
 
 ```
-text_linear          16.474 GB   (all 60 layers' quantised q/k/v/o + mlp)
-embed_tokens          0.793 GB   (262144 x 5376, itself affine-4bit g64)
-norms + layer_scalar  0.003 GB
-vision tower          1.143 GB   (strippable for a text-only run)
-                    ---------
-total                18.412 GB   ->  17.27 GB text-only
+inputs_embeds = concat[ target_embed(last_token) , last_hidden ]   # 2 x 5376
+h  = pre_projection(inputs_embeds)          # 10752 -> 1024, no bias
+for layer in 4 decoder layers:               # kv_shared_only = True
+    reads the TARGET's shared K/V for its layer_type; no cache of its own
+h  = norm(h)
+last_hidden = post_projection(h)            # 1024 -> 5376, feeds the next round
+logits      = embed_tokens.as_linear(h)     # tied lm_head, 1024 -> 262144
 ```
 
-## Data flow of one MTP round (`mlx_vlm/speculative/mtp.py:_mtp_rounds`, :523)
+Drafting autoregresses `block_size - 1` candidates (`block_size` default 4 ⇒ 3
+drafts + 1 bonus), `position_ids` held constant across draft steps, K/V taken from
+the target.
 
-1. drafter autoregresses `block_size-1` candidate tokens from
-   `[embed(last_bonus) ; target_hidden]`, reading the *target's* shared K/V
-   (`gemma4_assistant.py:217 draft_block`).
-2. target runs **one** forward over `[last_bonus, cand_1 … cand_k]` — a single
-   weight read, `k+1` positions of hidden state (`mtp.py:163`).
-3. acceptance walk compares each candidate against an independent sample from the
-   target distribution and stops at the first mismatch, emitting the target sample
-   as the bonus token.
-4. `rollback_speculative_cache` trims the target KV; the drafter's shared-KV view is
-   re-sliced.
+**This shape is why MTP is cheap here:** the drafter keeps **no KV cache of its
+own** (`gemma4_assistant.py:104-106`, `make_cache()` returns `[]`). It reuses the
+target's K/V, so it costs 0.264 GB of weights and no KV growth.
 
-## Interfaces used
+## Data flow of one MTP round (`mtp.py:523 _mtp_rounds`)
 
-- `mlx_vlm.generate.dispatch.stream_generate(...)` — wrapped by a scratch harness
-  so per-token wall-clock intervals can be recorded. The stock CLI prints only
-  average tok/s and has **no `--top-k`**, which the bar requires.
-- `mlx_vlm.sample_utils.make_sampler(temp=1.0, top_k=64)`.
-- `mlx_vlm.speculative.drafters.load_drafter(path, kind="mtp")`.
+1. Drafter autoregresses `block_size-1` candidates from
+   `[target_embed(last_token) ; last_hidden]`, reading the target's shared K/V.
+2. Target runs **one** forward over `[bonus, cand_1..cand_k]` — a single weight
+   read, `k+1` positions of hidden state.
+3. Acceptance walk draws an independent target sample `y ~ p` per position and
+   accepts draft `x ~ q` iff `x == y`, else emits `y` and stops.
+4. `rollback_speculative_cache` trims the target KV, and the drafter's shared-KV
+   view is re-sliced (`mtp.py:667-681`).
+
+## Exactness, and the one thing that must not be broken
+
+The rule is distribution-exact for *any* temperature: for `x ~ q`, `y ~ p`
+independent, `P(emit = z) = p(z)(1-q(z)) + p(z)q(z) = p(z)`.
+
+That argument **requires the target and drafter RNG streams to be independent.**
+mlx-vlm achieves it with `_SpeculativeSamplerRNG`
+(`mlx_vlm/speculative/common.py:46-132`), which saves and restores `mx.random.state`
+around the drafter call. If the engine reuses one RNG stream for both, the exactness
+argument collapses and R6 will fail. Port the separation, do not re-derive it.
+
+## Roofline (must be re-derived against Gxma's 11.6 GiB, not the abandoned target's)
+
+```
+target pass, 1 token   ~ 11.6 / 220 GB/s  =  52.7 ms   -> ~19 tok/s (matches measurement)
+40 tok/s requires      =  40 x 0.025 s    =  1.06 s of work per second
+                    =>  ~2.1 accepted tokens per target pass
+drafter cost           =  0.264 GB/pass    ~  1.2 ms per draft step (negligible)
+```
+
+Required per-draft acceptance `a` for 40 tok/s under an optimistic
+position-independent model (real acceptance decays with depth, because deeper
+drafts condition on *drafted* rather than accepted history):
+
+```
+K=3 drafts : a >= 0.84
+K=5 drafts : a >= 0.73
+K=7 drafts : a >= 0.70
+```
+
+**These thresholds are the gate.** The synthetic probes measured p–q overlap
+c ≈ 0.20–0.40, which would fail all three rows — but those were synthetic
+distributions, not this drafter against this target. T4 measures the real number
+before any optimization work is built.
 
 ## Measurement discipline
 
 - Exactly one model process; `pgrep -fl 'mlx_vlm|omlx|kaplumba'` must be empty first.
-- A/B interleaved (A B A B …), median of ≥3 runs, spread reported.
-- Memory from `top -l 1 -n 0 | grep PhysMem` (`unused`) and `sysctl -n vm.swapusage`.
-  `vm_stat` `Pages free` is used only to *decompose* memory, never as a pressure signal.
+- A/B interleaved (A B A B …), median of ≥3 runs, spread reported. This box has
+  produced 3.7–6.4 tok/s from the same binary minutes apart.
+- Memory from `top -l 1 -n 0 | grep PhysMem` (`unused`, which switches K/M/G/T and
+  drops the decimal below 10) and `sysctl -n vm.swapusage`. `vm_stat` `Pages free`
+  is only for *decomposing* memory, never as a pressure signal.
+- The budget figure is `phys_footprint` via `/usr/bin/time -l`, never
+  `--metrics peak_resident_pages_bytes` (that is `ru_maxrss` and misses the Metal
+  pages by 5.5 GiB).
+- `scripts/gpuq try -- <cmd>` for scheduling; it takes no lock and never may — the
+  engine owns the lock via `gpu_lock.rs` and returns exit 75 on contention.
 
 ## Risks
 
-1. **Memory (primary).** 24 GiB box vs 17.27 GB of mandatory-resident weights.
-2. **Roofline.** 17.27 GB / 220 GB/s = 78.5 ms per target pass = 12.74 tok/s ceiling
-   before any speculation.
-3. **Acceptance at temp 1.0.** The accept rule's per-position rate is bounded by
-   the p–q overlap, which shrinks sharply as the target distribution flattens.
-4. **Network.** huggingface.co delivers ~1 MB/s on this box; the 18.41 GB fetch is
-   the wall-clock long pole.
+1. **Acceptance rate (primary).** If real per-draft acceptance is below ~0.73, no
+   K reaches 40 tok/s and the deliverable becomes the ceiling plus proof.
+2. **KV rollback correctness.** Trimming target KV on rejection and re-slicing the
+   drafter's shared-KV view is the most likely source of a silent distribution
+   skew. It gets a dedicated test.
+3. **Drafter/target mismatch.** Both are vocab 262144 with tied embeddings and the
+   drafter's `backbone_hidden_size` 5376 matches Gxma's `hidden_size`, but a
+   drafter trained against a different target revision would show up as low
+   acceptance. Verify before building.
+4. **Overhead on the hot path.** The engine already runs ~53 ms/pass; adding a
+   per-round host round-trip must not cost more than it saves. Profile.
 
 ## Requirement → task map
 
 | req | task |
 |---|---|
-| R1 | T1 target acquisition |
-| R4 | T2 verification-source audit + synthetic exactness test |
-| R2 | T3 baseline harness + runs |
-| R3 | T4 MTP harness + runs |
-| R5 | T5 block-size / KV / flag sweep to the bar |
-| R6 | T6 distribution-faithfulness test |
-| R7 | T7 coherence / multi-turn test |
-| — | T8 write-up |
+| R1 | T5 drafter conversion |
+| R1 | T6 drafter forward |
+| R4 | T2 + T3b (done — verification audit and architecture read) |
+| R2 | T7 baseline |
+| R3 | T8 round loop |
+| R5 | T10 optimization sweep |
+| — | **T4 acceptance gate** (before T10) |
+| — | T9 KV rollback |
+| R6 | T11 distribution faithfulness |
+| R7 | T12 coherence |
+| — | T13 write-up |
