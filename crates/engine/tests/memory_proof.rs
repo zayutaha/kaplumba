@@ -85,6 +85,16 @@ impl HostMemory {
     /// What the kernel can hand out without compressing or swapping: untouched
     /// free pages plus everything it can drop and re-fault cheaply. Wired and
     /// compressor pages are excluded -- they are nobody else's to have.
+    ///
+    /// The same four counters `scripts/gpuq`'s `vm_stat` fallback sums, so this
+    /// tool and that one report the same number for the same box.
+    ///
+    /// **Known imprecision:** `speculative_count` and `purgeable_count` are not
+    /// provably disjoint from `inactive_count` from user space, so this may
+    /// over-count by up to the speculative total -- 0.877 GiB on an idle box
+    /// here, which is measured, not assumed. That makes the footprint check
+    /// below optimistic by at most that much; getting it exactly right needs a
+    /// kernel-internal counter, and a guess is worse than a stated bound.
     fn supply_bytes(&self) -> u64 {
         (self.free + self.inactive + self.purgeable + self.speculative) * self.page_size
     }
@@ -176,27 +186,22 @@ fn the_supply_probe_reports_this_box_sane_numbers() {
         "implausible page size {}",
         host.page_size,
     );
-    let total = (host.free
-        + host.active
-        + host.inactive
-        + host.purgeable
-        + host.speculative
-        + host.wired
-        + host.compressor)
-        * host.page_size;
-    assert!(total > 0);
+    // Only these four are disjoint page classes, so only these four may be
+    // summed and compared with the box. `speculative`, `purgeable` and
+    // `compressor` overlap with inactive/active -- summing all seven exceeds
+    // hw.memsize on a real box (measured 24.258 GiB against 24.000 GiB, of which
+    // 0.877 GiB was speculative), which is exactly what the first version of
+    // this assertion did and what caught it.
+    let core = (host.free + host.active + host.inactive + host.wired) * host.page_size;
     let memsize = sysctl_u64(c"hw.memsize");
     assert!(
-        total <= memsize,
-        "page counts sum to {total} bytes, more than hw.memsize {memsize}: the \
-         counters are not being read correctly",
+        core > 0 && core <= memsize,
+        "free+active+inactive+wired is {core} bytes against hw.memsize {memsize}: \
+         the counters are not being read correctly",
     );
-    // The definition of supply is the one thing here that a future edit could
-    // quietly corrupt, and the corruption that matters is folding *wired* pages
-    // in: wired is unswappable and belongs to nobody, so counting it as
-    // available is exactly how an admission check starts lying. Wired, free,
-    // inactive, purgeable and speculative pages are disjoint sets, so supply
-    // plus wired can never exceed the box.
+    // Supply is drawn from inactive and free, so it cannot exceed the box
+    // either -- and this is the bound that fails if wired ever leaks into
+    // "available", which is the corruption that makes an admission check lie.
     assert!(
         host.supply_bytes() + host.wired * host.page_size <= memsize,
         "supply {:.2} GiB + wired {:.2} GiB exceeds hw.memsize {:.2} GiB: wired \
