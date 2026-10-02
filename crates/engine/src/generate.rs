@@ -10,7 +10,29 @@ use crate::sampler::{Sampler, SamplerConfig, SamplerError};
 use crate::tokenizer::{GemmaTokenizer, TokenizerError};
 use kaplumba_kernels::encoder::MetalEncoder;
 
-pub const DEFAULT_CONTEXT_LIMIT: usize = 8192;
+/// The default usable context window, in tokens.
+///
+/// Raised from 8192 to 32768 after measuring that the model supports it:
+/// `config.json` declares `max_position_embeddings = 262144`, so 8192 was a
+/// *policy* choice, not a capability limit. See
+/// `spec/decode-20tps/implementation_notes.md` §7 for the measurements.
+///
+/// The cost is KV memory, and only the full-attention layers pay it, because the
+/// 50 sliding layers are fixed at their 1024-token window and ring. Per position,
+/// full layers hold 2 x 4 global KV heads x 512 global head dim x fp16 = 8 KiB,
+/// sliding layers 2 x 16 KV heads x 256 head dim x fp16 = 16 KiB:
+///
+/// ```text
+/// full KV   = 10 layers x positions x 8 KiB  =  0.078 MiB/token
+/// sliding   = 50 layers x 1024 x 16 KiB      =  0.781 GiB, constant
+/// ```
+///
+/// i.e. 0.64 + 0.78 = 1.4 GiB at 8k, 1.3 + 0.78 = 2.1 GiB at 16k and 2.5 + 0.78 =
+/// 3.3 GiB at 32k, on top of ~11.0 GiB of weights. Measured peak footprint at 32k
+/// is 14.4 GiB against this box's 24 GiB, so the window fits with headroom -- but
+/// it is not free, and it is why the cache still starts at 512 positions and
+/// doubles on demand rather than allocating the worst case at load.
+pub const DEFAULT_CONTEXT_LIMIT: usize = 32768;
 
 /// Set `AGX_RELAX_CDM_CTXSTORE_TIMEOUT=1` once, before the first command buffer.
 ///

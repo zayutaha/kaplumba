@@ -3371,7 +3371,22 @@ impl TextModel {
                 q_heads: metadata.config.num_attention_heads,
                 kv_heads,
                 head_dim,
-                max_sequence_len: 8192,
+                // The KV cache's growth bound, which used to be a hardcoded 8192
+                // and was therefore the real ceiling on context length:
+                // `DEFAULT_CONTEXT_LIMIT` could be raised and the run would still
+                // die at position 9216 with "position 9215 exceeds capacity 8192"
+                // from `GpuKvCache::ensure_capacity`.
+                //
+                // It is now the model's own `max_position_embeddings` (262144 for
+                // this checkpoint), which is what the field actually means. This
+                // is a *bound*, not an allocation: `DecoderLayer::new` starts the
+                // full-attention caches at `INITIAL_FULL_CACHE` (512) and
+                // `ensure_capacity` doubles on demand, so the memory is spent
+                // only as positions are actually reached. The policy bound on how
+                // many positions that may be is `DEFAULT_CONTEXT_LIMIT`, checked
+                // before every forward by `fits_in_context` / `generate`, so the
+                // two cannot disagree about what is reachable.
+                max_sequence_len: metadata.config.max_position_embeddings,
                 full_attention: full,
                 sliding_window: if full {
                     0
