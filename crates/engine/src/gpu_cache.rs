@@ -243,7 +243,20 @@ impl GpuKvCache {
         // Carry the live prefix over. Full caches only hold valid entries in the
         // low slots, so the copy is a straight prefix copy; sliding caches never
         // reach this path.
+        debug_assert!(
+            target > self.capacity,
+            "the ladder must grow: target {target} vs capacity {}",
+            self.capacity,
+        );
         let live = self.next_position.min(self.capacity);
+        // `target > self.capacity >= live` holds here: `growth_target` only
+        // returns something different when `needed > self.capacity`, and it
+        // returns `>= needed` (see its property 1). Both the copy length and the
+        // `target - live` length below depend on it -- in release a `target <
+        // live` would wrap `target - live` into a ~2^64 memset past the end of
+        // the buffer rather than panicking, so it is asserted rather than left
+        // to inspection.
+        debug_assert!(live <= target, "live {live} exceeds target {target}");
         if live > 0 {
             let element_bytes = self.stream_len * 2;
             unsafe {
