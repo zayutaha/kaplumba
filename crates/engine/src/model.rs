@@ -4810,6 +4810,116 @@ fn integer_rate(bits: f32, field: &str) -> Result<Exl3Rate, ModelError> {
     Ok(Exl3Rate::Integer(bits as u8))
 }
 
+/// Byte alignment every EXL3 `packed` argument must be bound at.
+///
+/// The decode family hard-casts the bound pointer:
+/// `linear_gemv_ishizuki_k*` does `const device uint *column =
+/// (const device uint *)packed + tn * WORDS`, and the `linear_gemv_exl3_k*_u*`
+/// family it falls back to is declared `const device ushort *`. Metal derives
+/// the requirement from the argument type and *enforces* it: binding the 16-bit
+/// variant at an odd byte offset is
+/// `validateComputeFunctionArguments: the offset into the buffer packed that is
+/// bound at Buffer index 0 must be a multiple of 2 but was set to 1813`, and
+/// past validation it is an undefined read whose failure mode is a GPU fault
+/// (`MTLCommandBufferStatus::Error`) or, worse, plausible-but-wrong numbers.
+///
+/// safetensors makes no such promise. `data_offsets` are relative to a payload
+/// that starts at `8 + header_len`, and `header_len` is however many bytes the
+/// writer's JSON serialised to, so the absolute start of any given tensor is
+/// `8 + header_len + data_offsets[0]` with no alignment guarantee at all.
+/// Measured on the two checkpoints in `~/.kaplumba/models`:
+///
+/// | checkpoint      | shard | `8 + header_len` | embed_tokens | lm_head.trellis |
+/// |-----------------|-------|------------------|--------------|-----------------|
+/// | `Gxma-4-bit`    | 1     | 99067 (odd)      | 763 (odd)    | 1813 (odd)      |
+/// | `Gxma-4-bit`    | 3     | 58585 (odd)      | --           | 1813 (odd)      |
+/// | `Gxma-repacked` | 1     | 133184 (4-aligned) | 2112       | --              |
+/// | `Gxma-repacked` | 2     | 174656 (4-aligned) | --         | 2880            |
+///
+/// So the 3 bpw checkpoint has never produced a misaligned bind, which is why
+/// this only ever bit the 4 bpw one, and why "the same code works on the other
+/// checkpoint" was never evidence that the offset is safe.
+///
+/// [`align_packed_view`] is where that is turned into a guarantee rather than an
+/// observation.
+pub(crate) const EXL3_PACKED_ALIGNMENT: u64 = 4;
+
+/// Return a `(buffer, offset)` pair whose offset satisfies
+/// [`EXL3_PACKED_ALIGNMENT`], copying only when the incoming one does not.
+///
+/// A zero-copy weight view is a page-aligned window around the tensor, so the
+/// tensor's offset inside it is `absolute_start % 4096` and cannot be adjusted:
+/// re-basing the window to a different page boundary only moves the offset by
+/// whole pages, and a page boundary is 4096-aligned, so the misalignment
+/// survives any rebasing. The only ways out are to change the packed kernel to
+/// read byte-misaligned words, or to give it a tensor that starts on a word.
+///
+/// The copy is one host `memcpy` of the trellis into a private
+/// `StorageModeShared` buffer, once, at load, and only for a tensor whose file
+/// offset is actually misaligned. On `Gxma-4-bit` that is `lm_head.trellis` and
+/// costs 704 MB; on `Gxma-repacked`, and on every arena-resident tensor, the
+/// `offset % 4 == 0` early return means zero cost and zero behaviour change.
+///
+/// A copy is the right trade against the alternative, which is not "slow" but
+/// *silently wrong*: at offset 1813 the aligned `linear_gemv_ishizuki_k8` is
+/// refused by `LinearKernels::ishizuki_gemv_pipeline` and the head runs on the
+/// 16-bit `linear_gemv_exl3_k8_u_mcg` instead, whose reads land a byte away from
+/// where the decoder means them. Measured on that path, greedy argmax margin for
+/// the first token fell from 11.42 (correct kernel) to 0.53 and the mean
+/// `|logit|` from 12.29 to 7.07, and the model emitted `edL laly own own owning
+/// own-CCCCCC`.
+fn align_packed_view(
+    device: &metal::Device,
+    buffer: &Buffer,
+    offset: u64,
+    len: u64,
+    name: &str,
+) -> Result<(Buffer, u64), ModelError> {
+    // The range check comes FIRST, so it applies to the pass-through case too.
+    // `ShardReader::check_range` already covers it at load, but a helper that
+    // validates one branch and not the other is a helper whose contract depends
+    // on which branch a caller happened to take.
+    if offset as usize > buffer.length() as usize
+        || (offset as usize)
+            .checked_add(usize::try_from(len).unwrap_or(usize::MAX))
+            .is_none_or(|end| end > buffer.length() as usize)
+    {
+        return Err(ModelError::InvalidWeights(format!(
+            "{name} zero-copy view of {len} bytes at offset {offset} does not fit its buffer"
+        )));
+    }
+    if offset % EXL3_PACKED_ALIGNMENT == 0 {
+        return Ok((buffer.clone(), offset));
+    }
+    if len == 0 {
+        return Ok((buffer.clone(), offset));
+    }
+    let source = buffer.contents();
+    if source.is_null() {
+        return Err(ModelError::InvalidWeights(format!(
+            "{name} zero-copy view has no host contents to realign"
+        )));
+    }
+    let len = usize::try_from(len)
+        .map_err(|_| ModelError::InvalidWeights(format!("{name} is too large to realign")))?;
+    // A fresh shared buffer's contents are page aligned by construction, so the
+    // tensor at offset 0 satisfies the contract with room to spare.
+    let realigned = device.new_buffer(
+        len as u64,
+        metal::MTLResourceOptions::StorageModeShared,
+    );
+    let destination = realigned.contents();
+    debug_assert!(!destination.is_null());
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            (source as *const u8).add(offset as usize),
+            destination as *mut u8,
+            len,
+        );
+    }
+    Ok((realigned, 0))
+}
+
 fn load_quantized_linear(
     weights: &TextWeights,
     name: &str,
@@ -4828,10 +4938,23 @@ fn load_quantized_linear(
     let (packed, packed_offset) = if copied {
         (weights.tensor_buffer(&trellis_name)?, 0)
     } else {
-        weights
+        let device = metal::Device::system_default().ok_or(ModelError::InvalidConfig(
+            "Metal system device is unavailable".to_string(),
+        ))?;
+        let view = weights
             .zero_copy_tensor_buffer(&trellis_name)?
-            .ok_or_else(|| ModelError::InvalidWeights(format!("{trellis_name} is not resident")))?
+            .ok_or_else(|| ModelError::InvalidWeights(format!("{trellis_name} is not resident")))?;
+        let len = weights
+            .tensors()
+            .get(&trellis_name)
+            .map_or(0, |tensor| tensor.source_len);
+        align_packed_view(&device, &view.0, view.1, len, &trellis_name)?
     };
+    debug_assert_eq!(
+        packed_offset % EXL3_PACKED_ALIGNMENT,
+        0,
+        "{trellis_name} would be bound at {packed_offset}, which no EXL3 kernel can read"
+    );
     let packed_len = weights
         .tensors()
         .get(&trellis_name)
@@ -4885,4 +5008,163 @@ fn read_sign_component(
         )));
     }
     Ok(values)
+}
+
+#[cfg(test)]
+mod packed_alignment_tests {
+    use super::{align_packed_view, EXL3_PACKED_ALIGNMENT};
+    use metal::{Device, MTLResourceOptions};
+
+    /// A byte-distinct pattern, so a copy that moves, truncates or reorders
+    /// bytes is caught rather than merely producing "some" data.
+    fn pattern(len: usize) -> Vec<u8> {
+        (0..len)
+            .map(|i| (i.wrapping_mul(31).wrapping_add(7) % 251) as u8)
+            .collect()
+    }
+
+    /// Copies, deliberately. A no-copy buffer over a local `Vec` would alias
+    /// freed host memory for the rest of the test, which is both a
+    /// use-after-free and a source of exactly the kind of "the bytes changed"
+    /// flake this module exists to catch.
+    fn upload(device: &Device, bytes: &[u8]) -> metal::Buffer {
+        device.new_buffer_with_data(
+            bytes.as_ptr() as *const std::ffi::c_void,
+            bytes.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+
+    fn read(buffer: &metal::Buffer, offset: u64, len: usize) -> Vec<u8> {
+        let p = unsafe { (buffer.contents() as *const u8).add(offset as usize) };
+        unsafe { std::slice::from_raw_parts(p, len) }.to_vec()
+    }
+
+    const PAGE: usize = 4096;
+    const PAYLOAD: usize = 8192;
+
+    /// Place the tensor at an offset whose residue modulo 4 is `misalign`, with a
+    /// full page of slack ahead of it inside the window, exactly as a zero-copy
+    /// view of a safetensors tensor has.
+    fn window_with_misalignment(device: &Device, misalign: u64) -> (metal::Buffer, u64, Vec<u8>) {
+        let bytes = pattern(PAGE + PAYLOAD + PAGE);
+        let buffer = upload(device, &bytes);
+        let offset = PAGE as u64 + misalign;
+        (buffer, offset, bytes[offset as usize..offset as usize + PAYLOAD].to_vec())
+    }
+
+    fn check(misalign: u64) {
+        let Some(device) = Device::system_default() else {
+            eprintln!("no Metal device; skipping");
+            return;
+        };
+        let (window, offset, want) = window_with_misalignment(&device, misalign);
+        assert_eq!(
+            offset % EXL3_PACKED_ALIGNMENT,
+            misalign % EXL3_PACKED_ALIGNMENT,
+            "test bug: the window is not at the intended misalignment"
+        );
+        let name = format!("m{misalign}.trellis");
+        let (got_buffer, got_offset) =
+            align_packed_view(&device, &window, offset, PAYLOAD as u64, &name).unwrap();
+
+        assert_eq!(
+            got_offset % EXL3_PACKED_ALIGNMENT,
+            0,
+            "{name}: returned offset {got_offset}, which no EXL3 kernel can read. \
+             `linear_gemv_ishizuki_k*` casts the bound pointer to `device uint *` \
+             and `linear_gemv_exl3_k*_u*` is declared `device ushort *`, so Metal \
+             requires the bind offset to be a multiple of 4 / 2 respectively. \
+             Gxma-4-bit reaches the kernel at 1813 and Gxma-repacked at 2880."
+        );
+        assert_eq!(read(&got_buffer, got_offset, PAYLOAD), want, "{name}: bytes moved");
+        assert!(
+            got_offset as usize + PAYLOAD <= got_buffer.length() as usize,
+            "{name}: view runs past the buffer it was returned with"
+        );
+    }
+
+    /// The defect as it presented: a safetensors payload at an odd absolute
+    /// offset. `Gxma-4-bit` shard 3 has `8 + header_len == 58585`, so
+    /// `lm_head.trellis` binds at 1813 and `embed_tokens` (shard 1, 99067) at
+    /// 763.
+    #[test]
+    fn odd_offsets_are_realigned_and_keep_their_bytes() {
+        for misalign in [1u64, 3, 763, 1813] {
+            check(misalign);
+        }
+    }
+
+    /// 2-mod-4 is enough for the 16-bit fallback but not for the aligned fast
+    /// path, so it must be realigned too: passing it through would silently run
+    /// `linear_gemv_exl3_kN_u` where `linear_gemv_ishizuki_kN` belongs, which is
+    /// a numerically different kernel, not just a slower one.
+    #[test]
+    fn two_mod_four_offsets_are_realigned() {
+        for misalign in [2u64, 6, 258, 1814] {
+            check(misalign);
+        }
+    }
+
+    /// The common case must stay free: an already-aligned view is handed back
+    /// untouched, so `Gxma-repacked` and every arena-resident tensor cost nothing
+    /// and behave exactly as before.
+    #[test]
+    fn aligned_offsets_pass_through_untouched() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("no Metal device; skipping");
+            return;
+        };
+        let bytes = pattern(PAGE + PAYLOAD + PAGE);
+        let window = upload(&device, &bytes);
+        for offset in [0u64, 4, 2112, 2880, 4092] {
+            let (buffer, got) =
+                align_packed_view(&device, &window, offset, PAYLOAD as u64, "aligned").unwrap();
+            assert_eq!(got, offset, "offset {offset} moved");
+            assert_eq!(
+                buffer.length(),
+                window.length(),
+                "offset {offset}: an aligned view was copied instead of passed through \
+                 (returned {} bytes, window is {})",
+                buffer.length(),
+                window.length()
+            );
+            assert_eq!(
+                read(&buffer, got, PAYLOAD),
+                bytes[offset as usize..offset as usize + PAYLOAD]
+            );
+        }
+    }
+
+    /// A zero-length tensor cannot be misaligned in any way that reads memory.
+    #[test]
+    fn empty_tensors_are_returned_as_they_are() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("no Metal device; skipping");
+            return;
+        };
+        let window = upload(&device, &pattern(PAGE));
+        let (buffer, offset) = align_packed_view(&device, &window, 3, 0, "empty").unwrap();
+        assert_eq!(offset, 3);
+        assert_eq!(buffer.length(), window.length());
+    }
+
+    /// A view that does not cover the tensor must be an error, not a read past
+    /// the end of the mapping.
+    #[test]
+    fn out_of_range_views_are_refused() {
+        let Some(device) = Device::system_default() else {
+            eprintln!("no Metal device; skipping");
+            return;
+        };
+        let window = upload(&device, &pattern(PAGE));
+        for (offset, len) in [(PAGE as u64 - 4, PAGE as u64), (8, PAGE as u64)] {
+            let error = align_packed_view(&device, &window, offset, len, "overrun.trellis")
+                .expect_err("a view that does not cover the tensor must be refused");
+            assert!(
+                error.to_string().contains("overrun.trellis"),
+                "error does not name the tensor: {error}"
+            );
+        }
+    }
 }

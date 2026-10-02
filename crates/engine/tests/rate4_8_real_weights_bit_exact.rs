@@ -37,7 +37,7 @@ use half::f16;
 use kaplumba_engine::exl3::{decode_tile, hadamard_128, BitRate, Codebook};
 use kaplumba_kernels::encoder::MetalEncoder;
 use kaplumba_kernels::exl3::{Exl3Codebook, Exl3Rate};
-use kaplumba_kernels::linear::{LinearEncodeRequest, LinearKernels};
+use kaplumba_kernels::linear::{LinearEncodeRequest, LinearKernels, PrefillEncodeRequest};
 use metal::{Buffer, Device, MTLResourceOptions};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
@@ -416,4 +416,207 @@ fn four_bpw_layers_and_the_eight_bpw_head_decode_real_weights_exactly() {
         4,
     );
     check_module(&kernels, &device, &queue, &model, "lm_head", 5376, 262144, 8);
+}
+
+/// The PREFILL (multi-query) dispatch of the same modules, against the same CPU
+/// reference, row by row.
+///
+/// `check_module` above only exercises `encode_gemv`, which is the single-query
+/// dispatch. The model's prefill takes a completely different path --
+/// `encode_gemm` -> `linear_input_rows` + `linear_gemm_mma` (or
+/// `linear_gemv_tiled`) + `linear_finalize_rows`, with its own dispatch geometry
+/// (`ceil(queries/128)` row tiles, `out_features/64` column tiles) and its own
+/// rate-dependent window arithmetic in `exl3_code_at_tg`. So a rate the decode
+/// path gets right can still be wrong in prefill, and the prefill is what
+/// produces the first sampled token, so a prefill error is visible in the very
+/// first token the user sees.
+///
+/// `linear_metal.rs::mma_prefill_gemm_matches_cpu_reference` does cover
+/// `encode_gemm` at integer rates 1..=8, but on SYNTHETIC 128x128 data with
+/// synthetic signs. This adds the missing half: real 4 bpw trellis bytes at the
+/// real module shapes.
+#[test]
+#[ignore = "requires KAPLUMBA_TEST_MODEL pointing at a 4/8 bpw checkpoint"]
+fn four_bpw_layers_prefill_real_weights_exactly() {
+    // Must be *removed*, not set: the flag disables the MMA path, so setting it
+    // would cover `linear_gemv_tiled` under a test named for the default.
+    // (`linear_metal.rs:901` records the same trap.)
+    unsafe { std::env::remove_var("KAPLUMBA_DISABLE_MMA_PREFILL") };
+    let model = test_model();
+    let Some(device) = Device::system_default() else {
+        eprintln!("no Metal device; skipping");
+        return;
+    };
+    let Ok(kernels) = LinearKernels::new() else {
+        eprintln!("LinearKernels unavailable; skipping");
+        return;
+    };
+    let queue = device.new_command_queue().to_owned();
+
+    // 129 queries = one FULL 128-query row tile plus one row of the second, so
+    // both the multi-tile grid and the row-guarded store of a partial tile run.
+    // 2 queries is the shape the CLI's smallest real prefill produces.
+    for queries in [2usize, 129] {
+        check_prefill_module(
+            &kernels,
+            &device,
+            &queue,
+            &model,
+            "model.language_model.layers.0.self_attn.q_proj",
+            5376,
+            8192,
+            4,
+            queries,
+        );
+        check_prefill_module(
+            &kernels,
+            &device,
+            &queue,
+            &model,
+            "model.language_model.layers.0.mlp.down_proj",
+            21504,
+            5376,
+            4,
+            queries,
+        );
+    }
+    // The head is 8 bpw, and is the module with no two-word kernel.
+    check_prefill_module(&kernels, &device, &queue, &model, "lm_head", 5376, 262144, 8, 2);
+}
+
+/// One real quantized module through `encode_gemm`, every query row compared to
+/// `cpu_reference` on the same row.
+///
+/// The gate is the same normalised mean absolute error `check_module` uses, and
+/// for the same reason: the GEMM reassociates the f32 sum, so a few outputs
+/// differ in the last ULPs, while a wrong bit rate / tile width / lane window
+/// changes the decoded weights and gives O(1).
+fn check_prefill_module(
+    kernels: &LinearKernels,
+    device: &Device,
+    queue: &metal::CommandQueue,
+    model: &PathBuf,
+    module: &str,
+    in_f: usize,
+    out_f: usize,
+    bits: u8,
+    queries: usize,
+) {
+    let trellis = read_packed(model, &format!("{module}.trellis"));
+    let input_signs = read_f16(model, &format!("{module}.suh"));
+    let output_signs = read_f16(model, &format!("{module}.svh"));
+    assert_eq!(
+        trellis.len(),
+        (in_f / 16) * (out_f / 16) * 16 * bits as usize,
+        "{module}.trellis is {} u16; {in_f}x{out_f} at {bits} bpw needs {}",
+        trellis.len(),
+        (in_f / 16) * (out_f / 16) * 16 * bits as usize
+    );
+
+    // A distinct row per query, so a row-indexing bug cannot pass by every row
+    // sharing one correct answer.
+    let rows: Vec<Vec<f16>> = (0..queries)
+        .map(|q| {
+            (0..in_f)
+                .map(|i| f16::from_f32(((i as f32 + q as f32 * 0.5) * 0.013).sin()))
+                .collect()
+        })
+        .collect();
+    let input: Vec<f16> = rows.iter().flatten().copied().collect();
+
+    let packed = upload(device, &trellis);
+    let sig = Sig {
+        input: upload_f16(device, &input),
+        input_signs: upload_f16(device, &input_signs),
+        output_signs: upload_f16(device, &output_signs),
+        transformed: device.new_buffer(
+            (queries * in_f * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        ),
+        raw: device.new_buffer(
+            (queries * out_f * 4) as u64,
+            MTLResourceOptions::StorageModeShared,
+        ),
+        output: device.new_buffer(
+            (queries * out_f * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        ),
+    };
+    // `linear_gemm_mma` STORES every output block rather than accumulating into
+    // it, so `raw` needs no pre-zeroing on the default path. Zero it anyway so
+    // the assertion below cannot be satisfied by a stale value.
+    zero_f32(&sig.raw, queries * out_f);
+
+    let mut encoder = MetalEncoder::new(queue).expect("encoder");
+    kernels
+        .encode_gemm(
+            &mut encoder,
+            PrefillEncodeRequest {
+                packed: &packed,
+                packed_offset: 0,
+                perm_mode: 0,
+                input: &sig.input,
+                input_signs: &sig.input_signs,
+                output_signs: &sig.output_signs,
+                transformed: &sig.transformed,
+                raw: &sig.raw,
+                output: &sig.output,
+                queries,
+                in_features: in_f,
+                out_features: out_f,
+                rate: Exl3Rate::Integer(bits),
+                codebook: Exl3Codebook::Mcg,
+            },
+        )
+        .unwrap_or_else(|e| panic!("{module} prefill {queries}q {in_f}x{out_f}@{bits}: {e}"));
+    encoder.commit_and_wait().expect("wait");
+
+    let p = sig.output.as_ref().contents() as *const u16;
+    let all: Vec<u16> = (0..queries * out_f)
+        .map(|i| unsafe { p.add(i).read() })
+        .collect();
+
+    for q in 0..queries {
+        let expected = cpu_reference(
+            &trellis,
+            in_f,
+            out_f,
+            bits,
+            &rows[q],
+            &input_signs,
+            &output_signs,
+        );
+        let got = &all[q * out_f..(q + 1) * out_f];
+        assert!(
+            got.iter().any(|&v| v != 0),
+            "{module} prefill row {q}: the GPU kernel produced all zeros"
+        );
+        let mut sum_squares = 0f64;
+        let mut sum_abs_diff = 0f64;
+        for (a, b) in expected.iter().zip(got) {
+            let b = f16::from_bits(*b);
+            sum_squares += f64::from(a.to_f32() * a.to_f32());
+            sum_abs_diff += f64::from((a.to_f32() - b.to_f32()).abs());
+        }
+        let rms = (sum_squares / out_f as f64).sqrt();
+        let normalised = sum_abs_diff / out_f as f64 / rms;
+        assert!(
+            normalised <= 5e-3,
+            "{module} prefill row {q}/{queries} {in_f}x{out_f}@{bits} bpw: \
+             mean |error| / RMS(output) = {normalised:.3e} exceeds 5e-3"
+        );
+        if q == 0 {
+            println!(
+                "  {module:<44} prefill {queries:>3}q {in_f:>5}x{out_f:<6} @{bits} bpw  \
+                 row0 err/RMS {normalised:.1e}"
+            );
+        }
+    }
+}
+
+fn zero_f32(buffer: &Buffer, count: usize) {
+    let p = buffer.contents() as *mut f32;
+    for i in 0..count {
+        unsafe { p.add(i).write(0.0) };
+    }
 }

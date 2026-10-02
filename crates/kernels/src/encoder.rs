@@ -647,8 +647,19 @@ impl<'q> MetalEncoder<'q> {
         // Buffers rolled out mid-forward are committed but unfinished. On one
         // in-order queue the wait above already covers them, but drain them
         // anyway so the barrier does not depend on that.
+        //
+        // Their status is checked too, not just waited on. A fault in a ROLLED
+        // buffer used to be discarded here: only `self.command_buffer` was
+        // inspected, so a prefill that rolled (which it does as soon as it
+        // exceeds `max_dispatches`) reported success while the GPU had already
+        // errored on an earlier buffer. That converts a crash into silently
+        // wrong output -- the worst outcome available, and the reason a rolling
+        // A/B appeared to "fix" a fault that was never fixed.
         for buffer in std::mem::take(&mut self.in_flight) {
             buffer.wait_until_completed();
+            if buffer.status() != MTLCommandBufferStatus::Completed {
+                return Err(command_failed(&buffer));
+            }
         }
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
             return Err(command_failed(&self.command_buffer));

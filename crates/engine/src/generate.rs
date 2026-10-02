@@ -817,6 +817,58 @@ impl MarginLog {
     }
 }
 
+/// Dispatches per command buffer for a **prefill**.
+///
+/// A 60-layer forward encodes ~2149 dispatches for this model, so the previous
+/// hardcoded 2500 never rolled and the whole prefill went into ONE command
+/// buffer. That is what the 4 bpw checkpoint cannot survive: measured on an
+/// M4 Pro, that prefill succeeds with 2144 dispatches in a buffer and faults
+/// with 2145, giving `MTLCommandBufferStatus::Error` and
+/// `Metal command buffer failed`. The boundary is exact, and it is a property of
+/// the *buffer*, not of the work: the same 2144/2145 split reproduces at 14 and
+/// at 86 prompt tokens, and it does not move with residency (it is identical
+/// with every weight file-mapped and with all 18 GB anonymous). See
+/// `spec/shim-exl3-4bpw/implementation_notes.md`.
+///
+/// The 3 bpw checkpoint passes with all 2149 in one buffer, so this is not a
+/// universal limit -- which is why a "works on the other checkpoint" A/B could
+/// not have found it. I could not determine the driver-side trigger: an equal
+/// dispatch count at the same shapes passes for 3 bpw and fails for 4 bpw, the
+/// threshold does not depend on prompt length, grid size, elapsed time or
+/// footprint, and no Metal API validation error is reported (with
+/// `MTL_DEBUG_LAYER=1`). So this is a measured bound, not a diagnosed one, and
+/// 1024 is chosen for 2x headroom under the observed 2145 rather than to sit
+/// just below it.
+///
+/// Cost of the bound: a 14-token prefill becomes 3 command buffers instead of 1,
+/// committed back to back with a single wait at the end, so the host keeps
+/// encoding while the GPU runs. Measured on the 4 bpw checkpoint, greedy text at
+/// `--temperature 0` is byte-identical with 2500 and with 1024.
+///
+/// `KAPLUMBA_PREFILL_MAX_DISPATCHES` overrides it for A/B only.
+pub const PREFILL_MAX_DISPATCHES_PER_BUFFER: u32 = 1024;
+
+fn prefill_max_dispatches_per_buffer() -> u32 {
+    std::env::var("KAPLUMBA_PREFILL_MAX_DISPATCHES")
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(PREFILL_MAX_DISPATCHES_PER_BUFFER)
+}
+
+/// # What the metrics mean
+///
+/// `ttft` is stamped when the first token is sampled, which is right after the
+/// prefill's wait: no decode step is included, so it does not move with
+/// `max_new_tokens`. The previous version stamped it after the first *batch's*
+/// wait, so it carried up to 7 decode steps of extra GPU time (~1.9 s measured at
+/// 614 tokens of context) and grew with `max_new_tokens`. `decode_duration` is
+/// the sum of the per-step waits and `decode_tokens_per_second` divides the
+/// generated-minus-one steps by it; the previous version divided steps it never
+/// ran by the wall time of a whole batch, which is where `decode_tok_s=0.24` at
+/// `--max-new-tokens 2` came from.
+///
+
 /// Greedy decode over the fully GPU-resident forward path.
 ///
 /// One step per barrier: the argmax is taken on the host off the single softcapped
@@ -856,18 +908,7 @@ impl MarginLog {
 /// on all reference prompts, suite green" — no test reaches it, because
 /// `SamplerConfig::default()` has `temperature: 1.0` and only the `--temperature 0`
 /// CLI flag enters it.
-///
-/// # What the metrics mean
-///
-/// `ttft` is stamped when the first token is sampled, which is right after the
-/// prefill's wait: no decode step is included, so it does not move with
-/// `max_new_tokens`. The previous version stamped it after the first *batch's*
-/// wait, so it carried up to 7 decode steps of extra GPU time (~1.9 s measured at
-/// 614 tokens of context) and grew with `max_new_tokens`. `decode_duration` is
-/// the sum of the per-step waits and `decode_tokens_per_second` divides the
-/// generated-minus-one steps by it; the previous version divided steps it never
-/// ran by the wall time of a whole batch, which is where `decode_tok_s=0.24` at
-/// `--max-new-tokens 2` came from.
+
 fn generate_gpu_greedy<F>(
     model: &mut TextModel,
     tokenizer: &crate::tokenizer::GemmaTokenizer,
@@ -905,7 +946,7 @@ where
         let prefill_started = Instant::now();
         let positions: Vec<u32> = (0..prompt_len as u32).collect();
         let mut prefill = MetalEncoder::new(&queue).map_err(ModelError::from)?;
-        prefill.set_max_dispatches(2500);
+        prefill.set_max_dispatches(prefill_max_dispatches_per_buffer());
         model
             .forward_buffer_into(prompt_ids, &positions, &mut prefill)
             .map_err(ModelError::from)?;
