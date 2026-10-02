@@ -32,11 +32,12 @@ pub const DEFAULT_TOP_K: usize = 64;
 pub const DEFAULT_TOP_P: f32 = 0.95;
 /// Generation budget when `--max-new-tokens` is not given.
 ///
-/// 4096 is half of the 8192 context limit. It has to be: `fits_in_context`
+/// 4096 fits well inside the 32768 context limit. It has to be: `fits_in_context`
 /// reserves the *whole* budget up front, so a default equal to the limit would
 /// make every prompt fail on the first turn (`used + need + max_new_tokens >
 /// limit` is then true for any non-empty prompt). Half leaves room for the
-/// prompt and the chat template's turn markers.
+/// prompt and the chat template's turn markers. 4096 is 1/8 of 32768, so
+/// long generations still leave room for several turns of history.
 pub const DEFAULT_MAX_NEW_TOKENS: usize = 4096;
 
 #[derive(Debug, Clone)]
@@ -367,7 +368,7 @@ mod tests {
 
     /// The default generation budget must leave room in the context for a
     /// prompt. `fits_in_context` reserves the whole budget up front, so a
-    /// default at or above the 8192 context limit would reject every prompt --
+    /// default at or above the 32768 context limit would reject every prompt --
     /// a failure at the first turn rather than at the limit.
     #[test]
     fn the_default_budget_leaves_room_for_a_prompt_in_the_context() {
