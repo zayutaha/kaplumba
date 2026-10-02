@@ -169,6 +169,29 @@ pub struct GpuStamp {
     pub gap_ms: f64,
 }
 
+/// Report a non-`Completed` command buffer with the label it carries.
+///
+/// `KernelError::CommandFailed` is a bare "Metal command buffer failed": it names
+/// neither which buffer failed nor when, and every non-completed status collapses
+/// into it. A 32k-context prefill that dies after ~273 s produced exactly that one
+/// line, which is enough to know *that* something failed and nothing about *what*.
+///
+/// Naming the phase costs nothing and needs no FFI: `-[MTLCommandBuffer label]`
+/// *is* bound by metal-rs (`CommandBufferRef::label`), and callers can label the
+/// work they encode. `-[MTLCommandBuffer error]` would carry the driver's own
+/// `localizedDescription`, but it is unbound in metal-rs 0.33 and reaching it by
+/// raw `msg_send` turned a clean `exit 1` into a segfault on the failure path —
+/// strictly worse than the bare message, so the labels are the diagnostic.
+fn command_failed(buffer: &CommandBuffer) -> KernelError {
+    let label = buffer.label();
+    if label.is_empty() {
+        eprintln!("Metal command buffer failed (unlabelled)");
+    } else {
+        eprintln!("Metal command buffer '{label}' failed");
+    }
+    KernelError::CommandFailed
+}
+
 /// Dispatches per command buffer. MLX uses 50 on this hardware class
 /// (`mlx/backend/metal/device.cpp`, arch `'s'` -> `max_ops_per_buffer_ = 50`,
 /// alongside a 50 MB cap) and omlx ships 16 for its multi-rank default
@@ -589,7 +612,7 @@ impl<'q> MetalEncoder<'q> {
             buffer.wait_until_completed();
         }
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
-            return Err(KernelError::CommandFailed);
+            return Err(command_failed(&self.command_buffer));
         }
         Ok(())
     }
@@ -639,13 +662,13 @@ impl<'q> MetalEncoder<'q> {
         for (_, buffer) in &self.stamped {
             buffer.wait_until_completed();
             if buffer.status() != MTLCommandBufferStatus::Completed {
-                return Err(KernelError::CommandFailed);
+                return Err(command_failed(buffer));
             }
         }
         for buffer in std::mem::take(&mut self.in_flight) {
             buffer.wait_until_completed();
             if buffer.status() != MTLCommandBufferStatus::Completed {
-                return Err(KernelError::CommandFailed);
+                return Err(command_failed(&buffer));
             }
         }
         Ok(())
@@ -674,7 +697,7 @@ impl<'q> MetalEncoder<'q> {
             buffer.wait_until_completed();
         }
         if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
-            return Err(KernelError::CommandFailed);
+            return Err(command_failed(&self.command_buffer));
         }
         Ok(())
     }
