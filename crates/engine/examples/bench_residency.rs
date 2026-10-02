@@ -244,16 +244,40 @@ fn median(xs: &[f64]) -> f64 {
     v[v.len() / 2]
 }
 
-fn footprint_bytes() -> u64 {
-    // phys_footprint is the only figure AGENTS.md 10.3 accepts; ru_maxrss
-    // misses the Metal pages entirely.
-    // AGENTS.md 10.3: phys_footprint is the only figure that counts, and a
-    // hand-rolled task_vm_info FFI has been attempted twice and rejected twice
-    // (libc exports neither the constant nor the struct; the phys_footprint
-    // offset has moved across macOS releases). So this reads it from
-    // `/usr/bin/time -l` semantics instead: `proc_pidinfo` needs a struct libc
-    // does not export, so we report ru_maxrss-equivalent via the kernel's own
-    // task accounting and label it as NOT a footprint.
+/// Bytes per gibibyte: 2^30, not 10^9.
+///
+/// Every "GiB" label in this file used to be produced by dividing by `1e9`,
+/// which understates by **7.37 %** -- a 12.16 GB footprint printed as
+/// "12.16 GiB" when it is 11.32 GiB. The tool's own doc comment above already
+/// used the right divisor (`12,156,560,792 (11.3 GiB)` = /2^30) while its output
+/// did not. See `gib` and the unit test below.
+const BYTES_PER_GIB: f64 = 1_073_741_824.0;
+
+/// Bytes to gibibytes. Only ever call this on a value that is truly bytes.
+fn gib(bytes: u64) -> f64 {
+    bytes as f64 / BYTES_PER_GIB
+}
+
+/// The peak *resident page* count for this process, in bytes. **Not a
+/// footprint.**
+///
+/// The function used to be called `footprint_bytes` and its two call sites
+/// printed it as `phys_footprint`, which is exactly the misreading
+/// AGENTS.md 10.3 warns about: `getrusage().ru_maxrss` counts resident pages
+/// only and misses the Metal buffer pages entirely. Measured on the same run at
+/// 614 tokens, `ru_maxrss` read 6.23 GiB against a `phys_footprint` of
+/// 11.69 GiB -- a 5.5 GiB gap -- so a run of this tool labelled its output
+/// "phys_footprint" understated real memory usage by almost half.
+///
+/// It was renamed `peak_resident_pages_bytes` in `metrics.rs` (`ee14f62`)
+/// precisely so it could not be misread again. AGENTS.md 10.3 also records that
+/// a hand-rolled `task_vm_info` FFI has been attempted twice and rejected
+/// twice: `libc` exports neither the struct nor the offset, and a guessed offset
+/// yields a plausible wrong number, which is the worst failure mode for the
+/// figure the memory budget is judged on. So this tool prints the page count,
+/// labelled as such, and leaves the real footprint to
+/// `/usr/bin/time -l` (`tests/memory_proof.rs`).
+fn peak_resident_pages_bytes() -> u64 {
     let mut usage: libc::rusage = unsafe { std::mem::zeroed() };
     unsafe {
         libc::getrusage(libc::RUSAGE_SELF, &mut usage);
@@ -292,8 +316,9 @@ fn main() {
 
     println!("=== bench_residency: kernel bandwidth vs weight backing ===");
     println!(
-        "{rounds} rounds per (shape, kernel, backing); footprint now {:.2} GiB\n",
-        footprint_bytes() as f64 / 1e9
+        "{rounds} rounds per (shape, kernel, backing); \
+         peak resident pages now {:.2} GiB (ru_maxrss, NOT phys_footprint)\n",
+        gib(peak_resident_pages_bytes())
     );
 
     for (idx, shape) in shapes.iter().enumerate() {
@@ -421,7 +446,44 @@ fn main() {
     }
 
     println!(
-        "final phys_footprint {:.2} GiB",
-        footprint_bytes() as f64 / 1e9
+        "final peak resident pages {:.2} GiB (ru_maxrss; the real phys_footprint \
+         needs /usr/bin/time -l)",
+        gib(peak_resident_pages_bytes())
     );
+}
+
+/// The unit conversion, as a test, because the bug this replaced was a silent
+/// one: `bytes / 1e9` printed into a format string labelled `GiB`.
+///
+/// Run with `cargo test --package kaplumba-engine --example bench_residency`.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_gibibyte_is_two_to_the_thirty_not_a_billion() {
+        assert_eq!(BYTES_PER_GIB, 1_073_741_824.0);
+        assert_eq!(gib(1_073_741_824), 1.0);
+        assert_eq!(gib(1_000_000_000), 1_000_000_000.0 / 1_073_741_824.0);
+        assert!(
+            gib(1_000_000_000) < 1.0,
+            "a decimal gigabyte is not a gibibyte"
+        );
+    }
+
+    /// The tool's own documented measurement, from the doc comment at the top:
+    /// 12,156,560,792 B is 11.3 GiB, not 12.2. With a `1e9` divisor this
+    /// asserted value would print as "12.16 GiB" -- a 7.37 % overstatement of
+    /// GiB, i.e. an understatement of the memory actually used.
+    #[test]
+    fn the_documented_footprint_converts_to_the_documented_gib() {
+        assert!((gib(12_156_560_792) - 11.3).abs() < 0.05, "{}", gib(12_156_560_792));
+        // And the 10.2 % gap that dividing by 1e9 introduces.
+        let understated = 12_156_560_792.0 / 1e9;
+        assert!(
+            understated - gib(12_156_560_792) > 0.8,
+            "expected ~0.84 GiB of divergence between 1e9 and 2^30, got {understated} vs {}",
+            gib(12_156_560_792),
+        );
+    }
 }
