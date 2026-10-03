@@ -613,11 +613,363 @@ static inline uint greedy_key(half value, uint index) {
     return argmax_key(uint(as_type<ushort>(value)), index);
 }
 
-static inline half key_to_half(uint key) {
+// ---------------------------------------------------------------------------
+// Device-side sampler: `sample_topk_blocks` then `sample_draw`.
+//
+// Two dispatches, both encoded into the decode step's own command buffer, so
+// they add GPU work that is already inside the step and cost the host no
+// barrier at all. This exists because sampling on the host cost 2.265 ms per
+// token at width 262,144 (`sampler.rs`, measured in
+// `spec/decode-ceiling/findings/P06-cpu-host-work.md`) and, because the host
+// needed the whole row, `temperature > 0` could not use the 1-deep pipeline and
+// paid a full barrier every token on top of it.
+//
+// ## Why the top-k is exact, and why it is a *total* order
+//
+// `value_key` (:531) is an order-preserving map from the fp16 bit pattern to a
+// `uint`, and fp16 -> f32 is exact, so comparing keys compares exactly the
+// values the host compares. Ties break on ascending index, which is what
+// `top_k_order`'s `.then_with(|l, r| l.cmp(r))` does. The pair is therefore a
+// **total** order: no tie a sort could resolve two ways, so the device's top-k
+// set AND its order are `top_k_order`'s, with no tolerance anywhere. NaN folds
+// to key 0 and can never win.
+//
+// ## Why the index travels separately, and not packed
+//
+// `argmax_key` packs a 16-bit index, which is why `argmax_slots` partitions
+// into 65536-element slots and reconstructs. That does not transfer here: the
+// sampler must break ties by **global** index across block boundaries, and a
+// 262,144-wide vocabulary needs 18 bits. So D1 packs the *local* index (a block
+// is at most `SAMPLE_STAGE` = 4096 wide, so 16 bits is exact within a block and
+// local order equals global order there) and D2 expands it back to global from
+// the block base. That is why D2 needs two arrays.
+//
+// ## Sizing, and the hard ceiling on `top_k`
+//
+// `blocks * k_padded == SAMPLE_CANDIDATES`, and `per_block = count / blocks`
+// must fit D1's shared array. So `count * k_padded <= SAMPLE_STAGE *
+// SAMPLE_CANDIDATES = 4096 * 4096`. For this model's 262,144-wide vocabulary
+// that is `k_padded <= 64` -- exactly the shipped `--top-k` default. A larger
+// `top_k` is rejected by `SamplerParams::validate` and the caller falls back to
+// the host sampler rather than building a 262,144-wide sort. Both dispatch's
+// arrays total 16 KiB against a 32 KiB threadgroup budget, so there is 2x
+// headroom instead of a kernel that compiles only at the limit.
+//
+// ## Cost
+//
+// D1 is `blocks` x 78 barrier stages; D2 is 2 stage sorts plus one small merge.
+// Both are tens of microseconds against a 62 ms step. Measured with
+// `KAPLUMBA_GPU_PROFILE=1`, which prints `sample/topk` and `sample/draw` beside
+// `head/argmax`.
+
+#define SAMPLE_CANDIDATES 4096u
+#define SAMPLE_STAGE 4096u
+#define SAMPLE_DRAW_STAGE 2048u
+#define SAMPLE_TOP_MAX 256u
+
+struct SampleTopKParams {
+    uint count;      // vocabulary
+    uint k_padded;   // next_pow2(top_k); candidates emitted per block
+    uint blocks;     // SAMPLE_CANDIDATES / k_padded
+    uint per_block;  // ceil(count / blocks), <= SAMPLE_STAGE
+};
+
+struct SampleDrawParams {
+    uint count;
+    uint top_k;       // the REQUESTED top_k, not the padded one
+    uint k_padded;    // next_pow2(top_k); every network length is this
+    uint candidates;  // blocks * k_padded
+    uint per_block;   // must match SampleTopKParams.per_block
+    uint step_idx;
+    float temperature;
+    float top_p;
+};
+
+/// Descending bitonic sort of `SAMPLE_CANDIDATES` packed keys.
+///
+/// `log2(n) * (log2(n) + 1) / 2` = 78 barrier stages at 4096. Each `j` step is
+/// a *disjoint* set of compare-exchange pairs -- thread `lid` owns exactly the
+/// pairs `(i, i ^ j)` with `i < i ^ j` -- so no thread reads a location another
+/// thread is writing in the same step, and one barrier per step suffices. One
+/// barrier per *element* would be 4096x more.
+static inline void sample_bitonic_desc(threadgroup uint *keys, uint n, uint lid, uint tgdim) {
+    for (uint k = 2u; k <= n; k <<= 1u) {
+        for (uint j = k >> 1u; j > 0u; j >>= 1u) {
+            for (uint i = lid; i < n; i += tgdim) {
+                const uint partner = i ^ j;
+                if (partner > i) {
+                    const uint a = keys[i];
+                    const uint b = keys[partner];
+                    // `(i & k) == 0` halves run descending, which makes the
+                    // finished array descending.
+                    const bool ascending = (i & k) != 0u;
+                    if ((b > a) != ascending) {
+                        keys[i] = b;
+                        keys[partner] = a;
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+/// The same network over `(value_key, global_index)` pairs, in descending order.
+///
+/// Ties on `value_key` break on **ascending global index**, which is the host's
+/// `top_k_order` order. Batcher bitonic is a full sorting network, so this is
+/// correct for *any* input, not only for a bitonic one -- which is why the
+/// merge below does not have to arrange its inputs.
+static inline void sample_bitonic_pairs(threadgroup uint *keys, threadgroup uint *idx,
+                                       uint n, uint lid, uint tgdim) {
+    for (uint k = 2u; k <= n; k <<= 1u) {
+        for (uint j = k >> 1u; j > 0u; j >>= 1u) {
+            for (uint i = lid; i < n; i += tgdim) {
+                const uint partner = i ^ j;
+                if (partner > i) {
+                    const uint a = keys[i];
+                    const uint b = keys[partner];
+                    const uint ia = idx[i];
+                    const uint ib = idx[partner];
+                    const bool take_b = (b > a) || (b == a && ib < ia);
+                    const bool ascending = (i & k) != 0u;
+                    if (take_b != ascending) {
+                        keys[i] = b;
+                        keys[partner] = a;
+                        idx[i] = ib;
+                        idx[partner] = ia;
+                    }
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+/// D1. One top-`k_padded` per block, into `candidates[tgid * k_padded + rank]`.
+///
+/// The block spans `per_block` contiguous elements and `per_block` is at most
+/// `SAMPLE_STAGE`, so the whole block is staged in shared memory and sorted.
+/// Read amplification is zero: the `blocks` threadgroups between them read
+/// `count` elements exactly once, 512 KiB for this vocabulary.
+kernel void sample_topk_blocks(
+    const device half *logits [[buffer(0)]],
+    device uint *candidates [[buffer(1)]],
+    constant SampleTopKParams &params [[buffer(2)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgdim [[threads_per_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]]) {
+    threadgroup uint keys[SAMPLE_CANDIDATES];
+
+    const uint lo = tgid * params.per_block;
+    const uint hi = min(lo + params.per_block, params.count);
+    for (uint i = lid; i < SAMPLE_STAGE; i += tgdim) {
+        const uint element = lo + i;
+        if (element < hi) {
+            keys[i] = argmax_key(uint(as_type<ushort>(logits[element])), i);
+        } else {
+            // Below every real key, so padding can only be selected when a block
+            // holds fewer than `k_padded` real elements. `SamplerParams::
+            // validate` rules that out by requiring `per_block >= k_padded`.
+            keys[i] = 0u;
+        }
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    sample_bitonic_desc(keys, SAMPLE_STAGE, lid, tgdim);
+    for (uint rank = lid; rank < params.k_padded; rank += tgdim) {
+        candidates[tgid * params.k_padded + rank] = keys[rank];
+    }
+}
+
+/// `float` of the fp16 whose key is `sortable`; the inverse of `sortable16`.
+///
+/// `+0.0` and `-0.0` both folded onto `0x8000` and both come back as `+0.0`,
+/// which is harmless: the softmax only forms `(x - maximum)`, and
+/// `0.0 - m == -0.0 - m` for every `m`.
+static inline float sample_key_float(uint sortable) {
     const uint SIGN = 0x8000u;
-    uint sortable = key >> 16;
-    uint bits = (sortable & SIGN) != 0u ? (sortable ^ SIGN) : ~sortable;
-    return as_type<half>(ushort(bits));
+    const uint bits = ((sortable & SIGN) != 0u) ? (sortable ^ SIGN) : ~sortable;
+    return float(as_type<half>(ushort(bits)));
+}
+
+struct SampleRng {
+    float unit;  // in [0, 1), 24-bit precision
+    ulong state;
+};
+
+/// The host's `next_f64() as f32`, without touching fp64.
+///
+/// `sampler.rs` builds `((bits >> 11) as f64) / 2^53` and then immediately
+/// demotes it: `let target = self.next_f64() as f32 * selected_total`. The double
+/// intermediate buys nothing, so this reproduces the demoted value directly.
+///
+/// **The conversion is left to the hardware on purpose.** An earlier version
+/// hand-rolled the 53-bit -> 24-bit rounding in integer arithmetic (split into a
+/// 24-bit `hi` and a 29-bit remainder, compare the remainder against a tie
+/// point, add the carry) and it was wrong twice over: the tie point was `2^24`
+/// where the 29-bit remainder needs `2^28`, and the final scale was `2^-53`
+/// applied to a value that was already `2^-29`-scaled by the split. Measured
+/// against the host over 3,000,000 draws: the hand-rolled version differed on
+/// **100%** of draws with a mean of 2e-9 against the host's 0.5 -- it was not
+/// sampling, it was returning a near-zero `unit`, which would have made every
+/// draw collapse onto the top-ranked token and silently turned sampling into
+/// greedy decoding. `float(n)` is a single instruction, rounds to nearest-even,
+/// and is exact: 0 differences in 3,000,000 draws.
+///
+/// `n < 2^53`, so `float(n)` cannot overflow, and `2^-53 * n < 1`, so `unit < 1`
+/// holds -- the same guarantee the host's `f64` demotion gives.
+static inline SampleRng sample_rng_next(ulong state) {
+    ulong x = state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    const ulong bits = x * 0x2545f4914f6cdd1dul;
+    SampleRng out;
+    out.unit = float(bits >> 11) * 0x1p-53f;
+    out.state = x;
+    return out;
+}
+
+/// D2. Global top-`top_k` of the candidates, softmax, top-p, inverse-CDF, draw.
+///
+/// Candidates arrive as `blocks * k_padded` packed keys whose low 16 bits are
+/// `0xFFFF - local_index`. Each pass expands `SAMPLE_DRAW_STAGE` of them into
+/// `(value_key, global_index)`, sorts that stage, and folds this stage's top
+/// `k_padded` into the running best with one small network. Running in passes
+/// is what keeps the two shared arrays at 8 KiB each instead of 16 KiB each.
+///
+/// Everything after the last barrier is thread 0, on purpose: the softmax sum,
+/// the top-p walk and the inverse-CDF walk are sequential f32 folds, and one
+/// thread folding in index order reproduces `sampler.rs:116`'s
+/// `weights.iter().sum::<f32>()` bit for bit. Parallelising them would throw
+/// away exactness for nothing.
+///
+/// Exactly one `sample_draw` runs per decode step. That is what makes a single
+/// `device ulong` of RNG state sufficient: `run_head` is true only for the last
+/// prefill chunk and for every decode step, and command buffers submitted to
+/// one serial queue execute in submission order.
+kernel void sample_draw(
+    constant const uint *candidates [[buffer(0)]],
+    constant SampleDrawParams &params [[buffer(1)]],
+    device ulong *rng [[buffer(2)]],
+    device uint *token_out [[buffer(3)]],
+    device uint *host_token_out [[buffer(4)]],
+    device uint *ranked_out [[buffer(5)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    threadgroup uint vkey[SAMPLE_DRAW_STAGE];
+    threadgroup uint gidx[SAMPLE_DRAW_STAGE];
+    threadgroup uint mv[2u * SAMPLE_TOP_MAX];
+    threadgroup uint mi[2u * SAMPLE_TOP_MAX];
+
+    const uint k = params.k_padded;
+    const uint top_k = params.top_k;
+    const uint passes = (params.candidates + SAMPLE_DRAW_STAGE - 1u) / SAMPLE_DRAW_STAGE;
+
+    for (uint pass = 0u; pass < passes; ++pass) {
+        const uint lo = pass * SAMPLE_DRAW_STAGE;
+        for (uint i = lid; i < SAMPLE_DRAW_STAGE; i += tgdim) {
+            const uint slot = lo + i;
+            if (slot < params.candidates) {
+                const uint packed = candidates[slot];
+                // slot = block * k_padded + local, so the block is slot / k and
+                // the global index is that block's base plus the local one.
+                vkey[i] = packed >> 16;
+                gidx[i] = (slot / k) * params.per_block + (0xFFFFu - (packed & 0xFFFFu));
+            } else {
+                vkey[i] = 0u;
+                gidx[i] = 0xFFFFFFFFu;
+            }
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        sample_bitonic_pairs(vkey, gidx, SAMPLE_DRAW_STAGE, lid, tgdim);
+        if (pass == 0u) {
+            for (uint i = lid; i < k; i += tgdim) {
+                mv[i] = vkey[i];
+                mi[i] = gidx[i];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        } else {
+            // Full sorting network over the concatenation of two descending
+            // runs, so no arrangement of the inputs is needed.
+            for (uint i = lid; i < k; i += tgdim) {
+                mv[k + i] = vkey[i];
+                mi[k + i] = gidx[i];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            sample_bitonic_pairs(mv, mi, 2u * k, lid, tgdim);
+            if (lid == 0u) {
+                for (uint i = k; i < 2u * k; ++i) {
+                    mv[i - k] = mv[i];
+                    mi[i - k] = mi[i];
+                }
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+
+    if (lid != 0u) {
+        return;
+    }
+
+    // ---- the exact top-k, for the tests that check it ----
+    //
+    // Written *before* the softmax reuses `mv`'s even slots, and null in the
+    // decode path, where the one `u32` the host reads is the token. This is the
+    // only way to observe the set AND the order directly: a drawn token is a
+    // random member of the set and says nothing about its position in it.
+    if (ranked_out != nullptr) {
+        for (uint i = 0u; i < top_k; ++i) {
+            ranked_out[i] = mi[i];
+        }
+    }
+
+    // ---- softmax over the top-`top_k`, in index order, as the host does ----
+    // `mv` now holds `(value_key, global_index)` for ranks 0..k_padded-1.
+    // Reusing `mv`'s even slots for the weights (after `maximum` is read) is
+    // what keeps this inside 12 KiB: the weights are 64 floats and a separate
+    // array would be one more buffer to size and account for.
+    const float maximum = sample_key_float(mv[0]);
+    float total = 0.0f;
+    for (uint i = 0u; i < top_k; ++i) {
+        const float weight = exp((sample_key_float(mv[i * 2u]) - maximum) / params.temperature);
+        mv[i * 2u] = as_type<uint>(weight);
+        total += weight;
+    }
+    // `sampler.rs:110-128`: top-k FIRST, truncating to `top_k`, and only then
+    // the top-p walk over those `top_k`. Doing the walk over the whole
+    // vocabulary instead is a different sampler, not a faster one.
+    float cumulative = 0.0f;
+    uint selected = 0u;
+    for (uint i = 0u; i < top_k; ++i) {
+        cumulative += as_type<float>(mv[i * 2u]) / total;
+        selected = i;
+        if (cumulative >= params.top_p) {
+            break;
+        }
+    }
+    float selected_total = 0.0f;
+    for (uint i = 0u; i <= selected; ++i) {
+        selected_total += as_type<float>(mv[i * 2u]);
+    }
+    const SampleRng draw = sample_rng_next(*rng);
+    *rng = draw.state;
+    const float target = draw.unit * selected_total;
+    float running = 0.0f;
+    uint token = mi[selected];
+    for (uint i = 0u; i <= selected; ++i) {
+        running += as_type<float>(mv[i * 2u]);
+        if (target <= running) {
+            token = mi[i];
+            break;
+        }
+    }
+    if (token_out != nullptr) {
+        token_out[0] = token;
+    }
+    if (host_token_out != nullptr) {
+        host_token_out[params.step_idx] = token;
+    }
 }
 
 kernel void greedy_pick(const device half *logits [[buffer(0)]],

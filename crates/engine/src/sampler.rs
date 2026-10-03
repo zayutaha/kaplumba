@@ -272,19 +272,82 @@ pub fn top_k_order(logits: &[f32], top_k: usize) -> Vec<usize> {
     order
 }
 
-/// Largest `top_k` the device sampler accepts.
+/// Coarse cap on the `top_k` the device path will even consider.
 ///
-/// The device path reduces the vocabulary to a bounded candidate array (a
-/// per-block top-`k`, then a global top-`k` over those), so `top_k` bounds the
-/// shared-memory staging array, not the vocabulary. A `top_k` above this is a
-/// **fall back to the host sampler with the non-pipelined loop**, not a wider
-/// device sort - building a 262,144-wide sort for a config nobody ships is how
-/// the fast path stops being reviewable.
+/// This is **not** the device bound; it is a sanity ceiling so a nonsensical
+/// `--top-k` is rejected without consulting the geometry. The real, per-vocabulary
+/// bound is [`device_top_k_limit`], which asks the kernel. Kept separate so that
+/// raising this cannot silently raise what the staging arrays accept.
 ///
 /// `spec/device-sampler` R7. The device path is only distribution-identical to
 /// `Sampler::sample` when it applies top-k before top-p, over the same
 /// `top_k` candidates (`sampler.rs:110-128`).
 pub const MAX_DEVICE_TOP_K: usize = 1024;
+
+/// Largest `top_k` the device sampler can actually serve for a `vocab`-wide row.
+///
+/// # Why this is computed and not a constant
+///
+/// The device path reduces the vocabulary to a bounded candidate array (a
+/// per-block top-`k`, then a global top-`k` over those), so `top_k` is bounded by
+/// **shared memory**, not by the vocabulary:
+///
+/// ```text
+/// count * k_padded <= SAMPLE_STAGE * SAMPLE_CANDIDATES
+/// ```
+///
+/// which is `k_padded <= 64` at this model's 262,144-wide vocabulary and
+/// `k_padded <= 8` at 524,288. That number is a property of four `#define`s and
+/// two buffer allocations in `elements.metal` and `elements.rs`.
+///
+/// The previous code duplicated the intent as `MAX_DEVICE_TOP_K = 1024` and
+/// validated against that. It therefore accepted `--top-k 128`, and the failure
+/// surfaced ~150 dispatches into a decode step as a `KernelError` from
+/// `ElementKernels::sample_geometry` — a crash on the fast path for a config that
+/// is perfectly legal on the host path, and the opposite of the documented
+/// "fall back to the host sampler" behaviour. One number, two owners, and the
+/// kernel's owner was not consulted.
+///
+/// So the kernel is asked, and the answer is cached per vocabulary size. The
+/// probe is ten `sample_geometry` calls (one per power of two up to
+/// `MAX_DEVICE_TOP_K`), so it runs once per model load, not per token.
+/// `device_sampler_supported` is the reason that is not per-token work.
+///
+/// # Why powers of two
+///
+/// `k_padded` is `next_pow2(top_k)`, so the set of servable `top_k` is exactly
+/// `{1, 2, ..., K}` for the largest servable power of two `K`, and the limit *is*
+/// that power of two. Probing powers of two descending therefore finds the limit
+/// directly, and does not depend on the acceptance set being monotone in `top_k`
+/// for any other reason than the padding.
+///
+/// A vocabulary too small to stage at all returns 0: the caller falls back to the
+/// host sampler, which is the correct outcome, not an error.
+pub fn device_top_k_limit(vocab: usize) -> usize {
+    use kaplumba_kernels::elements::ElementKernels;
+    // Largest power of two at or below the cap, walked down. `next_pow2` inside
+    // `sample_geometry` can overflow for a huge `top_k`, so the probe never
+    // exceeds `MAX_DEVICE_TOP_K`.
+    let mut limit = 1_usize;
+    while limit <= MAX_DEVICE_TOP_K / 2 {
+        let next = limit << 1;
+        if ElementKernels::sample_geometry(vocab, next).is_ok() {
+            limit = next;
+        } else {
+            // `sample_geometry` accepts a prefix of the powers of two (the
+            // per-block staging overflow is monotone in `k_padded`), so the
+            // first failure is the last success.
+            break;
+        }
+    }
+    if ElementKernels::sample_geometry(vocab, limit).is_ok() {
+        limit
+    } else {
+        // Not even `top_k = 1` fits, e.g. a vocabulary below the staging
+        // minimum. The host sampler is the correct answer, not an error.
+        0
+    }
+}
 
 /// The `SamplerConfig` fields the device sampler needs, in the layout its
 /// parameter buffer wants.
@@ -322,9 +385,10 @@ impl SamplerParams {
 
     /// Reject a configuration the device path cannot honour exactly.
     ///
-    /// `vocab` bounds `top_k` the way the host path does: a `top_k` at or above
-    /// the vocabulary would need the device path to sort the whole row, which
-    /// is exactly the thing it is built not to do.
+    /// The bound is [`device_top_k_limit`], i.e. **the kernel's own geometry**,
+    /// not a constant restated here. `vocab` bounds `top_k` the way the host path
+    /// does too: a `top_k` at or above the vocabulary would need the device path
+    /// to sort the whole row, which is exactly the thing it is built not to do.
     pub fn validate(&self, vocab: usize) -> Result<(), SamplerError> {
         if !self.temperature.is_finite() || self.temperature < 0.0 {
             return Err(SamplerError::InvalidTemperature);
@@ -335,7 +399,7 @@ impl SamplerParams {
         if !self.top_p.is_finite() || self.top_p <= 0.0 || self.top_p > 1.0 {
             return Err(SamplerError::InvalidTopP);
         }
-        let limit = MAX_DEVICE_TOP_K.min(vocab.saturating_sub(1));
+        let limit = device_top_k_limit(vocab).min(vocab.saturating_sub(1));
         if self.top_k as usize > limit {
             return Err(SamplerError::DeviceTopKTooLarge {
                 top_k: self.top_k as usize,
@@ -347,12 +411,32 @@ impl SamplerParams {
 }
 
 impl Sampler {
+    /// The RNG state a given `--seed` starts from.
+    ///
+    /// Named rather than inlined because the device sampler seeds its
+    /// `device ulong` from this and the two must agree exactly: a seed of 0
+    /// means "pick one", and a literal `0` on device would make
+    /// `xorshift64(0) == 0` forever.
+    pub fn seed_state(seed: u64) -> u64 {
+        if seed == 0 {
+            0x9e37_79b9_7f4a_7c15
+        } else {
+            seed
+        }
+    }
+
     pub fn new(config: SamplerConfig, seed: u64) -> Result<Self, SamplerError> {
         validate_config(config)?;
         Ok(Self {
             config,
-            state: if seed == 0 { 0x9e3779b97f4a7c15 } else { seed },
+            state: Self::seed_state(seed),
         })
+    }
+
+    /// The current RNG state, so a device sampler can be handed the same
+    /// position in the sequence the host sampler is at.
+    pub fn state(&self) -> u64 {
+        self.state
     }
 
     pub fn config(&self) -> SamplerConfig {
@@ -551,6 +635,162 @@ mod tests {
 /// plausible text -- it just changes the candidate SET whenever the `top_k`
 /// boundary falls inside the zeros.
 #[cfg(test)]
+/// The device RNG's arithmetic, transcribed from `sample_rng_next` in
+/// `elements.metal`.
+///
+/// This is a **transcription, not a reimplementation**: it exists so the Metal
+/// function can be pinned without a GPU, and it is only a claim about the device
+/// path while it stays character-for-character equivalent to the kernel. If the
+/// kernel changes, this must change with it -- see
+/// `device_rng_matches_the_host_bit_for_bit`.
+///
+/// Metal's `ulong` -> `float` conversion rounds to nearest-even, which is what
+/// makes the one-line form exact. Rust's `u64 as f32` does the same, so the two
+/// agree by the standard rather than by luck.
+fn device_rng_step(state: u64) -> (f32, u64) {
+    let mut x = state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    let bits = x.wrapping_mul(0x2545_f491_4f6c_dd1d);
+    ((bits >> 11) as f32 * 2.0_f32.powi(-53), x)
+}
+
+/// The host's `next_f64() as f32`, the value the device must reproduce.
+///
+/// `Sampler::next_f64` verbatim, demoted the way the sampler demotes it:
+/// `self.next_f64() as f32`.
+fn host_rng_step(state: u64) -> (f32, u64) {
+    let mut x = state;
+    x ^= x >> 12;
+    x ^= x << 25;
+    x ^= x >> 27;
+    let bits = x.wrapping_mul(0x2545_f491_4f6c_dd1d);
+    ((((bits >> 11) as f64) / ((1_u64 << 53) as f64)) as f32, x)
+}
+
+#[cfg(test)]
+mod device_rng_tests {
+    use super::{device_rng_step, host_rng_step};
+
+    /// Seeds chosen to cover the state patterns that matter: the shipped
+    /// zero-seed substitution, 1, a state whose high bits are set, a
+    /// `u64::MAX`, and the sign-bit-only state (which makes `x >> 12` and
+    /// `x >> 27` both zero and is the degenerate case for a shift-based mixer).
+    const SEEDS: [u64; 6] = [
+        0x9e37_79b9_7f4a_7c15,
+        1,
+        0xdead_beef_cafe_babe,
+        0x0123_4567_89ab_cdef,
+        u64::MAX,
+        0x8000_0000_0000_0000,
+    ];
+
+    /// **The device RNG must reproduce the host's `next_f64() as f32` bit for bit.**
+    ///
+    /// This gate exists because the first version of `sample_rng_next`
+    /// hand-rolled the 53-bit -> 24-bit rounding in integer arithmetic and was
+    /// wrong on **100%** of draws, with a mean `unit` of 2e-9 against the host's
+    /// 0.5. A `unit` that is ~2e9 times too small collapses every inverse-CDF
+    /// draw onto the top-ranked token: the model would have kept producing
+    /// plausible text while silently sampling greedily. Nothing about that
+    /// failure looks like a bug from the outside, which is exactly why it needs a
+    /// gate rather than a review comment.
+    ///
+    /// 3,000,000 draws across 6 seeds. Bitwise, not approximate: an ulp here is
+    /// enough to move a draw across a candidate boundary, and "close enough"
+    /// would not have caught the shipped bug, which was not close.
+    #[test]
+    fn device_rng_matches_the_host_bit_for_bit() {
+        let mut compared = 0_u64;
+        for seed in SEEDS {
+            let mut state = seed;
+            for _ in 0..500_000 {
+                let (host, host_next_state) = host_rng_step(state);
+                let (device, device_next_state) = device_rng_step(state);
+                assert_eq!(
+                    device.to_bits(),
+                    host.to_bits(),
+                    "seed {seed:#x} draw {compared}: device unit {:e} ({:#010x}) != \
+                     host {:e} ({:#010x}). The inverse-CDF target is \
+                     `unit * selected_total`, so a wrong `unit` does not fail \
+                     loudly -- it biases every draw toward the top candidate.",
+                    device,
+                    device.to_bits(),
+                    host,
+                    host.to_bits()
+                );
+                assert_eq!(
+                    device_next_state, host_next_state,
+                    "seed {seed:#x}: the xorshift advance must match, or the two \
+                     RNGs are out of step rather than merely mis-rounded"
+                );
+                assert!(
+                    (0.0..1.0).contains(&device),
+                    "unit {device} escaped [0, 1); the host's f64 demotion \
+                     guarantees it and the device path relies on it"
+                );
+                state = host_next_state;
+                compared += 1;
+            }
+        }
+        assert_eq!(compared, 3_000_000, "expected 6 seeds x 500,000 draws");
+    }
+
+    /// The pathological shapes a uniform draw must not have. Cheap, and they
+    /// localise a future regression to "distribution" rather than "value".
+    #[test]
+    fn device_rng_stays_uniform_and_in_range() {
+        let mut state = 0x9e37_79b9_7f4a_7c15_u64;
+        let draws = 200_000;
+        let mut buckets = [0_u32; 10];
+        let mut sum = 0.0_f64;
+        for _ in 0..draws {
+            let (unit, next) = device_rng_step(state);
+            state = next;
+            assert!((0.0..1.0).contains(&unit), "unit {unit} out of range");
+            sum += unit as f64;
+            buckets[(unit * 10.0) as usize] += 1;
+        }
+        let mean = sum / draws as f64;
+        assert!(
+            (mean - 0.5).abs() < 0.005,
+            "mean {mean} is not 0.5; the draw is biased, which is the failure \
+             mode that made the original kernel look merely 'low'"
+        );
+        for (index, count) in buckets.iter().enumerate() {
+            let share = *count as f64 / draws as f64;
+            assert!(
+                (share - 0.1).abs() < 0.01,
+                "bucket {index} holds {share:.4} of draws, expected ~0.1"
+            );
+        }
+    }
+
+    /// `xorshift64` must never stall. A zero state maps to zero forever, which
+    /// `Sampler::seed_state` already substitutes for, so this pins that the
+    /// substitution is load-bearing rather than decorative.
+    #[test]
+    fn a_zero_state_would_stall_and_is_substituted() {
+        let (first, next) = device_rng_step(0);
+        assert_eq!(next, 0, "xorshift64(0) is a fixed point at 0");
+        let (again, _) = device_rng_step(next);
+        assert_eq!(
+            again.to_bits(),
+            first.to_bits(),
+            "so every draw from a zero state is the same draw, forever"
+        );
+        assert_eq!(
+            super::Sampler::seed_state(0),
+            0x9e37_79b9_7f4a_7c15,
+            "a --seed of 0 must be substituted, or the device RNG returns the \
+             same draw forever"
+        );
+        assert_ne!(super::Sampler::seed_state(0), 0);
+    }
+}
+
+#[cfg(test)]
 mod order_key_tests {
     use super::order_key;
 
@@ -680,7 +920,9 @@ mod order_key_tests {
 
 #[cfg(test)]
 mod device_params_tests {
-    use super::{SamplerConfig, SamplerError, SamplerParams, MAX_DEVICE_TOP_K};
+    use super::{
+        device_top_k_limit, SamplerConfig, SamplerError, SamplerParams, MAX_DEVICE_TOP_K,
+    };
 
     const VOCAB: usize = 262_144;
 
@@ -704,9 +946,13 @@ mod device_params_tests {
     /// would sample from a different candidate set than the configuration asked
     /// for and report success, which is precisely the silent quality regression
     /// this change must not have (AGENTS.md §8).
+    ///
+    /// The boundary is [`device_top_k_limit`], i.e. the kernel's geometry, so
+    /// this test also pins that the two agree at the edge.
     #[test]
     fn top_k_above_the_device_bound_is_an_error_not_a_clamp() {
-        for top_k in [MAX_DEVICE_TOP_K + 1, 4096, 262_144] {
+        let limit = device_top_k_limit(VOCAB);
+        for top_k in [limit + 1, MAX_DEVICE_TOP_K + 1, 4096, 262_144] {
             let config = SamplerConfig {
                 temperature: 1.0,
                 top_k,
@@ -714,23 +960,81 @@ mod device_params_tests {
             };
             assert_eq!(
                 SamplerParams::from_config(config, VOCAB),
-                Err(SamplerError::DeviceTopKTooLarge {
-                    top_k,
-                    limit: MAX_DEVICE_TOP_K,
-                }),
+                Err(SamplerError::DeviceTopKTooLarge { top_k, limit }),
                 "top_k={top_k} must be rejected, not clamped"
             );
         }
         // ... and the boundary itself is accepted.
-        assert!(SamplerParams::from_config(
-            SamplerConfig {
-                temperature: 1.0,
-                top_k: MAX_DEVICE_TOP_K,
-                top_p: 0.95,
-            },
-            VOCAB,
-        )
-        .is_ok());
+        assert!(
+            SamplerParams::from_config(
+                SamplerConfig {
+                    temperature: 1.0,
+                    top_k: limit,
+                    top_p: 0.95,
+                },
+                VOCAB,
+            )
+            .is_ok(),
+            "the kernel geometry's own limit must be servable, or the fallback \
+             boundary is unreachable"
+        );
+    }
+
+    /// **The gate that would have caught the duplicated bound.**
+    ///
+    /// `SamplerParams::validate` and `ElementKernels::sample_geometry` must agree
+    /// on *every* `top_k`, not merely at the ones a test happened to pick. The
+    /// bug this pins is real and was shipped into the T2 diff: `validate` allowed
+    /// `top_k` up to `MAX_DEVICE_TOP_K` (1024) while the staging geometry accepts
+    /// `k_padded <= 64` at this vocabulary, so `--top-k 128` was accepted by the
+    /// host and then failed ~150 dispatches into a decode step as a
+    /// `KernelError` — a crash on the fast path for a legal host config, rather
+    /// than the documented fallback.
+    ///
+    /// Sweeping the whole range is what makes this a gate rather than a comment:
+    /// the two functions are in different crates, and nothing else makes them
+    /// consistent.
+    #[test]
+    fn the_host_bound_and_the_kernel_geometry_agree_at_every_top_k() {
+        use kaplumba_kernels::elements::ElementKernels;
+        for vocab in [4096_usize, 32768, 65_536, 131_072, 262_144, 524_288] {
+            let limit = device_top_k_limit(vocab);
+            // Powers of two and the values either side of each: the interesting
+            // boundaries are where `next_pow2` steps and where the per-block
+            // staging overflows.
+            let mut probes: Vec<usize> = (1..=11).map(|shift| 1_usize << shift).collect();
+            probes.extend((1..=11).map(|shift| (1_usize << shift) - 1));
+            probes.extend([0, vocab, vocab + 1, usize::MAX]);
+            for top_k in probes {
+                let host = SamplerParams::from_config(
+                    SamplerConfig {
+                        temperature: 1.0,
+                        top_k: top_k.max(1),
+                        top_p: 0.95,
+                    },
+                    vocab,
+                );
+                let kernel = ElementKernels::sample_geometry(vocab, top_k.max(1));
+                // `top_k = 0` is rejected by config validation before geometry is
+                // consulted, so it is the one probe where the two may disagree.
+                if top_k == 0 {
+                    continue;
+                }
+                assert_eq!(
+                    host.is_ok(),
+                    kernel.is_ok(),
+                    "vocab={vocab} top_k={top_k}: host says {}, kernel geometry says {} \
+                     (host: {:?}, kernel: {:?}). Whichever is wrong, a config accepted by one \
+                     and rejected by the other is either a crash on the decode path or a \
+                     silently unservable fast path.",
+                    host.is_ok(),
+                    kernel.is_ok(),
+                    host.as_ref().err(),
+                    kernel.as_ref().err()
+                );
+                let _ = limit;
+            }
+        }
     }
 
     /// A `top_k` at or above the vocabulary is the other half of the bound: the
@@ -745,15 +1049,13 @@ mod device_params_tests {
                 top_p: 0.95,
             };
             let outcome = SamplerParams::from_config(config, vocab);
-            if top_k < vocab && top_k <= MAX_DEVICE_TOP_K {
+            let limit = device_top_k_limit(vocab).min(vocab - 1);
+            if top_k < vocab && top_k <= limit {
                 assert!(outcome.is_ok(), "vocab={vocab} top_k={top_k} should be servable");
             } else {
                 assert_eq!(
                     outcome,
-                    Err(SamplerError::DeviceTopKTooLarge {
-                        top_k,
-                        limit: MAX_DEVICE_TOP_K.min(vocab - 1),
-                    }),
+                    Err(SamplerError::DeviceTopKTooLarge { top_k, limit }),
                     "vocab={vocab} top_k={top_k}"
                 );
             }

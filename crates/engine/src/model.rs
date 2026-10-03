@@ -2968,6 +2968,36 @@ impl HeadPick {
     }
 }
 
+/// Candidate slots staged between `sample_topk_blocks` and `sample_draw`.
+///
+/// Must equal `SAMPLE_CANDIDATES` in `crates/kernels/src/elements.metal`. The
+/// duplication is deliberate and is the `ArgmaxParams` convention the design
+/// note pointed at: a parameter struct declared on both sides is auditable,
+/// whereas a Rust-side magic number that silently disagreed with an MSL `#define`
+/// would only be found by a wrong answer.
+const SAMPLE_CANDIDATES: usize = 4096;
+
+/// Largest `top_k` the sampler buffers can stage, matching `SAMPLE_TOP_MAX` in
+/// `elements.metal`. `sample_geometry` enforces it; this is the buffer size.
+const SAMPLE_TOP_MAX: usize = 256;
+
+/// One device draw, plus the exact top-k the kernel ranked.
+///
+/// `ranked` is what makes the top-k testable: a *drawn* token is a random
+/// member of the candidate set and says nothing about its rank, so an equality
+/// test on the token alone would pass a kernel that returned the right set in
+/// the wrong order — which changes the sampled distribution.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeviceSample {
+    pub token: u32,
+    pub ranked: Vec<u32>,
+}
+
+/// Words in `scratch.host_tokens`, i.e. the largest `step_idx` a staged token can
+/// carry. Also the context limit the decode loop is capped at, so a draw count
+/// above it could not be read back.
+pub const HOST_TOKEN_SLOTS: usize = 8192;
+
 /// Where a staged token goes, when one is being staged.
 ///
 /// Bundled with `step_idx` because all three travel together and a partially
@@ -3052,6 +3082,19 @@ pub struct ForwardScratch {
     pub attn_partials: Buffer,
     /// Device-side argmax keys: 4 words (one u32 per 65,536 elements).
     pub argmax_keys: Buffer,
+    /// Device-sampler candidates between `sample_topk_blocks` and
+    /// `sample_draw`: `SAMPLE_CANDIDATES` u32, 16 KiB.
+    ///
+    /// Sized from the *sampler's* bound, not from the vocabulary and never from
+    /// the context length, per AGENTS.md §8. `sample_geometry` refuses any
+    /// `(vocab, top_k)` that does not fit this, so the buffer cannot overflow.
+    pub sample_candidates: Buffer,
+    /// One `ulong` of device RNG state, seeded host-side once per turn and
+    /// advanced by exactly one `sample_draw` per decode step.
+    pub rng_state: Buffer,
+    /// The device sampler's ranked top-`top_k`, for the tests that check it.
+    /// Null in the decode path, so nothing there reads it.
+    pub ranked_tokens: Buffer,
 }
 
 impl ForwardScratch {
@@ -3126,7 +3169,8 @@ impl ForwardScratch {
             device.new_buffer(64, options),
             device.new_buffer(64, options),
         ];
-        let host_tokens = device.new_buffer((8192 * std::mem::size_of::<u32>()) as u64, options);
+        let host_tokens =
+            device.new_buffer((HOST_TOKEN_SLOTS * std::mem::size_of::<u32>()) as u64, options);
         Ok(Self {
             max_tokens,
             hidden_a: u16_elements(max_tokens, hidden)?,
@@ -3165,6 +3209,15 @@ impl ForwardScratch {
                 (vocab.div_ceil(65536) * 4).max(16) as u64,
                 options,
             ),
+            sample_candidates: device.new_buffer(
+                (SAMPLE_CANDIDATES * std::mem::size_of::<u32>()) as u64,
+                options,
+            ),
+            rng_state: device.new_buffer(std::mem::size_of::<u64>() as u64, options),
+            ranked_tokens: device.new_buffer(
+                (SAMPLE_TOP_MAX * std::mem::size_of::<u32>()) as u64,
+                options,
+            ),
         })
     }
 
@@ -3195,6 +3248,9 @@ impl ForwardScratch {
             &self.capped,
             &self.attn_partials,
             &self.argmax_keys,
+            &self.sample_candidates,
+            &self.rng_state,
+            &self.ranked_tokens,
         ]
         .iter()
         .map(|buffer| buffer.length())
@@ -3932,6 +3988,151 @@ impl TextModel {
             let ptr = self.scratch.host_tokens.contents() as *const u32;
             *ptr.add(step_idx)
         }
+    }
+
+    /// Whether the device sampler can serve `(config)` for this model's
+    /// vocabulary, and if not, why.
+    ///
+    /// The caller uses this to choose between the device sampler on the
+    /// pipelined route and the host sampler on the barrier-per-token loop. There
+    /// is no third option and no approximation: a `top_k` the buffers cannot
+    /// stage is the host sampler's job.
+    pub fn device_sampler_supported(&self, config: crate::sampler::SamplerConfig) -> bool {
+        crate::sampler::SamplerParams::from_config(config, self.vocab_size).is_ok()
+    }
+
+    /// Overwrite `scratch.capped` with `values`, as fp16.
+    ///
+    /// Exists for the sampler's own tests, which need to feed the kernels rows
+    /// the model will never produce: all-equal values, exact ties, `+0.0` next
+    /// to `-0.0`, extreme exponents. A real forward cannot be made to emit those
+    /// on demand, and a top-k whose correctness is only ever checked on a
+    /// plausible row has not been checked.
+    #[doc(hidden)]
+    pub fn stage_capped_row(&mut self, values: &[f32]) -> Result<(), ModelError> {
+        if values.len() != self.vocab_size {
+            return Err(ModelError::InvalidInput(format!(
+                "staged row must be {} values, got {}",
+                self.vocab_size,
+                values.len()
+            )));
+        }
+        let capped = self.scratch.capped.contents() as *mut u16;
+        for (index, value) in values.iter().enumerate() {
+            unsafe {
+                *capped.add(index) = half::f16::from_f32(*value).to_bits();
+            }
+        }
+        Ok(())
+    }
+
+    /// Draw `count` tokens from the row already in `scratch.capped`, using the
+    /// device sampler and nothing else — no forward, no LM head.
+    ///
+    /// One `sample_draw` dispatch per draw, all in one command buffer, so the
+    /// distribution tests can afford 10^5 of them. This is a test/debug entry
+    /// point; the decode path reaches the same two dispatches from
+    /// `encode_lm_head`.
+    pub fn sample_capped_row_on_device(
+        &mut self,
+        config: crate::sampler::SamplerConfig,
+        rng_seed: u64,
+        count: u32,
+    ) -> Result<Vec<u32>, ModelError> {
+        Ok(self
+            .sample_capped_row_ranked(config, rng_seed, count)?
+            .into_iter()
+            .map(|draw| draw.token)
+            .collect())
+    }
+
+    /// [`Self::sample_capped_row_on_device`], keeping each draw's ranked top-k.
+    /// The last draw's ranking is returned for every entry, because the ranking
+    /// does not depend on the RNG — only the draw does.
+    pub fn sample_capped_row_ranked(
+        &mut self,
+        config: crate::sampler::SamplerConfig,
+        rng_seed: u64,
+        count: u32,
+    ) -> Result<Vec<DeviceSample>, ModelError> {
+        let params = crate::sampler::SamplerParams::from_config(config, self.vocab_size)
+            .map_err(|error| ModelError::InvalidInput(error.to_string()))?;
+        if count == 0 || count as usize > HOST_TOKEN_SLOTS {
+            return Err(ModelError::InvalidInput(format!(
+                "draw count must be in 1..={HOST_TOKEN_SLOTS}, got {count}"
+            )));
+        }
+        unsafe {
+            let rng = self.scratch.rng_state.contents() as *mut u64;
+            *rng = crate::sampler::Sampler::seed_state(rng_seed);
+        }
+        let queue = self.forward_queue();
+        let mut encoder = MetalEncoder::new(&queue)?;
+        encoder.set_max_dispatches(kaplumba_kernels::encoder::decode_max_dispatches_per_buffer());
+        let top_k = params.top_k as usize;
+        for step in 0..count {
+            if let Err(error) = self.encode_sample(&mut encoder, params, step) {
+                encoder.abandon();
+                return Err(error);
+            }
+        }
+        encoder.commit_and_wait()?;
+        let tokens = self.read_host_tokens(count as usize);
+        let ranked = self.read_ranked_tokens(top_k);
+        Ok(tokens
+            .into_iter()
+            .map(|token| DeviceSample { token, ranked: ranked.clone() })
+            .collect())
+    }
+
+    /// `host_tokens[0..count]`, read after the caller has waited.
+    fn read_host_tokens(&self, count: usize) -> Vec<u32> {
+        let ptr = self.scratch.host_tokens.contents() as *const u32;
+        unsafe { std::slice::from_raw_parts(ptr, count) }.to_vec()
+    }
+
+    fn read_ranked_tokens(&self, count: usize) -> Vec<u32> {
+        let ptr = self.scratch.ranked_tokens.contents() as *const u32;
+        unsafe { std::slice::from_raw_parts(ptr, count) }.to_vec()
+    }
+
+    /// D1 + D2 of the device sampler, staged into `host_tokens[step_idx]`.
+    ///
+    /// `token_out` is `None` on this path: the `next_token` ping-pong slot
+    /// belongs to `forward_step_pipelined`, and a test write there would
+    /// corrupt the slot the next decode step consumes. The decode path passes
+    /// the same pair through `HeadOut`; see `encode_lm_head`.
+    fn encode_sample(
+        &self,
+        encoder: &mut MetalEncoder,
+        params: crate::sampler::SamplerParams,
+        step_idx: u32,
+    ) -> Result<(), ModelError> {
+        self.elements
+            .encode_sample_topk_blocks(
+                encoder,
+                &self.scratch.capped,
+                &self.scratch.sample_candidates,
+                self.vocab_size,
+                params.top_k as usize,
+            )
+            .map_err(ModelError::Kernel)?;
+        self.elements
+            .encode_sample_draw(
+                encoder,
+                &self.scratch.sample_candidates,
+                &self.scratch.rng_state,
+                None,
+                Some(&self.scratch.host_tokens),
+                Some(&self.scratch.ranked_tokens),
+                self.vocab_size,
+                params.top_k as usize,
+                params.temperature,
+                params.top_p,
+                step_idx,
+            )
+            .map_err(ModelError::Kernel)?;
+        Ok(())
     }
 
     pub fn retract_gpu_caches(&mut self, tokens: usize) {

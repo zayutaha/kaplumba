@@ -160,3 +160,155 @@ text only (never the `--metrics` line):
   `cargo test --workspace` run and passed 3/3 when run alone afterwards. It is
   a bandwidth-ratio test on the GPU; running it concurrently with other tests
   is a plausible cause. Not reproducible here, recorded rather than dismissed.
+## T2 — two bugs in the device sampler's `top_k` bound, found before any GPU run
+
+Neither was found by a benchmark; both were found by reading the host validator
+against the kernel geometry and sweeping them against each other. Both are in
+code that was already written and compiling.
+
+### 1. The bound was stated twice, and the kernel's copy was stricter
+
+`SamplerParams::validate` rejected `top_k` above `MAX_DEVICE_TOP_K` (1024). The
+kernel's own `ElementKernels::sample_geometry` accepts only
+
+```text
+count * k_padded <= SAMPLE_STAGE * SAMPLE_CANDIDATES   (4096 * 4096)
+```
+
+which at this model's 262,144-wide vocabulary is `k_padded <= 64`. Measured
+with a standalone repro of the shipped function:
+
+| top_k | host `validate` | kernel geometry |
+|---|---|---|
+| 64 | ok | ok (per_block 4096) |
+| **65** | **ok** | **reject (per_block 8192 > 4096)** |
+| 128 | ok | reject (per_block 8192) |
+| 1024 | ok | reject (k_padded 1024) |
+
+So `--top-k 128` was accepted by the host and then failed as a `KernelError`
+partway through a decode step, rather than taking the documented "fall back to
+the host sampler on the non-pipelined loop" path. The doc comment on
+`MAX_DEVICE_TOP_K` promised a fallback; the code could not deliver one.
+
+**Fix:** `device_top_k_limit(vocab)` asks `sample_geometry` and `validate` uses
+that. The kernel is the single owner of the number. `MAX_DEVICE_TOP_K` survives
+only as a sanity ceiling on the probe, so that raising it cannot silently raise
+what the staging arrays accept. It is probed once per model load, not per token —
+`device_sampler_supported` is what keeps it off the hot path.
+
+**Gate:** `the_host_bound_and_the_kernel_geometry_agree_at_every_top_k` sweeps
+6 vocabularies (4096 … 524288) x ~26 `top_k` probes and asserts `host.is_ok() ==
+kernel.is_ok()` everywhere. Pointed probes are not enough: the two functions are
+in different crates and nothing else makes them agree.
+
+**Sabotage S1** (revert the bound to `MAX_DEVICE_TOP_K`):
+
+```
+vocab=4096 top_k=512: host says true, kernel geometry says false
+(host: None, kernel: Some(InvalidInput("device sampler: top_k 512 is above the
+256 the staging arrays accept")))
+```
+
+### 2. `next_pow2` overflowed to 0 and span an infinite loop
+
+```rust
+let mut k_padded = 1usize;
+while k_padded < top_k { k_padded <<= 1; }
+```
+
+At `top_k = usize::MAX`, `k_padded` walks up to 2^63, shifts left to 0, and
+`0 < top_k` is then true forever. This is an **infinite loop, not a wrong
+answer**: a large `top_k` hangs the process instead of returning the error the
+caller is waiting for. Confirmed by repro before fixing.
+
+It was reached from `top_k = usize::MAX`, which the sweep gate probes — the gate
+*hung* rather than failed, which is how it was found.
+
+**Fix:** reject `top_k > SAMPLE_TOP_MAX` on the **input**, before padding.
+
+Bounding the loop instead would **not** have been enough, and this is the part
+worth remembering: stopping at the cap lets `top_k = 1000` through as
+`k_padded = 256`, which samples from a narrower candidate set than the config
+asked for and reports success. That is precisely the silent quality regression
+AGENTS.md §8 forbids, and it would have passed every "does it not hang" check.
+The cap is on the input; the loop bound is defensive only.
+
+**Sabotage S2** (remove the cap check): the gate hangs, killed at 25 s. This is
+the only gate in the set whose failure mode is a hang, so it is worth knowing
+that it fails that way — a CI timeout, not an assertion message.
+
+### Test-running notes on this box
+
+- `cargo test --release -p kaplumba-engine --lib sampler` **exceeds 600 s** even
+  with everything cached — the link step dominates. Build once with
+  `cargo build --release -p kaplumba-engine --lib --tests`, then run the binary
+  directly: `./target/release/deps/kaplumba_engine-<hash> sampler`. The hash is
+  stable while the lib is unchanged and the whole suite runs in 0.06 s.
+- There is **no `timeout` binary** here. To observe a hang without stalling the
+  session, run the test in a subshell, poll `kill -0 $P`, and `kill -9` after N
+  seconds. That is how S2 was captured.
+
+## T2 — the device RNG was wrong on 100% of draws, and looked fine
+
+`sample_rng_next` in `elements.metal` reproduced the host's `next_f64() as f32`
+by hand-rolling the 53-bit -> 24-bit rounding in integer arithmetic: split into
+a 24-bit `hi` and a 29-bit remainder, compare the remainder against a tie point,
+add the carry, scale by a power of two.
+
+**It was wrong twice, and the two errors cancelled into something much worse
+than either.** The 29-bit remainder needs a `2^28` tie point, not `2^24`; and the
+scale was `2^-53` applied to a `hi` that had already absorbed the `2^29` split.
+Measured against the host over 3,000,000 draws:
+
+```text
+hand-rolled: 100% of draws differ, mean unit = 2e-9   (host: 0.5)
+```
+
+So `unit` was ~2e9 times too small. The draw is
+`target = unit * selected_total`, then an inverse-CDF walk — with a `unit` that
+tiny, `target` is below the first partial sum on essentially every token and
+**every draw collapses onto the top-ranked token.** The device sampler would have
+been a greedy decoder wearing a sampler's name, emitting entirely plausible text,
+with no error, no NaN, and a distribution test that would have needed 1e5 draws
+to notice.
+
+**Fix: delete the arithmetic.** `float(bits >> 11) * 0x1p-53f` — Metal's
+`ulong` -> `float` conversion already rounds to nearest-even, which is exactly
+what the host's `f64` demotion does. **0 differences in 3,000,000 draws.**
+
+The lesson is the one worth carrying past this spec: *"reproduce the host's
+rounding in integer arithmetic so we never touch the GPU's float conversion"* is
+a worse plan than using the conversion, because it replaces a well-specified
+instruction with an unspecified argument. The original comment even argued the
+hand-rolled version was safer. It was not safer; it was wrong.
+
+**Gates** (`sampler.rs`, `device_rng_tests`, CPU-only, no GPU):
+
+| gate | what it catches |
+|---|---|
+| `device_rng_matches_the_host_bit_for_bit` | 3,000,000 draws x 6 seeds, **bitwise**; also pins the xorshift advance and `unit ∈ [0,1)` |
+| `device_rng_stays_uniform_and_in_range` | mean within 0.005 of 0.5, every decile within 0.01 |
+| `a_zero_state_would_stall_and_is_substituted` | `xorshift64(0)` is a fixed point, so `seed_state(0)`'s substitution is load-bearing |
+
+Bitwise, not approximate — and note that "close enough" would **not** have caught
+this bug, which was not close. That is the argument for the exact comparison.
+
+**Sabotage S3** (restore the original hand-rolled version): both value gates
+fail, first draw:
+
+```
+device unit 9.833068e-11 (0x2ed83b40) != host 5.2790873e-2 (0x3d583b3e)
+mean 0.0000000009315009616178704 is not 0.5
+```
+
+### A trap in writing this gate
+
+The first version of `host_rng_step` advanced the xorshift **twice** — once in
+the host step and again by reading the already-advanced state into the device
+step — which made 100% of draws differ for a reason that had nothing to do with
+the kernel. It read exactly like the bug under test. The state-advance assertion
+in the gate is what makes that class of harness error impossible: if the two
+advances disagree, the failure says so instead of masquerading as a rounding
+difference. Two of my three intermediate repros were wrong in this way before the
+harness was right; in both cases the mean was the thing that gave it away
+(2e-9, then 32803, then 0.5 once the scale was right).

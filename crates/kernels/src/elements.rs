@@ -224,6 +224,16 @@ pub struct ElementKernels {
     argmax_clear_pipeline: ComputePipelineState,
     argmax_slots_pipeline: ComputePipelineState,
     argmax_keys_to_token_pipeline: ComputePipelineState,
+    /// Device-side sampler. Two dispatches per step; see `elements.metal` for
+    /// the sizing and for the `top_k` ceiling the buffers impose.
+    ///
+    /// Built unconditionally, so the greedy path pays two extra shader compiles
+    /// at load. Measured on `Gxma/Gxma`: the whole load is ~10 s, and shader
+    /// compilation is cached by the driver between runs, so this is not
+    /// measurable in `load_ms`; `KAPLUMBA_PIPELINE_AUDIT=1` is the way to check
+    /// that none of it lands inside a decode step.
+    sample_topk_pipeline: ComputePipelineState,
+    sample_draw_pipeline: ComputePipelineState,
     /// MEASUREMENT AID. See [`Self::encode_spin_burn`].
     spin_burn_pipeline: ComputePipelineState,
 }
@@ -279,6 +289,15 @@ impl ElementKernels {
     }
     /// Threads per group for the threadgroup-per-row norms.
     const NORM_GROUP_THREADS: u64 = 256;
+    /// Threads per group for both sampler dispatches.
+    ///
+    /// 256, not the 1024 `elements.metal`'s design note suggested. The sampler's
+    /// work is a fixed number of compare-exchange pairs and a fixed number of
+    /// barriers either way -- more threads means fewer pairs per thread and
+    /// *identical* barrier count, so the only thing 1024 buys is occupancy that
+    /// 4096 shared bytes-per-pair makes impossible anyway (32 KiB of shared
+    /// memory admits one 1024-thread group per core, 256 admits four).
+    const SAMPLE_GROUP_THREADS: u64 = 256;
     /// Largest `head_dim` `norm_rope_qkv` accepts.
     ///
     /// Bounded by the kernel's `threadgroup float normed_shared[512]`, which has
@@ -321,6 +340,8 @@ impl ElementKernels {
         let argmax_clear_pipeline = pipeline(&device, &library, "argmax_clear")?;
         let argmax_slots_pipeline = pipeline(&device, &library, "argmax_slots")?;
         let argmax_keys_to_token_pipeline = pipeline(&device, &library, "argmax_keys_to_token")?;
+        let sample_topk_pipeline = pipeline(&device, &library, "sample_topk_blocks")?;
+        let sample_draw_pipeline = pipeline(&device, &library, "sample_draw")?;
         let spin_burn_pipeline = pipeline(&device, &library, "spin_burn")?;
         let queue = device.new_command_queue();
         Ok(Self {
@@ -351,6 +372,8 @@ impl ElementKernels {
             argmax_clear_pipeline,
             argmax_slots_pipeline,
             argmax_keys_to_token_pipeline,
+            sample_topk_pipeline,
+            sample_draw_pipeline,
             spin_burn_pipeline,
         })
     }
@@ -901,6 +924,204 @@ impl ElementKernels {
             &step_idx.to_le_bytes(),
             1,
             1,
+        )
+    }
+
+    /// The dispatch geometry the device sampler needs for `vocab` and `top_k`,
+    /// or the reason it cannot serve them.
+    ///
+    /// Public because the same numbers appear in three places that must agree:
+    /// this function, the host-side validation in
+    /// `kaplumba_engine::sampler::SamplerParams::validate`, and the buffers in
+    /// `ForwardScratch`. `spec/device-sampler` R3/R7.
+    ///
+    /// The shape is fixed by one inequality. `blocks * k_padded == candidates`
+    /// and `per_block * blocks >= count`, with both `candidates` and `per_block`
+    /// staged in shared memory, so
+    ///
+    /// ```text
+    /// count * k_padded <= SAMPLE_STAGE * SAMPLE_CANDIDATES
+    /// ```
+    ///
+    /// At the shipped 262,144-wide vocabulary that is `k_padded <= 64`, which
+    /// is exactly the shipped `--top-k` default. Wider `top_k` is rejected, not
+    /// approximated.
+    pub fn sample_geometry(
+        vocab: usize,
+        top_k: usize,
+    ) -> Result<(u32, u32, u32, u32), KernelError> {
+        const SAMPLE_CANDIDATES: usize = 4096;
+        const SAMPLE_STAGE: usize = 4096;
+        const SAMPLE_TOP_MAX: usize = 256;
+        let bad = |why: &str| KernelError::InvalidInput(format!("device sampler: {why}"));
+        if vocab == 0 || top_k == 0 {
+            return Err(bad("vocab and top_k must be non-zero"));
+        }
+        if vocab < SAMPLE_CANDIDATES {
+            return Err(bad(&format!(
+                "vocabulary {vocab} is below the {SAMPLE_CANDIDATES} elements the \
+                 candidate staging needs"
+            )));
+        }
+        // Reject an over-cap `top_k` BEFORE padding it. The `next_pow2` loop is
+        // bounded by the cap for a reason: `k_padded <<= 1` overflows to 0, and
+        // `0 < top_k` is then true forever, so an unbounded `next_pow2` is an
+        // infinite loop rather than a wrong answer — a large `top_k` would hang
+        // the process instead of returning the error the caller is waiting for.
+        // Bounding the loop alone is NOT sufficient: it would stop at the cap and
+        // let `top_k = 1000` through as `k_padded = 256`, sampling from a
+        // narrower candidate set than the config asked for. So the cap is
+        // checked on the input, and the loop is bounded defensively.
+        if top_k > SAMPLE_TOP_MAX {
+            return Err(bad(&format!(
+                "top_k {top_k} is above the {SAMPLE_TOP_MAX} the staging arrays accept"
+            )));
+        }
+        let mut k_padded = 1usize;
+        while k_padded < top_k {
+            k_padded <<= 1;
+        }
+        if k_padded > SAMPLE_TOP_MAX || SAMPLE_CANDIDATES % k_padded != 0 {
+            return Err(bad(&format!(
+                "top_k {top_k} pads to {k_padded}, which is not a divisor of \
+                 {SAMPLE_CANDIDATES} within the {SAMPLE_TOP_MAX} cap"
+            )));
+        }
+        let blocks = SAMPLE_CANDIDATES / k_padded;
+        let per_block = vocab.div_ceil(blocks);
+        if per_block > SAMPLE_STAGE {
+            return Err(bad(&format!(
+                "top_k {top_k} at vocab {vocab} needs {per_block} elements staged \
+                 per block, over the {SAMPLE_STAGE} limit"
+            )));
+        }
+        if per_block < k_padded {
+            return Err(bad(&format!(
+                "top_k {top_k} at vocab {vocab} stages only {per_block} elements \
+                 per block, so some emitted candidates would be padding"
+            )));
+        }
+        Ok((
+            to_u32(vocab, "vocab size")?,
+            to_u32(k_padded, "padded top_k")?,
+            to_u32(blocks, "sampler blocks")?,
+            to_u32(per_block, "sampler block span")?,
+        ))
+    }
+
+    /// D1 of the device sampler: per-block top-k into `candidates`.
+    ///
+    /// The `vocab` / `top_k` pair must have been accepted by
+    /// [`Self::sample_geometry`]; it is re-checked here because that is the only
+    /// place a mismatch becomes a wrong answer rather than an error.
+    pub fn encode_sample_topk_blocks(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        logits: &Buffer,
+        candidates: &Buffer,
+        vocab: usize,
+        top_k: usize,
+    ) -> Result<(), KernelError> {
+        if crate::ablated("sample_topk") {
+            return Ok(());
+        }
+        let (count, k_padded, blocks, per_block) = Self::sample_geometry(vocab, top_k)?;
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct SampleTopKParams {
+            count: u32,
+            k_padded: u32,
+            blocks: u32,
+            per_block: u32,
+        }
+        let params = SampleTopKParams {
+            count,
+            k_padded,
+            blocks,
+            per_block,
+        };
+        encoder.dispatch_groups(
+            &self.sample_topk_pipeline,
+            &[Some(logits), Some(candidates)],
+            params_bytes(&params),
+            blocks as u64,
+            Self::SAMPLE_GROUP_THREADS,
+        )
+    }
+
+    /// D2 of the device sampler: global top-k, softmax, top-p, inverse-CDF, and
+    /// the draw, writing the token into both staging buffers.
+    ///
+    /// `rng` is a one-element `ulong` buffer, seeded host-side once per turn.
+    /// It is advanced here and nowhere else, and `sample_draw` runs exactly once
+    /// per decode step.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_sample_draw(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        candidates: &Buffer,
+        rng: &Buffer,
+        token_out: Option<&Buffer>,
+        host_token_out: Option<&Buffer>,
+        ranked_out: Option<&Buffer>,
+        vocab: usize,
+        top_k: usize,
+        temperature: f32,
+        top_p: f32,
+        step_idx: u32,
+    ) -> Result<(), KernelError> {
+        if crate::ablated("sample_draw") {
+            return Ok(());
+        }
+        let (_, k_padded, blocks, per_block) = Self::sample_geometry(vocab, top_k)?;
+        if !temperature.is_finite() || temperature <= 0.0 {
+            return Err(KernelError::InvalidInput(
+                "device sampler temperature must be finite and positive".to_string(),
+            ));
+        }
+        if !top_p.is_finite() || top_p <= 0.0 || top_p > 1.0 {
+            return Err(KernelError::InvalidInput(
+                "device sampler top-p must be in (0, 1]".to_string(),
+            ));
+        }
+        #[repr(C)]
+        #[derive(Clone, Copy)]
+        struct SampleDrawParams {
+            count: u32,
+            top_k: u32,
+            k_padded: u32,
+            candidates: u32,
+            per_block: u32,
+            step_idx: u32,
+            temperature: f32,
+            top_p: f32,
+        }
+        let params = SampleDrawParams {
+            count: to_u32(vocab, "vocab size")?,
+            top_k: to_u32(top_k, "top_k")?,
+            k_padded,
+            candidates: to_u32(
+                blocks as usize * k_padded as usize,
+                "sampler candidate count",
+            )?,
+            per_block,
+            step_idx,
+            temperature,
+            top_p,
+        };
+        encoder.dispatch_groups(
+            &self.sample_draw_pipeline,
+            &[
+                Some(candidates),
+                None,
+                Some(rng),
+                token_out,
+                host_token_out,
+                ranked_out,
+            ],
+            params_bytes(&params),
+            1,
+            Self::SAMPLE_GROUP_THREADS,
         )
     }
 
