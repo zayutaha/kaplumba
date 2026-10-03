@@ -68,7 +68,24 @@ Each task is one commit. Status updated immediately after each.
       shape/tensor spread" (T3 — it was a `_2col` artifact). The last lever is the
       3 bpw lane window (2.67× → 1.33× useful-byte amplification).
 
-- [ ] **T6 — the lane window, and it is a format change, not a tweak.** The ring is
+- [x] **T7 — o_proj: closed, nothing to fix.** The "159 GB/s outlier" was **my own
+      byte-count error** — o_proj is 1.156 GB (825.75 MB sliding + 330.30 MB full
+      attention), not 0.991 GB, so it runs at **186.0 GB/s** inside its peers'
+      186–203 band. `KAPLUMBA_ABLATE=o_proj_gemv` confirms the cost is real
+      (16.001 → 17.865 tok/s, +11.6%, 6 pairs), so the profiler is not
+      mis-attributing. Both candidate fixes lose: `KAPLUMBA_O_NOSK=1` −1.4% in
+      **6/6** pairs against the microbenchmark's predicted **+41%**, and
+      `KAPLUMBA_O_SK4=1` −0.4%. Shipped config is already optimal.
+      *Files:* `findings/F5-o-proj-closed.md`; F3's table corrected.
+
+- [ ] **T6 — the lane window.** **Correction to the earlier text:** this does *not*
+      necessarily need a repack. The 768-bit ring order is a shared convention
+      between the repacker and the kernel, but the *partition* of those 768 bits
+      into lanes is the kernel's own; 16 lanes × 48 bits tiles the ring exactly.
+      So a wider window may be reachable by re-partitioning alone, provided the
+      bit→(output,input) map is preserved. That map has to be read out of
+      `decode_state_mcg` / `pack_integer_states` first — it is not reverse-engineered
+      yet. Ceiling if it works: ~18.2–18.7 tok/s. The ring is
       ordered by `(lane, k)` with `lane = 4*(o mod 8) + g`, so one output's 16
       inputs are *strided* across four lanes by 32 codes. A 16-code contiguous
       window is not a usable `(output, input)` set, so widening the window requires

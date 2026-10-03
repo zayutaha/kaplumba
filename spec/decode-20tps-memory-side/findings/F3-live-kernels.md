@@ -49,15 +49,35 @@ guards fail.
 `KAPLUMBA_DECODE_PROFILE=kernel`, 32 recorded steps (8 warm-up excluded), Gxma-repacked,
 74-token prompt, `--temperature 0`:
 
+> **Corrected (F5).** The `o_proj` byte count in the first version of this table was
+> 0.991 GB, which assumed all 60 layers are 8192-wide. The 10 full-attention layers
+> are 16384-wide, so o_proj is 825.75 MB + 330.30 MB = **1.156 GB**. Redone below;
+> `qk_proj`'s bytes were missing too. The correction matters because it removes the
+> o_proj "anomaly" entirely — see `findings/F5-o-proj-closed.md`.
+
+Bytes/token by shape, from the safetensors headers (12.0395 GB total):
+
+| shape (colmajor) | × | bytes | role |
+|---|---:|---:|---|
+| `(1344,336,48)` | 120 | 5202.25 MB | gate + up |
+| `(336,1344,48)` | 60 | 2601.12 MB | down |
+| `(336,16384,96)` | 1 | 1056.96 MB | lm_head (row-major, K=5376 N=262144) |
+| `(512,336,48)` | 50 | 825.75 MB | q, sliding |
+| `(256,336,48)` | 100 | 825.75 MB | k + v, sliding |
+| `(336,512,48)` | 50 | 825.75 MB | o, sliding |
+| `(1024,336,48)` | 10 | 330.30 MB | q, full |
+| `(336,1024,48)` | 10 | 330.30 MB | o, full |
+| `(128,336,48)` | 10 | 41.29 MB | k/v, full |
+
 | kernel | count/step | own ms/step | share | bytes/token | **GB/s** |
 |---|---:|---:|---:|---:|---:|
 | `gate_up_gelu` | 60 | 25.58 | 40.0% | 5.202 GB | **203.4** |
 | `down_proj` | 60 | 13.10 | 20.5% | 2.601 GB | **198.6** |
 | `qkv_proj` | 50 | 8.62 | 13.5% | 1.652 GB | **191.6** |
-| `o_proj` | 60 | 6.22 | 9.7% | 0.991 GB | **159.4** |
+| `qk_proj` (10 full layers) | 10 | 1.95 | 3.1% | 0.372 GB | **190.4** |
+| `o_proj` | 60 | 6.22 | 9.7% | 1.156 GB | **186.0** |
 | `head/gemv` | 1 | 4.11 | 6.4% | 1.057 GB | ~257 |
 | `attention` | 60 | 2.34 | 3.7% | — | — |
-| `qk_proj` (10 full layers) | 10 | 1.95 | 3.1% | — | — |
 | `post_ffn_out` | 60 | 0.91 | 1.4% | — | — |
 | `post_attn_pre_ffn_transform` | 60 | 0.69 | 1.1% | — | — |
 | `kv_norm_rope_cache` | 60 | 0.33 | 0.5% | — | — |
@@ -73,11 +93,10 @@ The head is the fastest kernel in the model at ~257 GB/s (over the ceiling, so i
 `own_ms` is probably understated, but it is clearly not the problem). The **3 bpw**
 layer kernels are all at 159–203.
 
-`o_proj` is the outlier at 159 GB/s, 20% below its peers, and it uses the *same*
-kernel (`_colmajor_2col_sk2`) and the *same* grid (336 TGs) as `down_proj` at 199.
-The only difference is K (8192 vs 21504). That is the signature of a fixed per-dispatch
-cost being amortised over 2.6× less work, not of a bad access pattern
-(`perf_probe_splitk_gridshape.rs`'s header reaches the same conclusion independently).
+**Every 3 bpw projection is in a narrow 186–203 GB/s band.** There is no o_proj
+outlier: the earlier 159 GB/s was a byte-count error (F5). The spread is monotone in
+bytes per threadgroup (gate_up 64,512 B/TG at 203 down to o_proj's 49,152 B/TG at 186),
+which is the same axis the 4col experiment was built to move — and 4col lost (F4).
 
 ## 3. The ceiling, re-measured today
 
