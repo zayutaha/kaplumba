@@ -10,6 +10,8 @@ pub enum SamplerError {
     InvalidTopK,
     #[error("top-p must be in (0, 1]")]
     InvalidTopP,
+    #[error("top-k {top_k} exceeds the device sampler's limit of {limit}")]
+    DeviceTopKTooLarge { top_k: usize, limit: usize },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -83,6 +85,80 @@ pub fn top_k_order(logits: &[f32], top_k: usize) -> Vec<usize> {
             .then_with(|| left.cmp(right))
     });
     order
+}
+
+/// Largest `top_k` the device sampler accepts.
+///
+/// The device path reduces the vocabulary to a bounded candidate array (a
+/// per-block top-`k`, then a global top-`k` over those), so `top_k` bounds the
+/// shared-memory staging array, not the vocabulary. A `top_k` above this is a
+/// **fall back to the host sampler with the non-pipelined loop**, not a wider
+/// device sort - building a 262,144-wide sort for a config nobody ships is how
+/// the fast path stops being reviewable.
+///
+/// `spec/device-sampler` R7. The device path is only distribution-identical to
+/// `Sampler::sample` when it applies top-k before top-p, over the same
+/// `top_k` candidates (`sampler.rs:110-128`).
+pub const MAX_DEVICE_TOP_K: usize = 1024;
+
+/// The `SamplerConfig` fields the device sampler needs, in the layout its
+/// parameter buffer wants.
+///
+/// Separate from [`SamplerConfig`] because `top_k` is a `u32` on the wire and
+/// because the device path has a bound the host path does not. Constructed only
+/// through [`SamplerParams::from_config`], so the validation cannot be
+/// skipped by a caller that had a good reason.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SamplerParams {
+    pub temperature: f32,
+    pub top_k: u32,
+    pub top_p: f32,
+}
+
+impl SamplerParams {
+    /// Device parameters for `config`, or an error if the device path cannot
+    /// serve this configuration for a `vocab`-wide row.
+    ///
+    /// `top_k` is **not** clamped: a `top_k` the device path cannot stage is an
+    /// error the caller turns into "run the host sampler on the non-pipelined
+    /// loop", and silently sampling from a different candidate set than the
+    /// configuration asked for is the one failure this whole change must not
+    /// have.
+    pub fn from_config(config: SamplerConfig, vocab: usize) -> Result<Self, SamplerError> {
+        validate_config(config)?;
+        let params = Self {
+            temperature: config.temperature,
+            top_k: u32::try_from(config.top_k).map_err(|_| SamplerError::InvalidTopK)?,
+            top_p: config.top_p,
+        };
+        params.validate(vocab)?;
+        Ok(params)
+    }
+
+    /// Reject a configuration the device path cannot honour exactly.
+    ///
+    /// `vocab` bounds `top_k` the way the host path does: a `top_k` at or above
+    /// the vocabulary would need the device path to sort the whole row, which
+    /// is exactly the thing it is built not to do.
+    pub fn validate(&self, vocab: usize) -> Result<(), SamplerError> {
+        if !self.temperature.is_finite() || self.temperature < 0.0 {
+            return Err(SamplerError::InvalidTemperature);
+        }
+        if self.top_k == 0 {
+            return Err(SamplerError::InvalidTopK);
+        }
+        if !self.top_p.is_finite() || self.top_p <= 0.0 || self.top_p > 1.0 {
+            return Err(SamplerError::InvalidTopP);
+        }
+        let limit = MAX_DEVICE_TOP_K.min(vocab.saturating_sub(1));
+        if self.top_k as usize > limit {
+            return Err(SamplerError::DeviceTopKTooLarge {
+                top_k: self.top_k as usize,
+                limit,
+            });
+        }
+        Ok(())
+    }
 }
 
 impl Sampler {
@@ -279,6 +355,143 @@ mod tests {
             )
             .expect("sampler");
             assert_eq!(sampler.sample(&logits).expect("sample"), 300, "top_k={top_k}");
+        }
+    }
+}
+
+#[cfg(test)]
+mod device_params_tests {
+    use super::{SamplerConfig, SamplerError, SamplerParams, MAX_DEVICE_TOP_K};
+
+    const VOCAB: usize = 262_144;
+
+    /// The shipped default must be servable on device, or the whole change is
+    /// aimed at nothing.
+    #[test]
+    fn the_shipped_default_is_device_servable() {
+        let params =
+            SamplerParams::from_config(SamplerConfig::default(), VOCAB).expect("default config");
+        assert_eq!(
+            params,
+            SamplerParams {
+                temperature: 1.0,
+                top_k: 64,
+                top_p: 0.95
+            }
+        );
+    }
+
+    /// `top_k` above the device bound is an **error**, not a clamp. A clamp
+    /// would sample from a different candidate set than the configuration asked
+    /// for and report success, which is precisely the silent quality regression
+    /// this change must not have (AGENTS.md §8).
+    #[test]
+    fn top_k_above_the_device_bound_is_an_error_not_a_clamp() {
+        for top_k in [MAX_DEVICE_TOP_K + 1, 4096, 262_144] {
+            let config = SamplerConfig {
+                temperature: 1.0,
+                top_k,
+                top_p: 0.95,
+            };
+            assert_eq!(
+                SamplerParams::from_config(config, VOCAB),
+                Err(SamplerError::DeviceTopKTooLarge {
+                    top_k,
+                    limit: MAX_DEVICE_TOP_K,
+                }),
+                "top_k={top_k} must be rejected, not clamped"
+            );
+        }
+        // ... and the boundary itself is accepted.
+        assert!(SamplerParams::from_config(
+            SamplerConfig {
+                temperature: 1.0,
+                top_k: MAX_DEVICE_TOP_K,
+                top_p: 0.95,
+            },
+            VOCAB,
+        )
+        .is_ok());
+    }
+
+    /// A `top_k` at or above the vocabulary is the other half of the bound: the
+    /// device path must not be asked to stage a candidate array as wide as the
+    /// row it is reducing.
+    #[test]
+    fn top_k_at_or_above_the_vocabulary_is_rejected() {
+        for (vocab, top_k) in [(64_usize, 64_usize), (64, 63), (64, 65), (64, 4096)] {
+            let config = SamplerConfig {
+                temperature: 1.0,
+                top_k,
+                top_p: 0.95,
+            };
+            let outcome = SamplerParams::from_config(config, vocab);
+            if top_k < vocab && top_k <= MAX_DEVICE_TOP_K {
+                assert!(outcome.is_ok(), "vocab={vocab} top_k={top_k} should be servable");
+            } else {
+                assert_eq!(
+                    outcome,
+                    Err(SamplerError::DeviceTopKTooLarge {
+                        top_k,
+                        limit: MAX_DEVICE_TOP_K.min(vocab - 1),
+                    }),
+                    "vocab={vocab} top_k={top_k}"
+                );
+            }
+        }
+    }
+
+    /// Every rejection the host sampler already makes must survive the trip
+    /// through `SamplerParams`, or a bad `--temperature` would reach the GPU.
+    #[test]
+    fn host_config_validation_is_not_bypassed() {
+        for (config, expected) in [
+            (
+                SamplerConfig {
+                    temperature: -1.0,
+                    top_k: 64,
+                    top_p: 0.95,
+                },
+                SamplerError::InvalidTemperature,
+            ),
+            (
+                SamplerConfig {
+                    temperature: f32::NAN,
+                    top_k: 64,
+                    top_p: 0.95,
+                },
+                SamplerError::InvalidTemperature,
+            ),
+            (
+                SamplerConfig {
+                    temperature: 1.0,
+                    top_k: 0,
+                    top_p: 0.95,
+                },
+                SamplerError::InvalidTopK,
+            ),
+            (
+                SamplerConfig {
+                    temperature: 1.0,
+                    top_k: 64,
+                    top_p: 0.0,
+                },
+                SamplerError::InvalidTopP,
+            ),
+            (
+                SamplerConfig {
+                    temperature: 1.0,
+                    top_k: 64,
+                    top_p: 1.5,
+                },
+                SamplerError::InvalidTopP,
+            ),
+        ] {
+            assert_eq!(
+                SamplerParams::from_config(config, VOCAB),
+                Err(expected),
+                "config={config:?} must be rejected the same way the host sampler rejects it"
+            );
         }
     }
 }

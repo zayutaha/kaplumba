@@ -48,6 +48,7 @@
 //! dispatches run a single threadgroup -- is the input to the fusion proposal in
 //! the accompanying notes, not a change.
 
+use kaplumba_engine::model::HeadPick;
 use kaplumba_kernels::encoder::{
     decode_max_dispatches_per_buffer, MetalEncoder, MAX_DISPATCHES_PER_BUFFER, MAX_IN_FLIGHT,
 };
@@ -618,13 +619,13 @@ fn real_weights_decode_step_issues_the_census_number() {
     encoder.set_max_dispatches(decode_max_dispatches_per_buffer());
 
     model
-        .forward_step_pipelined(&mut encoder, 0, Some(2), 0, 0)
+        .forward_step_pipelined(&mut encoder, 0, Some(2), 0, 0, HeadPick::Argmax)
         .expect("step 0");
     let first = encoder.dispatches_encoded();
     let first_buffers = encoder.command_buffers_created();
 
     model
-        .forward_step_pipelined(&mut encoder, 1, None, 1, 1)
+        .forward_step_pipelined(&mut encoder, 1, None, 1, 1, HeadPick::Argmax)
         .expect("step 1");
     let second = encoder.dispatches_encoded() - first;
     let second_buffers = encoder.command_buffers_created() - first_buffers;
@@ -681,7 +682,7 @@ fn one_command_buffer_per_step_needs_the_same_number_of_dispatches() {
     encoder.set_max_dispatches(u32::MAX);
 
     model
-        .forward_step_pipelined(&mut encoder, 0, Some(2), 0, 0)
+        .forward_step_pipelined(&mut encoder, 0, Some(2), 0, 0, HeadPick::Argmax)
         .expect("step 0");
     let dispatches = encoder.dispatches_encoded();
     let buffers = encoder.command_buffers_created();

@@ -417,18 +417,26 @@ fn temperature_above_zero_disables_the_pipelined_path() {
     );
 }
 
-/// The device-side token hand-off exists and is wired, and only the sampler
-/// needs the full row.
+/// The device-side token hand-off exists and is wired, and the row a pick reads
+/// is now a property of the pick rather than of the caller's buffers.
 ///
-/// `forward_step_pipelined` (`model.rs:3745`) passes `next_token_out` and
-/// `host_token_out` into `forward_chunk`, which reaches `encode_argmax_to_token`
-/// (`model.rs:4470`). `read_host_token` (`model.rs:3794`) reads one `u32`. So the
-/// *machinery* to produce a token on the device with no host row readback
-/// already exists and runs today in greedy mode; what stops it being used at
-/// `temperature > 0` is that sampling needs the whole 262,144-wide row, not its
-/// argmax. See the report for what that would cost on device.
+/// `forward_step_pipelined` (`model.rs`) passes a `HeadPick` and a `HeadOut`
+/// into `forward_chunk`, which reaches `encode_argmax_to_token`.
+/// `read_host_token` reads one `u32`. So the *machinery* to produce a token on
+/// the device with no host row readback existed before this change and runs in
+/// greedy mode; what stopped it being used at `temperature > 0` is that
+/// sampling needs the whole 262,144-wide row, not its argmax.
+///
+/// **Rewritten by `spec/device-sampler` T1.** The old version asserted that
+/// `skip_softcap` was derived from buffer presence. That was true, and it was
+/// correct for the only pick that existed -- but the moment a second pick does,
+/// the same predicate hands the sampler the *raw* row, and `softcap`
+/// (`tanh(x/30)*30`) compresses the distribution, so the sample comes from a
+/// different distribution than the host sampler it replaces. Monotonic, so
+/// argmax never noticed; invisible to tok/s, to a smoke test, to `--metrics`.
+/// The probe now asserts the row is derived from `HeadPick`.
 #[test]
-fn the_device_token_handoff_exists_and_only_argmax_is_staged() {
+fn the_device_token_handoff_exists_and_the_row_follows_the_pick() {
     assert!(
         MODEL_RS.contains("pub fn forward_step_pipelined("),
         "forward_step_pipelined moved"
@@ -438,29 +446,39 @@ fn the_device_token_handoff_exists_and_only_argmax_is_staged() {
         "read_host_token moved"
     );
     assert!(
-        MODEL_RS.contains("if next_token_out.is_some() || host_token_out.is_some() {"),
-        "the argmax-to-token dispatch gate moved in encode_lm_head"
+        MODEL_RS.contains("pub enum HeadPick {"),
+        "HeadPick moved; the row a pick reads must be derived from it, not from \
+         buffer presence"
     );
-    // `skip_softcap` is what makes the staged token equal the host argmax: it
-    // reads `scratch.logits` instead of `scratch.capped`, and softcap is
-    // monotonic so the argmax is the same either way.
+    // Only argmax, and only with a token being staged, may read the raw row.
     assert!(
-        MODEL_RS.contains("let skip_softcap = (next_token_out.is_some() || host_token_out.is_some())"),
-        "encode_lm_head's skip_softcap predicate moved"
+        MODEL_RS.contains("staging && matches!(self, HeadPick::Argmax)"),
+        "HeadPick::reads_raw_row changed shape. If it became `staging` alone the \
+         device sampler reads scratch.logits instead of scratch.capped, which \
+         silently samples a less-compressed distribution at every temperature > 0."
     );
-    // Nothing stages a *sampled* token: the only writers of `host_tokens` are
-    // the argmax path.
+    assert!(
+        MODEL_RS.contains("let skip_softcap = pick.skips_softcap(out.is_some());"),
+        "encode_lm_head's skip_softcap is no longer derived from the pick"
+    );
+    // The old buffer-presence predicate must be gone, not merely supplemented.
+    assert!(
+        !MODEL_RS.contains("next_token_out.is_some() || host_token_out.is_some()"),
+        "the buffer-presence softcap predicate is back"
+    );
+    // Nothing stages a *sampled* token yet: the only writers of `host_tokens`
+    // are the argmax path. (T2/T3 add the sampler; then this must be revisited.)
     let host_token_writes = MODEL_RS
         .lines()
         .filter(|line| line.contains("host_tokens") && line.contains("new_buffer"))
         .count();
     assert_eq!(
         host_token_writes, 1,
-        "expected exactly one `host_tokens` allocation (model.rs:3003, 8192 slots)"
+        "expected exactly one `host_tokens` allocation (ForwardScratch::new, 8192 slots)"
     );
     eprintln!(
         "TOKEN-HANDOFF device argmax staged into host_tokens[{HOST_TOKEN_SLOTS}]; \
-         no on-device sampler exists, so temperature>0 must read the row"
+         row selected by HeadPick, not by buffer presence"
     );
 }
 

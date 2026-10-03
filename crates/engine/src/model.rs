@@ -2919,6 +2919,101 @@ let use_sk4 = env_flag("KAPLUMBA_O_SK4")
     }
 }
 
+/// What the LM head should do with the 262,144-wide row it just produced, and
+/// -- just as importantly -- which row it should read.
+///
+/// **This enum exists because `skip_softcap` used to be derived from whether a
+/// host output buffer happened to be present.** That predicate is correct for
+/// argmax and silently wrong for sampling, and nothing would have caught it.
+///
+/// `softcap` is `tanh(x/30)*30` (`elements.metal`): monotonic, so the **argmax
+/// is unaffected** -- which is exactly why the greedy path has always been
+/// allowed to skip it -- but it **compresses the distribution**, so a sampler
+/// reading the raw row draws from a *different distribution* than the host
+/// sampler it replaces. Not tok/s, not a smoke test, not `--metrics`: the
+/// condition looked right because it *was* right, for the one caller that
+/// existed.
+///
+/// So the row a pick reads is now a property of the pick, not of the caller.
+/// `HeadPick::Sample` always reads `scratch.capped`.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum HeadPick {
+    /// argmax over the raw row, staged into `token_ids_decode[1 - slot]` and
+    /// `host_tokens[step_idx]`. Unchanged in every respect;
+    /// `KAPLUMBA_FORCE_SOFTCAP` still forces the capped row through, for the
+    /// argmax it does not change.
+    Argmax,
+    /// top-k -> softmax -> top-p -> inverse-CDF, on device, over `scratch.capped`.
+    Sample(crate::sampler::SamplerParams),
+}
+
+impl HeadPick {
+    /// Whether this pick is allowed to read the **raw** row at all, before
+    /// `KAPLUMBA_FORCE_SOFTCAP` is consulted.
+    ///
+    /// Split out from [`Self::skips_softcap`] so it is testable without an
+    /// environment variable, which is process-global and cannot be set from two
+    /// tests in one binary.
+    fn reads_raw_row(&self, staging: bool) -> bool {
+        staging && matches!(self, HeadPick::Argmax)
+    }
+
+    /// Whether this pick may read the **raw** row and skip the softcap.
+    ///
+    /// Only argmax, and only when a token is actually being staged: with no
+    /// staging buffers the head still has to leave `scratch.capped` populated,
+    /// because `forward_buffer_into_vec` copies it back to the host.
+    fn skips_softcap(&self, staging: bool) -> bool {
+        self.reads_raw_row(staging) && !env_flag("KAPLUMBA_FORCE_SOFTCAP")
+    }
+}
+
+/// Where a staged token goes, when one is being staged.
+///
+/// Bundled with `step_idx` because all three travel together and a partially
+/// updated set is not a state the head can encode.
+#[derive(Clone, Copy, Debug)]
+pub struct HeadOut<'a> {
+    /// `token_ids_decode[1 - slot]`: the next decode step's input slot, written
+    /// on the GPU so the host never feeds a device-produced token back in.
+    pub next_token: &'a Buffer,
+    /// `host_tokens`: what `read_host_token` reads.
+    pub host_token: &'a Buffer,
+    pub step_idx: u32,
+}
+
+#[cfg(test)]
+mod head_pick_tests {
+    use super::HeadPick;
+    use crate::sampler::{SamplerConfig, SamplerParams};
+
+    fn sample() -> HeadPick {
+        HeadPick::Sample(SamplerParams::from_config(SamplerConfig::default(), 262_144).unwrap())
+    }
+
+    /// The property T1 exists for: `Sample` must never inherit argmax's licence
+    /// to read `scratch.logits`.
+    ///
+    /// Every cell is asserted, including the ones that look obvious, because
+    /// the failure mode is invisible: a sampler reading the raw row still
+    /// produces fluent, plausible text at the shipped default temperature.
+    #[test]
+    fn only_argmax_with_staging_reads_the_raw_row() {
+        // Argmax + a token is staged: today's pipelined greedy path, and the
+        // case that made skipping the softcap safe in the first place.
+        assert!(HeadPick::Argmax.reads_raw_row(true), "argmax + staging");
+        // Argmax + nothing staged (prefill, or a row readback): the head still
+        // has to leave `scratch.capped` populated for the host.
+        assert!(!HeadPick::Argmax.reads_raw_row(false), "argmax, no staging");
+        // The point of the whole change.
+        assert!(
+            !sample().reads_raw_row(true),
+            "SAMPLE MUST READ THE CAPPED ROW even when a token is being staged"
+        );
+        assert!(!sample().reads_raw_row(false), "sample, no staging");
+    }
+}
+
 /// Fixed-size activation scratch reused by every layer of every forward.
 ///
 /// Sizes depend only on the configured chunk length, never on the context
@@ -3773,6 +3868,12 @@ impl TextModel {
         kaplumba_kernels::elements::decode_argmax_token(keys)
     }
 
+    /// One pipelined decode step: stage the token, run the forward, and stage
+    /// the next token on the device so the host reads one `u32`.
+    ///
+    /// `pick` decides what the head does with the row and **which row it reads**
+    /// -- see [`HeadPick`]. `HeadPick::Argmax` is what every caller passed
+    /// before the device sampler existed, and it is byte-for-byte today's code.
     pub fn forward_step_pipelined(
         &mut self,
         encoder: &mut MetalEncoder,
@@ -3780,6 +3881,7 @@ impl TextModel {
         token: Option<u32>,
         slot: usize,
         step_idx: u32,
+        pick: HeadPick,
     ) -> Result<(), ModelError> {
         let slot = slot % 2;
         let next_slot = 1 - slot;
@@ -3815,9 +3917,12 @@ impl TextModel {
             encoder,
             &mut gpu,
             true,
-            Some(&next_token_buffer),
-            Some(&host_token_buffer),
-            step_idx,
+            pick,
+            Some(HeadOut {
+                next_token: &next_token_buffer,
+                host_token: &host_token_buffer,
+                step_idx,
+            }),
         )?;
         Ok(())
     }
@@ -3989,7 +4094,15 @@ impl TextModel {
         let result: Result<(), ModelError> = if token_ids.len() <= chunk {
             gpu.chunks += 1;
             gpu.chunk_rows = token_ids.len();
-            self.forward_chunk(token_ids, positions, encoder, &mut gpu, true, None, None, 0)
+            self.forward_chunk(
+                token_ids,
+                positions,
+                encoder,
+                &mut gpu,
+                true,
+                HeadPick::Argmax,
+                None,
+            )
         } else {
             // Only the last chunk's logits survive this loop, so only the last
             // chunk may run the vocabulary head. `peek` is the whole test: the
@@ -4004,9 +4117,15 @@ impl TextModel {
                 gpu.chunks += 1;
                 gpu.chunk_rows = chunk_ids.len();
                 let last = chunks.peek().is_none();
-                if let Err(error) =
-                    self.forward_chunk(chunk_ids, chunk_positions, encoder, &mut gpu, last, None, None, 0)
-                {
+                if let Err(error) = self.forward_chunk(
+                        chunk_ids,
+                        chunk_positions,
+                        encoder,
+                        &mut gpu,
+                        last,
+                        HeadPick::Argmax,
+                        None,
+                    ) {
                     // Report what ran before the failure rather than throwing
                     // the measurements away; then propagate.
                     outcome = Err(error);
@@ -4057,9 +4176,8 @@ impl TextModel {
         encoder: &mut MetalEncoder,
         gpu: &mut GpuProfile,
         run_head: bool,
-        next_token_out: Option<&Buffer>,
-        host_token_out: Option<&Buffer>,
-        step_idx: u32,
+        pick: HeadPick,
+        out: Option<HeadOut<'_>>,
     ) -> Result<(), ModelError> {
         if token_ids.len() != positions.len() || token_ids.is_empty() {
             return Err(ModelError::InvalidInput(
@@ -4308,7 +4426,7 @@ impl TextModel {
         gpu.stamp(encoder, "chunk/copy_last_row")?;
         // `encode_lm_head` stamps its own sub-steps (head/final_norm, head/gemv,
         // head/softcap).
-        self.encode_lm_head(encoder, gpu, next_token_out, host_token_out, step_idx)?;
+        self.encode_lm_head(encoder, gpu, pick, out)?;
         gpu_flush!();
         // No greedy pick is encoded here. It used to be, into
         // `scratch.token_ids[tokens]` — one element past the end of that buffer
@@ -4416,9 +4534,8 @@ impl TextModel {
         &self,
         encoder: &mut MetalEncoder,
         profile: &mut GpuProfile,
-        next_token_out: Option<&Buffer>,
-        host_token_out: Option<&Buffer>,
-        step_idx: u32,
+        pick: HeadPick,
+        out: Option<HeadOut<'_>>,
     ) -> Result<(), ModelError> {
         let hidden = self.hidden_size;
         let vocab = self.vocab_size;
@@ -4472,8 +4589,12 @@ impl TextModel {
         // the chunk after the layer GEMMs, so it gets its own boundary rather
         // than hiding inside the head's phase total.
         profile.stamp(encoder, "head/gemv")?;
-        let skip_softcap = (next_token_out.is_some() || host_token_out.is_some())
-            && !env_flag("KAPLUMBA_FORCE_SOFTCAP");
+        // THE row this pick reads. Derived from `pick`, not from whether the
+        // caller happens to have a staging buffer -- see `HeadPick`. Before this
+        // was `pick`-independent, `Sample` inherited argmax's licence to read
+        // `scratch.logits` and would have sampled a *less compressed* row than
+        // the host sampler it replaces, silently and at every temperature > 0.
+        let skip_softcap = pick.skips_softcap(out.is_some());
         let argmax_src = if skip_softcap {
             &self.scratch.logits
         } else {
@@ -4496,14 +4617,14 @@ impl TextModel {
             )
             .map_err(ModelError::Kernel)?;
         profile.stamp(encoder, "head/argmax")?;
-        if next_token_out.is_some() || host_token_out.is_some() {
+        if let Some(out) = out {
             self.elements
                 .encode_argmax_to_token(
                     encoder,
                     &self.scratch.argmax_keys,
-                    next_token_out,
-                    host_token_out,
-                    step_idx,
+                    Some(out.next_token),
+                    Some(out.host_token),
+                    out.step_idx,
                 )
                 .map_err(ModelError::Kernel)?;
             profile.stamp(encoder, "head/argmax_token")?;

@@ -468,6 +468,7 @@ impl<'a> ChatSession<'a> {
                         if step == 0 { Some(token) } else { None },
                         step % 2,
                         step as u32,
+                        crate::model::HeadPick::Argmax,
                     )
                     .map_err(ModelError::from)?;
                 encoder.commit_terminal().map_err(ModelError::from)?;
