@@ -78,14 +78,21 @@ Each task is one commit. Status updated immediately after each.
       `KAPLUMBA_O_SK4=1` −0.4%. Shipped config is already optimal.
       *Files:* `findings/F5-o-proj-closed.md`; F3's table corrected.
 
-- [ ] **T6 — the lane window.** **Correction to the earlier text:** this does *not*
-      necessarily need a repack. The 768-bit ring order is a shared convention
-      between the repacker and the kernel, but the *partition* of those 768 bits
-      into lanes is the kernel's own; 16 lanes × 48 bits tiles the ring exactly.
-      So a wider window may be reachable by re-partitioning alone, provided the
-      bit→(output,input) map is preserved. That map has to be read out of
-      `decode_state_mcg` / `pack_integer_states` first — it is not reverse-engineered
-      yet. Ceiling if it works: ~18.2–18.7 tok/s. The ring is
+- [x] **T6 — the lane window, analysed and declined (R2/R5).** Walked out of the
+      packer and the kernel rather than assumed. Two corrections to the headline:
+      (a) **48 bits do not fit in 64.** The ring's `-16` rotation puts every window
+      at offset `19 + 16L mod 32 ∈ {19, 3}`, never 0, so a 48-bit span needs
+      **3 words**, giving 96/48 = **2.0×** amplification, not the 1.33× the idea
+      assumed. (b) **`x` loads are a third of the traffic and do not improve**,
+      so total load bytes go **1.50 → 1.25 per code (−17%)**, not −50%.
+      Against arm (c)'s measured +11% for *all* DRAM cost, a −17% request-count
+      change is a low-single-digit win, for a rewrite that re-earns bit-exactness.
+      *Declined.* *Files:* `findings/F6-wide-window-analysed.md`.
+
+- [ ] **T8 — the only remaining route.** Fewer bytes/token or more tokens per
+      weight pass. Verify-gated speculative decoding / MTP, permitted explicitly
+      by AGENTS §8; **no infrastructure for it exists in this tree**. Needs its own
+      spec. Every bandwidth lever is now closed by measurement: T2/T3/T4/F3/F4/F5/F6. The ring is
       ordered by `(lane, k)` with `lane = 4*(o mod 8) + g`, so one output's 16
       inputs are *strided* across four lanes by 32 codes. A 16-code contiguous
       window is not a usable `(output, input)` set, so widening the window requires

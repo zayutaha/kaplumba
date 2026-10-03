@@ -213,6 +213,50 @@ shape (512,336,48) x 50     825.75 MB
 
 So 12.039 GB is exact and the F3/F4 arithmetic is not resting on a stale figure.
 
+## T6 — the wide lane window, analysed out (file: `findings/F6-wide-window-analysed.md`)
+
+Recovered the bit→(output,input) map from `pack_integer_windows`
+(`crates/engine/src/exl3.rs:330-353`) plus `extract_v_mcg_32` / `_fused2_2col`:
+
+```
+R(o,i) = 96*(o mod 8) + 24*g + 755 + 12*(o>=8) + 3*idx(i)
+```
+
+One output's two adjacent input groups are a contiguous 48-bit span, so 16 lanes x 48 bits
+tile the 768-bit ring exactly — **no repack is needed**, the ring order is unchanged.
+But the window start is `755 + 48L`, so `sh = (755+48L) mod 32 = 19 + 16L mod 32`, which is
+**19 or 3, never 0**. At sh=19 a 48-bit span needs bits [19,67) = **3 words**:
+
+```
+current  2 words = 64 bits /  8 codes (24 useful) -> 2.67x
+wide     3 words = 96 bits / 16 codes (48 useful) -> 2.00x
+"ideal"  2 words = 64 bits / 16 codes             -> 1.33x   <- unreachable
+```
+
+And per code, `x` loads do not improve (0.50 B either way), so total load traffic per
+code goes 1.50 -> 1.25 B, **-17%**, not -50%. Arm (c) — which removes *all* DRAM cost at
+the same instruction count — is only +11%. **Declined.**
+
+If anyone wants the cheap falsifier before discarding it: one probe arm, replica with a
+single `uint2` instead of two `u32` at the same address. Odd-`j0` lanes cannot use
+`uint2` (the recorded `uint4`/`ulong2` dead end), so it is a 50%-of-lanes experiment on
+the exact axis.
+
+## Live per-kernel numbers after the F5 correction
+
+| kernel | own ms/step | bytes/token | GB/s |
+|---|---:|---:|---:|
+| gate_up_gelu | 25.58 | 5.202 GB | 203.4 |
+| down_proj | 13.10 | 2.601 GB | 198.6 |
+| qkv_proj | 8.62 | 1.652 GB | 191.6 |
+| qk_proj | 1.95 | 0.372 GB | 190.4 |
+| o_proj | 6.22 | 1.156 GB | 186.0 |
+| head/gemv | 4.11 | 1.057 GB | ~257 |
+
+186-203 GB/s across every 3 bpw projection. `KAPLUMBA_ABLATE=o_proj_gemv`:
+16.001 -> 17.865 tok/s (+11.6%, 6 pairs), so o_proj's 6.2 ms is real and the profiler is
+not mis-attributing. `KAPLUMBA_O_NOSK=1` -1.4% (6/6), `KAPLUMBA_O_SK4=1` -0.4%.
+
 ## Open, with the current best guess
 
 - **Q1** the two-gate_proj 10% spread → placement, worth ~10% if model-wide.
