@@ -1113,7 +1113,6 @@ impl ElementKernels {
             &self.sample_draw_pipeline,
             &[
                 Some(candidates),
-                None,
                 Some(rng),
                 token_out,
                 host_token_out,
