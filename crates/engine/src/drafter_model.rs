@@ -115,6 +115,7 @@ impl DrafterModel {
             1024,
             inputs_embeds_row.len(),
         )?;
+        trace_stage("pre_projection", &h);
 
         for (i, layer) in self.layers.iter().enumerate() {
             let prefix = format!("model.layers.{i}");
@@ -125,6 +126,7 @@ impl DrafterModel {
                 1024,
                 1e-6,
             )?;
+            trace_stage(&format!("layer{i}.input_layernorm"), &hn);
             let q = self.gemv_named(
                 &hn,
                 &format!("model.layers.{i}.self_attn.q_proj"),
@@ -148,6 +150,7 @@ impl DrafterModel {
                 partial_factor: if layer.full { 0.25 } else { 1.0 },
                 proportional: layer.full,
             })?;
+            trace_stage(&format!("layer{i}.q_rope"), &q);
             let kv = if layer.full { &shared.full } else { &shared.sliding };
             if kv.kv_heads * kv.head_dim != kv.keys.len() / kv.len.max(1) {
                 return Err(DrafterError::BadShape);
@@ -164,6 +167,7 @@ impl DrafterModel {
                 scale: 1.0,
                 window: if layer.full { 0 } else { layer.sliding_window },
             })?;
+            trace_stage(&format!("layer{i}.attn"), &attn);
             let o = self.gemv_named(
                 &attn,
                 &format!("model.layers.{i}.self_attn.o_proj"),
@@ -178,6 +182,7 @@ impl DrafterModel {
                 1e-6,
             )?;
             let mut out = self.elements.residual_add(&h, &o)?;
+            trace_stage(&format!("layer{i}.post_attn_residual"), &out);
 
             let resid = out.clone();
             let hn = self.elements.rms_norm(
@@ -216,6 +221,7 @@ impl DrafterModel {
             out = self.elements.residual_add(&resid, &mlp)?;
             let scalar = layer_scalar_of(&self.weights, i)?;
             h = self.elements.layer_scale(&out, scalar)?;
+            trace_stage(&format!("layer{i}.out"), &h);
         }
 
         let h_normed = self.elements.rms_norm(
@@ -225,8 +231,10 @@ impl DrafterModel {
             1024,
             1e-6,
         )?;
+        trace_stage("final_norm", &h_normed);
         let last_hidden =
             self.gemv_named(&h_normed, "post_projection", 5376, 1024)?;
+        trace_stage("post_projection", &last_hidden);
         Ok(DrafterStep { last_hidden, hidden: h_normed })
     }
 
@@ -293,6 +301,33 @@ impl DrafterModel {
         let ptr = buf.contents() as *const u16;
         Ok(unsafe { std::slice::from_raw_parts(ptr, n) })
     }
+}
+
+/// NaN/infinity probe used by the MTP acceptance harness to localise a bad
+/// stage. Off unless `KAPLUMBA_DRAFTER_TRACE` is set; the check is O(n) over
+/// rows that are at most 5376 wide, so it is not free but never runs in
+/// production.
+fn trace_stage(name: &str, values: &[u16]) {
+    if std::env::var_os("KAPLUMBA_DRAFTER_TRACE").is_none() {
+        return;
+    }
+    let bad = values
+        .iter()
+        .filter(|v| {
+            let f = half::f16::from_bits(**v).to_f32();
+            f.is_nan() || f.is_infinite()
+        })
+        .count();
+    let head: Vec<String> = values
+        .iter()
+        .take(4)
+        .map(|v| format!("{:.4}", half::f16::from_bits(*v).to_f32()))
+        .collect();
+    eprintln!(
+        "[drafter] {name}: len={} bad={bad} head=[{}]",
+        values.len(),
+        head.join(", ")
+    );
 }
 
 fn shape_of_qproj(weights: &DrafterWeights, i: usize) -> Result<usize, DrafterError> {

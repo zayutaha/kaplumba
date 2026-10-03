@@ -190,21 +190,60 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     let mut sampler = Sampler::new(sampler_cfg, args.seed)?;
 
-    // Tokenize the prompt with the engine's tokenizer is more machinery than the
-    // gate needs; use the known-safe single-token seed and grow context from
-    // there. (A real prompt tokenizer hookup is T7's job.)
-    // BOS for Gemma is 2.
-    let mut context: Vec<u32> = vec![2];
+    // A real prompt. A BOS-only context makes the target loop on one token, and
+    // a loop measures acceptance of ~1.0 for free — the gate must be measured on
+    // text the model actually wants to continue.
+    let tokenizer = kaplumba_engine::tokenizer::GemmaTokenizer::from_model_dir(std::path::Path::new(
+        &args.target,
+    ))?;
+    let mut context: Vec<u32> = tokenizer.encode_prompt(&args.prompt)?;
+    eprintln!("prompt tokenized to {} tokens", context.len());
 
     let mut accepted_hist: Vec<usize> = Vec::new();
     let mut rounds_done = 0usize;
+    let (mut depth1_measured, mut depth1_exact, mut depth1_top5, mut depth1_top20) =
+        (0usize, 0usize, 0usize, 0usize);
     let start = Instant::now();
+
+    // Prefill the whole prompt in ONE M>1 forward so the target's KV cache and
+    // its next-token prediction are real. Without this the context is a single
+    // BOS token, the target loops on one id, and acceptance reads ~1.0 for free
+    // — a gate measured on a degenerate loop is not a gate.
+    let prefill_len = context.len();
+    let positions: Vec<u32> = (0..prefill_len as u32).collect();
+    let (_, prefill_logits) = target.forward_with_hidden(&context, &positions)?;
+    eprintln!(
+        "prefilled {prefill_len} tokens; cache primed; gpu_next_position={}",
+        target.gpu_next_position()
+    );
+
+    // Invariant for the rest of the program:
+    //
+    //   * `context` = every COMMITTED token plus exactly one PENDING token,
+    //     which is `context.last()`;
+    //   * the target's KV cache holds `context[..len-1]` — the pending token is
+    //     predicted but not yet fed.
+    //
+    // So the pending token is fed at slot `context.len() - 1` at the top of each
+    // round, which is also where the cache expects the next write. Getting this
+    // off by one either trips the cache's monotonic-position check or, worse,
+    // silently double-counts a token.
+    context.push(if args.temperature == 0.0 {
+        greedy_token(&prefill_logits)
+    } else {
+        sample_token(&prefill_logits, &mut sampler)
+    });
 
     // Round loop: draft K, verify token-by-token with the target (M=1).
     while rounds_done < args.rounds {
-        let position = context.len();
-        // 1) Target forward on the last token to get its hidden + logits.
+        let position = context.len() - 1;
         let last_token = *context.last().unwrap();
+        if std::env::var_os("MTP_VERBOSE").is_some() {
+            eprintln!(
+                "round {rounds_done}: feeding {last_token} at pos={position} (cache at {})",
+                target.gpu_next_position()
+            );
+        }
         let (hidden, logits) = target.forward_with_hidden(&[last_token], &[position as u32])?;
         let target_token = if args.temperature == 0.0 {
             greedy_token(&logits)
@@ -222,16 +261,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             full: build_kv_slice(&f_keys, &f_values, &f_slots, f_heads, f_head_dim),
         };
 
-        // 3) Drafter autoregressively drafts K tokens from the same position,
-        //    feeding its own previous draft back each step (position held constant,
-        //    per the reference draft_block).
-        // 3) Drafter autoregressively drafts K tokens. Per the reference
-        //    `draft_block`, `position_ids` is held CONSTANT at kv_offset
-        //    (= position + 1, the next slot) across all K steps, and each step
-        //    feeds its own previous draft back.
-        let draft_position = position + 1;
-        let mut tok_embed = target_embedding_scaled(&target, target_token);
-        let mut prev_hidden = hidden.clone(); // the target's hidden that produced target_token
+        // 3) Draft K tokens autoregressively.
+        //
+        //    Two details are load-bearing and both were wrong in the first
+        //    version of this harness, which measured a meaningless 0.675/round:
+        //
+        //    * Position. `_mtp_draft_position` is `kv_valid_len - 1`
+        //      (`mtp.py:714-719`), i.e. the drafter queries at the slot of the
+        //      LAST token in the shared KV, not the slot after it. The KV holds
+        //      `position + 1` tokens here, so the drafter's position is
+        //      `position`.
+        //    * Conditioning. `draft_block(last_bonus, hidden, ...)` pairs
+        //      `embed(last_bonus)` with the hidden state OF THAT SAME TOKEN
+        //      (`gemma4_assistant.py:224-246`). So the first drafter input is
+        //      `[embed(last_token), hidden(last_token)]`, and its output predicts
+        //      the slot AFTER `last_token` — the same slot `target_token`
+        //      predicts. That makes draft[0] directly comparable to
+        //      `target_token` with no extra forward.
+        let draft_position = position;
+        let mut tok_embed = target_embedding_scaled(&target, last_token);
+        let mut prev_hidden = hidden.clone(); // the target's hidden for `last_token`
         let mut drafts = Vec::with_capacity(args.k);
         for _ in 0..args.k {
             let mut input = vec![0u16; tok_embed.len() + prev_hidden.len()];
@@ -249,78 +298,168 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             drafts.push(drafted);
         }
 
-        // 4) Verify against the target's own continuation, one token per forward
-        //    (M=1 — enough to measure the acceptance RATE, which does not depend
-        //    on how the verify is batched).
+        // 4) Verify against the target's own continuation, one forward per
+        //    accepted token (M=1). The acceptance RATE does not depend on how
+        //    the verify is batched, so this measures the gate without T8a.
         //
-        //    G0 = target_token already predicted after `last_token` (position).
-        //    draft[0] predicts the slot AFTER G0, so the first verification
-        //    forward feeds G0 @ position+1 to get G1, and compares draft[0] to G1.
-        //    Each acceptance then feeds the accepted token forward to learn the
-        //    next target prediction. After accepting `a` drafts, `next_target`
-        //    is the bonus/correction token.
+        //    `expected` is always "the target's prediction for the slot that
+        //    draft[i] proposes". For i=0 that slot is the one `target_token`
+        //    already predicts; afterwards it is `bonus`, learned by feeding the
+        //    just-accepted token forward.
         let mut accepted = 0usize;
-        let (_, logit_row) =
-            target.forward_with_hidden(&[target_token], &[(position + 1) as u32])?;
-        let mut next_target = if args.temperature == 0.0 {
-            greedy_token(&logit_row)
-        } else {
-            sample_token(&logit_row, &mut sampler)
-        };
+        let mut expected = target_token;
+        // Is draft[0] merely losing an argmax tie, or is the drafter nowhere near?
+        // Top-k containment of the drafter's first proposal against the target's
+        // row separates "drafter understands this context" from "drafter is not
+        // conditioned on this target at all" — the difference between "too weak
+        // for 40 tok/s" and "this harness is still wrong".
+        let target_top20: Vec<usize> = top_k_indices(&logits, 20);
+        let target_top5: Vec<usize> = target_top20[..5.min(target_top20.len())].to_vec();
         for (i, &drafted) in drafts.iter().enumerate() {
-            if drafted == next_target {
-                accepted = i + 1;
-                let pos = position + 1 + accepted;
-                let (_, logit_row) = target.forward_with_hidden(&[drafted], &[pos as u32])?;
-                next_target = if args.temperature == 0.0 {
-                    greedy_token(&logit_row)
-                } else {
-                    sample_token(&logit_row, &mut sampler)
-                };
-            } else {
+            if drafted != expected {
                 break;
             }
+            accepted = i + 1;
+            let pos = position + accepted;
+            if std::env::var_os("MTP_VERBOSE").is_some() {
+                eprintln!(
+                    "  verify[{i}] feeding {drafted} at pos={pos} (cache at {})",
+                    target.gpu_next_position()
+                );
+            }
+            let (_, logit_row) = target.forward_with_hidden(&[drafted], &[pos as u32])?;
+            expected = if args.temperature == 0.0 {
+                greedy_token(&logit_row)
+            } else {
+                sample_token(&logit_row, &mut sampler)
+            };
         }
+        let next_target = expected;
 
         accepted_hist.push(accepted);
         rounds_done += 1;
+        if let Some(&first_draft) = drafts.first() {
+            depth1_measured += 1;
+            if first_draft == target_token {
+                depth1_exact += 1;
+            }
+            if target_top5.contains(&(first_draft as usize)) {
+                depth1_top5 += 1;
+            }
+            if target_top20.contains(&(first_draft as usize)) {
+                depth1_top20 += 1;
+            }
+        }
 
-        // Commit: G0, the confirmed drafts, and the bonus/correction token.
-        context.push(target_token);
-        for i in 0..accepted {
-            context.push(drafts[i]);
+        // Diagnostics: a 0% acceptance that is really a wiring bug looks exactly
+        // like a 0% acceptance that is a real result, so print both token streams
+        // until the gate has been shown to be trustworthy.
+        if std::env::var_os("MTP_VERBOSE").is_some() {
+            let h0 = f16::from_bits(hidden[0]).to_f32();
+            let any_nan = hidden.iter().any(|v| f16::from_bits(*v).to_f32().is_nan());
+            let kv_s_nan = shared.sliding.keys.iter().any(|v| f16::from_bits(*v).to_f32().is_nan());
+            let kv_f_nan = shared.full.keys.iter().any(|v| f16::from_bits(*v).to_f32().is_nan());
+            eprintln!("[round {rounds_done}] pos={position} target_hidden[0]={h0} nan_in_hidden={any_nan} nan_in_sliding_kv={kv_s_nan} nan_in_full_kv={kv_f_nan} sliding_len={} full_len={}", shared.sliding.len, shared.full.len);
+            eprintln!("  target G0 = {target_token}");
+            eprintln!("  drafts    = {drafts:?}");
+            eprintln!("  accepted  = {accepted}");
+        }
+
+        // Commit.
+        //
+        //   * `accepted == 0`: no verification forward ran, so the cache still
+        //     covers 0..=position and the pending token IS `target_token`. Pushing
+        //     it as both a committed and a pending token double-counted it and
+        //     desynchronised `context` from the cache by one slot — which is what
+        //     produced "positions must begin at the current cache position" on
+        //     round 1.
+        //   * `accepted > 0`: the cache covers 0..=position+accepted, holding
+        //     `target_token` (== draft[0]) then draft[1..accepted].
+        if accepted > 0 {
+            context.push(target_token);
+            for i in 1..accepted {
+                context.push(drafts[i]);
+            }
         }
         context.push(next_target);
-        if context.len() > 1024 {
-            context.drain(..context.len() - 512);
+        // Trimming `context` would desynchronise it from the KV cache (the cache
+        // has no "roll back" that a `drain` implies), so stop instead of
+        // pretending. A long run is a `--rounds` job, not a trimming one.
+        if context.len() >= 900 {
+            eprintln!("context reached {} tokens; stopping measurement", context.len());
+            break;
         }
     }
 
     let elapsed = start.elapsed();
     let total_accepted: usize = accepted_hist.iter().sum();
-    let mean_accepted = total_accepted as f64 / accepted_hist.len().max(1) as f64;
-    let target_pass_ms = 89.5; // measured single-token target GPU span, spec/decode-3bpw-amplification
+    let rounds = accepted_hist.len().max(1) as f64;
+    let mean_accepted = total_accepted as f64 / rounds;
+    // P(the i-th draft is reached AND accepted). Depth-1 is the health check on
+    // the drafter itself: a correctly conditioned drafter accepts its FIRST
+    // proposal far more often than not. A low depth-1 rate would mean the wiring
+    // is wrong rather than that the drafter is weak, which is the difference
+    // between "MTP is too slow" and "this harness is broken".
+    let mut depth_hits = vec![0usize; args.k];
+    for &a in &accepted_hist {
+        for slot in depth_hits.iter_mut().take(a) {
+            *slot += 1;
+        }
+    }
+    let target_pass_ms = 89.5; // measured single-token target GPU span
     let achieved_tps = mean_accepted * 1000.0 / target_pass_ms;
 
     eprintln!("\n=== MTP acceptance gate (K={}, temperature={:.1}) ===", args.k, args.temperature);
     eprintln!("rounds: {}", accepted_hist.len());
     eprintln!("mean accepted drafts/round: {mean_accepted:.3}");
-    eprintln!("accepted histogram: {:?}", accepted_hist);
+    eprintln!("accepted histogram: {accepted_hist:?}");
+    eprintln!(
+        "P(accept at depth d): [{}]",
+        depth_hits
+            .iter()
+            .map(|h| format!("{:.3}", *h as f64 / rounds))
+            .collect::<Vec<_>>()
+            .join(", ")
+    );
+    if depth1_measured > 0 {
+        let n = depth1_measured as f64;
+        eprintln!(
+            "drafter draft[0] vs target: exact {}/{} ({:.3}), in top-5 {:.3}, in top-20 {:.3}",
+            depth1_exact,
+            depth1_measured,
+            depth1_exact as f64 / n,
+            depth1_top5 as f64 / n,
+            depth1_top20 as f64 / n,
+        );
+    }
     eprintln!("implied tok/s at {target_pass_ms:.0}ms target pass: {achieved_tps:.2}");
     eprintln!("40 tok/s needs >= 3.14 accepted/pass: {}", if mean_accepted >= 3.14 { "PASS" } else { "FAIL" });
     eprintln!("wall clock: {:.1}s", elapsed.as_secs_f64());
     Ok(())
 }
 
-/// Scaled target embedding for one token. The reference multiplies the target's
-/// embedding by `embed_scale = sqrt(hidden_size)` before handing it to the
-/// drafter (`gemma4_assistant.py` `draft_block`, `language.py:377`).
+/// Scaled target embedding for one token.
+///
+/// `TextModel::embedding` already returns `embed_tokens[token] * sqrt(hidden)`,
+/// which is exactly what the reference multiplies by `embed_scale`
+/// (`gemma4_assistant.py` `draft_block`, `language.py:377`), so this is now a
+/// straight pass-through. It previously re-interpreted raw BF16 checkpoint bits
+/// as FP16, which produced `-inf`/`NaN` and a meaningless 0% acceptance rate.
 fn target_embedding_scaled(target: &TextModel, token: u32) -> Vec<u16> {
-    let raw = target.embedding(&[token]);
-    let scale = (target.hidden_size() as f32).sqrt();
-    raw.into_iter()
-        .map(|v| f16::from_f32(f16::from_bits(v).to_f32() * scale).to_bits())
-        .collect()
+    target.embedding(&[token])
+}
+
+/// Top-k token indices of an f16 logit row, descending by value.
+fn top_k_indices(logits: &[u16], k: usize) -> Vec<usize> {
+    let mut order: Vec<usize> = (0..logits.len()).collect();
+    order.sort_unstable_by(|&a, &b| {
+        f16::from_bits(logits[b])
+            .to_f32()
+            .partial_cmp(&f16::from_bits(logits[a]).to_f32())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
+    order.truncate(k);
+    order
 }
 
 /// Project the drafter's post-projection hidden through the target's embedding

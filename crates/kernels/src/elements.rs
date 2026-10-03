@@ -437,17 +437,42 @@ impl ElementKernels {
         vocab_size: usize,
         scale: f32,
     ) -> Result<Vec<u16>, KernelError> {
+        self.embedding_scaled_view(tokens, embedding, 0, false, hidden_size, vocab_size, scale)
+    }
+
+    /// Embedding lookup against a possibly offloaded table.
+    ///
+    /// `offset` is the byte offset of row 0 inside `embedding`, which is
+    /// non-zero when the table is a page-aligned window over the shard mapping
+    /// (`no_copy_view`). `bf16` says the stored rows are BF16 and the kernel
+    /// must widen them. The buffer is allowed to be LONGER than
+    /// `hidden * vocab * 2` — that is what the alignment window does — so this
+    /// checks that the table *fits* rather than that it is exactly the right
+    /// size. The exact-length check this replaces made every offloaded model
+    /// unloadable on this path, and `TextModel::embedding`'s host mirror read
+    /// the wrong bytes as a result.
+    pub fn embedding_scaled_view(
+        &self,
+        tokens: &[u32],
+        embedding: &Buffer,
+        offset: u64,
+        bf16: bool,
+        hidden_size: usize,
+        vocab_size: usize,
+        scale: f32,
+    ) -> Result<Vec<u16>, KernelError> {
         if tokens.is_empty() || hidden_size == 0 || vocab_size == 0 || !scale.is_finite() {
             return Err(KernelError::InvalidInput(
                 "embedding buffer dimensions are invalid".to_string(),
             ));
         }
-        let expected = checked_product(hidden_size, vocab_size, "embedding shape")?
+        let needed = checked_product(hidden_size, vocab_size, "embedding shape")?
             .checked_mul(2)
+            .and_then(|bytes| bytes.checked_add(offset as usize))
             .ok_or_else(|| KernelError::InvalidInput("embedding shape overflows".to_string()))?;
-        if embedding.length() != expected as u64 {
+        if embedding.length() < needed as u64 {
             return Err(KernelError::InvalidInput(
-                "embedding buffer length does not match dimensions".to_string(),
+                "embedding buffer is shorter than the table it must hold".to_string(),
             ));
         }
         if tokens.iter().any(|token| *token as usize >= vocab_size) {
@@ -463,8 +488,8 @@ impl ElementKernels {
             hidden: to_u32(hidden_size, "hidden size")?,
             vocab: to_u32(vocab_size, "vocabulary size")?,
             scale,
-            offset: 0,
-            bf16: 0,
+            offset: to_u32(offset as usize, "embedding byte offset")?,
+            bf16: u32::from(bf16),
         };
         self.run(
             &self.embedding_pipeline,

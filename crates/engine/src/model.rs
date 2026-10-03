@@ -3288,6 +3288,12 @@ pub struct TextModel {
     spin_scratch: Option<Buffer>,
 }
 
+/// f16 bit pattern scaled by `scale`, returned as f32. Used by the speculative
+/// host path to apply the embedding scale without a kernel round trip.
+fn f16_scaled(bits: u16, scale: f32) -> f32 {
+    half::f16::from_bits(bits).to_f32() * scale
+}
+
 impl TextModel {
     /// Threads the injected `spin_burn` dispatch runs. Wide enough to fill the
     /// GPU's cores several times over, so the loop's cost is set by `iters` and
@@ -4939,25 +4945,43 @@ impl TextModel {
         }
     }
 
-    /// Raw embedding rows for `token_ids`, without the scale factor.
+    /// Scaled embedding rows for `token_ids`: `embed_tokens[token] * sqrt(hidden)`.
+    ///
+    /// Reads through the GPU kernel with the buffer's real `offset` and `bf16`
+    /// flag. The previous host-mirror version indexed `embedding_buffer.contents()`
+    /// directly and returned garbage for an offloaded (page-aligned, BF16) table —
+    /// it is what made `mtp_acceptance`'s drafter input `-inf`/`NaN` and the
+    /// measured acceptance rate read 0.
     pub fn embedding(&self, token_ids: &[u32]) -> Vec<u16> {
+        let scale = (self.hidden_size as f32).sqrt();
+        if let Some(buffer) = &self.embedding_buffer {
+            return self
+                .elements
+                .embedding_scaled_view(
+                    token_ids,
+                    buffer,
+                    self.embedding_offset,
+                    self.embedding_is_bf16,
+                    self.hidden_size,
+                    self.vocab_size,
+                    scale,
+                )
+                .unwrap_or_default();
+        }
         let mut output = vec![0_u16; token_ids.len() * self.hidden_size];
-        let source_ptr: *const u16 = if let Some(buffer) = &self.embedding_buffer {
-            unsafe { (buffer.contents() as *const u16).add(self.embedding_offset as usize / 2) }
-        } else {
-            self.embedding.as_ptr()
-        };
         for (row, token) in token_ids.iter().enumerate() {
             let token = *token as usize;
             if token >= self.vocab_size {
                 continue;
             }
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    source_ptr.add(token * self.hidden_size),
-                    output.as_mut_ptr().add(row * self.hidden_size),
-                    self.hidden_size,
-                );
+            for column in 0..self.hidden_size {
+                let value = half::f16::from_bits(
+                    self.embedding[token * self.hidden_size + column],
+                )
+                .to_f32()
+                    * scale;
+                output[row * self.hidden_size + column] =
+                    half::f16::from_f32(value).to_bits();
             }
         }
         output
@@ -5107,13 +5131,15 @@ impl TextModel {
         Ok(self.elements.softcap(&logits, self.final_softcap)?)
     }
 
-    /// Forward a single token and return `(final-norm hidden, capped logits)`.
+    /// Forward a single token through the GPU buffer path, returning
+    /// `(final-norm hidden, capped logits)`.
     ///
     /// The MTP drafter's input is `[target_embed(token), target_hidden]` — the
     /// 5376-wide hidden **after** the final norm and **before** the lm_head.
-    /// `forward` returns only logits, so the speculative path needs both. Kept
-    /// separate from `forward` so the decode path does not pay for a host copy
-    /// of the hidden row it never reads.
+    /// `forward_buffer_into_vec` returns only logits, so the speculative path
+    /// needs both, and it must read them from the GPU buffers
+    /// (`scratch.last_hidden` / `scratch.capped`) rather than the host-slice
+    /// path, which has no host copy of the EXL3 weights.
     pub fn forward_with_hidden(
         &mut self,
         token_ids: &[u32],
@@ -5124,77 +5150,45 @@ impl TextModel {
                 "model token and position counts must match and be non-empty".to_string(),
             ));
         }
-        let mut hidden = if let Some(embedding) = &self.embedding_buffer {
-            self.elements.embedding_scaled_buffer(
-                token_ids,
-                embedding,
-                self.hidden_size,
-                self.vocab_size,
-                (self.hidden_size as f32).sqrt(),
-            )?
-        } else {
-            self.elements.embedding_scaled(
-                token_ids,
-                &self.embedding,
-                self.hidden_size,
-                self.vocab_size,
-                (self.hidden_size as f32).sqrt(),
-            )?
-        };
-        for layer in &mut self.layers {
-            hidden = layer.forward(&hidden, positions)?;
+        let queue = self.forward_queue.clone();
+        let mut encoder = MetalEncoder::new(&queue)?;
+        let decode_step = token_ids.len() == 1;
+        if decode_step {
+            encoder.set_max_dispatches(
+                kaplumba_kernels::encoder::decode_max_dispatches_per_buffer(),
+            );
+            crate::decode_profile::begin_step(&mut encoder, |encoder| {
+                self.calibration_dispatch(encoder)
+            })?;
         }
-        let tokens = positions.len();
-        hidden = self.elements.rms_norm(
-            &hidden,
-            &self.final_norm,
-            tokens,
-            self.hidden_size,
-            self.layers[0].config.rms_norm_eps,
-        )?;
-        let hidden_out = hidden.clone();
-        let logits = if let Some(packed) = &self.lm_head.metal_buffer {
-            let request = LinearBufferRequest {
-                packed,
-                packed_offset: self.lm_head.metal_offset,
-                input: &hidden,
-                input_signs: &self.lm_head.input_signs,
-                output_signs: &self.lm_head.output_signs,
-                in_features: self.lm_head.in_features,
-                out_features: self.lm_head.out_features,
-                rate: self.lm_head.rate,
-                codebook: self.lm_head.codebook,
-            };
-            if tokens == 1 {
-                self.linear.gemv_buffer(request)?
-            } else {
-                self.linear.gemm_chunk_buffer(request)?
-            }
-        } else if tokens == 1 {
-            self.linear.gemv(LinearRequest {
-                packed: &self.lm_head.packed,
-                input: &hidden,
-                input_signs: &self.lm_head.input_signs,
-                output_signs: &self.lm_head.output_signs,
-                in_features: self.lm_head.in_features,
-                out_features: self.lm_head.out_features,
-                rate: self.lm_head.rate,
-                codebook: self.lm_head.codebook,
-            })?
-        } else {
-            self.linear.gemm_chunk(PrefillRequest {
-                packed: &self.lm_head.packed,
-                input: &hidden,
-                input_signs: &self.lm_head.input_signs,
-                output_signs: &self.lm_head.output_signs,
-                queries: tokens,
-                in_features: self.lm_head.in_features,
-                out_features: self.lm_head.out_features,
-                rate: self.lm_head.rate,
-                codebook: self.lm_head.codebook,
-            })?
-        };
-        Ok((hidden_out, self.elements.softcap(&logits, self.final_softcap)?))
+        if let Err(error) = self.forward_buffer_into(token_ids, positions, &mut encoder) {
+            encoder.abandon();
+            return Err(error);
+        }
+        if decode_step {
+            record_decode_step_tallies(&encoder);
+            let started = std::time::Instant::now();
+            crate::decode_profile::close_step(&mut encoder)?;
+            crate::decode_profile::end_step(
+                &mut encoder,
+                started.elapsed().as_secs_f64() * 1e3,
+            )?;
+        }
+        encoder.commit_and_wait()?;
+
+        let tokens = token_ids.len();
+        let hidden_len = tokens * self.hidden_size;
+        let mut hidden_out = vec![0u16; hidden_len];
+        unsafe {
+            let src = self.scratch.last_hidden.contents() as *const u16;
+            std::ptr::copy_nonoverlapping(src, hidden_out.as_mut_ptr(), hidden_len);
+        }
+        let mut logits = vec![0u16; self.vocab_size];
+        unsafe {
+            let src = self.scratch.capped.contents() as *const u16;
+            std::ptr::copy_nonoverlapping(src, logits.as_mut_ptr(), self.vocab_size);
+        }
+        Ok((hidden_out, logits))
     }
 
     /// Read one decoder layer's GPU KV cache back to the host as
