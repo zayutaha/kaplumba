@@ -659,35 +659,57 @@ kernel void linear_gemv_ishizuki_k3_fused2_4col(
 
             float v[8];
 
+            // Burst-load every word before the first use, exactly as
+            // `_fused2_2col` (:491-495) and the T4.3 hoist in
+            // `_colmajor_2col_sk2` (:2477-2480) do.
+            //
+            // This is not cosmetic. As written this kernel inlines the index
+            // expression into each `extract_v_mcg_32(...)` call, so it holds ONE
+            // word pair in flight where `_2col` holds four. An A/B without this
+            // hoist measures the absence of the hoist, not column tiling, and a
+            // loss would be uninterpretable.
+            //
+            // Bit-exact by construction: only *when* the loads are issued moves.
+            // Each column's accumulation order and the reduction tree below are
+            // untouched.
+            const uint w0_0_0 = t0_0[j0], w0_0_1 = t0_0[j1];
+            const uint w1_0_0 = t1_0[j0], w1_0_1 = t1_0[j1];
+            const uint w0_1_0 = t0_1[j0], w0_1_1 = t0_1[j1];
+            const uint w1_1_0 = t1_1[j0], w1_1_1 = t1_1[j1];
+            const uint w0_2_0 = t0_2[j0], w0_2_1 = t0_2[j1];
+            const uint w1_2_0 = t1_2[j0], w1_2_1 = t1_2[j1];
+            const uint w0_3_0 = t0_3[j0], w0_3_1 = t0_3[j1];
+            const uint w1_3_0 = t1_3[j0], w1_3_1 = t1_3[j1];
+
             // Col 0: 2 contiguous sub-steps along K
-            extract_v_mcg_32(t0_0[j0], t0_0[j1], sh0, rsh0, v);
+            extract_v_mcg_32(w0_0_0, w0_0_1, sh0, rsh0, v);
             acc0_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
             acc0_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
-            extract_v_mcg_32(t1_0[j0], t1_0[j1], sh0, rsh0, v);
+            extract_v_mcg_32(w1_0_0, w1_0_1, sh0, rsh0, v);
             acc0_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
             acc0_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
 
             // Col 1: 2 contiguous sub-steps along K
-            extract_v_mcg_32(t0_1[j0], t0_1[j1], sh0, rsh0, v);
+            extract_v_mcg_32(w0_1_0, w0_1_1, sh0, rsh0, v);
             acc1_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
             acc1_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
-            extract_v_mcg_32(t1_1[j0], t1_1[j1], sh0, rsh0, v);
+            extract_v_mcg_32(w1_1_0, w1_1_1, sh0, rsh0, v);
             acc1_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
             acc1_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
 
             // Col 2: 2 contiguous sub-steps along K
-            extract_v_mcg_32(t0_2[j0], t0_2[j1], sh0, rsh0, v);
+            extract_v_mcg_32(w0_2_0, w0_2_1, sh0, rsh0, v);
             acc2_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
             acc2_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
-            extract_v_mcg_32(t1_2[j0], t1_2[j1], sh0, rsh0, v);
+            extract_v_mcg_32(w1_2_0, w1_2_1, sh0, rsh0, v);
             acc2_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
             acc2_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
 
             // Col 3: 2 contiguous sub-steps along K
-            extract_v_mcg_32(t0_3[j0], t0_3[j1], sh0, rsh0, v);
+            extract_v_mcg_32(w0_3_0, w0_3_1, sh0, rsh0, v);
             acc3_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
             acc3_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
-            extract_v_mcg_32(t1_3[j0], t1_3[j1], sh0, rsh0, v);
+            extract_v_mcg_32(w1_3_0, w1_3_1, sh0, rsh0, v);
             acc3_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
             acc3_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
         }
