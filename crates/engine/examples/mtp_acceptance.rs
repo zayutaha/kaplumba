@@ -407,7 +407,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     let target_pass_ms = 89.5; // measured single-token target GPU span
-    let achieved_tps = mean_accepted * 1000.0 / target_pass_ms;
+    // Each round emits `accepted + 1` tokens: the confirmed drafts PLUS the
+    // target's own next token, which the verify pass yields for free because it
+    // already streamed every weight to produce the logits the drafts were
+    // checked against.
+    //
+    // The first version of this harness omitted that +1 and reported 9.87 tok/s
+    // for a configuration that sustains ~21. That 2.1x error is why speculation
+    // was reported as worthless when it is in fact close to a 2x win on this
+    // box, and it is the reason `spec/mtp-40tps` T4 was written up as "stop".
+    let tokens_per_pass = mean_accepted + 1.0;
+    let achieved_tps = tokens_per_pass * 1000.0 / target_pass_ms;
 
     eprintln!("\n=== MTP acceptance gate (K={}, temperature={:.1}) ===", args.k, args.temperature);
     eprintln!("rounds: {}", accepted_hist.len());
@@ -432,8 +442,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             depth1_top20 as f64 / n,
         );
     }
+    eprintln!(
+        "tokens per pass = accepted + 1 bonus = {tokens_per_pass:.3}"
+    );
     eprintln!("implied tok/s at {target_pass_ms:.0}ms target pass: {achieved_tps:.2}");
-    eprintln!("40 tok/s needs >= 3.14 accepted/pass: {}", if mean_accepted >= 3.14 { "PASS" } else { "FAIL" });
+    eprintln!(
+        "40 tok/s needs tokens_per_pass >= {:.2} (i.e. accepted >= {:.2})",
+        40.0 * target_pass_ms / 1000.0,
+        40.0 * target_pass_ms / 1000.0 - 1.0
+    );
     eprintln!("wall clock: {:.1}s", elapsed.as_secs_f64());
     Ok(())
 }

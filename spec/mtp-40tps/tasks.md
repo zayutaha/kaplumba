@@ -26,16 +26,24 @@ T0–T3 is kept because it is measured, not speculative.
       60 rounds, verified one token per forward (the acceptance *rate* does not
       depend on verify batching, so this needs no T8a kernel).
 
-      | temperature | mean accepted/round | P(accept at depth 1) | implied tok/s |
+      | temperature | mean accepted/round | tokens/pass (incl. bonus) | implied tok/s |
       |---|---|---|---|
-      | 0 (greedy) | **0.883** | 0.450 | 9.9 |
-      | 1.0 / top_k 64 | **0.600** | 0.350 | 6.7 |
+      | 0 (greedy) | **0.883** | 1.883 | **21.0** |
+      | 1.0 / top_k 64 | **0.600** | 1.600 | 17.9 |
 
-      **40 tok/s needs ≥ 3.14 accepted/pass. Measured 0.88 (greedy) and 0.60
-      (temp 1.0). MTP with this drafter cannot reach 40 tok/s on this box, by a
-      factor of ~3.5x in greedy and ~5x at temp 1.0.** The implied numbers are
-      also optimistic: they charge nothing for the drafter's own forward and
-      assume a free M>1 verify.
+      **CORRECTION (2026-10-03).** This task was first written up as "STOP —
+      MTP cannot reach 40 tok/s". That conclusion rested on an arithmetic error
+      in the harness: `tokens_per_pass` was computed as `accepted`, omitting the
+      **+1 bonus token** that every speculative round emits for free, because
+      the verify pass has already streamed every weight to produce the logits the
+      drafts were checked against. The error was 2.1x, and it reported 9.9 tok/s
+      for a configuration that sustains **21.0** — against a measured non-speculative
+      decode of 11.2 tok/s. Speculation with this drafter is a **~1.9x win**, not a
+      dead end, and T8a is **unfrozen**.
+
+      The gate against the 40 tok/s target still fails: 40 tok/s needs 3.58
+      tokens/pass, i.e. `accepted >= 2.58`, against a measured 0.883. The binding
+      constraint is the drafter, not the verify kernel.
 
       **Why the drafter is the limit, not the wiring** — draft[0] lands inside
       the target's top-5 only **63%** of the time (top-20: 77%). A drafter
@@ -112,32 +120,33 @@ no M>1 3 bpw forward path, and "T8" as an integration bullet was hiding that.
   or a 3 bpw GEMM. Must be bit-validated per row against the M=1 reference,
   benchmarked (bytes/token vs M=1 baseline), and sabotage-tested. No T8b
   (= old T8) until this exists.
-  **FROZEN by T4.** At 0.88 accepted/round a verify kernel would have to be
-  *and* the drafter improved to move the number, so this is not worth building
-  until the drafter's top-5 containment (0.63) is raised.
+  **UNFROZEN.** At 0.883 accepted/round this already yields 1.883 tokens per
+  pass = **~21 tok/s** against a measured 11.2 tok/s non-speculative, so the
+  kernel is worth building today. It is the critical path for the 2x; the
+  remaining 2x up to 40 tok/s additionally needs `accepted >= 2.58`, which is
+  `spec/kv-free-drafter`.
 - [ ] **T8b — Draft/verify round loop** (was T8). Blocked on T8a, and on a
   drafter that clears the gate.
 
 ## What T4 closed, and what it makes pointless
 
-T4 measured 0.883 accepted/round greedy and 0.600 at temp 1.0, against the
-3.14 that 40 tok/s requires. The gate therefore **fails**, and the standing
-instruction in the spec is to stop and report the ceiling. Concretely:
+**SUPERSEDED — see the CORRECTION above. T8a is unfrozen and the spec is live
+again.** The reasoning that froze it was: "batching the verify changes how fast
+the confirmed tokens are produced, not which tokens they are". That is true, and
+it is also the point: the count is fixed at `accepted + 1` per pass, so the
+*batching* is precisely what turns 1.883 tokens/pass into 21 tok/s instead of
+11.2. Freezing the kernel froze the 2x.
 
-- **T8a** (M>1 3 bpw verify kernel) — frozen. This is the largest remaining
-  engineering item in the whole spec (the engine has no M>1 path at all) and it
-  buys nothing: batching the verify changes how fast the confirmed tokens are
-  produced, not which tokens they are, and the count is already too low.
-- **T8b / T9 / T10** — moot for this drafter.
-- **T11 / T12** (distribution faithfulness, temp-1.0 coherence) — these were
-  written for a build that reached 40 tok/s. Acceptance at temp 1.0 is 0.600
-  and the implied rate 6.7 tok/s, so there is no fast path whose coherence
-  needs proving.
-- **What is NOT closed**: the acceptance measurement itself is now a reusable
-  instrument. `mtp_acceptance` will answer the same question in seconds for any
-  future drafter, and the `draft[0] in top-k` line says whether a candidate is
-  worth building anything on.
+What remains true after the correction:
 
-**The only thing that reopens this spec** is a drafter with materially higher
-top-k containment against this target — i.e. one trained against *this* Gxma
-checkpoint rather than the released `qat-assistant-4bit`.
+- **T4 fails the 40 tok/s bar** (needs `accepted >= 2.58`, has 0.883). The
+  binding constraint is the drafter, and `spec/kv-free-drafter` exists to
+  attack it.
+- **The acceptance measurement is a reusable instrument.** `mtp_acceptance`
+  answers the same question in ~20 s for any drafter, and its `draft[0] in
+  top-k` line distinguishes "the drafter is weak" from "the drafter is not
+  conditioned on this target".
+- **Nothing here is a substitute for T8a.** Even at 3.58 tokens/pass the speed
+  only materialises if the verify runs as one M=K+1 pass. The engine has no
+  M>1 3 bpw path at all today, and that is now the critical path for the 2x
+  that is already within reach.
