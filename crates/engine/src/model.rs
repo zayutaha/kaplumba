@@ -1070,15 +1070,46 @@ impl DecoderLayer {
         config.validate()?;
         weights.validate(&config)?;
         let device = system_device()?;
-        // Full-attention caches start at a small capacity and double on demand
-        // up to `max_sequence_len`; allocating the worst case up front was most
-        // of the KV footprint for conversations that only need a few hundred
-        // positions.
+        // Full-attention caches start at a small capacity and grow on demand
+        // (1.25x per rung, `gpu_cache.rs`) up to `max_sequence_len`; allocating
+        // the worst case up front was most of the KV footprint for conversations
+        // that only need a few hundred positions.
         const INITIAL_FULL_CACHE: usize = 512;
+
+        // `KAPLUMBA_KV_INITIAL` preallocates instead of growing there.
+        //
+        // It exists because growth has a transient the ladder cannot avoid: each
+        // rung holds the old and new buffer at once. Reaching 32768 takes 19
+        // rungs, and the top rung is 26214 -> 32768 -- a ~6.5 GB spike on top of
+        // a ~15 GB resident set. On a 24 GiB box that is the same over-supply
+        // condition which makes the 4 bpw checkpoint swap (measured: 17.59 GiB
+        // of dirty, incompressible anonymous memory against 16-17 GiB of
+        // supply, 96 s per token). Paying it once at load beats paying it
+        // mid-conversation, but it is still a real cost, so the default is
+        // unchanged.
+        //
+        // Rejected rather than clamped, matching `metal::resident_limit_bytes`:
+        // a typo that silently becomes 512 is worse than a load that refuses.
+        // The clamp to `max_sequence_len` (and to `MAX_POLICY_CAPACITY`, which
+        // `GpuKvCache::new` applies itself) happens below and after this.
+        let initial_full_cache: usize = match std::env::var("KAPLUMBA_KV_INITIAL") {
+            Ok(raw) => match raw.trim().parse::<usize>() {
+                Ok(value) if value >= 64 => value,
+                Ok(value) => panic!(
+                    "KAPLUMBA_KV_INITIAL is {value}, which is below the 64-position floor; \
+                     a cache smaller than a single attention tile is a typo or a unit mistake"
+                ),
+                Err(_) => {
+                    panic!("KAPLUMBA_KV_INITIAL is {raw:?}, which is not a position count")
+                }
+            },
+            Err(_) => INITIAL_FULL_CACHE,
+        };
+
         let gpu_cache = if config.full_attention {
             GpuKvCache::new(
                 &device,
-                config.max_sequence_len.min(INITIAL_FULL_CACHE),
+                config.max_sequence_len.min(initial_full_cache),
                 config.kv_heads,
                 config.head_dim,
             )?

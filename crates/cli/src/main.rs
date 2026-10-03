@@ -3,6 +3,7 @@ mod chat;
 mod report;
 
 use std::env;
+use std::io::IsTerminal;
 use std::process::ExitCode;
 use std::time::Instant;
 
@@ -43,15 +44,39 @@ fn run() -> Result<(), String> {
         print!("{}", help_text());
         return Ok(());
     };
+    let mut arguments = arguments;
+
+    // Bare `kaplumba --model DIR` on an interactive terminal used to block in
+    // `read_prompt`, which reads stdin to EOF when no `--prompt`/`--prompt-file`
+    // was given. The process sat there waiting for Ctrl-D with no output at all,
+    // which is indistinguishable from a 12 GB load that had wedged. Chat is what
+    // that invocation means to anyone who types it, so that is what it now does.
+    //
+    // A *piped* stdin is left alone: `echo q | kaplumba --model DIR` is a
+    // legitimate one-shot use, and requiring `--prompt` for it would be a
+    // regression. This branch is specifically the interactive-terminal case.
+    if !arguments.benchmark
+        && !arguments.chat
+        && arguments.prompt.is_none()
+        && arguments.prompt_file.is_none()
+        && std::io::stdin().is_terminal()
+    {
+        arguments.chat = true;
+    }
+
     let prompt = if arguments.benchmark || arguments.chat {
         String::new()
     } else {
         arguments.read_prompt().map_err(|error| error.to_string())?
     };
+    // The load reads 11-16 GB and takes 6-10 s. Previously that was entirely
+    // silent, which is the other half of why a healthy load looked like a hang.
+    eprintln!("loading {} ...", arguments.model_path.display());
     let load_started = Instant::now();
     let mut model =
         TextModel::load_from_dir(&arguments.model_path).map_err(|error| error.to_string())?;
     let load_ms = load_started.elapsed().as_secs_f64() * 1000.0;
+    eprintln!("loaded in {load_ms:.0} ms");
     let tokenizer =
         GemmaTokenizer::from_model_dir(&arguments.model_path).map_err(|error| error.to_string())?;
     if arguments.chat {
