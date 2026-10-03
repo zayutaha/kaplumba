@@ -3,6 +3,7 @@ pub mod chat;
 pub mod config;
 pub mod decode_profile;
 pub mod drafter;
+pub mod drafter_model;
 pub mod exl3;
 pub mod generate;
 pub mod gpu_cache;
