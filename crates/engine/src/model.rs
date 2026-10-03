@@ -5131,6 +5131,174 @@ impl TextModel {
         Ok(self.elements.softcap(&logits, self.final_softcap)?)
     }
 
+    /// Post-final-norm hidden states for EVERY position of a forward pass.
+    ///
+    /// `forward_with_hidden` returns one row because the head only lifts the
+    /// last one. Training a drafter needs them all, and — the point — it needs
+    /// them in ONE forward rather than one per position: the target costs ~90 ms
+    /// a token, so a per-position export of 20k positions is half an hour, while
+    /// a chunked prefill yields hundreds of training examples per pass.
+    ///
+    /// The vocabulary head is skipped (`run_head: false`), so this does not pay
+    /// for the 262,144-wide projection.
+    pub fn hidden_states_all(
+        &mut self,
+        token_ids: &[u32],
+        positions: &[u32],
+    ) -> Result<Vec<u16>, ModelError> {
+        if token_ids.len() != positions.len() || token_ids.is_empty() {
+            return Err(ModelError::InvalidInput(
+                "model token and position counts must match and be non-empty".to_string(),
+            ));
+        }
+        self.ensure_scratch(token_ids.len())?;
+        let queue = self.forward_queue.clone();
+        let mut encoder = MetalEncoder::new(&queue)?;
+        let mut gpu = GpuProfile::new(false);
+        let hidden = self.hidden_size;
+        let tokens = token_ids.len();
+        // Chunk so a long document stays inside the scratch budget (AGENTS.md
+        // §8 forbids scratch that grows with input length).
+        let mut raw = Vec::with_capacity(tokens * hidden);
+        let mut chunk_start = 0usize;
+        let mut position_base = 0u32;
+        while chunk_start < tokens {
+            let end = (chunk_start + PREFILL_CHUNK).min(tokens);
+            let is_last = end == tokens;
+            let ids = &token_ids[chunk_start..end];
+            let pos = &positions[chunk_start..end];
+            let _ = &pos;
+            let run_head = is_last;
+            let result = self.forward_chunk(
+                ids,
+                pos,
+                &mut encoder,
+                &mut gpu,
+                run_head,
+                HeadPick::Argmax,
+                None,
+            );
+            if let Err(error) = result {
+                encoder.abandon();
+                return Err(error);
+            }
+            // Read back this chunk's rows. `hidden_a`/`hidden_b` hold the
+            // post-layer state pre-final-norm; normalise on the host.
+            let src = if self.layers.len().is_multiple_of(2) {
+                &self.scratch.hidden_a
+            } else {
+                &self.scratch.hidden_b
+            };
+            let mut chunk_rows = vec![0u16; (end - chunk_start) * hidden];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    src.contents() as *const u16,
+                    chunk_rows.as_mut_ptr(),
+                    chunk_rows.len(),
+                );
+            }
+            let normed = self.elements.rms_norm(
+                &chunk_rows,
+                &self.final_norm,
+                end - chunk_start,
+                hidden,
+                self.layers[0].config.rms_norm_eps,
+            )?;
+            raw.extend_from_slice(&normed);
+            chunk_start = end;
+            position_base = position_base.wrapping_add(0);
+        }
+        encoder.commit_and_wait()?;
+        Ok(raw)
+    }
+
+    /// The target's own greedy next token for every row of `hidden`.
+    ///
+    /// This is the label a drafter must learn: not the corpus's next token, but
+    /// what THIS checkpoint would emit. Training against the corpus was the
+    /// single worst mistake in the first pass of `spec/kv-free-drafter`: the
+    /// model reached training loss 1.24 and 7% held-out accuracy, because the
+    /// target does not generate wikitext verbatim and the two distributions are
+    /// different functions.
+    ///
+    /// The head is run as one GEMM over all rows, so a 512-row window costs one
+    /// pass over the 0.5 GB head (~2.5 ms) instead of 512 decode forwards
+    /// (~46 s). That is what makes training data cheap enough to have plenty of.
+    pub fn greedy_next_tokens(
+        &mut self,
+        hidden: &[u16],
+        tokens: usize,
+    ) -> Result<Vec<u32>, ModelError> {
+        if hidden.len() != tokens * self.hidden_size || tokens == 0 {
+            return Err(ModelError::InvalidInput(
+                "hidden length must be tokens * hidden_size".to_string(),
+            ));
+        }
+        let logits = match self.lm_head.metal_buffer.as_ref() {
+            Some(packed) => {
+                let request = LinearBufferRequest {
+                    packed,
+                    packed_offset: self.lm_head.metal_offset,
+                    input: hidden,
+                    input_signs: &self.lm_head.input_signs,
+                    output_signs: &self.lm_head.output_signs,
+                    in_features: self.lm_head.in_features,
+                    out_features: self.lm_head.out_features,
+                    rate: self.lm_head.rate,
+                    codebook: self.lm_head.codebook,
+                };
+                if tokens == 1 {
+                    self.linear.gemv_buffer(request)?
+                } else {
+                    self.linear.gemm_chunk_buffer(request)?
+                }
+            }
+            None => {
+                let request = PrefillRequest {
+                    packed: &self.lm_head.packed,
+                    input: hidden,
+                    input_signs: &self.lm_head.input_signs,
+                    output_signs: &self.lm_head.output_signs,
+                    queries: tokens,
+                    in_features: self.lm_head.in_features,
+                    out_features: self.lm_head.out_features,
+                    rate: self.lm_head.rate,
+                    codebook: self.lm_head.codebook,
+                };
+                if tokens == 1 {
+                    self.linear.gemv(LinearRequest {
+                        packed: &self.lm_head.packed,
+                        input: hidden,
+                        input_signs: &self.lm_head.input_signs,
+                        output_signs: &self.lm_head.output_signs,
+                        in_features: self.lm_head.in_features,
+                        out_features: self.lm_head.out_features,
+                        rate: self.lm_head.rate,
+                        codebook: self.lm_head.codebook,
+                    })?
+                } else {
+                    self.linear.gemm_chunk(request)?
+                }
+            }
+        };
+        let capped = self.elements.softcap(&logits, self.final_softcap)?;
+        Ok(capped
+            .chunks(self.vocab_size)
+            .map(|row| {
+                let mut best = 0usize;
+                let mut best_val = f32::NEG_INFINITY;
+                for (i, v) in row.iter().enumerate() {
+                    let f = half::f16::from_bits(*v).to_f32();
+                    if f > best_val {
+                        best_val = f;
+                        best = i;
+                    }
+                }
+                best as u32
+            })
+            .collect())
+    }
+
     /// Forward a single token through the GPU buffer path, returning
     /// `(final-norm hidden, capped logits)`.
     ///
