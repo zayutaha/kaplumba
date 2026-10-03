@@ -145,6 +145,7 @@ fn resident_of(
 /// Header-only ledger: every text tensor's shard, absolute file offset, size,
 /// dtype and 4-byte alignment. No GPU, no mmap, no allocation.
 #[test]
+#[ignore = "requires KAPLUMBA_TEST_MODEL; reads the checkpoint's safetensors headers"]
 fn probe_offload_header_ledger() {
     let root = model_dir();
     let index = safetensors::read_index(&root.join("model.safetensors.index.json")).unwrap();
