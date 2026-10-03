@@ -12,21 +12,16 @@ checkpoint. One new file: `crates/engine/tests/probe_budget_reconcile.rs`
 
 ## 1. The budget
 
-### 512-token context — `62.30 ms → 64.09 ms → 15.61 tok/s`
+### 512-token context — **63.601 ms = 15.72 tok/s** (predicted, not measured)
 
 | # | term | bytes | disp | ms | GB/s | source |
 |---|---|---:|---:|---:|---:|---|
-| 1 | layer weight GEMV (240 dispatches) | 10 982.5 MB | 240 | **56.045** | 196.0 | **residual of the 62.30 ms measurement**, at the 37-key rate; byte count is context-independent |
+| 1 | layer weight GEMV (240 dispatches) | 10 982.5 MB | 240 | **56.045** | 196.0 | **residual of the 62.30 ms measurement**, at the 37-key rate; the byte count is context-independent |
 | 2 | `lm_head` GEMV | 1 057.0 MB | 1 | **4.178** | 253.0 | §18.1 `KAPLUMBA_ABLATE=head_gemv` = +1.12 tok/s = 4.17 ms; §16.2 GPU clock 4.12 ms. Two instruments, 1.2% apart |
-| 3 | attention, 60 dispatches (KV read + partials) | 500.6 MB | 60 | **2.521** | 198.6 | T7.6.13 `own_ms`, median of 9 **interleaved** samples, one pass per command buffer |
+| 3 | attention, 60 dispatches (KV + partials) | 500.6 MB | 60 | **2.521** | 198.6 | T7.6.13 `own_ms`, median of 9 **interleaved** samples |
 | 4 | element / transform / finalize | 78.5 MB | 361 | **0.840** | 93.5 | T5.10 production interleaved A/B (`P07:32`) — **not** the 7.8 ms profiler figure |
 | 5 | host: `Detokenizer` (GPU idle) | 0 | 0 | **0.017** | — | `tokenizer.rs:202-235`, quadratic: 0.017 → **0.105** ms at 119 tokens |
-| | **total** | **12 618.7 MB** | **662** | **63.601** | 198.4 | |
-| | vs 62.30 measured | | | **+1.30** | | **the KV delta, 461.4 → 500.6 MB is priced at the step's own 198.4 GB/s** |
-
-Context-independence is the reason the table closes with nothing left over:
-the only term that changes between 37 and 512 keys is attention, and it changes
-by **0.053 ms per 1 000 keys** at the measured 198.4 GB/s.
+| | **total** | **12 618.6 MB** | **662** | **63.601** | 198.4 | **15.72 tok/s**, −2.1% vs 16.05 |
 
 ### 16 384-token context — **71.8 – 87.5 ms = 11.4 – 13.9 tok/s**
 
@@ -40,33 +35,54 @@ by **0.053 ms per 1 000 keys** at the measured 198.4 GB/s.
 | | **total** | **14 375.3 MB** | **71.82 – 87.47** | **11.43 – 13.92 tok/s** |
 
 **The band is honest, and the low end is the one to plan against.** The shipped
-attention path is **not** bandwidth-bound at 16 k: T7.6.13's own numbers put the
-10 full-attention layers at **58 GB/s** at 8192 keys (67.1 MB in 1.157 ms), which
-is 82.6 GB/s stepped to 16 384. Pricing the same bytes at the 203 GB/s peak
-gives 10.74 ms. I did not resolve which is right: the T7.6.13 full-layer rows
-were measured at `splits = 16`, and `decode_splits` now returns
-`decode_one_wave_workgroups(256)/kv_heads` = **54/4 = 13** (`attention.rs:299-306`),
-a 19% smaller grid. The measured arm is therefore stale-optimistic; the priced arm
-assumes a fix that has not been made. **Neither is a result.**
+attention path is **not** bandwidth-bound at 16 k. Pricing the same bytes at the
+203 GB/s peak gives 10.74 ms; T7.6.13's own full-layer numbers give 26.39 ms. I did
+not resolve which is right: the T7.6.13 rows were measured at `splits = 16`, and
+`decode_splits` now returns `decode_one_wave_workgroups(256)/kv_heads` =
+**54/4 = 13** (`attention.rs:299-306`), a 19% smaller grid. The measured arm is
+stale-optimistic; the priced arm assumes a fix nobody made. **Neither is a result.**
+
+### 🔴 The marginal cost of context is not one number, and it is not the step's rate
+
+This is the part I got wrong on the first pass, and the test caught it. I asserted
+the 37 → 512 delta was the KV byte delta priced at the step's own 198.4 GB/s. It
+is not, and for two separate reasons:
+
+| regime | marginal GB/s | why |
+|---|---:|---|
+| 37 → 64 keys | **29.2** | `encode_decode_single_pass`, one dispatch per layer |
+| 64 → 512 keys | **198.6** | split+combine — a **6.8×** step at the arm boundary (`model.rs:1884-1892`) |
+| 50 **sliding** layers, 512 → 1024 | **443.6** | 16 splits × 16 KV heads = 256 workgroups; nearly full occupancy |
+| 10 **full** layers, 512 → 8192 | **57.4** | 16 × 4 = 64 workgroups on a 54-workgroup wave |
+| 10 **full** layers, 8192 → 16384 | **56.6** | stable to **1.4%** |
+
+**Context is expensive because of 10 layers, not 60.** Past 1024 keys the 50
+sliding layers are frozen — the ring wraps, no memmove — so *every* additional
+token costs **56.6 GB/s** on 1/6 of the layers, a quarter of the step's own 198.
+That is **0.058 ms per 1 000 keys**, and it is stable for the rest of the model's
+life.
+
+P15's untraceable "+0.42 ms per 1000" is 7× this. The test asserts they *disagree*
+by >0.05 ms/1000, so if they ever agree, this file fails rather than quietly
+inheriting a number with no provenance.
 
 ### Crossover: attention never reaches the weight stream inside the context cap
 
-`KV(P) = 50·min(P,1024)·16384 + 10·P·8192`. The 50 sliding layers **stop growing
-at 1024** — the ring wraps, so there is no memmove. So for `P > 1024`:
+`KV(P) = 50·min(P,1024)·16384 + 10·P·8192`. For `P > 1024`:
 
 ```
 922,746,880 + 81,920·P  =  10,982,522,880   ->   P = 122 800 tokens
 ```
 
 **122 800, against `MAX_POLICY_CAPACITY` = 32 768.** At the cap the KV read is
-3.52 GB = **32.1%** of the weight stream. Attention becomes the majority term
-only at ~4× the maximum context this build can hold.
+3.52 GB = **32.1%** of the weight stream. Attention becomes the majority term only
+at ~4× the maximum context this build can hold.
 
 🔴 **P07's "attention equals GEMV weight streaming at P ≈ 13 100" is wrong twice
-over**, and both errors inflate the number's usefulness: it scales all 50 sliding
-layers with context (the ring does not), *and* it uses the retired 11.834 GB
-weight figure. `11.834e9 / 901,120 = 13 133` — so that figure is exactly the
-product of the two mistakes.
+over**, and both errors make the number more useful-looking than it is: it scales
+all 50 sliding layers with context (the ring does not), *and* it uses the retired
+11.834 GB weight figure. `11.834e9 / 901,120 = 13 133` — that figure is exactly
+the product of the two mistakes.
 
 ---
 
@@ -243,12 +259,21 @@ the check that let the bad number survive. Byte counts have to be pinned to
 
 | sabotage | result |
 |---|---|
-| 11.834 GB as the layer byte count | **FAILS** — `drifted from bench::per_token_weight_bytes`, left 10777035392 / right 10982522880 |
-| element layer 0.84 → 1.52 (the corrupt 9-role figure) | **FAILS** — `the un-priced pool moved to 1.264 ms` |
-| a second `ablated("attention")` guard site | **FAILS** — `left: 1, right: 2` |
-| sliding window treated as growing (P07's formula) | **FAILS** — `the full-attention share moved` |
-| 241 GEMV dispatches → 750 | **FAILS** — `(2.176 − 2.176) vs (3.78)` mismatch |
+| 11.834 GB as the layer byte count | **FAILS** — `drifted from bench::per_token_weight_bytes`, left 10 777 035 392 / right 10 982 522 880 |
+| element layer 0.84 → 1.52 (the corrupt 9-role figure) | **FAILS** — `the un-priced pool moved to 1.264 ms`, 4 tests |
+| sliding window treated as growing (P07's formula) | **FAILS** — `the full-attention share moved`, 2 tests |
+| 241 GEMV dispatches → 750 | **FAILS** — 1 test |
 | per-dispatch constant 9.03 → 0 | **FAILS** — 3 tests |
+| head 253 → 203 GB/s | **FAILS** — 3 tests |
+| single-pass ratio ×2 (the 64-key boundary) | **FAILS** — 3 tests |
+| a second `ablated("attention")` guard site | **FAILS** — `left: 1, right: 2` |
+
+**One sabotage log entry is itself worth reporting.** My first attempt at the
+byte-count sabotage *passed all 12 tests*, because the layer term is a residual
+and re-prices itself. My first fix — a plausible-looking rate band of
+178–182 GB/s around P05's rescaled figures — **also passed**, because the retired
+figure implies 192.3 GB/s which is nowhere near that band. The check was
+decoration. Only the direct byte pin discriminates, and it now does.
 
 ---
 
@@ -256,18 +281,34 @@ the check that let the bad number survive. Byte counts have to be pinned to
 
 - **62.30 ms decomposes with no unexplained residual.** 56.045 (240 layer GEMVs,
   196.0 GB/s) + 4.178 (head @ 253.0) + 1.220 (attention, 60 dispatches) + 0.840
-  (element, 361 dispatches) + 0.017 (detokenizer) = 62.300.
+  (element, 361 dispatches) + 0.017 (detokenizer) = 62.300. It closes by
+  construction, so the budget's value is entirely in its **term values**, which
+  are all independently sourced — and in the one term that reconciles the fit.
 - **The largest addressable overhead at temperature 0 is 0.19 ms** — the
-  bit-exact cross-simdgroup shuffle already proved. Everything else structural is
-  barred by bit-exactness (the 9 266 ULP reduction order, `G ∤ 32`), forbidden
-  (KV quantisation), or measured counterproductive (multi-queue, single-pass
-  attention). With the detokenizer and four mechanical host fixes: **0.28 ms,
-  +0.07 tok/s.**
+  bit-exact cross-simdgroup shuffle already proved (masks 128/64/32 →
+  `simd_shuffle_xor`, 840 barriers × 0.226 µs). Everything else structural is
+  barred by bit-exactness (the 9 266 ULP reduction order, `G ∤ 32` at G=42),
+  forbidden (KV quantisation, AGENTS.md §8), or measured counterproductive
+  (multi-queue >1.2× worse than serial; single-pass attention 7.9× slower at the
+  1024-key cap). With the detokenizer and four mechanical host fixes:
+  **0.28 ms, +0.07 tok/s.** The target is 12.3 ms away.
 - **The largest addressable overhead on the path the engine actually runs is
-  6.70 ms** — device-side sampler plus a temperature-agnostic pipeline gate.
-  Worth **+1.53 tok/s at temperature 1.0**, taking the default from 14.37 to
-  15.90 tok/s, i.e. parity with greedy.
-- **At 16 k the step is 71.8 – 87.5 ms (11.4 – 13.9 tok/s)**, and the range is
-  real: the shipped full-attention path runs at 58–83 GB/s, not 203. Resolving
-  it needs one measurement of the 10 full layers at the shipped `splits = 13`,
-  which is ~12 s of GPU and settles the only open term in this document.
+  6.70 ms** — device-side sampler plus a temperature-agnostic pipeline gate
+  (`chat.rs:388` gates on `greedy`). Worth **+1.53 tok/s at temperature 1.0**,
+  taking the default from 14.37 to 15.90 tok/s — parity with greedy, not beyond.
+  Note `ROUND1-2-SUMMARY.md` claims `+2 tok/s`; the budget says **+1.53**,
+  because 0.60 ms of the 7.30 ms shortfall is the bracketed widen + readback
+  pair, which was never measured and is not recovered by a device-side sampler.
+- **At 16 k the step is 71.8 – 87.5 ms (11.4 – 13.9 tok/s)** and the range is
+  real: the shipped full-attention path runs at **56.6 GB/s**, not 203.
+  Resolving it needs one measurement of the 10 full layers at the shipped
+  `splits = 13` — ~12 s of GPU, and it settles the only open term here.
+- **The 2.176 ms constant, the 0.840 ms element layer and the 0.247 ms floor are
+  three views of two disjoint pools**, not three incompatible numbers:
+  0.247 ms is bytes and sits *inside* 0.840 ms; 2.176 ms is dispatches on GEMVs
+  and is the *same pool as* the 1.944 ms un-priced residual. Report the first as
+  a range, never a sum.
+
+**The one thing I would do next, and it is not a kernel:** the open term is a
+12-second GPU measurement of 10 attention kernels at the shipped split count.
+Everything else in this document is closed.

@@ -244,7 +244,15 @@ struct Shape {
 }
 
 fn classify(k: &Kernel) -> Shape {
-    let b = &k.body;
+    // Helper definitions that live in the gap between one kernel and the next
+    // must not be attributed to the earlier kernel. `nod_stub` is declared at
+    // `linear.metal` just after `linear_gemv_ishizuki_k8` and before the `_nod`
+    // family, so a naive `contains` reads k8 as a no-decode probe.
+    let n_stub = k
+        .body
+        .find("static float nod_stub")
+        .unwrap_or(k.body.len());
+    let b: &str = &k.body[..n_stub];
     let name = &k.name;
 
     let family: &'static str = if name.contains("_exl3_") {
@@ -754,7 +762,7 @@ fn census_of_all_138_linear_kernels() {
     // all 138 look reachable.
     const AB_ONLY: [&str; 2] = ["encode_gemv_named", "encode_ishizuki_gemv_named"];
     println!("\nA: kernels a single env flag would put on the production decode path");
-    let mut flagged: BTreeMap<&str, Vec<String>> = BTreeMap::new();
+    let mut flagged: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for (name, sites) in &dispatch {
         if live.iter().any(|(l, _)| l == name) || AB_ONLY.contains(&sites[0].func.as_str()) {
             continue;
@@ -774,7 +782,7 @@ fn census_of_all_138_linear_kernels() {
             .cloned()
             .collect();
         if !unset.is_empty() {
-            flagged.insert(name, unset);
+            flagged.insert(name.clone(), unset);
         }
     }
     for (name, flags) in &flagged {
@@ -852,7 +860,7 @@ fn census_of_all_138_linear_kernels() {
     println!("   selector), which for THIS checkpoint is entered only by lm_head");
     println!("   (perm_mode 0), so only the rate-6 unsuffixed kernel survives:");
     for (name, sites) in &selector {
-        if live.iter().any(|(l, _)| *l == *name) || !by_name.contains_key(name.as_str()) {
+        if live.iter().any(|(l, _)| *l == name.as_str()) || !by_name.contains_key(name.as_str()) {
             continue;
         }
         println!("  {name:<52} via {}", sites[0].func);
@@ -1257,7 +1265,7 @@ fn the_head_runs_the_unfolded_codebook_kernel() {
         (0..32).map(|lane| (48 * lane + 1526) % 32).collect();
     assert_eq!(
         sh0.into_iter().collect::<Vec<_>>(),
-        vec![22, 6],
+        vec![6, 22],
         "the KA=6 lane shift set; anything outside {{6, 22}} means the \
          3-word-window derivation in linear_repacked.metal changed"
     );

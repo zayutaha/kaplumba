@@ -1142,10 +1142,17 @@ fn the_sixteen_k_step_is_dominated_by_the_full_attention_layers() {
         "the sliding layers' marginal rate ({sliding_512_8192:.1}) is no longer several \
          times the full layers' ({full_512_8192:.1}); the whole 16k story depends on this gap"
     );
+    // ms per 1000 keys of context, past 1024, where all growth is full-layer.
+    let per_1k_ms = kv_8192_growth(1000, 2000) / (full_8192_16k * GB) * 1e3;
     println!(
-        "  => past 1024 keys every additional token of context costs {:.2} ms per 1000, \
-         at {full_8192_16k:.1} GB/s on 1/6 of the layers. Not the step's 198.",
-        (full_8192_16k / GB) * 1000.0
+        "  => past 1024 keys every additional token of context costs {per_1k_ms:.4} ms per \
+         1000, at {full_8192_16k:.1} GB/s on 1/6 of the layers — a quarter of the step's own 198."
+    );
+    // Cross-check against P15's quoted +0.42 ms/1000, which has no provenance.
+    assert!(
+        (per_1k_ms - 0.42).abs() > 0.05,
+        "the derived marginal cost is {per_1k_ms:.4} ms/1000, which now AGREES with P15's \
+         untraceable 0.42 — one of them is wrong and this file cannot say which"
     );
 
     // The 10 full-attention layers' own share at 16384: 1.342 GB of the 2.181 GB,
