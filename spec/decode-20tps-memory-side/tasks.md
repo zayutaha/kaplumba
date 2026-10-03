@@ -26,7 +26,7 @@ Each task is one commit. Status updated immediately after each.
       N=2048; byte-weighted 176.5 GB/s over 10.983 GB = 62.23 ms, which
       reproduces the measured 62.3 ms step from first principles. Gcodes/s tracks
       GB/s (511.7 → 267.2), so it is *not* an instruction effect. 71.1% of bytes
-      are in the two large-N shapes; target is +34%.** *Commit:* `f3a6c4f`.
+      are in the two large-N shapes; target is +34%.** *Commit:* `73cf9a7`.
 
 - [ ] **T2** — Latency vs pattern discriminator (R2, R3). Decide whether the
       11% memory-side term is "too few loads in flight" or "bad DRAM access
