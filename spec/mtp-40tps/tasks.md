@@ -32,6 +32,21 @@ T0–T3 is kept because it is measured, not speculative.
       the engine's format. Rust tool, no Python in the repo. Verify the conversion
       against a reference and **state whether the check is bit-level or
       distributional**.
+  - [x] T5a — Rust unpack of MLX affine-4bit verified **bit-exact** vs
+        `mx.dequantize` (`crates/engine/tests/mlx_affine_unpack.rs`, `0abe7ca`).
+        Math: single-f32-rounded `nibble*scale+bias`; nibble order = LSB-first
+        along K.
+  - [x] T5b — `affine4_gemv` Metal kernel
+        (`crates/kernels/src/affine.{metal,rs}`, `7bb42d6`), agrees with host
+        reference. **Sabotage evidence**: `w_det += 1.0f` gives max-abs-err
+        24.2 on the same test; the test also caught a broken shader build
+        being silently skipped (fixed). Note: engine convention supplies
+        FP16 activations/scales/biases (bf16→f16 conversion at load), so the
+        drafter checkpoint's bf16 `scales`/`biases` must be converted the same
+        way on load.
+  - [ ] T5c — loader wiring: read the drafter's `model.safetensors` into
+        engine-owned Metal buffers with the same payload byte ranges the test
+        uses; feed `affine4_gemv`.
 - [ ] **T6 — Drafter forward.** `pre_projection` (10752→1024) → 4 decoder layers
       reading the **target's shared K/V** → `norm` → `post_projection` (1024→5376),
       lm_head = tied `embed_tokens`. The drafter keeps **no cache of its own**
