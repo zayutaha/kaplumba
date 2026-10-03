@@ -81,3 +81,27 @@ from — it is read-only reference material under
   embeddings, and the drafter's `backbone_hidden_size` 5376 equals Gxma's
   `hidden_size`. Unverified: a drafter whose embedding semantics disagree with the
   target is useless no matter how fast it is.
+
+## Amendment 2026-10-03 — structural gaps acknowledged (was never measured)
+
+Post-review, three problems with the earlier plan as written, recorded so the
+next attempt does not re-derive them:
+
+1. **T8 hides a new-kernel project.** "One target forward over
+   `[bonus, cand_1..cand_k]`" requires an M=K+1 forward. The engine's only fast
+   GEMV path is M=1 (`linear_gemv_*`); there is no measured 3 bpw M>1 kernel in
+   this repo. T8 is therefore not "integration" — it is a kernel spec of its
+   own. Until it exists and is benchmarked, R5's 40 tok/s rests on a pass that
+   does not exist.
+2. **Q1/T4 was never run.** T4 is gated behind T5 (drafter conversion), which
+   was never done, so the make-or-break acceptance number is still open.
+3. **The 3 bpw verify-side advantage is plausible but unproven in our
+   engine.** In verify, the book is read once per K+1 tokens, so the lane-load
+   amplification that caps M=1 decode at ~200 GB/s should be amortized. Whether
+   a 3 bpw M=4..8 path then beats a hypothetical 4 bpw one is a measurement,
+   not a premise.
+
+Sequencing consequence: **T5 → T6 → T4(gate) → [only if acceptance ≥ ~0.73]
+M>1 verify kernel as its own spec → T7/T8 → …**. T8–T10 in
+`implementation_notes` as originally written are frozen until the gate is
+answered.

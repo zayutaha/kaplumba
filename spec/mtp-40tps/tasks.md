@@ -42,10 +42,10 @@ T0–T3 is kept because it is measured, not speculative.
 
 - [ ] **T7 — Baseline (R2).** Non-speculative decode of Gxma, 1024 tokens,
       ≥3 interleaved runs. Denominator for everything.
-- [ ] **T8 — Draft/verify round loop (R3).** One target forward over
+- [ ] **T8 — Draft/verify round loop (R3) — BLOCKED on T8a.** One target forward over
       `[bonus, cand_1..cand_k]`; accept-on-equal walk with **target and drafter RNG
       streams kept separate** (`common.py:46-132`) — that separation is what makes
-      exactness hold.
+      exactness hold. (Demoted: depended on a nonexistent M>1 forward; see T8a.)
 - [ ] **T9 — KV rollback.** Trim target KV to `accepted` on rejection, and re-slice
       the shared-KV view the drafter reads. This is the most likely place for a
       silent distribution skew; it needs its own test.
@@ -68,3 +68,13 @@ T5 → T6 → **T4 (gate)** → T7/T8 → T9 → T10 → T11/T12 → T13.
 T4 is a gate, not a parallel task: if real acceptance is too low, T8–T10 are wasted
 work and the answer is a roofline, not a speedup. Measure it as soon as the drafter
 runs, before building the fast path.
+
+**AMENDED 2026-10-03:** T8 is promoted to its own kernel spec. The engine has
+no M>1 3 bpw forward path, and "T8" as an integration bullet was hiding that.
+
+- [ ] **T8a — M>1 3 bpw verify kernel (own spec required).** A forward over
+  `[bonus, cand_1..cand_k]` for K+1 ∈ {2,4,6,8}. Either an M=K+1 GEMV-style path
+  or a 3 bpw GEMM. Must be bit-validated per row against the M=1 reference,
+  benchmarked (bytes/token vs M=1 baseline), and sabotage-tested. No T8b
+  (= old T8) until this exists.
+- [ ] **T8b — Draft/verify round loop** (was T8). Blocked on T8a.
