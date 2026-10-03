@@ -49,14 +49,33 @@ Each task is one commit. Status updated immediately after each.
       fixed-per-dispatch amortisation signature (K 8192 vs 21504), not placement.
       *Files:* `findings/F3-live-kernels.md` §2.
 
-- [ ] **T4** — Land the highest-value Phase-2 change (R4). Interleaved A/B, ≥6
-      pairs, control arm, medians and spread. Regression gate:
-      `--temperature 0` byte-identical over ≥3 runs, generated text only.
-      *Files:* `crates/kernels/src/linear_repacked.metal` (+ `linear.rs` if a
-      variant is added).
-      *The named candidate:* serve 16 codes per lane from the same 64-bit window
-      (2.67× → 1.33× useful-byte amplification at KA=3). Kernel rewrite; changes
-      accumulation order, so bit-exactness must be re-earned.
+- [x] **T4.1** — Hoist the ring-word loads in `linear_gemv_ishizuki_k3_fused2_4col`
+      above the first `extract_v_mcg_32`, matching `_fused2_2col` (:491) and the
+      T4.3 hoist in `_colmajor_2col_sk2` (:2477). Bit-exact scheduling change;
+      required or the 4col A/B measures the missing hoist instead of column
+      tiling (`A3-kernelsel.md` says so explicitly). *Commit:* `bb858c6`.
+
+- [x] **T4.2** — A/B `KAPLUMBA_FUSED2_4COL=1` end to end. **NEGATIVE.** 6
+      interleaved pairs, one binary, 128 greedy tokens: arm A (live `_fused2_2col`)
+      median **16.021**, arm B (`_fused2_4col`) median **15.907**; B slower in
+      **6/6** pairs. Bit-exactness demonstrated first — both arms produce the
+      *identical* 128-token id hash (`4ce9ef31…`). The `bytes-per-threadgroup`
+      axis does not pay. *Files:* `findings/F4-fused2-4col-negative.md`.
+
+- [ ] **T4** — Land the highest-value Phase-2 change (R4). **Not landed.** The two
+      candidates named in `plan.md` are now both closed by measurement: "more loads
+      in flight" (F3 §6, three independent refutations) and "the 10%
+      shape/tensor spread" (T3 — it was a `_2col` artifact). The last lever is the
+      3 bpw lane window (2.67× → 1.33× useful-byte amplification).
+
+- [ ] **T6 — the lane window, and it is a format change, not a tweak.** The ring is
+      ordered by `(lane, k)` with `lane = 4*(o mod 8) + g`, so one output's 16
+      inputs are *strided* across four lanes by 32 codes. A 16-code contiguous
+      window is not a usable `(output, input)` set, so widening the window requires
+      a new ring order: change `reorder_tensor_to_colmajor` / `pack_integer_states`
+      (`kaplumba_engine::exl3`), version the on-disk format, repack all 411
+      tensors, rewrite the reduction, re-earn bit-exactness. **Deserves its own
+      spec.** Ceiling if it works: ~18.7 tok/s (F4 §Arithmetic).
 
 - [x] **T5** — Report and close (R1-R5). `findings/F3-live-kernels.md`: live
       per-kernel bandwidth (~200–206 GB/s), the re-measured ceiling (241–249,

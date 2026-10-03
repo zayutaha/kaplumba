@@ -161,6 +161,58 @@ scripts/gpuq try -- env KAPLUMBA_DECODE_PROFILE=kernel ./target/release/kaplumba
 scripts/gpuq try -- ./target/release/examples/probe_bw_250gb
 ```
 
+## T4.1/T4.2 — `fused2_4col` run at last, and it loses (files: `findings/F4-fused2-4col-negative.md`)
+
+**T4.1** (`bb858c6`): hoisted the 16 ring-word loads in
+`linear_gemv_ishizuki_k3_fused2_4col` above the first `extract_v_mcg_32`, matching
+`_fused2_2col` (`linear_repacked.metal:491-495`) and the T4.3 hoist in
+`_colmajor_2col_sk2` (`:2477-2480`). Without it the kernel holds 1 word pair in flight
+against `_2col`'s 4, and A3 predicts the A/B would measure the missing hoist rather than
+column tiling.
+
+**T4.2**: bit-exactness first, then the A/B. One binary, `--temperature 0 --show-ids`:
+
+```
+armA (default, _fused2_2col)   4ce9ef31cfe358957ce89573aa72864e3be638123a6090778200504bdd782d4f
+armB (FUSED2_4COL=1, 4col)     4ce9ef31cfe358957ce89573aa72864e3be638123a6090778200504bdd782d4f
+```
+
+128/128 ids identical => 4 columns per threadgroup is bit-exact here (stronger than the
+`contig4` siblings, which only agree after fp16 rounding). Then 6 interleaved pairs:
+**A median 16.021, B median 15.907, B slower in 6/6.**
+
+**The box was unusually quiet** — within-arm spread 0.03 tok/s, not the recorded 35%.
+That is why 6 pairs resolved a 0.7% effect; do not assume the same power on a busy box.
+
+**Also noted:** the first arm-A run after a rebuild died with
+`Metal command buffer failed (unlabelled) status=Error` and the immediate rerun was
+clean. A leftover crashed process (the `perf_probe_splitk_gridshape` segfault, below)
+appears to have left the driver in a bad state. Treat a single Metal failure as
+suspicious-but-retryable, and never conclude from one run in either direction.
+
+**`perf_probe_splitk_gridshape` segfaults** (exit 139) in `KAPLUMBA_PROBE_WEIGHTS` mode
+after printing its header, in `split_factor_sweep`. Fix or delete it; do not cite its
+absent rows. Its own header already disclaims its variant ranking, so the loss is small.
+
+## Verified bytes/token — the number the ceiling rests on
+
+Read from the `Gxma-repacked` safetensors headers directly (all shards, all `.trellis`):
+
+```
+total                                    12.0395 GB
+  words_per_tile=48  (3 bpw)             10.9825 GB
+  words_per_tile=96  (6 bpw, lm_head)     1.0570 GB
+
+shape (1344,336,48) x120   5202.25 MB   gate/up
+shape (336,1344,48) x 60   2601.12 MB   down
+shape (336,16384,96) x  1  1056.96 MB   lm_head (row-major, K=5376 N=262144)
+shape (256,336,48) x100     825.75 MB
+shape (336,512,48) x 50     825.75 MB
+shape (512,336,48) x 50     825.75 MB
+```
+
+So 12.039 GB is exact and the F3/F4 arithmetic is not resting on a stale figure.
+
 ## Open, with the current best guess
 
 - **Q1** the two-gate_proj 10% spread → placement, worth ~10% if model-wide.
