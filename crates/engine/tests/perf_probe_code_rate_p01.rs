@@ -1,7 +1,50 @@
 //! P01 probe: the **instruction-level cost of decoding one EXL3 code**, and
 //! whether the live 3 bpw decode GEMV is bound by it.
 //!
-//! # The claim under test
+//! # 🔴 CORRECTION (2026-10-03): THE HEADLINE CLAIM BELOW IS REFUTED BY ARM (G)
+//!
+//! **This file's loader was broken until today, so arms (a)-(g) had never run.**
+//! Three independent defects, each reported as the same innocuous `found only 0
+//! 3 bpw .trellis tensors`: dtype required `U16` where the checkpoint writes
+//! `I16`; shapes required 2-D where every tensor is 3-D tile-major
+//! (`[N/16, K/16, 48]`); and `data_offsets` used as absolute file offsets when
+//! they are relative to the data section starting at `8 + header_len`. See
+//! [`load_real_3bpw_tensors`].
+//!
+//! With the instrument repaired, **arm (G) -- the register-resident arm this
+//! file registered in advance as decisive -- returns the opposite verdict**:
+//!
+//! ```text
+//! (G) register-resident, zero memory   633.4 / 637.2 / 634.0 Gcodes/s   (3 runs)
+//!     == 237.6 GB/s at 3 bpw
+//! 20 tok/s needs                        631.2 Gcodes/s
+//! production (same runs)                463.6-469.3  and  511.1-512.4 Gcodes/s
+//! ```
+//!
+//! The machine sustains the *identical* per-code instruction stream at ~634
+//! Gcodes/s, **above** what 20 tok/s needs, while production runs at 464-511.
+//! The pre-registered criterion -- "G < 631 Gcodes/s => 20 tok/s is impossible,
+//! unconditionally" -- **did not fire**. So the instruction count is not the
+//! wall, and the "~18.6 tok/s ceiling / 20 tok/s is unreachable" conclusion
+//! below is unsupported.
+//!
+//! Arm (C) localises the gap: replacing weight loads with L1-resident synthetic
+//! words -- same instructions, same addressing, different buffer -- buys **+10 to
+//! +12.5%**, and arm (G) buys **+24%**. So the gap decomposes into a memory-side
+//! term (~11%, the loads themselves) and an instruction/loop-overhead term
+//! (~13%). Those are the first two quantified, reproduced components.
+//!
+//! Caveats, stated because they bound the claim: (G)'s accumulation is
+//! `v[0]+v[1]+...` (7 ops per 8 codes) where production spends 8 FMAs, and (G)
+//! has no address arithmetic, so ~634 is an **upper bound** on the instruction
+//! side. The realistic near-term target is arm (C)'s ~568 Gcodes/s = 213 GB/s =
+//! 17.7 tok/s, which is still above the 462-511 production reaches.
+//!
+//! One more thing that is unexplained and is itself a memory-placement clue: the
+//! two gate_proj tensors here are the *same shape* yet differ by ~10% in
+//! production code rate (464 vs 511).
+//!
+//! # The claim under test (now refuted by the above)
 //!
 //! From a read-only audit of `crates/kernels/src/linear_repacked.metal` -- the
 //! live kernel is `linear_gemv_ishizuki_k3_colmajor_2col`
@@ -749,6 +792,16 @@ const ARMS: [(&str, &str); 5] = [
     ("probe_2col_nomask", "(e) extraction masks removed"),
 ];
 
+/// Arm (G), the decisive one, by name.
+///
+/// Deliberately **not** a member of [`ARMS`]: that list is the GEMV arms, which
+/// are dispatched with the GEMV binding signature `(packed, x, y, shape, seeds)`.
+/// This kernel takes `(seed, out, ctrl)` and is timed by [`run_ceiling_arm`] on
+/// its own. Its pipeline still has to exist, though -- leaving it out of the
+/// pipeline construction is what made the arm die with
+/// `no pipeline probe_code_ceiling` after the loader was finally fixed.
+const CEILING_ARM: &str = "probe_code_ceiling";
+
 /// 20 tok/s needs this code rate: 236.7 GB/s at 3 bpw.
 const GCODES_FOR_20TOK: f64 = 236.7 / 3.0 * 8.0;
 /// Best 3 bpw kernel ever measured in this tree.
@@ -794,6 +847,14 @@ impl Tensor {
 struct ShardHeader {
     shard: String,
     tensors: serde_json::Map<String, serde_json::Value>,
+    /// Absolute offset of the shard's data section.
+    ///
+    /// `data_offsets` in the header are **relative to the start of the data
+    /// section**, which begins `8 + header_len` bytes into the file (the 8-byte
+    /// little-endian length prefix, then the JSON). Reading them as absolute
+    /// file offsets silently returns header bytes as trellis. This probe did
+    /// exactly that; see the module notes on why arms (a)-(g) never ran.
+    data_start: u64,
 }
 
 fn read_shard_headers(model: &Path) -> Vec<ShardHeader> {
@@ -846,34 +907,132 @@ fn read_shard_headers(model: &Path) -> Vec<ShardHeader> {
                     tensors.insert(k.clone(), v.clone());
                 }
             }
-            ShardHeader { shard, tensors }
+            let data_start = 8 + header_len as u64;
+
+            // **The gate for the offset defect.** safetensors lays the data
+            // section out back to back with no padding, so the last tensor's end
+            // offset plus the data-section base is exactly the file length. An
+            // off-by-`data_start` read -- the bug this loader shipped with --
+            // moves that by ~133 KB and fails here by name, instead of silently
+            // feeding the kernel header JSON as trellis. Nothing downstream can
+            // catch that: garbage bytes still decode to finite floats, so arm
+            // (a) would have produced plausible-looking numbers from nonsense.
+            let file_len = std::fs::metadata(model.join(&shard))
+                .expect("stat shard")
+                .len();
+            let max_end = tensors
+                .values()
+                .filter_map(|t| t["data_offsets"].as_array())
+                .filter(|a| a.len() == 2)
+                .filter_map(|a| a[1].as_u64())
+                .max()
+                .unwrap_or(0);
+            assert_eq!(
+                data_start + max_end, file_len,
+                "{shard}: the data section does not end where the file does \
+                 (base {data_start} + last end {max_end} != {file_len}). The \
+                 header's data_offsets are relative to the data section, which \
+                 begins after the 8-byte length prefix and the header. If this \
+                 fails, the probe is reading header bytes as trellis and every \
+                 timing below is measured on garbage."
+            );
+
+            ShardHeader {
+                shard,
+                tensors,
+                data_start,
+            }
         })
         .collect()
 }
 
 /// The largest genuinely-3-bpw `.trellis` tensors, biggest first.
 ///
-/// The bit rate is discriminated by exact arithmetic, not by a metadata field:
-/// `payload_len * 8 == prod(shape) * 3` holds only at 3 bpw, so the 6 bpw
-/// `lm_head.trellis` (where it equals `prod(shape) * 6`) is excluded without
-/// trusting `quantization_config.json` -- that file is known stale relative to
-/// the payload in this repo
+/// # This loader has never worked, and that is why arms (a)-(g) had no result
+///
+/// Three independent defects, any one of which was fatal, and all three of which
+/// reported as the same innocuous `found only 0 3 bpw .trellis tensors`:
+///
+/// 1. **dtype was required to be `U16`.** Both checkpoints write `I16`. Zero
+///    tensors matched.
+/// 2. **shape was required to be 2-D.** Every tensor here is 3-D tile-major
+///    (`[N/16, K/16, 48]`), so zero matched even after (1).
+/// 3. **`data_offsets` were used as absolute file offsets.** They are relative
+///    to the data section, which starts at `8 + header_len`. Even with (1) and
+///    (2) fixed, the read would have returned header bytes as trellis -- a
+///    kernel fed garbage, with no error. This is the same defect class as the
+///    4-bit misaligned-bind bug recorded in `decode-ceiling`.
+///
+/// So the pre-registered decisive experiment for the whole 20 tok/s question
+/// (arm (G), below) had never been executed when it was cited as if it had. Any
+/// claim built on these arms is unbacked.
+///
+/// The bit rate is still discriminated by exact arithmetic rather than by
+/// trusting `quantization_config.json` (stale for this tree), but the arithmetic
+/// is now expressed in the units the file actually uses: `words_per_tile == 16 *
+/// bpw`, so 48 words is 3 bpw and the 6 bpw head's 96 is excluded.
+///
+/// Kept as three separate assertions rather than one combined predicate, so a
+/// future format drift names which assumption broke instead of reporting "0".
 /// (`spec/decode-3bpw-amplification/implementation_notes.md:271-272`).
 fn load_real_3bpw_tensors(model: &Path, want: usize) -> Vec<Tensor> {
     let mut found: Vec<Tensor> = Vec::new();
     for shard in read_shard_headers(model) {
         for (name, meta) in shard.tensors {
-            if !name.ends_with(".trellis") || meta["dtype"].as_str() != Some("U16") {
-                continue;
+            // `I16` and `U16` are the same 16 bits; the payload is read as raw
+            // words either way, so the sign in the header is not load-bearing.
+            // Both checkpoints write `I16`, and requiring `U16` excluded every
+            // tensor in the file.
+            match meta["dtype"].as_str() {
+                Some("I16") | Some("U16") => {}
+                _ => continue,
             }
             let shape: Vec<usize> = match meta["shape"].as_array() {
                 Some(a) => a.iter().filter_map(|v| v.as_u64()).map(|v| v as usize).collect(),
                 None => continue,
             };
-            if shape.len() != 2 || shape[0] == 0 || shape[1] == 0 {
+            if shape.iter().any(|d| *d == 0) {
                 continue;
             }
-            let prod = shape[0] * shape[1];
+
+            // Two on-disk framings. Everything in this tree is tile-major (3-D);
+            // the 2-D branch is kept only so a flat form would still load.
+            //
+            // A 16x16 tile is 256 weights, packed into `shape[2]` u16 words:
+            //
+            //     shape[2] * 16 == 256 * bpw   =>   bpw == shape[2] / 16
+            //
+            // so 48 words is 3 bpw and 96 is the 6 bpw head. That is the bit
+            // rate discriminated by exact arithmetic rather than by trusting
+            // `quantization_config.json`, which is stale for this tree.
+            let (n, k) = match shape.len() {
+                3 => {
+                    let words_per_tile = shape[2];
+                    if words_per_tile != 48 {
+                        continue; // not 3 bpw
+                    }
+                    // Which tile-count is N and which is K is the difference
+                    // between the two checkpoint layouts:
+                    //     Gxma          (row-major) [K/16, N/16, 48]
+                    //     Gxma-repacked (colmajor)  [N/16, K/16, 48]
+                    // This probe runs the COLMajor kernel, so the repacked
+                    // convention applies. Checked against all five live roles
+                    // and config.json (hidden 5376, intermediate 21504,
+                    // heads 32 x head_dim 256):
+                    //     gate/up [1344, 336] = [21504/16, 5376/16]
+                    //     down    [336, 1344] = [5376/16, 21504/16]
+                    //     q       [512, 336]  = [8192/16, 5376/16]
+                    //     k       [256, 336]  = [4096/16, 5376/16]
+                    //     o       [336, 512]  = [5376/16, 8192/16]
+                    (shape[0] * 16, shape[1] * 16)
+                }
+                2 => (shape[0], shape[1]),
+                _ => continue,
+            };
+            if n % 32 != 0 || k % 16 != 0 {
+                continue; // the kernel's tile geometry needs this
+            }
+
             let offsets = match meta["data_offsets"].as_array() {
                 Some(a) if a.len() == 2 => a,
                 _ => continue,
@@ -881,17 +1040,18 @@ fn load_real_3bpw_tensors(model: &Path, want: usize) -> Vec<Tensor> {
             let start = offsets[0].as_u64().expect("start");
             let end = offsets[1].as_u64().expect("end");
             let len = (end - start) as usize;
-            if len * 8 != prod * 3 {
+            if len * 8 != n * k * 3 {
                 continue; // not 3 bpw
             }
             let mut file = File::open(model.join(&shard.shard)).expect("shard");
-            file.seek(SeekFrom::Start(start)).expect("seek");
+            file.seek(SeekFrom::Start(shard.data_start + start))
+                .expect("seek");
             let mut bytes = vec![0u8; len];
             file.read_exact(&mut bytes).expect("payload");
             found.push(Tensor {
                 name,
-                n: shape[0],
-                k: shape[1],
+                n,
+                k,
                 words: bytes
                     .chunks_exact(2)
                     .map(|p| u16::from_le_bytes([p[0], p[1]]))
@@ -949,6 +1109,20 @@ fn build_library(device: &Device) -> Ctx {
             .unwrap_or_else(|e| panic!("pipeline {name}: {e}"));
         arms.push((name.to_string(), state));
     }
+    // Arm (G): same treatment as the GEMV arms -- asserted present, then built.
+    // It is appended rather than added to `ARMS` so the GEMV timing loop cannot
+    // try to dispatch it with a binding signature it does not accept.
+    assert!(
+        library.get_function(CEILING_ARM, None).is_ok(),
+        "probe library does not contain {CEILING_ARM}"
+    );
+    let function = library
+        .get_function(CEILING_ARM, None)
+        .unwrap_or_else(|e| panic!("probe library has no {CEILING_ARM}: {e}"));
+    let state = device
+        .new_compute_pipeline_state_with_function(&function)
+        .unwrap_or_else(|e| panic!("pipeline {CEILING_ARM}: {e}"));
+    arms.push((CEILING_ARM.to_string(), state));
     Ctx {
         queue: device.new_command_queue(),
         library,
