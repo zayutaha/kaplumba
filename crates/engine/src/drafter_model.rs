@@ -230,6 +230,18 @@ impl DrafterModel {
         Ok(DrafterStep { last_hidden, hidden: h_normed })
     }
 
+    /// Project the post-projection hidden through the tied `embed_tokens`
+    /// (`lm_head`), returning a `vocab`-wide f16 row. The drafter ties its
+    /// lm_head to `model.embed_tokens`, which is itself affine-quantized, so this
+    /// is the same GEMV with a different base name.
+    pub fn logits(&self, hidden: &[u16]) -> Result<Vec<u16>, DrafterError> {
+        let vocab = self
+            .weights
+            .shape("model.embed_tokens.weight")
+            .ok_or(DrafterError::MissingTensor)?[0];
+        self.gemv_named(hidden, "model.embed_tokens", vocab, hidden.len())
+    }
+
     fn gemv_named(
         &self,
         x: &[u16],
