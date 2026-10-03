@@ -850,11 +850,16 @@ static inline SampleRng sample_rng_next(ulong state) {
 /// one serial queue execute in submission order.
 kernel void sample_draw(
     constant const uint *candidates [[buffer(0)]],
-    constant SampleDrawParams &params [[buffer(1)]],
-    device ulong *rng [[buffer(2)]],
-    device uint *token_out [[buffer(3)]],
-    device uint *host_token_out [[buffer(4)]],
-    device uint *ranked_out [[buffer(5)]],
+    device ulong *rng [[buffer(1)]],
+    device uint *token_out [[buffer(2)]],
+    device uint *host_token_out [[buffer(3)]],
+    device uint *ranked_out [[buffer(4)]],
+    // LAST, like every other kernel here: `dispatch_groups` binds the parameter
+    // struct at `bindings.len()`, i.e. after the trailing buffers. A `params` at
+    // buffer(1) with a `None` placeholder is silently read from a null binding,
+    // which is what this signature did before — and it produced an all-zero
+    // ranked row rather than an error, because a zero `top_k` writes nothing.
+    constant SampleDrawParams &params [[buffer(5)]],
     uint lid [[thread_position_in_threadgroup]],
     uint tgdim [[threads_per_threadgroup]]) {
     threadgroup uint vkey[SAMPLE_DRAW_STAGE];
@@ -898,12 +903,16 @@ kernel void sample_draw(
             }
             threadgroup_barrier(mem_flags::mem_threadgroup);
             sample_bitonic_pairs(mv, mi, 2u * k, lid, tgdim);
-            if (lid == 0u) {
-                for (uint i = k; i < 2u * k; ++i) {
-                    mv[i - k] = mv[i];
-                    mi[i - k] = mi[i];
-                }
-            }
+            // The network leaves the best `k` of the concatenation in slots
+            // `0..k` already, descending. There is nothing to compact.
+            //
+            // An earlier version "compacted" by copying slots `k..2k` over
+            // `0..k` after the sort -- i.e. it kept the WORSE half and
+            // discarded the better one. It is the shape of code that looks like
+            // tidying up a merge and is instead an in-place reversal of it, and
+            // it failed silently: on an all-equal row it returned indices
+            // 131072.. instead of 0..63, because the discarded half was the
+            // only half holding the low (tie-break-winning) indices.
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
     }
