@@ -48,11 +48,15 @@ T0–T3 is kept because it is measured, not speculative.
         `5cbadbc`): bf16→f16 conversion of scales/biases/layernorms at load,
         packed u32 weights kept verbatim; `drafter_load_gemv_matches_host`
         proves loader + buffer GEMV agree on the real `pre_projection`.
-- [ ] **T6 — Drafter forward.** `pre_projection` (10752→1024) → 4 decoder layers
+- [x] **T6 — Drafter forward.** `pre_projection` (10752→1024) → 4 decoder layers
       reading the **target's shared K/V** → `norm` → `post_projection` (1024→5376),
-      lm_head = tied `embed_tokens`. The drafter keeps **no cache of its own**
-      (`gemma4_assistant.py:104-106`); it reads the target's per-layer-type shared
-      K/V, which is why it costs no extra KV memory.
+      lm_head = tied `embed_tokens`. Validated **standalone** against MLX golden
+      arrays from `Gemma4AssistantDraftModel` with fake shared-KV
+      (`crates/engine/tests/drafter_forward.rs`, `5117572`): max abs diff
+      0.03125 over 5376 values after 4 layers in f16 vs MLX's f32 — consistent
+      with f16-vs-bf16 rounding, not a bug. No own KV cache.
+      (T6 standalone done: the shared-KV *extraction* from the target is T8b
+      territory; the round-loop needs it.)
 
 ## Integration
 
