@@ -103,6 +103,11 @@ precedent showing that a 1-ULP reassociation can move 43 of 128 greedy tokens.
 
 ## 5. Recommendation
 
+> **CONFIRMED BY MEASUREMENT — see `findings/F7-load-width-falsifier.md`.**
+> A 4x cut in load instructions at identical bytes (4 B → 16 B loads) is worth **+3.3%**.
+> The wide window removes ~25% of the weight load instructions, so its ceiling is on the
+> order of **+1%**. Do not implement it.
+
 **Do not implement it.** It is a high-risk rewrite for a payoff that is smaller than the
 one already measured-and-lost in F4, and it cannot reach 20 tok/s under any outcome — the
 bandwidth route's ceiling is ~18.7 (F4 §Arithmetic) and this lever does not reach that.

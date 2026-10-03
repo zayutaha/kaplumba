@@ -89,6 +89,20 @@ Each task is one commit. Status updated immediately after each.
       change is a low-single-digit win, for a rewrite that re-earns bit-exactness.
       *Declined.* *Files:* `findings/F6-wide-window-analysed.md`.
 
+- [x] **T6.1 — falsify T6 with the cheap uint2/uint4 arm (F7).** Added
+      `stream_uint1` / `stream_uint2` to `bw_probe.metal` and
+      `load_width_sensitivity` to `probe_bw_250gb.rs`: same bytes, same
+      grid-stride order, same arithmetic per byte, only the load width differs.
+      **Gate:** all three arms must return the same checksum.
+      **Sabotage-verified** — shifting `stream_uint2` to `gid + 1` makes the gate
+      fire by name (`0x0a057b80` vs `0xde0ea369`) with no GB/s printed; reverted,
+      and the passing checksum matches the pre-existing `stream_uint4` 6 GB one.
+      **Result: uint1 244.6, uint2 245.9 (+0.5%), uint4 252.7 (+3.3%). A 4x cut in
+      load instructions is worth +3.3%, so T6's ~25% cut cannot pay. Also sets a
+      new box record of 252.7 GB/s.**
+      *Files:* `crates/kernels/src/bw_probe.metal`,
+      `crates/engine/examples/probe_bw_250gb.rs`, `findings/F7-load-width-falsifier.md`.
+
 - [ ] **T8 — the only remaining route.** Fewer bytes/token or more tokens per
       weight pass. Verify-gated speculative decoding / MTP, permitted explicitly
       by AGENTS §8; **no infrastructure for it exists in this tree**. Needs its own

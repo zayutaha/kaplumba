@@ -242,6 +242,42 @@ single `uint2` instead of two `u32` at the same address. Odd-`j0` lanes cannot u
 `uint2` (the recorded `uint4`/`ulong2` dead end), so it is a 50%-of-lanes experiment on
 the exact axis.
 
+### T6.1 — the falsifier, RUN (files: `findings/F7-load-width-falsifier.md`)
+
+Rather than shoehorn `uint2` into the GEMV (which only half the lanes could use), the
+question was put directly to the memory system with the existing self-gating probe:
+`stream_uint1` / `stream_uint2` / `stream_uint4`, **same bytes, same grid-stride order**,
+identical arithmetic intensity per byte (one u32 add per four bytes in all three). Only
+the load width differs. 6 GB, 40960 threads, 9 interleaved rounds, min.
+
+```
+stream_uint1   4 B/load   244.6 GB/s
+stream_uint2   8 B/load   245.9 GB/s   +0.5%
+stream_uint4  16 B/load   252.7 GB/s   +3.3%
+```
+
+**A 4x reduction in load instructions is worth +3.3%.** T6's window removes ~25% of the
+weight load instructions, so its ceiling is ~+1%. T6 stands.
+
+**Gate:** all three arms must return the same checksum (adding the same multiset of u32s
+in groups of 1, 2 or 4 is the same sum). **Sabotage-verified:** shifting `stream_uint2` to
+start at `gid + 1` fires
+
+```
+stream_uint1 and stream_uint2 disagree on the checksum (0x0a057b80 vs 0xde0ea369)
+```
+
+with no GB/s printed. Reverted; the passing checksum `0x0a057b80` equals the
+`stream_uint4` 6 GB checksum the probe printed *before* these arms existed, so the new arm
+agrees with the established instrument rather than only with itself.
+
+**Retro-explains two old dead ends.** `uint4`/`ulong2` widening was rejected because no
+lane-uniform residue class exists at KA=3. The alignment problem was real, but it was
+guarding a 3% prize.
+
+**New box record: 252.7 GB/s** (previous best 250.5). It does not move F4's arithmetic,
+which uses the 241-249 band.
+
 ## Live per-kernel numbers after the F5 correction
 
 | kernel | own ms/step | bytes/token | GB/s |
