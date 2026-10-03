@@ -1,4 +1,5 @@
 pub mod attention;
+pub mod affine;
 pub mod elements;
 pub mod encoder;
 pub mod exl3;
