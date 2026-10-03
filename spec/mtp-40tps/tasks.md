@@ -44,9 +44,10 @@ T0–T3 is kept because it is measured, not speculative.
         FP16 activations/scales/biases (bf16→f16 conversion at load), so the
         drafter checkpoint's bf16 `scales`/`biases` must be converted the same
         way on load.
-  - [ ] T5c — loader wiring: read the drafter's `model.safetensors` into
-        engine-owned Metal buffers with the same payload byte ranges the test
-        uses; feed `affine4_gemv`.
+  - [x] T5c — `DrafterWeights` loader (`crates/engine/src/drafter.rs`,
+        `5cbadbc`): bf16→f16 conversion of scales/biases/layernorms at load,
+        packed u32 weights kept verbatim; `drafter_load_gemv_matches_host`
+        proves loader + buffer GEMV agree on the real `pre_projection`.
 - [ ] **T6 — Drafter forward.** `pre_projection` (10752→1024) → 4 decoder layers
       reading the **target's shared K/V** → `norm` → `post_projection` (1024→5376),
       lm_head = tied `embed_tokens`. The drafter keeps **no cache of its own**
