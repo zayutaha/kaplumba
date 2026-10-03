@@ -91,6 +91,33 @@ impl AffineKernels {
             std::ptr::copy_nonoverlapping(biases.as_ptr(), bb.contents() as *mut u16, biases.len());
             std::ptr::copy_nonoverlapping(x.as_ptr(), xb.contents() as *mut u16, x.len());
         }
+        self.gemv_buffers(&xb, &wb, &sb, &bb, &yb, n_rows, k_dim, group_size)?;
+        let src = yb.contents() as *const u16;
+        let mut out = vec![0u16; n_rows];
+        unsafe {
+            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), n_rows);
+        }
+        Ok(out)
+    }
+
+    /// Same math as [`Self::gemv`] on caller-owned Metal buffers, so a loaded
+    /// checkpoint does not copy weights per call.
+    pub fn gemv_buffers(
+        &self,
+        x: &Buffer,
+        w: &Buffer,
+        s: &Buffer,
+        b: &Buffer,
+        y: &Buffer,
+        n_rows: usize,
+        k_dim: usize,
+        group_size: usize,
+    ) -> Result<(), KernelError> {
+        if k_dim % 8 != 0 || k_dim % group_size != 0 {
+            return Err(KernelError::InvalidInput(
+                "k_dim must be a multiple of 8 and group_size".to_string(),
+            ));
+        }
         let n_bytes = (n_rows as u32).to_le_bytes();
         let k_bytes = (k_dim as u32).to_le_bytes();
         let g_bytes = (group_size as u32).to_le_bytes();
@@ -98,26 +125,14 @@ impl AffineKernels {
         let cmd = self.queue.new_command_buffer();
         let encoder = cmd.new_compute_command_encoder();
         encoder.set_compute_pipeline_state(&self.gemv_pipeline);
-        encoder.set_buffer(0, Some(&wb), 0);
-        encoder.set_buffer(1, Some(&sb), 0);
-        encoder.set_buffer(2, Some(&bb), 0);
-        encoder.set_buffer(3, Some(&xb), 0);
-        encoder.set_buffer(4, Some(&yb), 0);
-        encoder.set_bytes(
-            5,
-            size_of::<u32>() as u64,
-            n_bytes.as_ptr() as *const c_void,
-        );
-        encoder.set_bytes(
-            6,
-            size_of::<u32>() as u64,
-            k_bytes.as_ptr() as *const c_void,
-        );
-        encoder.set_bytes(
-            7,
-            size_of::<u32>() as u64,
-            g_bytes.as_ptr() as *const c_void,
-        );
+        encoder.set_buffer(0, Some(w), 0);
+        encoder.set_buffer(1, Some(s), 0);
+        encoder.set_buffer(2, Some(b), 0);
+        encoder.set_buffer(3, Some(x), 0);
+        encoder.set_buffer(4, Some(y), 0);
+        encoder.set_bytes(5, size_of::<u32>() as u64, n_bytes.as_ptr() as *const c_void);
+        encoder.set_bytes(6, size_of::<u32>() as u64, k_bytes.as_ptr() as *const c_void);
+        encoder.set_bytes(7, size_of::<u32>() as u64, g_bytes.as_ptr() as *const c_void);
         encoder.dispatch_thread_groups(
             metal::MTLSize::new(n_rows as u64, 1, 1),
             metal::MTLSize::new(256, 1, 1),
@@ -125,11 +140,13 @@ impl AffineKernels {
         encoder.end_encoding();
         cmd.commit();
         cmd.wait_until_completed();
-        let src = yb.contents() as *const u16;
-        let mut out = vec![0u16; n_rows];
-        unsafe {
-            std::ptr::copy_nonoverlapping(src, out.as_mut_ptr(), n_rows);
-        }
-        Ok(out)
+        Ok(())
+    }
+
+    pub fn alloc_u16(&self, count: usize) -> Result<Buffer, KernelError> {
+        Ok(self.device.new_buffer(
+            (count * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        ))
     }
 }
