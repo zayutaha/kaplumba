@@ -103,17 +103,19 @@ Each task is one commit. Status updated immediately after each.
       *Files:* `crates/kernels/src/bw_probe.metal`,
       `crates/engine/examples/probe_bw_250gb.rs`, `findings/F7-load-width-falsifier.md`.
 
+- [x] **T7.1 — every live-dispatch variant measured (F8).**
+      `KAPLUMBA_SK2_CONTIG4=1` **-2.0%** and `KAPLUMBA_SK2_1COL=1` **-1.2%**,
+      both losing in 6/6 interleaved pairs, against the shipped
+      `_colmajor_2col_sk2` at **16.024 tok/s**. That dispatch is o_proj +
+      down_proj = 30.2% of the step. **With F4 and F5, every variant axis on the
+      decode dispatch is measured and the shipped configuration is the maximum of
+      all of them.** *Files:* `findings/F8-sk2-variants-closed.md`.
+
 - [ ] **T8 — the only remaining route.** Fewer bytes/token or more tokens per
       weight pass. Verify-gated speculative decoding / MTP, permitted explicitly
       by AGENTS §8; **no infrastructure for it exists in this tree**. Needs its own
-      spec. Every bandwidth lever is now closed by measurement: T2/T3/T4/F3/F4/F5/F6. The ring is
-      ordered by `(lane, k)` with `lane = 4*(o mod 8) + g`, so one output's 16
-      inputs are *strided* across four lanes by 32 codes. A 16-code contiguous
-      window is not a usable `(output, input)` set, so widening the window requires
-      a new ring order: change `reorder_tensor_to_colmajor` / `pack_integer_states`
-      (`kaplumba_engine::exl3`), version the on-disk format, repack all 411
-      tensors, rewrite the reduction, re-earn bit-exactness. **Deserves its own
-      spec.** Ceiling if it works: ~18.7 tok/s (F4 §Arithmetic).
+      spec. Every bandwidth lever is now closed by measurement:
+      T2/T3/T4/T5/T6/T6.1/T7/T7.1 and F3-F8.
 
 - [x] **T5** — Report and close (R1-R5). `findings/F3-live-kernels.md`: live
       per-kernel bandwidth (~200–206 GB/s), the re-measured ceiling (241–249,
