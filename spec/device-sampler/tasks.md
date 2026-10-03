@@ -20,7 +20,7 @@ Each task is one commit. Status updated immediately after each.
       **Temperature-0 byte-identity:** 7 runs across 3 prompts, generated text
       only, all hashes equal to `863bce5`'s binary.
       *Commit:* `spec/device-sampler: T1 HeadPick, skip_softcap from mode`
-- [ ] **T2** — `sample_topk_blocks` + `sample_draw` in
+- [x] **T2** — `sample_topk_blocks` + `sample_draw` in
       `elements.metal` / `elements.rs`; `device ulong` RNG in
       `ForwardScratch`; `sample_candidates` + `rng_state` in
       `resident_bytes()`.
@@ -28,12 +28,20 @@ Each task is one commit. Status updated immediately after each.
       `crates/kernels/src/elements.rs`, `crates/engine/src/model.rs`,
       new test `crates/engine/tests/device_sampler.rs`.
       *Tests:* (1) device top-64 **set and order** == `top_k_order`, exact,
-      on adversarial rows (heavy ties, ±0.0, NaN, ±inf, extreme exponents);
-      (2) RNG: the MSL integer round-to-nearest-even reproduces the host's
-      `next_f64() as f32` bit-for-bit over ≥10⁵ draws (integer test, no GPU);
-      (3) TV distance host vs device below threshold over ≥10⁵ device draws;
-      (4) `top_k` bound: `top_k > 1024` is rejected at the call, not
-      silently wrong.
+      on adversarial rows (heavy ties, ±0.0, ±inf, extreme exponents);
+      (2) RNG: the device `float(n) * 2^-53` reproduces the host's
+      `next_f64() as f32` bit-for-bit over 3×10⁶ draws (integer test, no GPU);
+      (3) TV distance host vs device below threshold over ≥10⁵ device draws,
+      threshold measured at 0.06 (a correct sampler reads 0.026–0.036);
+      (4) `top_k` bound: derived from the kernel geometry, swept at every
+      `top_k` against it, and refused at the call rather than silently wrong.
+      *Result:* 6/6 GPU tests + 15/15 lib tests pass.
+      **Six defects found and fixed**, four CPU-side and two GPU-side; all six
+      sabotage-verified. The two GPU ones were silent — no fault, no NaN:
+      `sample_draw` read its params from a null binding (`dispatch_groups`
+      binds the param struct last, not in the middle), and the merge kept the
+      *worse* half of the sorted pair. See `implementation_notes.md`.
+      *Commits:* `454fb0e`, `f79722c`, `c0e5a6c`.
 - [ ] **T3** — wire the sampler into the pipelined route and ungate the
       pipeline: `chat.rs:388`, `generate.rs:150`/`:269`, `generate_gpu_greedy`
       → `generate_gpu_pick(pick: HeadPick)`, first token from

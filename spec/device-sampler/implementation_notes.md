@@ -312,3 +312,116 @@ advances disagree, the failure says so instead of masquerading as a rounding
 difference. Two of my three intermediate repros were wrong in this way before the
 harness was right; in both cases the mean was the thing that gave it away
 (2e-9, then 32803, then 0.5 once the scale was right).
+
+## T2, part 2 — two silent GPU-only defects, both found by gates rather than reading
+
+Neither faulted, neither produced a NaN, and both would have shipped as
+"working". They were caught only because the gates compare against an oracle
+rather than checking for a crash.
+
+### `sample_draw` read its parameters from a null binding
+
+The signature declared
+
+```metal
+constant SampleDrawParams &params [[buffer(1)]],
+device ulong *rng [[buffer(2)]],
+```
+
+with a `None` placeholder on the host side to leave a gap. But
+`MetalEncoder::dispatch_groups` binds the parameter struct at
+**`bindings.len()`** (`encoder.rs:453`) — i.e. after the trailing buffers,
+always. Every other kernel in the file follows that convention; this one
+assumed an in-the-middle gap was possible.
+
+So `params` was never bound at index 1. The kernel read a null `constant`
+struct, i.e. all zeros — and a zero `top_k` means the ranked-output loop
+`for (i = 0; i < top_k; ++i)` **writes nothing**. The symptom was a
+silently all-zero ranked row, not a fault.
+
+**Fix:** params moved to `buffer(5)`, the `None` placeholder removed. This is
+now commented in the signature, because "add an optional output buffer" is
+exactly the edit that reintroduces it.
+
+**Sabotage S5** (params back at `buffer(1)`, `None` placeholder restored):
+`device_top_k_matches_the_host_set_and_order_on_adversarial_rows` fails.
+
+### The merge kept the worse half of the sorted pair
+
+```metal
+sample_bitonic_pairs(mv, mi, 2u * k, lid, tgdim);
+if (lid == 0u) {
+    for (uint i = k; i < 2u * k; ++i) { mv[i - k] = mv[i]; mi[i - k] = mi[i]; }
+}
+```
+
+The network leaves the best `k` of the concatenation in `0..k`, descending.
+The "compaction" loop copied `k..2k` **over** `0..k` — keeping the worse half
+and discarding the better. It is the shape of code that reads like tidying up a
+merge and is in fact an in-place reversal of one.
+
+On an all-equal row it returned indices `131072..` instead of `0..63`, because
+the discarded half was the only half holding the low tie-break-winning indices.
+Zero overlap with the host's answer on a realistic row.
+
+**Found without a GPU round-trip.** The device's `all_equal` output
+(`131072, 131073, ...`) was reproduced exactly by transcribing the sort and
+merge into a standalone host program — which then showed the copy loop as the
+sole difference. Worth remembering: a 262,144-wide GPU kernel is a ~8-second
+cycle per hypothesis, and this class of bug is decidable in microseconds of
+scalar Rust.
+
+**Fix:** delete the loop.
+
+**Sabotage S4** (restore the loop): the top-k gate fails.
+
+### A test bug the gate caught, worth recording
+
+The `extremes` row originally included `NaN`, and the host returned a `NaN`
+element at **rank 0**. That was not a device bug: `top_k_order` documents that
+it requires finite logits, and its comparator's `partial_cmp(..).unwrap_or(Equal)`
+is not a strict weak ordering under `NaN`, so **the host has no defined answer
+there**. The test was asking a function a question outside its contract, and the
+"failure" was the harness's.
+
+The device's behaviour is separately pinned by `nan_never_wins_on_the_device`:
+`value_key` folds `NaN` to 0, below every real key, so it cannot be selected.
+That is asserted directly, because there is no oracle to compare against.
+
+Worth separating: *the gate failed* and *the gate was wrong*. Both are real, and
+the second is the one that would have shipped a permanent red test that people
+learn to ignore.
+
+### TV threshold: measured, not guessed
+
+Five independent 1e5-draw trials on this box:
+
+```text
+tv = 0.0344 / 0.0357 / 0.0336 / 0.0256 / 0.0346     (top prob 0.0159, full top-64 support)
+```
+
+That matches theory — 64 bins at mean `p ~ 1/64`, per-bin sd ~4e-4, summed to
+~0.025 — so this is the sampling noise floor for a *correct* sampler, not bias.
+The threshold is **0.06**, about 1.7x the worst observed trial.
+
+The first draft asserted `< 0.05`, which sits *inside* the noise band and would
+have flaked roughly half the time. And the margin it was protecting against is
+enormous: a sampler collapsed onto the argmax has TV ~ 0.98. Correct-vs-broken
+is ~30x apart, so the threshold should be loose, not tight. A tight threshold
+here buys nothing and costs a coin flip.
+
+### A process note: commit kernel edits immediately
+
+The merge fix was applied, verified on GPU (probe showed `0,1,2,...` matching
+the host), and then **lost** when the session restarted — it was uncommitted. The
+next run rebuilt cleanly, passed a compile, and failed with byte-identical
+output to the pre-fix run, which read exactly like a stale binary and was not
+one.
+
+Two lessons, both cheap:
+- `md5 -q` the file after a kernel edit, not just the test result. The test said
+  "failed for a reason you think you already fixed"; only the md5 said the fix
+  was not in the file.
+- Commit `elements.metal` in the same step as the fix. An uncommitted kernel
+  edit is one session restart from gone, and the failure mode is
+  indistinguishable from a build problem.
