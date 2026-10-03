@@ -95,6 +95,72 @@ slower, which is the signature of insufficient parallelism. This is the T2
 hypothesis, and it must be proven by varying grid at **fixed shape and fixed
 bytes** before it is accepted.
 
+## T2/T3/T5 result — F1/F2 measured a dead kernel (files: `findings/F3-live-kernels.md`)
+
+**The P01 probe's "production" arm is not the live decode kernel.**
+`KAPLUMBA_TRACE_GEMV=1` on a real decode run prints:
+
+```
+linear_gemv_ishizuki_k3_colmajor_2col_sk2    (o_proj, down_proj)
+linear_gemv_ishizuki_k3_fused2_2col          (gate, up)
+linear_gemv_ishizuki_k3_fused3_2col          (q, k, v)
+linear_gemv_ishizuki_k<unknown>              (lm_head; reverse name lookup bug)
+```
+
+`linear_gemv_ishizuki_k3_colmajor_2col` — F1's "production" and the kernel F2's whole
+table is built on — **is not in the list**. It is only reached from `encode_gemv_raw`'s
+2col arm (`linear.rs:2130-2157`), which the live path does not take. Same class as the
+loader defects in F1: the instrument timed an entry point the engine never calls.
+
+**The live kernels are faster than F2 said.** `KAPLUMBA_DECODE_PROFILE=kernel`, 32 steps:
+
+| kernel | own ms/step | share | bytes/token | GB/s |
+|---|---:|---:|---:|---:|
+| gate_up_gelu | 25.58 | 40.0% | 5.202 GB | 203.4 |
+| down_proj | 13.10 | 20.5% | 2.601 GB | 198.6 |
+| qkv_proj | 8.62 | 13.5% | 1.652 GB | 191.6 |
+| o_proj | 6.22 | 9.7% | 0.991 GB | **159.4** |
+| head/gemv | 4.11 | 6.4% | 1.057 GB | ~257 |
+| attention | 2.34 | 3.7% | — | — |
+| qk_proj | 1.95 | 3.1% | — | — |
+| post_ffn_out / post_attn / kv_norm / norms | 2.0 | 3.1% | — | — |
+
+Uninstrumented step **62.8 ms = 15.92 tok/s** (`decode_tok_s=15.917`, 128 tokens,
+temp 0). Matvec share 93.2% ⇒ ~58.5 ms for ~12.04 GB = **~206 GB/s live matvec**.
+
+**Ceiling re-measured today** (`probe_bw_250gb`, self-gating, 2/6/12 GB, uint4):
+median **241–249 GB/s**, best **253.3**. The user's 250 GB/s is real for a 2 GB pure
+stream; it is not what 12 GB of weights delivers into the kernel.
+
+**The arithmetic cap — this is the headline:**
+
+```
+now         58.5 ms matvec + 4.3 ms rest = 62.8 ms  15.92 tok/s   206 GB/s
+at 245      49.1 + 4.3                  = 53.4 ms  18.7 tok/s
+at 237 (arm G instruction bound)        55.1 ms    18.1 tok/s
+20 tok/s    needs matvec <= 45.7 ms  => 263 GB/s  > ceiling
+```
+
+**So the bandwidth route tops out at ~18–19 tok/s.** 20 tok/s needs fewer bytes/token or
+more tokens per weight pass. §8 forbids precision loss, so the lossless route is
+verify-gated speculative decoding / MTP — **and no such infrastructure exists in this
+tree** (searched; `spec/mtp-40tps/` is a different 4-bit checkpoint, not a decoder).
+
+Full JSON-safe repro commands:
+
+```bash
+M=~/.kaplumba/models/Gxma-repacked
+PP=$(python3 -c "print('Explain the theory of relativity. '*10)")
+# end to end
+scripts/gpuq try -- ./target/release/kaplumba --model "$M" --prompt "$PP" \
+    --max-new-tokens 128 --temperature 0 --metrics
+# per-kernel
+scripts/gpuq try -- env KAPLUMBA_DECODE_PROFILE=kernel ./target/release/kaplumba \
+    --model "$M" --prompt "$PP" --max-new-tokens 40 --temperature 0
+# ceiling
+scripts/gpuq try -- ./target/release/examples/probe_bw_250gb
+```
+
 ## Open, with the current best guess
 
 - **Q1** the two-gate_proj 10% spread → placement, worth ~10% if model-wide.

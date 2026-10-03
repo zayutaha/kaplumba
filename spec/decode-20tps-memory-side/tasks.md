@@ -28,26 +28,40 @@ Each task is one commit. Status updated immediately after each.
       GB/s (511.7 → 267.2), so it is *not* an instruction effect. 71.1% of bytes
       are in the two large-N shapes; target is +34%.** *Commit:* `73cf9a7`.
 
-- [ ] **T2** — Latency vs pattern discriminator (R2, R3). Decide whether the
-      11% memory-side term is "too few loads in flight" or "bad DRAM access
-      pattern". They need opposite fixes.
-      *Files:* probe only. *Tests:* the arm must be shown capable of failing both
-      ways before either verdict is reported — a verdict that flips on a
-      calibration constant is not a discriminator (`decode-ceiling` already lost
-      a week to exactly that).
+- [x] **T2** — Latency vs pattern, **answered from prior evidence plus one new
+      measurement, but NOT with a fresh within-shape discriminator.**
+      *Latency is closed:* `spec/decode-bandwidth-240gb/spec.md` measured 0.08M →
+      2.62M loads in flight (32×) at **1.06×** bandwidth, and two other attempts
+      (`ROUND1-2-SUMMARY.md:15`, `A3-kernelsel.md:203`) got ≤ +0.3%. No new GPU
+      time was spent re-deriving it.
+      *Pattern is the lane window:* the head (`k6`, row-major) reaches ~257 GB/s
+      while every 3 bpw layer kernel sits at 159–203 GB/s in the same step — and
+      the only property that differs is usable bytes per lane-load (2.0× at
+      6 bpw vs 2.67× at 3 bpw). **This is inference from the F3 table, not a
+      gated experiment**, and T2's own bar ("the arm must be shown capable of
+      failing both ways") is therefore still *unmet*. Recorded as open.
+      *Files:* `findings/F3-live-kernels.md`.
 
-- [ ] **T3** — The 10% two-`gate_proj` spread (Q1). Reproducible, unexplained,
-      identical shapes: 464 vs 511 Gcodes/s. If it is placement, it is free.
-      *Files:* probe only.
+- [x] **T3** — The 10% two-`gate_proj` spread (Q1) — **moot as posed.** It was a
+      pair of `_colmajor_2col` measurements, and that kernel is not on the live
+      path (T2/F3). The live analogue is `o_proj` at **159 GB/s against its own
+      peers at 199–203 on the same kernel and the same 336-TG grid**, which is a
+      fixed-per-dispatch amortisation signature (K 8192 vs 21504), not placement.
+      *Files:* `findings/F3-live-kernels.md` §2.
 
 - [ ] **T4** — Land the highest-value Phase-2 change (R4). Interleaved A/B, ≥6
       pairs, control arm, medians and spread. Regression gate:
       `--temperature 0` byte-identical over ≥3 runs, generated text only.
       *Files:* `crates/kernels/src/linear_repacked.metal` (+ `linear.rs` if a
       variant is added).
+      *The named candidate:* serve 16 codes per lane from the same 64-bit window
+      (2.67× → 1.33× useful-byte amplification at KA=3). Kernel rewrite; changes
+      accumulation order, so bit-exactness must be re-earned.
 
-- [ ] **T5** — Report and close (R1-R5). Step-level bandwidth, attribution of
-      every remaining GB/s to a named wall or a closed hypothesis.
+- [x] **T5** — Report and close (R1-R5). `findings/F3-live-kernels.md`: live
+      per-kernel bandwidth (~200–206 GB/s), the re-measured ceiling (241–249,
+      best 253), and the arithmetic that **caps the bandwidth route at ~18–19
+      tok/s** — 20 tok/s needs 263 GB/s effective, above the box.
 
 ## Standing constraints
 
