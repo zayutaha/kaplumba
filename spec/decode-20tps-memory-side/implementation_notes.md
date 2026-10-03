@@ -67,6 +67,34 @@ Exhaustive over all 8^6 rate assignments, the 410 layer tensors are a plateau ov
 1–4 bpw. **So the memory-side route is the only route, which is why this spec
 exists.**
 
+## T1 result — per-shape bandwidth tracks N (files: `findings/F2-per-shape.md`)
+
+Changed the loader to select one payload per **distinct (K,N) shape**. Selecting
+"the 2 biggest" had returned two identical gate/up tensors, so the old "2 biggest"
+sweep was really one shape measured twice. Added `trellis_shape(n,k)` as the
+single owner of the 3-D tile-major convention (`[N/16, K/16, 16*bpw]` colmajor;
+`[K/16, N/16, 16*bpw]` row-major) and `shape_inventory()`, a header-only byte
+census that needs no GPU.
+
+| shape | ×tensors | bytes | GB/s | Gcodes/s | grid |
+|---|---:|---:|---:|---:|---:|
+| K=5376 N=21504 | 120 | 5202 MB | 191.9 | 511.7 | 672 |
+| K=21504 N=5376 | 60 | 2601 MB | 175.0 | 466.7 | 168 |
+| K=5376 N=8192 | 50 | 826 MB | 167.5 | 446.6 | 256 |
+| K=8192 N=5376 | 50 | 826 MB | 160.3 | 427.3 | 168 |
+| K=5376 N=4096 | 100 | 826 MB | 136.1 | 362.8 | 128 |
+| K=5376 N=16384 | 10 | 330 MB | 185.4 | 494.5 | 512 |
+| K=16384 N=5376 | 10 | 330 MB | 172.1 | 458.9 | 168 |
+| K=5376 N=2048 | 10 | 41 MB | 100.2 | 267.2 | 64 |
+| **weighted** | **410** | **10.983 GB** | **176.5** | **470.7** | |
+
+Byte-weighted: 10983/Σ(bytes/GB/s) = 62.23 ms, matching the measured ~62.3 ms
+step. The ratio is monotone in N over 1.9×, and **Gcodes/s tracks GB/s**, so the
+small shapes are *not* instruction-bound: the same instruction stream runs 1.9×
+slower, which is the signature of insufficient parallelism. This is the T2
+hypothesis, and it must be proven by varying grid at **fixed shape and fixed
+bytes** before it is accepted.
+
 ## Open, with the current best guess
 
 - **Q1** the two-gate_proj 10% spread → placement, worth ~10% if model-wide.

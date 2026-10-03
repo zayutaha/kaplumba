@@ -15,14 +15,18 @@ Each task is one commit. Status updated immediately after each.
       (= 8 + header_len). **Observed failure recorded.**
       *Commit:* `a5683d1`.
 
-- [ ] **T1** — Per-role bandwidth table on real weights (R1). Load one tensor
-      per live role (q, k, o, gate, up, down) instead of "the 2 biggest", and
-      report GB/s and Gcodes/s per role plus the byte-weighted step figure.
-      *Files:* `crates/engine/tests/perf_probe_code_rate_p01.rs` (probe only).
-      *Tests:* the table itself; assert every role loads and hits the fidelity
-      gate. Closes Q3 and says whether one role carries the loss.
-      *Why first:* a 2.3× spread is visible in the synthetic sweep; if it is real,
-      Phases 2-3 are aimed at the wrong thing.
+- [x] **T1** — Per-shape bandwidth table on real weights (R1). Load one tensor
+      per **distinct (K,N) shape** (not per role, and not "the 2 biggest", which
+      returned two identical gate_proj tensors) and report GB/s and Gcodes/s per
+      shape plus the byte-weighted step figure. Added `trellis_shape()` (single
+      owner of the 3-D tile-major convention) and `shape_inventory()`.
+      *Files:* `crates/engine/tests/perf_probe_code_rate_p01.rs` (probe only),
+      `findings/F2-per-shape.md`. *Tests:* `p01_code_rate_issue_bound`.
+      **Finding: bandwidth is monotone in N, 191.9 GB/s at N=21504 → 100.2 at
+      N=2048; byte-weighted 176.5 GB/s over 10.983 GB = 62.23 ms, which
+      reproduces the measured 62.3 ms step from first principles. Gcodes/s tracks
+      GB/s (511.7 → 267.2), so it is *not* an instruction effect. 71.1% of bytes
+      are in the two large-N shapes; target is +34%.** *Commit:* `f3a6c4f`.
 
 - [ ] **T2** — Latency vs pattern discriminator (R2, R3). Decide whether the
       11% memory-side term is "too few loads in flight" or "bad DRAM access

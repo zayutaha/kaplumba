@@ -975,74 +975,112 @@ fn read_shard_headers(model: &Path) -> Vec<ShardHeader> {
 /// Kept as three separate assertions rather than one combined predicate, so a
 /// future format drift names which assumption broke instead of reporting "0".
 /// (`spec/decode-3bpw-amplification/implementation_notes.md:271-272`).
-fn load_real_3bpw_tensors(model: &Path, want: usize) -> Vec<Tensor> {
-    let mut found: Vec<Tensor> = Vec::new();
+/// `(n, k, payload_bytes, data_offset_start)` for a 3 bpw `.trellis`, or `None`.
+///
+/// **The single owner of the checkpoint's trellis convention.** Every parse of a
+/// trellis header goes through here, so the three defects that made arms (a)-(g)
+/// un-runnable for the life of this probe cannot diverge between callers again:
+///
+/// 1. dtype -- both checkpoints write `I16`. Requiring `U16` excluded every
+///    tensor in the file. The payload is read as raw words either way, so the
+///    sign is not load-bearing.
+/// 2. shape -- every tensor here is 3-D tile-major, not 2-D. A 16x16 tile is 256
+///    weights in `shape[2]` u16 words, so `shape[2] == 16 * bpw`: 48 is 3 bpw and
+///    the 6 bpw head's 96 is excluded. Which tile-count is N and which is K is
+///    the difference between the two checkpoint layouts:
+///
+///    ```text
+///    Gxma          (row-major) [K/16, N/16, 48]
+///    Gxma-repacked (colmajor)  [N/16, K/16, 48]
+///    ```
+///
+///    This probe runs the COLMajor kernel, so the repacked convention applies.
+///    Checked against all five live roles and `config.json` (hidden 5376,
+///    intermediate 21504, 32 heads x head_dim 256):
+///    gate/up `[1344, 336]` = `[21504/16, 5376/16]`; down `[336, 1344]`;
+///    q `[512, 336]` = `[8192/16, 5376/16]`; k `[256, 336]`; o `[336, 512]`.
+/// 3. offsets -- `data_offsets` are relative to the data section, which starts at
+///    `8 + header_len`. The caller must add `ShardHeader::data_start`; using them
+///    raw returns header bytes and nothing downstream can detect it.
+fn trellis_shape(_name: &str, meta: &serde_json::Value) -> Option<(usize, usize, usize, u64)> {
+    match meta["dtype"].as_str() {
+        Some("I16") | Some("U16") => {}
+        _ => return None,
+    }
+    let shape: Vec<usize> = meta["shape"]
+        .as_array()?
+        .iter()
+        .filter_map(|v| v.as_u64())
+        .map(|v| v as usize)
+        .collect();
+    if shape.is_empty() || shape.iter().any(|d| *d == 0) {
+        return None;
+    }
+    let (n, k) = match shape.len() {
+        3 => {
+            if shape[2] != 48 {
+                return None; // not 3 bpw
+            }
+            (shape[0] * 16, shape[1] * 16)
+        }
+        2 => (shape[0], shape[1]),
+        _ => return None,
+    };
+    if n % 32 != 0 || k % 16 != 0 {
+        return None; // the kernel's tile geometry needs this
+    }
+    let offsets = meta["data_offsets"].as_array()?;
+    if offsets.len() != 2 {
+        return None;
+    }
+    let start = offsets[0].as_u64()?;
+    let end = offsets[1].as_u64()?;
+    let len = (end.checked_sub(start)?) as usize;
+    if len * 8 != n * k * 3 {
+        return None; // not 3 bpw
+    }
+    Some((n, k, len, start))
+}
+
+/// Header-only: `(n, k, tensor count, total payload bytes)` per distinct shape.
+///
+/// The byte weights the per-shape bandwidths into a step-level figure. Read from
+/// headers only, so it costs nothing next to the payloads.
+fn shape_inventory(model: &Path) -> Vec<(usize, usize, usize, u64)> {
+    let mut map: std::collections::BTreeMap<(usize, usize), (usize, u64)> = Default::default();
     for shard in read_shard_headers(model) {
         for (name, meta) in shard.tensors {
-            // `I16` and `U16` are the same 16 bits; the payload is read as raw
-            // words either way, so the sign in the header is not load-bearing.
-            // Both checkpoints write `I16`, and requiring `U16` excluded every
-            // tensor in the file.
-            match meta["dtype"].as_str() {
-                Some("I16") | Some("U16") => {}
-                _ => continue,
+            if let Some((n, k, len, _)) = trellis_shape(&name, &meta) {
+                let entry = map.entry((n, k)).or_default();
+                entry.0 += 1;
+                entry.1 += len as u64;
             }
-            let shape: Vec<usize> = match meta["shape"].as_array() {
-                Some(a) => a.iter().filter_map(|v| v.as_u64()).map(|v| v as usize).collect(),
+        }
+    }
+    map.into_iter()
+        .map(|((n, k), (count, bytes))| (n, k, count, bytes))
+        .collect()
+}
+
+/// One payload per **distinct `(n, k)` shape**, not "the N biggest tensors".
+///
+/// The probe's question is how bandwidth varies across the shapes the model
+/// actually runs. Selecting by size would return 62 identical gate_proj tensors
+/// and answer a different question; the synthetic sweep suggests a 2.3x spread
+/// by shape, and if that is real it decides where every later task aims.
+fn load_real_3bpw_tensors(model: &Path, want: usize) -> Vec<Tensor> {
+    let mut found: Vec<Tensor> = Vec::new();
+    let mut seen: Vec<(usize, usize)> = Vec::new();
+    for shard in read_shard_headers(model) {
+        for (name, meta) in shard.tensors {
+            let (n, k, len, start) = match trellis_shape(&name, &meta) {
+                Some(t) => t,
                 None => continue,
             };
-            if shape.iter().any(|d| *d == 0) {
+            if seen.contains(&(n, k)) {
                 continue;
             }
-
-            // Two on-disk framings. Everything in this tree is tile-major (3-D);
-            // the 2-D branch is kept only so a flat form would still load.
-            //
-            // A 16x16 tile is 256 weights, packed into `shape[2]` u16 words:
-            //
-            //     shape[2] * 16 == 256 * bpw   =>   bpw == shape[2] / 16
-            //
-            // so 48 words is 3 bpw and 96 is the 6 bpw head. That is the bit
-            // rate discriminated by exact arithmetic rather than by trusting
-            // `quantization_config.json`, which is stale for this tree.
-            let (n, k) = match shape.len() {
-                3 => {
-                    let words_per_tile = shape[2];
-                    if words_per_tile != 48 {
-                        continue; // not 3 bpw
-                    }
-                    // Which tile-count is N and which is K is the difference
-                    // between the two checkpoint layouts:
-                    //     Gxma          (row-major) [K/16, N/16, 48]
-                    //     Gxma-repacked (colmajor)  [N/16, K/16, 48]
-                    // This probe runs the COLMajor kernel, so the repacked
-                    // convention applies. Checked against all five live roles
-                    // and config.json (hidden 5376, intermediate 21504,
-                    // heads 32 x head_dim 256):
-                    //     gate/up [1344, 336] = [21504/16, 5376/16]
-                    //     down    [336, 1344] = [5376/16, 21504/16]
-                    //     q       [512, 336]  = [8192/16, 5376/16]
-                    //     k       [256, 336]  = [4096/16, 5376/16]
-                    //     o       [336, 512]  = [5376/16, 8192/16]
-                    (shape[0] * 16, shape[1] * 16)
-                }
-                2 => (shape[0], shape[1]),
-                _ => continue,
-            };
-            if n % 32 != 0 || k % 16 != 0 {
-                continue; // the kernel's tile geometry needs this
-            }
-
-            let offsets = match meta["data_offsets"].as_array() {
-                Some(a) if a.len() == 2 => a,
-                _ => continue,
-            };
-            let start = offsets[0].as_u64().expect("start");
-            let end = offsets[1].as_u64().expect("end");
-            let len = (end - start) as usize;
-            if len * 8 != n * k * 3 {
-                continue; // not 3 bpw
-            }
+            seen.push((n, k));
             let mut file = File::open(model.join(&shard.shard)).expect("shard");
             file.seek(SeekFrom::Start(shard.data_start + start))
                 .expect("seek");
@@ -1059,12 +1097,11 @@ fn load_real_3bpw_tensors(model: &Path, want: usize) -> Vec<Tensor> {
             });
         }
     }
-    found.sort_by_key(|t| std::cmp::Reverse(t.codes()));
     assert!(
-        found.len() >= want,
-        "found only {} 3 bpw .trellis tensors under {model:?}, wanted {want}",
-        found.len()
+        !found.is_empty(),
+        "no 3 bpw .trellis tensors under {model:?}; the loader is broken, not the model"
     );
+    found.sort_by_key(|t| std::cmp::Reverse(t.codes()));
     found.truncate(want);
     found
 }
@@ -1253,7 +1290,28 @@ fn p01_code_rate_issue_bound() {
 
     let rounds = arg_usize("--rounds", 11);
     let iters = arg_usize("--iters", 12);
-    let tensors = load_real_3bpw_tensors(&model, 2);
+    let tensors = load_real_3bpw_tensors(&model, 12);
+
+    // Header-only inventory: which shapes carry the bytes. The per-shape
+    // bandwidths measured below are weighted by these byte counts into the
+    // step-level figure, and the weighting is what decides whether one role
+    // carries the whole loss -- a 2.3x spread only matters if it sits on the
+    // shapes that hold the bytes.
+    let inventory = shape_inventory(&model);
+    let inventory_bytes: u64 = inventory.iter().map(|(_, _, _, b)| *b).sum();
+    println!("\n=== layer shape inventory (header-only) ===");
+    for (n, k, count, bytes) in &inventory {
+        println!(
+            "  K={k:<6} N={n:<6} x{count:<3} {:8.2} MB  {:5.1}% of layer bytes",
+            *bytes as f64 / 1e6,
+            *bytes as f64 / inventory_bytes as f64 * 100.0
+        );
+    }
+    println!(
+        "  total layer trellis {:.3} GB across {} shapes",
+        inventory_bytes as f64 / 1e9,
+        inventory.len()
+    );
 
     for t in &tensors {
         let (k, n) = (t.k, t.n);
