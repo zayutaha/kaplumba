@@ -36,54 +36,239 @@ pub struct Sampler {
     state: u64,
 }
 
-/// The `top_k` candidates, best first.
+/// Ascending-in-value `u32` key for a logit. Two properties, both load-bearing.
 ///
-/// **This replaced a full `sort_by` of all 262,144 indices followed by a
-/// truncate to `top_k`.** Both selections timed from ONE binary on the same
-/// 262,144-wide row (`examples/bench_sampler.rs`):
+/// * **Order preserving.** For any non-NaN pair, `key(a) < key(b)` exactly when
+///   `a < b`: flipping *every* bit of a negative float and only the sign bit of a
+///   positive one turns IEEE-754's sign-magnitude layout into two's-complement
+///   order. That is what lets the selection compare integers instead of doing two
+///   random gathers into the `f32` row per comparison, which is what the
+///   comparator this replaced spent its time on.
+/// * **Equal exactly where `partial_cmp` says equal.** `-0.0` sorts below `+0.0`
+///   as a key but *compares equal*, and the shipped comparator then breaks that
+///   tie by INDEX. So `-0.0` is folded onto `+0.0` (via `value == 0.0`, which is
+///   true for both zeros). Without the fold, a row whose `top_k` boundary falls
+///   inside the zeros selects a different SET than the sort, `sample()` returns a
+///   different token for the same `--seed`, and nothing raises an error.
+///
+/// NaN has no place in this order — the shipped comparator calls every comparison
+/// involving it `Equal` via `unwrap_or`, which is not even a strict weak ordering,
+/// so `select_nth_unstable_by` had no defined answer for it either. `sample`
+/// rejects non-finite logits (`sampler.rs:198`) before reaching here; `top_k_order`
+/// inherits the same precondition.
+#[inline]
+fn order_key(value: f32) -> u32 {
+    let bits = if value == 0.0 { 0.0_f32.to_bits() } else { value.to_bits() };
+    bits ^ ((((bits as i32) >> 31) as u32) | 0x8000_0000)
+}
+
+/// The `top_k` candidates, best first: **logit descending, index ascending on
+/// ties**, which is a TOTAL order, so the returned vector is uniquely determined
+/// and any correct selection is obliged to return this exact sequence.
+///
+/// # What this replaced, and why it was still 1.9 ms
+///
+/// Three selectors, all timed from ONE binary (`tests/probe_topk_equality.rs`) on the same
+/// 262,144-wide fp16-derived row at `top_k = 64`; median of 41 **interleaved** samples,
+/// min..max in brackets (`--release`; AGENTS.md 10.2.5 — decode on this box has been measured
+/// from 3.7 to 6.4 tok/s from the same binary minutes apart, so a single reading is not a
+/// result):
 ///
 /// ```text
-/// selection OLD (full sort):  14.71 ms/token
-/// selection NEW (partition):   1.89 ms/token      7.8x
-/// whole `sample()`:            2.87 ms/token      (was ~15.5)
+///                                  tailed row                uniform row
+/// full `sort_by` of every index    14.71 ms (older run, see examples/bench_sampler.rs)
+/// `select_nth_unstable_by`         1.790 [1.672..1.967]       2.024 [1.931..2.284]
+/// this (two-pass counting)         0.251 [0.225..0.328]       0.254 [0.224..0.307]
+/// whole `sample()`                 1.848 -> 0.322             2.069 -> 0.321
 /// ```
 ///
-/// The old cost was 23.4% of a 62.9 ms decode step, and it was the entire
-/// difference between greedy's 15.9 tok/s and sampling's 12.2 — not the model,
-/// not attention, the host sort.
+/// The partition was already O(n), so this was never a sort-bound problem. It was bound by
+/// the two things an Introselect over indices cannot avoid: it builds a **2 MiB `Vec<usize>`**
+/// (8 B x 262,144) on every call before it can partition anything, and its comparator does
+/// **two indirect gathers into the 1 MiB `f32` row per comparison**. Counting the rank-`k`
+/// threshold directly removes both — no index vector, no per-comparison gather — and leaves
+/// at most a few hundred indices to rank at the end. Measured peak allocation per call:
+/// **2,097,152 B -> 263,160 B**, and unchanged when the row is doubled
+/// (`tests/probe_topk_alloc.rs`).
 ///
-/// `select_nth_unstable_by` partitions in O(n) instead of O(n log n). Because
-/// the comparator is a TOTAL order (ties broken by ascending index), the first
-/// `keep` entries after partitioning are exactly the set a full sort would have
-/// produced; sorting just that prefix restores the order, so everything
-/// downstream sees an identical sequence.
+/// # The alternative, and why not
 ///
-/// The claim that matters is the equality, not the speed: a sampler that quietly
-/// selected a different candidate set would be a silent quality regression that
-/// no throughput number would reveal. `top_k_selection_matches_a_full_sort`
-/// checks it across lengths, `top_k` values, and tie densities.
+/// A bounded binary heap of `f32`/`index` pairs was measured on the same binary: 0.13 ms on
+/// realistic rows (11-14x faster than the partition) but **4.95 ms on an ascending row, 2.6x
+/// SLOWER than the partition's own worst**, because a data-dependent sift-down runs `log k`
+/// times per late arrival. That is a production regression waiting for a logit row whose best
+/// tokens sit at high token ids, to win 0.12 ms on the typical row. The counting select's own
+/// worst sample over every row measured is 0.808 ms against the partition's 2.284 ms — 2.8x
+/// better tail for 0.12 ms of typical-case cost. `spec/decode-ceiling/findings/B3-topk.md`.
 ///
-/// Public so `examples/bench_sampler.rs` can time this exact function against
-/// the sort it replaced from ONE binary. A benchmark that reimplemented either
-/// side would be timing the benchmark.
+/// Its one regression, stated rather than buried: on **presorted** rows Introselect is a single
+/// pass, so the partition wins there (0.214 vs 0.644 ms ascending). A logit row is indexed by
+/// token id and is not presorted.
+///
+/// # Why it is O(n) on every input
+///
+/// Two counting passes over `order_key`, 16 bits at a time, each a branch-free
+/// histogram with a fixed 65,536-entry table. The first pass locates the bucket
+/// holding the `top_k`-th best key; if that bucket is wider than `RANK_DIRECT`
+/// (512) the second pass pins the exact key inside it (16 + 16 = 32, so two
+/// passes always suffice). Then one gather pass keeps the winners and ranks them
+/// with the shipped comparator. There is no data-dependent *structure* anywhere —
+/// no heap to sift, no recursion — which is what bounds the tail: worst sample
+/// over every row measured is 0.808 ms against the partition's 2.284 ms.
+///
+/// The passes themselves are not free of the input: consecutive elements landing
+/// in the same histogram bucket serialise on store-to-load forwarding, which is
+/// why a smooth (ascending) row costs 0.644 ms where a random one costs 0.251 ms.
+/// That is a 2.5x spread on an input a model does not produce; the heap's spread
+/// was 36x (0.13 -> 4.95 ms).
+///
+/// # The claim that matters
+///
+/// Equality, not speed. A sampler that quietly selected a different candidate set
+/// would be a silent quality regression: `--seed` reproducibility depends on this
+/// vector, no error is raised, and throughput would look fine. `sample` is a pure
+/// function of `(order, logits, config, rng state)`, so an identical `order` forces
+/// an identical token.
+///
+/// `tests/probe_topk_equality.rs` checks the returned vector is byte-identical to
+/// the deleted partition across tie-dense rows, adversarial orderings, signed
+/// zeros, `f32::MIN`/`MAX`/`NEG_INFINITY`, all-equal rows, `k = 1`, `k >= len`, and
+/// fp16-derived logit distributions, and every one of those gates has been observed
+/// failing against a deliberately broken selector (AGENTS.md 3.4).
+/// `tests/probe_topk_alloc.rs` pins the allocation budget, because reverting this
+/// function to the partition keeps every equality gate green and puts the 2 MiB
+/// per-token allocation back.
+///
+/// Requires FINITE logits. `sample` enforces that (`sampler.rs:198`); under a NaN
+/// the shipped comparator's `unwrap_or(Equal)` is not even a strict weak ordering,
+/// so the old partition had no defined answer to reproduce either.
+///
+/// Public so `examples/bench_sampler.rs` and `tests/probe_topk_equality.rs` can
+/// time this exact function against the selections it replaced, from one binary.
+/// A benchmark that reimplemented either side would be timing the benchmark.
 pub fn top_k_order(logits: &[f32], top_k: usize) -> Vec<usize> {
     let keep = top_k.min(logits.len());
-    let mut order = (0..logits.len()).collect::<Vec<_>>();
-    if keep < order.len() {
-        order.select_nth_unstable_by(keep, |left, right| {
-            logits[*right]
-                .partial_cmp(&logits[*left])
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| left.cmp(right))
-        });
-    }
-    order.truncate(keep);
-    order.sort_by(|left, right| {
+    // The shipped order, verbatim: logit DESCENDING, then index ASCENDING.
+    let better = |left: &usize, right: &usize| {
         logits[*right]
             .partial_cmp(&logits[*left])
             .unwrap_or(std::cmp::Ordering::Equal)
             .then_with(|| left.cmp(right))
-    });
+    };
+    if keep == 0 {
+        return Vec::new();
+    }
+    if keep >= logits.len() {
+        // `keep` covers the whole row, so there is nothing to partition. This is
+        // the one branch that still sorts everything, and it is the branch the
+        // partition also took when `top_k >= logits.len()`.
+        let mut order = (0..logits.len()).collect::<Vec<_>>();
+        order.sort_by(better);
+        return order;
+    }
+
+    // A bucket no wider than this is ranked by sorting it instead of counting a
+    // second histogram. Realistic logits put the `top_k`-th best value in a
+    // bucket a few dozen elements wide, so the usual path is ONE counting pass.
+    const RANK_DIRECT: usize = 512;
+    const RADIX_BITS: u32 = 16;
+    const RADIX: usize = 1 << RADIX_BITS;
+    const DIGIT_MASK: u32 = RADIX as u32 - 1;
+
+    debug_assert!(
+        logits.len() < u32::MAX as usize,
+        "bucket counts are u32, so a row of 2^32 logits could overflow one"
+    );
+
+    let mut counts = vec![0_u32; RADIX];
+    // Winners settled so far in strictly higher buckets, and winners still owed
+    // from the bucket currently being examined. `above + need == keep` always.
+    let mut above = 0_usize;
+    let mut need = keep;
+    // Bit offset of the digit being counted, and the bits above it already fixed.
+    let mut shift = RADIX_BITS;
+    let mut prefix = 0_u32;
+    let mut prefix_bits = 0_u32;
+
+    loop {
+        if prefix_bits == 0 {
+            for value in logits {
+                counts[((order_key(*value) >> shift) & DIGIT_MASK) as usize] += 1;
+            }
+        } else {
+            counts.fill(0);
+            for value in logits {
+                let key = order_key(*value);
+                if key >> prefix_bits == prefix {
+                    counts[((key >> shift) & DIGIT_MASK) as usize] += 1;
+                }
+            }
+        }
+        // Descend from the top digit: everything above it wins outright, and the
+        // first digit whose running count reaches `need` holds the `need`-th best
+        // key. The bucket is never empty, so this always stops at or above digit 0.
+        let mut digit = RADIX - 1;
+        let mut skipped = 0_usize;
+        let mut within = counts[digit] as usize;
+        while skipped + within < need {
+            skipped += within;
+            digit -= 1;
+            within = counts[digit] as usize;
+        }
+        above += skipped;
+        need -= skipped;
+        // The chosen digit joins the fixed prefix, so `prefix` now names the
+        // winning bucket in both the break and the refine case below.
+        prefix = (prefix << RADIX_BITS) | digit as u32;
+
+        if shift > 0 && within > RANK_DIRECT {
+            // Too crowded to rank directly: count the next 16 bits of this bucket
+            // alone. 16 + 16 = 32, so this second pass pins the EXACT key.
+            prefix_bits += RADIX_BITS;
+            shift -= RADIX_BITS;
+            continue;
+        }
+        break;
+    }
+
+    // `[low, end)` is the winning bucket. `shift == 0` means it is the single
+    // exact key. `u64`, because `end` can be 2^32.
+    let low = (prefix << shift) as u64;
+    let end = low + (1_u64 << shift);
+    let mut order: Vec<usize> = Vec::with_capacity(above);
+    let mut bucket: Vec<usize> = Vec::with_capacity(need);
+    let mut taken = 0_usize;
+    for (index, value) in logits.iter().enumerate() {
+        let key = order_key(*value) as u64;
+        if key >= end {
+            order.push(index);
+        } else if key >= low {
+            // With `shift > 0` the bucket is at most `RANK_DIRECT` wide and every
+            // member is a candidate. With `shift == 0` every member has the SAME
+            // key, so the first `need` in ascending index order are exactly the
+            // ones the index tie-break keeps -- which is also what keeps this Vec
+            // at `need` elements instead of rebuilding the 2 MiB one this function
+            // exists to avoid.
+            if shift > 0 || taken < need {
+                taken += 1;
+                bucket.push(index);
+            }
+        }
+    }
+    debug_assert_eq!(order.len(), above, "gathered the wrong number of winners");
+    order.sort_by(better);
+    if shift > 0 {
+        // A wide bucket collects every member and ranks them; only the exact case
+        // above is forced to exactly `need` candidates.
+        debug_assert!(bucket.len() >= need, "bucket lost candidates");
+        bucket.sort_by(better);
+        bucket.truncate(need);
+    } else {
+        debug_assert_eq!(bucket.len(), need, "exact bucket must yield exactly `need`");
+    }
+    // Every key in `order` is >= `end` and every key in `bucket` is < `end`, so
+    // concatenating two correctly-ordered runs keeps the whole thing ordered.
+    order.extend(bucket);
     order
 }
 
@@ -355,6 +540,140 @@ mod tests {
             )
             .expect("sampler");
             assert_eq!(sampler.sample(&logits).expect("sample"), 300, "top_k={top_k}");
+        }
+    }
+}
+
+/// `order_key` is what replaces the per-comparison `f32` gathers, so it has to
+/// agree with `partial_cmp` on both strict order and ties. Ties are the
+/// dangerous half: a key that inverts `-0.0` against `+0.0` still sorts every
+/// other row correctly, still returns a plausible top-k, and still samples
+/// plausible text -- it just changes the candidate SET whenever the `top_k`
+/// boundary falls inside the zeros.
+#[cfg(test)]
+mod order_key_tests {
+    use super::order_key;
+
+    /// The whole `f16` domain, which is the domain the logit row actually has:
+    /// `generate.rs:326-330` widens fp16 to `f32` and the widening is exact.
+    /// Exhaustive, because the failure mode is a single inverted pattern that
+    /// would change one `--seed` output and nothing else.
+    #[test]
+    fn order_key_is_order_preserving_over_every_fp16_pattern() {
+        let mut mapped: Vec<(u32, f32)> = (0..=u16::MAX)
+            .map(|bits| {
+                let value = half::f16::from_bits(bits).to_f32();
+                (order_key(value), value)
+            })
+            .filter(|(_, value)| value.is_finite())
+            .collect();
+        // 65,536 patterns - 2,046 NaN - 2 infinity = 63,488 finite.
+        assert_eq!(mapped.len(), 63_488, "the finite f16 domain changed size");
+        mapped.sort_unstable_by_key(|(key, _)| *key);
+        for pair in mapped.windows(2) {
+            let ((key_a, value_a), (key_b, value_b)) = (pair[0], pair[1]);
+            if key_a == key_b {
+                assert_eq!(
+                    value_a, value_b,
+                    "order_key collided two DIFFERENT f32 values (0x{value_a:e}) and \
+                     (0x{value_b:e}) at key 0x{key_a:08x}, so one of them would be \
+                     unreachable by any key-based selection"
+                );
+                continue;
+            }
+            assert!(
+                value_a <= value_b,
+                "order_key inverted a strict pair: key 0x{key_a:08x} = {value_a:e} sorted \
+                 BELOW key 0x{key_b:08x} = {value_b:e}"
+            );
+        }
+    }
+
+    /// The `f32`-only specials, including the two signed zeros. `partial_cmp`
+    /// calls `-0.0` and `+0.0` equal, so `Equal` here demands `Equal` keys: that
+    /// is the `-0.0` fold, asserted rather than described.
+    #[test]
+    fn order_key_agrees_with_partial_cmp_on_the_f32_specials() {
+        let smallest = f32::from_bits(1);
+        let values = [
+            f32::NEG_INFINITY,
+            f32::MIN,
+            -f32::MAX,
+            -1.0e30_f32,
+            -65536.0,
+            -1024.0,
+            -1.0,
+            -f32::MIN_POSITIVE,
+            -smallest,
+            -0.0,
+            0.0,
+            smallest,
+            f32::MIN_POSITIVE,
+            1.0,
+            1024.0,
+            65536.0,
+            1.0e30_f32,
+            f32::MAX,
+            f32::INFINITY,
+            // Values fp16 cannot hold, so the `f32` mantissa is exercised past the
+            // 10 bits the row would ever carry.
+            -1.000_000_1,
+            1.000_000_1,
+            3.141_592_7,
+        ];
+        for left in values {
+            for right in values {
+                let (key_left, key_right) = (order_key(left), order_key(right));
+                match left.partial_cmp(&right).expect("all finite or infinities") {
+                    std::cmp::Ordering::Less => assert!(
+                        key_left < key_right,
+                        "order_key inverted: {left:e} keyed 0x{key_left:08x} but \
+                         {right:e} keyed 0x{key_right:08x}"
+                    ),
+                    std::cmp::Ordering::Equal => assert_eq!(
+                        key_left, key_right,
+                        "partial_cmp says {left:e} == {right:e}, so their keys must be \
+                         equal or the index tie-break applies to the wrong side"
+                    ),
+                    std::cmp::Ordering::Greater => assert!(
+                        key_left > key_right,
+                        "order_key inverted: {left:e} keyed 0x{key_left:08x} but \
+                         {right:e} keyed 0x{key_right:08x}"
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The `f32` domain more broadly: a deterministic sweep of bit patterns,
+    /// filtered to finite, sorted by key. Cheap insurance against a mantissa-range
+    /// mistake that the fp16 sweep above cannot see (fp16 leaves 13 mantissa bits
+    /// at zero, so it never tests the low ones).
+    #[test]
+    fn order_key_is_monotone_across_a_broad_f32_sweep() {
+        let mut state = 0x243F_6A88_85A3_08D3_u64;
+        let mut mapped: Vec<(u32, f32)> = (0..1 << 20)
+            .map(|_| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                let value = f32::from_bits(state as u32);
+                (order_key(value), value)
+            })
+            .filter(|(_, value)| value.is_finite())
+            .collect();
+        assert!(mapped.len() > 1 << 19, "the sweep lost too many patterns");
+        mapped.sort_unstable_by_key(|(key, _)| *key);
+        for pair in mapped.windows(2) {
+            let ((key_a, value_a), (key_b, value_b)) = (pair[0], pair[1]);
+            assert!(
+                value_a <= value_b,
+                "order_key inverted {value_a:e} (0x{key_a:08x}) below {value_b:e} \
+                 (0x{key_b:08x})"
+            );
+            if key_a == key_b {
+                assert_eq!(value_a, value_b, "two distinct f32 values share a key");
+            }
         }
     }
 }
