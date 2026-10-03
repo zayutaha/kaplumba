@@ -5106,6 +5106,124 @@ impl TextModel {
         };
         Ok(self.elements.softcap(&logits, self.final_softcap)?)
     }
+
+    /// Forward a single token and return `(final-norm hidden, capped logits)`.
+    ///
+    /// The MTP drafter's input is `[target_embed(token), target_hidden]` — the
+    /// 5376-wide hidden **after** the final norm and **before** the lm_head.
+    /// `forward` returns only logits, so the speculative path needs both. Kept
+    /// separate from `forward` so the decode path does not pay for a host copy
+    /// of the hidden row it never reads.
+    pub fn forward_with_hidden(
+        &mut self,
+        token_ids: &[u32],
+        positions: &[u32],
+    ) -> Result<(Vec<u16>, Vec<u16>), ModelError> {
+        if token_ids.len() != positions.len() || token_ids.is_empty() {
+            return Err(ModelError::InvalidInput(
+                "model token and position counts must match and be non-empty".to_string(),
+            ));
+        }
+        let mut hidden = if let Some(embedding) = &self.embedding_buffer {
+            self.elements.embedding_scaled_buffer(
+                token_ids,
+                embedding,
+                self.hidden_size,
+                self.vocab_size,
+                (self.hidden_size as f32).sqrt(),
+            )?
+        } else {
+            self.elements.embedding_scaled(
+                token_ids,
+                &self.embedding,
+                self.hidden_size,
+                self.vocab_size,
+                (self.hidden_size as f32).sqrt(),
+            )?
+        };
+        for layer in &mut self.layers {
+            hidden = layer.forward(&hidden, positions)?;
+        }
+        let tokens = positions.len();
+        hidden = self.elements.rms_norm(
+            &hidden,
+            &self.final_norm,
+            tokens,
+            self.hidden_size,
+            self.layers[0].config.rms_norm_eps,
+        )?;
+        let hidden_out = hidden.clone();
+        let logits = if let Some(packed) = &self.lm_head.metal_buffer {
+            let request = LinearBufferRequest {
+                packed,
+                packed_offset: self.lm_head.metal_offset,
+                input: &hidden,
+                input_signs: &self.lm_head.input_signs,
+                output_signs: &self.lm_head.output_signs,
+                in_features: self.lm_head.in_features,
+                out_features: self.lm_head.out_features,
+                rate: self.lm_head.rate,
+                codebook: self.lm_head.codebook,
+            };
+            if tokens == 1 {
+                self.linear.gemv_buffer(request)?
+            } else {
+                self.linear.gemm_chunk_buffer(request)?
+            }
+        } else if tokens == 1 {
+            self.linear.gemv(LinearRequest {
+                packed: &self.lm_head.packed,
+                input: &hidden,
+                input_signs: &self.lm_head.input_signs,
+                output_signs: &self.lm_head.output_signs,
+                in_features: self.lm_head.in_features,
+                out_features: self.lm_head.out_features,
+                rate: self.lm_head.rate,
+                codebook: self.lm_head.codebook,
+            })?
+        } else {
+            self.linear.gemm_chunk(PrefillRequest {
+                packed: &self.lm_head.packed,
+                input: &hidden,
+                input_signs: &self.lm_head.input_signs,
+                output_signs: &self.lm_head.output_signs,
+                queries: tokens,
+                in_features: self.lm_head.in_features,
+                out_features: self.lm_head.out_features,
+                rate: self.lm_head.rate,
+                codebook: self.lm_head.codebook,
+            })?
+        };
+        Ok((hidden_out, self.elements.softcap(&logits, self.final_softcap)?))
+    }
+
+    /// Read one decoder layer's GPU KV cache back to the host as
+    /// `(keys, values, positions, slot_of_position)`.
+    ///
+    /// The drafter reads the target's shared K/V, and the cache lives in Metal
+    /// buffers, so the MTP round loop needs a host copy. Read-only and
+    /// diagnostic-adjacent; the speculative path is its only caller. The slot
+    /// array is returned alongside the values because sliding caches RING, so a
+    /// position is not its own slot once the cache wraps.
+    pub fn layer_kv_to_host(
+        &self,
+        index: usize,
+    ) -> Result<(Vec<u16>, Vec<u16>, Vec<u32>, Vec<usize>, usize, usize), ModelError> {
+        let layer = self.layers.get(index).ok_or_else(|| {
+            ModelError::InvalidInput(format!("layer {index} does not exist"))
+        })?;
+        let (keys, values, positions) = layer.gpu_cache.read_to_host();
+        let full = layer.config.full_attention;
+        let key_count = layer.gpu_cache.key_count(full);
+        let stream_len = layer.gpu_cache.stream_len();
+        let kv_heads = layer.gpu_cache.kv_heads();
+        let head_dim = layer.gpu_cache.head_dim();
+        let mut slots = Vec::with_capacity(key_count);
+        for position in 0..key_count {
+            slots.push(layer.gpu_cache.slot_for(position, full));
+        }
+        Ok((keys, values, positions, slots, kv_heads, head_dim))
+    }
 }
 
 /// Test/diagnostic-only accessors on [`QuantizedLinear`].
