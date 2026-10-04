@@ -1276,3 +1276,120 @@ the flash arm is on):
   this much uncertainty.
 * The 16 384-token arms of this run did not complete before the session ended,
   so there is no data point between 8k and the unmeasurable 24k.
+
+---
+
+## 15 — N5: the OQ5 gate is green, and its test now tests the real code
+
+### 15.1 The red test was not a regex bug
+
+`/tmp/test_parse.sh` failed with `line 15: $1: unbound variable` on every call.
+§13.2 hypothesised "`set -uo pipefail` interacting with `$1` inside the helper".
+That was right, and the mechanism is worth writing down because it is not
+obvious: the call site was
+
+```bash
+avail=$(printf '%s\n' "$1" | parse)     # parse is the LAST element of a pipeline
+```
+
+and **bash does not pass a function's positional parameters to a command running
+as the last element of a pipeline** (that requires `shopt -s lastpipe`, which is
+off by default and is off in every script here). So `$1` inside `parse` was
+unbound on *every* invocation, not only in the live check, the function printed
+nothing, and `gpuq_mem_healthy` failed closed — which is exactly why all eleven
+checks failed, including the ones that should have passed. The parser's regex
+was fine. The comment on the function ("stdin: a gpuq status body") described the
+intended interface; the body used `$1`.
+
+**Fix:** read stdin and never place a parser in pipeline position.
+
+### 15.2 The test was testing a copy
+
+`/tmp/test_parse.sh` reimplemented `parse` and `healthy` inline. It therefore
+proved nothing about `box_healthy` in `/tmp/decode_splits_sweep.sh` — the code
+that actually gated a run. A green test over a copy is the AGENTS.md §3.4
+failure mode in its purest form: **the test cannot fail because it is not
+exercising the code that can fail.**
+
+Both files now live in the repo and share one parser:
+
+| file | role |
+|---|---|
+| `scripts/gpuq_mem.sh` | the parser and the classifiers, sourceable, no side effects |
+| `scripts/test_gpuq_mem.sh` | 19 assertions, sources the real file, plus two end-to-end harness checks |
+| `scripts/bench_decode_splits.sh` | the harness; sources the real file |
+
+Deleting `/tmp/decode_splits_sweep.sh` and `/tmp/test_parse.sh` in favour of
+these also removes the `/tmp`-ephemerality that has already destroyed one sweep.
+
+### 15.3 What the harness gained beyond a fixed parser
+
+* **Generic over the swept knob** (`VAR=... ROPE="..."`), so N1 and N4 use the
+  same instrument rather than each growing their own.
+* **Interleaved** (`ROUNDS`), because `ROUNDS=3` with `A B C / A B C / A B C`
+  is what makes a null believable on a box whose spread is ±3.7% at 4k.
+* **Polls memory DURING the arm.** §13.3 established that a pre-arm gate cannot
+  work, because the arm is what tips a 24k run into compression. The poller
+  writes `<epoch> <compressor> <unused>` every `POLL_SECS` and
+  `mem_sample_verdict` classifies afterwards. **An invalid sample logs
+  `INVALID-NO-NUMBER` and no `decode_tok_s` at all** — deliberately. OQ5's
+  distortion is 99× and always pessimistic, so a recorded-but-flagged number
+  still reads as a data point in a table, and "more splits is much worse" is
+  precisely the conclusion three invalid arms already nearly produced.
+* **`/usr/bin/time -l` for `phys_footprint`**, never `ru_maxrss`.
+* **exit 75 is its own outcome** (`GPU-BUSY`), never a zero tok/s.
+
+### 15.4 Two parser bugs found while writing this, by writing the pure function
+
+`top_physmem_fields` has to read `compressor` and `unused`, which `gpuq status`
+does not expose. The first version split the `PhysMem` line on commas:
+
+```
+PhysMem: 23G used (9165M wired, 5954M compressor), 110M unused.
+```
+
+`split(",")` on the parenthesised part yields **2** fields (`9165M wired`,
+`5954M compressor`), so a positional reader looks for a 3rd that is not there and
+finds nothing — and `unused`, which sits *outside* the parens, is not in the
+inner text at all. The committed version matches on **field name**:
+
+```awk
+match($0, "[0-9]+(\\.[0-9]+)?[KMGTkmgt]?[ \t]+unused")
+```
+
+which is order-independent, paren-independent, and unit-aware. Asserted on the
+exact string AGENTS.md §10.3 records: `554M compressor -> 0.54`, `126M unused ->
+0.12`. Note this is *not* the bug AGENTS.md warns about — that one is stripping
+non-digits and taking the last comma field; named matching is the fix for it,
+not a repeat of it.
+
+### 15.5 Sabotage verification, with the failure modes observed
+
+| sabotage | observed result |
+|---|---|
+| pre-arm gate replaced by `if false` in `run_arm` | suite exits 1 with **both** `FAIL: harness ran the model on a box it could not parse` and `FAIL: no SKIPPED line in the log`; restore returns exit 0 and the harness is byte-identical (`diff` vs backup clean) |
+| `MIN_UNUSED_GIB=1000000` | `gate rejects an unreachable threshold` |
+| parser re-introduced with a greedy-digit class | `greedy-digit bug stays fixed` assertion exists to catch exactly this |
+
+**One sabotage of the test itself was found and fixed.** The first sentinel
+checked `grep -q MARKER "$TD/out"`, but the harness redirects the arm's output
+into its own temp file, so the marker was never in `$TD/out` and the assertion
+**passed while the harness was sabotaged** — a green check that could not fail.
+It now drops a sentinel *file*, which no stream redirection can hide. Recorded
+because it is the second time in this repo that a "green" test turned out to be
+unfalsifiable for a reason unrelated to the code it names.
+
+### 15.6 What this does NOT fix
+
+OQ8 stands. A gate can refuse to *report* a compressed sample; it cannot produce
+a valid one, and the 24k run compresses the box by construction. `N5` makes the
+8k/16k measurements trustworthy. It does not make 24k decode measurable.
+
+**Commands**
+
+```bash
+bash scripts/test_gpuq_mem.sh                       # the gate's own suite
+LOG=/tmp/x.log scripts/bench_decode_splits.sh 8192 1 2 4 8 16
+VAR=KAPLUMBA_DECODE_FLASH ROPE="0 --" ROUNDS=3 \
+  scripts/bench_decode_splits.sh 8192                # "--" leaves the var unset
+```

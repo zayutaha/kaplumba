@@ -442,13 +442,51 @@ split count a **runtime** value for a measured reason (template split count =
 
 ## N5 — Fix the red OQ5 gate in the sweep harness
 
-**Status:** ☐ not started, **test is written and failing**.
+**Status:** ✅ done. `scripts/gpuq_mem.sh` (new, sourceable), `scripts/test_gpuq_mem.sh`
+(new, the fixed and committed successor of `/tmp/test_parse.sh`),
+`scripts/bench_decode_splits.sh` (new, the committed successor of
+`/tmp/decode_splits_sweep.sh`).
 
-`/tmp/test_parse.sh` fails: `$1: unbound variable` under `set -uo pipefail`; both
-healthy cases report unhealthy and the live parse is empty. It has already caught
-two real parser bugs (`[^0-9]*` backtracking to the last digit run; single-token
-`17G`). N1 and N4 both need this harness. See `implementation_notes.md` §13.2.
+**Root cause of the red test (it was not a regex problem).** `parse()` was
+invoked in **pipeline position** — `avail=$(printf '%s\n' "$1" | parse)` — and
+bash does not pass a function's positional parameters to a command that runs as
+the *last* element of a pipeline (no `lastpipe`). So `$1` inside `parse` was
+always unbound, the helper returned empty every time, and the synthetic
+`healthy=1` cases read unhealthy. §13.2's hypothesis was right. The fix reads
+stdin instead of `$1`, and no parser sits in pipeline position.
 
-**Process rules this session earned:** never pipe a long measurement into `tail`
-(it buffers until EOF -- cost a ~50-minute sweep); a "the change did nothing"
-reading needs a positive control first.
+**Bigger problem found while fixing it:** the test tested a *reimplementation*
+of the parser pasted into the test file, so it could pass while the harness's
+real parser was broken — a coverage illusion of exactly the kind AGENTS.md §3.4
+warns about. The parser now lives once, in `scripts/gpuq_mem.sh`, and the test
+sources it.
+
+**Files.** `scripts/gpuq_mem.sh` provides `gpuq_mem_available_gib`,
+`gpuq_mem_healthy` (fail-closed), `box_healthy`, `top_physmem_fields`
+(named-field, unit-aware, pure — reads stdin so it is testable),
+`top_physmem_live`, `mem_poll_record`, `mem_sample_verdict`.
+`scripts/bench_decode_splits.sh` is now generic over the swept knob (`VAR=`, so
+N4 and N1 use the same harness), **interleaves** arms by round, polls memory
+**during** each arm, logs `phys_footprint` from `/usr/bin/time -l`, and records
+**no number at all** for a sample its own poller judged invalid.
+
+**Test:** `bash scripts/test_gpuq_mem.sh` → **ALL PASS, exit 0**. 19 assertions,
+including two fail-closed shapes added here (a garbage `memory:` line, and a
+line with no digits at all), the historical `554M` trap asserted as a *number*
+(`554M compressor -> 0.54`, `126M unused -> 0.12`, both GiB), the no-poll case,
+and two end-to-end checks: a stubbed `gpuq` reporting a garbage memory line must
+make the harness SKIP the arm and never invoke the binary, and a stubbed healthy
+`gpuq` must let the arm through.
+
+**Sabotage check (AGENTS.md 3.4), observed failure modes.** Replacing the
+harness's pre-arm gate with `if false; then` fails the suite with
+`FAIL: harness ran the model on a box it could not parse` **and**
+`FAIL: no SKIPPED line in the log`; restoring it returns exit 0 and the harness
+is byte-identical to the backup. An earlier version of the sentinel check grepped
+the harness's stdout for a marker the harness redirects into its own temp file,
+so it passed under sabotage — replaced by a sentinel *file*, which cannot be
+hidden by stream redirection.
+
+---
+
+## N6 — final scorecard
