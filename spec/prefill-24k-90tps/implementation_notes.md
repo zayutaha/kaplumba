@@ -1125,3 +1125,130 @@ marginal (OQ5), the three valid data points we have for 24k E2E prefill are
 67.10 / 55.42 / 62.87, and each carries the +-20% spread.** Resolve the gate, then
 re-run T2a from scratch. Do not merge any arm from the current log into a
 result.
+
+---
+
+## 14 — T2b: MMA decode attention, ported from oMLX 0.7.0 `sdpa_flash`
+
+### 14.1 What oMLX actually did, and why it transfers
+
+Cloned `github.com/jundot/omlx` to `/tmp/kaplumba-refs/omlx`, checked out tag
+**v0.7.0** (`4d4f5a28`). The reference commit is **`07d88dbd`**, whose message is
+the most useful single document found in this repo so far. Its diagnosis, for
+their model:
+
+> "MLX's vector SDPA spends a 32-lane simd_sum plus a full online-softmax update
+> on every lane per (row, query head, key): at MiMo's GQA 16 it is ALU-bound at
+> ~1/3 of DRAM bandwidth for one decode row (350-390 GB/s of KV on the M5 Ultra
+> vs a 1.1 TB/s streaming roofline; more key blocks than MLX's cap of 1024 only
+> reach 414 GB/s at 1M) and each extra verify row costs as much again, so a
+> 3-row MTP verify reads KV at 112-134 GB/s and **decode collapses with
+> context**."
+
+That is the same conclusion §6 reached here from first principles ("decode is
+latency-bound, the grid is only 64 workgroups, each walking a 128-iteration
+dependent scalar dot per key"), reached independently on different hardware and a
+different GQA ratio. Two independent diagnoses agreeing is the strongest
+evidence in this spec that the shape of the problem is understood.
+
+Their fix, `omlx/patches/mimo_v2/sdpa_flash.py`:
+
+> "computes the same float32 attention with 8x8 float32 simdgroup matrix
+> products: the query rows of a KV head form 8-row bands, each threadgroup owns a
+> contiguous key split, stages 8-key K/V tiles in threadgroup memory for all
+> bands, runs S = Q'K^T, the online softmax per tile and O += PV, and a second
+> pass merges the float32 split partials."
+
+Their measured end-to-end effect, which is the number to expect here:
+
+| context | 8k | 64k | 256k |
+|---|---|---|---|
+| decode tok/s | +2.8% | +19.6% | **+71.6%** |
+
+**The gain grows with context**, which is the whole point: at short context the
+decode step is dominated by streaming weights, and attention only becomes the
+term that matters as the KV window grows. This is also why the 8k number below
+is a floor for the 24k case, not a prediction of it.
+
+### 14.2 What was taken, and what was deliberately not
+
+**Taken** (all three are in `55cd5df`):
+
+* 8x8 simdgroup MMA for decode QK **and** PV, replacing the per-key `simd_sum`.
+* The `(m, s, O)` partial split layout, so the existing combine pass and its
+  exactness argument are reused unchanged. Nothing new had to be proven about
+  the combine.
+* **The split count stays a runtime value.** oMLX: "a template split count cost
+  ~115 ms of JIT per step: -22% decode at 8k in the first A/B." Our
+  `params.splits` was already runtime; this is recorded so nobody "tidies" it into
+  a template parameter.
+* **fp32 MMA and fp32 partials**, with no bf16 rounding of partials. Worth noting
+  oMLX measured their flash kernel as *more* accurate than the kernel it replaces
+  ("max |err| vs float64 0.0078 ... where MLX's is 0.0083-0.0135"), because MLX
+  rounds per-block partials to bf16 and this does not.
+* A **4096-key threshold**, matching `OMLX_MIMO_DECODE_FLASH_MIN_KEYS`.
+
+**Not taken**, and why:
+
+* **Everything NAX/M5.** `omlx/utils/nax_attention.py` (1043 new lines) and
+  `omlx/utils/fast_attention.py` (345 new lines) are the two biggest new files in
+  v0.7.0 and both are NAX-gated -- they require an M5 tensor unit. This is an M4
+  Pro. `nax_attention.py` also exists to give MLA models a 192/128 head-dim
+  kernel; Gxma is 512/512, so it has no target here.
+* **All MTP / speculative work** (`omlx/speculative/dflash_drafter.py` and the
+  Lightning MTP verify commits), per the brief.
+* **TurboQuant KV** (`omlx/turboquant_kv.py`). AGENTS.md §8 forbids KV cache
+  quantization.
+* **Their fused decode layer stack** (q/k/v as one row-concatenated mat-vec,
+  fused residual+RMSNorm, fused MoE experts, multi-row router gemv). These are
+  real wins -- "A MiMo-V2.6-Flash decode step dispatched ~2.8k kernels, most of
+  them small element-wise ops" -- and they are **model-shape-specific and
+  MoE-specific**. Gxma is a dense model with a different layer stack. Recorded as
+  a lead, not attempted.
+
+### 14.3 Measured here (interleaved A/B, 3 rounds, 8204-token prompt)
+
+`bash /tmp/ab_decode_flash.sh 8192 3`, `--max-new-tokens 24`, temperature 0,
+`KAPLUMBA_DECODE_FLASH=0` for off and unset for on:
+
+| arm | r1 | r2 | r3 | median | spread |
+|---|---|---|---|---|---|
+| scalar split kernel | 12.000 | 12.059 | 11.990 | **12.000** | +-0.3% |
+| **MMA decode kernel** | 12.978 | 12.979 | 12.972 | **12.978** | **+-0.03%** |
+
+**+8.2%**, and the effect arm is an order of magnitude tighter than the control,
+so this is not a spread artefact. Two things follow:
+
+* **AC3's "decode >= 12 @8k" was being met by 0.0%** before this (median 12.000).
+  It is now met with 8% of margin. That criterion was on a knife edge.
+* oMLX's own 8k figure for the same change is +2.8%, so +8.2% here is a *better*
+  8k result than theirs on a different GPU. Consistent with our kernel having more
+  to gain (GQA 8 and head_dim 512 mean the scalar path does 8x512 FMAs per key
+  per head against their 16x192).
+
+### 14.4 The 24k decode A/B could not be taken, and why that is a finding
+
+The obvious next measurement -- the same A/B at 24 590 tokens -- is **blocked,
+not merely unlucky**. Attempted, and the first arm read:
+
+```
+r1 flash=off prompt_tokens=24590 decode_tok_s=0.055
+```
+
+`top` during the run: `PhysMem: 23G used (9165M wired, 5954M compressor), 110M
+unused`. That is **0.055 tok/s against a 5.44 baseline -- a 99x pessimisation**,
+and it is the compressor, not the kernel.
+
+The cause is structural, and this is the third time it has bitten (OQ5, and the
+discarded splits=4/splits=8 arms in §13.1): **the 24k benchmark drives this box
+into memory compression by construction.** Its own footprint is 18.35 GiB of a
+24 GiB machine, so the run evicts the desktop's own pages, and every subsequent
+allocation is a compression event. There is no gate that fixes this from
+outside the run.
+
+**So 24k decode is currently unmeasurable on this box**, and §13's OQ5 gate is
+the wrong answer to that: the gate can refuse to *report* a compressed sample,
+but it cannot produce a valid one. Closing AC1 (decode >= 14 @24k) needs either
+a quieter machine (desktop closed, or a second box) or a lower-footprint
+configuration. Until then the 8k result in §14.3 is the trustworthy decode
+measurement, and it is a lower bound for 24k rather than an estimate of it.
