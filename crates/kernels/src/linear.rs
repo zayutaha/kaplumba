@@ -57,6 +57,66 @@ fn env_flag(name: &str) -> bool {
     value
 }
 
+/// GEMM-MMA prefill variant ids, see [`force_gemm_mma_variant`].
+///
+/// The env-flag arm reads `KAPLUMBA_MMA_4SG` / `KAPLUMBA_REGPIPE` /
+/// `KAPLUMBA_REGPIPE_K32` through `env_flag`, which MEMOISES on first read --
+/// by design (see [`env_flag`]). A test process therefore cannot flip variants
+/// by setting variables mid-run: the first dispatch caches the answer. These
+/// ids plus the atomic override below exist so a test can A/B every variant in
+/// ONE process without touching the environment at all.
+pub const GEMM_MMA_VARIANT_AUTO: u8 = 0;
+/// `linear_gemm_mma`, the shipped 128x64 / 256-thread tile.
+pub const GEMM_MMA_VARIANT_128X64: u8 = 1;
+/// `linear_gemm_mma_4sg`, the 128x32 / 4-simdgroup research tile.
+pub const GEMM_MMA_VARIANT_4SG: u8 = 2;
+/// `linear_gemm_mma_regpipe`.
+pub const GEMM_MMA_VARIANT_REGPIPE: u8 = 3;
+/// `linear_gemm_mma_regpipe_k32`.
+pub const GEMM_MMA_VARIANT_REGPIPE_K32: u8 = 4;
+
+static GEMM_MMA_VARIANT_FORCED: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(GEMM_MMA_VARIANT_AUTO);
+
+/// Force the GEMM-MMA prefill variant for subsequent [`LinearKernels::encode_gemm`]
+/// calls in this process, overriding the env flags. `GEMM_MMA_VARIANT_AUTO`
+/// restores env selection.
+///
+/// Test hook: the env flags above are process-cached, and one test binary
+/// compares variants inside a single `#[test]`. Variants 2, 3 and 4 share the
+/// production eligibility gate (`perm_mode != 1 && rate == Integer(3) &&
+/// codebook == Mcg`) -- forcing them elsewhere falls back to 128X64 rather than
+/// running a kernel on a shape its host gate would never send it.
+pub fn force_gemm_mma_variant(variant: u8) {
+    GEMM_MMA_VARIANT_FORCED.store(variant, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// See [`force_gemm_mma_variant`]: back to env-flag selection.
+pub fn clear_gemm_mma_variant() {
+    GEMM_MMA_VARIANT_FORCED.store(GEMM_MMA_VARIANT_AUTO, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// [`last_gemm_mma_variant`] reports this when no MMA prefill dispatch has
+/// happened yet in this process (or the last prefill fell through to the
+/// scalar tiled kernel, which does not touch the counter).
+pub const GEMM_MMA_VARIANT_NONE: u8 = u8::MAX;
+
+static GEMM_MMA_LAST_DISPATCHED: std::sync::atomic::AtomicU8 =
+    std::sync::atomic::AtomicU8::new(GEMM_MMA_VARIANT_NONE);
+
+/// The variant id `encode_gemm` last ACTUALLY dispatched (after the
+/// eligibility fallback, so a forced regpipe on an ineligible shape reports
+/// `GEMM_MMA_VARIANT_128X64`, which is what ran).
+///
+/// Test hook, and a load-bearing one: every T4 variant computes bit-identical
+/// output to `linear_gemm_mma`, so output comparison alone cannot tell "the
+/// 4sg kernel ran and agreed" from "the dispatch never left the baseline" --
+/// the vacuous pass that shipped `8f1a863` (AGENTS.md §3, Q11). A test that
+/// asserts outputs must assert this next to them.
+pub fn last_gemm_mma_variant() -> u8 {
+    GEMM_MMA_LAST_DISPATCHED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Output tile-columns per threadgroup for the decode matvec: the NR0 axis.
 ///
 /// The kernel reads a fixed three ring words per lane whatever the rate is, so a
@@ -337,6 +397,20 @@ pub struct LinearKernels {
     /// 9216 B. Only valid for `rate == Integer(3) && codebook == Mcg`, the
     /// folded-MCG arm; every other rate keeps `gemm_mma_pipeline`.
     gemm_mma_regpipe_pipeline: ComputePipelineState,
+    /// RESEARCH VARIANT for T4 (`linear_gemm_mma_4sg`): the same KCHUNK=64 and
+    /// the same sixteen accumulators per thread, but a 128q x 32n tile on FOUR
+    /// simdgroups instead of 128q x 64n on eight -- 4 row x 4 column
+    /// accumulators, 8 fragment loads per 16 MMAs (0.5) instead of 10 (0.625),
+    /// and `bstage` at 5120 B instead of 9216 B. Bit-identical output to
+    /// `gemm_mma_pipeline`; selected by `KAPLUMBA_MMA_4SG` or the test hook
+    /// [`force_gemm_mma_variant`].
+    gemm_mma_4sg_pipeline: ComputePipelineState,
+    /// RESEARCH VARIANT for T4 (`linear_gemm_mma_regpipe_k32`): `regpipe` with
+    /// KCHUNK=32, so `bstage` drops to 4608 B and the prefetch stream runs
+    /// twice as often. KCHUNK=32 measured -2% against the ORIGINAL kernel;
+    /// this re-measures it behind regpipe, which moved the dequant into the
+    /// MMA basic block. Selected by `KAPLUMBA_REGPIPE_K32` or the test hook.
+    gemm_mma_regpipe_k32_pipeline: ComputePipelineState,
     finalize_rows_pipeline: ComputePipelineState,
     zero_raw_pipeline: ComputePipelineState,
     gemv_reduce_sk2_pipeline: Option<ComputePipelineState>,
@@ -608,6 +682,10 @@ impl LinearKernels {
         let gemm_mma_pipeline = pipeline_audit::build(&device, &library, "linear_gemm_mma")?;
         let gemm_mma_regpipe_pipeline =
             pipeline_audit::build(&device, &library, "linear_gemm_mma_regpipe")?;
+        let gemm_mma_4sg_pipeline =
+            pipeline_audit::build(&device, &library, "linear_gemm_mma_4sg")?;
+        let gemm_mma_regpipe_k32_pipeline =
+            pipeline_audit::build(&device, &library, "linear_gemm_mma_regpipe_k32")?;
         let finalize_rows_pipeline =
             pipeline_audit::build(&device, &library, "linear_finalize_rows")?;
         let zero_raw_pipeline = pipeline_audit::build(&device, &library, "linear_zero_raw")?;
@@ -661,6 +739,8 @@ impl LinearKernels {
             gemv_tiled_pipeline,
             gemm_mma_pipeline,
             gemm_mma_regpipe_pipeline,
+            gemm_mma_4sg_pipeline,
+            gemm_mma_regpipe_k32_pipeline,
             finalize_rows_pipeline,
             zero_raw_pipeline,
             gemv_reduce_sk2_pipeline,
@@ -3282,20 +3362,74 @@ impl LinearKernels {
             // scalar tiled kernel below runs instead. `validate_encode` demands
             // multiples of 128, so in practice the guard only ever fires on a
             // hypothetical small device.
-            if out_features % 64 == 0
-                && self.gemm_mma_pipeline.max_total_threads_per_threadgroup() >= 256
+            //
+            // T4 adds two research tiles behind their own switches:
+            //   KAPLUMBA_MMA_4SG       -> linear_gemm_mma_4sg (128q x 32n, 128
+            //                             threads, grid x = out/32)
+            //   KAPLUMBA_REGPIPE_K32   -> linear_gemm_mma_regpipe_k32
+            // Both share regpipe's MCG-3bpw host gate (4sg carries only the
+            // folded-MCG arm, see its header). Selection is funnelled
+            // through one `variant` so a test can force any of the four with
+            // `force_gemm_mma_variant` (env_flag memoises, tests cannot flip
+            // it mid-process).
+            let forced = GEMM_MMA_VARIANT_FORCED.load(std::sync::atomic::Ordering::Relaxed);
+            let mut variant = if forced != GEMM_MMA_VARIANT_AUTO {
+                forced
+            } else if env_flag("KAPLUMBA_MMA_4SG") {
+                GEMM_MMA_VARIANT_4SG
+            } else if env_flag("KAPLUMBA_REGPIPE_K32") {
+                GEMM_MMA_VARIANT_REGPIPE_K32
+            } else if env_flag("KAPLUMBA_REGPIPE") {
+                GEMM_MMA_VARIANT_REGPIPE
+            } else {
+                GEMM_MMA_VARIANT_128X64
+            };
+            // The three research tiles are gated on the folded-MCG arm,
+            // exactly as regpipe always was (4sg carries that arm alone -- no
+            // `fractional_window` / `params.codebook`, see its header): standard
+            // linear_gemm_mma is verified across all layouts, so anything the
+            // gate excludes falls back to it (never to a disabled path).
+            let research_eligible =
+                perm_mode != 1 && rate == Exl3Rate::Integer(3) && codebook == Exl3Codebook::Mcg;
+            if (variant == GEMM_MMA_VARIANT_REGPIPE
+                || variant == GEMM_MMA_VARIANT_REGPIPE_K32
+                || variant == GEMM_MMA_VARIANT_4SG)
+                && !research_eligible
             {
-                // The register-pipelined variant is an experimental research kernel;
-                // standard linear_gemm_mma is verified bit-exact and rock-solid across all layouts.
-                let regpipe = env_flag("KAPLUMBA_REGPIPE")
-                    && perm_mode != 1
-                    && rate == Exl3Rate::Integer(3)
-                    && codebook == Exl3Codebook::Mcg;
-                let gemm = if regpipe {
-                    &self.gemm_mma_regpipe_pipeline
-                } else {
-                    &self.gemm_mma_pipeline
-                };
+                variant = GEMM_MMA_VARIANT_128X64;
+            }
+            let max_threads = self.gemm_mma_pipeline.max_total_threads_per_threadgroup();
+            let selected: Option<(u8, &ComputePipelineState, u64, u64)> = match variant {
+                GEMM_MMA_VARIANT_4SG if out_features % 32 == 0 && max_threads >= 128 => Some((
+                    GEMM_MMA_VARIANT_4SG,
+                    &self.gemm_mma_4sg_pipeline,
+                    (out_features / 32) as u64,
+                    128,
+                )),
+                GEMM_MMA_VARIANT_REGPIPE if out_features % 64 == 0 && max_threads >= 256 => Some((
+                    GEMM_MMA_VARIANT_REGPIPE,
+                    &self.gemm_mma_regpipe_pipeline,
+                    (out_features / 64) as u64,
+                    256,
+                )),
+                GEMM_MMA_VARIANT_REGPIPE_K32 if out_features % 64 == 0 && max_threads >= 256 => {
+                    Some((
+                        GEMM_MMA_VARIANT_REGPIPE_K32,
+                        &self.gemm_mma_regpipe_k32_pipeline,
+                        (out_features / 64) as u64,
+                        256,
+                    ))
+                }
+                _ if out_features % 64 == 0 && max_threads >= 256 => Some((
+                    GEMM_MMA_VARIANT_128X64,
+                    &self.gemm_mma_pipeline,
+                    (out_features / 64) as u64,
+                    256,
+                )),
+                _ => None,
+            };
+            if let Some((dispatched, gemm, grid_x, threads)) = selected {
+                GEMM_MMA_LAST_DISPATCHED.store(dispatched, std::sync::atomic::Ordering::Relaxed);
                 encoder.dispatch_1d(
                     &self.input_rows_pipeline,
                     &[Some(input), Some(input_signs), Some(transformed)],
@@ -3311,9 +3445,9 @@ impl LinearKernels {
                         TensorRef::new(raw, 0),
                     ],
                     params_bytes(&linear_params),
-                    (out_features / 64) as u64,
+                    grid_x,
                     queries.div_ceil(128) as u64,
-                    256,
+                    threads,
                     1,
                 )?;
                 return encoder.dispatch_1d(
