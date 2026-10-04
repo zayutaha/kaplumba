@@ -132,6 +132,39 @@ pub fn flash_query_block_for(key_count: usize) -> usize {
     }
 }
 
+/// Key count from which the decode step uses the MMA flash kernel instead of the
+/// scalar split kernel.
+///
+/// Defaults to 4096, the same threshold oMLX ships (`OMLX_MIMO_DECODE_FLASH_MIN_KEYS`,
+/// `omlx/patches/mimo_v2/sdpa_flash.py`, v0.7.0): below it a decode split is
+/// short enough that the scalar path's lack of MMA does not dominate, and the
+/// existing `attention_single_pass_bit_exact` guarantees are worth more than the
+/// speed.
+///
+/// `KAPLUMBA_DECODE_FLASH=0|off|false|no` turns it off everywhere;
+/// `KAPLUMBA_DECODE_FLASH_MIN_KEYS=<n>` moves the threshold. Read once per
+/// process (same `OnceLock` idiom as `flash_query_block_override`), because this
+/// is consulted 60x/token and `getenv` takes a lock in some libc builds.
+pub fn decode_flash_min_keys() -> usize {
+    static CACHE: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        if let Ok(raw) = std::env::var("KAPLUMBA_DECODE_FLASH") {
+            if matches!(raw.trim(), "0" | "off" | "false" | "no") {
+                return usize::MAX;
+            }
+        }
+        std::env::var("KAPLUMBA_DECODE_FLASH_MIN_KEYS")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(4096)
+    })
+}
+
+/// Whether a decode step with `key_count` live keys should use the MMA kernel.
+pub fn decode_flash_enabled(key_count: usize) -> bool {
+    key_count >= decode_flash_min_keys()
+}
+
 /// Parse a `KAPLUMBA_DECODE_SINGLE_PASS` value into a key limit. `0` means off.
 ///
 /// Exposed so the parsing rules are testable without the process-wide cache in
@@ -492,6 +525,15 @@ pub struct AttentionKernels {
     /// query per threadgroup). Both are built so the query block can be chosen
     /// per request without a race on a process-wide selection.
     attention_flash_bq1_pipeline: Option<ComputePipelineState>,
+    /// T2b: the decode flash kernel (`attention_decode_flash_512_8`) -- the
+    /// prefill flash body with `BQ = 1` and `PARTIALS`, so a decode split's QK
+    /// and PV are 8x8 simdgroup MMA instead of a 32-lane `simd_sum` per
+    /// (key, query head). It writes the *same* `(m, s, O)` partials the scalar
+    /// split kernel writes, so the combine pass and its exactness argument are
+    /// untouched; only the `(m, s, O)` numbers change, by fp32 summation order.
+    ///
+    /// `None` (compile failure) degrades to the scalar split kernel.
+    decode_flash_pipeline: Option<ComputePipelineState>,
 }
 
 /// `q_heads / kv_heads` values the transposed kernel is instantiated for, and
@@ -748,6 +790,10 @@ impl AttentionKernels {
         let attention_flash_bq1_pipeline =
             crate::pipeline_audit::build(&device, &library, "online_attention_flash_bq1_512_8")
                 .ok();
+        // T2b: decode flash. Built unconditionally like the prefill twins so a
+        // missing kernel is a fallback, not a library-wide failure.
+        let decode_flash_pipeline =
+            crate::pipeline_audit::build(&device, &library, "attention_decode_flash_512_8").ok();
         let queue = device.new_command_queue();
         Ok(Self {
             device,
@@ -768,6 +814,7 @@ impl AttentionKernels {
             decode_combine_512_pipeline,
             attention_flash_pipeline,
             attention_flash_bq1_pipeline,
+            decode_flash_pipeline,
         })
     }
 
@@ -942,6 +989,57 @@ impl AttentionKernels {
         index: usize,
         splits: usize,
     ) -> Result<(), KernelError> {
+        let groups = request.q_heads / request.kv_heads.max(1);
+        let flash = self.decode_flash_pipeline.is_some()
+            && request.head_dim == 512
+            && groups == 8
+            && decode_flash_enabled(request.key_count);
+        self.encode_decode_split_explicit(
+            encoder, request, partials, index, splits, flash,
+        )
+    }
+
+    /// [`Self::encode_decode_split_with_splits`] with the kernel chosen by the
+    /// caller instead of by [`decode_flash_enabled`].
+    ///
+    /// Public so a test can run **both** decode kernels in one process and
+    /// compare them, which the environment gate cannot allow:
+    /// `decode_flash_min_keys` is a `OnceLock`, so whichever spelling the process
+    /// started with would be the only one reachable. Passing `flash = false`
+    /// forces the scalar split kernel; `true` forces the MMA one and returns
+    /// `InvalidInput` if it did not compile, rather than silently falling back --
+    /// a silent fallback here would make a correctness test vacuous.
+    pub fn encode_decode_split_explicit(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        request: AttentionEncodeRequest<'_>,
+        partials: &Buffer,
+        index: usize,
+        splits: usize,
+        flash: bool,
+    ) -> Result<(), KernelError> {
+        if flash {
+            if self.decode_flash_pipeline.is_none() {
+                return Err(KernelError::InvalidInput(
+                    "decode flash kernel unavailable (attention_decode_flash_512_8 did not compile)"
+                        .to_string(),
+                ));
+            }
+            // The kernel is instantiated for head_dim 512 / groups 8 ONLY. It is
+            // written for `NSG == 8` simdgroups and indexes the grid itself, so
+            // running it on any other shape reads the wrong KV heads -- and the
+            // sliding shape's `32 * groups` = 64 threads would not even fill its
+            // threadgroup. Checked here, not only at the production call site,
+            // so an explicit `flash = true` cannot dispatch it on a shape it does
+            // not fit.
+            if request.head_dim != 512 || request.q_heads / request.kv_heads.max(1) != 8 {
+                return Err(KernelError::InvalidInput(format!(
+                    "decode flash kernel is only instantiated for head_dim 512 with 8 q-heads per kv head, got head_dim {} with {}",
+                    request.head_dim,
+                    request.q_heads / request.kv_heads.max(1)
+                )));
+            }
+        }
         let AttentionEncodeRequest {
             q_heads,
             kv_heads,
@@ -985,8 +1083,18 @@ impl AttentionKernels {
         };
         let bytes = params_bytes(&params);
         let kv_groups = to_u32(kv_heads, "kv head count")?;
+        // T2b: on the full-attention shape (groups 8, head_dim 512) and above
+        // the key threshold, use the MMA decode kernel when it compiled. The
+        // grid, the buffer bindings and the partials layout are identical to the
+        // scalar kernel's, so only the pipeline changes here.
+        let use_flash_decode = flash;
+        let split_pipeline: &ComputePipelineState = if use_flash_decode {
+            self.decode_flash_pipeline.as_ref().expect("checked above")
+        } else {
+            &self.decode_split_pipelines[index]
+        };
         encoder.dispatch_groups(
-            &self.decode_split_pipelines[index],
+            split_pipeline,
             &[
                 Some(request.queries),
                 Some(request.keys),

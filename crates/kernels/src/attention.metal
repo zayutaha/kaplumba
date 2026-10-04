@@ -1418,7 +1418,18 @@ static void attention_gqa_mma_body(
 // straddling m-tile is always read before the softmax barrier and the
 // straddling k-step only after it. Everything is threadgroup-uniform (base,
 // range_end, key_count, q0), so every barrier below is taken by all 256 threads.
-template <int HEAD_DIM, int NSG, int BQ>
+// `PARTIALS` turns this into the DECODE kernel: one query row, a grid of
+// `splits * kv_heads` threadgroups, each owning a contiguous key slice, and an
+// unnormalised `(m, s, O)` partial per (split, head) in the layout
+// `attention_decode_combine_body` already reads. The QK and PV bodies are
+// unchanged -- the decode win is that the per-key `simd_sum` + online-softmax
+// update of the scalar path is replaced by 8x8 simdgroup MMA, which is what
+// oMLX's `sdpa_flash` does for the same reason (`omlx/patches/mimo_v2/
+// sdpa_flash.py`, oMLX v0.7.0). Measured there at 1.9-3.6x per decode layer.
+//
+// `BQ` must be 1 in this mode: a decode step has exactly one query row, so the
+// partial layout has no query axis to block over.
+template <int HEAD_DIM, int NSG, int BQ, bool PARTIALS>
 static void attention_prefill_flash_body(
     const device half *queries,
     const device half *keys,
@@ -1426,6 +1437,7 @@ static void attention_prefill_flash_body(
     const device uint *query_positions,
     const device uint *key_positions,
     device half *output,
+    device float *partials,
     constant AttentionParams &params,
     uint tid,
     uint tgid,
@@ -1435,6 +1447,9 @@ static void attention_prefill_flash_body(
     threadgroup half *tail,
     threadgroup float *msb,
     threadgroup float *ssum) {
+    static_assert(NSG == 8, "the flash body assumes 8 simdgroups == groups");
+    static_assert(!PARTIALS || BQ == 1,
+                  "the decode partials layout has no query axis to block over");
     static_assert(NSG == 8, "the flash body assumes 8 simdgroups == groups");
     constexpr float NEG = -1.701411733864e+38f;
     constexpr uint TILE = 64u;
@@ -1446,14 +1461,25 @@ static void attention_prefill_flash_body(
     const uint sg = tid >> 5u;
     const uint groups = params.q_heads / params.kv_heads;
     // This threadgroup owns BQ consecutive queries (q0 .. q0+BQ-1) of one KV
-    // head; the grid is `ceil(queries/BQ) * kv_heads` threadgroups.
-    const uint qg = tgid / params.kv_heads;
-    const uint key_head = tgid - qg * params.kv_heads;
+    // head; the grid is `ceil(queries/BQ) * kv_heads` threadgroups. Decode
+    // instead owns one (split, KV head) pair over a contiguous key slice.
+    const uint qg = PARTIALS ? 0u : tgid / params.kv_heads;
+    const uint key_head = PARTIALS ? tgid - (tgid / params.kv_heads) * params.kv_heads
+                                   : tgid - qg * params.kv_heads;
     const uint q0 = qg * uint(BQ);
+    const uint split = PARTIALS ? tgid / params.kv_heads : 0u;
     const uint head = key_head * groups + sg;
     const uint kv_stride = params.kv_heads * uint(HEAD_DIM);
     const uint head_base = key_head * uint(HEAD_DIM);
-    const uint range_end = params.key_count;
+    // Decode scans only this split's slice. `min(key_count, ...)` keeps a split
+    // from running off the end when `key_count` is not a multiple of
+    // `keys_per_split`; an empty slice falls out of the loop with m = NEG and a
+    // zero accumulator, which the combine pass weights to zero.
+    const uint range_begin =
+        PARTIALS ? split * params.keys_per_split : 0u;
+    const uint range_end =
+        PARTIALS ? min(params.key_count, range_begin + params.keys_per_split)
+                 : params.key_count;
 
     // Q rows for all BQ queries of this simdgroup's own head, staged as halves
     // (the QK B operand is loaded transposed from here, so no half->float
@@ -1496,7 +1522,7 @@ static void attention_prefill_flash_body(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    for (uint base = 0u; base < range_end; base += TILE) {
+    for (uint base = range_begin; base < range_end; base += TILE) {
         const uint live_in_tile = min(TILE, range_end - base);
         // Key sub-tile that straddles `range_end`, or NSUB when none does.
         const uint partial_sub =
@@ -1670,6 +1696,34 @@ static void attention_prefill_flash_body(
         }
     }
 
+    // Decode: emit the unnormalised `(m, s, O)` partial for this split in the
+    // layout `attention_decode_combine_body` reads --
+    //   partials[(split * q_heads + head) * (head_dim + 2)] = [m, s, O[head_dim]]
+    // so the combine pass is unchanged and stays exact-by-construction (every
+    // factor it applies is in [0, 1] because `m_s <= M`). An empty slice writes
+    // m = NEG, s = 0 and a zero O, which the combine weights to zero.
+    if (PARTIALS) {
+        const uint stride = params.head_dim + 2u;
+        // `m`/`s` are replicated across the simdgroup and belong to *its* head,
+        // so one lane per simdgroup writes them; no `ssum` round trip needed.
+        if (lane == 0u) {
+            device float *mrow =
+                partials + (split * params.q_heads + head) * stride;
+            mrow[0] = m[0];
+            mrow[1] = s[0];
+        }
+        device float *orow =
+            partials + (split * params.q_heads + key_head * groups + fm) * stride
+            + 2u;
+#pragma unroll
+        for (uint j = 0; j < NPER; ++j) {
+            const uint nt = sg * uint(NPER) + j;
+            orow[nt * 8u + fn + 0u] = acc[0][j].thread_elements()[0];
+            orow[nt * 8u + fn + 1u] = acc[0][j].thread_elements()[1];
+        }
+        return;
+    }
+
     // Normalise once at the end: publish each (query, head) `s`, then write fp16.
     if (lane == 0u) {
 #pragma unroll
@@ -1714,9 +1768,39 @@ static void attention_prefill_flash_body(
         threadgroup half tail[8 * (HEAD_DIM)];                                 \
         threadgroup float msb[(BQ) * 8];                                       \
         threadgroup float ssum[(BQ) * 8];                                      \
-        attention_prefill_flash_body<HEAD_DIM, NSG, BQ>(queries, keys, values, \
-            query_positions, key_positions, output, params, tid, tgid,         \
-            qstage, sth, wq, tail, msb, ssum);                                 \
+        attention_prefill_flash_body<HEAD_DIM, NSG, BQ, false>(                \
+            queries, keys, values, query_positions, key_positions, output,     \
+            (device float *)output, params, tid, tgid, qstage, sth, wq, tail,   \
+            msb, ssum);                                                        \
+    }
+
+// Decode: the same body with BQ = 1 and PARTIALS, so it scans one split's key
+// slice and writes the `(m, s, O)` partial that `attention_decode_combine_512`
+// merges. Buffer 5 is the partials buffer, not `output`.
+//
+// Threadgroup use is the BQ = 1 prefill figure: 8 KB qstage + 2 KB sth + 1 KB
+// wq + 8 KB tail = 19.5 KB, under the 32 KB cliff.
+#define KAPLUMBA_FA_DECODE_FLASH(NAME, HEAD_DIM, NSG)                         \
+    kernel void NAME(                                                          \
+        const device half *queries [[buffer(0)]],                              \
+        const device half *keys [[buffer(1)]],                                 \
+        const device half *values [[buffer(2)]],                               \
+        const device uint *query_positions [[buffer(3)]],                      \
+        const device uint *key_positions [[buffer(4)]],                         \
+        device float *partials [[buffer(5)]],                                  \
+        constant AttentionParams &params [[buffer(6)]],                        \
+        uint tid [[thread_position_in_threadgroup]],                           \
+        uint tgid [[threadgroup_position_in_grid]]) {                          \
+        threadgroup half qstage[(NSG) * (HEAD_DIM)];                           \
+        threadgroup float sth[64 * 8];                                         \
+        threadgroup half wq[8 * 64];                                           \
+        threadgroup half tail[8 * (HEAD_DIM)];                                 \
+        threadgroup float msb[8];                                              \
+        threadgroup float ssum[8];                                             \
+        attention_prefill_flash_body<HEAD_DIM, NSG, 1, true>(                  \
+            queries, keys, values, query_positions, key_positions,             \
+            (device half *)partials, partials, params, tid, tgid, qstage, sth,  \
+            wq, tail, msb, ssum);                                              \
     }
 
 // Only the full-attention shape is instantiated: groups == NSG == 8, HEAD_DIM
@@ -1729,6 +1813,12 @@ KAPLUMBA_FA_FLASH(online_attention_flash_512_8, 512, 8, 2)
 // `attention::FLASH_QUERY_BLOCK_MIN_KEYS` keys, where query blocking only adds
 // critical-path latency (measured at 8k: BQ=2 is ~4% slower than BQ=1).
 KAPLUMBA_FA_FLASH(online_attention_flash_bq1_512_8, 512, 8, 1)
+// T2b: decode, full-attention shape only (groups == NSG == 8, HEAD_DIM 512),
+// same restriction as the prefill flash kernels. BQ is fixed at 1 by the
+// partials layout; the split count is a RUNTIME value (`params.splits`), not a
+// template parameter -- oMLX measured ~115 ms of JIT per step and -22% decode at
+// 8k from templating it (`omlx/patches/mimo_v2/sdpa_flash.py`, v0.7.0).
+KAPLUMBA_FA_DECODE_FLASH(attention_decode_flash_512_8, 512, 8)
 
 // Prefill MMA kernel: same buffers as KAPLUMBA_FA_GQA, plus the Q-half staging
 // slot and the guarded tail tile. Threadgroup use at the worst instantiated

@@ -224,13 +224,26 @@ fn read_u16(buffer: &Buffer, n: usize) -> Vec<u16> {
 
 fn run_split_combine(fx: &Fixture, case: &Case, splits: usize, output: &Buffer) -> Vec<u16> {
     let mut enc = MetalEncoder::new(&fx.queue).expect("encoder");
+    // Pin the SCALAR arm explicitly. Every expectation in this file is a
+    // measurement of `attention_gqa_body<..., true>` -- the exact expected
+    // differing-element counts in
+    // `the_one_wave_split_rule_costs_one_fp16_ulp_and_is_not_bit_exact` are
+    // meaningless against any other kernel. Since T2b the production entry
+    // point switches to the MMA decode kernel at >= 4096 keys, so following the
+    // default here silently re-pointed that test at a different kernel; it
+    // caught exactly that (8 passed -> 7 passed, 1 failed).
+    //
+    // Following the default would also make this file's guarantee conditional
+    // on an environment variable, which is why the flash arm is pinned by
+    // `attention_decode_flash_matches_split` instead.
     fx.kernels
-        .encode_decode_split_with_splits(
+        .encode_decode_split_explicit(
             &mut enc,
             case.request(output),
             &case.partials,
             case.index(),
             splits,
+            false,
         )
         .unwrap_or_else(|e| panic!("split({splits}) on {}: {e}", case.shape.name));
     enc.commit_and_wait().expect("wait");
