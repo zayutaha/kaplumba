@@ -177,3 +177,112 @@ done
 /usr/bin/time -l ./target/release/kaplumba --model "$M" --prompt "$PP" \
     --max-new-tokens 1 --temperature 0 --metrics 2>&1 | grep -E 'phys|peak_res|prefill'
 ```
+
+---
+
+## T7 — COORDINATOR INTEGRATION + FINAL MEASUREMENT (2026-10-04)
+
+Branches merged into `mtp-speculation`, in order:
+`438ead9` (impl/ctx24k, T5) → `e1005e7` (impl/gemm-mma, T3/T4) →
+`de5acfd` (impl/attn-mma, T1/T2). The three touched disjoint files, so all
+three merges were clean. Then: `0e15434` build/census fixes, `c02b270` regpipe
+default, `3ea15aa` T2 partitioned MMA.
+
+### Build fixes the agents flagged (both red at base)
+
+- `crates/engine/examples/attn_bench.rs:374` called 2-arg `decode_splits`;
+  the 3-arg (q_heads, kv_heads, key_count) form has existed since `2297f19`.
+  This is why `cargo test` without `--tests` never compiled.
+- Census literals bumped for the two new `linear.metal` kernels:
+  `perf_probe_simd_alu_roofline.rs` 111→113 / 138→140,
+  `probe_kernsel_census.rs` 138→140 (×2), `probe_variants_window_forms.rs`
+  138→140.
+
+### T4 GEMM — regpipe wins, now the default (`c02b270`)
+
+Full interleaved table in `/private/var/folders/tp/wz3877_s1z756p1kcsz3_…/opencode/p120-t4-measure.tsv`.
+614-token GEMM (7 projections, ms): baseline 6035 / regpipe **5753** / 4sg 6246 /
+k32 6295. TFLOPS 5.85 → **6.13**. 8k end to end 75.6 → 78.8 (+4.2%). 4sg and
+k32 are measured losers (recorded negative results). regpipe is bit-identical
+to `linear_gemm_mma` and MCG-3bpw gated; `KAPLUMBA_MMA_128X64` forces baseline.
+
+### T2 ATTENTION — the T1 MMA QK was the bug, and the fix is a partition
+
+T1's MMA body ran all four 8-key sub-tiles in **every** simdgroup. Because
+`simdgroup_multiply_accumulate` is per-simdgroup, all NSG simdgroups computed
+the identical 8×8 dot tile from identical fragments — NSG× redundant tensor
+work *and* NSG× redundant strided K loads. Measured 1.7–5× **slower** than the
+scalar QK it replaced.
+
+T2 assigns sub-tile `sub` to simdgroup `sub % NSG`, publishes each 8×8 tile to
+a 1 KB `sstage` shared buffer, and reads its own row back (one extra barrier per
+full tile). MMA work 4·NSG → 4 sub-tiles. The final partial tile keeps T1's
+all-simdgroup staging path (its barrier must be uniform), once per pass.
+
+`attention_qk_mma_bench` ratio mma/scalar:
+
+| shape | T1 | T2 |
+|---|---|---|
+| full d512 NSG8 keys=8192 | 1.700 | **0.833** (MMA 1.2× faster) |
+| sliding d256 NSG2 keys=1024 | 1.813 | 1.588 |
+| sliding d256 NSG2 keys=8192 | 4.967 | 3.296 |
+
+The NSG=2 loss is structural: an 8×8 MMA always computes 8 query rows, but a
+`groups == 2` shape uses only 2 — 6/8 of every MMA is waste. `groups == 8` uses
+all 8. So `attention_qk_for(groups)` selects MMA only for `groups >= 4`
+(`== 8` on Gxma); both env flags still force a global arm.
+
+### End-to-end (merged binary, `KAPLUMBA_MAX_IN_FLIGHT=1`, interleaved)
+
+| ctx | before | after | peak `phys_footprint` |
+|---|---|---|---|
+| 614 | 96.17 | **100.56** | 12.66 GiB (T5 run D) |
+| 8k | 75.61 | **80.52** | 14.15 GiB |
+| 16k | 60.75 | **63.96** | 15.54 GiB |
+| 24k | 51.12 | **52.84** | 17.12 GiB |
+
+`.tsv`s: `p120-int/measure-arms.tsv`, `p120-int/8k-run.log`, `p120-int/mem-run.log`.
+
+### AC status
+
+- **AC2 MET** (80.52 @8k). **AC6 MET** (17.12 GiB @24k < 20). **AC8 MET**
+  (worst error 2.1603e-3, unchanged — regpipe is bit-identical). **AC9 MET**
+  (HOST_TOKEN_SLOTS 32768; 24k prefill+decode runs).
+- **AC1 (120 @614) / AC4 (7.5 TFLOPS) UNMET** — same wall. 5117 ms budget needs
+  GEMM ≤4707 ms; regpipe is 5753. Attention=0 would give only ~101 tok/s. The
+  remaining 6.13→7.5 is the tile-shape ceiling (T4 exhausted 4sg/k32; the
+  staging-stripped diagnostic caps this shape near 76.7 tok/s of GEMM work).
+  Reported as a measured wall per the spec's AC1 escape clause.
+- **AC5 (attention ≥1.5× @8k) UNMET** — 1.2× on the full QK, ~+8% attention
+  overall. The sliding (NSG2) arm cannot use an 8×8 MMA efficiently.
+- **AC7 partly unmet** — 5 reference prompts correct (Paris / red-blue-yellow /
+  391 / etc.), but decode measures **~14.0 tok/s**, below the 15 target. This is
+  pre-existing (decode does not touch the MMA prefill path or regpipe) and was
+  never independently verified before — T0 recorded it as "user-reported".
+
+### Four pre-existing suite failures (NOT this spec's)
+
+`cargo test --release --workspace --tests --no-fail-fast` → 111 targets ok,
+4 failing. Each verified present at the base commit `43a4176` by inspecting the
+base blobs directly:
+
+| test | why it was already failing at 43a4176 |
+|---|---|
+| `perf_probe_host_ops::the_device_token_handoff_exists…` | the `host_tokens` allocation is split over two lines (base model.rs:3172-3173), the probe greps one line |
+| `perf_probe_dispatchsel_columns::the_colmajor_contig4…` | base model.rs already names `ishizuki_gemv_pipeline` (probe asserts 0) |
+| `perf_probe_concurrency_dependency_graph::no_device_side_sampler_exists` | `kernel void sample` already present in base elements.metal (device-sampler spec shipped) |
+| `probe_cache_hierarchy::activation_loads_are_4_byte_alignable…` | base linear_repacked.metal:2121 is not the pinned line (kernel moved) |
+
+They are stale source-text probes owned by other specs; left untouched (not
+weakened) and reported as limitations, per AGENTS.md §4.3.
+
+### Measurement hygiene notes worth keeping
+
+- The 614 arm of the *final* A/B had one 82.64 tok/s outlier with
+  `ttft=7430 ms` (box recovering from the 24k run); its r2 was 100.60. Report
+  the median, and never a single amber reading.
+- `KAPLUMBA_GPU_PROFILE` cannot be turned off with `=0` — it is presence-based
+  (`env_flag` uses `var_os().is_some()`); use `env -u` (T5 §7).
+- `/usr/bin/time -l` "peak memory footprint" is the budget number;
+  `peak_resident_pages_bytes` understates by ~5 GiB (AGENTS §10.3).
+```

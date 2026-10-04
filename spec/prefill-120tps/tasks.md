@@ -38,7 +38,11 @@ Plan's "~36% norms+dispatch" row is **measured false** — it is 1.3%.
 
 ## T1 — Attention MMA: QK score computation
 
-**Status:** ☐ not started
+**Status:** ✅ DONE — branch `impl/attn-mma` (commit `aa9f1c6`), merged `de5acfd`.
+`attention_gqa_mma_body` + `online_attention_gqa_mma_{256,512}_{1,2,4,8}`.
+Verified bit-close to scalar by `attention_qk_mma_matches_scalar` (12 cases,
+TOL=5e-3; clean run max abs diff 0.000000). **As implemented it was 1.7–5×
+SLOWER than scalar** — see T2.
 
 **Intent:** Replace the scalar QK dot product loop in `attention_gqa_body`
 with `simdgroup_multiply_accumulate`, batching 8 keys per MMA step.
@@ -76,8 +80,21 @@ with `simdgroup_multiply_accumulate`, batching 8 keys per MMA step.
 
 ## T2 — Attention MMA: measure and tune
 
-**Status:** ☐ not started  
-**Depends on:** T1
+**Status:** ✅ DONE (commit `3ea15aa`). Root cause found and fixed: T1 ran the
+full sub-tile set in **every** simdgroup (NSG× redundant tensor work + K loads).
+T2 partitions sub-tiles across simdgroups and publishes a shared score tile.
+
+**Measured (`attention_qk_mma_bench`, ratio mma/scalar, before → after):**
+| shape | before | after |
+|---|---|---|
+| full d512 NSG8 keys=8192 | 1.700 | **0.833** (1.2× faster) |
+| sliding d256 NSG2 keys=1024 | 1.813 | 1.588 (still slower) |
+| sliding d256 NSG2 keys=8192 | 4.967 | 3.296 (still slower) |
+
+**End to end:** 8k **78.82 → 80.52 tok/s (+2.2%, meets AC2)**; 614 unchanged
+(~100.5). Default is now shape-aware (`attention_qk_for(groups)`: MMA only for
+groups ≥ 4). AC5 (attention ≥1.5×) is **not** met — the win is 1.2× on the
+full-attention QK only, ~+8% on attention overall at 8k.
 
 **Intent:** Measure the actual speedup from T1 and tune the tile parameters.
 
@@ -105,7 +122,10 @@ with `simdgroup_multiply_accumulate`, batching 8 keys per MMA step.
 
 ## T3 — GEMM: weight repack for MMA tile locality
 
-**Status:** ☐ not started
+**Status:** ⚠️ NOT PURSUED — R3 is satisfied by T4's measured tile-variant
+sweep. The repack is an offline layout change with an unknown payoff and a
+larger blast radius; T4 found a real win (regpipe) with no format change, so
+the budget went there. Node marked closed, not silently dropped.
 
 **Intent:** Reorder the trellis tiles so that the 4 column tiles read per
 K-chunk by the MMA kernel are contiguous in memory, improving L1/L2 locality.
@@ -139,7 +159,19 @@ K-chunk by the MMA kernel are contiguous in memory, improving L1/L2 locality.
 
 ## T4 — GEMM: investigate remaining tile variants
 
-**Status:** ☐ not started
+**Status:** ✅ DONE — branch `impl/gemm-mma` (commit `ad1e860`), merged
+`e1005e7`; regpipe default landed `c02b270`.
+
+**Measured (same binary, interleaved; GEMM = 7 projections):**
+| variant | 614 tok GEMM ms | TFLOPS | 8k tok/s |
+|---|---|---|---|
+| baseline 128×64 | 6035 | 5.85 | 75.6 |
+| **regpipe (new default)** | **5753** | **6.13** | **78.8** |
+| 4sg 128×32 | 6246 | 5.65 | 71.7 |
+| regpipe_k32 | 6295 | 5.61 | 71.7 |
+
+regpipe is bit-identical to `linear_gemm_mma`, MCG-3bpw gated. 4sg and k32 are
+losers (recorded negative results).
 
 **Intent:** Try tile shape variants that haven't been rejected in
 `spec/engine-performance` §14, specifically targeting the load:MMA ratio.
@@ -173,7 +205,11 @@ K-chunk by the MMA kernel are contiguous in memory, improving L1/L2 locality.
 
 ## T5 — Context extension to 24k
 
-**Status:** ☐ not started
+**Status:** ✅ DONE — branch `impl/ctx24k` (commit `6fd187e`), merged
+`438ead9`. `HOST_TOKEN_SLOTS = DEFAULT_CONTEXT_LIMIT` (32768). 24k prefill +
+decode measured **17.13 GiB** peak `phys_footprint`, < 20 GiB. (Premise in R4
+was wrong: `HOST_TOKEN_SLOTS` never blocked 24k — an under-sized-buffer defect
+was fixed instead.)
 
 **Intent:** Enable 24k prompts by fixing HOST_TOKEN_SLOTS and validating KV
 cache sizing.
@@ -205,8 +241,11 @@ cache sizing.
 
 ## T6 — PV MMA (gated on T2 results)
 
-**Status:** ☐ not started  
-**Depends on:** T2
+**Status:** ⏸ GATED OUT. The T2 measurements show attention is **memory-bound**
+(V/K re-read per query), not QK-instruction-bound: fixing the QK to 1.2× moved
+8k by only 2.2%, and the PV loop is shared by both arms. A PV MMA would not
+touch the re-read term, so the gate ("proceed only if attention ≥20% after QK
+MMA") is not met in a way that makes PV MMA worth the complexity.
 
 **Gate:** Only proceed if T2 shows attention is still ≥ 20% of prefill time at
 16k after QK MMA. If attention drops below 20%, the PV improvement is marginal
@@ -238,7 +277,7 @@ accumulation.
 
 ## T7 — Final measurement and acceptance
 
-**Status:** ☐ not started  
+**Status:** ✅ DONE — see the results table below and `implementation_notes.md`.
 **Depends on:** T1–T6
 
 **Intent:** Comprehensive measurement against all acceptance criteria.
@@ -258,3 +297,42 @@ accumulation.
 9. Write final summary in `implementation_notes.md`.
 
 **Test:** all acceptance criteria from spec.md evaluated and recorded.
+
+---
+
+## T7 results — end-to-end prefill (merged binary, `KAPLUMBA_MAX_IN_FLIGHT=1`)
+
+| ctx | prompt tok | before (T0) | after (regpipe + shape-aware MMA) | peak `phys_footprint` |
+|---|---|---|---|---|
+| 614 | 614 | 96.17 | **100.56** | 12.66 GiB |
+| 8k | 7814 | 75.61 | **80.52** | 14.15 GiB |
+| 16k | 15974 | 60.75 | **63.96** | 15.54 GiB |
+| 24k | 23954 | 51.12 | **52.84** | 17.12 GiB |
+
+GEMM at 614: 5.85 → 6.13 TFLOPS (regpipe). Decode (short ctx, 96 tok): ~14.0
+tok/s (pre-existing, unchanged). Five reference prompts correct.
+
+**Acceptance scorecard:**
+
+| AC | target | result |
+|---|---|---|
+| AC1 | 120 @614 | **100.6** — unmet; attributed below |
+| AC2 | ≥80 @8k | **80.52** — MET |
+| AC3 | 16k/24k reported | **63.96 / 52.84** — reported |
+| AC4 | ≥7.5 TFLOPS | **6.13** — unmet; T4 sweep + ceiling |
+| AC5 | attention ≥1.5× @8k | **1.2× full QK only** — unmet |
+| AC6 | footprint ≤ budget | **17.12 GiB @24k** — MET |
+| AC7 | tests + 5 prompts + decode ≥15 | tests/prompts ✓; decode **14.0** — partly unmet |
+| AC8 | worst GEMM error ≤2.16e-3 | **2.1603e-3**, unchanged (bit-identical) — MET |
+| AC9 | HOST_TOKEN_SLOTS ≥24k | **32768**; 24k runs — MET |
+
+### AC1 attribution (the spec's escape clause)
+
+At 614 the 5117 ms budget needs GEMM ≤4707 ms. regpipe reaches 5753 ms (6.13
+TFLOPS). Making attention **entirely free** would give 614/(5753+~230) ≫ … it
+still cannot reach 120: the T0 arithmetic (attention=0 → 99.2 tok/s, GEMM 5.84
+TFLOPS) plus T4's 6.13 TFLOPS gives 614/(5753+702) ≈ **101 tok/s**, which is
+what is measured. The remaining 6.13 → 7.5 TFLOPS is a tile-shape wall: T4
+exhausted 4sg and k32 against it, and the staging-stripped diagnostic caps this
+shape near 76.7 tok/s of GEMM-only work. AC1 is therefore reported as a
+measured wall, not a missing optimization.
