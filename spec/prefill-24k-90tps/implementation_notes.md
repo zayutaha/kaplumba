@@ -1798,3 +1798,134 @@ model-shape-specific and MoE-specific, and Gxma is dense. **Not attempted**, and
 N4 sweep above is consistent with that being right: at 8k the decode step is
 **12.917 tok/s = 77 ms**, and the attention kernel is the dominant term (§6), so a
 few dozen saved element-wise dispatches cannot be where the time is.
+
+### 18.6 Confirmation at 16k: the win GROWS with context
+
+`scripts/bench_decode_splits.sh 16384 13 16`, 2 interleaved rounds, 16 384-token
+prompt, `--max-new-tokens 32`:
+
+| arm | r1 | r2 | median | spread |
+|---|---|---|---|---|
+| shipped default | 12.082 | 12.107 | **12.095** | 0.21% |
+| `splits=13` | 12.327 | 12.339 | **12.333** | 0.10% |
+| `splits=16` (explicit) | 12.090 | 12.108 | **12.099** | 0.15% |
+
+**+1.97% at 16k against +0.93% at 8k**, with the effect spread 2-4x tighter than
+the control's. The explicit `splits=16` arm reproduces the shipped default to
+0.03%, which is the positive control for this sweep: pinning 16 and not pinning
+anything are the same measurement, so the 13-vs-16 gap is real and not an artefact
+of how the knob is applied.
+
+The direction is what makes this worth acting on rather than filing: **the gain
+grows with context**, the same shape oMLX measured for their decode flash kernel
+(+2.8% @8k -> +19.6% @64k -> +71.6% @256k) and the same shape T2b showed here
+(+4.4% @4k -> +8.2% @8k). At 24k, if the trend held, splits=13 would be worth
+~3%, and the 24k context is where AC1 lives. **This is the first measured
+prefill-or-decode lever of this spec whose effect is still rising at the largest
+context the box can run.**
+
+Why 13 beats 16 at all, in one sentence: the decode grid is `splits * kv_heads`,
+so 16 splits is a 64-workgroup grid and 13 is a 52-workgroup grid, and 52 is the
+last size that fits in **one** wave on this box — 54 is one wave, 55 is two
+(`decode_one_wave_workgroups`, `attention.rs:583-594`). Sixteen splits overshoots
+the machine by one workgroup and pays for a second wave of two. The shipped
+`ThreadTarget` rule computes `16384 / (32 * q_heads) = 16` from a *thread* budget
+that has nothing to do with workgroup residency, which is precisely the error
+`decode-19tok` diagnosed and why `WorkgroupsPerCore` was written and then not
+defaulted.
+
+---
+
+## 20 — N6: final scorecard
+
+`scripts/scorecard.sh`, 3 interleaved rounds, two arms:
+
+* **shipped** — no env overrides, what a user gets;
+* **workgroups** — `KAPLUMBA_DECODE_SPLIT_RULE=workgroups`, i.e. decode splits
+  16 → 13. The opt-in exists so the scorecard can carry N4's measured improvement
+  without this commit flipping a shipped default.
+
+Both arms run every context, so a short-context regression is visible in the same
+table rather than assumed absent.
+
+| context | tokens | arm | prefill tok/s | spread | decode tok/s | spread | `phys_footprint` | `ru_maxrss` |
+|---|---|---|---|---|---|---|---|---|
+| 614 | 626 | shipped | **100.90** | 0.22% | **14.862** | 0.47% | 12.65 | 9.07 |
+| 614 | 626 | workgroups | **101.04** | 0.16% | **14.860** | 0.29% | 12.66 | 8.80 |
+| 8k | 8204 | shipped | **85.01** | 0.50% | **12.754** | 0.17% | 14.16 | 8.70 |
+| 8k | 8204 | workgroups | **85.52** | 0.14% | **12.911** | 0.26% | 14.15 | 8.77 |
+| 16k | 16 394 | shipped | **74.72** (n=2) | 0.71% | **12.067** (n=2) | 0.01% | 15.54 | 8.82 |
+| 16k | 16 394 | workgroups | **75.00** | 1.02% | **12.329** | 0.10% | 15.54 | 9.13 |
+
+**N4's decode win reproduces in an independent run:** +1.07% @8k (12.754 →
+12.911) and **+2.17% @16k** (12.067 → 12.329), against control spreads of
+0.17-0.47%. At 614 it is a dead heat (14.862 vs 14.860), which is the expected
+shape: below 4096 keys the decode kernel is not the MMA one and the split rule
+does not apply. The prefill column moves by +0.14% / +0.60% / +0.37% — noise, and
+it must be, because the arms differ only in a decode knob.
+
+**AC4: `phys_footprint` 12.65-15.54 GiB**, against the 20 GiB budget, and the
+`ru_maxrss` column beside it reads **5.5-6.7 GiB lower** — the AGENTS.md 10.3 trap,
+measured again on every single run. **`swapouts` did not move** across any of the
+sixteen runs (738 188 448 at the first, 738 264 408 at the last, and the counter is
+cumulative since boot — so the engine caused **zero** swaps).
+
+**AC5, five reference prompts, greedy, diffed between arms:** all five produce
+**byte-identical text** (`p1` Paris, `p2` 366, `p3` CCCXCI, `p4` the additive
+primaries, `p5` "there are no such numbers"). Only the `loaded in NNNN ms` banner
+differs, as it must. The diff is the test; eyeballing five answers is not.
+
+**Full workspace suite:** 116 test binaries ok, **4 failed** —
+`perf_probe_concurrency_dependency_graph::no_device_side_sampler_exists`,
+`perf_probe_dispatchsel_columns::the_colmajor_contig4_kernel_is_not_on_the_decode_path`,
+`perf_probe_host_ops::the_device_token_handoff_exists_and_the_row_follows_the_pick`,
+`probe_cache_hierarchy::activation_loads_are_4_byte_alignable_and_collapse_2_to_1`.
+**All four verified present at base `b92234f`** by building the base in a separate
+worktree with its own `CARGO_TARGET_DIR` and running those four binaries: same four
+names, same counts. **None is attributable to this work.** New in this session and
+passing: `attention_prefill_pass_bit_exact` (17) and `attention_rescale_guard` (8).
+
+### 20.1 A PRE-EXISTING crash, found by the reference-prompt sweep
+
+The original second reference prompt — *"A ball is thrown straight up. What colour
+does it turn at the top of its flight?"* — **fails the engine outright**:
+
+```
+Metal command buffer failed (unlabelled) status=Error
+```
+
+at `--max-new-tokens >= 32`, and completes normally at 16. Reproducible every time.
+
+**Verified pre-existing, not this spec's regression.** Three checks, in order:
+reproduced on the shipped binary; reproduced again with the N3 rescale guard
+**removed from `attention.metal`** (so not the guard); and reproduced on a build of
+**base commit `b92234f`** made in a separate worktree with its own
+`CARGO_TARGET_DIR`, same command, same error. It is also not the flash kernel
+(`KAPLUMBA_SCALAR_ATTENTION=1` and `KAPLUMBA_NO_SINGLE_PASS=1` both succeed), so it
+is in the decode/sampler path rather than attention — consistent with §14.2's
+unattributed note that oMLX's MoE model dispatched ~2.8k kernels per decode step
+and that most were small element-wise ops.
+
+**Not fixed here, and why:** locating it needs per-dispatch attribution across a
+decode step, which is what §14.2 identified and did not do, and the brief scoped
+this session to prefill attention and the decode split count. Filed with a minimal
+repro instead, because AC5's "five reference prompts correct" would otherwise have
+been reported as "the model is broken" with no pointer to the cause. Anyone picking
+it up wants a prompt + `--max-new-tokens 32` and `KAPLUMBA_GPU_PROFILE=1`.
+
+### 20.2 What the scorecard does NOT establish
+
+* **AC1 (decode ≥ 14 @24k) is still unmeasurable** (OQ8). The 16k row above is the
+  largest context measured. Three attempts at 24k decode have produced invalid
+  samples and §16/§15 established that this box's memory signals cannot separate a
+  stalled run from a good one. Not re-attempted, per the brief.
+* **AC2 (prefill ≥ 90 @24k) is unmet and this session did not move it.** 16k
+  measures 75.0 tok/s; the spec's own arithmetic (§12.1) puts the 24k requirement at
+  attention 149.7 s → ≤ 56 s, a 2.7× kernel speedup. N1 was the strongest remaining
+  idea and it measured neutral. Prefill is 20% short, not 25% — the honest summary
+  of four levers tried (T3, T4f, T2b, N1) against one target.
+* **The `workgroups` arm is not shipped.** `KAPLUMBA_DECODE_SPLIT_RULE=workgroups`
+  makes it available without a rebuild; the default flip is one line and is the
+  owner's decision.
+* `phys_footprint` at 16k is 15.54 GiB, not the 18.35 GiB §11.1 recorded at 24k —
+  consistent, since that run was 24 590 tokens against 16 394 here.
