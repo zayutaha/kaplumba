@@ -2993,10 +2993,30 @@ pub struct DeviceSample {
     pub ranked: Vec<u32>,
 }
 
-/// Words in `scratch.host_tokens`, i.e. the largest `step_idx` a staged token can
-/// carry. Also the context limit the decode loop is capped at, so a draw count
-/// above it could not be read back.
-pub const HOST_TOKEN_SLOTS: usize = 8192;
+/// Words in `scratch.host_tokens`, i.e. the largest `step_idx` a staged token
+/// can carry without writing past the end of the buffer.
+///
+/// `step_idx` is the **decode step within one run**, not an absolute position:
+/// `generate.rs`'s pipelined loop passes `1..total_to_generate` and `chat.rs`'s
+/// passes its per-turn `step`, so a 24k prompt never indexes by prompt length.
+/// (`HOST_TOKEN_SLOTS` does *not* cap the decode loop -- no loop reads it; the
+/// cap on a run is `fits_in_context` / `prompt + max_new <= context_limit`.)
+///
+/// **Why the policy window.** The largest legal `step_idx` is
+/// `max_new_tokens - 1`, and `generate.rs:131-145` only bounds
+/// `prompt + max_new` by `DEFAULT_CONTEXT_LIMIT` (32768) -- so a short prompt
+/// with `--max-new-tokens 10000` is a legal run, and against the old 8192-slot
+/// buffer it made the GPU write `host_tokens[step_idx]` (and
+/// `read_host_token`, an unchecked `*ptr.add`) **out of bounds**. Sizing the
+/// buffer to the policy window makes the buffer cover every index a legal run
+/// can produce, by construction, and it is the same constant that bounds the
+/// KV cache (`gpu_cache.rs::MAX_POLICY_CAPACITY`), so raising the policy
+/// raises both together. Raised from 8192 to 32768 by `spec/prefill-120tps`
+/// T5 (AC9); cost is 32 KiB -> 128 KiB.
+///
+/// The same bound governs `sample_capped_row_ranked`'s `count`, whose draws
+/// are staged into `host_tokens[0..count]` in one call.
+pub const HOST_TOKEN_SLOTS: usize = crate::generate::DEFAULT_CONTEXT_LIMIT;
 
 /// Where a staged token goes, when one is being staged.
 ///
