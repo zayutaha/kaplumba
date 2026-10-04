@@ -1131,16 +1131,16 @@ fn the_discriminating_experiment_is_named_not_assumed() {
 fn specialisation_costs_compile_time_not_throughput() {
     let linear_kernels = LINEAR_METAL.matches("\nkernel void ").count();
     let repacked_kernels = REPACKED_METAL.matches("\nkernel void ").count();
-    assert_eq!(linear_kernels, 111, "linear.metal kernel count moved");
+    assert_eq!(linear_kernels, 113, "linear.metal kernel count moved");
     assert_eq!(
         repacked_kernels, 27,
         "linear_repacked.metal kernel count moved"
     );
     let total = linear_kernels + repacked_kernels;
-    assert_eq!(total, 138);
+    assert_eq!(total, 140);
 
     // `LinearKernels::new` splices the two files into ONE library
-    // (`linear.rs:24-30`), so all 138 land in one metallib and all are
+    // (`linear.rs:24-30`), so all 140 land in one metallib and all are
     // available for I-cache eviction pressure -- but eviction only matters for
     // what is resident during decode.
     let dispatches_per_step = 546;
@@ -1166,7 +1166,7 @@ fn specialisation_costs_compile_time_not_throughput() {
     // A kernel that is entered hundreds of times per step cannot be paying an
     // I-cache miss on every entry; the miss would be amortised to nothing
     // against a body of ~66 ALU ops per tile. So the specialisation is not a
-    // runtime cost, and the only thing the 138-kernel library buys that is
+    // runtime cost, and the only thing the 140-kernel library buys that is
     // worth arguing about is register pressure *within* one kernel -- which is
     // addressed by `Nr0`, not by the family count.
     let dispatches_per_kernel = dispatches_per_step as f64 / hot.len() as f64;

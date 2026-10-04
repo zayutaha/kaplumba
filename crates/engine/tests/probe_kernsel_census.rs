@@ -575,15 +575,15 @@ fn census_of_all_138_linear_kernels() {
     // C1. The count, and that both files share one compilation.
     assert_eq!(
         kernels.len(),
-        138,
-        "expected 138 linear kernels (111 in linear.metal + 27 in linear_repacked.metal), \
+        140,
+        "expected 140 linear kernels (113 in linear.metal + 27 in linear_repacked.metal), \
          found {} — the census below is incomplete if this moved",
         kernels.len()
     );
     let linear_rs = read("crates/kernels/src/linear.rs");
     assert!(
         linear_rs.contains("new_library_with_source(&combined_source(), &options)"),
-        "linear.rs must compile both .metal files as ONE library, or \"138 kernels\" \
+        "linear.rs must compile both .metal files as ONE library, or \"140 kernels\" \
          is two libraries and the load cost is not the one the notes record"
     );
 
@@ -638,8 +638,8 @@ fn census_of_all_138_linear_kernels() {
         .filter(|(_, s)| s.rate.is_some() || s.family == "other")
         .count();
     println!(
-        "\n138 total = {gemvish} rate-parameterised GEMV + {} epilogue/reduce/gemm/aux",
-        138 - gemvish
+        "\n140 total = {gemvish} rate-parameterised GEMV + {} epilogue/reduce/gemm/aux",
+        140 - gemvish
     );
 
     // ---- C3: the `_co` hoist gap lands on a dead kernel ------------------
@@ -759,7 +759,7 @@ fn census_of_all_138_linear_kernels() {
     // env flags that no product code sets (`grep set_var crates/` finds tests
     // only). `encode_gemv_named` / `encode_ishizuki_gemv_named` are excluded:
     // they are the name-addressable A/B entry points and would otherwise make
-    // all 138 look reachable.
+    // all 140 look reachable.
     const AB_ONLY: [&str; 2] = ["encode_gemv_named", "encode_ishizuki_gemv_named"];
     println!("\nA: kernels a single env flag would put on the production decode path");
     let mut flagged: BTreeMap<String, Vec<String>> = BTreeMap::new();
@@ -853,7 +853,7 @@ fn census_of_all_138_linear_kernels() {
         }
         none += 1;
     }
-    println!("  {none} of 138: constructed at load, never named by any dispatch site.");
+    println!("  {none} of 140: constructed at load, never named by any dispatch site.");
     println!("  (includes the 8 `_nod` garbage probes, the 2 `gemv_reduce_*`, and the 2 `_bench` kernels)");
 
     println!("\nC: kernels reachable only through `ishizuki_gemv_pipeline` (the rate-slot");
@@ -1096,7 +1096,7 @@ fn the_census_detectors_can_fail() {
     assert_eq!(
         kernels_in("linear_repacked.metal", &rep).len()
             + kernels_in("linear.metal", &both).len(),
-        138
+        140
     );
     let renamed = rep.replacen(
         "kernel void linear_gemv_ishizuki_k3_fused2_co4(",
@@ -1119,7 +1119,7 @@ fn the_census_detectors_can_fail() {
         kernels_in("linear_repacked.metal", &demoted).len(),
         26,
         "a kernel demoted to a plain function is no longer in the library's \
-         inventory, and the 138 figure must move with it"
+         inventory, and the 140 figure must move with it"
     );
 }
 

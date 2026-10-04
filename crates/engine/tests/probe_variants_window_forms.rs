@@ -1002,7 +1002,7 @@ fn library_census_and_the_honest_answer_on_instruction_cache_pressure() {
         ishizuki.len() as f64 * 100.0 / ishizuki.len() as f64 * nod as f64 / ishizuki.len() as f64,
         variants - 1,
     );
-    assert_eq!(lib.len(), 138, "the linear library's kernel count moved");
+    assert_eq!(lib.len(), 140, "the linear library's kernel count moved");
     assert_eq!(ishizuki.len(), 45);
     assert_eq!((nod, w2), (8, 4));
 

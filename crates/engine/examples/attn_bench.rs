@@ -371,7 +371,7 @@ fn main() {
         let best = *times.first().expect("timed");
         let worst = *times.last().expect("timed");
         let kv_bytes = (variant.key_count * kv_bytes_per_key(shape)) as f64;
-        let splits = decode_splits(Q_HEADS, variant.key_count);
+        let splits = decode_splits(Q_HEADS, shape.kv_heads, variant.key_count);
         // QK and PV each do one MAC per (query head, key, dimension), and a MAC
         // is 2 FLOP, so 4 * q_heads * keys * head_dim. GQA does not divide this
         // out: a kv head's K row is read once but every one of its
