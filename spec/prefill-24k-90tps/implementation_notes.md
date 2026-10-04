@@ -581,3 +581,155 @@ it was "ok" at the instant it was asked -- a parallel agent can take the model
 *after* the status check and before the load completes. A run that does not reach
 its output must be re-checked for CPU time and `vm.swapusage`, not assumed slow.
 to reach 90 tok/s (266 s) without cutting ~125 s out of these two numbers.
+
+## 9 — T4e: where the flash kernel's time actually goes (ablation, 24 576 keys)
+
+§7.5 and §8.1 blamed `simdgroup_load`s per MMA and occupancy. Both were wrong, and
+the reason they were wrong is that neither was measured on the kernel's real cost
+split. This is that split, from ablations in `attention.metal`, each measured on
+the no-model bench (`attention_arm_throughput_at_prefill_geometry`, BQ=1, 1024
+queries, 24 576 keys, warm, median of 3):
+
+| variant | ms | what it removes |
+|---|---|---|
+| baseline | 1148 | -- |
+| `ksteps = 0` (no PV at all) | **433** | PV MMAs, `af`/`bf` loads, rescale, straddle staging |
+| QK loop disabled | 689 | QK MMAs, `kf`/`qf` loads, `sth` publish |
+| **all MMAs and all their loads off** | **36.7** | everything except softmax, barriers, tail staging, epilogue |
+
+**The softmax, the barriers and the straddle staging are 3% of the kernel.** 96%
+is MMA issue plus the fragment loads that feed it. The kernel runs at 1.44 TFLOP/s
+= **9% of the 15.6 TFLOPS tensor peak** measured by `examples/mma_peak.rs`.
+
+Two sub-measurements separate loads from MMAs. Forcing the K and V device loads to
+re-read one cached row (same instruction count, same cache lines):
+
+| variant | ms | delta |
+|---|---|---|
+| baseline | 1148 | -- |
+| `kf` from a fixed row (K load cached) | 977 | **-171** |
+| `bf` from a fixed row (V load cached) | 810 | **-338** |
+
+So the strided device loads are ~509 ms of 1148 = **44%**, and the MMA issue is
+~600 ms = 52%. Neither dominates, so no single change can reach 3-4x.
+
+### 9.1 The loads are near-minimal -- and that is the problem
+
+Bytes read by the K/V loads, from the loop counters. One `simdgroup_half8x8` is
+8x8 halfs = **128 B**, and the sub-tiles are partitioned across simdgroups
+(`k0 = base + sg*8`, `nt = sg + j*NSG`), so there is **no redundancy**:
+
+| load | per threadgroup per 64-key tile |
+|---|---|
+| `kf` | 8 sg x 64 d8 x 128 B = 64 KB |
+| `bf` | 8 sg x 8 nt x 8 kt x 128 B = 64 KB |
+| unique K and V for 64 keys x 512 dims | 64 KB each = 128 KB |
+
+Exactly minimal. Over 384 key tiles and 4096 threadgroups (1024 queries x 4 KV
+heads) that is **201 GB in 1.15 s = 175 GB/s**, i.e. **64% of the 273 GB/s DRAM
+rate** -- so this kernel is *partly bandwidth-bound after all*, contrary to §9's
+first reading (an earlier draft of this section miscalculated a fragment as
+1024 B and concluded "122 TB/s, therefore cache-resident"; the fragment is 128 B
+and the conclusion was wrong).
+
+This is why the ablation split is 44% loads / 52% MMA issue: the two are
+*balanced*, and neither can be removed without the other becoming the wall. It is
+also why cutting threadgroup memory (§8.1, §8.4) and removing `qstage` (§9.2) did
+nothing: those target occupancy, and the kernel is not occupancy-limited at 4096
+threadgroups.
+
+### 9.1b Query blocking is the right lever used the wrong way
+
+BQ=2 halves the K/V bytes (each threadgroup reads a key once and reuses it for 2
+queries) but also halves the grid, 4096 -> 2048. §8.2 measured it as a 2% loss.
+The two effects cancel: the byte win is real, the parallelism loss is real. The
+correct form is **BQ=2 with the grid restored** -- split the key range too, so
+2048 query-pairs x 2 key-halves = 4096 threadgroups, each reading half the bytes
+of the BQ=1 shape. That needs a partial/combine pass (flash-decoding style) and
+is the only change identified in this section that attacks the 44% load term
+without giving up the parallel term.
+
+### 9.2 What was tried against this split, and the verdicts
+
+| change | result | why |
+|---|---|---|
+| `+8` half bank padding on `qstage`/`wq` instead of 1024 B / 128 B strides | 1111 ms (neutral) | the loads are not bank-conflict limited |
+| 2 independent QK accumulators (`dots` + `dots2`), summed once | 1126 ms (~-2%) | the dot is a 64-deep dependent MMA chain, but ILP is not what caps it |
+| K fragment software-pipelined one `d8` ahead | 1166 ms (**slower**) | the extra live fragment costs more than the overlap buys |
+| **remove `qstage` entirely; load Q transposed from the device** | 1151 ms (neutral) | the transposed 8x8 load spans exactly the 8 heads (`groups == NSG == 8`, `head0 = key_head*8`), so it needs no staging -- but threadgroup memory 19.5 -> 11.5 KB did not change the time |
+
+### 9.3 The conclusion that matters for AC2
+
+**Attention is bandwidth- and compute-balanced, with no single dominant term and
+no overlap between the two.** 44% loads + 52% MMA issue *sum* to 96% instead of
+`max(44, 52) = 52%`, which means the strided K/V loads and the tensor work are
+not overlapping: a threadgroup sits on a fragment load, then sits on an MMA.
+At 175 GB/s and 1.44 TFLOP/s it is using 64% of DRAM and 9% of tensor peak -- so
+there is headroom on *both* pipes simultaneously, which is the signature of a
+pipeline that is not pipelined, not of a resource that is full.
+
+The three structural fixes the plan named are all measured neutral or negative:
+occupancy (threadgroup memory, `qstage`), operand reuse (KSUB=4, `FLASH_KEY_SUBTILES`)
+and bank conflicts (padding) -- see §9.2, §8.1, §8.4. So the fix is not a better
+`simdgroup_load` choice inside this tile shape.
+
+Two levers remain, in the order they attack the cost split:
+
+1. **BQ=2 with the grid restored** (§9.1b): halves the 44% load term without
+   giving up the threadgroups. This is the change the byte model always wanted;
+   §8.2 lost because BQ alone halves the grid too. Needs a partial/combine pass,
+   for which the decode split path (`ATTENTION_SPLITS_MAX`, `decode_partial_elements`)
+   is the existing pattern to copy.
+2. **Overlap loads with MMAs**: software-pipeline the *whole* per-tile body
+   (one tile's MMAs against the next tile's fragment loads) rather than one `d8`
+   step ahead, which measured slower (§9.2). This targets the 48% that is
+   currently idle.
+
+### 9.3b The bench is valid for *work*, invalid for *ranking* -- reconciled
+
+A useful distinction, because both readings are true at once:
+
+- **FLOP/time: the bench predicts the engine exactly.** 1.44 TFLOP/s on the bench
+  at 24 576 keys; the engine's full-attention FLOPs (1.88e14 over 10 layers) at
+  1.44 TFLOP/s = 131 s, against 132 s measured by the profile. Byte traffic also
+  matches: 23.5 TB / 132 s = 178 GB/s engine vs 175 GB/s bench.
+- **Arm ordering: the bench is wrong three times out of three** (§8.7, §9.4).
+  `mma` 28% faster on the bench, `flash` faster end to end at 614, 8k and 16k.
+
+So `attention_arm_throughput_at_prefill_geometry` can be trusted for "how much
+time does this shape cost" (which is what AC2's budget arithmetic rests on) and
+must not be used to choose an arm. The likely cause of the ordering inversion is
+that the bench's KV tile is hot and resident across all three repeats, while the
+engine interleaves attention with a GEMM that streams 11 GB of weights per chunk
+and evicts it.
+
+### 9.4 T4e: flash beats mma end to end at 16k, where attention is a third of the wall
+
+| prompt | flash | mma |
+|---|---|---|
+| 16 394 | **69.36** | 66.95 |
+| 24 590 | **62.87** | not run (OQ5: see below) |
+
+A 3.6% full-layer-attention win, which is the largest E2E arm separation measured
+at any context. It confirms `flash` as the shipped arm (§8.7) at the one context
+where the choice is worth 3.6% rather than noise -- and it is the **third**
+confirmation that the TFLOP/s bench cannot rank arms: the bench says `mma` is 28%
+faster than `flash` at 24 576 keys (869 ms vs 1148 ms), and end to end `flash` is
+**faster**. The bench measures a bare kernel on a hot, resident KV tile; the
+engine measures it interleaved with a GEMM that streams 11 GB of weights per
+chunk, and the two orderings differ.
+
+### 9.5 Current E2E numbers (this session, interleaved, 2 rounds where taken)
+
+| prompt | prefill tok/s | |
+|---|---|---|
+| 626 | 101.5 | |
+| 8 204 | 80.1 / 81.8 (flash), 79.9 / 79.6 (mma) | |
+| 16 394 | **69.36** | |
+| 24 590 | **62.87** | target 90 |
+
+GEMM is context-independent at ~9.4 ms/token, so at 24k it is ~225 s of the
+~381 s wall (59%). Non-GEMM cost grows with context (3.1 -> 5.0 -> 6.5 ms/token
+over 8k/16k/24k), consistent with attention being linear in context. Closing
+24k from 62.87 to 90 needs 381 s -> 273 s, i.e. **-108 s (28%)**, and GEMM alone
+is 225 s of it.

@@ -89,9 +89,10 @@ full-shape ratio; then end-to-end 8k A/B before spending a 24k run.
 
 ## T4 — Prefill attention: verify the full-attention win end to end
 
-**Status:** 🔄 in progress. 8k done (above, +8.1%). Query blocking built,
-measured, **rejected**; the kernel deficit is now explained and an instrument
-exists. **Next:** raise MMA/fragment-load in the QK loop.
+**Status:** 🔄 in progress. 8k done (above, +8.1%). Query blocking built, measured
+and **rejected in its grid-halving form**; the cost split is now measured
+(T4e) and the arm decision is settled (T4c). **Next:** T4f -- query blocking with
+the key range split so the grid is not halved.
 
 ### T4a — query blocking (`BQ`): built, correct, **does not pay**
 
@@ -157,10 +158,41 @@ MMA but needs 28 KB of threadgroup memory; **13% slower** in the engine at 8k
 (attention 20.6 s -> 23.4 s) and slower on the bench (1118 -> 1318 ms at 24 576
 keys). Recorded as §8.1; `FLASH_KEY_SUBTILES = 1` documents the shipped value.
 
-**Remaining (T4e):** the two things that could still move attention are (a) the
-GEMM ceiling (§5: 90 tok/s needs GEMM *and* attention to improve together) and
-(b) a structural change to the flash body's per-tile barrier/softmax serial cost.
-Do not use the TFLOP/s bench to choose between arms.
+### T4e — ablate the flash body; the cost split is now measured ✅
+
+Ablations in `attention.metal` (24 576 keys, BQ=1): baseline 1148 ms, PV off 433,
+QK off 689, **all MMAs and their loads off 36.7**. So the softmax/barriers/staging
+are 3%; the strided device loads are 44% (K -171 ms, V -338 ms) and MMA issue 52%,
+**and the two do not overlap** (they sum instead of maxing). Attention runs at
+175 GB/s = 64% DRAM and 1.44 TFLOP/s = 9% tensor peak, simultaneously.
+
+| tried | result |
+|---|---|
+| bank-conflict padding on `qstage`/`wq` | 1111 ms, neutral |
+| 2 independent QK accumulators | 1126 ms, ~-2% |
+| K fragment software-pipelined 1 `d8` ahead | 1166 ms, slower |
+| remove `qstage`, load Q transposed from device | 1151 ms, neutral (but it does work: transposed 8x8 spans the 8 heads) |
+
+So occupancy, operand reuse and bank conflicts are all **out**; the two levers
+left are (a) **BQ=2 with the grid restored** by splitting the key range
+(§9.1b -- halves the 44% load term without halving the threadgroups, needs a
+partial/combine pass like the decode split path) and (b) overlapping a tile's
+MMAs with the next tile's loads (the 48% idle).
+
+**Arm decision (third confirmation):** `flash` beats `mma` end to end at 16k
+(69.36 vs 66.95) and 24k (62.87 flash), even though the bench says `mma` is 28%
+faster. The bench is valid for *work* (1.44 TFLOP/s predicts the engine's 131 s
+of full attention against 132 s measured) and invalid for *ranking*.
+
+| prompt | prefill tok/s |
+|---|---|
+| 626 | 101.5 |
+| 8 204 | 80.1 (flash) |
+| 16 394 | 69.36 (flash) / 66.95 (mma) |
+| 24 590 | **62.87** (target 90) |
+
+**Remaining (T4f):** BQ=2 + key split with a combine pass. GEMM is ~225 s of the
+24k wall (59%) and needs ~7.8 TFLOPS for 90, per §5.
 
 ---
 

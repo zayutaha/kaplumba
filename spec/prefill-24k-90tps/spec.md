@@ -115,10 +115,13 @@ Additional for this spec:
   bandwidth-bound, and if so what is the real limiter? — AC2 should be treated as
   unproven, not merely unmet.** The alternative to resolving it is a target
   change or a GEMM push, both of which need user direction.
-- **OQ5 — 24k measurement is not reproducible under desktop load.** Two 24k A/B
-  attempts in this session stalled: the model loaded (18 GiB wired) but the box
+- **OQ5 — 24k measurement is marginal under desktop load.** Two 24k A/B attempts
+  in this session stalled: the model loaded (18 GiB wired) but the box
   entered compression (7.1 GiB compressor, <300 MiB free) once the 24k KV+scratch
   were resident, and `kaplumba` sat at ~2% CPU. The same box runs 614/8k
-  measurements normally. The 24k figures in this spec (`52.84`, `~63.2`) were
-  taken with less concurrent load; a 24k run needs the desktop footprint
-  minimised, and any 24k sample taken under contention is invalid.
+  measurements normally. **Partially resolved:** a later 24k run *did* complete on
+  this same box -- **62.87 tok/s at 24 590 tokens**, with the desktop at ~7 GiB
+  resident -- so 24k measurement is possible but marginal. Before trusting or
+  discarding a 24k sample, check `top`'s `unused`, `sysctl vm.swapusage` and the
+  process's CPU time (a sample with >2% CPU in compression is invalid), not just
+  `gpuq try`, which only reads the lock at one instant.
