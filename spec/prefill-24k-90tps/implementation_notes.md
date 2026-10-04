@@ -1393,3 +1393,184 @@ LOG=/tmp/x.log scripts/bench_decode_splits.sh 8192 1 2 4 8 16
 VAR=KAPLUMBA_DECODE_FLASH ROPE="0 --" ROUNDS=3 \
   scripts/bench_decode_splits.sh 8192                # "--" leaves the var unset
 ```
+
+---
+
+## 16 — N1: prefill key-range passes are implemented, bit-exact, and MEASURED NEUTRAL
+
+### 16.1 What shipped
+
+`PASSES` template parameter on `attention_prefill_flash_body`
+(`crates/kernels/src/attention.metal:1432`), two new kernels
+(`online_attention_flash_pass_512_8`, `online_attention_flash_pass_bq1_512_8`),
+`pass_begin`/`pass_keys` added to `AttentionParams`, a host loop in
+`encode_online_attention_passes`, a fixed-size `attn_pass_state` scratch buffer,
+and `attention_prefill_pass_bit_exact.rs` (**17 tests, all pass**).
+
+The mechanism is oMLX's, verbatim in shape. From
+`omlx/utils/nax_attention.py:162-170`: *"One dispatch covers key blocks
+[kb_begin, kb_end). Unless FIRST, the online-softmax state of every query row
+(fp32 O accumulator, running max, running sum) is loaded from Sin; unless LAST it
+is stored to Sout instead of normalising and writing the output. Every row thus
+runs exactly the operations of one full dispatch, in the same order
+(bit-identical output)."* Their `FIRST`/`LAST` are template parameters; ours are
+the runtime tests `range_begin == 0` and `range_end >= key_count`, so **one
+pipeline serves every pass of the chain** rather than one instantiation per
+(first, last) combination — 4 kernels instead of 8, and no JIT dimension growth.
+
+The state layout is the decode partials layout with a query axis in front:
+`(q, head)` rows of `O[512], m, s` fp32, 67 371 008 B at the 1024-query chunk.
+Fixed-size and context-independent (AGENTS.md §8): it is sized from
+`max_tokens <= PREFILL_CHUNK`, and `prefill_pass_state_elements` has no key count
+in its signature — the structural reason it cannot grow with context. It is
+**scratch, not weights**, so the 11.51 GiB weight budget does not move, and the
+measured 16k `phys_footprint` is 15.48-15.56 GiB across all six arms, i.e. the
+64 MiB does not show up against the pre-existing 15 GiB.
+
+### 16.2 Two bugs, both caught by the test and neither by inspection
+
+**Buffer order.** `dispatch_groups` appends the params blob at
+`bindings.len()` (`crates/kernels/src/encoder.rs:453`). So `state` has to be
+inserted *before* `params`, which puts `output` at 5, `state` at 6, `params` at 7
+— the reverse of every other kernel here. Getting it wrong bound the state buffer
+to the params bytes and left the real output unbound: **no error, all 16 777 216
+fp16 values wrong by 0.7133789.** Two wrong orderings were tried before the right
+one; both looked like plausible implementation, and both produced a stable,
+confidently-wrong number rather than a failure. Recorded because §10.2's "open
+hazard" note is the same class of problem and this is the second instance.
+
+**Unaligned pass edges — the one that would have shipped.** The online softmax
+updates `(m, s, O)` **once per 64-key tile**, so the sequence of running maxima,
+and therefore the sequence of rescale factors applied to `s` and `O`, is a
+function of where the tile boundaries fall. My first version cut at
+`(count * index) / passes`, which lands mid-tile. Measured cost:
+**one fp16 ulp on 1.0% of outputs** — `637 195 of 16 777 216` values differ,
+worst |diff| **0.000488**, first at `(query 40, head 5, dim 116)` for 44-key
+passes over 129 keys.
+
+That is the number to sit with: **0.000488 is 10x inside the 5e-3 tolerance every
+other attention test in this repo uses.** `attention_qk_mma_matches_scalar` allows
+5e-3; `attention_decode_flash_matches_split` allows 5e-3. A one-ulp regression
+would have been invisible to all of them, would have been reported as "bit-exact",
+and would have shipped. What caught it was insisting on `to_bits()` equality in
+the new test rather than reusing the house tolerance.
+
+oMLX never had this hazard: it cuts in units of its key block (`_BK = 32`,
+`:76`), `_pass_edges` returns block **indices** (`:800`) and the kernel loops
+`for (kb = kb_lo; kb < kb_hi; kb++)` (`:362`), so an edge is a block boundary by
+construction. Here it has to be explicit: `PREFILL_PASS_TILE = 64`,
+`prefill_pass_edges` snaps every non-final edge to a multiple of it, and the test
+pins the alignment invariant directly.
+
+**Sabotage verification, observed failure modes.** Adding 8 to every edge
+(`edges.push(index * tiles_per_pass * 64 + 8)`) fails **7 of 17** tests, with
+both messages firing as intended: `edge 1 of a 1000-key chain with pass_keys=1 is
+not tile-aligned` and `a pass chain of 44 keys over 129 keys is NOT bit-exact:
+15 627 870 of 16 777 216 fp16 values differ, worst |diff| = 0.12805176`. Reverted;
+`diff` against the pre-sabotage `.metal` is clean and the suite returns to 17/17.
+
+A second sabotage — dropping the `if edge < key_count` guard, to see whether the
+empty-final-pass case is covered — **passed 17/17**. That guard is unreachable
+for any input the production code produces (see 16.4), so the test cannot fail on
+it. Recorded rather than papered over with a test that asserts an unreachable
+branch.
+
+### 16.3 The measurement: NEUTRAL. Do not ship it as a speedup.
+
+Interleaved A/B, 3 rounds, 16 394-token prompt, `--max-new-tokens 1`,
+`KAPLUMBA_PREFILL_PASS_KEYS` per arm, poll file kept per arm:
+
+| arm | r1 | r2 | r3 | median | spread |
+|---|---|---|---|---|---|
+| one dispatch (`pass_keys=0`) | 74.947 | 74.750 | 74.108 | **74.750** | 0.84% |
+| `pass_keys=2048` (8 passes) | 74.827 | 74.787 | 74.704 | **74.787** | 0.12% |
+| `pass_keys=8192` (2 passes) | 74.950 | 74.298 | *INVALID* | **74.950** | — |
+
+**+0.05% at 8 passes and +0.27% at 2 passes, against a 0.84% spread on the
+control.** Both are inside the noise. The one discarded arm
+(`r3 pass8192 INVALID-NO-NUMBER`, `unused-dropped-to-0.04GiB`) is recorded as
+invalid with no number, per the harness rule.
+
+**Positive control, same binary, same prompt, same session:**
+`KAPLUMBA_SCALAR_ATTENTION=1` reads **62.019 tok/s / 272.72 s wall** against the
+flash default's **74.576 / 230.47** — the instrument moved 20% on a known effect,
+so a 0.05% reading of "no difference" is believable rather than a broken build.
+This is the check §10.3 asks for and the one the whole T2a sweep was missing.
+
+Peak `phys_footprint` (from `/usr/bin/time -l`, **not** `ru_maxss`): 15.48, 15.49,
+15.50, 15.56, 15.52, 15.51, 15.52, 15.50, 15.56 GiB across the nine arms —
+indistinguishable, so the 64 MiB state buffer is free at this scale. The
+`ru_maxrss` column reads 8.56-9.09 GiB, i.e. **5.5 GiB below the truth**, exactly
+as AGENTS.md 10.3 warns; it is logged only as a contrast.
+
+### 16.4 Why neutral is the expected answer, not a surprise
+
+oMLX measured the mechanism on **a 1M-key context at ~85 TFLOPS against ~103 at
+64k** (`nax_attention.py:89-91`) — a 21% effect at 16x our context. At 16k our
+entire KV working set for a full layer is 134 MB, well inside what the caches
+absorb, so the drift the slices are supposed to prevent has barely begun. §10
+already measured the same thing from the other direction: **capping the K/V
+allocation 64x smaller bought 6%.** A mechanism that fixes cache-residency loss
+cannot pay where there is no residency loss to fix.
+
+So the honest reading is: **N1's premise does not hold at any context this box can
+measure.** It would be expected to matter at 1M keys on hardware where it matters
+to oMLX, and this engine's 24k ceiling makes that unreachable. This is a
+**negative result with a bit-exact, fully tested implementation behind it** — the
+implementation is worth keeping (it is the only correct way to express the
+mechanism, and the tile-alignment invariant it forced is a real property of the
+kernel), but the *default must stay one dispatch*, because "no measurable
+difference" plus 64 MiB of scratch plus 2x the dispatch count is a net loss on
+anything that is not bandwidth-starved.
+
+The gate ships **on by default** because it is measured neutral and bit-exact;
+`KAPLUMBA_PREFILL_PASS_KEYS=0` restores a single dispatch. If a future session
+measures a context where it pays, that is the flag to reach for.
+
+### 16.5 Invariants and facts worth keeping
+
+* **Pass edges must be tile-aligned or the output changes by one ulp.** The
+  strongest single fact from this work. `PREFILL_PASS_TILE` and the snapping in
+  `prefill_pass_edges` are load-bearing for correctness, not performance.
+* `dispatch_groups` puts params at `bindings.len()` — an extra buffer must be
+  inserted before it, not appended.
+* `top -l 1 -n 0` is **throttled to nothing under load**: 25 of 25 polls inside a
+  4-second loop during an 8k prefill returned no PhysMem line. `vm_stat` is a
+  sysctl read and answered every time. `top_physmem_live` retries then falls back
+  per field. A `top`-only poller is blind exactly when the box is busiest.
+* **Loading the model drives the compressor to 6-9.5 GiB on this box** and takes
+  `unused` from ~17 GiB to ~0.1 GiB in about 8 seconds, on its own. A gate that
+  watches the whole run reads every good run as compressed.
+* **A good run and a stalled run print the same memory numbers here.** The OQ5
+  stall reads 5.90 GiB compressor / 0.11 GiB unused; a 626-token run returning
+  **100.9 tok/s** read **9.47 / 0.09**. This is §15.6 restated with numbers and it
+  is the strongest form of the OQ8 argument yet: the measurement, not the kernel,
+  is the binding constraint on this box.
+* `sys` CPU on this box is 3.5-32% of wall on *good* runs (dominated by the
+  11.5 GiB mmap'd weight read), so OQ5's ">2% CPU in compression" rule, read as
+  `sys/real`, rejects good runs. Reported, not gated on.
+* **The `end` pass carries the load**: 16 394 tokens at `pass_keys=2048` is 8 passes
+  and the last one holds the most keys, so tail latency is unchanged — consistent
+  with the neutral result.
+* The grid gate is `<= 512` threadgroups (oMLX's `n_groups < min_groups` is `<`,
+  but their comment calls 512 the "wave or two" size, so the boundary belongs on
+  the unsliced side). 128 queries x 4 kv heads at BQ=1 = 512 groups → one dispatch;
+  129 queries → sliced.
+* `ATTENTION_SINGLE_PASS_MAX_KEYS` and `FLASH_QUERY_BLOCK_MIN_KEYS` are unrelated to
+  this work and unchanged.
+
+### 16.6 Commands
+
+```bash
+# correctness (17 tests, no model load)
+scripts/gpuq try -- cargo test --release -p kaplumba-engine \
+  --test attention_prefill_pass_bit_exact
+
+# the measurement
+ROUNDS=3 OUTDIR=/tmp/n1_16k scripts/bench_prefill_passes.sh 16384 2048 8192
+ROUNDS=1 OUTDIR=/tmp/x scripts/bench_prefill_passes.sh 24576 8192   # 24k, marginal
+KAPLUMBA_PREFILL_PASS_KEYS=0 ./target/release/kaplumba ...           # one dispatch
+
+# the gate's own suite
+bash scripts/test_gpuq_mem.sh
+```
