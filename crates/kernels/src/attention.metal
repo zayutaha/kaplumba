@@ -1721,10 +1721,28 @@ static void attention_prefill_flash_body(
 
         // ---- PV: acc[q][head][dim] = ms * acc + P[head][key] * V[key][dim].
         // The V element `bf` is loaded once and reused by every blocked query,
-        // which halves the V device traffic. ----
+        // which halves the V device traffic.
+        //
+        // The rescale is skipped for any (query, head) whose max did not move in
+        // this tile: `ms = exp(m_old - m_new)` is then exactly 1, and
+        // `x * 1 == x` in IEEE-754, so the guard is bit-exact rather than an
+        // approximation. Ported from oMLX v0.7.0
+        // (`omlx/patches/mimo_v2/sdpa_flash.py:299-300`, *"A row whose max did not
+        // move has factor 1: skipping its rescale is exact"*).
+        //
+        // `fm` is the fragment row, i.e. the head, and the softmax wrote `ms` for
+        // exactly that head -- so this is one branch per (query, head) per tile,
+        // guarding `NPER * 2` multiplies. On the first tile of a dispatch every
+        // head moves (m starts at NEG), so the branch costs nothing there; on later
+        // tiles only the heads that found a new maximum take it. With `BQ = 1` the
+        // loop is one iteration, so this is a plain `if` on a threadgroup value
+        // all lanes of a simdgroup already computed.
 #pragma unroll
         for (uint b = 0; b < uint(BQ); ++b) {
             const float msv = msb[b * uint(NSG) + fm];
+            if (msv == 1.0f) {
+                continue;
+            }
 #pragma unroll
             for (uint j = 0; j < NPER; ++j) {
                 acc[b][j].thread_elements()[0] *= msv;
