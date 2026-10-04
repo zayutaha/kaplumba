@@ -89,10 +89,10 @@ full-shape ratio; then end-to-end 8k A/B before spending a 24k run.
 
 ## T4 — Prefill attention: verify the full-attention win end to end
 
-**Status:** 🔄 in progress. 8k done (above, +8.1%). Query blocking built, measured
-and **rejected in its grid-halving form**; the cost split is now measured
-(T4e) and the arm decision is settled (T4c). **Next:** T4f -- query blocking with
-the key range split so the grid is not halved.
+**Status:** 🔄 in progress. 8k +8.1% (T3). Query blocking **rejected in its
+grid-halving form**; cost split measured (T4e); arm decision settled (T4c);
+**T4f shipped +15-21% on the bench, +1.6% E2E at 8k** (`1254780`). The key-split
+plan was refuted before building it. **Next:** T4g -- re-ablate, then GEMM vs T2.
 
 ### T4a — query blocking (`BQ`): built, correct, **does not pay**
 
@@ -191,8 +191,50 @@ of full attention against 132 s measured) and invalid for *ranking*.
 | 16 394 | 69.36 (flash) / 66.95 (mma) |
 | 24 590 | **62.87** (target 90) |
 
-**Remaining (T4f):** BQ=2 + key split with a combine pass. GEMM is ~225 s of the
-24k wall (59%) and needs ~7.8 TFLOPS for 90, per §5.
+### T4e-b — the key-split-with-combine plan is **refuted, do not build it**
+
+The §9.1b plan was to halve the K/V bytes with BQ=2 and restore the threadgroup
+count by splitting the key range, which needs a partial/combine pass. Measured
+first: the bench now sweeps `queries` 256 / 1024 / 4096 (grid 1024 / 4096 / 16384)
+and flash runs at **1.78 / 1.80 / 1.80 TFLOP/s** -- flat. The kernel is **not
+grid-starved**, so halving the grid was never what cost BQ=2 its win, and a
+combine pass would have bought nothing. Recorded so nobody spends the effort.
+
+### T4f — contiguous V dim window per simdgroup ✅ `1254780`
+
+PV assigned its n-tiles `nt = sg + j*NSG`, so each simdgroup read **8 scattered
+16-byte windows at every 64-dim step** of each V row, with the 8 rows 4 KB apart
+-- structurally the opposite of the K load, which walks `d8` contiguously over its
+own 8 rows and never over-fetches. That asymmetry is exactly why the ablation
+put the V load at 338 ms against the K load at 171 ms for byte-identical work.
+
+Fix, one line in two places (PV loop + epilogue write): `nt = sg * NPER + j`.
+The n-tiles are still a partition of `[0, 64)`, so the output rows are unchanged.
+
+**Measured, no-model bench, warm, `mma` as an untouched control (871 ms before
+and after):**
+
+| case | flash bq1 before -> after | flash bq2 (what the engine runs at 24k) |
+|---|---|---|
+| 8192 keys / 1024 q | 334.06 -> **286.68** (+17%) | 318.08 -> **292.44** (+9%) |
+| 24576 keys / 1024 q | 1099.79 -> **916.24** (+20%) | 1062.91 -> **902.17** (+15%) |
+| 24576 keys / 256 q | 275.52 -> **232.02** (+19%) | 223.42 |
+| 24576 keys / 4096 q | 4456.60 -> **3670.43** (+21%) | 3588.84 |
+
+**Correctness:** `attention_qk_mma_matches_scalar` worst |flash - scalar| still
+**4.88e-4** (one ulp, tol 5e-3) over all 6 full-shape cases incl. every straddle;
+`attention_single_pass_bit_exact` 8/8. **E2E 8k:** 80.09 / 81.80 -> **82.42 /
+82.24**, with mma unmoved at 79.80 / 79.80 (it never touched this code, so it is a
+real control).
+
+**Caveat:** a ~6% effect at 24k cannot be resolved on this box -- two back-to-back
+clean runs of the *same* binary gave 62.72 and 49.43 tok/s (21% spread) while the
+box was compressing. See OQ5.
+
+**Remaining (T4g):** re-ablate on the updated body to find the next dominant term,
+then choose between the GEMM (~225 s of the 24k wall, 59%, untouched by this whole
+spec) and T2 (decode, untouched). Per §5, 90 tok/s needs **both** the GEMM and
+attention to improve.
 
 ---
 
