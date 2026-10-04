@@ -94,6 +94,21 @@ Additional for this spec:
 
 ## Acceptance criteria
 
+> **Status after the N1-N6 session (`48df478`).** AC3, AC4 and AC5 **met**;
+> AC1 and AC2 **unmet**. Per-criterion evidence is in
+> `implementation_notes.md` §20 and `tasks.md` (N6). The table at the top of this
+> file is still the `b73090d` snapshot and is superseded by `NEXT.md` §7.1.
+>
+> | AC | target | measured | verdict |
+> |---|---|---|---|
+> | 1 | decode ≥ 14 @24k | **unmeasurable** (OQ8); 12.329 @16k | ❌ blocked, not failed |
+> | 2 | prefill ≥ 90 @24k | 67.10 @24k (older, 1 round) | ❌ 20% short, unmoved |
+> | 3 | prefill ≥ 80 @8k, ≥ 100 @614, decode ≥ 12 @8k | 85.52 / 101.04 / 12.911 | ✅ |
+> | 4 | `phys_footprint` ≤ 20 GiB @24k, `swaps` 0 | 15.54 GiB @16k, 18.35 @24k; **zero swapouts** in 16 runs | ✅ |
+> | 5 | all tests pass, 5 reference prompts, worst GEMM error ≤ 2.16e-3 | 116 binaries ok, 4 failed **all verified at base**; 5 prompts byte-identical between arms | ✅ with a caveat |
+
+
+
 1. Decode ≥ **14 tok/s** at 24k context.
 2. Prefill ≥ **90 tok/s** at 24k context.
 3. No regression: prefill ≥ 80 @8k and ≥ 100 @614; decode ≥ 12 @8k.
@@ -174,15 +189,58 @@ Additional for this spec:
   lower-footprint configuration to measure, or (c) accept 8k as the decode
   acceptance context and re-baseline AC1 against it. **Needs user direction.**
 - **OQ9 — Should the prefill key range be sliced into successive dispatches?**
-  **OPEN, and it is the strongest remaining prefill idea.** oMLX v0.7.0's prefill
-  path (`omlx/utils/nax_attention.py`) runs "several dispatches over consecutive
-  key ranges (`OMLX_NAX_ATTN_PASS_KEYS` keys each, default 8192) that hand the
-  fp32 online-softmax row state (O accumulator, running max and sum) from one to
-  the next through device memory, so each row computes exactly what one dispatch
-  computes (bit-identical output)", for the stated reason that **"one dispatch
-  over a long key range lets its threadgroups drift apart until each streams its
-  KV head from DRAM; per-slice dispatches keep the K/V they share in the
-  on-chip caches."** That is a *different* mechanism from §12.2's parallel
-  key-split-plus-combine (which needs no combine pass and no extra partials
-  buffer beyond the row state), and it targets the same cache-residency loss that
-  §10 measured directly. It is **not yet built or measured here.**
+  **CLOSED: no, not at any context this box can measure.** Built (N1), verified
+  bit-exact against the one-dispatch body over 17 cases including ragged tiles,
+  query tails and windowed shapes, and measured interleaved at 16 394 tokens:
+  **+0.05% at 8 passes and +0.27% at 2 passes, against a 0.84% control spread.**
+  A positive control on the same binary and prompt (`KAPLUMBA_SCALAR_ATTENTION=1`)
+  moves the same instrument by 20%, so the null is believable rather than a broken
+  build. The mechanism's own premise is a cache-residency loss, and oMLX measured it
+  over **1M** keys (~85 vs ~103 TFLOPS); at 16k this engine's KV working set is
+  134 MB per full layer and §10 already showed a 64x smaller K/V allocation buys
+  6%. **There is no residency loss here to recover.** The implementation ships
+  (measured neutral, bit-exact, off with `KAPLUMBA_PREFILL_PASS_KEYS=0`) because it
+  is the only correct expression of the mechanism — and because building it forced
+  the discovery that **pass boundaries must land on tile boundaries**, a correctness
+  invariant of the online softmax: an unaligned boundary changes the output by one
+  fp16 ulp on ~1% of outputs, ten times inside the 5e-3 tolerance every other
+  attention test in this repo uses. See `implementation_notes.md` §16.
+
+  *The original text of this question is preserved below, since the verdict is
+  "no" and the reasoning above is easier to check against the claim being closed:*
+
+  > **OPEN, and it is the strongest remaining prefill idea.** oMLX v0.7.0's prefill
+  > path (`omlx/utils/nax_attention.py`) runs "several dispatches over consecutive
+  > key ranges (`OMLX_NAX_ATTN_PASS_KEYS` keys each, default 8192) that hand the
+  > fp32 online-softmax row state (O accumulator, running max and sum) from one to
+  > the next through device memory, so each row computes exactly what one dispatch
+  > computes (bit-identical output)", for the stated reason that **"one dispatch
+  > over a long key range lets its threadgroups drift apart until each streams its
+  > KV head from DRAM; per-slice dispatches keep the K/V they share in the
+  > on-chip caches."** That is a *different* mechanism from §12.2's parallel
+  > key-split-plus-combine (which needs no combine pass and no extra partials
+  > buffer beyond the row state), and it targets the same cache-residency loss that
+  > §10 measured directly. It is **not yet built or measured here.**
+
+- **OQ10 — NEW. Is the shipped decode split count the measured optimum?** **CLOSED:
+  no, and it is the only lever in this spec whose effect is still rising with
+  context.** An interleaved 3-round sweep of `KAPLUMBA_DECODE_SPLITS` at 8204
+  tokens with the MMA decode kernel gives 7.882 / 10.125 / 11.732 / 12.626 /
+  **12.917** / 12.776 tok/s at splits 1 / 2 / 4 / 8 / **13** / 16, with effect arms
+  at ±0.05%. `decode_one_wave_workgroups(256) / kv_heads = 54 / 4 = 13` predicts the
+  measured maximum — a third independent reproduction of the rule
+  `spec/decode-19tok` derived and swept on three shapes. The shipped default is 16
+  only because `decode_split_rule()` returns `ThreadTarget`, whose
+  `16384 / (32 * q_heads) = 16` comes from a *thread* budget unrelated to
+  workgroup residency. Confirmed at 16 394 tokens: **+2.17% decode** (12.067 →
+  12.329), effect spread 2-4x tighter than the control's, and the explicit-16 arm
+  reproduces the shipped default to 0.03%, which is the sweep's positive control.
+  **The cap is not the constraint:** 24 and 32 clamp (measured 12.777 / 12.780
+  against 16's 12.776) and the curve peaks at 13, *below* the cap; the only shape
+  that could want more is the 64-thread sliding one, which does not use the MMA
+  kernel. Flipping the default is one line
+  (`KAPLUMBA_DECODE_SPLIT_RULE=workgroups` already ships it as an opt-in) and is
+  provably a no-op for the 50 sliding layers, which evaluate to the 16 that ships
+  today. **Not flipped here** — the call is the owner's. See
+  `implementation_notes.md` §18.
+
