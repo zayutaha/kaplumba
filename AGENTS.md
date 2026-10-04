@@ -156,11 +156,32 @@ Tone: factual and dense. Prefer specifics (paths, numbers, commit hashes) over n
 
 ---
 
-## 6. Single-model constraint
+## 6. Parallel agents (replaces the old single-model rule)
 
-- **Only one LLM (agent session) may be “in memory” at a time** for a given task: do not run parallel agents on the same spec or the same working tree.
-- If delegating, wait for the previous agent to finish and write its handover notes before starting the next.
-- No concurrent edits to the same files; serialize work.
+**Multiple agent sessions may run in parallel.** The old rule — "only one LLM
+in memory at a time" — is lifted. The constraint that survives is the **GPU
+one**, not the agent one:
+
+- **Only ONE agent may load the model at a time.** Two concurrent model
+  instances exceed physical memory and invalidate every benchmark (AGENTS.md
+  §10). Every agent that runs the binary must go through `scripts/gpuq try --`
+  and treat exit **75** as "GPU busy, do the non-GPU work, retry later".
+  Compute-bound work (writing kernels, reading code, editing, unit tests that
+  do not load the model) is **not** restricted — run as many of those as
+  useful.
+- **No concurrent edits to the same files.** Split work by file ownership:
+  give each agent a disjoint set of files (e.g. one owns `attention.metal`,
+  another owns `linear.metal`, another owns `model.rs`). If two agents must
+  touch the same file, serialize them.
+- **Each agent works in its own worktree with its own `CARGO_TARGET_DIR`**
+  (§10.2 #4). A shared `target/` lets one agent's rebuild land in the middle
+  of another's benchmark.
+- Each agent writes its own handover notes to `spec/<name>/implementation_notes.md`
+  (or a per-agent file if two are in the same spec) **before finishing**, and
+  the coordinator merges the task-status updates into `tasks.md` — otherwise
+  concurrent writers clobber each other's checklist.
+- A **model-loading** agent must still wait for the previous one; only the
+  loading is serialized, not the thinking.
 
 ---
 
