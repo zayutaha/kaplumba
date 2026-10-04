@@ -44,7 +44,26 @@ correct.
 
 ## T3 — Prefill attention: flash-style MMA, 64-key tiles
 
-**Status:** ☐ not started. **This is the only path to AC2.**
+**Status:** ✅ done. `attention_prefill_flash_body` + `KAPLUMBA_FA_FLASH` in
+`attention.metal`; `AttentionQk::Flash` + `attention_flash_pipeline` in
+`attention.rs`; `attention_qk_for(groups, head_dim)` now selects it for
+`head_dim == 512 && groups == 8`.
+
+**Measured, interleaved A/B, 3 rounds (`measure-flash.tsv`):**
+
+| | 614 | 8k |
+|---|---|---|
+| flash (new default) | 98.84 / 99.78 | 84.96 / 85.01 / 84.97 |
+| scalar (`KAPLUMBA_SCALAR_ATTENTION=1`) | 99.84 / 99.97 | 78.59 / 78.75 / 78.14 |
+| delta | −0.6% (noise) | **+8.1%** |
+
+Also +5.5% over the MMA arm it replaces (80.52 @8k on the shipped default).
+Correctness: `attention_flash_matches_scalar_on_the_full_shape`, worst fp16
+abs diff **4.88e-4** (one ulp) over 5 full-shape cases incl. tails, multi-query
+and non-unit scale. **Sabotage check (AGENTS.md 3.4):** forcing `kt0 = 2*(lane & 15)`
+raises the diff to **0.374756** (77x the 5e-3 tolerance) and fails the test with
+the diagnostic message; reverted. Full workspace suite: same **4 pre-existing**
+failures as at base, no new ones.
 
 **Intent:** Fix all three structural costs read from `attention_gqa_mma_body`:
 (a) only 4 of 8 simdgroups engage QK; (b) PV is scalar with 8× redundant V
@@ -70,10 +89,10 @@ full-shape ratio; then end-to-end 8k A/B before spending a 24k run.
 
 ## T4 — Prefill attention: verify the full-attention win end to end
 
-**Status:** ☐ not started. **Depends on:** T3.
-
-**Test:** interleaved 8k and 24k A/B, medians with spread; 24k ≥ 90 tok/s or a
-measured explanation of the residual.
+**Status:** 🔄 in progress. 8k done (above, +8.1%). **Next:** interleaved 24k
+A/B, then decide whether the residual gap to 90 tok/s is QK-chain latency
+(the 64 dependent MMAs per m-tile), the 8x8 device-load coalescing, or the
+GEMM floor.
 
 ---
 

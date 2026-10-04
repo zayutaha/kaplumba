@@ -333,10 +333,69 @@ fn attention_mma_matches_scalar() {
     );
 }
 
-/// The production default is **shape-aware** (T2): `encode_online_attention`
-/// must dispatch the MMA arm on the full-attention shape (`groups >= 4`, NSG 8)
-/// and the scalar arm on the sliding shape (`groups == 2`, NSG 2), bitwise, with
-/// no environment override set.
+/// T3 (`spec/prefill-24k-90tps`): the flash body replaces the scalar QK *and*
+/// the scalar PV for the full-attention shape, so it diverges from scalar in two
+/// more places than the MMA arm does -- the softmax is fed an 8x8 MMA tile and
+/// the PV fold is a second `simdgroup_multiply_accumulate` with the weights
+/// stored as fp16 in `wq`. That fp16 P is a real, deliberate precision change,
+/// so this assertion is the thing that decides whether the rewrite is usable.
+#[test]
+fn attention_flash_matches_scalar_on_the_full_shape() {
+    let Some(fx) = Fixture::new() else {
+        return;
+    };
+    if !fx.kernels.flash_attention_available() {
+        panic!(
+            "the T3 flash pipeline (online_attention_flash_512_8) did not build; a \
+             Metal compile error is silent here because a failed library makes \
+             every test in this file no-op"
+        );
+    }
+    const TOL: f32 = 5e-3;
+    let mut worst_seen = 0.0f32;
+    let mut worst_case = String::new();
+    let mut failures: Vec<String> = Vec::new();
+    let mut checked = 0usize;
+    for (shape, key_count, queries_count, query_abs, scale) in cases() {
+        if !(shape.head_dim == 512 && shape.q_heads / shape.kv_heads == 8) {
+            continue;
+        }
+        checked += 1;
+        let case = fx.case(shape, key_count, queries_count, query_abs, scale);
+        let scalar = run(&fx, &case, &case.output_a, AttentionQk::Scalar);
+        let flash = run(&fx, &case, &case.output_b, AttentionQk::Flash);
+        let (diff, nans) = worst(&scalar, &flash);
+        println!("flash {} -> diff={diff:.6} nans={nans}", case.label());
+        if diff > worst_seen {
+            worst_seen = diff;
+            worst_case = case.label();
+        }
+        if nans > 0 || diff > TOL {
+            failures.push(format!("{}: diff={diff:.6} nans={nans}", case.label()));
+        }
+    }
+    assert!(checked > 0, "no full-attention cases exercised the flash arm");
+    println!(
+        "worst |flash - scalar| fp16 abs diff: {worst_seen:.6} at {worst_case} \
+         over {checked} cases (tol {TOL})"
+    );
+    assert!(
+        failures.is_empty(),
+        "the flash prefill body diverges from scalar on {} case(s). Suspect the \
+         64-key m-tile ownership (`sg <= partial_sub`), the sth [key][head] \
+         publish lane map, the 2-keys-per-lane softmax reduction, the wq \
+         [head][key] layout (ld must be 64), the PV n-tile ownership \
+         (`sg + j * NSG`), the `tail` K/V straddle staging, or the per-head msb \
+         rescale row index ({:#?})",
+        failures.len(),
+        failures
+    );
+}
+
+/// The production default is **shape-aware** (T2/T3): `encode_online_attention`
+/// must dispatch the flash arm on the full-attention shape (`head_dim == 512`,
+/// `groups == 8`) and the scalar arm on the sliding shape (`groups == 2`, NSG 2),
+/// bitwise, with no environment override set.
 ///
 /// This replaces the T1 guard that pinned Scalar globally. The T1 partitioned
 /// MMA loses on NSG 2 (1.6x slower) and wins on NSG 8 (1.2x faster), measured in
@@ -349,7 +408,12 @@ fn the_default_prefill_path_is_shape_aware() {
     let Some(fx) = Fixture::new() else {
         return;
     };
-    for (shape, expect_mma) in [(FULL, true), (SLIDING, false)] {
+    let full_arm = if fx.kernels.flash_attention_available() {
+        AttentionQk::Flash
+    } else {
+        AttentionQk::Mma
+    };
+    for (shape, expect_specialised) in [(FULL, full_arm), (SLIDING, AttentionQk::Scalar)] {
         let case = fx.case(shape, 65, 2, 65, 1.0);
         let mut enc = MetalEncoder::new(&fx.queue).expect("encoder");
         fx.kernels
@@ -358,17 +422,13 @@ fn the_default_prefill_path_is_shape_aware() {
         enc.commit_and_wait().expect("wait");
         let n = case.queries_count * case.shape.q_heads * case.shape.head_dim;
         let default_out = read_u16(&case.output_a, n);
-        let expected_qk = if expect_mma {
-            AttentionQk::Mma
-        } else {
-            AttentionQk::Scalar
-        };
+        let expected_qk = expect_specialised;
         let expected = run(&fx, &case, &case.output_b, expected_qk);
         assert_eq!(
             default_out, expected,
             "encode_online_attention on {} must dispatch the {expected_qk:?} arm \
              by default; it did not. Reconcile attention_single_pass_bit_exact \
-             and the T2 measurements before changing the shape rule",
+             and the T3 measurements before changing the shape rule",
             shape.name
         );
     }

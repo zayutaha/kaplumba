@@ -165,6 +165,67 @@ All three are fixed by the same change: a flash-style kernel with 64-key tiles
 with `simdgroup_load` at stride `kv_stride`). That is T3/T4, now the only path
 to AC2.
 
+## 4 — T3: the flash prefill body is in, and it is numerically sound
+
+**Files:** `crates/kernels/src/attention.metal` (`attention_prefill_flash_body`
++ `KAPLUMBA_FA_FLASH` + `KAPLUMBA_FA_FLASH(online_attention_flash_512_8, 512, 8)`),
+`crates/kernels/src/attention.rs` (`AttentionQk::Flash`, `flash_supported`,
+`attention_qk_for(groups, head_dim)`, `attention_flash_pipeline`).
+
+**Design.** One threadgroup per `(query, kv_head)`, 256 threads, same grid as the
+MMA arm. Per 64-key tile:
+
+1. **QK** -- eight 8-key m-tiles, `sub == sg`, so all 8 simdgroups issue MMAs
+   (the MMA body engaged only 4 of 8). `sth[64][8]` publishes
+   `dots.thread_elements()[0/1]` at `(sg*8 + fm)*8 + fn`.
+2. **Softmax** -- simdgroup `sg` owns head `sg` and two keys per lane
+   (`kt0 = 2*lane`), so the per-head max is one `simd_max` over 64 keys and the
+   running sum one `simd_sum(w0 + w1)`. `m` and `s` stay in registers; only the
+   per-head rescale `msb[sg]` is published, because the PV accumulators carry all
+   8 heads in one 8x8 fragment and need `msb[fm]` per row.
+3. **PV as MMA** -- `P[8 heads x 64 keys] x V[64 keys x 512 dims]`, with `V`
+   loaded straight from the device by `simdgroup_load(.., kv_stride)`. Each
+   simdgroup owns 8 of the 64 n-tiles (`nt = sg + j*NSG`) and holds 8
+   `simdgroup_float8x8` accumulators. This is what removes the MMA body's 8x
+   redundant V read + `cvt` across the GQA group (item 2 of the T1 read).
+4. The straddling K sub-tile and V k-step are staged into one shared 8x512-half
+   `tail` buffer (dead rows zeroed), reusing llama.cpp's guarded-tail shape. The
+   reuse is safe because the K straddle is consumed before the softmax barrier
+   and the V straddle only after it.
+
+Threadgroup memory at 512/8: 8 KB `qstage` + 2 KB `sth` + 1 KB `wq` + 8 KB `tail`
++ 64 B = **19 KB**, the same as the MMA body, under the 32 KB cliff.
+
+**Precision change, stated explicitly.** The MMA body kept `w` in fp32; the flash
+body stores `P` as fp16 in `wq`, because `simdgroup_multiply_accumulate` needs a
+half operand. That is the standard flash-attention trade and it is why the
+assertion below is a tolerance, not `to_bits()`.
+
+**Measured (GPU, `attention_qk_mma_matches_scalar`)** -- new test
+`attention_flash_matches_scalar_on_the_full_shape`, 5 full-attention cases
+(keys 7 / 31 / 32 / 129 / 1000, up to 3 queries, scale 1.0 and 0.04419):
+
+```
+flash full 32q/4kv/d512 (NSG=8) keys=7    -> diff=0.000488 nans=0
+flash full 32q/4kv/d512 (NSG=8) keys=31   -> diff=0.000488 nans=0
+flash full 32q/4kv/d512 (NSG=8) keys=32   -> diff=0.000488 nans=0
+flash full 32q/4kv/d512 (NSG=8) keys=1000 -> diff=0.000488 nans=0
+flash full 32q/4kv/d512 (NSG=8) keys=129  -> diff=0.000488 nans=0
+worst |flash - scalar| fp16 abs diff: 0.000488 (tol 0.005)
+```
+
+0.000488 is one fp16 ulp at these magnitudes -- the fp16 `P` store, as
+predicted, and two orders below the 5e-3 the MMA arm already ships with.
+`the_default_prefill_path_is_shape_aware` was updated to expect `Flash` on the
+full shape (it failed exactly there before the update, which is itself evidence
+the selection took effect rather than silently staying on MMA).
+
+**No-op hazard, recorded because it bit this session.** A Metal compile error
+fails the *whole* library, so `AttentionKernels::new()` returns `Err`, and every
+test in this file takes the `let Some(fx) = ... else { return }` path and
+*silently passes*. `attention_flash_matches_scalar_on_the_full_shape` therefore
+`panic!`s rather than returning when `flash_attention_available()` is false.
+
 ## 3 — Background: the GEMM ceiling (from `spec/engine-performance`)
 
 Relevant to R4 (verify-only) and to why 120 tok/s @614 was reported as a wall in

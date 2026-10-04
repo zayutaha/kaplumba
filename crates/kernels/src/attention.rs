@@ -429,6 +429,11 @@ pub struct AttentionKernels {
     decode_single_pipelines: [Option<ComputePipelineState>; GQA_PIPELINES],
     decode_combine_256_pipeline: ComputePipelineState,
     decode_combine_512_pipeline: ComputePipelineState,
+    /// T3 (`spec/prefill-24k-90tps`): the flash-style QK+PV prefill body for the
+    /// one shape it is written for (HEAD_DIM 512, groups 8). `Option` for the
+    /// same reason `decode_single_pipelines` is: a missing kernel must degrade
+    /// to the MMA arm, not take the whole library down.
+    attention_flash_pipeline: Option<ComputePipelineState>,
 }
 
 /// `q_heads / kv_heads` values the transposed kernel is instantiated for, and
@@ -493,6 +498,17 @@ fn decode_single_pass_name(head_dim: usize, nsg: usize) -> Option<String> {
 pub enum AttentionQk {
     Scalar,
     Mma,
+    /// T3 (`spec/prefill-24k-90tps`): 64-key tiles with the QK *and* the PV fold
+    /// as `simdgroup_multiply_accumulate`. Only instantiated for HEAD_DIM 512 /
+    /// groups 8; any other shape routes to [`AttentionQk::Mma`].
+    Flash,
+}
+
+/// Every `(head_dim, groups)` pair [`AttentionQk::Flash`] is instantiated for.
+/// One shape today; kept as a predicate rather than an `==` at the call site so
+/// a second instantiation cannot be added without the selection following.
+fn flash_supported(head_dim: usize, groups: usize) -> bool {
+    matches!((head_dim, groups), (512, 8))
 }
 
 /// True for the spellings that mean "on"; anything else is off, so a typo can
@@ -537,6 +553,12 @@ fn attention_qk_override() -> Option<AttentionQk> {
         {
             return Some(AttentionQk::Scalar);
         }
+        if std::env::var("KAPLUMBA_FLASH_ATTENTION")
+            .map(|raw| qk_env_truthy(&raw))
+            .unwrap_or(false)
+        {
+            return Some(AttentionQk::Flash);
+        }
         if std::env::var("KAPLUMBA_MMA_ATTENTION")
             .map(|raw| qk_env_truthy(&raw))
             .unwrap_or(false)
@@ -554,9 +576,12 @@ fn attention_qk_override() -> Option<AttentionQk> {
 /// layers (NSG 2) measured **1.6x slower**, so they keep scalar. Either flag
 /// (`KAPLUMBA_MMA_ATTENTION` / `KAPLUMBA_SCALAR_ATTENTION`) overrides the rule
 /// globally for A/B.
-pub fn attention_qk_for(groups: usize) -> AttentionQk {
+pub fn attention_qk_for(groups: usize, head_dim: usize) -> AttentionQk {
     if let Some(forced) = attention_qk_override() {
         return forced;
+    }
+    if flash_supported(head_dim, groups) {
+        return AttentionQk::Flash;
     }
     if groups >= 4 {
         AttentionQk::Mma
@@ -636,6 +661,10 @@ impl AttentionKernels {
         }
         let decode_combine_256_pipeline = extra("attention_decode_combine_256")?;
         let decode_combine_512_pipeline = extra("attention_decode_combine_512")?;
+        // T3: optional, like the single-pass decode kernels -- a missing flash
+        // pipeline falls back to the MMA arm instead of failing the library.
+        let attention_flash_pipeline =
+            crate::pipeline_audit::build(&device, &library, "online_attention_flash_512_8").ok();
         let queue = device.new_command_queue();
         Ok(Self {
             device,
@@ -654,7 +683,16 @@ impl AttentionKernels {
             decode_single_pipelines,
             decode_combine_256_pipeline,
             decode_combine_512_pipeline,
+            attention_flash_pipeline,
         })
+    }
+
+    /// Whether the T3 flash prefill pipeline compiled. Decode/sliding shapes
+    /// never consult it; the full-attention shape falls back to [`AttentionQk::Mma`]
+    /// when this is false, which is what keeps the `Option` from turning a build
+    /// accident into a wrong answer.
+    pub fn flash_attention_available(&self) -> bool {
+        self.attention_flash_pipeline.is_some()
     }
 
     pub fn online_attention(&self, request: AttentionRequest<'_>) -> Result<Vec<u16>, KernelError> {
@@ -1075,15 +1113,30 @@ impl AttentionKernels {
         // The generic kernel indexes a flat `queries * q_heads` thread range, so
         // it needs its own group count; both specialised kernels index the grid
         // themselves and discard the surplus threads on an early return.
+        let flash = match qk {
+            AttentionQk::Flash if flash_supported(head_dim, groups) => {
+                self.attention_flash_pipeline.as_ref()
+            }
+            _ => None,
+        };
         let (pipeline, grid_groups, group_threads) = match gqa_index(head_dim, groups) {
-            Some(index) => (
-                match qk {
-                    AttentionQk::Scalar => &self.attention_gqa_pipelines[index],
-                    AttentionQk::Mma => &self.attention_gqa_mma_pipelines[index],
-                },
-                (queries_count * kv_heads) as u64,
-                (32 * groups) as u64,
-            ),
+            Some(index) => match flash {
+                // Flash shares the specialised grid exactly: one threadgroup per
+                // (query, KV head), 32 * groups threads. Only the body differs.
+                Some(pipeline) => (pipeline, (queries_count * kv_heads) as u64, 256),
+                None => (
+                    match qk {
+                        // A `Flash` request on an unsupported shape, or one whose
+                        // pipeline failed to build, degrades to the MMA arm.
+                        AttentionQk::Scalar => &self.attention_gqa_pipelines[index],
+                        AttentionQk::Mma | AttentionQk::Flash => {
+                            &self.attention_gqa_mma_pipelines[index]
+                        }
+                    },
+                    (queries_count * kv_heads) as u64,
+                    (32 * groups) as u64,
+                ),
+            },
             None => match head_dim {
                 256 => (
                     &self.attention_tg2_256_pipeline,
@@ -1139,7 +1192,8 @@ impl AttentionKernels {
         } else {
             request.q_heads / request.kv_heads
         };
-        self.encode_online_attention_qk(encoder, request, attention_qk_for(groups))
+        let head_dim = request.head_dim;
+        self.encode_online_attention_qk(encoder, request, attention_qk_for(groups, head_dim))
     }
 
     pub fn working_set_bytes(&self, request: &AttentionRequest<'_>) -> usize {
