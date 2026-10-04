@@ -1574,3 +1574,227 @@ KAPLUMBA_PREFILL_PASS_KEYS=0 ./target/release/kaplumba ...           # one dispa
 # the gate's own suite
 bash scripts/test_gpuq_mem.sh
 ```
+
+---
+
+## 17 — N3(a): the O rescale guard, and what the test had to be against
+
+### 17.1 What shipped, and from where
+
+`attention.metal`, the PV rescale loop of `attention_prefill_flash_body`:
+`if (msv == 1.0f) { continue; }` guarding `NPER * 2` multiplies per
+(query, head, tile). Ported from oMLX v0.7.0
+`omlx/patches/mimo_v2/sdpa_flash.py:299-300`, verbatim including the reasoning:
+*"A row whose max did not move has factor 1: skipping its rescale is exact"*
+(`const bool moved = simd_any(m_new != m_run); ... if (moved) { ... e *= factor; }`).
+
+It is exact because `ms = exp(m_old - m_new)` is **exactly** 1 when the two are
+equal, and `x * 1.0f == x` in IEEE-754 -- asserted bit-for-bit in
+`attention_rescale_guard::the_guard_is_load_bearing` for every value the
+accumulator can hold, including the kernel's NEG sentinel `-1.701411733864e+38f`
+and `±FLT_MAX`. Zero of the difference is rounding; there is none to bound.
+
+### 17.2 The test had to be against the SCALAR arm, and finding that out took a sabotage
+
+The first version compared the **pass chain** against a **one-dispatch flash run**.
+It passed 8/8 with the guard sabotaged to `if (true) { continue; }` -- because both
+arms run the same body, so a uniform corruption is invisible between them. The
+guard could be arbitrarily wrong and that comparison could not tell.
+
+**That is the third time in this spec a self-comparison has hidden a bug** (the two
+that shipped are called out in AGENTS.md §3.4: the `k >= 32` kernel that read
+activations instead of weights, and the ablation that set a flag disabling the path
+under test). Recording it because the pattern is the common case, not the exception:
+when you add an optimisation, comparing "optimised" against "also optimised" is
+almost never the control you want.
+
+The fixed test compares both flash arms against `AttentionQk::Scalar` — an
+independent implementation of the same maths (per-lane dot products, no MMA, no
+rescale guard). With the guard inverted (`if (msv != 1.0f)`) it fails **7 of 8**
+with `the guarded flash body is 0.38110352 from the scalar reference
+(queries=1024 keys=1024 window=0 block=2, 13 080 382 of 16 777 216 values differ)` —
+**76x the 5e-3 tolerance**, i.e. a wrong answer rather than a rounding difference,
+which is exactly what skipping a rescale that mattered produces.
+
+### 17.3 Two measured bounds, recorded rather than tuned away
+
+* **The tolerance is 5e-3, the same number every other attention test here uses,
+  and deliberately not tightened.** The flash body reassociates the QK dot product
+  (scalar accumulates in `d` order, the tensor unit in its own), which alone
+  measures 4.88e-4 at unit scale. A "one ulp" tolerance would fail on the
+  reassociation, not the guard, and would train a reader to ignore it.
+* **Value scale 32x is excluded, and the bound was measured, not guessed.** At that
+  magnitude flash and scalar differ by **0.015625 with the guard and 0.015625 with
+  the guard removed entirely** — identical to 6 digits. The guard contributes
+  nothing there; the difference is reassociation growing with input magnitude. So
+  the scales tested are 1, 2 and 4.
+
+### 17.4 Coverage and a vacuity bug the assertion caught
+
+8 tests: settled max (random V), max-never-moves-after-the-first-tile (flat V),
+moving max (wide V), ragged tiles (8 key counts), both query blocks and two
+windows, query tails (BQ=2 with odd counts), and a 49-pass chain over 24 590 keys.
+
+**The first version of the "max never moves" case used all-zero V and passed
+vacuously.** With V = 0, `Q·K = 0` for every key, so every score is forced to NEG
+by the causal test, `s` stays 0, and the epilogue's `sm > 0` guard writes zeros —
+so any comparison agrees. The test helper's assertion that the control output is
+non-zero caught it; flat **non-zero** V gives the intended case (identical scores,
+max moves once, guard fires on every later tile).
+
+---
+
+## 18 — N4: `decode_splits` re-swept with the MMA kernel. The optimum is 13, and the cap is not the constraint
+
+### 18.1 The sweep
+
+`scripts/bench_decode_splits.sh`, interleaved A/B over rounds, 8204-token prompt,
+`--max-new-tokens 32`, MMA decode kernel (on by default above 4096 keys), poll file
+kept per arm:
+
+| requested splits | decode tok/s (mean) | min | max | n |
+|---|---|---|---|---|
+| 1 | 7.882 | 7.879 | 7.886 | 3 |
+| 2 | 10.125 | 10.124 | 10.127 | 3 |
+| 4 | 11.732 | 11.727 | 11.738 | 2 (one INVALID) |
+| 8 | 12.626 | 12.621 | 12.633 | 3 |
+| **13** | **12.917** | 12.911 | 12.926 | 3 |
+| 16 (cap) | 12.776 | 12.772 | 12.783 | 3 |
+| shipped default (no override) | 12.798 | 12.785 | 12.813 | 3 |
+| 24 (→ clamps to 16) | 12.777 | 12.767 | 12.794 | 3 |
+| 32 (→ clamps to 16) | 12.780 | 12.774 | 12.789 | 3 |
+
+**Spread is ±0.05% on the effect arms and ±0.11% on the control** — an order of
+magnitude tighter than the 3.7% this box was measured at in §14.5, which is the
+realisation that most of the documented noise was *load-state* noise, and load state
+is what the poll gate now controls for. The curve is therefore trustworthy at the
+1% level, which nothing else in this spec has been.
+
+`phys_footprint` 14.10-14.16 GiB across all 27 arms — the partials buffer is not
+observable in it.
+
+### 18.2 `ATTENTION_SPLITS_MAX = 16` cannot be probed above, and does not need to be
+
+`parse_pinned_splits` filters the knob to `1..=ATTENTION_SPLITS_MAX`
+(`attention.rs:531`), so arms above the cap **clamp**. Confirmed empirically rather
+than by reading the code: `splits=24` reads 12.777 and `splits=32` reads 12.780,
+against `splits=16`'s 12.776 — identical to within 0.03%, i.e. the same
+measurement three times. The harness labels them `above-cap(16)` in the log so this
+can never again be mistaken for three distinct data points (the T2a sweep's failure).
+
+**And it does not matter, because the curve has already peaked.** The maximum is at
+13, *below* the cap. Raising the cap can only help the one shape whose budget is a
+lower bound — the 64-thread sliding shape, where `decode_one_wave_workgroups(64) = 288`
+is documented as "at least 288", i.e. 18 splits at 16 kv heads, above the cap
+(`attention.rs:594-608`). Those layers do not use the MMA kernel at all
+(`encode_decode_split_explicit` refuses any shape but head_dim 512 / groups 8), so
+the question does not arise on this path. **N4's second question is answered: the cap
+is not the binding constraint, and probing above it would measure nothing.**
+
+### 18.3 The finding: 13 is the optimum, and an existing un-defaulted rule predicts it
+
+`decode_one_wave_workgroups(256) = 54`, and `54 / kv_heads(4) = 13` — exactly the
+measured maximum. That rule was implemented and swept in `spec/decode-19tok` and
+reproduced the optimum for three shapes (`kv_heads` 4/5/6 → 13/10/9), with the
+workgroup-count transition bracketed from both sides (54 is one wave, 55 is two,
+`attention.rs:583-594`). **This is now an independent third reproduction of 13, on
+different hardware state and with a different decode kernel.**
+
+The reason the shipped default is 16 and not 13 is a one-line default, not a
+calculation: `decode_split_rule()` returns `DecodeSplitRule::ThreadTarget`
+(`attention.rs:514`), whose arithmetic is `16384 / (32 * q_heads) = 16384 / 1024 =
+16` — and `clamp(1, ATTENTION_SPLITS_MAX)` keeps it. So:
+
+* **swapping the default to `WorkgroupsPerCore` is worth +0.93% decode @8k**
+  (12.917 vs 12.798, ~9x the effect spread) on the 10 full layers;
+* **and is provably a no-op for the other 50** — the 64-thread shape evaluates
+  `288 / 16 = 18`, which the cap clamps to the 16 that ships today. The code says
+  so at `attention.rs:600-606`: *"that is why 83% of the layers cannot regress from
+  this rule: for them it provably evaluates to the number that ships today."*
+
+**Not flipped in this commit, deliberately.** Two reasons, both worth stating: the
++0.93% is small enough that it deserves its own A/B at 16k and 24k rather than
+riding along on a sweep whose purpose was to answer a different question, and
+flipping a shipped default on the strength of a rule that has never been the default
+is exactly the move that `spec/decode-19tok` presumably declined to make for
+whatever reason it declined. The evidence for the change is now three independent
+measurements and it is written down; the decision is one line and belongs to whoever
+owns the shipping default. `KAPLUMBA_DECODE_SPLIT_RULE=workgroups` already ships it
+as an opt-in, so the claim is testable today without a rebuild.
+
+### 18.4 The other thing this sweep settles
+
+`splits=1` reads **7.882 tok/s against 12.917 at the optimum — 39% slower.** §6
+diagnosed decode as parallelism-limited from the scalar kernel's per-key
+`simd_sum`, and T2b replaced the arithmetic; the sweep shows the *parallelism*
+half of that diagnosis survives the arithmetic fix: at one split there is 1/13 of
+the grid and 39% of the throughput. So the MMA kernel is still not saturating the
+machine at the shipped split count, which is the honest framing of what is left in
+decode and where §14's "+71.6% at 256k" would eventually come from.
+
+### 18.5 Two harness bugs this sweep found (both would have produced wrong medians)
+
+* `grep VALID` also matches `INVALID-NO-NUMBER`, so discarded samples were folded
+  into the median table. Caught because an arm marked INVALID appeared in the
+  medians *with a number*. Fixed to `grep -E ' VALID( |$)'` in both harnesses. The
+  §13.1 sweep's discarded arms were exactly this failure mode.
+* A first smoke run reported `splits1 mean=13.495` from a sample its own gate had
+  rejected — the same bug, one run earlier, and the reason it is called out.
+
+---
+
+## 19 — N3(b), the head-dim split: NOT APPLICABLE HERE, and here is the proof
+
+oMLX's `HS == 2` scheme (`sdpa_flash.py:58-59`, `:398-405`) splits a band's head
+dims over two simdgroups:
+
+```python
+def _head_split(rows: int) -> int:
+    """Simdgroups per 8-qrow band: one-row forwards split each band's head
+    and value dims over two simdgroups (more threads per key tile), multi-row
+    forwards keep one; the arithmetic is the same either way."""
+    return 2 if rows == 1 else 1
+```
+
+with `constexpr int DKQ = DK / HS;  // head-dim blocks held by this simdgroup` and
+`DVH = DVB / HS`. The precondition is `QB = (G * ROWS) / 8`: with MiMo's GQA 16 and
+`ROWS = 1`, `QB = 2` bands per threadgroup, so `HS = 2` means **4 simdgroups** —
+two bands x two dim-halves — and the 32-thread threadgroup grows to 128.
+
+**Our decode shape cannot express that.** `NSG = 8` and `groups = q_heads /
+kv_heads = 8` are equal, and `BQL = 1`, so there is exactly **one** 8-head band:
+`QB = (8 * 1) / 8 = 1`. `HS = 2` would then use `QB * HS = 2` simdgroups out of 8
+and idle six — a 4x reduction in the QK thread count on the shape that is already
+the narrowest. There is no second band to put in the freed simdgroups, because
+decode has one query row.
+
+**And the premise is already satisfied here by a different mechanism.** `HEAD_DIM`
+is 512 and `NTILES = HEAD_DIM / 8 = 64`, so `NPER = NTILES / NSG = 8`: each
+simdgroup already owns a contiguous 64-dim window of the value head (8 n-tiles of
+8 dims). The value-dim split oMLX's `HS` introduces is, in this kernel, the
+**pre-existing** `nt = sg * NPER + j` partition — and it is exactly the assignment
+T4f changed because it was the right one (+6.7% E2E at 24k). PV is already split
+8 ways over the value dims. There is nothing left for `HS` to split.
+
+The QK half of the idea (split the 512-dim *query/key* reduction across simdgroups
+and add the partial scores through threadgroup memory) is *not* ruled out by
+arithmetic — it is exactly what `sdpa_flash.py:198-241` does for `HS == 2`, and it
+would halve the per-simdgroup dependent chain at the cost of a threadgroup-memory
+exchange per key tile. But it is a substantial kernel rewrite with a real chance of
+losing to the extra barrier and the partial-sum traffic, it has no reference
+measurement on a 512-dim head, and §10 has already established that **the
+microbench cannot rank attention arms** (four independent confirmations). So
+adopting it would mean building it blind, then measuring E2E, on the strength of a
+technique whose own authors measured it at 3-4% on a different head dim.
+
+**Recorded as not-taken with reasons, per the brief, rather than silently skipped.**
+
+### 19.1 The oMLX fused decode layer stack, revisited
+
+`implementation_notes.md` §14.2 recorded their fused q/k/v mat-vec + residual +
+RMSNorm layer stack as a lead: *"A MiMo-V2.6-Flash decode step dispatched ~2.8k
+kernels, most of them small element-wise ops."* Their own note is that it is
+model-shape-specific and MoE-specific, and Gxma is dense. **Not attempted**, and the
+N4 sweep above is consistent with that being right: at 8k the decode step is
+**12.917 tok/s = 77 ms**, and the attention kernel is the dominant term (§6), so a
+few dozen saved element-wise dispatches cannot be where the time is.

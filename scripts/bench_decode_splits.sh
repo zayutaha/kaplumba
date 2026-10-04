@@ -1,151 +1,134 @@
 #!/usr/bin/env bash
-# bench_decode_splits.sh -- sweep KAPLUMBA_DECODE_SPLITS (or another env knob)
-# end to end, one arm at a time, with a trustworthy memory gate.
+# bench_decode_splits.sh -- N4: sweep `KAPLUMBA_DECODE_SPLITS` with the MMA
+# decode kernel, interleaved, with the OQ5 gate.
 #
-# USAGE
-#   LOG=/tmp/x.log scripts/bench_decode_splits.sh <keys> <split...>
-#   LOG=/tmp/x.log VAR=KAPLUMBA_DECODE_FLASH ROPE="0 unset" \
-#       scripts/bench_decode_splits.sh 8192 --          # -- means "leave unset"
+# usage: ROUNDS=3 OUTDIR=/tmp/n4 scripts/bench_decode_splits.sh <keys> [splits ...]
+#        " --" in the split list means "leave KAPLUMBA_DECODE_SPLITS unset"
 #
-# ENV
-#   LOG                   append one line per arm here (default /tmp/bench_sweep.log)
-#   VAR                   env knob to pin per arm   (default KAPLUMBA_DECODE_SPLITS)
-#   ROPE                  space-separated arm values (default "$*")
-#   ROUNDS                interleaved rounds, A B C A B C (default 1)
-#   MIN_UNUSED_GIB        pre-arm gate threshold    (default 4)
-#   MAX_NEW_TOKENS        decode tokens per arm     (default 24)
-#   GPUQ_BIN              override scripts/gpuq (tests stub this)
-#   KAPLUMBA_BIN          override the binary under test
-#   KAPLUMBA_MODEL        override the model path
-#   DRY_RUN=1             run the whole pipeline, substitute a stub for the binary
+# Why the cap matters. `ATTENTION_SPLITS_MAX = 16` has never been probed above
+# (implementation_notes.md 12.3), and the parallelism trade changed completely when
+# T2b shipped the MMA kernel: the scalar kernel was latency-bound on a 64-workgroup
+# grid, the MMA one may want MORE. So the sweep includes values ABOVE the cap and
+# records what the engine actually did with them -- `decode_splits` clamps, so an
+# arm above the cap must be reported as clamped, not as a distinct measurement.
 #
-# WHY IT IS BUILT THIS WAY
-#
-# * One line per arm is APPENDED as each arm finishes. Never pipe this into
-#   `tail`: tail buffers until EOF, so an interrupted run loses everything. That
-#   cost a ~50-minute 24k sweep (implementation_notes.md 12.3).
-# * Arms are INTERLEAVED by round (A B C / A B C / ...), never A A A B B B, so a
-#   drift in box conditions cannot masquerade as an effect. This box has been
-#   measured at 3.7 / 3.9 / 4.3 / 4.8 / 6.0 / 6.4 tok/s from the same binary
-#   minutes apart (AGENTS.md 10.2 #5).
-# * The memory gate checks the box BEFORE the arm AND samples it DURING the arm.
-#   A pre-arm check alone is not enough, because the arm is what pushes a 24k
-#   run into compression: its own phys_footprint is 18.35 GiB of a 24 GiB box.
-#   Post-hoc an arm whose sample is INVALID is logged as INVALID and carries no
-#   number, because the OQ5 distortion is 99x and one-sided (0.055 tok/s against
-#   5.44) -- a sweep that only emits pessimistic samples reads as "more splits is
-#   much worse" and would send the next person to delete query splitting.
+# The engine prints its effective split count only indirectly, so this also records
+# the partials-buffer requirement: `splits * q_heads * (head_dim + 2)` f32, which is
+# what the cap exists to bound.
 set -uo pipefail
 cd "$(dirname "$0")/.."
 # shellcheck source=scripts/gpuq_mem.sh
 . ./scripts/gpuq_mem.sh
 
 M=${KAPLUMBA_MODEL:-$HOME/.kaplumba/models/Gxma/Gxma}
-GPUQ=${GPUQ_BIN:-scripts/gpuq}
 KAP=${KAPLUMBA_BIN:-./target/release/kaplumba}
-VAR=${VAR:-KAPLUMBA_DECODE_SPLITS}
+GPUQ=${GPUQ_BIN:-scripts/gpuq}
 MIN_UNUSED_GIB=${MIN_UNUSED_GIB:-4}
-MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-24}
-POLL_SECS=${POLL_SECS:-3}
-LOG=${LOG:-/tmp/bench_sweep.log}
-DRY_RUN=${DRY_RUN:-0}
+MAX_NEW_TOKENS=${MAX_NEW_TOKENS:-32}
+POLL_SECS=${POLL_SECS:-5}
+ROUNDS=${ROUNDS:-3}
+OUTDIR=${OUTDIR:-/tmp/bench_splits}
+# The shipped cap, mirrored here so the log can label clamped arms. Read from the
+# binary's own log rather than hardcoded if the engine ever prints it.
+CAP=${ATTENTION_SPLITS_MAX:-16}
 
-KEYS=${1:-24576}
+KEYS=${1:-8192}
 shift || true
-ROUNDS=${ROUNDS:-1}
-[ "$#" -gt 0 ] && ROPE="$*" || ROPE=${ROPE:-"1 4 8 16"}
+[ "$#" -gt 0 ] && SPLITS="$*" || SPLITS=${SPLITS:-"1 2 4 8 16 24 32"}
 
-# The prompt sentence used throughout this spec, repeated to reach ~$KEYS tokens.
-# "Explain the theory of relativity. " is 6 tokens, hence KEYS/6 repetitions.
 PROMPT=$(printf 'Explain the theory of relativity. %.0s' $(seq 1 "$(( KEYS / 6 ))"))
 
-: > "$LOG"
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
+mkdir -p "$OUTDIR"
+SUMMARY="$OUTDIR/summary.tsv"
+: > "$SUMMARY"
 
-# One arm. Args: <rope value>. Appends its own lines to $LOG.
-# Echoes nothing: everything goes to the log, so an interrupted run still has it.
-run_arm() {
-  local arm=$1 poll="$TMP/poll" out rc verdict
+{
+  echo "# N4 decode split sweep (MMA kernel), keys=$KEYS rounds=$ROUNDS splits=[$SPLITS]"
+  echo "# cap=$CAP; arms above the cap are expected to CLAMP and are labelled as such"
+  echo "# columns: round label requested_splits prompt_tokens decode_tok_s footprint"
+} >> "$SUMMARY"
+
+run_arm() { # <label> <requested splits, or --> <round>
+  local label=$1 want=$2 round=$3
+  local log="$OUTDIR/${label}_r${round}.log"
+  local poll="$OUTDIR/${label}_r${round}.polls"
   : > "$poll"
-
-  # Pre-arm gate: refuse to start on a box we cannot vouch for.
+  local avail
+  avail=$("$GPUQ" status 2>/dev/null | gpuq_mem_available_gib)
   if ! "$GPUQ" status 2>/dev/null | gpuq_mem_healthy "$MIN_UNUSED_GIB"; then
-    local avail
-    avail=$("$GPUQ" status 2>/dev/null | gpuq_mem_available_gib)
-    echo "$VAR=$arm SKIPPED box-unhealthy (available='${avail:-UNPARSEABLE}' GiB, need >=${MIN_UNUSED_GIB})" >> "$LOG"
+    printf 'r%s %s %s SKIPPED box-unhealthy available=%s need=%s\n' \
+      "$round" "$label" "$want" "${avail:-UNPARSEABLE}" "$MIN_UNUSED_GIB" >> "$SUMMARY"
     return 0
   fi
+  ( while :; do mem_poll_record "$poll"; sleep "$POLL_SECS"; done ) &
+  local poll_pid=$!
+  local marker="$OUTDIR/.loaded.$$"
+  rm -f "$marker"
+  ( local waited=0
+    while [ "$waited" -lt 1800 ]; do
+      grep -q '^loaded in ' "$log" 2>/dev/null && { : > "$marker"; break; }
+      sleep 0.5; waited=$(( waited + 1 ))
+    done ) &
+  local watch_pid=$!
 
-  # Poll DURING the arm. The arm is what tips the box into compression.
-  (
-    while :; do mem_poll_record "$poll"; sleep "$POLL_SECS"; done
-  ) & local poll_pid=$!
-
-  local rc_file="$TMP/rc"
-  : > "$rc_file"
-  if [ "$DRY_RUN" = "1" ]; then
-    printf 'DRY-RUN %s=%s keys=%s\n' "$VAR" "$arm" "$KEYS" >> "$LOG"
+  if [ "$want" = "--" ]; then
+    env -u KAPLUMBA_DECODE_SPLITS "$GPUQ" try -- /usr/bin/time -l "$KAP" \
+      --model "$M" --prompt "$PROMPT" --max-new-tokens "$MAX_NEW_TOKENS" \
+      --temperature 0 --metrics > "$log" 2>&1
   else
-    # `env VAR=...` rather than a prefix assignment so a value of "0" or an empty
-    # value is still passed, and gpuq's exit 75 can be told apart from the
-    # engine's. NO `tail` anywhere: capture, then grep.
-    if [ "$arm" = "--" ]; then
-      env -u "$VAR" "$GPUQ" try -- /usr/bin/time -l "$KAP" \
-        --model "$M" --prompt "$PROMPT" --max-new-tokens "$MAX_NEW_TOKENS" \
-        --temperature 0 --metrics > "$TMP/out" 2>&1
-    else
-      env "$VAR=$arm" "$GPUQ" try -- /usr/bin/time -l "$KAP" \
-        --model "$M" --prompt "$PROMPT" --max-new-tokens "$MAX_NEW_TOKENS" \
-        --temperature 0 --metrics > "$TMP/out" 2>&1
-    fi
-    rc=$?
-    printf '%s\n' "$rc" > "$rc_file"
+    KAPLUMBA_DECODE_SPLITS="$want" "$GPUQ" try -- /usr/bin/time -l "$KAP" \
+      --model "$M" --prompt "$PROMPT" --max-new-tokens "$MAX_NEW_TOKENS" \
+      --temperature 0 --metrics > "$log" 2>&1
   fi
-  rc=$(cat "$rc_file"); rc=${rc:-0}
-
-  kill "$poll_pid" 2>/dev/null; wait "$poll_pid" 2>/dev/null
+  local rc=$?
+  kill "$poll_pid" "$watch_pid" 2>/dev/null; wait "$poll_pid" 2>/dev/null
 
   if [ "$rc" = "75" ]; then
-    echo "$VAR=$arm GPU-BUSY (exit 75; do other work, retry later)" >> "$LOG"
-    return 0
-  fi
-  if [ "$DRY_RUN" = "1" ]; then
-    verdict=$(mem_sample_verdict "$poll" 2>&1 || true)
-    echo "    mem: $verdict" >> "$LOG"
-    return 0
+    printf 'r%s %s %s GPU-BUSY\n' "$round" "$label" "$want" >> "$SUMMARY"
+    rm -f "$marker"; return 0
   fi
   if [ "$rc" != "0" ]; then
-    echo "$VAR=$arm FAILED rc=$rc (see $TMP/out)" >> "$LOG"
-    sed -n '1,5p' "$TMP/out" >> "$LOG"
-    return 0
+    printf 'r%s %s %s FAILED rc=%s\n' "$round" "$label" "$want" "$rc" >> "$SUMMARY"
+    sed -n '1,4p' "$log" >> "$SUMMARY"
+    rm -f "$marker"; return 0
   fi
 
-  verdict=$(mem_sample_verdict "$poll" 2>&1) && verdict_ok=1 || verdict_ok=0
-  local pre dec post
-  pre=$(grep -o 'prompt_tokens=[0-9]*' "$TMP/out" | head -1)
-  dec=$(grep -o 'decode_tok_s=[0-9.]*' "$TMP/out" | head -1)
-  post=$(grep -o 'prefill_tok_s=[0-9.]*' "$TMP/out" | head -1)
-  local peak
-  peak=$(awk -F'[ \t]+' '/peak memory footprint/ { printf "%.2f", $NF / 1073741824; exit }' "$TMP/out")
-  local swap
-  swap=$(grep -o 'swaps=[0-9]*' "$TMP/out" | head -1)
-
-  if [ "$verdict_ok" = "1" ]; then
-    echo "$VAR=$arm $pre $dec $post $swap footprint=${peak:-?}GiB mem=$verdict" >> "$LOG"
+  local verdict cpuverdict ok=1 toks dec foot
+  verdict=$(MEM_PHASE_LOAD_DONE="$marker" mem_sample_verdict "$poll") || ok=0
+  cpuverdict=$(mem_cpu_compression_ok "$log")
+  rm -f "$marker"
+  toks=$(grep -o 'prompt_tokens=[0-9]*' "$log" | head -1)
+  dec=$(grep -o 'decode_tok_s=[0-9.]*' "$log" | head -1)
+  foot=$(awk '/peak memory footprint/ { printf "%.2f", $1 / 1073741824; exit }' "$log")
+  # An arm above the cap that produced the SAME number as the cap arm is evidence
+  # of clamping, not of a speedup. Reported so the reader never has to guess.
+  local clamped=""
+  if [ "$want" != "--" ] && [ "$want" -gt "$CAP" ] 2>/dev/null; then clamped="above-cap($CAP)"; fi
+  if [ "$ok" = "1" ]; then
+    printf 'r%s %s %s %s %s footprint=%sGiB VALID %s mem=[%s] cpu=[%s]\n' \
+      "$round" "$label" "$want" "$toks" "$dec" "${foot:-?}" "$clamped" \
+      "$verdict" "$cpuverdict" >> "$SUMMARY"
   else
-    # The number is deliberately NOT recorded on an invalid sample: OQ5's
-    # distortion is 99x and always pessimistic, so an invalid number is worse
-    # than no number.
-    echo "$VAR=$arm INVALID-NO-NUMBER $pre footprint=${peak:-?}GiB mem=$verdict" >> "$LOG"
+    printf 'r%s %s %s %s INVALID-NO-NUMBER footprint=%sGiB %s mem=[%s] cpu=[%s]\n' \
+      "$round" "$label" "$want" "$toks" "${foot:-?}" "$clamped" \
+      "$verdict" "$cpuverdict" >> "$SUMMARY"
   fi
 }
 
-echo "sweep $VAR rope='$ROPE' keys=$KEYS rounds=$ROUNDS prompt_tokens~$((KEYS)) log=$LOG" >> "$LOG"
 for r in $(seq 1 "$ROUNDS"); do
-  for arm in $ROPE; do
-    echo "round=$r" >> "$LOG"
-    run_arm "$arm"
-  done
+  run_arm shipped -- "$r"
+  for s in $SPLITS; do run_arm "splits$s" "$s" "$r"; done
 done
-echo "SWEEP-DONE" >> "$LOG"
+echo "SWEEP-DONE" >> "$SUMMARY"
+
+grep -v '^#' "$SUMMARY"
+echo "--- decode medians over VALID samples ---"
+# `grep VALID` also matches `INVALID-NO-NUMBER`, which silently folded discarded
+# samples into the medians -- caught because an INVALID arm appeared in the output
+# with a number. Match the whole word instead.
+grep -E ' VALID( |$)' "$SUMMARY" | awk '
+  { label = $2; for (i = 1; i <= NF; i++) if ($i ~ /^decode_tok_s=/) { split($i, kv, "="); v = kv[2] + 0 }
+    if (v > 0) { n[label]++; s[label] += v; if (v > mx[label]) mx[label] = v
+                 if (mn[label] == 0 || v < mn[label]) mn[label] = v } }
+  END { for (k in n) printf "%-12s n=%d mean=%.3f min=%.3f max=%.3f\n", k, n[k], s[k]/n[k], mn[k], mx[k] }
+' | sort

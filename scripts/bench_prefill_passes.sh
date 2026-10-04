@@ -150,7 +150,10 @@ echo "SWEEP-DONE" >> "$SUMMARY"
 
 cat "$SUMMARY"
 echo "--- medians over VALID samples ---"
-grep VALID "$SUMMARY" | awk -v OFS='\t' '
+# `grep VALID` also matches `INVALID-NO-NUMBER`, which folds discarded samples into
+# the medians -- found by noticing an INVALID arm appear in the median table with a
+# number on it. Match the whole word instead.
+grep -E ' VALID( |$)' "$SUMMARY" | awk -v OFS='\t' '
   {
     label = $2; pk = $3;
     for (i = 1; i <= NF; i++) if ($i ~ /^prefill_tok_s=/) { split($i, kv, "="); v = kv[2] + 0 }
