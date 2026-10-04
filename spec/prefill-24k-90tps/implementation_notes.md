@@ -1037,3 +1037,91 @@ result T3 recorded, and the reason flash is safe to ship.
   itself is the next thing to question, and raising it enlarges the decode
   partials buffer from `16 * q_heads * (head_dim + 2)` floats (4.2 MB at
   `q_heads = 32, head_dim = 512`).
+
+---
+
+## 13 — T2a status: decode split sweep BLOCKED on an unverified memory gate
+
+### 13.1 What the sweep measured, and what must be thrown away
+
+`/tmp/decode_splits_sweep.sh`, 24 590-token prompt, `--max-new-tokens 24`,
+`KAPLUMBA_DECODE_SPLITS` pinned, one round per arm:
+
+| arm | decode tok/s | verdict |
+|---|---|---|
+| splits=1 | **2.673** | **valid** |
+| splits=4 | 0.160 | **INVALID** -- box in memory compression |
+| splits=8 | 0.310 | **INVALID** -- box in memory compression |
+| splits=16 | -- | never ran (session ended) |
+
+`top` sampled during the splits=8 arm:
+
+```
+PhysMem: 23G used (11G wired, 5509M compressor), 126M unused.
+```
+
+126 MiB unused with a 5.5 GB compressor is the OQ5 stall signature, and the
+distortion is enormous and **one-sided in the pessimistic direction** -- which is
+the dangerous direction, because a sweep that only ever produces pessimistic
+samples reads as "more splits is much worse" and would send the next person to
+delete query splitting. **Do not read 0.160 or 0.310 as a property of the split
+count.** They are properties of the compressor.
+
+The only surviving datum is `splits=1 -> 2.673`, against a documented baseline of
+**5.44 at the shipped split count**. That is a ~2x gap between one split and the
+shipped setting, which is consistent with the decode kernel being parallelism-
+limited (§6) -- but it is **one** valid point on one arm, and it does **not**
+establish where the optimum is. In particular it does not show whether the curve
+is still rising at `ATTENTION_SPLITS_MAX = 16`, which is the actual question T2a
+was opened to answer.
+
+### 13.2 The memory gate is written, unit-tested, and DOES NOT PASS
+
+`box_healthy()` was added to the sweep so an arm cannot be sampled on a
+compressed box. It **does not work**, and the sweep must not be trusted with it
+until it does.
+
+State of the work, precisely:
+
+* `bash -n` passes on both the sweep and the test. That is the only thing that
+  passes.
+* `/tmp/test_parse.sh` exists and covers: the healthy cases, the OQ5 stall
+  signature, four fail-closed shapes (no memory line, `17G` single-token,
+  unreclaimable-only, empty), the historical `554M` trap from AGENTS.md 10.3, a
+  live read, and a sabotage check. **It currently FAILS.**
+* Observed failures: both `healthy=1` cases report `healthy=0`, and the live
+  parse returns **`<EMPTY>`**, with `line 15: $1: unbound variable` repeated 11
+  times on stderr.
+* Diagnosis **not yet done.** The `unbound variable` points at `set -uo pipefail`
+  interacting with `$1` inside the `healthy()` helper (the helper reads `"$1"`
+  but the live-check block calls it without an argument), and the synthetic
+  failures are most likely the same cause rather than a regex problem. That is a
+  hypothesis, not a finding, and it must be confirmed before the parser is
+  trusted.
+
+The parser itself has already been wrong **twice** in this session, and both times
+a test caught it and inspection did not:
+
+1. `[^0-9]*` is greedy and backtracks to the **last** digit run, so
+   `memory: 7.4 GiB available` parsed as `4` GiB.
+2. A single-token `memory: 17G available` has no space before the unit, so a
+   `\([0-9.]*\) \([KMG]i*B\)` pattern cannot match it at all.
+
+The third version sidesteps the unit entirely by taking `scripts/gpuq`'s already
+-corrected number (`scripts/gpuq:150` prints a fixed `memory: <n> GiB available
+(reclaimable)` format), which is the right call given AGENTS.md 10.3 -- but
+"right call" is not "verified", and the test that would verify it is red.
+
+### 13.3 Why a 24k measurement needs a gate at all, and why the gate is hard
+
+The 24k run itself consumes ~18.35 GiB `phys_footprint` (AC4's budget is 20 GiB),
+so **the benchmark drives the box into compression by construction**. A gate that
+samples only *before* an arm is insufficient, because the arm is what pushes the
+box over; the current script samples after as well and logs `top` per arm, but
+that has not been validated either.
+
+The honest position for anyone continuing: **24k measurement on this box is
+marginal (OQ5), the three valid data points we have for 24k E2E prefill are
+67.10 / 55.42 / 62.87, and each carries the +-20% spread.** Resolve the gate, then
+re-run T2a from scratch. Do not merge any arm from the current log into a
+result.
