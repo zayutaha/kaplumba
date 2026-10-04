@@ -10,14 +10,22 @@ Current, measured on `mtp-speculation` (`882d874`, merged `spec/prefill-120tps`)
 | | 8k | 24k | target @24k |
 |---|---|---|---|
 | prefill tok/s | 80.52 | **52.84** | **90** |
-| decode tok/s | 12.27 | **0.30–0.43** | **14** |
-| peak `phys_footprint` | 14.15 GiB | 17.12 GiB | < 20 GiB |
+| decode tok/s | 12.27 | **5.44** | **14** |
+| peak `phys_footprint` | 14.15 GiB | 18.35 GiB | < 20 GiB |
 
-The two gaps are different problems. Prefill at 24k is a **compute/bandwidth**
-problem (attention is ~60% of wall at 24k, GEMM the rest). Decode at 24k is a
-**collapse** — 32× slower than 8k for 3× the context, ~11× worse than the O(L)
-KV-read scaling predicts — and is therefore expected to be a defect or a
-memory-pressure cliff rather than a slow kernel. Characterising it is R1.
+> **Corrected after T1.** The 24k decode figure of 0.30–0.43 previously in this
+table came from a `KAPLUMBA_GPU_PROFILE=1` run; the profiler itself distorts
+the measurement (the same prompt measured 0.082 tok/s profiled vs **5.44 tok/s
+clean**). The clean 24k decode is 5.44 tok/s. There is **no memory cliff**
+(`swaps 0`, `sys` 20 s of 434 s), so `OQ1` is closed and decode is a 2.6×
+kernel-speedup ask, not a defect hunt. See `implementation_notes.md` §2b/§2c.
+
+Prefill at 24k is a **compute** problem with a measured budget: GEMM 213.7 s +
+attention 192.9 s of a 409.9 s kernel sum. The target 90 tok/s is 266 s total,
+so AC2 requires **attention 193 s → ≤ 52 s with GEMM untouched**. Full-layer
+attention currently runs at **1.06 TFLOPS** (12% of SIMT fp32 peak, 7% of the
+15.6 TFLOPS tensor peak); at 6 TFLOPS the run would land at 91.8 tok/s. AC2 is
+reachable only through an MMA flash-attention rewrite (T3).
 
 ## Non-goals / restrictions
 
@@ -78,14 +86,17 @@ Additional for this spec:
 
 ## Open questions
 
-- **OQ1 — Is decode-at-24k memory pressure?** 17.12 GiB measured footprint on a
-  24 GiB box, with the OS growing swap. If decode is disk-bound, the fix is
-  memory, not kernels, and 14 tok/s may require the footprint to come down
-  materially.
-- **OQ2 — Is 90 tok/s @24k reachable even with free attention?** At 24k the
-  GEMM is ~9.6 ms/token-equivalent; if attention were free, 24k would be
-  ~104 tok/s. So 90 is between the current 52.8 and the attention-free bound —
-  it does **not** require a GEMM improvement, only a large attention one.
+- **OQ1 — Is decode-at-24k memory pressure?** **CLOSED (T1): no.** Clean
+  24k decode is 5.44 tok/s with `swaps 0` and an 18.35 GiB peak footprint; the
+  0.30–0.43 figure was profiler distortion.
+- **OQ2 — Is 90 tok/s @24k reachable even with free attention?** **CLOSED (T1),
+  and the earlier arithmetic was wrong.** The commentary that "if attention were
+  free, 24k would be ~104 tok/s" used the GEMM-only 9.6 ms/token. The measured
+  non-attention cost at 24k is 216.9 s (GEMM 213.7 s + 3.2 s else) = **110.5
+  tok/s**, not 104. Against a 266 s budget that leaves **52 s for attention**, so
+  AC2 does *not* need a GEMM change — but it needs a 3.7× attention cut, which
+  means MMA or nothing.
 - **OQ3 — Single-pass decode gate.** `ATTENTION_SINGLE_PASS_MAX_KEYS = 64`, so
-  24k always uses split+combine. Verify the split grid at 24k actually fills the
-  machine (`splits × kv_heads` workgroups).
+  24k always uses split+combine. Confirmed: `decode_splits` clamps to
+  `ATTENTION_SPLITS_MAX = 16` and the 24k full-layer grid is
+  `16 × 4 = 64` workgroups — the latency hypothesis for T2 rests on this.

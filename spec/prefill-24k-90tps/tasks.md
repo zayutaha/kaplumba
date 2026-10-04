@@ -6,70 +6,74 @@ Small, independently verifiable steps. Updated immediately after completion.
 
 ## T1 — Diagnose the 24k decode collapse
 
-**Status:** 🔄 in progress
+**Status:** ✅ done (diagnosis in `implementation_notes.md` §2b/§2c; no code).
 
-**Intent:** Attribute the 2.3–3.3 s/token at 24k to a named cause (R1). Every
-decode change is gated on this.
+**Result — the collapse was a profiler artifact.** Clean (unprofiled) 24k
+decode is **5.44 tok/s**, not 0.30–0.43; the `KAPLUMBA_GPU_PROFILE=1` run
+reported 0.082 tok/s on the same prompt. `swaps 0`, 18.35 GiB peak footprint,
+`sys` 20 s of 434 s → **no memory cliff** (OQ1 answered). Decode is
+latency-bound in the attention kernels: the 24k decode grid is only
+`16 splits × 4 kv_heads = 64` workgroups for the 10 full layers, each serially
+scanning its split.
 
-**Files:** none (measurement).
-
-**Work:**
-1. `KAPLUMBA_GPU_PROFILE=1` at 24k, 4 decode tokens, `/usr/bin/time -l`,
-   `sysctl vm.swapusage` before/after.
-2. Compare decode per-layer kernel `own_ms` at 24k vs the 8k profile: full
-   attention should scale ~2.9×, sliding stay flat, everything else flat.
-3. Read `getrusage` `swaps` and the system swap delta.
-4. Note the inter-boundary gap for each decode token.
-
-**Test:** a written attribution — every second of the per-token cost assigned to
-a kernel, a host step, or paging — or an explicit "cannot attribute" with the
-profile attached as the reason.
+**Prefill budget at 24k (the number that matters):** GEMM 213.7 s, attention
+192.9 s (full ≈ 176.7 s, sliding ≈ 16.3 s), other 3.2 s. Target 90 tok/s =
+266 s, so **AC2 needs attention 193 s → ≤ 52 s with GEMM untouched**. Full
+attention currently runs at **1.06 TFLOPS** (12% of SIMT peak, 7% of tensor
+peak) → at 6 TFLOPS the run lands at 91.8 tok/s. Reachable only via MMA.
 
 ---
 
-## T2 — Fix the decode cause found in T1
+## T2 — Decode at 24k: 5.44 → 14 tok/s (2.6×)
 
 **Status:** ☐ not started. **Depends on:** T1.
 
-**Files:** TBD by T1.
+**Files:** `crates/kernels/src/attention.metal`, `crates/kernels/src/attention.rs`.
 
-**Work / Test:** defined once T1 lands. Must show decode ≥ 14 tok/s at 24k with
-no 8k/short-context decode regression, five prompts still correct.
+**Intent:** The decode split kernel (`attention_gqa_body` with `PARTIALS=true`)
+shares the scalar QK/PV structure with prefill. It is latency-bound: 64
+workgroups for the full layers, each 8 simdgroups × 47 serial 32-key tiles.
+
+**Work:** raise in-flight parallelism per workgroup (more resident splits, or a
+flash-style MMA split body), *not* more splits (already clamped at 16).
+
+**Test:** decode tok/s at 24k ≥ 14, no short/8k decode regression, five prompts
+correct.
 
 ---
 
-## T3 — Prefill attention: query blocking
+## T3 — Prefill attention: flash-style MMA, 64-key tiles
 
-**Status:** ☐ not started
+**Status:** ☐ not started. **This is the only path to AC2.**
 
-**Intent:** Amortise K/V load + `half→float` conversion across `Q_BLOCK` queries
-per threadgroup (R3.1).
+**Intent:** Fix all three structural costs read from `attention_gqa_mma_body`:
+(a) only 4 of 8 simdgroups engage QK; (b) PV is scalar with 8× redundant V
+read+convert across the GQA group; (c) the Q fragment reloads from `qhstage`
+on every `d8` step although it is key-tile-invariant.
 
-**Files:** `crates/kernels/src/attention.metal` (`attention_gqa_body`),
-`crates/kernels/src/attention.rs` (grid).
+**Files:** `crates/kernels/src/attention.metal`, `crates/kernels/src/attention.rs`.
 
 **Work:**
-1. Add a `Q_BLOCK` template parameter; threadgroup handles `Q_BLOCK` queries of
-   one KV head; per-query accumulators and softmax state.
-2. Tail query handling when `queries % Q_BLOCK != 0`.
-3. Keep the scalar arm's bit-exactness with the single-pass kernel
-   (`attention_single_pass_bit_exact` pins `AttentionQk::Scalar`).
+1. Widen the tile to 64 keys: eight 8-key m-tiles, one owned per simdgroup,
+   so all 8 engage QK.
+2. Replace scalar PV with `simdgroup_multiply_accumulate`:
+   `P[8 heads × 64 keys] × V[64 keys × 512 dims]`, V loaded from device with
+   `simdgroup_load(.., kv_stride)` (no threadgroup V staging; 64×512 halves is
+   over the 32 KB cliff).
+3. Hoist the Q fragment load out of the key loop where register pressure allows.
 
-**Test:** `attention_qk_mma_matches_scalar` and the bit-exact test green;
-`Q_BLOCK=2` vs `1` A/B at 8k with medians; sabotage-check the Q_BLOCK indexing.
+**Test:** `attention_qk_mma_matches_scalar` + `attention_single_pass_bit_exact`
+green (pin `AttentionQk::Scalar` where required); `attention_qk_mma_bench`
+full-shape ratio; then end-to-end 8k A/B before spending a 24k run.
 
 ---
 
-## T4 — Prefill attention: 64-key MMA publish
+## T4 — Prefill attention: verify the full-attention win end to end
 
-**Status:** ☐ not started. **Depends on:** T3 result.
+**Status:** ☐ not started. **Depends on:** T3.
 
-**Intent:** Engage all 8 simdgroups and halve the publish barrier rate on the
-full-attention shape (R3.2).
-
-**Files:** `crates/kernels/src/attention.metal` (`attention_gqa_mma_body`).
-
-**Test:** `attention_qk_mma_bench` full-shape ratio; end-to-end 8k/24k A/B.
+**Test:** interleaved 8k and 24k A/B, medians with spread; 24k ≥ 90 tok/s or a
+measured explanation of the residual.
 
 ---
 
