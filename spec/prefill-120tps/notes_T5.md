@@ -191,7 +191,60 @@ an assert message.
 4. `tests/device_sampler.rs:384` / `perf_probe_host_ops.rs:49,477` comments
    hardcode "8192" where the code correctly uses the symbol.
 
-## 7. Commands
+## 7. Secondary task — "cut the prefill host gap": PREMISE REFUTED, no change made
+
+T0 recorded `inter-boundary gap = 3686 ms of a 108 984 ms 8k prefill (3.4%)`
+and the brief estimated cutting it "would be worth ~3% of end-to-end prefill
+tok/s". Profiling first, as instructed, shows **the gap is the profiler's own
+cost — it is not paid by product runs**, so there is nothing to cut in
+`model.rs`.
+
+**Mechanism (code):** `GpuProfile::stamp` (`model.rs:829-840`) is a no-op
+unless `KAPLUMBA_GPU_PROFILE` is set; when set, it **commits the command
+buffer at every one of ~7213 boundaries** (8 chunks × 60 layers × ~15) and
+drains with waits every 15 (`DRAIN_EVERY`, `model.rs:621-637` — the comment
+itself says "the *gaps* between buffers are an artefact of the profiler").
+Unprofiled, the same forward rolls command buffers only at
+`max_dispatches_per_buffer` (~2 commits at 8k).
+
+**Measured, interleaved A/B, 8k prompt, 3 pairs, same binary, same env
+(`KAPLUMBA_MAX_IN_FLIGHT=1`):**
+
+| pair | OFF tok/s (env unset) | OFF ttft ms | ON tok/s | ON ttft ms | ON own_ms | ON gap ms | ON span ms |
+|---|---|---|---|---|---|---|---|
+| 1 | 73.653 | 106 099 | 73.604 | 106 169 | 103 410 | 1 558 | 106 158 |
+| 2 | 73.431 | 106 419 | 68.619 | 113 883 | 104 252 | **7 346** | 113 872 |
+| 3 | 72.789 | 107 359 | 71.224 | 109 717 | 103 786 | 3 841 | 109 706 |
+
+- Medians: OFF **73.431** tok/s (range 72.79–73.65), ON **71.224**
+  (68.62–73.60): profiling costs ~3 % — i.e. the "gap %" shows up exactly as
+  the profiler ON-vs-OFF delta, not as time the product path spends idle.
+- The load-bearing rows are the *spread of the gap itself*: pair 1's gap is
+  1.6 s and its ON wall (106 158) equals the OFF arm (106 099); pair 2's gap
+  is 7.3 s and its ON wall exceeds the OFF arm by 7.5 s. `own_ms` is stable at
+  103.4–104.3 s (±0.4 %) across all three. **Wall follows the gap, kernel time
+  does not** — the gap is added on top of what an unprofiled run costs.
+- Residual product-side non-kernel time (unprofiled ttft − profiled own_ms,
+  mixed runs) ≈ 2–3 s ≈ 2–2.8 %, an *upper bound* confounded by run variance;
+  it is not the 3686 ms figure and this box's spread (±1.7 % on OFF alone)
+  cannot resolve it further. Record, do not chase.
+
+**First attempt discarded (method error, recorded for honesty):** I ran the
+first A/B with `KAPLUMBA_GPU_PROFILE=0` for the OFF arm. `env_flag`
+(`model.rs:666-679`) is **presence-based** (`var_os().is_some()`), and
+`model.rs:4315` uses it, so `=0` still *enables* the profiler — both arms were
+profiled (medians 70.5 vs 70.9, meaningless). The valid run uses
+`env -u KAPLUMBA_GPU_PROFILE`. Footgun for anyone measuring: **you cannot turn
+the profiler off with `=0`; the variable must be absent.**
+
+**Verdict:** no optimization made, per the brief's own rule ("optimize only
+if you can measure an improvement interleaved against baseline"). The brief's
+"worth ~3 %" mistakes measurement overhead for product overhead. If gap
+fidelity matters for future attribution, the lever is profiler-side
+(`DRAIN_EVERY`, asynchronous timestamp reads) and its benefit is *measurement
+accuracy*, zero product tok/s — flagged, not T5's or this spec's job.
+
+## 8. Commands
 
 ```bash
 export CARGO_TARGET_DIR=/private/var/folders/tp/wz3877_s1z756p1kcsz3_d4h0000gn/T/opencode/p120-ctx-target
