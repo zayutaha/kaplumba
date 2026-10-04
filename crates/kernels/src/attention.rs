@@ -94,6 +94,19 @@ pub const FLASH_QUERY_BLOCK: usize = 2;
 /// Overridable with `KAPLUMBA_FLASH_BQ=1|2` for A/B.
 pub const FLASH_QUERY_BLOCK_MIN_KEYS: usize = 16_384;
 
+/// 8-key m-tiles per simdgroup in the shipped flash kernel: **1**, i.e. a
+/// 64-key pass with each simdgroup owning one m-tile. This is a record of the
+/// shipped configuration, not a template parameter -- the flash body is not
+/// currently instantiated with a key-subtile count.
+///
+/// A `KSUB = 4` variant (a 256-key pass, 4 m-tiles per simdgroup) was built to
+/// halve the QK's `simdgroup_load`s per MMA; it needs 28 KB of threadgroup memory
+/// instead of 19.5 KB and measured **13% slower** in the engine at 8k (attention
+/// 20.6 s -> 23.4 s) as well as slower on the micro-bench at 24 576 keys
+/// (1118 -> 1318 ms). It was reverted, so this constant has no `attention.metal`
+/// counterpart to match.
+pub const FLASH_KEY_SUBTILES: usize = 1;
+
 /// `KAPLUMBA_FLASH_BQ=1|2` forces the flash query block; any other value is
 /// ignored. Read once (same `OnceLock` idiom as [`attention_qk`]).
 fn flash_query_block_override() -> Option<usize> {

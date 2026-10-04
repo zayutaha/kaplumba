@@ -434,3 +434,150 @@ Two consequences, both acted on:
    M=2 (16 keys per simdgroup, TILE 128) takes QK to 4 loads / 4 MMAs = 1.00 at
    BQ=2, and PV to 16 x 10 / 256 = 0.63... see §8 for the arithmetic actually
    run.
+
+## 8 — T5: what actually limits the flash prefill attention (four experiments)
+
+The §7.5 load-reuse model predicts MMA/fragment-load is the limiter. Four
+experiments, each measured twice (bench, and the engine's own
+`KAPLUMBA_GPU_PROFILE=1` attention kernel sum), and **three of the four
+contradicted it**. Recorded in order, because the corrections are the useful
+part.
+
+### 8.1 `KSUB = 4` (256-key pass, 4 m-tiles per simdgroup): 13% SLOWER
+
+Halves the QK's fragment loads (0.50 -> 1.33 MMA/load) by amortising the Q
+fragment over four MMAs. It needs 28 KB of threadgroup memory instead of 19.5.
+
+| | bench 24576 keys | engine attention @8k |
+|---|---|---|
+| `KSUB = 1` | 1118 ms | 20 623 / 20 674 ms |
+| `KSUB = 4` | 1318 ms | 23 377 ms |
+
+**The loads were not the limiter; occupancy is.** Threadgroup memory is per
+threadgroup, so 28 KB vs 19.5 KB directly cuts how many threadgroups fit on a
+core, and the kernel was latency-bound, not issue-bound. `spec/engine-performance`
+§14 already lists "18 KB threadgroup" among its rejected experiments; this is the
+same wall seen from the other side. Reverted; `FLASH_KEY_SUBTILES = 1`.
+
+### 8.2 Query blocking, re-measured after fixing the PV loop order: **-2.0%**
+
+The §7.3 verdict ("-6.2% at 24k") was measured with the broken PV loop order
+(§7.5 consequence 1). With `BQ` P fragments preloaded once per k-step:
+
+| | engine attention @8k | engine attention @24k |
+|---|---|---|
+| `BQ = 1` | 19 403 / 20 623 ms | 144 961 ms |
+| `BQ = 2` | 18 996 ms | 141 994 ms |
+
+So query blocking is a **small win once the loop order is right** (-2.0%), not a
+loss -- the §5 byte-traffic model overstated it by 3x, but it had the sign right.
+
+### 8.3 `exp` -> `fast::exp2(x * log2 e)`: within noise, kept
+
+The online softmax calls `exp` once per (query, key, head). `exp` lowers to a
+~15-op polynomial; `fast::exp2` is one MUFU.EX2 plus a multiply. Measured
+1374 -> 1363 ms on the bench (0.8%). Kept because it is strictly less work and the
+weights are stored as **fp16** for the PV fold anyway -- 2^-11 relative, against
+MUFU.EX2's ~2^-21 -- so it is two orders of magnitude tighter than the precision
+the kernel already accepts.
+
+### 8.4 Dropping the 8 KB `tail` straddle buffer: **the tests caught the obvious
+### version, and the bench says it is not a win either**
+
+Occupancy said to cut threadgroup memory (19.5 -> 11.1 KB). Two attempts:
+
+1. *Clamp a straddling fragment's first row to `range_end - 8`.* **Wrong**, and
+   `attention_flash_matches_scalar_on_the_full_shape` caught it immediately: diff
+   0.57 on the `keys=7` case, 0.51 on `keys=31`. The clamp re-reads the wrong
+   rows for the keys *inside* the straddling sub-tile that are still live (at
+   `range_end = 129` the key 128 sub-tile re-reads key 121's scores). A test that
+   only checked the common `key_count % 64 == 0` case would have shipped this.
+2. *Round the tile loop up to a whole 64-key pass and read the trailing fragments
+   unconditionally out of **zeroed** padding* (a variant that had `GpuKvCache`
+   `new`/`ensure_capacity` allocate and clear `64 * stream_len` halves past
+   `capacity`). Correct -- worst diff back to **4.88e-4** -- and branch-free. But
+   on the bench it measured **slower**, and adding an `if (k0 >= range_end)
+   continue` guard inside the `d8` loop measured **23% slower** than staging,
+   because it breaks the load/MMA pipelining across `d8`. Net: not a win.
+
+**This attempt was reverted in full, including the cache padding.**
+`GpuKvCache::new` today allocates exactly `capacity * stream_len` halves
+(`gpu_cache.rs`), and the flash body's tile loop is `for (base = 0; base <
+range_end; base += 64)` with no rounding. The kernel is out-of-bounds-safe by
+construction, not by padding: every K fragment load is guarded by `k0 + 8 <=
+range_end`, the one fragment that straddles `range_end` is staged into `tail`
+with dead rows zeroed, and the PV k-step that straddles is staged the same way.
+An earlier draft of this note claimed the padding "is still there"; it is not,
+and neither is the rounded loop. The staged `tail` buffer stays because it is
+not slower than the barrier-free variants above.
+
+### 8.5 The honest picture at 24k
+
+Engine-measured, current build, `KAPLUMBA_GPU_PROFILE=1`, 23 954-token prompt:
+
+| term | ms | TFLOP/s |
+|---|---|---|
+| GEMM (q,k,v,o,gate,up,down) | 214 842 | 6.44 |
+| attention (all 60 layers) | 144 962 | 1.30 |
+| everything else | ~3 200 | |
+| **kernel sum** | **363 003** | |
+| inter-dispatch gap | ~24 000 | |
+| wall | ~388 000 = **63.2 tok/s** | |
+
+Attention is 91% full-attention layers and runs at 1.30 TFLOP/s. The GEMM is at
+6.44 against the ~7.8 TFLOPS structure-matched ceiling
+(`spec/engine-performance` §12/§13). Neither is within 2x of what it would take
+
+### 8.6 Progress vs the spec baseline (T3 + T4 so far)
+
+The spec's opening table measured 24k prefill at **52.84 tok/s** (`882d874`). The
+current build's 24k wall is ~388 s for 23 954 tokens = **~63.2 tok/s** (§8.5), so
+`regpipe` + the flash body have moved 24k prefill by **~+20%**. The 8k number has
+moved 78.82 -> ~85 (T3). Nothing here reaches 90 yet; the remaining arithmetic is
+in §5 and §8.5.
+
+### 8.7 The arm-throughput bench does **not** rank arms; E2E does
+
+§7.4/§8.2 used `attention_arm_throughput_at_prefill_geometry` to argue the MMA arm
+beats flash. Its absolute numbers are real, but its **relative ranking does not
+reproduce end to end**, and this is the second time the bench and the engine have
+disagreed (the first was the §7.3 BQ verdict).
+
+Interleaved E2E with `KAPLUMBA_FULL_QK=flash|mma` (the override moves only the 10
+full layers, so the 50 sliding layers are identical in both arms):
+
+| prompt | flash | mma |
+|---|---|---|
+| 614 (3 rounds) | 101.46 / 101.49 / 101.34 | 101.60 / 98.29 / 101.49 |
+| 8204 (2 rounds) | 80.09 / 81.80 | 79.89 / 79.55 |
+
+**Tied.** flash is marginally steadier at 614 and marginally ahead at 8k; the
+bench's `mma` advantage (2.14 vs 1.58 TFLOP/s at 8k, 1.89 vs 1.47 at 24k) does not
+appear at all. At 8k, attention is ~17 s of a ~102 s prefill, so a genuine 28%
+attention win would be ~+3.7% E2E (80 -> 83); it is not there.
+
+One earlier single-shot 614 flash reading of 85.46 (the first thing measured this
+session) was a **cold-run outlier**: three repeats give 101.3-101.5. Single
+readings at short context are not results.
+
+Consequence for method, not just for this arm: **the bench's TFLOP/s is a ceiling
+instrument, not a ranking instrument.** Any arm-selection claim must come from
+`KAPLUMBA_FULL_QK` E2E (or an equivalent), because the bench geometry
+(rectangular, every query past `key_count`) is not the engine's (chunked,
+triangular) and the two orders diverge. This supersedes the "mma is 28% faster"
+reading of §7.4/§8.2.
+
+The 24k A/B (flash vs mma at 24 576 keys) is in flight; 614 and 8k being tied
+predicts it is tied too, and attention being ~37% of the 24k wall would have made a
+real 28% attention win a ~10% E2E win.
+
+### 8.8 Session hazard: the box is shared, and a contended 24k run thrashes
+
+A 24k A/B launched while another agent held the model never progressed: after
+13 minutes the `kaplumba` process had used **15 s of CPU and 652 MB RSS**, while
+`top` showed 23 GiB used, 112 MiB free and **4.8 GiB of swap**. It was faulting
+the model in behind a competing instance. `scripts/gpuq try` had said "ok", and
+it was "ok" at the instant it was asked -- a parallel agent can take the model
+*after* the status check and before the load completes. A run that does not reach
+its output must be re-checked for CPU time and `vm.swapusage`, not assumed slow.
+to reach 90 tok/s (266 s) without cutting ~125 s out of these two numbers.

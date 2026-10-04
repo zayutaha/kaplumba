@@ -142,8 +142,25 @@ instruction; the GEMM runs at 1.60 MMA/load (6.75 TFLOP/s), the flash QK at
 the n-tile loop, dropping PV from 0.89 to 0.67 MMA/load. Fixed by preloading
 the `BQ` P fragments once per k-step (0.89 at BQ=1, 1.60 at BQ=2).
 
-**Remaining:** raise the QK's M-tiles from 1 to 2, and decide the shipped
-full-shape arm (E2E `KAPLUMBA_FULL_QK` A/B in flight).
+### T4c — full-shape arm decided (E2E), and the bench's ranking is discredited
+
+`KAPLUMBA_FULL_QK=flash|mma` E2E, interleaved: **tied** at 614 (flash 101.46 /
+101.49 / 101.34 vs mma 101.60 / 98.29 / 101.49) and at 8k (flash 80.09 / 81.80 vs
+mma 79.89 / 79.55). The TFLOP/s bench's mma-over-flash ranking (2.14 vs 1.58 at
+8k) does not reproduce; **`flash` stays the shipped full-shape arm.** Recorded as
+§8.7: the bench is a ceiling instrument, not a ranking instrument.
+
+### T4d — QK M-tiles (KSUB): tried at 4, **negative**, reverted
+
+A 256-key pass (4 m-tiles per simdgroup) halves the QK's `simdgroup_load`s per
+MMA but needs 28 KB of threadgroup memory; **13% slower** in the engine at 8k
+(attention 20.6 s -> 23.4 s) and slower on the bench (1118 -> 1318 ms at 24 576
+keys). Recorded as §8.1; `FLASH_KEY_SUBTILES = 1` documents the shipped value.
+
+**Remaining (T4e):** the two things that could still move attention are (a) the
+GEMM ceiling (§5: 90 tok/s needs GEMM *and* attention to improve together) and
+(b) a structural change to the flash body's per-tile barrier/softmax serial cost.
+Do not use the TFLOP/s bench to choose between arms.
 
 ---
 
