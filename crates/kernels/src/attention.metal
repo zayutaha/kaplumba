@@ -14,6 +14,11 @@ struct AttentionParams {
     // Prefill passes 0 and scans `0 .. key_count`.
     uint splits;
     uint keys_per_split;
+    // Prefill key-range passes (OQ9): this dispatch covers
+    // `[pass_begin, min(key_count, pass_begin + pass_keys))`. `pass_keys == 0`
+    // is the one-dispatch behaviour and scans `[0, key_count)`.
+    uint pass_begin;
+    uint pass_keys;
 };
 
 template <int HEAD_DIM>
@@ -1429,7 +1434,28 @@ static void attention_gqa_mma_body(
 //
 // `BQ` must be 1 in this mode: a decode step has exactly one query row, so the
 // partial layout has no query axis to block over.
-template <int HEAD_DIM, int NSG, int BQ, bool PARTIALS>
+//
+// `PASSES` is oMLX's key-range-pass mechanism (OQ9), ported from
+// `omlx/utils/nax_attention.py:162-170` ("One dispatch covers key blocks
+// [kb_begin, kb_end). Unless FIRST, the online-softmax state of every query row
+// (fp32 O accumulator, running max, running sum) is loaded from Sin; unless LAST
+// it is stored to Sout instead of normalising and writing the output. Every row
+// thus runs exactly the operations of one full dispatch, in the same order
+// (bit-identical output)") -- `FIRST`/`LAST` here are the runtime tests
+// `pass_begin == 0` and `pass_begin + pass_keys >= key_count`.
+//
+// The reason oMLX has it: "one dispatch over a long key range lets its
+// threadgroups drift apart until each streams its KV head from DRAM; per-slice
+// dispatches keep the K/V they share in the on-chip caches" (`:30-32`), measured
+// as "~85 TFLOPS at 1M keys against ~103 at 64k" (`:89-91`).
+//
+// The row state lives in `state`, one `(m, s, O[HEAD_DIM])` fp32 row per
+// (query, q head) -- the decode partials layout with a query axis in front, so
+// nothing new has to be proven about it. `acc[b][j]`'s fragment row `fm` is the
+// q head (see the load-layout note above `linear.metal:10208`) and its columns
+// are this simdgroup's `NPER * 8` dims (`nt = sg * NPER + j`, T4f), so the eight
+// simdgroups together cover each `(query, head)` row exactly once.
+template <int HEAD_DIM, int NSG, int BQ, bool PARTIALS, bool PASSES>
 static void attention_prefill_flash_body(
     const device half *queries,
     const device half *keys,
@@ -1438,6 +1464,7 @@ static void attention_prefill_flash_body(
     const device uint *key_positions,
     device half *output,
     device float *partials,
+    device float *state,
     constant AttentionParams &params,
     uint tid,
     uint tgid,
@@ -1450,12 +1477,15 @@ static void attention_prefill_flash_body(
     static_assert(NSG == 8, "the flash body assumes 8 simdgroups == groups");
     static_assert(!PARTIALS || BQ == 1,
                   "the decode partials layout has no query axis to block over");
-    static_assert(NSG == 8, "the flash body assumes 8 simdgroups == groups");
+    static_assert(!PARTIALS || !PASSES,
+                  "decode splits and prefill passes are different key-axis cuts");
     constexpr float NEG = -1.701411733864e+38f;
     constexpr uint TILE = 64u;
     constexpr uint NSUB = 8u;
     constexpr uint NTILES = uint(HEAD_DIM) / 8u;
     constexpr uint NPER = NTILES / uint(NSG);
+    // Row stride of `state`: fp32 O[HEAD_DIM], then the running max and sum.
+    constexpr uint SSTRIDE = uint(HEAD_DIM) + 2u;
 
     const uint lane = tid & 31u;
     const uint sg = tid >> 5u;
@@ -1475,11 +1505,23 @@ static void attention_prefill_flash_body(
     // from running off the end when `key_count` is not a multiple of
     // `keys_per_split`; an empty slice falls out of the loop with m = NEG and a
     // zero accumulator, which the combine pass weights to zero.
+    //
+    // Prefill passes (OQ9) scan `[pass_begin, pass_end)` instead, where
+    // `pass_keys == 0` reproduces the one-dispatch `[0, key_count)` range. The
+    // causal and window tests below are per key inside the range, so a key
+    // outside it is simply visited by another pass: cutting the index range
+    // cannot change any row's arithmetic.
     const uint range_begin =
-        PARTIALS ? split * params.keys_per_split : 0u;
+        PARTIALS ? split * params.keys_per_split : params.pass_begin;
     const uint range_end =
         PARTIALS ? min(params.key_count, range_begin + params.keys_per_split)
-                 : params.key_count;
+        : (params.pass_keys == 0u
+               ? params.key_count
+               : min(params.key_count, params.pass_begin + params.pass_keys));
+    // FIRST / LAST, as oMLX templates them; runtime here so one pipeline serves
+    // every pass of the slice chain.
+    const bool pass_first = range_begin == 0u;
+    const bool pass_last = range_end >= params.key_count;
 
     // Q rows for all BQ queries of this simdgroup's own head, staged as halves
     // (the QK B operand is loaded transposed from here, so no half->float
@@ -1519,6 +1561,37 @@ static void attention_prefill_flash_body(
     }
     const uint fm = ((lane >= 16u) ? 4u : 0u) + ((lane >> 1u) & 3u);
     const uint fn = ((lane & 8u) ? 4u : 0u) + ((lane & 1u) << 1u);
+
+    // OQ9, resume: this dispatch continues a row an earlier one started. The
+    // round trip is fp32 -> device -> fp32 and the key-tile loop below is
+    // unchanged, so every row runs exactly the operations of one full dispatch in
+    // the same order and the output is bit-identical to it (oMLX's claim, which
+    // the `attention_prefill_pass_bit_exact` test checks rather than assumes).
+    if (PASSES && !pass_first) {
+#pragma unroll
+        for (uint b = 0; b < uint(BQ); ++b) {
+            if (q0 + b >= params.queries) {
+                continue;
+            }
+            const device float *sbase =
+                state + (q0 + b) * params.q_heads * SSTRIDE + key_head * groups * SSTRIDE;
+            // `m`/`s` are replicated across the simdgroup and belong to its own
+            // head, so a broadcast read is enough and no reduction is needed.
+            const device float *mrow = sbase + uint(sg) * SSTRIDE;
+            m[b] = mrow[HEAD_DIM];
+            s[b] = mrow[HEAD_DIM + 1u];
+            const device float *orow = sbase + fm * SSTRIDE;
+#pragma unroll
+            for (uint j = 0; j < NPER; ++j) {
+                // `acc[b][j]`'s columns are dims `nt*8 + fn`, `nt*8 + fn + 1`
+                // with `nt = sg * NPER + j` -- the same n-tile order T4f fixed.
+                const device float *e =
+                    orow + (uint(sg) * uint(NPER) + j) * 8u + fn;
+                acc[b][j].thread_elements()[0] = e[0];
+                acc[b][j].thread_elements()[1] = e[1];
+            }
+        }
+    }
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1724,6 +1797,33 @@ static void attention_prefill_flash_body(
         return;
     }
 
+    // OQ9, hand off: this dispatch covered `[range_begin, range_end)` and a
+    // later one covers the rest, so store the running row state instead of
+    // normalising and writing the output. Symmetric with the resume above.
+    if (PASSES && !pass_last) {
+#pragma unroll
+        for (uint b = 0; b < uint(BQ); ++b) {
+            if (q0 + b >= params.queries) {
+                continue;
+            }
+            device float *sbase = state
+                + (q0 + b) * params.q_heads * SSTRIDE + key_head * groups * SSTRIDE;
+            if (lane == 0u) {
+                device float *mrow = sbase + uint(sg) * SSTRIDE;
+                mrow[HEAD_DIM] = m[b];
+                mrow[HEAD_DIM + 1u] = s[b];
+            }
+            device float *orow = sbase + fm * SSTRIDE;
+#pragma unroll
+            for (uint j = 0; j < NPER; ++j) {
+                device float *e = orow + (uint(sg) * uint(NPER) + j) * 8u + fn;
+                e[0] = acc[b][j].thread_elements()[0];
+                e[1] = acc[b][j].thread_elements()[1];
+            }
+        }
+        return;
+    }
+
     // Normalise once at the end: publish each (query, head) `s`, then write fp16.
     if (lane == 0u) {
 #pragma unroll
@@ -1768,10 +1868,44 @@ static void attention_prefill_flash_body(
         threadgroup half tail[8 * (HEAD_DIM)];                                 \
         threadgroup float msb[(BQ) * 8];                                       \
         threadgroup float ssum[(BQ) * 8];                                      \
-        attention_prefill_flash_body<HEAD_DIM, NSG, BQ, false>(                \
+        attention_prefill_flash_body<HEAD_DIM, NSG, BQ, false, false>(          \
             queries, keys, values, query_positions, key_positions, output,     \
-            (device float *)output, params, tid, tgid, qstage, sth, wq, tail,   \
-            msb, ssum);                                                        \
+            (device float *)output, (device float *)output, params, tid, tgid, \
+            qstage, sth, wq, tail, msb, ssum);                                 \
+    }
+
+// OQ9: the same body with `PASSES`, so one dispatch covers only
+// `[pass_begin, pass_begin + pass_keys)` of the key axis and hands its fp32
+// `(m, s, O)` row state to the next dispatch.
+//
+// **Buffer order.** `dispatch_groups` appends the params blob at
+// `bindings.len()`, so `state` is inserted at index 6 and `params` lands at 7
+// instead of 6. `output` stays at 5, as in every other attention kernel.
+// Getting this wrong binds the state buffer to the params bytes, or leaves the
+// kernel's output unbound: neither is an error, both are a plausible and
+// completely wrong number.
+#define KAPLUMBA_FA_FLASH_PASS(NAME, HEAD_DIM, NSG, BQ)                         \
+    kernel void NAME(                                                          \
+        const device half *queries [[buffer(0)]],                              \
+        const device half *keys [[buffer(1)]],                                 \
+        const device half *values [[buffer(2)]],                               \
+        const device uint *query_positions [[buffer(3)]],                      \
+        const device uint *key_positions [[buffer(4)]],                         \
+        device half *output [[buffer(5)]],                                     \
+        device float *state [[buffer(6)]],                                     \
+        constant AttentionParams &params [[buffer(7)]],                        \
+        uint tid [[thread_position_in_threadgroup]],                           \
+        uint tgid [[threadgroup_position_in_grid]]) {                          \
+        threadgroup half qstage[(BQ) * (NSG) * (HEAD_DIM)];                    \
+        threadgroup float sth[(BQ) * 64 * 8];                                  \
+        threadgroup half wq[(BQ) * 8 * 64];                                    \
+        threadgroup half tail[8 * (HEAD_DIM)];                                 \
+        threadgroup float msb[(BQ) * 8];                                       \
+        threadgroup float ssum[(BQ) * 8];                                      \
+        attention_prefill_flash_body<HEAD_DIM, NSG, BQ, false, true>(           \
+            queries, keys, values, query_positions, key_positions, output,     \
+            (device float *)output, state, params, tid, tgid, qstage, sth, wq,  \
+            tail, msb, ssum);                                                  \
     }
 
 // Decode: the same body with BQ = 1 and PARTIALS, so it scans one split's key
@@ -1797,10 +1931,10 @@ static void attention_prefill_flash_body(
         threadgroup half tail[8 * (HEAD_DIM)];                                 \
         threadgroup float msb[8];                                              \
         threadgroup float ssum[8];                                             \
-        attention_prefill_flash_body<HEAD_DIM, NSG, 1, true>(                  \
+        attention_prefill_flash_body<HEAD_DIM, NSG, 1, true, false>(                \
             queries, keys, values, query_positions, key_positions,             \
-            (device half *)partials, partials, params, tid, tgid, qstage, sth,  \
-            wq, tail, msb, ssum);                                              \
+            (device half *)partials, partials, (device float *)partials, params,\
+            tid, tgid, qstage, sth, wq, tail, msb, ssum);                       \
     }
 
 // Only the full-attention shape is instantiated: groups == NSG == 8, HEAD_DIM
@@ -1813,6 +1947,12 @@ KAPLUMBA_FA_FLASH(online_attention_flash_512_8, 512, 8, 2)
 // `attention::FLASH_QUERY_BLOCK_MIN_KEYS` keys, where query blocking only adds
 // critical-path latency (measured at 8k: BQ=2 is ~4% slower than BQ=1).
 KAPLUMBA_FA_FLASH(online_attention_flash_bq1_512_8, 512, 8, 1)
+// OQ9: the `BQ = 2` and `BQ = 1` key-range-pass twins. Selected only when
+// `prefill_pass_enabled` says the shape has enough threadgroups for the slices to
+// stay in step (oMLX's `_PASS_MIN_GROUPS = 512` analogue); otherwise the
+// one-dispatch kernels above run, unchanged and bit-identical.
+KAPLUMBA_FA_FLASH_PASS(online_attention_flash_pass_512_8, 512, 8, 2)
+KAPLUMBA_FA_FLASH_PASS(online_attention_flash_pass_bq1_512_8, 512, 8, 1)
 // T2b: decode, full-attention shape only (groups == NSG == 8, HEAD_DIM 512),
 // same restriction as the prefill flash kernels. BQ is fixed at 1 by the
 // partials layout; the split count is a RUNTIME value (`params.splits`), not a

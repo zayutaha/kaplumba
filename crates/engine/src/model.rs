@@ -1899,8 +1899,26 @@ impl DecoderLayer {
                 )?;
             }
         } else {
-            self.attention
-                .encode_online_attention(encoder, attention_request)?;
+            // OQ9: prefill can be a chain of key-range dispatches, each handing
+            // its fp32 `(m, s, O)` row state to the next. Bit-identical to the
+            // one-dispatch path by construction; `encode_online_attention_passes`
+            // returns `false` (encoding nothing) for any shape or grid it is not
+            // eligible for, so this falls through to the single dispatch exactly
+            // as it did before the mechanism existed.
+            let block = kaplumba_kernels::attention::flash_query_block_for(key_count);
+            let dispatched = self
+                .attention
+                .encode_online_attention_passes(
+                    encoder,
+                    attention_request,
+                    block,
+                    &scratch.attn_pass_state,
+                )
+                .map_err(ModelError::Kernel)?;
+            if !dispatched {
+                self.attention
+                    .encode_online_attention(encoder, attention_request)?;
+            }
         }
         profile.stamp(encoder, &format!("{}attention", prefix()))?;
         timer.lap("attention");
@@ -3100,6 +3118,12 @@ pub struct ForwardScratch {
     /// (split, query head), so `splits * q_heads * (head_dim + 2)` floats. Sized
     /// once from the layer shapes, never from a key count.
     pub attn_partials: Buffer,
+    /// OQ9: prefill key-range-pass row state, one fp32 `(m, s, O[head_dim])` row
+    /// per (query, q head) of a chunk. Sized from `max_tokens`, which is at most
+    /// `PREFILL_CHUNK` and never the prompt length, so it is fixed-size and
+    /// context-independent like every other buffer here (AGENTS.md §8). Private
+    /// storage: only the attention kernels read or write it.
+    pub attn_pass_state: Buffer,
     /// Device-side argmax keys: 4 words (one u32 per 65,536 elements).
     pub argmax_keys: Buffer,
     /// Device-sampler candidates between `sample_topk_blocks` and
@@ -3143,6 +3167,9 @@ impl ForwardScratch {
         inter: usize,
         vocab: usize,
         attn_partials: usize,
+        // Floats of OQ9 prefill pass row state, sized by the caller from
+        // `max_tokens` and the widest layer shape.
+        attn_pass_state: usize,
     ) -> Result<Self, ModelError> {
         if max_tokens == 0 || hidden == 0 || vocab == 0 {
             return Err(ModelError::InvalidConfig(
@@ -3225,6 +3252,13 @@ impl ForwardScratch {
             // replacement is fixed-size and independent of context length, per
             // AGENTS.md §8; 1.05 MB at 16 splits x 32 heads x 512 dims.
             attn_partials: f32_elements(1, attn_partials)?,
+            // OQ9: prefill key-range-pass row state, one fp32 (m, s, O) row per
+            // (query, q head) of a chunk. Sized from `max_tokens` -- which is at
+            // most PREFILL_CHUNK, never the prompt length -- so it is fixed-size
+            // and context-independent like every other buffer here. Private
+            // storage: only the attention kernels touch it. 64.3 MiB at
+            // 1024 x 32 x 514 f32.
+            attn_pass_state: f32_elements(1, attn_pass_state)?,
             argmax_keys: device.new_buffer(
                 (vocab.div_ceil(65536) * 4).max(16) as u64,
                 options,
@@ -3267,6 +3301,7 @@ impl ForwardScratch {
             &self.logits,
             &self.capped,
             &self.attn_partials,
+            &self.attn_pass_state,
             &self.argmax_keys,
             &self.sample_candidates,
             &self.rng_state,
@@ -3406,6 +3441,15 @@ impl TextModel {
                 layer.config.head_dim,
             ));
         }
+        // Sized for one row, since this scratch is the 1-token one and is
+        // replaced by `ensure_scratch` before any multi-token prefill.
+        let attn_pass_state =
+            kaplumba_kernels::attention::prefill_pass_state_elements_widest(
+                layers
+                    .iter()
+                    .map(|layer| (layer.config.q_heads, layer.config.head_dim)),
+                1,
+            );
         let scratch = ForwardScratch::new(
             1,
             hidden_size,
@@ -3414,6 +3458,7 @@ impl TextModel {
             inter,
             vocab_size,
             attn_partials,
+            attn_pass_state,
         )?;
         Ok(Self {
             embedding,
@@ -4878,6 +4923,13 @@ impl TextModel {
                 layer.config.head_dim,
             ));
         }
+        let attn_pass_state =
+            kaplumba_kernels::attention::prefill_pass_state_elements_widest(
+                self.layers
+                    .iter()
+                    .map(|layer| (layer.config.q_heads, layer.config.head_dim)),
+                tokens,
+            );
         self.scratch = ForwardScratch::new(
             tokens,
             self.hidden_size,
@@ -4886,6 +4938,7 @@ impl TextModel {
             inter,
             self.vocab_size,
             attn_partials,
+            attn_pass_state,
         )?;
         self.scratch_tokens = tokens;
         Ok(())

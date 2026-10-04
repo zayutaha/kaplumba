@@ -1,5 +1,6 @@
 use std::ffi::c_void;
 use std::mem::{size_of, size_of_val};
+use std::sync::OnceLock;
 
 use metal::{
     Buffer, CommandQueue, CompileOptions, ComputePipelineState, Device, Library,
@@ -227,6 +228,183 @@ pub fn decode_partial_elements(q_heads: usize, head_dim: usize) -> usize {
         .saturating_add(rows.saturating_mul(2))
 }
 
+// ---------------------------------------------------------------------------
+// OQ9: prefill key-range passes.
+// ---------------------------------------------------------------------------
+
+/// Keys per prefill pass. oMLX's `OMLX_NAX_ATTN_PASS_KEYS` default is **8192**
+/// (`omlx/utils/nax_attention.py:93`), and its measured reason is cache
+/// residency, not a byte budget: *"Every threadgroup of a dispatch streams this
+/// many keys of its KV head, so the key slice the threadgroups in flight share
+/// stays in the on-chip caches (one dispatch over 1M keys runs at ~85 TFLOPS
+/// against ~103 at 64k)"* (`:89-91`).
+///
+/// `KAPLUMBA_PREFILL_PASS_KEYS=<n>` overrides it; **0 turns passes off** and
+/// restores the one-dispatch body.
+pub const PREFILL_PASS_KEYS: usize = 8192;
+
+/// Minimum number of threadgroups before passes are worth it.
+///
+/// oMLX gates on `_PASS_MIN_GROUPS = 512` (`:94`) with the reason in the
+/// comment at `:91-92`: *"Grids of a wave or two (query tails under ~512 rows
+/// at 64 heads) keep one dispatch: their threadgroups stay in step anyway."*
+/// Below that the slices would cost more state traffic than the drift they fix,
+/// so the shipped rule keeps one dispatch.
+pub const PREFILL_PASS_MIN_GROUPS: usize = 512;
+
+/// Total threadgroups the prefill grid has for `queries` rows and `kv_heads`.
+pub fn prefill_threadgroups(queries: usize, kv_heads: usize, block: usize) -> usize {
+    queries.div_ceil(block.max(1)).saturating_mul(kv_heads)
+}
+
+/// Keys per prefill pass for one dispatch, honouring `KAPLUMBA_PREFILL_PASS_KEYS`.
+///
+/// 0 means "one dispatch": either the knob is off, or the key range fits in a
+/// single pass anyway.
+pub fn prefill_pass_keys_for(key_count: usize) -> usize {
+    static CACHE: OnceLock<usize> = OnceLock::new();
+    let configured = *CACHE.get_or_init(|| {
+        std::env::var("KAPLUMBA_PREFILL_PASS_KEYS")
+            .ok()
+            .and_then(|raw| raw.trim().parse::<usize>().ok())
+            .unwrap_or(PREFILL_PASS_KEYS)
+    });
+    if configured == 0 || key_count <= configured {
+        return 0;
+    }
+    configured
+}
+
+/// The flash body's key tile (`TILE = 64` in `attention.metal`).
+///
+/// **Pass boundaries must land on tile edges, and this constant is why.** The
+/// online softmax updates the running max, sum and accumulator **once per
+/// tile**, so the sequence of `m` values -- and therefore the sequence of
+/// rescale factors applied to `s` and to `O` -- is a function of where the tile
+/// boundaries fall. Cut the key range at a non-tile index and every row's
+/// arithmetic changes: measured here as a **one-fp16-ulp** difference on 1% of
+/// outputs (worst |diff| 0.000488, 637 195 of 16 777 216 values, first at
+/// `(query 40, head 5, dim 116)` for 44-key passes over 129 keys). That is far
+/// inside the 5e-3 tolerance every other attention test here uses, so it would
+/// have shipped as "exact" while being measurably, reproducibly different.
+///
+/// oMLX does not have this hazard because it cuts in units of its key block
+/// (`_BK = 32`, `nax_attention.py:76`): `_pass_edges` returns block *indices*
+/// (`:800`), and the kernel loops `for (kb = kb_lo; kb < kb_hi; kb++)`
+/// (`:362`), so an edge is a block boundary by construction. The equivalent here
+/// is to snap every edge down to a multiple of 64.
+pub const PREFILL_PASS_TILE: usize = 64;
+
+/// Key-tile boundaries of the dispatch chain for `key_count` keys, including 0
+/// and `key_count`. A single dispatch is `[0, key_count]`.
+///
+/// `pass_keys` is floored to whole tiles; a `pass_keys` below one tile becomes
+/// one tile per pass. The final boundary is `key_count` itself, so the last
+/// dispatch is always the one whose `range_end >= key_count` -- the one that
+/// normalises and writes the output.
+pub fn prefill_pass_edges(key_count: usize, pass_keys: usize) -> Vec<usize> {
+    let tiles = key_count.div_ceil(PREFILL_PASS_TILE);
+    let tiles_per_pass = (pass_keys / PREFILL_PASS_TILE).max(1);
+    if tiles <= tiles_per_pass {
+        return vec![0, key_count];
+    }
+    let passes = tiles.div_ceil(tiles_per_pass);
+    let mut edges = Vec::with_capacity(passes + 1);
+    edges.push(0usize);
+    for index in 1..passes {
+        // Skip an edge that coincides with the end, so the chain never ends in an
+        // empty pass: `24590 / 64 = 385` tiles, 4 per pass, gives 96 full passes
+        // plus a 1-tile remainder, and the tile-aligned edge `96 * 4 * 64` is
+        // 24576, not 24590 -- so the last pass is `[24576, 24590)`, 14 keys.
+        let edge = index * tiles_per_pass * PREFILL_PASS_TILE;
+        if edge < key_count {
+            edges.push(edge);
+        }
+    }
+    edges.push(key_count);
+    edges
+}
+
+/// Should this prefill dispatch use the key-range-pass kernel, and with how many
+/// passes?
+///
+/// Returns the pass count (>= 2, so the caller knows there is work to do) or 0
+/// for "one dispatch". Three conditions, in oMLX's order:
+///
+/// 1. the flash shape (the pass kernels are instantiated for `HEAD_DIM = 512`,
+///    `groups = 8` only, like every other flash kernel here);
+/// 2. the pass kernels actually compiled;
+/// 3. the grid is big enough that the slices stay in step -- oMLX's
+///    `_PASS_MIN_GROUPS` gate, on **threadgroups** rather than query rows.
+pub fn prefill_pass_count(
+    queries: usize,
+    kv_heads: usize,
+    key_count: usize,
+    head_dim: usize,
+    groups: usize,
+    block: usize,
+    available: bool,
+) -> usize {
+    if !available || !flash_supported(head_dim, groups) {
+        return 0;
+    }
+    let pass_keys = prefill_pass_keys_for(key_count);
+    if pass_keys == 0 {
+        return 0;
+    }
+    let groups_in_grid = prefill_threadgroups(queries, kv_heads, block);
+    // **Below** the gate, matching oMLX's `n_groups < min_groups`
+    // (`nax_attention.py:797`): a grid *at* 512 keeps one dispatch. Their comment
+    // calls 512 the "wave or two" size ("query tails under ~512 rows at 64 heads
+    // keep one dispatch: their threadgroups stay in step anyway", `:91-92`), so
+    // the boundary belongs on the unsliced side.
+    if groups_in_grid <= PREFILL_PASS_MIN_GROUPS {
+        return 0;
+    }
+    prefill_pass_edges(key_count, pass_keys)
+        .len()
+        .saturating_sub(1)
+}
+
+/// Floats the prefill key-range-pass row state holds for one chunk: one fp32
+/// `(m, s, O[head_dim])` row per (query, q head).
+///
+/// Fixed in the *chunk* size, never in the context length: a chunk is at most
+/// `PREFILL_CHUNK` queries regardless of how long the prompt is, so this is a
+/// constant per layer shape, exactly as AGENTS.md §8 requires. 64.3 MiB at
+/// 1024 queries x 32 heads x (512 + 2) -- affordable inside the 20 GiB budget
+/// that the 24k run measures at 18.35 GiB, and it is **scratch**, not weights, so
+/// the 11.51 GiB weight footprint does not move.
+pub fn prefill_pass_state_elements(
+    queries: usize,
+    q_heads: usize,
+    head_dim: usize,
+) -> usize {
+    queries
+        .saturating_mul(q_heads)
+        .saturating_mul(head_dim)
+        .saturating_add(queries.saturating_mul(q_heads).saturating_mul(2))
+}
+
+/// Widest prefill pass row state across a set of layer shapes, in floats.
+///
+/// Sizing this from the widest layer rather than per layer keeps the buffer
+/// fixed-size and shared, which is the same trade the decode partials make.
+pub fn prefill_pass_state_elements_widest<I>(shapes: I, max_queries: usize) -> usize
+where
+    I: IntoIterator<Item = (usize, usize)>,
+{
+    let widest = shapes
+        .into_iter()
+        .map(|(q_heads, head_dim)| prefill_pass_state_elements(max_queries, q_heads, head_dim))
+        .max()
+        .unwrap_or(1);
+    widest.max(1)
+}
+
+/// Convenience for tests and callers that want the boundaries rather than the
+/// count. See [`prefill_pass_edges`] for the alignment guarantee.
+
 /// How many ways to cut `key_count` keys for the decode path.
 ///
 /// **MEASUREMENT KNOB / DEFAULT PENDING.** The split count used to come from a
@@ -450,6 +628,11 @@ struct AttentionParams {
     /// which is what the prefill kernels get.
     splits: u32,
     keys_per_split: u32,
+    /// Prefill key-range passes (OQ9): the key index this dispatch starts at,
+    /// and how many keys it covers. `pass_keys == 0` is the one-dispatch
+    /// behaviour, `[0, key_count)`.
+    pass_begin: u32,
+    pass_keys: u32,
 }
 
 #[derive(Clone, Copy)]
@@ -525,6 +708,12 @@ pub struct AttentionKernels {
     /// query per threadgroup). Both are built so the query block can be chosen
     /// per request without a race on a process-wide selection.
     attention_flash_bq1_pipeline: Option<ComputePipelineState>,
+    /// OQ9: the key-range-pass twins of the two prefill flash kernels. One
+    /// dispatch covers `[pass_begin, pass_begin + pass_keys)` and hands its fp32
+    /// `(m, s, O)` row state to the next through buffer 7. `None` if either
+    /// failed to compile, in which case the one-dispatch kernels run unchanged.
+    attention_flash_pass_pipeline: Option<ComputePipelineState>,
+    attention_flash_pass_bq1_pipeline: Option<ComputePipelineState>,
     /// T2b: the decode flash kernel (`attention_decode_flash_512_8`) -- the
     /// prefill flash body with `BQ = 1` and `PARTIALS`, so a decode split's QK
     /// and PV are 8x8 simdgroup MMA instead of a 32-lane `simd_sum` per
@@ -790,6 +979,19 @@ impl AttentionKernels {
         let attention_flash_bq1_pipeline =
             crate::pipeline_audit::build(&device, &library, "online_attention_flash_bq1_512_8")
                 .ok();
+        // OQ9: the key-range-pass twins. Optional for the same reason -- if
+        // either fails to compile, `prefill_pass_count(.., available = false)`
+        // returns 0 and the one-dispatch flash kernels run, bit-identically.
+        let attention_flash_pass_pipeline =
+            crate::pipeline_audit::build(&device, &library, "online_attention_flash_pass_512_8")
+                .ok();
+        let attention_flash_pass_bq1_pipeline =
+            crate::pipeline_audit::build(
+                &device,
+                &library,
+                "online_attention_flash_pass_bq1_512_8",
+            )
+            .ok();
         // T2b: decode flash. Built unconditionally like the prefill twins so a
         // missing kernel is a fallback, not a library-wide failure.
         let decode_flash_pipeline =
@@ -814,6 +1016,8 @@ impl AttentionKernels {
             decode_combine_512_pipeline,
             attention_flash_pipeline,
             attention_flash_bq1_pipeline,
+            attention_flash_pass_pipeline,
+            attention_flash_pass_bq1_pipeline,
             decode_flash_pipeline,
         })
     }
@@ -865,6 +1069,8 @@ impl AttentionKernels {
             window: to_u32(window, "attention window")?,
             splits: 0,
             keys_per_split: 0,
+            pass_begin: 0,
+            pass_keys: 0,
         };
         // Resolve the pipeline before opening an encoder. Returning early from
         // inside `set_compute_pipeline_state` used to drop a live compute
@@ -1080,6 +1286,8 @@ impl AttentionKernels {
             window: to_u32(request.window, "window")?,
             splits: to_u32(splits, "split count")?,
             keys_per_split: to_u32(keys_per_split, "keys per split")?,
+            pass_begin: 0,
+            pass_keys: 0,
         };
         let bytes = params_bytes(&params);
         let kv_groups = to_u32(kv_heads, "kv head count")?;
@@ -1217,6 +1425,8 @@ impl AttentionKernels {
             window: to_u32(request.window, "window")?,
             splits: 0,
             keys_per_split: 0,
+            pass_begin: 0,
+            pass_keys: 0,
         };
         debug_assert_eq!(
             gqa_index(head_dim, groups),
@@ -1309,6 +1519,8 @@ impl AttentionKernels {
             window: to_u32(window, "attention window")?,
             splits: 0,
             keys_per_split: 0,
+            pass_begin: 0,
+            pass_keys: 0,
         };
         // Prefill: one threadgroup per (query, KV HEAD), holding one simdgroup
         // per query head that shares that KV head. `groups` query heads read the
@@ -1424,6 +1636,170 @@ impl AttentionKernels {
 
     pub fn working_set_bytes(&self, request: &AttentionRequest<'_>) -> usize {
         request.q_heads * request.head_dim * size_of::<f32>()
+    }
+
+    /// Whether the prefill key-range-pass kernels (OQ9) compiled.
+    ///
+    /// Separate from [`Self::flash_attention_available`] because a missing pass
+    /// kernel must NOT disable the one-dispatch flash kernel: it only means the
+    /// prefill dispatch runs as one key range, which is what it does today.
+    pub fn prefill_pass_available(&self) -> bool {
+        self.attention_flash_pass_pipeline.is_some() && self.attention_flash_pass_bq1_pipeline.is_some()
+    }
+
+    /// Prefill attention as `passes` key-range dispatches (OQ9), each handing its
+    /// fp32 `(m, s, O)` row state to the next through `state`.
+    ///
+    /// Bit-identical to [`Self::encode_online_attention_qk_block`]: the per-tile
+    /// arithmetic and its order are unchanged, and the row state is fp32 in, fp32
+    /// out. What differs is only that the key axis is cut into `passes` pieces,
+    /// so the threadgroups in flight at any instant share a narrower slice of the
+    /// KV head than they would over the whole window.
+    ///
+    /// `state` must hold `queries * q_heads * (head_dim + 2)` fp32. Callers get
+    /// the size from [`prefill_pass_state_elements`]; a short buffer is an error,
+    /// never a silent truncation, because every row of every pass writes its whole
+    /// row unconditionally.
+    ///
+    /// Returns `false` without touching the encoder when this shape is not
+    /// eligible (see [`prefill_pass_count`]), so the caller falls back to the
+    /// one-dispatch dispatch and nothing is half-encoded.
+    pub fn encode_online_attention_passes(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        request: AttentionEncodeRequest<'_>,
+        block: usize,
+        state: &Buffer,
+    ) -> Result<bool, KernelError> {
+        Self::encode_online_attention_passes_explicit(
+            self,
+            encoder,
+            request,
+            block,
+            state,
+            prefill_pass_keys_for(request.key_count),
+        )
+    }
+
+    /// [`Self::encode_online_attention_passes`] with the keys-per-pass given
+    /// explicitly, so a test can sweep pass sizes inside one process without
+    /// fighting the `KAPLUMBA_PREFILL_PASS_KEYS` `OnceLock` cache, and so a test
+    /// can bypass the grid gate to exercise shapes production never takes.
+    ///
+    /// `pass_keys` is honoured as given: the eligibility gate is
+    /// [`prefill_pass_count`]'s, and a caller that wants a chain regardless of the
+    /// grid size is asking for something production never asks for, which is
+    /// exactly what a correctness test wants.
+    pub fn encode_online_attention_passes_explicit(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        request: AttentionEncodeRequest<'_>,
+        block: usize,
+        state: &Buffer,
+        pass_keys: usize,
+    ) -> Result<bool, KernelError> {
+        let AttentionEncodeRequest {
+            queries,
+            keys,
+            values,
+            query_positions,
+            key_positions,
+            output,
+            queries_count,
+            q_heads,
+            kv_heads,
+            head_dim,
+            key_count,
+            scale,
+            window,
+        } = request;
+        if queries_count == 0
+            || kv_heads == 0
+            || q_heads == 0
+            || q_heads % kv_heads != 0
+        {
+            return Err(KernelError::InvalidInput(
+                "attention dimensions must be non-zero and q_heads divisible by kv_heads".to_string(),
+            ));
+        }
+        let groups = q_heads / kv_heads;
+        // Eligibility: the shape must have a pass kernel, and the key range must
+        // actually need more than one pass. The grid-size gate
+        // (`PREFILL_PASS_MIN_GROUPS`) belongs to `prefill_pass_count`, which the
+        // production caller applies through `encode_online_attention_passes`;
+        // the `_explicit` entry point is a test tool and deliberately skips it.
+        if !self.prefill_pass_available() || !flash_supported(head_dim, groups) {
+            return Ok(false);
+        }
+        if pass_keys == 0 || key_count <= pass_keys {
+            return Ok(false);
+        }
+        let edges = prefill_pass_edges(key_count, pass_keys);
+        let passes = edges.len().saturating_sub(1);
+        if passes < 2 {
+            return Ok(false);
+        }
+        let pipeline = if block == 1 {
+            self.attention_flash_pass_bq1_pipeline
+                .as_ref()
+                .expect("checked by prefill_pass_available")
+        } else {
+            self.attention_flash_pass_pipeline
+                .as_ref()
+                .expect("checked by prefill_pass_available")
+        };
+        let required = prefill_pass_state_elements(queries_count, q_heads, head_dim);
+        if (state.length() as usize) < required * size_of::<f32>() {
+            return Err(KernelError::InvalidInput(format!(
+                "prefill pass state buffer is {} bytes, needs {required} f32 for {queries_count} queries x {q_heads} heads x {head_dim} dims",
+                state.length()
+            )));
+        }
+        let grid = (queries_count.div_ceil(block) * kv_heads) as u64;
+        for index in 0..passes {
+            let pass_begin = edges[index];
+            let pass_end = edges[index + 1];
+            let params = AttentionParams {
+                queries: to_u32(queries_count, "attention query count")?,
+                q_heads: to_u32(q_heads, "attention query head count")?,
+                kv_heads: to_u32(kv_heads, "attention KV head count")?,
+                head_dim: to_u32(head_dim, "attention head dimension")?,
+                key_count: to_u32(key_count, "attention key count")?,
+                scale,
+                window: to_u32(window, "attention window")?,
+                splits: 0,
+                keys_per_split: 0,
+                pass_begin: to_u32(pass_begin, "prefill pass begin")?,
+                pass_keys: to_u32(
+                    pass_end.saturating_sub(pass_begin),
+                    "prefill pass key count",
+                )?,
+            };
+            // `dispatch_groups` appends the params blob at `bindings.len()`, so the
+            // extra buffer has to be inserted *before* it: `output` stays at 5
+            // like every other attention kernel, `state` takes 6, and `params`
+            // lands at 7. Two ways to get this wrong, both silent -- binding
+            // `state` to the params bytes, or leaving the kernel's real output
+            // unbound so it inherits whatever the previous dispatch left at that
+            // index. Both produce a plausible, stable, wrong number rather than
+            // an error, and the second one is what a plausible-looking edit gets.
+            encoder.dispatch_groups(
+                pipeline,
+                &[
+                    Some(queries),
+                    Some(keys),
+                    Some(values),
+                    Some(query_positions),
+                    Some(key_positions),
+                    Some(output),
+                    Some(state),
+                ],
+                params_bytes(&params),
+                grid,
+                256,
+            )?;
+        }
+        Ok(true)
     }
 
     fn make_u16_buffer(&self, values: &[u16]) -> Result<Buffer, KernelError> {

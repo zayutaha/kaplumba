@@ -89,6 +89,7 @@ fn the_host_tokens_buffer_is_really_slots_wide() {
         /* inter = */ 16,
         /* vocab = */ 16,
         /* attn_partials = */ 16,
+        /* attn_pass_state = */ 16,
     ) else {
         eprintln!("no Metal device; skipping");
         return;
