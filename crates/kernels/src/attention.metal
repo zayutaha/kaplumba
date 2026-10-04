@@ -1138,7 +1138,8 @@ static void attention_gqa_mma_body(
     uint tgid,
     threadgroup float *wbuf,
     threadgroup half *qhstage,
-    threadgroup half *kbuf) {
+    threadgroup half *kbuf,
+    threadgroup float *sstage) {
     static_assert(HEAD_DIM % 256 == 0, "HEAD_DIM must be a multiple of 32 * 8");
     // Same constant as the scalar body: finite, so `m_old - m` stays finite for
     // a fully dead tile and `exp()` can never return NaN.
@@ -1198,16 +1199,27 @@ static void attention_gqa_mma_body(
         // 1. score this lane's key with four 8-key MMA sub-tiles. `score` holds
         //    the unnormalised dot until the live/scale step below, mirroring
         //    scalar's `dot` at :837-851.
+        //
+        // T2 fix (spec/prefill-120tps): the T1 body had EVERY simdgroup compute
+        // all four sub-tiles -- identical inputs, identical 8x8 `dots` -- so
+        // the tensor work AND the strided K fragment loads were `NSG` x
+        // redundant. That measured 1.7-5x SLOWER than the scalar QK it
+        // replaces (micro-bench `attention_qk_mma_bench`). Below, sub-tile
+        // `sub` is owned by exactly the simdgroup with `sub % NSG == sg`; its
+        // 8x8 result is published to a 1 KB shared score tile and every lane
+        // reads its own row back. Total MMA work drops from `4*NSG` sub-tiles
+        // to exactly 4, at the cost of one extra barrier per full tile.
+        //
+        // The final (partial) tile cannot use ownership -- its staging barrier
+        // must be taken by every simdgroup -- so it keeps T1's all-simdgroup
+        // path. It occurs at most once per pass, so its NSG x cost is noise.
         float score = NEG;
-        for (uint sub = 0u; sub < 4u; ++sub) {
-            const uint k0 = base + sub * 8u;
-            if (k0 >= range_end) {
-                // Uniform across the whole threadgroup (base and range_end are
-                // loop-invariant), so the break cannot strand a barrier.
-                break;
-            }
-            simdgroup_float8x8 dots = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-            if (k0 + 8u <= range_end) {
+        const bool partial_tile = (base + 32u > range_end);
+        if (!partial_tile) {
+            for (uint sub = sg; sub < 4u; sub += uint(NSG)) {
+                const uint k0 = base + sub * 8u;
+                simdgroup_float8x8 dots =
+                    make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
                 for (int d8 = 0; d8 < HEAD_DIM; d8 += 8) {
                     simdgroup_half8x8 kf, qf;
                     simdgroup_load(kf, keys + k0 * kv_stride + head_base + d8,
@@ -1215,49 +1227,80 @@ static void attention_gqa_mma_body(
                     simdgroup_load(qf, qhstage + d8, HEAD_DIM, ulong2(0, 0), true);
                     simdgroup_multiply_accumulate(dots, kf, qf, dots);
                 }
-            } else {
-                // Tail: stage [k0, range_end) with zeros past the end so no
-                // out-of-bounds device read is ever issued; the scalar `live`
-                // test below forces those positions to NEG.
-                for (uint i = lane; i < 8u * uint(HEAD_DIM); i += 32u) {
-                    const uint row = i / uint(HEAD_DIM);
-                    const uint col = i % uint(HEAD_DIM);
-                    const uint pos = k0 + row;
-                    kbuf[i] = pos < range_end
-                        ? keys[pos * kv_stride + head_base + col]
-                        : half(0.0f);
-                }
-                threadgroup_barrier(mem_flags::mem_threadgroup);
-                for (int d8 = 0; d8 < HEAD_DIM; d8 += 8) {
-                    simdgroup_half8x8 kf, qf;
-                    simdgroup_load(kf, kbuf + d8, HEAD_DIM);
-                    simdgroup_load(qf, qhstage + d8, HEAD_DIM, ulong2(0, 0), true);
-                    simdgroup_multiply_accumulate(dots, kf, qf, dots);
-                }
+                // Publish the 8x8 tile: M = key within the sub, N = query row.
+                // Same lane map as the working GEMM store (linear.metal:10427):
+                //   fm = (lane>=16?4:0)+((lane>>1)&3)
+                //   fn = (lane&8?4:0)+((lane&1)<<1)
+                // thread_elements()[0] sits at (fm, fn), [1] at (fm, fn+1).
+                const uint fm = ((lane >= 16u) ? 4u : 0u) + ((lane >> 1u) & 3u);
+                const uint fn = ((lane & 8u) ? 4u : 0u) + ((lane & 1u) << 1u);
+                sstage[(sub * 8u + fm) * 8u + fn] = dots.thread_elements()[0];
+                sstage[(sub * 8u + fm) * 8u + fn + 1u] = dots.thread_elements()[1];
             }
-            // Lane map, decoded from the working GEMM store rather than
-            // guessed: linear.metal:10208-10209 defines
-            //   lane_fm = (lane >= 16 ? 4 : 0) + ((lane >> 1) & 3)   // M index
-            //   lane_fn = (lane & 8 ? 4 : 0) + ((lane & 1) << 1)      // N, even
-            // and linear.metal:10427-10433 stores thread_elements()[0] at
-            // (lane_fm, lane_fn) and [1] at (lane_fm, lane_fn + 1).
-            // Here M = key (A's rows), N = query row (B's cols), so key `m`,
-            // row `sg` lives on lane
-            //   src = (m >= 4 ? 16 : 0) + ((sg & ~1) >= 4 ? 8 : 0)
-            //        + 2 * (m & 3) + (sg & 1)
-            // at element index (sg & 1). Out-of-range lanes underflow `m`;
-            // src stays <= 31 by construction and their result is discarded
-            // by the guard below.
-            const float mine = dots.thread_elements()[sg & 1u];
-            const uint m = lane - sub * 8u;
-            const uint pair = sg >> 1u;
-            const uint src = ((m >= 4u) ? 16u : 0u)
-                + ((pair >= 2u) ? 8u : 0u)
-                + 2u * (m & 3u)
-                + (pair & 1u);
-            const float v = simd_shuffle(mine, ushort(src));
-            if (lane >= sub * 8u && lane < sub * 8u + 8u) {
-                score = v;
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            score = sstage[lane * 8u + sg];
+        } else {
+            for (uint sub = 0u; sub < 4u; ++sub) {
+                const uint k0 = base + sub * 8u;
+                if (k0 >= range_end) {
+                    // Uniform across the whole threadgroup (base and range_end
+                    // are loop-invariant), so the break cannot strand a barrier.
+                    break;
+                }
+                simdgroup_float8x8 dots =
+                    make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+                if (k0 + 8u <= range_end) {
+                    for (int d8 = 0; d8 < HEAD_DIM; d8 += 8) {
+                        simdgroup_half8x8 kf, qf;
+                        simdgroup_load(kf, keys + k0 * kv_stride + head_base + d8,
+                                       kv_stride);
+                        simdgroup_load(qf, qhstage + d8, HEAD_DIM, ulong2(0, 0), true);
+                        simdgroup_multiply_accumulate(dots, kf, qf, dots);
+                    }
+                } else {
+                    // Tail: stage [k0, range_end) with zeros past the end so no
+                    // out-of-bounds device read is issued; the scalar `live`
+                    // test below forces those positions to NEG.
+                    for (uint i = lane; i < 8u * uint(HEAD_DIM); i += 32u) {
+                        const uint row = i / uint(HEAD_DIM);
+                        const uint col = i % uint(HEAD_DIM);
+                        const uint pos = k0 + row;
+                        kbuf[i] = pos < range_end
+                            ? keys[pos * kv_stride + head_base + col]
+                            : half(0.0f);
+                    }
+                    threadgroup_barrier(mem_flags::mem_threadgroup);
+                    for (int d8 = 0; d8 < HEAD_DIM; d8 += 8) {
+                        simdgroup_half8x8 kf, qf;
+                        simdgroup_load(kf, kbuf + d8, HEAD_DIM);
+                        simdgroup_load(qf, qhstage + d8, HEAD_DIM, ulong2(0, 0), true);
+                        simdgroup_multiply_accumulate(dots, kf, qf, dots);
+                    }
+                }
+                // Lane map, decoded from the working GEMM store rather than
+                // guessed: linear.metal:10208-10209 defines
+                //   lane_fm = (lane >= 16 ? 4 : 0) + ((lane >> 1) & 3)   // M index
+                //   lane_fn = (lane & 8 ? 4 : 0) + ((lane & 1) << 1)      // N, even
+                // and linear.metal:10427-10433 stores thread_elements()[0] at
+                // (lane_fm, lane_fn) and [1] at (lane_fm, lane_fn + 1).
+                // Here M = key (A's rows), N = query row (B's cols), so key `m`,
+                // row `sg` lives on lane
+                //   src = (m >= 4 ? 16 : 0) + ((sg & ~1) >= 4 ? 8 : 0)
+                //        + 2 * (m & 3) + (sg & 1)
+                // at element index (sg & 1). Out-of-range lanes underflow `m`;
+                // src stays <= 31 by construction and their result is discarded
+                // by the guard below.
+                const float mine = dots.thread_elements()[sg & 1u];
+                const uint m = lane - sub * 8u;
+                const uint pair = sg >> 1u;
+                const uint src = ((m >= 4u) ? 16u : 0u)
+                    + ((pair >= 2u) ? 8u : 0u)
+                    + 2u * (m & 3u)
+                    + (pair & 1u);
+                const float v = simd_shuffle(mine, ushort(src));
+                if (lane >= sub * 8u && lane < sub * 8u + 8u) {
+                    score = v;
+                }
             }
         }
 
@@ -1328,7 +1371,8 @@ static void attention_gqa_mma_body(
 
 // Prefill MMA kernel: same buffers as KAPLUMBA_FA_GQA, plus the Q-half staging
 // slot and the guarded tail tile. Threadgroup use at the worst instantiated
-// shape (NSG=8, HEAD_DIM=512): 2 KB wbuf + 8 KB qhstage + 8 KB kbuf = 18 KB.
+// shape (NSG=8, HEAD_DIM=512): 2 KB wbuf + 8 KB qhstage + 8 KB kbuf + 1 KB
+// sstage (the T2 published score tile) = 19 KB, under the 32 KB cliff.
 #define KAPLUMBA_FA_GQA_MMA(NAME, HEAD_DIM, NSG)                               \
     kernel void NAME(                                                          \
         const device half *queries [[buffer(0)]],                              \
@@ -1343,9 +1387,10 @@ static void attention_gqa_mma_body(
         threadgroup float wbuf[2 * (NSG) * 32];                                \
         threadgroup half qhstage[8 * (HEAD_DIM)];                              \
         threadgroup half kbuf[8 * (HEAD_DIM)];                                 \
+        threadgroup float sstage[32 * 8];                                      \
         attention_gqa_mma_body<HEAD_DIM, NSG>(queries, keys, values,           \
             query_positions, key_positions, output, params, tid, tgid,         \
-            wbuf, qhstage, kbuf);                                              \
+            wbuf, qhstage, kbuf, sstage);                                      \
     }
 
 // Same eight shapes as KAPLUMBA_FA_GQA: the host selects by gqa_index, and

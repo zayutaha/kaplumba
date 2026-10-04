@@ -43,10 +43,11 @@
 //! * A non-unit `scale` (1/sqrt(512)), applied after extraction rather than
 //!   inside the dot.
 //!
-//! The default path is pinned separately: `encode_online_attention` must be
-//! bit-identical to the `AttentionQk::Scalar` arm. That is the assertion which
-//! fails if anyone flips the environment default to MMA without reconciling
-//! `attention_single_pass_bit_exact` (see notes_T1_T2.md).
+//! The default path is pinned separately: `encode_online_attention` is
+//! shape-aware (T2), so with no env override it must be bit-identical to the
+//! `AttentionQk::Mma` arm on the full-attention shape and to the
+//! `AttentionQk::Scalar` arm on the sliding shape. `attention_single_pass_bit_exact`
+//! pins the scalar arm explicitly so its bit-exact claim is not affected.
 
 use half::f16;
 use kaplumba_kernels::attention::{
@@ -332,31 +333,43 @@ fn attention_mma_matches_scalar() {
     );
 }
 
-/// The environment default is Scalar, pinned bitwise: `encode_online_attention`
-/// must be the scalar arm exactly.
+/// The production default is **shape-aware** (T2): `encode_online_attention`
+/// must dispatch the MMA arm on the full-attention shape (`groups >= 4`, NSG 8)
+/// and the scalar arm on the sliding shape (`groups == 2`, NSG 2), bitwise, with
+/// no environment override set.
 ///
-/// This is the guard rail for the ownership conflict recorded in
-/// `notes_T1_T2.md`: flipping `attention_qk()`'s default to `Mma` fails here
-/// *and* in `attention_single_pass_bit_exact`, deliberately, so the flip cannot
-/// happen as a drive-by.
+/// This replaces the T1 guard that pinned Scalar globally. The T1 partitioned
+/// MMA loses on NSG 2 (1.6x slower) and wins on NSG 8 (1.2x faster), measured in
+/// `attention_qk_mma_bench`, so the selection is per shape. Both arms are the
+/// same kernels `attention_mma_matches_scalar` compares, so comparing the
+/// default's output to the explicit arm is a real dispatch-identity check (a
+/// default that silently stayed scalar on FULL would fail the FULL case).
 #[test]
-fn the_default_prefill_path_is_the_scalar_arm() {
+fn the_default_prefill_path_is_shape_aware() {
     let Some(fx) = Fixture::new() else {
         return;
     };
-    let case = fx.case(FULL, 65, 2, 65, 1.0);
-    let mut enc = MetalEncoder::new(&fx.queue).expect("encoder");
-    fx.kernels
-        .encode_online_attention(&mut enc, case.request(&case.output_a))
-        .unwrap_or_else(|e| panic!("prefill default: {e}"));
-    enc.commit_and_wait().expect("wait");
-    let n = case.queries_count * case.shape.q_heads * case.shape.head_dim;
-    let default_out = read_u16(&case.output_a, n);
-    let scalar = run(&fx, &case, &case.output_b, AttentionQk::Scalar);
-    assert_eq!(
-        default_out, scalar,
-        "encode_online_attention no longer equals the AttentionQk::Scalar arm: \
-         the environment default moved. If that is intentional, reconcile \
-         attention_single_pass_bit_exact and update this test in the same commit"
-    );
+    for (shape, expect_mma) in [(FULL, true), (SLIDING, false)] {
+        let case = fx.case(shape, 65, 2, 65, 1.0);
+        let mut enc = MetalEncoder::new(&fx.queue).expect("encoder");
+        fx.kernels
+            .encode_online_attention(&mut enc, case.request(&case.output_a))
+            .unwrap_or_else(|e| panic!("prefill default on {}: {e}", shape.name));
+        enc.commit_and_wait().expect("wait");
+        let n = case.queries_count * case.shape.q_heads * case.shape.head_dim;
+        let default_out = read_u16(&case.output_a, n);
+        let expected_qk = if expect_mma {
+            AttentionQk::Mma
+        } else {
+            AttentionQk::Scalar
+        };
+        let expected = run(&fx, &case, &case.output_b, expected_qk);
+        assert_eq!(
+            default_out, expected,
+            "encode_online_attention on {} must dispatch the {expected_qk:?} arm \
+             by default; it did not. Reconcile attention_single_pass_bit_exact \
+             and the T2 measurements before changing the shape rule",
+            shape.name
+        );
+    }
 }

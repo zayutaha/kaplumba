@@ -508,33 +508,61 @@ fn qk_env_truthy(raw: &str) -> bool {
 /// * `KAPLUMBA_SCALAR_ATTENTION=1|on|true|yes` -> [`AttentionQk::Scalar`],
 ///   always wins: this is the brief's A/B spelling for forcing the baseline.
 /// * else `KAPLUMBA_MMA_ATTENTION=1|on|true|yes` -> [`AttentionQk::Mma`].
-/// * else the default, **`Scalar`**.
+/// * else the default is **`Scalar`**.
 ///
-/// The default stays `Scalar` deliberately: `attention_single_pass_bit_exact`
-/// asserts the prefill GQA output equals the single-pass decode output in 0 of
-/// N fp16 elements, and the MMA's reassociated dot product cannot satisfy that.
-/// Flipping the default is a coordinator decision recorded in
-/// `spec/prefill-120tps/notes_T1_T2.md`, not something this knob does on its
-/// own. Decode never consults this: it goes through
+/// The production entry point does not call this: it goes through
+/// [`attention_qk_for`], which keeps `Scalar` on the shapes where MMA measured
+/// a loss and selects MMA on the full-attention shape where it measured a win.
+/// This function remains the global override (both flags, or `Scalar`).
+///
+/// `attention_single_pass_bit_exact` asserts the scalar prefill GQA output
+/// equals the single-pass decode output in 0 of N fp16 elements; the MMA's
+/// reassociated dot product cannot satisfy that, so that test pins
+/// `AttentionQk::Scalar` explicitly. Decode never consults this: it goes through
 /// `encode_online_attention_split` / the single-pass path, neither of which
 /// calls `encode_online_attention`.
 pub fn attention_qk() -> AttentionQk {
-    static CACHE: std::sync::OnceLock<AttentionQk> = std::sync::OnceLock::new();
+    attention_qk_override().unwrap_or(AttentionQk::Scalar)
+}
+
+/// The process-wide prefill QK env override, or `None` when neither flag is
+/// set. Read once (same `OnceLock` idiom as [`attention_qk`]): it is consulted
+/// once per layer per prompt, and `getenv` takes a lock in some libc builds.
+fn attention_qk_override() -> Option<AttentionQk> {
+    static CACHE: std::sync::OnceLock<Option<AttentionQk>> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| {
         if std::env::var("KAPLUMBA_SCALAR_ATTENTION")
             .map(|raw| qk_env_truthy(&raw))
             .unwrap_or(false)
         {
-            return AttentionQk::Scalar;
+            return Some(AttentionQk::Scalar);
         }
         if std::env::var("KAPLUMBA_MMA_ATTENTION")
             .map(|raw| qk_env_truthy(&raw))
             .unwrap_or(false)
         {
-            return AttentionQk::Mma;
+            return Some(AttentionQk::Mma);
         }
-        AttentionQk::Scalar
+        None
     })
+}
+
+/// Shape-aware prefill QK selection (T2, `spec/prefill-120tps`). With no env
+/// override the partitioned MMA QK is used only where it measured a win: the
+/// `groups >= 4` full-attention layers (`head_dim` 512, NSG 8), where the
+/// micro-bench measured **1.2x faster** than scalar. The `groups == 2` sliding
+/// layers (NSG 2) measured **1.6x slower**, so they keep scalar. Either flag
+/// (`KAPLUMBA_MMA_ATTENTION` / `KAPLUMBA_SCALAR_ATTENTION`) overrides the rule
+/// globally for A/B.
+pub fn attention_qk_for(groups: usize) -> AttentionQk {
+    if let Some(forced) = attention_qk_override() {
+        return forced;
+    }
+    if groups >= 4 {
+        AttentionQk::Mma
+    } else {
+        AttentionQk::Scalar
+    }
 }
 
 /// Threadgroups of `per_group` threads needed to cover `threads`, at least one.
@@ -1106,7 +1134,12 @@ impl AttentionKernels {
         if crate::ablated("attention") {
             return Ok(());
         }
-        self.encode_online_attention_qk(encoder, request, attention_qk())
+        let groups = if request.kv_heads == 0 {
+            0
+        } else {
+            request.q_heads / request.kv_heads
+        };
+        self.encode_online_attention_qk(encoder, request, attention_qk_for(groups))
     }
 
     pub fn working_set_bytes(&self, request: &AttentionRequest<'_>) -> usize {

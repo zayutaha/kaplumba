@@ -43,8 +43,8 @@
 
 use half::f16;
 use kaplumba_kernels::attention::{
-    ATTENTION_SPLITS_MAX, AttentionEncodeRequest, AttentionKernels, decode_gqa_index,
-    decode_partial_elements,
+    ATTENTION_SPLITS_MAX, AttentionEncodeRequest, AttentionKernels, AttentionQk,
+    decode_gqa_index, decode_partial_elements,
 };
 use kaplumba_kernels::encoder::MetalEncoder;
 use metal::{Buffer, CommandQueue, Device, MTLResourceOptions};
@@ -252,8 +252,12 @@ fn run_single_pass(fx: &Fixture, case: &Case, output: &Buffer) -> Vec<u16> {
 /// a change of one ULP in f32.
 fn run_prefill_gqa(fx: &Fixture, case: &Case, output: &Buffer) -> Vec<u16> {
     let mut enc = MetalEncoder::new(&fx.queue).expect("encoder");
+    // Pin the scalar arm explicitly: the production default is now shape-aware
+    // (T2 enables MMA on the full-attention `groups >= 4` shape), and the MMA's
+    // reassociated dot product cannot be bit-exact with the single-pass kernel.
+    // This test is about the scalar `acc*(1/s)` vs `acc/s` question alone.
     fx.kernels
-        .encode_online_attention(&mut enc, case.request(output))
+        .encode_online_attention_qk(&mut enc, case.request(output), AttentionQk::Scalar)
         .unwrap_or_else(|e| panic!("prefill gqa on {}: {e}", case.shape.name));
     enc.commit_and_wait().expect("wait");
     read_u16(output, case.shape.q_heads * case.shape.head_dim)
