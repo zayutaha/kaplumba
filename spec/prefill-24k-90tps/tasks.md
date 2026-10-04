@@ -89,10 +89,61 @@ full-shape ratio; then end-to-end 8k A/B before spending a 24k run.
 
 ## T4 — Prefill attention: verify the full-attention win end to end
 
-**Status:** 🔄 in progress. 8k done (above, +8.1%). **Next:** interleaved 24k
-A/B, then decide whether the residual gap to 90 tok/s is QK-chain latency
-(the 64 dependent MMAs per m-tile), the 8x8 device-load coalescing, or the
-GEMM floor.
+**Status:** 🔄 in progress. 8k done (above, +8.1%). Query blocking built,
+measured, **rejected**; the kernel deficit is now explained and an instrument
+exists. **Next:** raise MMA/fragment-load in the QK loop.
+
+### T4a — query blocking (`BQ`): built, correct, **does not pay**
+
+`attention_prefill_flash_body<HEAD_DIM, NSG, BQ>` with two instantiations
+(`online_attention_flash_512_8` BQ=2, `online_attention_flash_bq1_512_8` BQ=1),
+shared grid `ceil(queries/BQ) * kv_heads`, block chosen by
+`flash_query_block_for(key_count)`, `KAPLUMBA_FLASH_BQ=1|2` to override, and
+`encode_online_attention_qk_block` so tests cover both. `KAPLUMBA_FULL_QK`
+adds a **full-shape-only** arm override, because the global flags also move the
+50 sliding layers and cannot express a full-layer A/B.
+
+Correctness: both blocks vs scalar, worst fp16 abs diff **4.88e-4** over 6
+full-shape cases including two new 5-query cases (BQ=2 grid tail). **Sabotage
+check:** dropping `b` from `msb[b*NSG+sg]` fails only BQ=2 on the multi-query
+cases (0.575–0.745 vs tol 5e-3) and leaves BQ=1 at one ulp.
+
+**Measured, interleaved (`measure-bq.tsv`):**
+
+| prompt | BQ=1 | BQ=2 |
+|---|---|---|
+| 614 | 99.671 | 99.472 |
+| 8k | 83.912 | 82.436 |
+| 24k | **63.154** | **59.250** |
+
+-1.8% at 8k, **-6.2% at 24k**. The §5 K/V byte-traffic model does not describe
+this kernel. Recorded as a negative result; BQ=1 is the shipped rule.
+
+### T4b — the instrument, and the real limiter
+
+`attention_arm_throughput_at_prefill_geometry` (new, in
+`attention_qk_mma_bench.rs`): no model load, real prefill geometry
+(`queries = 1024`, one threadgroup per (query, KV head)), TFLOP/s per arm.
+~25 s for all arms at two key counts.
+
+| arm | 8192 keys | 24576 keys |
+|---|---|---|
+| scalar | 397.34 ms (1.38) | 1243.66 ms (1.33) |
+| **mma** | **253.21 ms (2.17)** | **880.21 ms (1.87)** |
+| flash bq1 | 360.50 ms (1.52) | 1184.23 ms (1.39) |
+| flash bq2 | 384.45 ms (1.43) | 1216.92 ms (1.36) |
+
+**MMAs per fragment load is the limiter.** A `simdgroup_load` is a real
+instruction; the GEMM runs at 1.60 MMA/load (6.75 TFLOP/s), the flash QK at
+0.50 (1.39 TFLOP/s), and 1.60/0.50 = 3.2 predicts the 3.6x measured gap. Heads
+(N) is fixed at 8, so the only axis that can grow is keys per simdgroup.
+
+**Bug found by this instrument:** the first BQ cut loaded the P fragment inside
+the n-tile loop, dropping PV from 0.89 to 0.67 MMA/load. Fixed by preloading
+the `BQ` P fragments once per k-step (0.89 at BQ=1, 1.60 at BQ=2).
+
+**Remaining:** raise the QK's M-tiles from 1 to 2, and decide the shipped
+full-shape arm (E2E `KAPLUMBA_FULL_QK` A/B in flight).
 
 ---
 

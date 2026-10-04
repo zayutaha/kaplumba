@@ -1399,19 +1399,26 @@ static void attention_gqa_mma_body(
 //   fn = (lane & 8 ? 4 : 0) + ((lane & 1) << 1)        // N index = dim, even
 //   thread_elements()[0] sits at (fm, fn), [1] at (fm, fn + 1).
 //
-// Threadgroup memory at HEAD_DIM=512, NSG=8:
-//   qstage  8x512 halfs =  8 KB   (Q rows, one per simdgroup)
-//   sth     64x8  floats =  2 KB  (QK scores, [key in tile][head])
-//   wq      8x64  halfs =   1 KB  (P, [head][key in tile], ld = 64)
-//   tail    8x512 halfs =   8 KB  (straddling K or V 8-key step; reused)
-//   msb[8] + ssum[8] floats =   64 B
-//   total 19 KB, under the cliff.
+// Query blocking (T4, `spec/prefill-24k-90tps`): a threadgroup owns `BQ`
+// consecutive queries of ONE KV head, so every K/V key it streams is reused by
+// `BQ` queries. At BQ = 1 each query re-reads its whole causal prefix, which at
+// L = 24k is 23.5 TB over the 10 full layers -- ~86 s of pure 273 GB/s streaming
+// against ~31 s of tensor work, i.e. K/V bandwidth is the binding constraint.
+// BQ = 2 halves it. See implementation_notes.md section 5.
+//
+// Threadgroup memory at HEAD_DIM=512, NSG=8, BQ=2:
+//   qstage  BQ*8*512 halfs = 16 KB (Q rows, one per (query, simdgroup))
+//   sth     BQ*64*8 floats =  4 KB (QK scores, [query][key in tile][head])
+//   wq      BQ*8*64 halfs  =  2 KB (P, [query][head][key in tile], ld = 64)
+//   tail    8*512 halfs    =  8 KB (straddling K or V 8-key step; reused)
+//   msb[BQ*8] + ssum[BQ*8] floats = 128 B
+//   total 30.1 KB, under the 32 KB cliff.
 //
 // `tail` is shared between the QK straddle and the PV straddle because the
 // straddling m-tile is always read before the softmax barrier and the
 // straddling k-step only after it. Everything is threadgroup-uniform (base,
-// range_end, key_count), so every barrier below is taken by all 256 threads.
-template <int HEAD_DIM, int NSG>
+// range_end, key_count, q0), so every barrier below is taken by all 256 threads.
+template <int HEAD_DIM, int NSG, int BQ>
 static void attention_prefill_flash_body(
     const device half *queries,
     const device half *keys,
@@ -1438,33 +1445,51 @@ static void attention_prefill_flash_body(
     const uint lane = tid & 31u;
     const uint sg = tid >> 5u;
     const uint groups = params.q_heads / params.kv_heads;
-    const uint query = tgid / params.kv_heads;
-    const uint key_head = tgid - query * params.kv_heads;
+    // This threadgroup owns BQ consecutive queries (q0 .. q0+BQ-1) of one KV
+    // head; the grid is `ceil(queries/BQ) * kv_heads` threadgroups.
+    const uint qg = tgid / params.kv_heads;
+    const uint key_head = tgid - qg * params.kv_heads;
+    const uint q0 = qg * uint(BQ);
     const uint head = key_head * groups + sg;
-    const uint q_abs = query_positions[query];
     const uint kv_stride = params.kv_heads * uint(HEAD_DIM);
     const uint head_base = key_head * uint(HEAD_DIM);
     const uint range_end = params.key_count;
 
-    // Q row for this simdgroup's own head, staged as halves (the QK B operand is
-    // loaded transposed from here, so no half->float conversion is needed).
-    for (uint c = lane * 8u; c < uint(HEAD_DIM); c += 256u) {
-        *reinterpret_cast<threadgroup uint4 *>(qstage + sg * uint(HEAD_DIM) + c) =
-            *reinterpret_cast<const device uint4 *>(
-                queries + (query * params.q_heads + head) * uint(HEAD_DIM) + c);
+    // Q rows for all BQ queries of this simdgroup's own head, staged as halves
+    // (the QK B operand is loaded transposed from here, so no half->float
+    // conversion is needed). The threadgroup holds all 8 heads x BQ queries.
+    for (uint b = 0; b < uint(BQ); ++b) {
+        if (q0 + b >= params.queries) {
+            continue;
+        }
+        const device half *qsrc =
+            queries + ((q0 + b) * params.q_heads + head) * uint(HEAD_DIM);
+        threadgroup half *qdst = qstage + (b * uint(NSG) + sg) * uint(HEAD_DIM);
+        for (uint c = lane * 8u; c < uint(HEAD_DIM); c += 256u) {
+            *reinterpret_cast<threadgroup uint4 *>(qdst + c) =
+                *reinterpret_cast<const device uint4 *>(qsrc + c);
+        }
     }
 
-    // Running softmax state is per *head* and simdgroup `sg` owns exactly head
-    // `sg`, so `m` and `s` stay in registers replicated across its 32 lanes;
-    // only `msb` (the per-head rescale the PV accumulators need, whose rows are
-    // spread over tokens all 8 simdgroups) has to be published.
-    float m = NEG;
-    float s = 0.0f;
-
-    simdgroup_float8x8 acc[NPER];
+    // Running softmax state is per (query, head); simdgroup `sg` owns head `sg`
+    // for all BQ queries, so `m`/`s` stay in registers replicated across its 32
+    // lanes; only `msb` (the per-(query,head) rescale the PV accumulators need,
+    // whose rows are spread over all 8 simdgroups) has to be published.
+    float m[BQ];
+    float s[BQ];
 #pragma unroll
-    for (uint j = 0; j < NPER; ++j) {
-        acc[j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+    for (uint b = 0; b < uint(BQ); ++b) {
+        m[b] = NEG;
+        s[b] = 0.0f;
+    }
+
+    simdgroup_float8x8 acc[BQ][NPER];
+#pragma unroll
+    for (uint b = 0; b < uint(BQ); ++b) {
+#pragma unroll
+        for (uint j = 0; j < NPER; ++j) {
+            acc[b][j] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+        }
     }
     const uint fm = ((lane >= 16u) ? 4u : 0u) + ((lane >> 1u) & 3u);
     const uint fn = ((lane & 8u) ? 4u : 0u) + ((lane & 1u) << 1u);
@@ -1496,28 +1521,53 @@ static void attention_prefill_flash_body(
         if (sg <= partial_sub) {
             const uint k0 = base + sg * 8u;
             const bool staged = (sg == partial_sub);
-            simdgroup_float8x8 dots = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            // One dots fragment per blocked query. The K element `kf` is loaded
+            // once and reused by every query -- this reuse is the whole point of
+            // query blocking, and it halves the K device traffic.
+            simdgroup_float8x8 dots[BQ];
+#pragma unroll
+            for (uint b = 0; b < uint(BQ); ++b) {
+                dots[b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            }
             if (staged || k0 + 8u <= range_end) {
                 for (int d8 = 0; d8 < HEAD_DIM; d8 += 8) {
-                    simdgroup_half8x8 kf, qf;
+                    simdgroup_half8x8 kf;
                     if (staged) {
                         simdgroup_load(kf, tail + d8, HEAD_DIM);
                     } else {
                         simdgroup_load(kf, keys + k0 * kv_stride + head_base + d8,
                                        kv_stride);
                     }
-                    simdgroup_load(qf, qstage + d8, HEAD_DIM, ulong2(0, 0), true);
-                    simdgroup_multiply_accumulate(dots, kf, qf, dots);
+#pragma unroll
+                    for (uint b = 0; b < uint(BQ); ++b) {
+                        if (q0 + b >= params.queries) {
+                            continue;
+                        }
+                        simdgroup_half8x8 qf;
+                        simdgroup_load(qf,
+                                       qstage + (b * uint(NSG)) * uint(HEAD_DIM) + d8,
+                                       HEAD_DIM, ulong2(0, 0), true);
+                        simdgroup_multiply_accumulate(dots[b], kf, qf, dots[b]);
+                    }
                 }
             }
-            // Publish [key in tile][head]. Keys past `range_end` are forced to
-            // NEG by the `live` test below, so a stale or zero slot is harmless.
-            sth[(sg * 8u + fm) * 8u + fn] = dots.thread_elements()[0];
-            sth[(sg * 8u + fm) * 8u + fn + 1u] = dots.thread_elements()[1];
+            // Publish [query][key in tile][head]. Keys past `range_end` are
+            // forced to NEG by the `live` test below, so a stale or zero slot is
+            // harmless.
+#pragma unroll
+            for (uint b = 0; b < uint(BQ); ++b) {
+                if (q0 + b >= params.queries) {
+                    continue;
+                }
+                sth[(b * TILE + sg * 8u + fm) * 8u + fn] = dots[b].thread_elements()[0];
+                sth[(b * TILE + sg * 8u + fm) * 8u + fn + 1u] =
+                    dots[b].thread_elements()[1];
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // ---- online softmax: simdgroup `sg` owns head `sg`, 2 keys per lane --
+        // ---- online softmax: simdgroup `sg` owns head `sg`, 2 keys per lane,
+        //      independently for each of the BQ blocked queries ----
         const uint kt0 = 2u * lane;
         const uint k0 = base + kt0;
         const uint k1 = k0 + 1u;
@@ -1525,25 +1575,34 @@ static void attention_prefill_flash_body(
         const bool in1 = (k1 < range_end);
         const uint p0 = in0 ? key_positions[k0] : 0u;
         const uint p1 = in1 ? key_positions[k1] : 0u;
-        const bool live0 = in0 && (p0 <= q_abs)
-            && (params.window == 0u || (q_abs - p0) < params.window);
-        const bool live1 = in1 && (p1 <= q_abs)
-            && (params.window == 0u || (q_abs - p1) < params.window);
-        const float sc0 = live0 ? sth[kt0 * 8u + sg] * params.scale : NEG;
-        const float sc1 = live1 ? sth[(kt0 + 1u) * 8u + sg] * params.scale : NEG;
-        // Same shape as the scalar body: fold the running max in before the
-        // cross-lane reduction, and `NEG` (not -inf) so a fully dead tile keeps
-        // `m_old - m` finite.
-        const float m_new = simd_max(max(max(sc0, sc1), m));
-        const float ms = exp(m - m_new);
-        const float w0 = live0 ? exp(sc0 - m_new) : 0.0f;
-        const float w1 = live1 ? exp(sc1 - m_new) : 0.0f;
-        s = s * ms + simd_sum(w0 + w1);
-        m = m_new;
-        wq[sg * TILE + kt0] = half(w0);
-        wq[sg * TILE + kt0 + 1u] = half(w1);
-        if (lane == 0u) {
-            msb[sg] = ms;
+#pragma unroll
+        for (uint b = 0; b < uint(BQ); ++b) {
+            if (q0 + b >= params.queries) {
+                continue;
+            }
+            const uint q_abs = query_positions[q0 + b];
+            const bool live0 = in0 && (p0 <= q_abs)
+                && (params.window == 0u || (q_abs - p0) < params.window);
+            const bool live1 = in1 && (p1 <= q_abs)
+                && (params.window == 0u || (q_abs - p1) < params.window);
+            const float sc0 =
+                live0 ? sth[(b * TILE + kt0) * 8u + sg] * params.scale : NEG;
+            const float sc1 =
+                live1 ? sth[(b * TILE + kt0 + 1u) * 8u + sg] * params.scale : NEG;
+            // Same shape as the scalar body: fold the running max in before the
+            // cross-lane reduction, and `NEG` (not -inf) so a fully dead tile
+            // keeps `m_old - m` finite.
+            const float m_new = simd_max(max(max(sc0, sc1), m[b]));
+            const float ms = exp(m[b] - m_new);
+            const float w0 = live0 ? exp(sc0 - m_new) : 0.0f;
+            const float w1 = live1 ? exp(sc1 - m_new) : 0.0f;
+            s[b] = s[b] * ms + simd_sum(w0 + w1);
+            m[b] = m_new;
+            wq[(b * uint(NSG) + sg) * TILE + kt0] = half(w0);
+            wq[(b * uint(NSG) + sg) * TILE + kt0 + 1u] = half(w1);
+            if (lane == 0u) {
+                msb[b * uint(NSG) + sg] = ms;
+            }
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
@@ -1561,17 +1620,34 @@ static void attention_prefill_flash_body(
             threadgroup_barrier(mem_flags::mem_threadgroup);
         }
 
-        // ---- PV: acc[head][dim] = ms * acc + P[head][key] * V[key][dim] ----
-        const float msv = msb[fm];
+        // ---- PV: acc[q][head][dim] = ms * acc + P[head][key] * V[key][dim].
+        // The V element `bf` is loaded once and reused by every blocked query,
+        // which halves the V device traffic. ----
 #pragma unroll
-        for (uint j = 0; j < NPER; ++j) {
-            acc[j].thread_elements()[0] *= msv;
-            acc[j].thread_elements()[1] *= msv;
+        for (uint b = 0; b < uint(BQ); ++b) {
+            const float msv = msb[b * uint(NSG) + fm];
+#pragma unroll
+            for (uint j = 0; j < NPER; ++j) {
+                acc[b][j].thread_elements()[0] *= msv;
+                acc[b][j].thread_elements()[1] *= msv;
+            }
         }
+        // Loop order matters more than anything else in this kernel: a
+        // `simdgroup_load` is a real instruction, so the MMAs per load is what
+        // caps throughput. Preloading all `BQ` P fragments once per k-step and
+        // reusing them across the `NPER` n-tiles costs `BQ + NPER` loads for
+        // `BQ * NPER` MMAs -- 9/8 at BQ=1 and 10/16 at BQ=2, versus the
+        // `BQ * NPER` P loads a per-(n-tile) load would cost. The same argument
+        // is why the K fragment in the QK loop is loaded outside the query
+        // loop. (Measured cost of getting this wrong: the T4 bench scored the
+        // flash body at ~0.5 MMA/load, 42% below the MMA arm.)
         const uint ksteps = (live_in_tile + 7u) / 8u;
         for (uint kt = 0; kt < ksteps; ++kt) {
-            simdgroup_half8x8 af;
-            simdgroup_load(af, wq + kt * 8u, TILE);
+            simdgroup_half8x8 af[BQ];
+#pragma unroll
+            for (uint b = 0; b < uint(BQ); ++b) {
+                simdgroup_load(af[b], wq + (b * uint(NSG)) * TILE + kt * 8u, TILE);
+            }
             const bool staged = (kt == partial_kt);
 #pragma unroll
             for (uint j = 0; j < NPER; ++j) {
@@ -1583,30 +1659,45 @@ static void attention_prefill_flash_body(
                     simdgroup_load(bf, values + (base + kt * 8u) * kv_stride
                                        + head_base + nt * 8u, kv_stride);
                 }
-                simdgroup_multiply_accumulate(acc[j], af, bf, acc[j]);
+#pragma unroll
+                for (uint b = 0; b < uint(BQ); ++b) {
+                    if (q0 + b >= params.queries) {
+                        continue;
+                    }
+                    simdgroup_multiply_accumulate(acc[b][j], af[b], bf, acc[b][j]);
+                }
             }
         }
     }
 
-    // Normalise once at the end: publish each head's `s`, then write fp16.
+    // Normalise once at the end: publish each (query, head) `s`, then write fp16.
     if (lane == 0u) {
-        ssum[sg] = s;
+#pragma unroll
+        for (uint b = 0; b < uint(BQ); ++b) {
+            ssum[b * uint(NSG) + sg] = s[b];
+        }
     }
     threadgroup_barrier(mem_flags::mem_threadgroup);
-    const float sm = ssum[fm];
-    const float inv = sm > 0.0f ? 1.0f / sm : 0.0f;
     const uint out_head = key_head * groups + fm;
 #pragma unroll
-    for (uint j = 0; j < NPER; ++j) {
-        const uint nt = sg + j * uint(NSG);
-        device half *orow = output
-            + (query * params.q_heads + out_head) * uint(HEAD_DIM) + nt * 8u;
-        orow[fn + 0u] = half(acc[j].thread_elements()[0] * inv);
-        orow[fn + 1u] = half(acc[j].thread_elements()[1] * inv);
+    for (uint b = 0; b < uint(BQ); ++b) {
+        if (q0 + b >= params.queries) {
+            continue;
+        }
+        const float sm = ssum[b * uint(NSG) + fm];
+        const float inv = sm > 0.0f ? 1.0f / sm : 0.0f;
+#pragma unroll
+        for (uint j = 0; j < NPER; ++j) {
+            const uint nt = sg + j * uint(NSG);
+            device half *orow = output
+                + ((q0 + b) * params.q_heads + out_head) * uint(HEAD_DIM) + nt * 8u;
+            orow[fn + 0u] = half(acc[b][j].thread_elements()[0] * inv);
+            orow[fn + 1u] = half(acc[b][j].thread_elements()[1] * inv);
+        }
     }
 }
 
-#define KAPLUMBA_FA_FLASH(NAME, HEAD_DIM, NSG)                                 \
+#define KAPLUMBA_FA_FLASH(NAME, HEAD_DIM, NSG, BQ)                             \
     kernel void NAME(                                                          \
         const device half *queries [[buffer(0)]],                              \
         const device half *keys [[buffer(1)]],                                 \
@@ -1617,13 +1708,13 @@ static void attention_prefill_flash_body(
         constant AttentionParams &params [[buffer(6)]],                        \
         uint tid [[thread_position_in_threadgroup]],                           \
         uint tgid [[threadgroup_position_in_grid]]) {                          \
-        threadgroup half qstage[(NSG) * (HEAD_DIM)];                           \
-        threadgroup float sth[64 * 8];                                         \
-        threadgroup half wq[8 * 64];                                           \
+        threadgroup half qstage[(BQ) * (NSG) * (HEAD_DIM)];                    \
+        threadgroup float sth[(BQ) * 64 * 8];                                  \
+        threadgroup half wq[(BQ) * 8 * 64];                                    \
         threadgroup half tail[8 * (HEAD_DIM)];                                 \
-        threadgroup float msb[8];                                              \
-        threadgroup float ssum[8];                                             \
-        attention_prefill_flash_body<HEAD_DIM, NSG>(queries, keys, values,     \
+        threadgroup float msb[(BQ) * 8];                                       \
+        threadgroup float ssum[(BQ) * 8];                                      \
+        attention_prefill_flash_body<HEAD_DIM, NSG, BQ>(queries, keys, values, \
             query_positions, key_positions, output, params, tid, tgid,         \
             qstage, sth, wq, tail, msb, ssum);                                 \
     }
@@ -1631,8 +1722,13 @@ static void attention_prefill_flash_body(
 // Only the full-attention shape is instantiated: groups == NSG == 8, HEAD_DIM
 // 512. The sliding shape (groups 2, HEAD_DIM 256) keeps the scalar body, and
 // `pipeline_warmup_coverage` is not extended to this kernel because it is
-// selected by `attention_qk_for`, not by `gqa_index`.
-KAPLUMBA_FA_FLASH(online_attention_flash_512_8, 512, 8)
+// selected by `attention_qk_for`, not by `gqa_index`. BQ must equal
+// `attention::FLASH_QUERY_BLOCK` on the Rust side, which sizes the grid.
+KAPLUMBA_FA_FLASH(online_attention_flash_512_8, 512, 8, 2)
+// The `BQ = 1` twin: same body, one query per threadgroup. Selected below
+// `attention::FLASH_QUERY_BLOCK_MIN_KEYS` keys, where query blocking only adds
+// critical-path latency (measured at 8k: BQ=2 is ~4% slower than BQ=1).
+KAPLUMBA_FA_FLASH(online_attention_flash_bq1_512_8, 512, 8, 1)
 
 // Prefill MMA kernel: same buffers as KAPLUMBA_FA_GQA, plus the Q-half staging
 // slot and the guarded tail tile. Threadgroup use at the worst instantiated

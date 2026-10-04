@@ -78,6 +78,47 @@ pub const ATTENTION_SINGLE_PASS_MAX_KEYS: usize = 64;
 /// where single-pass is *much* worse, or it cannot see the shape of the curve.
 pub const ATTENTION_SINGLE_PASS_SWEEP_MAX_KEYS: usize = 65_536;
 
+/// Queries per threadgroup in the flash prefill attention kernel (T4,
+/// `spec/prefill-24k-90tps`). At 24k tokens each query would otherwise re-read
+/// its whole causal K/V prefix -- 23.5 TB over the 10 full layers, ~86 s of pure
+/// 273 GB/s streaming against ~31 s of tensor work. Blocking `BQ` queries per
+/// threadgroup divides that byte traffic by `BQ`. Must equal the `BQ` argument of
+/// `KAPLUMBA_FA_FLASH(online_attention_flash_512_8, 512, 8, BQ)` in
+/// `attention.metal`, which also sizes the threadgroup memory.
+pub const FLASH_QUERY_BLOCK: usize = 2;
+
+/// Key count at or above which the flash prefill kernel uses
+/// [`FLASH_QUERY_BLOCK`] queries per threadgroup instead of 1. Query blocking
+/// halves the K/V device traffic but doubles the per-threadgroup critical path,
+/// so it only pays when attention is bandwidth-bound rather than latency-bound.
+/// Overridable with `KAPLUMBA_FLASH_BQ=1|2` for A/B.
+pub const FLASH_QUERY_BLOCK_MIN_KEYS: usize = 16_384;
+
+/// `KAPLUMBA_FLASH_BQ=1|2` forces the flash query block; any other value is
+/// ignored. Read once (same `OnceLock` idiom as [`attention_qk`]).
+fn flash_query_block_override() -> Option<usize> {
+    static CACHE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| match std::env::var("KAPLUMBA_FLASH_BQ") {
+        Ok(raw) => match raw.trim().parse::<usize>() {
+            Ok(b) if b == 1 || b == FLASH_QUERY_BLOCK => Some(b),
+            _ => None,
+        },
+        Err(_) => None,
+    })
+}
+
+/// Query block for one flash dispatch, from the key count and the override.
+pub fn flash_query_block_for(key_count: usize) -> usize {
+    if let Some(forced) = flash_query_block_override() {
+        return forced;
+    }
+    if key_count >= FLASH_QUERY_BLOCK_MIN_KEYS {
+        FLASH_QUERY_BLOCK
+    } else {
+        1
+    }
+}
+
 /// Parse a `KAPLUMBA_DECODE_SINGLE_PASS` value into a key limit. `0` means off.
 ///
 /// Exposed so the parsing rules are testable without the process-wide cache in
@@ -434,6 +475,10 @@ pub struct AttentionKernels {
     /// same reason `decode_single_pipelines` is: a missing kernel must degrade
     /// to the MMA arm, not take the whole library down.
     attention_flash_pipeline: Option<ComputePipelineState>,
+    /// The `BQ = 1` twin of `attention_flash_pipeline` (the same body with one
+    /// query per threadgroup). Both are built so the query block can be chosen
+    /// per request without a race on a process-wide selection.
+    attention_flash_bq1_pipeline: Option<ComputePipelineState>,
 }
 
 /// `q_heads / kv_heads` values the transposed kernel is instantiated for, and
@@ -581,6 +626,9 @@ pub fn attention_qk_for(groups: usize, head_dim: usize) -> AttentionQk {
         return forced;
     }
     if flash_supported(head_dim, groups) {
+        if let Some(forced) = full_qk_override() {
+            return forced;
+        }
         return AttentionQk::Flash;
     }
     if groups >= 4 {
@@ -588,6 +636,25 @@ pub fn attention_qk_for(groups: usize, head_dim: usize) -> AttentionQk {
     } else {
         AttentionQk::Scalar
     }
+}
+
+/// `KAPLUMBA_FULL_QK=flash|mma|scalar` overrides the prefill arm for the
+/// full-attention shape (`head_dim == 512`, `groups == 8`) **only**, leaving the
+/// sliding shape on its rule. The global flags ([`attention_qk`]) cannot express
+/// this: they move all 60 layers, and the sliding shape has a different winner
+/// (`spec/prefill-120tps` measured MMA 1.6x *slower* there), so a full-layer-only
+/// A/B needs its own knob. Read once.
+fn full_qk_override() -> Option<AttentionQk> {
+    static CACHE: std::sync::OnceLock<Option<AttentionQk>> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        let raw = std::env::var("KAPLUMBA_FULL_QK").ok()?;
+        match raw.trim() {
+            "flash" => Some(AttentionQk::Flash),
+            "mma" => Some(AttentionQk::Mma),
+            "scalar" => Some(AttentionQk::Scalar),
+            _ => None,
+        }
+    })
 }
 
 /// Threadgroups of `per_group` threads needed to cover `threads`, at least one.
@@ -665,6 +732,9 @@ impl AttentionKernels {
         // pipeline falls back to the MMA arm instead of failing the library.
         let attention_flash_pipeline =
             crate::pipeline_audit::build(&device, &library, "online_attention_flash_512_8").ok();
+        let attention_flash_bq1_pipeline =
+            crate::pipeline_audit::build(&device, &library, "online_attention_flash_bq1_512_8")
+                .ok();
         let queue = device.new_command_queue();
         Ok(Self {
             device,
@@ -684,6 +754,7 @@ impl AttentionKernels {
             decode_combine_256_pipeline,
             decode_combine_512_pipeline,
             attention_flash_pipeline,
+            attention_flash_bq1_pipeline,
         })
     }
 
@@ -692,7 +763,7 @@ impl AttentionKernels {
     /// when this is false, which is what keeps the `Option` from turning a build
     /// accident into a wrong answer.
     pub fn flash_attention_available(&self) -> bool {
-        self.attention_flash_pipeline.is_some()
+        self.attention_flash_pipeline.is_some() || self.attention_flash_bq1_pipeline.is_some()
     }
 
     pub fn online_attention(&self, request: AttentionRequest<'_>) -> Result<Vec<u16>, KernelError> {
@@ -1059,6 +1130,22 @@ impl AttentionKernels {
         request: AttentionEncodeRequest<'_>,
         qk: AttentionQk,
     ) -> Result<(), KernelError> {
+        let block = flash_query_block_for(request.key_count);
+        self.encode_online_attention_qk_block(encoder, request, qk, block)
+    }
+
+    /// [`Self::encode_online_attention_qk`] with the flash query block passed in
+    /// explicitly, so a test can exercise both flash kernels (`BQ = 1` and
+    /// `BQ = 2`) inside one process without fighting the `KAPLUMBA_FLASH_BQ`
+    /// `OnceLock` cache. `block` is ignored unless the arm resolves to a flash
+    /// pipeline.
+    pub fn encode_online_attention_qk_block(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        request: AttentionEncodeRequest<'_>,
+        qk: AttentionQk,
+        block: usize,
+    ) -> Result<(), KernelError> {
         let AttentionEncodeRequest {
             queries,
             keys,
@@ -1113,9 +1200,18 @@ impl AttentionKernels {
         // The generic kernel indexes a flat `queries * q_heads` thread range, so
         // it needs its own group count; both specialised kernels index the grid
         // themselves and discard the surplus threads on an early return.
+        // Query blocking: which flash kernel to use, and with how many queries
+        // per threadgroup. Both kernels share the grid geometry
+        // `ceil(queries / block) * kv_heads`, so the block travels with the
+        // pipeline selection.
         let flash = match qk {
             AttentionQk::Flash if flash_supported(head_dim, groups) => {
-                self.attention_flash_pipeline.as_ref()
+                let pipeline = if block == 1 {
+                    self.attention_flash_bq1_pipeline.as_ref()
+                } else {
+                    self.attention_flash_pipeline.as_ref()
+                };
+                pipeline.map(|p| (p, block))
             }
             _ => None,
         };
@@ -1123,7 +1219,16 @@ impl AttentionKernels {
             Some(index) => match flash {
                 // Flash shares the specialised grid exactly: one threadgroup per
                 // (query, KV head), 32 * groups threads. Only the body differs.
-                Some(pipeline) => (pipeline, (queries_count * kv_heads) as u64, 256),
+                // Query blocking: the kernel body owns `block` consecutive
+                // queries per threadgroup, so the grid is
+                // `ceil(queries / block) * kv_heads`. Keep the block in lockstep
+                // with the `BQ` argument of the `KAPLUMBA_FA_FLASH` instantiation
+                // in `attention.metal`.
+                Some((pipeline, block)) => (
+                    pipeline,
+                    (queries_count.div_ceil(block) * kv_heads) as u64,
+                    256,
+                ),
                 None => (
                     match qk {
                         // A `Flash` request on an unsupported shape, or one whose

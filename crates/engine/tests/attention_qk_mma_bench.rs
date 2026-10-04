@@ -185,3 +185,109 @@ fn attention_mma_bench_scalar_vs_mma() {
         let _ = first; // output content is asserted by the matches-scalar test
     }
 }
+
+/// T4 (`spec/prefill-24k-90tps`): prefill-shaped attention throughput, in
+/// TFLOP/s, for every arm the engine can dispatch. This is the instrument for
+/// the 24k attention budget: it runs the real dispatch geometry
+/// (`queries = 1024`, one threadgroup per `(query, KV head)`) at the real key
+/// counts, with no model load, so a kernel change can be scored in seconds.
+///
+/// FLOPs are the *unmasked* full-causal count `queries * q_heads * keys *
+/// head_dim * 4` (2 for QK, 2 for PV, 4 for the mul-add pair). Every query is
+/// positioned at or past `key_count` so no key is masked out, which makes the
+/// number the kernel's actual work rather than its nominal work.
+///
+/// Informational: it prints and only asserts each arm produced finite output.
+#[test]
+fn attention_arm_throughput_at_prefill_geometry() {
+    let Some(fx) = Fixture::new() else {
+        return;
+    };
+    const PAIRS: usize = 3;
+    // (shape, key_count, queries_count) -- 1024 queries is the engine's
+    // `PREFILL_CHUNK`, and the key counts are the last chunk of an 8k and a 24k
+    // prefill.
+    let cases = [(FULL, 8192usize, 1024usize), (FULL, 24576, 1024)];
+    for (shape, key_count, queries_count) in cases {
+        let kv = key_count * shape.kv_heads * shape.head_dim;
+        let queries = queries_count * shape.q_heads * shape.head_dim;
+        let queries_buf = fx.row(queries, 3.0);
+        let keys_buf = fx.row(kv, 11.0);
+        let values_buf = fx.row(kv, 29.0);
+        let query_positions: Vec<u32> = (0..queries_count as u32)
+            .map(|i| key_count as u32 + i)
+            .collect();
+        let key_positions: Vec<u32> = (0..key_count as u32).collect();
+        let query_positions_buf = fx.u32(&query_positions);
+        let key_positions_buf = fx.u32(&key_positions);
+        let out = fx.device.new_buffer(
+            (queries * 2) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let request = AttentionEncodeRequest {
+            queries: &queries_buf,
+            keys: &keys_buf,
+            values: &values_buf,
+            query_positions: &query_positions_buf,
+            key_positions: &key_positions_buf,
+            output: &out,
+            queries_count,
+            q_heads: shape.q_heads,
+            kv_heads: shape.kv_heads,
+            head_dim: shape.head_dim,
+            key_count,
+            scale: 1.0,
+            window: shape.window,
+        };
+        let flops = (queries_count * shape.q_heads * key_count * shape.head_dim * 4) as f64;
+
+        let mut arms: Vec<(&str, AttentionQk, usize)> = vec![
+            ("scalar", AttentionQk::Scalar, 1),
+            ("mma", AttentionQk::Mma, 1),
+        ];
+        if fx.kernels.flash_attention_available() {
+            arms.push(("flash bq1", AttentionQk::Flash, 1));
+            arms.push(("flash bq2", AttentionQk::Flash, 2));
+        }
+
+        // Warm every pipeline first so no arm pays first-touch cost.
+        for (_, qk, block) in &arms {
+            let mut enc = MetalEncoder::new(&fx.queue).expect("encoder");
+            fx.kernels
+                .encode_online_attention_qk_block(&mut enc, request, *qk, *block)
+                .unwrap_or_else(|e| panic!("warm ({qk:?}): {e}"));
+            enc.commit_and_wait().expect("wait");
+        }
+
+        println!(
+            "--- {} keys={key_count} queries={queries_count} ({:.2} GFLOP/iter) ---",
+            shape.name,
+            flops / 1e9
+        );
+        for (name, qk, block) in arms {
+            let mut ms = Vec::new();
+            for _ in 0..PAIRS {
+                let t0 = std::time::Instant::now();
+                let mut enc = MetalEncoder::new(&fx.queue).expect("encoder");
+                fx.kernels
+                    .encode_online_attention_qk_block(&mut enc, request, qk, block)
+                    .unwrap_or_else(|e| panic!("encode ({name}): {e}"));
+                enc.commit_and_wait().expect("wait");
+                ms.push(t0.elapsed().as_secs_f64() * 1e3);
+            }
+            let med = median_f64(&mut ms);
+            let tflops = flops / (med * 1e-3) / 1e12;
+            println!(
+                "  {name:<10} {med:8.2} ms  [{:.2} {:.2}]  {tflops:6.2} TFLOP/s",
+                ms[0],
+                ms[PAIRS - 1]
+            );
+            assert!(med.is_finite() && med > 0.0, "bad timing for {name}");
+        }
+    }
+}
+
+fn median_f64(xs: &mut [f64]) -> f64 {
+    xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    xs[xs.len() / 2]
+}

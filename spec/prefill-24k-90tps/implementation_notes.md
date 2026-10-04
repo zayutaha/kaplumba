@@ -226,6 +226,100 @@ test in this file takes the `let Some(fx) = ... else { return }` path and
 *silently passes*. `attention_flash_matches_scalar_on_the_full_shape` therefore
 `panic!`s rather than returning when `flash_attention_available()` is false.
 
+## 5 — Is AC2 (90 tok/s @24k) reachable at all? The arithmetic, before more kernel work
+
+This is the question OQ2 left open, and it has a sharp answer once the FLOP and
+byte counts are written down for the *full* layers at L = 23954, which is 100%% of
+the problem (sliding attention is 16 s of 193 s).
+
+Per layer, per `(query, key)` causal pair and per KV head, the work is
+8 q-heads × 512 dims × 2 (QK) + 8 × 512 × 2 (PV) = **16384 FLOP**.
+
+| quantity | value |
+|---|---|
+| causal (query,key) pairs | L²/2 = 2.87e8 |
+| KV heads (full) | 4 |
+| FLOPs per layer | 2.87e8 × 4 × 16384 = **1.88e13** |
+| FLOPs, 10 full layers | **1.88e14** |
+| bytes read per visit (one query re-reads its whole causal K and V) | 512 × 2 (K,V) × 2 B = **2048** |
+| bytes per layer | 2.87e8 × 4 × 2048 = **2.35e12** |
+| bytes, 10 layers | **23.5 TB** |
+
+At the measured 273 GB/s of this box that is **86 s of pure K/V streaming** -- and
+that is a *lower bound*, because it is the ideal case where no byte is fetched
+twice. Measured attention is 176.7 s, so the flash body's remaining headroom is
+at most ~2×, i.e. ~90 s in the limit.
+
+> **Therefore, with the shipped GEMM, AC2 is unreachable even with a perfect
+> attention kernel.**
+>
+> ```
+> GEMM (measured, context-independent)   213.7 s
+> attention lower bound                   86.0 s
+> everything else                          3.2 s
+>                                        -------
+> floor                                  302.9 s -> 79.1 tok/s
+> required for 90 tok/s                   266 s
+> ```
+
+To reach 90 tok/s at the 86 s attention floor the GEMM would have to fall to
+180 s, i.e. **7.6 TFLOPS**, against today's 6.6. `spec/prefill-120tps` already
+declared the 7.5 TFLOPS target a wall (`spec/engine-performance` §12/§14: 16 named
+accumulators is the register ceiling; 64x64 tiles, KCHUNK=32, staged `astage`, 32
+accumulators, 8->4 simdgroups and the codebook LUT were all tried and rejected).
+
+### The one design change that moves the lower bound: query blocking
+
+The 23.5 TB above exists only because **every query re-reads its whole causal K and
+V**. A threadgroup that owns `BQ` queries of one KV head reads each key once and
+reuses it across `BQ` queries, so the byte count divides by `BQ`:
+
+| BQ | bytes/layer | 10 layers | @273 GB/s | FLOP-bound? | floor total | tok/s |
+|---|---|---|---|---|---|---|
+| 1 (today) | 2.35e12 | 23.5 TB | 86 s | compute 31 s | 303 s | 79 |
+| 2 | 1.17e12 | 11.7 TB | 43 s | 31 s | 260 s | 92 |
+| 4 | 5.9e11 | 5.9 TB | 22 s | 31 s | 248 s | 96 |
+
+(the FLOP column is 1.88e14 / 6.0 TFLOPS = 31 s; past BQ=2 memory stops being the
+binding constraint and the tensor pipe is.)
+
+So the path to AC2 is **query blocking with `BQ >= 2`**, not more MMA throughput.
+Cost/risk, measured against the current body:
+
+* `qstage` becomes `BQ * NSG * HEAD_DIM` halves. BQ=2 is 16 KB, and with `sth`
+  2 KB + `wq` 2 KB + `tail` 8 KB that is 28 KB of the 32 KB cliff. BQ=4 is 32 KB
+  on its own and does not fit without dropping `tail` or shrinking the tile.
+* The PV accumulator doubles to 16 `simdgroup_float8x8` per simdgroup (32
+  registers); `msb`/`ssum` become per `(query, head)` pairs.
+* The softmax needs `BQ` independent running `(m, s)` pairs, i.e. 2 keys x BQ per
+  lane per tile.
+
+That is a larger and riskier change than T3 was, and BQ=2 clears 90 only at the
+ideal bandwidth; at a realistic 70-85%% of peak the floor is 300-340 s. It is the
+right next step, but AC2 should be treated as **not demonstrated** until it is
+measured.
+
+## 6 — Decode: the same lower bound, and why T2 is also a rewrite
+
+Decode at 24k is 5.44 tok/s = 184 ms/token against a 9.4 ms GEMM. Per token the
+full layers must stream their whole K and V once (there is only one query, so
+*no* read is redundant):
+
+| term | bytes | @273 GB/s |
+|---|---|---|
+| 10 full layers | 2 × 10 × 23954 × 4 × 512 × 2 = **1.96 GB** | 7.2 ms |
+| 50 sliding layers | 2 × 50 × 1024 × 16 × 256 × 2 = **0.84 GB** | 3.1 ms |
+| GEMM | -- | 9.4 ms |
+| **total** | 2.8 GB | **19.7 ms = 51 tok/s** |
+
+So decode at 24k should be ~51 tok/s from bandwidth alone and is measured at 5.44.
+That is a **9.3x gap with no redundant byte to remove** -- it is purely latency
+and occupancy: the full layers dispatch only `16 splits x 4 kv_heads = 64`
+workgroups, each 8 warps serially walking 47 32-key tiles with a 128-iteration
+dependent scalar dot per key. 14 tok/s (71 ms/token) is above the 19.7 ms floor,
+so it is reachable, but only by giving that work more parallelism or an MMA QK --
+not by tuning.
+
 ## 3 — Background: the GEMM ceiling (from `spec/engine-performance`)
 
 Relevant to R4 (verify-only) and to why 120 tok/s @614 was reported as a wall in
@@ -241,3 +335,102 @@ Relevant to R4 (verify-only) and to why 120 tok/s @614 was reported as a wall in
   LUT, `extract_bits`, gate/up concat, `AGX_RELAX_CDM_CTXSTORE_TIMEOUT`,
   resident weights. `spec/prefill-120tps` T4 adds 4sg and regpipe_k32 to that
   list; `regpipe` is the winner and ships.
+
+## 7 — T4: query blocking, and the instrument that explains the attention budget
+
+### 7.1 What was built
+
+`attention_prefill_flash_body` is now templated on `BQ` (queries per threadgroup),
+with two kernels instantiated from the same macro:
+
+```
+KAPLUMBA_FA_FLASH(online_attention_flash_512_8,     512, 8, 2)   // BQ = 2
+KAPLUMBA_FA_FLASH(online_attention_flash_bq1_512_8, 512, 8, 1)   // BQ = 1
+```
+
+Both share the grid geometry `ceil(queries / BQ) * kv_heads`. The block is chosen
+per request by `flash_query_block_for(key_count)` (`KAPLUMBA_FLASH_BQ=1|2`
+overrides it), and `encode_online_attention_qk_block` takes it explicitly so a test
+covers both kernels in one process. Arm selection for the full shape only is
+`KAPLUMBA_FULL_QK=flash|mma|scalar`; the global flags cannot express a
+full-layer-only A/B because they also move the 50 sliding layers.
+
+### 7.2 Correctness and the sabotage check (AGENTS.md 3.4)
+
+`attention_flash_matches_scalar_on_the_full_shape` now runs **both** BQ=1 and BQ=2
+and adds two 5-query cases (`(FULL, 513, 5, 513)` and `(SLIDING, 513, 5, 480)`) so
+the BQ=2 grid tail (`ceil(q/BQ) * kv_heads`, one dead query in the last group) and
+the per-query softmax state are load-bearing. Worst `|flash - scalar|` fp16 abs
+diff over 6 full-shape cases x 2 blocks: **4.88e-4 (one ulp)**, tol 5e-3.
+
+Sabotage (dropping the per-query index from `msb`: `msb[b*NSG+sg]` -> `msb[sg]`):
+
+| case | BQ=1 | BQ=2 |
+|---|---|---|
+| keys 7 / 31 / 32 (1-3 queries) | 0.000488 | 0.000488 (b=0 only, unaffected) |
+| keys 1000 / 129 / 513, queries 2,2,5 | 0.000488 | **0.744 / 0.575 / 0.745** |
+
+The sabotage fails **only** the BQ=2 arm on the multi-query cases, and the test
+fails with its diagnostic. Reverted; suite green.
+
+### 7.3 Measured: query blocking does **not** pay. (E2E, interleaved)
+
+`measure-bq.tsv` (round 1 of 2; the 24k pair is complete, the script was stopped
+after it because the result was decisive):
+
+| prompt | BQ=1 | BQ=2 |
+|---|---|---|
+| 614 | 99.671 | 99.472 |
+| 8k | 83.912 | 82.436 |
+| **24k** | **63.154** | **59.250** |
+
+BQ=2 is **-1.8% at 8k and -6.2% at 24k**. The K/V byte-traffic model in §5 (which
+predicted a 2x reduction in the dominant term) is therefore **not** what limits
+this kernel; halving the loads while doubling the per-threadgroup critical path and
+the register footprint is a net loss. Recorded as a negative result.
+
+### 7.4 The instrument: `attention_arm_throughput_at_prefill_geometry`
+
+New test in `crates/engine/tests/attention_qk_mma_bench.rs`. No model load; real
+dispatch geometry (`queries = 1024` = `PREFILL_CHUNK`, one threadgroup per
+`(query, KV head)`); FLOPs = `queries * q_heads * keys * head_dim * 4` (QK + PV,
+mul-add counted as 2), every query positioned at/past `key_count` so nothing is
+masked. ~25 s for all four arms at two key counts.
+
+| arm | 8192 keys | 24576 keys |
+|---|---|---|
+| scalar | 397.34 ms (1.38 TFLOP/s) | 1243.66 ms (1.33) |
+| **mma** | **253.21 ms (2.17)** | **880.21 ms (1.87)** |
+| flash bq1 | 360.50 ms (1.52) | 1184.23 ms (1.39) |
+| flash bq2 | 384.45 ms (1.43) | 1216.92 ms (1.36) |
+
+### 7.5 Why attention is at 24% of the MMA ceiling: MMAs per fragment load
+
+The GEMM sustains 6.75 TFLOP/s; attention sustains 1.4-1.9. Both are 8x8x8
+`simdgroup_multiply_accumulate`. The difference is **operand reuse**: a
+`simdgroup_load` is a real instruction, so what caps the loop is MMAs per load.
+
+| loop | M-tiles x N-tiles | loads / MMAs | MMA/load |
+|---|---|---|---|
+| `linear_gemm_mma_regpipe` (QTILE 128 / OUTS 64, per k-step) | 2 x 8 | 10 / 16 | **1.60** |
+| flash QK (`dots[key][head]`, 64). BQ=1 | 1 x 1 | 2 / 1 | 0.50 |
+| flash QK, BQ=2 | 1 x 1 | 3 / 2 | 0.67 |
+| flash PV (`P[head][key] x V[key][dim]`), BQ=1, P hoisted | 1 x 8 | 9 / 8 | 0.89 |
+| flash PV, BQ=2, P hoisted | 1 x 8 | 10 / 16 | **1.60** |
+| flash PV, BQ=2, P loaded per n-tile (the T4 first cut) | 1 x 8 | 24 / 16 | 0.67 |
+
+1.60 / 0.50 = 3.2, against a measured 6.75 / 1.87 = 3.6. **The load-reuse model
+explains the attention deficit within 12%, and it is the thing to fix.**
+
+Two consequences, both acted on:
+
+1. The first BQ cut loaded the P fragment *inside* the n-tile loop (to make the
+   query the inner axis), which dropped PV from 0.89 to 0.67 at BQ=1 and 1.60 to
+   0.67 at BQ=2. Fixed: the `BQ` P fragments are preloaded once per k-step and
+   reused across all `NPER` n-tiles, restoring 0.89 / 1.60. This is a real
+   regression the bench caught and the E2E could not have attributed.
+2. The next raise is the QK's M-tiles. It is currently 1 (8 keys); heads (N) is
+   fixed at 8, so the only axis that can grow is keys per simdgroup. Going to
+   M=2 (16 keys per simdgroup, TILE 128) takes QK to 4 loads / 4 MMAs = 1.00 at
+   BQ=2, and PV to 16 x 10 / 256 = 0.63... see §8 for the arithmetic actually
+   run.

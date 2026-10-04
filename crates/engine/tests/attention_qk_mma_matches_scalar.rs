@@ -126,6 +126,13 @@ fn cases() -> Vec<(Shape, usize, usize, u32, f32)> {
         (SLIDING, 257, 1, 257, 0.062_5),
         // NSG=1 ratio.
         (NSG1, 65, 4, 65, 1.0),
+        // T4 query blocking (`FLASH_QUERY_BLOCK = 2`): 5 queries land on 3
+        // threadgroups, the last of which owns one live query and one dead one,
+        // and the causal cut makes the two blocked queries in a group disagree
+        // about which keys are live. A BQ-to-grid or per-query-state bug shows
+        // here and nowhere else.
+        (FULL, 513, 5, 513, 1.0),
+        (SLIDING, 513, 5, 480, 1.0),
     ]
 }
 
@@ -261,9 +268,23 @@ fn run(
     output: &Buffer,
     qk: AttentionQk,
 ) -> Vec<u16> {
+    run_block(fx, case, output, qk, 1)
+}
+
+/// Same as [`run`], with the flash query block pinned. `block` only matters for
+/// `AttentionQk::Flash`; passing it explicitly is what lets one process cover
+/// both flash kernels. The auto rule (`flash_query_block_for`) would pick `BQ=1`
+/// for every key count in `cases()`.
+fn run_block(
+    fx: &Fixture,
+    case: &Case,
+    output: &Buffer,
+    qk: AttentionQk,
+    block: usize,
+) -> Vec<u16> {
     let mut enc = MetalEncoder::new(&fx.queue).expect("encoder");
     fx.kernels
-        .encode_online_attention_qk(&mut enc, case.request(output), qk)
+        .encode_online_attention_qk_block(&mut enc, case.request(output), qk, block)
         .unwrap_or_else(|e| panic!("prefill ({qk:?}) on {}: {e}", case.label()));
     enc.commit_and_wait().expect("wait");
     let n = case.queries_count * case.shape.q_heads * case.shape.head_dim;
@@ -363,15 +384,23 @@ fn attention_flash_matches_scalar_on_the_full_shape() {
         checked += 1;
         let case = fx.case(shape, key_count, queries_count, query_abs, scale);
         let scalar = run(&fx, &case, &case.output_a, AttentionQk::Scalar);
-        let flash = run(&fx, &case, &case.output_b, AttentionQk::Flash);
-        let (diff, nans) = worst(&scalar, &flash);
-        println!("flash {} -> diff={diff:.6} nans={nans}", case.label());
-        if diff > worst_seen {
-            worst_seen = diff;
-            worst_case = case.label();
-        }
-        if nans > 0 || diff > TOL {
-            failures.push(format!("{}: diff={diff:.6} nans={nans}", case.label()));
+        // Both flash kernels: BQ=1 and the query-blocked BQ=2. The 8-query and
+        // 5-query cases are what make BQ=2's grid tail (`ceil(q/BQ) * kv_heads`)
+        // and its second query's softmax/PV state load-bearing.
+        for block in [1usize, 2usize] {
+            let flash = run_block(&fx, &case, &case.output_b, AttentionQk::Flash, block);
+            let (diff, nans) = worst(&scalar, &flash);
+            println!("flash BQ={block} {} -> diff={diff:.6} nans={nans}", case.label());
+            if diff > worst_seen {
+                worst_seen = diff;
+                worst_case = format!("BQ={block} {}", case.label());
+            }
+            if nans > 0 || diff > TOL {
+                failures.push(format!(
+                    "BQ={block} {}: diff={diff:.6} nans={nans}",
+                    case.label()
+                ));
+            }
         }
     }
     assert!(checked > 0, "no full-attention cases exercised the flash arm");
