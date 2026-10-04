@@ -3367,6 +3367,13 @@ impl LinearKernels {
             //   KAPLUMBA_MMA_4SG       -> linear_gemm_mma_4sg (128q x 32n, 128
             //                             threads, grid x = out/32)
             //   KAPLUMBA_REGPIPE_K32   -> linear_gemm_mma_regpipe_k32
+            //   KAPLUMBA_MMA_128X64    -> force the original tile (A/B control
+            //                             for the T4-measured regpipe default)
+            // The default (no flag) is now REGPIPE: T4 measured it +4.7% GEMM
+            // at 614 tokens (6035 -> 5753 ms, 5.85 -> 6.13 TFLOPS) and it is
+            // bit-identical to linear_gemm_mma, so the eligible MCG-3bpw arm
+            // ships it. Everything the research gate excludes still falls back
+            // to linear_gemm_mma below.
             // Both share regpipe's MCG-3bpw host gate (4sg carries only the
             // folded-MCG arm, see its header). Selection is funnelled
             // through one `variant` so a test can force any of the four with
@@ -3381,8 +3388,11 @@ impl LinearKernels {
                 GEMM_MMA_VARIANT_REGPIPE_K32
             } else if env_flag("KAPLUMBA_REGPIPE") {
                 GEMM_MMA_VARIANT_REGPIPE
-            } else {
+            } else if env_flag("KAPLUMBA_MMA_128X64") {
                 GEMM_MMA_VARIANT_128X64
+            } else {
+                // T4 default: regpipe for eligible MCG-3bpw checkpoints.
+                GEMM_MMA_VARIANT_REGPIPE
             };
             // The three research tiles are gated on the folded-MCG arm,
             // exactly as regpipe always was (4sg carries that arm alone -- no

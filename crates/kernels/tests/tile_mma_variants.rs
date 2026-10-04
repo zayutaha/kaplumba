@@ -448,6 +448,10 @@ fn variants_match_the_baseline() {
 /// ship behind flags nobody set.
 #[test]
 fn auto_selection_defaults_to_the_shipped_tile() {
+    // T4 measured `regpipe` +4.7% GEMM at 614 tokens and bit-identical output,
+    // so it is now the default for the eligible (MCG-3bpw) arm; the original
+    // `linear_gemm_mma` is reachable only via the research-gate fallback or
+    // `KAPLUMBA_MMA_128X64` (the A/B control).
     let _guard = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
     let Some(kernels) = kernels() else { return };
     unsafe {
@@ -455,6 +459,7 @@ fn auto_selection_defaults_to_the_shipped_tile() {
         std::env::remove_var("KAPLUMBA_MMA_4SG");
         std::env::remove_var("KAPLUMBA_REGPIPE_K32");
         std::env::remove_var("KAPLUMBA_REGPIPE");
+        std::env::remove_var("KAPLUMBA_MMA_128X64");
     };
     clear_gemm_mma_variant();
 
@@ -478,8 +483,9 @@ fn auto_selection_defaults_to_the_shipped_tile() {
         rate,
     );
     assert_eq!(
-        run.dispatched, GEMM_MMA_VARIANT_128X64,
-        "with no override and no flag, the dispatch must stay on the shipped tile"
+        run.dispatched, GEMM_MMA_VARIANT_REGPIPE,
+        "with no override and no flag, the eligible MCG-3bpw arm must dispatch \
+         the T4-measured regpipe tile (not the original linear_gemm_mma)"
     );
 }
 
