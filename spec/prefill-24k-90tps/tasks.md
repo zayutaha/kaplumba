@@ -643,3 +643,44 @@ hidden by stream redirection.
 ---
 
 ## N6 — final scorecard
+
+**Status:** ✅ done, `48df478`. See `implementation_notes.md` §20.
+
+`scripts/scorecard.sh`, 3 interleaved rounds, arms = shipped vs
+`KAPLUMBA_DECODE_SPLIT_RULE=workgroups` (N4's decode win as an opt-in, so the
+scorecard can carry it without flipping a default):
+
+| context | tokens | arm | prefill tok/s | spread | decode tok/s | spread | `phys_footprint` |
+|---|---|---|---|---|---|---|---|
+| 614 | 626 | shipped | **100.90** | 0.22% | **14.862** | 0.47% | 12.65 |
+| 614 | 626 | workgroups | **101.04** | 0.16% | **14.860** | 0.29% | 12.66 |
+| 8k | 8204 | shipped | **85.01** | 0.50% | **12.754** | 0.17% | 14.16 |
+| 8k | 8204 | workgroups | **85.52** | 0.14% | **12.911** | 0.26% | 14.15 |
+| 16k | 16 394 | shipped | **74.72** (n=2) | 0.71% | **12.067** (n=2) | 0.01% | 15.54 |
+| 16k | 16 394 | workgroups | **75.00** | 1.02% | **12.329** | 0.10% | 15.54 |
+
+**AC4 met with margin:** `phys_footprint` 12.65-15.54 GiB against 20 GiB, and
+**zero swapouts** across all sixteen runs (the cumulative `vm_stat` Swapouts
+counter did not move). The `ru_maxrss` column reads 5.5-6.7 GiB *below* the truth
+on every run — AGENTS.md 10.3's trap, measured again.
+
+**AC5 met:** five reference prompts, greedy, **byte-identical text between arms**
+(`scripts/refprompts.sh`; the diff is the test, not an eyeball).
+
+**AC3 (no regression) met:** prefill ≥ 100 @614 (101.04) and ≥ 80 @8k (85.52);
+decode ≥ 12 @8k (12.911).
+
+**AC1 and AC2 remain unmet and unmoved** — see `implementation_notes.md` §20.2.
+24k decode is still unmeasurable (OQ8) and 24k prefill is 20% short, not 25%.
+
+**Suite:** 116 binaries ok, 4 failed, and **all four verified at base `b92234f`**
+(rebuilt in a separate worktree with its own `CARGO_TARGET_DIR`). New and passing
+this session: `attention_prefill_pass_bit_exact` (17), `attention_rescale_guard` (8).
+
+**A pre-existing crash found by the prompt sweep** (implementation_notes.md
+§20.1): *"A ball is thrown straight up…"* fails with `Metal command buffer failed
+(unlabelled) status=Error` at `--max-new-tokens >= 32` and passes at 16.
+Reproduced with the N3 guard removed **and** on a base build, so not this spec's;
+in the decode/sampler path rather than attention. Filed with a minimal repro
+rather than fixed — localising it needs per-dispatch decode attribution, which is
+outside this session's scope.

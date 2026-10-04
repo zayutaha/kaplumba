@@ -173,3 +173,105 @@ Only after N1–N4. Interleaved A/B at 8k/16k/24k, peak `phys_footprint` via
   sample.** >2% CPU in compression means the sample is invalid — discard it, do
   not report it.
 - **One model process at a time**, via `scripts/gpuq try --` (exit 75 = busy).
+---
+
+## 7. Session update (`48df478`) — what changed and what it cost
+
+This section supersedes §1-§5 above. Read it instead of them.
+
+### 7.1 Scorecard
+
+| | 614 | 8k | 16k | 24k |
+|---|---|---|---|---|
+| prefill, shipped | 100.90 | 85.01 | 74.72 | 67.10 (older, 1 round) |
+| prefill, `workgroups` | 101.04 | 85.52 | 75.00 | — |
+| decode, shipped | 14.862 | 12.754 | 12.067 | **unmeasurable** |
+| decode, `workgroups` | 14.860 | **12.911** | **12.329** | — |
+| `phys_footprint` | 12.65 | 14.16 | 15.54 | 18.35 (older) |
+
+3 interleaved rounds. `phys_footprint` 12.65-15.54 GiB against the 20 GiB budget.
+**Zero swapouts** across all sixteen runs. Five reference prompts byte-identical
+between arms. Full suite: 116 binaries ok, 4 failed, all four verified at base
+`b92234f`. Detail: `implementation_notes.md` §20.
+
+### 7.2 What landed
+
+1. **N3(a), the `msv == 1` rescale guard** (`4bd162c`). Exact, verified against the
+   *scalar* arm — because comparing against another flash run passed 8/8 with the
+   guard sabotaged to always fire. Third self-comparison trap in this spec.
+2. **N1, prefill key-range passes** (`386c9c2`), implemented and **bit-exact**,
+   **measured neutral** (`c61dcba`). The durable output is the tile-alignment
+   invariant (§16.2): unaligned pass edges change the output by one fp16 ulp,
+   10x inside the tolerance every other attention test here uses.
+3. **N4, the decode split sweep** (`d956e68`). The optimum is **13, not the shipped
+   16**, and `decode_one_wave_workgroups(256)/kv_heads = 54/4 = 13` predicts it — a
+   third independent reproduction of the rule `spec/decode-19tok` derived. Worth
+   **+2.17% decode @16k**, and the gain grows with context. Available as
+   `KAPLUMBA_DECODE_SPLIT_RULE=workgroups`; the default flip is one line and is not
+   made here.
+4. **N5, the OQ5 gate** (`d6683a6`, `086073b`). Green, and the honest finding is
+   negative: **a good run and a stalled run print the same memory numbers on this
+   box** (a 626-token run at 100.9 tok/s reads 9.47 GiB compressor / 0.09 GiB
+   unused; the documented stall reads 5.90 / 0.11). No threshold separates them.
+5. Five harnesses in `scripts/`, all tested: `gpuq_mem.sh`, `test_gpuq_mem.sh`,
+   `bench_prefill_passes.sh`, `bench_decode_splits.sh`, `scorecard.sh`,
+   `refprompts.sh`.
+
+### 7.3 What was refuted, with the evidence
+
+* **N1 (prefill key-range passes) does not pay at any context this box can
+  measure.** +0.05% / +0.27% at 16k against a 0.84% control spread, with a
+  positive control (scalar attention) moving the same instrument 20% on the same
+  binary and prompt. oMLX measured it at ~85 vs ~103 TFLOPS over **1M** keys; ours
+  is 134 MB of KV per full layer at 16k, and §10 already showed a 64x smaller K/V
+  allocation buys 6%. **No residency loss exists here for the slices to recover.**
+* **N3(b), the `HS == 2` head-dim split, is not applicable.** `QB = (8 * 1) / 8 = 1`
+  band at our decode shape, so `HS = 2` would idle six of eight simdgroups, and PV
+  is already split 8 ways over the value dims by the pre-existing `nt = sg*NPER + j`
+  partition. Arithmetic in §19.
+* **`ATTENTION_SPLITS_MAX = 16` is not the constraint.** 24 and 32 clamp (measured:
+  12.777 / 12.780 against 16's 12.776) and the curve peaked at 13, *below* the cap.
+  Raising it could only help the 64-thread sliding shape, which does not use the
+  MMA kernel at all.
+* **§10's microbench cannot attribute or rank attention arms.** Re-confirmed and
+  left in force: every conclusion in this session came from E2E interleaved A/B.
+
+### 7.4 The findings worth more than the numbers
+
+* **The measurement, not the kernel, is the binding constraint on this box** (OQ8,
+  now with numbers). The memory signals cannot separate a good run from a stalled
+  one; `sys` CPU is 3.5-32% of wall on *good* runs because it is dominated by the
+  11.5 GiB mmap'd weight read, so OQ5's ">2% CPU" rule read that way rejects good
+  runs; and 24k decode's own 18.35 GiB footprint evicts the desktop. **A quieter
+  box, not a better kernel, is what unblocks AC1.**
+* **A self-comparison cannot detect a uniform corruption.** Three instances in this
+  spec now (two shipped historically). When adding an optimisation, the control
+  must be an *independent implementation of the same maths*, not another run of the
+  optimised code.
+* **"Bit-exact" claims need a tolerance an order of magnitude tighter than the
+  house one.** A one-fp16-ulp regression is 10x inside the 5e-3 that every
+  attention test here uses; it would have shipped as "exact".
+* **Pass boundaries must land on tile boundaries** — a correctness invariant of the
+  online softmax, not a performance detail (§16.2).
+* **A PRE-EXISTING crash**, found by the reference-prompt sweep (§20.1): a short
+  prompt fails with `Metal command buffer failed (unlabelled) status=Error` at
+  `--max-new-tokens >= 32` and passes at 16. Verified on base `b92234f`, so not this
+  spec's; in the decode/sampler path, not attention. **Unfixed and worth someone's
+  time** — it is in the path AC5 tests and it would read as "the model is broken".
+
+### 7.5 What is still open
+
+* **AC2 (prefill ≥ 90 @24k): unmet, 20% short, and unmoved.** Four levers tried
+  (T3, T4f, T2b, N1) against one target. §12.1's arithmetic still holds: attention
+  must go 149.7 s → ≤ 56 s, a 2.7× kernel speedup, at 1.74 TFLOP/s against a ~3.4
+  target. N1 was supposed to be the mechanism for it and does not apply here.
+* **AC1 (decode ≥ 14 @24k): unmeasurable.** Needs a quieter box (OQ8) or a
+  lower-footprint 24k configuration. The splits=13 result is the best decode lever
+  this spec found and its effect is still rising at 16k.
+* **OQ7 is still open** and now more pointed: removing the QK and PV *instructions*
+  from the flash kernel does not speed it up, and §16 adds that its bytes are not
+  the constraint either. Whatever it is, it is not DRAM traffic and not instruction
+  count as currently modelled.
+* **The `workgroups` default flip.** One line, +2.17% @16k, provably a no-op for
+  83% of layers. Needs an owner.
+* **The pre-existing Metal crash** (§20.1). Needs per-dispatch decode attribution.
