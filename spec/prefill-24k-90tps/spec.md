@@ -100,3 +100,25 @@ Additional for this spec:
   24k always uses split+combine. Confirmed: `decode_splits` clamps to
   `ATTENTION_SPLITS_MAX = 16` and the 24k full-layer grid is
   `16 × 4 = 64` workgroups — the latency hypothesis for T2 rests on this.
+- **OQ4 — Is AC2 reachable at all, given the measured budget?** **OPEN, and this
+  is now the binding question.** With attention at the T1 lower bound of 86 s
+  (the BQ=1 K/V-bandwidth floor, `implementation_notes.md` §5) the kernel sum is
+  `214.8 + 86 + 3.2 = 304 s` -> **79 tok/s**, below the 90 target before the
+  ~24 s inter-dispatch gap is even counted. The *only* arithmetic that reaches 90
+  is query blocking, which divides the bandwidth floor (`BQ=2` -> 43 s -> 260 s
+  kernel sum -> 92 tok/s). But **query blocking was measured and does not pay**:
+  `BQ=2` is -2.0% engine attention at 8k and -6.2% at 24k (§7.3/§8.2), and the
+  bench ranks `flash bq2` at or below `flash bq1` at both 8k and 24k (§8.7).
+  So the §5 byte-traffic model, which says bandwidth is the binding constraint,
+  is contradicted by the only experiment that tests it. **Until that
+  contradiction is resolved — is the kernel latency-bound rather than
+  bandwidth-bound, and if so what is the real limiter? — AC2 should be treated as
+  unproven, not merely unmet.** The alternative to resolving it is a target
+  change or a GEMM push, both of which need user direction.
+- **OQ5 — 24k measurement is not reproducible under desktop load.** Two 24k A/B
+  attempts in this session stalled: the model loaded (18 GiB wired) but the box
+  entered compression (7.1 GiB compressor, <300 MiB free) once the 24k KV+scratch
+  were resident, and `kaplumba` sat at ~2% CPU. The same box runs 614/8k
+  measurements normally. The 24k figures in this spec (`52.84`, `~63.2`) were
+  taken with less concurrent load; a 24k run needs the desktop footprint
+  minimised, and any 24k sample taken under contention is invalid.
