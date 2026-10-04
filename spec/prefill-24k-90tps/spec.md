@@ -101,7 +101,13 @@ Additional for this spec:
   `ATTENTION_SPLITS_MAX = 16` and the 24k full-layer grid is
   `16 × 4 = 64` workgroups — the latency hypothesis for T2 rests on this.
 - **OQ4 — Is AC2 reachable at all, given the measured budget?** **OPEN, and this
-  is now the binding question.** With attention at the T1 lower bound of 86 s
+  is now the binding question.** (Partly answered by §10: the contradiction named
+  below — the byte model says bandwidth-bound, the one experiment says otherwise
+  — is **not** a contradiction at all. §10 shows a 64× reduction in the bytes
+  available to the K/V loads buys 6%, so the kernel is *not* bandwidth-bound;
+  query blocking was correctly measured as not paying. The real limiter is
+  still unidentified, which is worse than "bandwidth", because it cannot be
+  targeted.) With attention at the T1 lower bound of 86 s
   (the BQ=1 K/V-bandwidth floor, `implementation_notes.md` §5) the kernel sum is
   `214.8 + 86 + 3.2 = 304 s` -> **79 tok/s**, below the 90 target before the
   ~24 s inter-dispatch gap is even counted. The *only* arithmetic that reaches 90
@@ -125,3 +131,17 @@ Additional for this spec:
   discarding a 24k sample, check `top`'s `unused`, `sysctl vm.swapusage` and the
   process's CPU time (a sample with >2% CPU in compression is invalid), not just
   `gpuq try`, which only reads the lock at one instant.
+- **OQ6 — Is the GEMM's 6.13–6.44 TFLOPS a hard wall?** **OPEN, and now the
+  binding question for AC2.** §5 puts a *perfect* attention kernel at 86 s, which
+  with the measured GEMM (213.7 s) and overhead (3.2 s) is 302.9 s = **79.1
+  tok/s** — 11 tok/s short of AC2 *before any attention work is counted*. To
+  reach 90 the GEMM must fall to ~170–184 s, i.e. **7.5–8.1 TFLOPS**, at the
+  same time as attention hits its streaming floor.
+  `spec/engine-performance` §12/§14 and `spec/prefill-120tps` T4 rejected
+  64×64 tiles, KCHUNK=32, staged `astage`, 32 accumulators, 8→4 simdgroups, the
+  codebook LUT, `extract_bits`, gate/up concat fusion, `regpipe_k32` and
+  `AGX_RELAX_CDM_CTXSTORE_TIMEOUT`, and declared ~7.5 TFLOPS a wall on 16 named
+  accumulators being the register ceiling. **None of that has been re-tested
+  against the prefill chunk shape at 24k**, which is the only geometry that
+  matters here. Needs user direction: accept AC2 as unreachable and re-baseline,
+  or fund a GEMM attempt whose prior is 9-for-9 negative.

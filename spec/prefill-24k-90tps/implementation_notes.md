@@ -895,3 +895,92 @@ an 86 s floor -- real headroom, but §10 shows we have no instrument that can
 attribute it, and the two biggest untried levers (GEMM at 59% of the wall, and
 decode at a 9.3x gap) are untouched. T2 is taken next; the GEMM question is
 recorded as OQ6 below.
+
+---
+
+## 12 — The 86 s "bandwidth floor" is wrong by ~350x, and AC2 is NOT GEMM-gated
+
+§5 -- and every conclusion built on it, including OQ4 and the §11.1 arithmetic --
+rests on one number: *"bytes read per visit (one query re-reads its whole causal K
+and V) = 512 x 2 (K,V) x 2 B = 2048"*, applied to **every (query,key) pair**. That
+is the **L1/L2 request volume**, not DRAM traffic. `PREFILL_CHUNK = 1024`
+(`crates/engine/src/model.rs:121`), so all 1024 queries of a chunk read the *same*
+keys, and those keys are read from DRAM once per chunk, not once per query.
+
+Counting actual DRAM traffic for a 24 590-token prefill (25 chunks; chunk `c`
+covers queries `[1024c, 1024c+1024)` and the KV range `[0, 1024(c+1))`):
+
+**Full-attention layers** (`kv_heads = 4`, `head_dim = 512`, no window):
+
+```
+per chunk   live_keys * 4 * 512 * 2 B * 2 (K and V)   =  live_keys * 8192 B
+sum         sum_{k=1..24} 1024k = 1024 * 300 = 307 200 keys
+per layer   307200 * 8192                            =  2.52 GB
+10 layers                                             = 25.2 GB
+```
+
+**Sliding layers** (`kv_heads = 16`, `head_dim = 256`, `window = 1024`; a chunk
+of 1024 queries spans 2047 live keys):
+
+```
+per chunk   2047 * 16 * 256 * 2 B * 2                = 33.5 MB
+25 chunks * 50 layers                                 = 41.9 GB
+```
+
+| term | bytes | @273 GB/s |
+|---|---|---|
+| 10 full layers | 25.2 GB | 0.092 s |
+| 50 sliding layers | 41.9 GB | 0.154 s |
+| **whole 24k prefill** | **67.1 GB** | **0.25 s** |
+
+**Measured attention at 24k is ~150 s.** So attention moves 67 GB in 150 s =
+**0.45 GB/s, about 0.16% of this box's DRAM rate.** The kernel is not
+bandwidth-bound by three orders of magnitude, and the honest floor is set by the
+**L2** path (23.5 TB of fragment requests at an L2 rate of a few TB/s, i.e.
+single-digit seconds), not by DRAM at all.
+
+This is not a new claim -- it is what §10 measured and did not connect. §10
+capped the K/V allocation **64x** smaller, so every one of those fragment loads
+hit cache, and the kernel got **6% faster**. A kernel that were moving 201 GB
+from DRAM (§9.1) cannot lose only 6% when 98.4% of its bytes start in L2.
+
+### 12.1 AC2 re-derived
+
+| | s | tok/s |
+|---|---|---|
+| measured wall at 24 590 tokens | 366.6 | 67.1 |
+| GEMM + other (measured, context-independent) | 216.9 | -- |
+| **measured attention** | **~149.7** | -- |
+| **AC2 budget** | **273** | **90** |
+| **attention allowed** | **56.1** | |
+
+Attention must go **149.7 -> 56 s, a 2.7x kernel speedup**. In TFLOP/s terms the
+full layers are 1.88e14 FLOP (§5, unchanged -- that count is right) and currently
+run at ~1.74 TFLOP/s in isolation (§10), so the target is **~3.4 TFLOP/s = 22%
+of the 15.6 TFLOPS tensor peak measured by `examples/mma_peak.rs`**. Twenty-two
+percent is an ordinary number for a hand-written attention kernel. It is not the
+2% the old arithmetic implied.
+
+**Therefore: OQ4's conclusion ("needs 7.6 TFLOPS of GEMM") and OQ6 (added an hour
+ago, "is the GEMM a wall?") are both wrong, and are withdrawn in the same commit
+that records this.** The GEMM is 216.9 s and must not change; the entire 90 tok/s
+ask is an attention-kernel ask, worth 56 s out of a 273 s budget.
+
+### 12.2 What this re-opens
+
+* **§9.1b's "BQ=2 + key split + combine pass" is re-opened, not left refuted.**
+  Its refutation rested on the §9 cost split, which §10 withdrew. Its *own*
+  argument is untouched by §5's error and is in fact the strongest one now
+  available: the kernel is instruction-bound, so the only lever that matters is
+  **fragment loads and MMAs issued per byte of L1/L2 traffic**, and query blocking
+  multiplies MMAs-per-load in *both* halves (the `kf` fragment feeds BQ queries in
+  QK, the `bf` fragment feeds BQ accumulators in PV) while dividing the 23.5 TB of
+  fragment requests by BQ. Splitting the key range restores the grid that BQ=2
+  gives away, which is why the naive BQ=2 measured -2.0% and -6.2%.
+* **The `FLUSH_QUERY_BLOCK_MIN_KEYS = 16_384` threshold is now suspect** for the
+  same reason: it was chosen from §5's byte model.
+* **§10's real puzzle is smaller than it looked.** "Removing the MMAs does not
+  help" is much less strange next to "the loads hit L2": the kernel's instruction
+  mix, not its bytes, is the wall. What still needs explaining is that removing
+  the QK *and* PV *instructions* moves nothing -- that remains unexplained and
+  is recorded as OQ7.
