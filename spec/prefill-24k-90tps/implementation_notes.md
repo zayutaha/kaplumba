@@ -1252,3 +1252,27 @@ but it cannot produce a valid one. Closing AC1 (decode >= 14 @24k) needs either
 a quieter machine (desktop closed, or a second box) or a lower-footprint
 configuration. Until then the 8k result in §14.3 is the trustworthy decode
 measurement, and it is a lower bound for 24k rather than an estimate of it.
+
+### 14.5 A second context point, and a useful noise measurement
+
+`bash /tmp/ctx_curve.sh 24576 4096` (4096 is exactly the shipped threshold, so
+the flash arm is on):
+
+| ctx | arm | prefill tok/s | decode tok/s |
+|---|---|---|---|
+| 4106 | scalar | 82.936 | 12.787 |
+| 4106 | **MMA** | 86.042 | **13.346** |
+
+* **Decode +4.4% at 4k, against +8.2% at 8k.** Two points, same direction, and
+  the gain grows with context -- the shape oMLX measured (+2.8% @8k rising to
+  +71.6% @256k). One round each, so it is a data point rather than a curve; the
+  8k figure (3 interleaved rounds) remains the load-bearing one.
+* **The prefill column is a noise measurement, not an effect.** `KAPLUMBA_DECODE_FLASH`
+  cannot touch prefill -- it selects a kernel inside `encode_decode_split_*`,
+  which decode dispatches through and prefill does not -- so 82.936 vs 86.042 is
+  **3.7% of pure run-to-run spread at 4k**. Useful to have: it sets the floor on
+  what this box can resolve without interleaving, and it is a reminder that the
+  §11 24k prefill pair (67.10 / 55.42) was one round each and carries at least
+  this much uncertainty.
+* The 16 384-token arms of this run did not complete before the session ended,
+  so there is no data point between 8k and the unmeasurable 24k.
