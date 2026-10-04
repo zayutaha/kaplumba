@@ -1929,3 +1929,46 @@ it up wants a prompt + `--max-new-tokens 32` and `KAPLUMBA_GPU_PROFILE=1`.
   owner's decision.
 * `phys_footprint` at 16k is 15.54 GiB, not the 18.35 GiB §11.1 recorded at 24k —
   consistent, since that run was 24 590 tokens against 16 394 here.
+
+---
+
+## 21 — Post-scorecard: the positive control that was not one
+
+`scripts/test_gpuq_mem.sh` finished the session with an end-to-end positive control
+— *the harness must be able to dispatch an arm at all* — and that control was wrong
+in three separate ways before it was right. Each was found by reading its own
+output, not by a sabotage.
+
+1. **It pointed at a branch the harness no longer had.** The committed harness
+   (`bench_decode_splits.sh`) takes `LOG`/`OUTDIR` and dispatches for real; the
+   positive control still passed `DRY_RUN=1`, which only the pre-commit harness
+   understood. The harness wrote its summary into the default `OUTDIR`, the log at
+   `$LOG` was never created, and **both** assertions reported FAIL — while the exit
+   code alone was being read as "harness fine".
+2. **`bench_decode_splits.sh` silently ignored `LOG=`.** It wrote
+   `OUTDIR/summary.tsv` unconditionally. Any caller passing `LOG=` got the summary
+   somewhere else and nothing where it asked — which is precisely why (1) failed
+   with "no such file" rather than "no VALID arm". Fixed: `SUMMARY=${LOG:-$OUTDIR/summary.tsv}`.
+3. **The stub `gpuq` did not run the command it was handed.** Its `try` branch was
+   `exit 0`, so the stub binary was never invoked, the log was empty, and the
+   assertion was reading an artefact of the stub rather than of the harness. Fixed
+   to `exec "$@"`. It also has to print `time -l`'s shape (the OQ5 CPU check reads
+   it) and to sleep long enough for the memory poller to land at least twice —
+   "no poll records" is a verdict the harness is *right* to return, so a control
+   that races the poller tests the wrong path.
+
+**Sabotage-verified after the fix:** making the harness skip every arm but one
+(so it never dispatches) fails the positive control with
+`FAIL: healthy box did not dispatch a VALID arm`, and the skip-side assertions
+still pass — i.e. the two checks are independent, which is what a positive control
+is for. Final state: `bash scripts/test_gpuq_mem.sh` → **37 ok, 0 FAIL, ALL PASS**.
+
+The generalisable point, and the third instance of it in this spec: **a "positive
+control" written against a harness is a test of the harness, and it can pass
+because the harness is not there.** Mine reported success for a harness that had
+been replaced. The check that caught it was making an *absent file* a failure
+rather than an absence.
+
+`TD_OVERRIDE` / `TD_KEEP` are exposed so a failing run's scratch directory can be
+inspected instead of being deleted by the EXIT trap — which is how (1) and (3) were
+diagnosed at all.

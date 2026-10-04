@@ -64,7 +64,9 @@ GOT_UNUSED=$(top_physmem_gib_on "PhysMem: 23G used (11G wired, 554M compressor),
 if [ "$GOT_UNUSED" = "0.12" ]; then printf '  ok   %-26s %s\n' "126M unused -> GiB" "$GOT_UNUSED"
 else printf '  FAIL %-26s expected 0.12 got %s\n' "126M unused -> GiB" "$GOT_UNUSED"; fail=1; fi
 
-TD=$(mktemp -d); trap 'rm -rf "$TD"' EXIT
+TD=${TD_OVERRIDE:-$(mktemp -d)}
+mkdir -p "$TD"
+[ -n "${TD_KEEP:-}" ] || trap 'rm -rf "$TD"' EXIT
 
 echo "== live =="
 LIVE=$(scripts/gpuq status 2>/dev/null)
@@ -258,31 +260,76 @@ echo "the binary was run on a box the gate could not parse"
 exit 0
 STUBEOF
 chmod +x "$STUB"
-GPUQ_BIN="$STUB" LOG="$LOG" MIN_UNUSED_GIB=4 \
+GPUQ_BIN="$STUB" LOG="$LOG" MIN_UNUSED_GIB=4 MAXNEW=1 \
   scripts/bench_decode_splits.sh 64 1 > "$TD/out" 2>&1
-if [ -e "$SENTINEL" ]; then
-  echo "  FAIL: harness ran the model on a box it could not parse"; fail=1
-else echo "  ok   harness did not run the model on an unparseable box"; fi
-if grep -q 'SKIPPED box-unhealthy' "$LOG"; then echo "  ok   arm recorded as SKIPPED"
-else echo "  FAIL: no SKIPPED line in the log"; cat "$LOG"; fail=1; fi
 
 echo "== end-to-end positive control: a HEALTHY box must let the arm through =="
 STUB2="$TD/gpuq_ok"
 cat > "$STUB2" <<'STUBEOF'
 #!/usr/bin/env bash
+# A healthy `gpuq`: the status line the gate parses, and for `try` it RUNS the
+# command it was handed -- an earlier version just exited 0, so the stub binary was
+# never invoked and the positive control was asserting against an empty log.
 if [ "${1:-}" = "status" ]; then
   echo "memory: 9.9 GiB available (reclaimable), 4 GiB in use by processes, 0 MiB swap"
   exit 0
 fi
-echo "STUB-RAN-THE-BINARY ok"
-exit 0
+shift
+[ "${1:-}" = "--" ] && shift
+exec "$@"
 STUBEOF
 chmod +x "$STUB2"
+# And now the positive control, against the harness's own dispatch path with a
+# stubbed `top` reporting a healthy box and a stubbed `KAPLUMBA_BIN` that succeeds.
+# This is the assertion that the "it skipped" check above skipped for the right
+# reason: it proves the harness is capable of running an arm at all.
+STUBBIN="$TD/kaplumba"
+cat > "$STUBBIN" <<'BINEOF'
+#!/usr/bin/env bash
+# Must take long enough for the harness's memory poller to land at least twice
+# (POLL_SECS=1), because "no poll records" is a verdict the harness is right to
+# return and the positive control must exercise the VALID path, not the
+# INVALID-no-poll path. It must also print `time -l`'s shape, because the OQ5 CPU
+# check reads it.
+echo "loading stub model ... "
+sleep 1
+echo "loaded in 1000 ms"
+sleep 1
+echo "It does not matter."
+echo "prompt_tokens=64 generated_tokens=1 prefill_tok_s=100.000 decode_tok_s=15.000"
+echo "       2.50 real         0.10 user         0.05 sys"
+exit 0
+BINEOF
+chmod +x "$STUBBIN"
 LOG2="$TD/sweep2.log"
-GPUQ_BIN="$STUB2" LOG="$LOG2" MIN_UNUSED_GIB=4 DRY_RUN=1 \
+rm -f "$LOG2"
+GPUQ_BIN="$STUB2" KAPLUMBA_BIN="$STUBBIN" LOG="$LOG2" \
+  MIN_UNUSED_GIB=4 MAXNEW=1 POLL_SECS=1 ROUNDS=1 \
   scripts/bench_decode_splits.sh 64 1 > "$TD/out2" 2>&1 || true
-if grep -q 'DRY-RUN' "$LOG2"; then echo "  ok   healthy box let the arm run"
-else echo "  FAIL: healthy box blocked the arm"; cat "$LOG2"; fail=1; fi
+if [ ! -s "$LOG2" ]; then
+  echo "  FAIL: positive control wrote no log at all"; cat "$TD/out2" 2>/dev/null; fail=1
+elif grep -qE 'splits1 1 .* VALID' "$LOG2"; then
+  echo "  ok   healthy box dispatched the arm   $(grep -m1E ' VALID' "$LOG2" | cut -c1-96)"
+else
+  echo "  FAIL: healthy box did not dispatch a VALID arm"; cat "$LOG2"; fail=1
+fi
+# Now the SKIP side, which needs the log to exist at all. That check is why the
+# missing log is itself a failure rather than a silent pass: this positive control
+# once pointed at a `DRY_RUN` branch the committed harness no longer had, so the
+# harness wrote nothing, the stub gpuq was never invoked, and the skip assertion
+# below passed on a log that did not exist.
+if [ ! -s "$LOG" ]; then
+  echo "  FAIL: the skip arm wrote no log at $LOG"; cat "$TD/out" 2>/dev/null; fail=1
+elif grep -q 'SKIPPED box-unhealthy' "$LOG"; then
+  echo "  ok   arm recorded as SKIPPED"
+else
+  echo "  FAIL: no SKIPPED line in the log"; cat "$LOG"; fail=1
+fi
+if [ -e "$SENTINEL" ]; then
+  echo "  FAIL: harness ran the model on a box it could not parse"; fail=1
+else
+  echo "  ok   harness did not run the model on an unparseable box"
+fi
 
 [ "$fail" -eq 0 ] && echo "ALL PASS" || echo "FAILURES PRESENT"
 exit "$fail"

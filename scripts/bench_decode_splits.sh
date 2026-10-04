@@ -39,7 +39,11 @@ shift || true
 PROMPT=$(printf 'Explain the theory of relativity. %.0s' $(seq 1 "$(( KEYS / 6 ))"))
 
 mkdir -p "$OUTDIR"
-SUMMARY="$OUTDIR/summary.tsv"
+# `LOG` is accepted as an alias for the summary path, because that is the name the
+# other harnesses and the tests use. Without it a caller passing `LOG=` silently
+# gets the summary in OUTDIR and nothing where it asked -- which is exactly how
+# this harness's own positive control ended up reading an absent file.
+SUMMARY=${LOG:-$OUTDIR/summary.tsv}
 : > "$SUMMARY"
 
 {
@@ -82,8 +86,7 @@ run_arm() { # <label> <requested splits, or --> <round>
   fi
   local rc=$?
   kill "$poll_pid" "$watch_pid" 2>/dev/null; wait "$poll_pid" 2>/dev/null
-
-  if [ "$rc" = "75" ]; then
+    if [ "$rc" = "75" ]; then
     printf 'r%s %s %s GPU-BUSY\n' "$round" "$label" "$want" >> "$SUMMARY"
     rm -f "$marker"; return 0
   fi
