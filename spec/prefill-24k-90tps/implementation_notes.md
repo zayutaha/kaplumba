@@ -849,3 +849,49 @@ pipe, so a failed build read as success. Both are cheap checks; skipping them co
 more than the ablations were worth. The rule this suggests: **an ablation whose
 result is "the change did nothing" is only believable after a positive control
 has been shown to move the same instrument.**
+
+---
+
+## 11 — T4g follow-up: 24k E2E after T4f, and the arm separation is now 21%
+
+Interleaved A/B, one round each, `bash /tmp/ab_fullqk.sh 24576 1 flash mma`,
+24590-token prompt, temperature 0, `--max-new-tokens 1 --metrics`:
+
+| arm | prefill tok/s |
+|---|---|
+| **flash** | **67.10** |
+| mma | 55.42 |
+
+**T4f is worth +6.7% on the 24k wall** (62.87 -> 67.10), against +1.6% at 8k.
+The gain grows with context because the V loads it de-scattered are exactly the
+ones that scale with keys.
+
+**And the microbench is wrong about the ranking for the fourth time.** §10.2
+already recorded three independent confirmations that
+`attention_arm_throughput_at_prefill_geometry` cannot rank arms; here it reports
+`mma` 8% *faster* at 24 576 keys (958 vs 880 for the bq1 arm) and the engine
+reports `flash` **21% faster**. The margin at 24k (11.7 tok/s) is four times the
+one measured at 16k in §9.4, so the effect is real and grows with context.
+
+### 11.1 Where AC2 stands after T4f
+
+| | s | tok/s |
+|---|---|---|
+| measured wall at 24 590 tokens | 366.6 | **67.1** |
+| target for AC2 | 273 | 90 |
+| §5 floor: GEMM 213.7 + attention 86.0 + other 3.2 | 302.9 | **79.1** |
+
+So **AC2 needs 73 s more than a perfect attention kernel can deliver with the
+shipped GEMM**, and §5's arithmetic says closing that needs 7.6 TFLOPS of GEMM
+(measured 6.13-6.44) *and* attention at its 86 s streaming floor simultaneously.
+`spec/prefill-120tps` / `spec/engine-performance` §12/§14 already declared 7.5
+TFLOPS a wall after rejecting 64x64 tiles, KCHUNK=32, staged `astage`, 32
+accumulators, 8->4 simdgroups, the codebook LUT, `extract_bits`, concat fusion
+and resident weights.
+
+**This is the point at which "keep optimising attention" stops being the highest
+-value use of the remaining budget.** Attention now sits at ~132-145 s against
+an 86 s floor -- real headroom, but §10 shows we have no instrument that can
+attribute it, and the two biggest untried levers (GEMM at 59% of the wall, and
+decode at a 9.3x gap) are untouched. T2 is taken next; the GEMM question is
+recorded as OQ6 below.
