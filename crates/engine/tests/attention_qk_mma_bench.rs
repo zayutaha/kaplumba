@@ -206,8 +206,14 @@ fn attention_arm_throughput_at_prefill_geometry() {
     const PAIRS: usize = 3;
     // (shape, key_count, queries_count) -- 1024 queries is the engine's
     // `PREFILL_CHUNK`, and the key counts are the last chunk of an 8k and a 24k
-    // prefill.
-    let cases = [(FULL, 8192usize, 1024usize), (FULL, 24576, 1024)];
+    // prefill. 256 and 4096 probes how throughput scales with grid size: if the
+    // kernel were grid-starved the TFLOP/s would climb from 256 to 4096.
+    let cases = [
+        (FULL, 8192usize, 1024usize),
+        (FULL, 24576, 1024),
+        (FULL, 24576, 256),
+        (FULL, 24576, 4096),
+    ];
     for (shape, key_count, queries_count) in cases {
         let kv = key_count * shape.kv_heads * shape.head_dim;
         let queries = queries_count * shape.q_heads * shape.head_dim;

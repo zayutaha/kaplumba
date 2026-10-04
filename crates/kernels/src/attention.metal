@@ -1651,7 +1651,7 @@ static void attention_prefill_flash_body(
             const bool staged = (kt == partial_kt);
 #pragma unroll
             for (uint j = 0; j < NPER; ++j) {
-                const uint nt = sg + j * uint(NSG);
+                const uint nt = sg * uint(NPER) + j; // KAPLUMBA_NT_BLOCK
                 simdgroup_half8x8 bf;
                 if (staged) {
                     simdgroup_load(bf, tail + nt * 8u, HEAD_DIM);
@@ -1688,7 +1688,7 @@ static void attention_prefill_flash_body(
         const float inv = sm > 0.0f ? 1.0f / sm : 0.0f;
 #pragma unroll
         for (uint j = 0; j < NPER; ++j) {
-            const uint nt = sg + j * uint(NSG);
+            const uint nt = sg * uint(NPER) + j; // KAPLUMBA_NT_BLOCK
             device half *orow = output
                 + ((q0 + b) * params.q_heads + out_head) * uint(HEAD_DIM) + nt * 8u;
             orow[fn + 0u] = half(acc[b][j].thread_elements()[0] * inv);
