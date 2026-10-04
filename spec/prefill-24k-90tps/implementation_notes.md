@@ -584,6 +584,12 @@ to reach 90 tok/s (266 s) without cutting ~125 s out of these two numbers.
 
 ## 9 — T4e: where the flash kernel's time actually goes (ablation, 24 576 keys)
 
+> **SUPERSEDED BY §10 — the ablation table below does not reproduce.** Re-run
+> against the post-T4f body, `ksteps = 0` gives 966.88 ms against a 958.39 ms
+> baseline (here: 433 against 1148), and so does every other arm. Do not quote
+> the cost split or anything derived from it. Kept as the record of what produced
+> T4f.
+
 §7.5 and §8.1 blamed `simdgroup_load`s per MMA and occupancy. Both were wrong, and
 the reason they were wrong is that neither was measured on the kernel's real cost
 split. This is that split, from ablations in `attention.metal`, each measured on
@@ -733,3 +739,113 @@ GEMM is context-independent at ~9.4 ms/token, so at 24k it is ~225 s of the
 over 8k/16k/24k), consistent with attention being linear in context. Closing
 24k from 62.87 to 90 needs 381 s -> 273 s, i.e. **-108 s (28%)**, and GEMM alone
 is 225 s of it.
+
+---
+
+## 10 — T4g: the T4e ablation does not reproduce, and the microbench cannot be
+## used for compile-time ablation at all
+
+**Read this before quoting any number in §9.** T4g re-ran the §9 ablation against
+the post-T4f body (`1254780`). None of it reproduces.
+
+Same bench (`attention_arm_throughput_at_prefill_geometry`), same shape (full
+32q/4kv/d512), 24 576 keys, 1024 queries, BQ=1 arm `flash bq1`, median of 3,
+`scripts/gpuq try -- cargo test`, `| grep` filtering only, tree restored with
+`git checkout` after every arm:
+
+| variant | T4e (§9) | T4g (this section) |
+|---|---|---|
+| baseline | 1148 | **958.39** |
+| `ksteps = 0` (no PV) | 433 | **966.88** |
+| QK loop disabled | 689 | **959.90** |
+| both off | 36.7 | **941.88** |
+| quarter of the key tiles | -- | 956.17 |
+| eighth of the key tiles | -- | 947.33 |
+| `if (tid < 256u) { return; }` at the top of the body | -- | **964.79** |
+| 400 000-iteration float spin at the top of the body | -- | 962.77 |
+| 3 000 000-iteration threadgroup-memory spin | -- | **4 828.96** |
+| `mma` arm (untouched control, every run) | 869-871 | 867-894 |
+
+T4f explains the baseline (1148 -> 958 is the `nt` reordering). It explains
+nothing else. **Removing the PV MMAs and their V loads makes the kernel 0.9%
+slower. Removing the QK MMAs and their K loads makes it 0.2% faster. Removing
+both, or returning from the body before any of it, changes nothing.** An added
+spin loop *does* cost time, so the body is executing.
+
+### 10.1 What was ruled out, and how
+
+Each of these was checked and failed to explain it, so the next person does not
+repeat them:
+
+* **The patches did not build.** Ruled out. `cargo build --release -p
+  kaplumba-engine --tests` returns **0** with zero `^error` lines, and
+  `strings target/release/deps/attention_qk_mma_bench-738fbc382e39fb35 |
+  grep -c KAPLUMBA_ABLATE_exit` is **1** — the patched source is in the binary that
+  runs. (Note: the first version of the harness read `rc=$?` after a pipe into
+  `tail`, so `rc` was `tail`'s status and always 0. That bug is what made the
+  first two ablation rounds look clean. Always capture the status of the command
+  you care about.)
+* **The patches did not reach the executing kernel.** Ruled out for `ksteps = 0`
+  by construction: the same edit makes
+  `attention_flash_matches_scalar_on_the_full_shape` **FAIL** (`test result:
+  FAILED. 2 passed; 1 failed`), so the edited body is the one producing output.
+* **The bench was not dispatching the flash kernel.** Ruled out by an
+  `eprintln!` inside `encode_online_attention_qk_block`:
+  `qk=Flash block=1 ... flash_pipeline=true bq1_some=true bq2_some=true` and
+  `qk=Flash block=2`. The `block == 1 -> attention_flash_bq1_pipeline` /
+  `block == 2 -> attention_flash_pipeline` selection resolves, for
+  `head_dim=512 groups=8`, i.e. `flash_supported` is true and both pipelines
+  exist. Neither arm silently falls back to MMA.
+* **The cost is host-side.** Ruled out. An arm that builds a `MetalEncoder` and
+  drops it without committing reports **0.05 ms** (three samples 0.01-0.10).
+* **The kernel is bandwidth-bound.** Ruled out. Capping the K/V allocation
+  (`KV_ELEMS`) from 50 331 648 halves (100 MB) to 4 194 304 (8 MB) to 262 144
+  (0.5 MB), with `key_count` unchanged so the same 24 576 keys are read, moved
+  `flash bq1` at 8192 keys/1024 queries from **303.57 -> 292.64 -> 284.04 ms**:
+  a **64x** reduction in the bytes available to the loads bought 6%. If the
+  kernel were moving 201 GB (§9.1) from DRAM, this is where it would show.
+* **The time is not proportional to the work.** Ruled out, and this is the
+  result that makes the whole thing incoherent. Adding cases to the bench at a
+  fixed 1024 queries:
+
+  | keys | 64 | 1024 | 4096 | 24576 |
+  |---|---|---|---|---|
+  | `flash bq1` ms | 2.28 | 32.24 | 144.36 | 947.35 |
+  | TFLOP/s | 1.89 | 2.13 | 1.90 | 1.74 |
+
+  Perfectly linear in `keys`, flat in TFLOP/s, and equally linear in `queries`
+  (256 / 1024 / 4096 -> 237 / 947 / 3825 ms). **An empty kernel cannot have a
+  cost that is linear in `keys * queries`.** So the body *is* doing the work; so
+  is deleting it.
+
+### 10.2 What this means for the spec
+
+1. **§9's cost split (loads 44%, MMA 52%, softmax 3%) is not reproducible and
+   must not be used to justify a change.** It is kept above only as the record of
+   what produced T4f's design; every conclusion drawn from it in §9.1, §9.1b and
+   §9.2 rests on a measurement that does not survive a re-run.
+2. **§9.1b's "BQ=2 + key split + combine pass" stays refuted** — not because the
+   byte arithmetic is wrong (it is right) but because it was justified by a split
+   that does not reproduce. It is refuted *a fortiori*: the same reasoning
+   predicted BQ=2 would help, and BQ=2 measured -2.0% (§8.2) and +0% E2E.
+3. **The microbench is a valid throughput instrument and an invalid attribution
+   instrument.** It is stable (the `mma` control held 867-894 ms across ~12 runs,
+   ±1.5%; `scalar` 1239-1258), linear, and it reproduces T4f's effect. It cannot
+   attribute cost, and it cannot rank arms (§8.7, §9.4 — third confirmation).
+   **E2E is the only instrument that has ever ranked anything correctly here.**
+4. **Open hazard for whoever picks this up:** `pipeline_audit::build(...).ok()`
+   turns a Metal compile error into `None`, and the dispatch then falls back to
+   the MMA kernel *silently*. The bench prints the arm name it was asked for, not
+   the kernel it got. So a `.metal` edit that fails to compile produces a
+   plausible, stable, completely wrong number rather than an error. Any future
+   ablation must assert `flash_attention_available()` and print
+   `pipeline.function_name()` for the arm, not trust the label.
+
+### 10.3 Process failure worth recording
+
+Four ablation rounds were run before the obvious control — *does an empty kernel
+take zero time?* — was tried. The first two rounds also used a `rc=$?` after a
+pipe, so a failed build read as success. Both are cheap checks; skipping them cost
+more than the ablations were worth. The rule this suggests: **an ablation whose
+result is "the change did nothing" is only believable after a positive control
+has been shown to move the same instrument.**

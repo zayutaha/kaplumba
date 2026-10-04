@@ -92,7 +92,9 @@ full-shape ratio; then end-to-end 8k A/B before spending a 24k run.
 **Status:** 🔄 in progress. 8k +8.1% (T3). Query blocking **rejected in its
 grid-halving form**; cost split measured (T4e); arm decision settled (T4c);
 **T4f shipped +15-21% on the bench, +1.6% E2E at 8k** (`1254780`). The key-split
-plan was refuted before building it. **Next:** T4g -- re-ablate, then GEMM vs T2.
+plan was refuted before building it. **T4g done (negative, §10):** the §9 ablation
+does not reproduce and the microbench cannot attribute cost. **Next:** GEMM (T5)
+vs decode (T2), E2E only.
 
 ### T4a — query blocking (`BQ`): built, correct, **does not pay**
 
@@ -236,6 +238,43 @@ then choose between the GEMM (~225 s of the 24k wall, 59%, untouched by this who
 spec) and T2 (decode, untouched). Per §5, 90 tok/s needs **both** the GEMM and
 attention to improve.
 
+### T4g — re-ablation of the post-T4f body: **the T4e split does not reproduce** ✅
+
+**Status:** ✅ done, negative. `implementation_notes.md` §10. No product code
+changed; the working tree is byte-identical to `1254780` apart from these two spec
+files.
+
+Re-ran the §9 ablation against the T4f body, same bench, 24 576 keys / 1024
+queries / `flash bq1`, median of 3, tree restored after every arm:
+
+| variant | T4e | T4g |
+|---|---|---|
+| baseline | 1148 | 958.39 |
+| `ksteps = 0` | 433 | **966.88** |
+| QK off | 689 | **959.90** |
+| both off | 36.7 | **941.88** |
+| eighth of the tiles | -- | 947.33 |
+| `return` at the top of the body | -- | **964.79** |
+| 3 M-iteration threadgroup spin | -- | **4 828.96** |
+| `mma` control | 869-871 | 867-894 |
+
+Deleting the PV work, the QK work, both, or the entire body changes nothing; an
+added spin loop costs 3.9 s. Ruled out: build failure (`cargo` rc 0, marker
+present in the binary via `strings`), wrong kernel (`eprintln!` in the dispatcher
+shows `qk=Flash block=1 flash_pipeline=true`), host cost (no-commit arm 0.05 ms),
+bandwidth (`KV_ELEMS` 64x shrink buys 6%), and work-proportionality (time *is*
+linear in keys x queries: 2.28 / 32.24 / 144.36 / 947.35 ms at 64 / 1024 / 4096 /
+24576 keys).
+
+**Consequences:** §9's cost split and everything derived from it (§9.1, §9.1b,
+§9.2) is withdrawn as a basis for design. §9.1b stays refuted. The microbench is a
+throughput instrument, not an attribution instrument and not a ranking instrument
+(third independent confirmation, §8.7/§9.4/§10.2).
+
+**Rule adopted:** an ablation reading "the change did nothing" is only believable
+after a positive control has been shown to move the same instrument in the same
+build.
+
 ---
 
 ## T5 — Verify GEMM at 24k
@@ -245,6 +284,11 @@ attention to improve.
 **Intent:** Confirm GEMM per token is context-independent at 24k (R4).
 
 **Test:** profiled GEMM `own_ms`/token at 8k vs 24k within spread.
+
+**Priority after T4g:** this and T2 are the only untouched levers. GEMM is ~225 s
+of the ~381 s 24k wall (59%) at 6.13-6.44 TFLOPS against a ~7.8 ceiling, and
+attention cannot alone reach 90 tok/s (381 s - 132 s attention = 249 s = 96.6
+tok/s *if attention were free*, which it cannot be).
 
 ---
 
