@@ -301,3 +301,154 @@ TFLOPS, peak `phys_footprint`, five reference prompts, worst GEMM error, full
 suite. Evaluate AC1–AC5.
 
 **Test:** scorecard with medians and spread.
+
+---
+
+## T2b — MMA decode attention kernel ✅ `55cd5df`
+
+**Status:** ✅ done and measured. **Files:** `crates/kernels/src/attention.metal`,
+`crates/kernels/src/attention.rs`,
+`crates/engine/tests/attention_decode_flash_matches_split.rs` (new),
+`crates/engine/tests/attention_single_pass_bit_exact.rs`.
+
+**Intent:** replace decode's per-key 32-lane `simd_sum` + online-softmax update
+with 8x8 simdgroup MMA. §6 diagnosed decode as latency-bound; oMLX v0.7.0
+(`07d88dbd`, `omlx/patches/mimo_v2/sdpa_flash.py`) diagnosed the same kernel
+shape as ALU-bound at ~1/3 of DRAM bandwidth on different hardware and a
+different GQA ratio, and fixed it the same way.
+
+**Work:** `attention_decode_flash_512_8` = the prefill flash body with `BQ=1` and
+a new `PARTIALS` template parameter. Emits the same `(m, s, O)` layout the
+scalar split kernel emits, so `attention_decode_combine_*` and its exactness
+argument are reused untouched. Carried over from oMLX: **split count stays a
+runtime value** (a template split count cost them ~115 ms JIT/step and -22%
+decode @8k), fp32 MMA and fp32 partials, 4096-key threshold.
+
+**Correctness (AGENTS.md 3.4):** `attention_decode_flash_matches_split`, 15
+cases -- worst |flash - scalar| fp16 abs diff **0.000488** (one ulp), tol 5e-3,
+0 NaNs, across splits 1/2/3/5/13/16, a slice running off the end, and EMPTY
+splits (`key_count` < `splits * 64`). **Sabotage check:** dropping `split` from
+the partials index fails at `keys=64 splits=2: worst |flash - scalar| =
+0.5576477 exceeds tol 0.005` (111x) and only on `splits >= 2`, correct because
+splits=1 makes the paths identical by construction.
+
+**Regression found and fixed:** `the_one_wave_split_rule_costs_one_fp16_ulp_and_is_not_bit_exact`
+pins EXACT differing-element counts for the scalar rule; following the
+production default silently re-pointed it at the new kernel (8 passed -> 7
+passed, 1 failed). It now pins the scalar arm through `encode_decode_split_explicit`
+-- preserves its original subject rather than weakening the assertion.
+
+**Measured (interleaved A/B, 3 rounds, 8204 tokens, `--max-new-tokens 24`):**
+
+| arm | r1 | r2 | r3 | median |
+|---|---|---|---|---|
+| scalar | 12.000 | 12.059 | 11.990 | 12.000 (+-0.3%) |
+| **MMA** | 12.978 | 12.979 | 12.972 | **12.978 (+-0.03%)** |
+
+**+8.2% decode @8k**, and **+4.4% @4k** (12.787 -> 13.346, one round). Effect arm
+is an order of magnitude tighter than the control, so not a spread artefact.
+**AC3 (decode >= 12 @8k) was being met by 0.0% and is now met with 8% margin.**
+Gain grows with context (oMLX: +2.8% @8k -> +71.6% @256k), so 12.98 @8k is a
+**floor** for 24k, not an estimate of it.
+
+**Gates:** `KAPLUMBA_DECODE_FLASH=0` off, `KAPLUMBA_DECODE_FLASH_MIN_KEYS=<n>`
+threshold (default 4096), shape enforced in `encode_decode_split_explicit`
+(head_dim 512, 8 q-heads/kv-head only -- a test caught that this was initially
+unchecked, which would have dispatched a 256-thread kernel onto the 64-thread
+sliding shape).
+
+**Verified:** attention_single_pass_bit_exact 8 passed, attention_decode_flash_matches_split
+3 passed, attention_qk_mma_matches_scalar 3 passed, all rc 0.
+
+---
+
+## N1 — Prefill: slice the key range into successive dispatches (OQ9)
+
+**Status:** ☐ not started. **Priority: highest remaining.**
+
+**Files:** `crates/kernels/src/attention.metal`, `crates/kernels/src/attention.rs`,
+`crates/engine/src/model.rs` (prefill chunk loop).
+
+**Intent:** port oMLX's prefill key-range slicing. From
+`omlx/utils/nax_attention.py`: "several dispatches over consecutive key ranges
+(`OMLX_NAX_ATTN_PASS_KEYS` keys each, default 8192) that hand the fp32
+online-softmax row state (O accumulator, running max and sum) from one to the
+next through device memory, so each row computes exactly what one dispatch
+computes (bit-identical output)", because "one dispatch over a long key range
+lets its threadgroups drift apart until each streams its KV head from DRAM;
+per-slice dispatches keep the K/V they share in the on-chip caches."
+
+**Why:** it attacks the cache-residency loss §10 measured directly (a 64x smaller
+K/V buffer bought only 6%, so not DRAM-bound -- but T4f's *access-pattern* change
+was worth +6.7% E2E, so layout is what pays).
+
+**Constraints:** scratch fixed-size and context-independent (AGENTS.md §8). Row
+state = 1024 queries x 32 heads x 512 dims x 4 B = **67 MB fixed per chunk**,
+affordable inside the 20 GiB budget (currently 18.35 GiB). **No combine pass
+needed** -- unlike §12.2's parallel key-split, which stays an alternative.
+
+**Test:** bit-exact vs the current one-dispatch body; then E2E at 16k **first**
+(a ~6% effect is resolvable there; 24k carries ±20% per OQ5). Slice size is a
+sweep knob.
+
+**Risk:** medium. 67 MB written + read per slice may cost more than the cache
+residency it buys. Measure before believing.
+
+---
+
+## N2 — Unblock 24k measurement (OQ8)
+
+**Status:** ☐ blocked on user direction. **Blocks:** AC1 and validation of N1 at
+the context that matters.
+
+24k decode is **structurally unmeasurable** on this box: the run's own
+18.35 GiB footprint evicts the desktop and the compressor drives decode to
+0.055 tok/s (99x pessimisation). Three attempts have produced invalid samples.
+A gate cannot fix this. Options: (a) quieter machine, (b) lower-footprint 24k
+configuration, (c) re-baseline AC1 onto 8k. See `NEXT.md` §3.
+
+---
+
+## N3 — Cheap micro-wins from oMLX's decode kernel
+
+**Status:** ☐ not started. Low effort, unquantified.
+
+- Guard the O rescale on `m_new != m_run` ("a row whose max did not move has
+  factor 1: skipping its rescale is exact").
+- Head-dim split over simdgroup pairs (their `HS == 2`). We spend all 8
+  simdgroups on 8 query heads; splitting head dim trades simdgroups for a
+  shorter dependent chain. Our head dim is 512 vs their 192/128, so more
+  relevant here than there.
+- Also recorded from `07d88dbd`: their fused decode layer stack (one
+  row-concatenated q/k/v mat-vec, fused residual+RMSNorm) cut ~2.8k kernels/step
+  for a MoE model. Not portable as written, but it says **look at our
+  element-kernel count per decode step**.
+
+---
+
+## N4 — Re-examine `decode_splits` with the MMA kernel
+
+**Status:** ☐ not started. Supersedes the T2a sweep, whose arms were all invalid.
+
+The scalar kernel was latency-bound on a 64-workgroup grid; the MMA kernel's
+parallelism trade is different and may want **more** splits.
+`ATTENTION_SPLITS_MAX = 16` is a hard cap never probed above. oMLX keeps the
+split count a **runtime** value for a measured reason (template split count =
+~115 ms JIT/step, -22% decode @8k); ours already is.
+
+**Prerequisite:** N5 (a trustworthy harness).
+
+---
+
+## N5 — Fix the red OQ5 gate in the sweep harness
+
+**Status:** ☐ not started, **test is written and failing**.
+
+`/tmp/test_parse.sh` fails: `$1: unbound variable` under `set -uo pipefail`; both
+healthy cases report unhealthy and the live parse is empty. It has already caught
+two real parser bugs (`[^0-9]*` backtracking to the last digit run; single-token
+`17G`). N1 and N4 both need this harness. See `implementation_notes.md` §13.2.
+
+**Process rules this session earned:** never pipe a long measurement into `tail`
+(it buffers until EOF -- cost a ~50-minute sweep); a "the change did nothing"
+reading needs a positive control first.

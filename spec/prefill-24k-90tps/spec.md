@@ -5,13 +5,22 @@
 At **24k tokens of context**, reach **≥90 tok/s prefill** and **≥14 tok/s decode**,
 with no quality loss and within the 24 GiB machine budget.
 
-Current, measured on `mtp-speculation` (`882d874`, merged `spec/prefill-120tps`):
+Current, measured on `mtp-speculation`. "Before" is the merged
+`spec/prefill-120tps` baseline (`882d874`); "now" is `b73090d`.
 
-| | 8k | 24k | target @24k |
-|---|---|---|---|
-| prefill tok/s | 80.52 | **52.84** | **90** |
-| decode tok/s | 12.27 | **5.44** | **14** |
-| peak `phys_footprint` | 14.15 GiB | 18.35 GiB | < 20 GiB |
+| | 8k before | 8k now | 24k before | 24k now | target @24k |
+|---|---|---|---|---|---|
+| prefill tok/s | 80.52 | 82.42 | 52.84 | **67.10** | **90** |
+| decode tok/s | 12.27 | **12.98** | 5.44 | **not measurable** (OQ8) | **14** |
+| peak `phys_footprint` | 14.15 GiB | -- | 18.35 GiB | -- | < 20 GiB |
+
+> **Decode at 24k has no "now" number, and that is the finding, not a gap.**
+> The 24k run's own footprint is 18.35 GiB of a 24 GiB machine, so it evicts the
+> desktop and every later allocation is a compression event: a measured arm read
+> **0.055 tok/s**, a 99x pessimisation, against a 5.44 baseline. The 8k figure
+> (12.98, three interleaved rounds) is the trustworthy decode measurement, and it
+> is a **floor** for 24k, not an estimate: the gain grows with context
+> (+4.4% at 4k, +8.2% at 8k). See `implementation_notes.md` §14.4 and OQ8.
 
 > **Corrected after T1.** The 24k decode figure of 0.30–0.43 previously in this
 table came from a `KAPLUMBA_GPU_PROFILE=1` run; the profiler itself distorts
@@ -20,12 +29,20 @@ clean**). The clean 24k decode is 5.44 tok/s. There is **no memory cliff**
 (`swaps 0`, `sys` 20 s of 434 s), so `OQ1` is closed and decode is a 2.6×
 kernel-speedup ask, not a defect hunt. See `implementation_notes.md` §2b/§2c.
 
-Prefill at 24k is a **compute** problem with a measured budget: GEMM 213.7 s +
-attention 192.9 s of a 409.9 s kernel sum. The target 90 tok/s is 266 s total,
-so AC2 requires **attention 193 s → ≤ 52 s with GEMM untouched**. Full-layer
-attention currently runs at **1.06 TFLOPS** (12% of SIMT fp32 peak, 7% of the
-15.6 TFLOPS tensor peak); at 6 TFLOPS the run would land at 91.8 tok/s. AC2 is
-reachable only through an MMA flash-attention rewrite (T3).
+Prefill at 24k is an **attention** problem, not a GEMM problem. The measured
+budget at 67.10 tok/s is GEMM + other **216.9 s** (context-independent) plus
+attention **~149.7 s** of a 366.6 s wall. The 90 tok/s budget is 273 s, so **AC2
+requires attention 149.7 s → ≤ 56 s, a 2.7x kernel speedup, with the GEMM
+untouched.**
+
+> **Corrected in §12.** This paragraph used to say AC2 needs attention 193 s →
+> ≤ 52 s *and* a GEMM at 7.6 TFLOPS, on the strength of an 86 s "bandwidth
+> floor". **That floor was wrong by ~350x**: it counted 2048 B of DRAM per
+> (query,key) pair, but `PREFILL_CHUNK = 1024` means a whole chunk shares every
+> key, so the real 24k KV traffic is 67.1 GB ≈ 0.25 s. The kernel moves 0.45 GB/s,
+> about **0.16% of the DRAM rate** — it is not bandwidth-bound at all. In TFLOP/s
+> terms the full layers run at ~1.74 and need **~3.4**, which is 22% of the
+> 15.6 TFLOPS tensor peak: an ordinary number. OQ4 and OQ6 are withdrawn.
 
 ## Non-goals / restrictions
 
@@ -147,3 +164,25 @@ Additional for this spec:
   work-proportionality — §10.1). Until this is answered, no attention change can
   be *predicted*, only measured end to end, and the microbench must not be used
   to attribute cost.
+- **OQ8 — 24k decode is unmeasurable on this box.** **OPEN, and it blocks AC1.**
+  The 24k run's own `phys_footprint` is 18.35 GiB of a 24 GiB machine, so it
+  evicts the desktop and the compressor then drives decode to **0.055 tok/s**
+  (a 99x pessimisation; §14.4). Three separate attempts have now produced
+  invalid 24k decode samples (§13.1, §14.4). **A gate cannot fix this** — a gate
+  can refuse to report a compressed sample, not produce a valid one — so the
+  options are (a) a quieter machine (desktop closed, or a second box), (b) a
+  lower-footprint configuration to measure, or (c) accept 8k as the decode
+  acceptance context and re-baseline AC1 against it. **Needs user direction.**
+- **OQ9 — Should the prefill key range be sliced into successive dispatches?**
+  **OPEN, and it is the strongest remaining prefill idea.** oMLX v0.7.0's prefill
+  path (`omlx/utils/nax_attention.py`) runs "several dispatches over consecutive
+  key ranges (`OMLX_NAX_ATTN_PASS_KEYS` keys each, default 8192) that hand the
+  fp32 online-softmax row state (O accumulator, running max and sum) from one to
+  the next through device memory, so each row computes exactly what one dispatch
+  computes (bit-identical output)", for the stated reason that **"one dispatch
+  over a long key range lets its threadgroups drift apart until each streams its
+  KV head from DRAM; per-slice dispatches keep the K/V they share in the
+  on-chip caches."** That is a *different* mechanism from §12.2's parallel
+  key-split-plus-combine (which needs no combine pass and no extra partials
+  buffer beyond the row state), and it targets the same cache-residency loss that
+  §10 measured directly. It is **not yet built or measured here.**
