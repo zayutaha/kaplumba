@@ -53,16 +53,19 @@ instruction count; M=8 additionally removes the fake-lane loads. There is no
 "Q_TILE=8 exploiting existing rows" saving to be had beyond this.
 
 **Score extraction stays in registers — zero extra barriers vs scalar:**
-for fp32 8×8, lane `t` holds `C[t>>2][(t&3)*2]` and `C[t>>2][(t&3)*2+1]` (M-key, N-row).
-The sg's row is `sg`, whose pair column is `pair = sg>>1`, held by lanes
-`4m+pair` (one per key m). Per 8-key sub-tile each lane computes
-`mine = pair-matching element of its own held pair`, then one
-`simd_shuffle(mine, 4*m+pair)` fetches key `m`'s score; lanes in `[sub*8, sub*8+8)` keep
-the result in their scalar-layout score register (`lane = key within the 32-tile`).
-After the four sub-tiles the scalar steps 2–4 (online softmax `simd_max`/`simd_sum`,
-double-buffered `wbuf`, PV loop) are **copied verbatim**, so barrier count per 32-key
-tile is identical to scalar (1) in the fast path. The fragment-layout assumption above
-is exactly what `attention_qk_mma_matches_scalar` verifies; sabotage log below.
+the fp32 8×8 fragment lane map is the one the working GEMM uses
+(`linear.metal:10208-10209` + store macro `:10427-10433`): lane `t` holds
+`(M, N) = (lane_fm, lane_fn)` and `(lane_fm, lane_fn+1)` with
+`lane_fm = (t>=16 ? 4 : 0) + ((t>>1)&3)`, `lane_fn = (t&8 ? 4 : 0) + ((t&1)<<1)`.
+M = key, N = query row. Per 8-key sub-tile, key `m`'s dot for the sg's row `sg`
+lives on lane `src = (m>=4 ? 16 : 0) + ((sg>>1)>=2 ? 8 : 0) + 2*(m&3) +
+((sg>>1)&1)` at element index `sg&1`, fetched with one `simd_shuffle`, landing
+directly in the scalar layout `lane = key within the 32-tile` that steps 2–4
+expect. (The design originally guessed `row = t>>2`; the correctness test
+caught it — see findings.) No score buffer, no publish, no extra barrier.
+After the four sub-tiles the scalar steps 2–4 (online softmax
+`simd_max`/`simd_sum`, double-buffered `wbuf`, PV loop) are **copied verbatim**,
+so barrier count per 32-key tile is identical to scalar (1) in the fast path.
 
 **Tail sub-tile** (`k0+8 > range_end`, at most once per pass, uniform across the
 threadgroup so its barrier is safe): cooperative guarded fill of `kbuf[8][HEAD_DIM]`

@@ -1112,9 +1112,12 @@ KAPLUMBA_FA_COMBINE(attention_decode_combine_512, 512)
 // scores and keeps column `sg` (rows >= NSG in `qhstage` are deliberately
 // unwritten garbage; their C columns are discarded and never read).
 //
-// Extraction stays in registers: for the fp32 8x8 fragment, lane t holds
-// C[t >> 2][(t & 3) * 2 + {0, 1}] (first index = M = key, second = N = row),
-// so key m's value for row `sg` sits on lane 4m + (sg >> 1), one simd_shuffle
+// Extraction stays in registers: the fp32 8x8 fragment lane map is the one
+// the working GEMM uses (linear.metal:10208-10209 + store macro :10427-10433)
+// -- lane t holds elements (lane_fm, lane_fn) and (lane_fm, lane_fn + 1) with
+// lane_fm = (t >= 16 ? 4 : 0) + ((t >> 1) & 3) and
+// lane_fn = (t & 8 ? 4 : 0) + ((t & 1) << 1) -- so key m's value for row `sg`
+// sits on one lane (see the formula at the extraction site), one simd_shuffle
 // away, and lands directly in the scalar layout `lane = key within the 32-tile`
 // that steps 2-4 expect. No score buffer, no publish, no extra barrier.
 //
