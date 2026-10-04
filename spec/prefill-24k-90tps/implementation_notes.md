@@ -984,3 +984,56 @@ ask is an attention-kernel ask, worth 56 s out of a 273 s budget.
   mix, not its bytes, is the wall. What still needs explaining is that removing
   the QK *and* PV *instructions* moves nothing -- that remains unexplained and
   is recorded as OQ7.
+
+---
+
+## 12.3 Verification state at `7568c7e` (end of session)
+
+**No product or test code changed in this session's second half.** Every ablation
+was applied to `crates/kernels/src/attention.metal` (and the temporary
+instrumentation to `attention.rs` and `attention_qk_mma_bench.rs`), then reverted.
+Confirmed by `git diff --stat 1254780 HEAD -- crates/` -> **empty**, and by a grep
+for `KAPLUMBA_ABLATE_`, `DBG qk=`, `DBG kv=`, `KV_ELEMS`, `ksteps = 0u` across
+`crates/` -> **no hits**.
+
+The last few builds in this session were made from *patched* `.metal` sources, so
+the verification below was re-run against a build of HEAD after `touch
+crates/kernels/src/attention.metal`:
+
+| check | result |
+|---|---|
+| `cargo build --release -p kaplumba-engine --tests` | rc 0 |
+| `attention_qk_mma_matches_scalar` | **3 passed**, rc 0 |
+| &nbsp;&nbsp;worst \|flash - scalar\| fp16 abs diff | **0.000488** (one ulp), tol 0.005, **0 NaNs**, 6 cases x {BQ=1, BQ=2} |
+| &nbsp;&nbsp;worst \|mma - scalar\| | **0.000000** (bit-exact) |
+| `attention_single_pass_bit_exact` | **8 passed**, rc 0 |
+
+**Quality: unchanged.** The only numerically-different path is the flash prefill
+kernel, which is one fp16 ulp from the scalar reference on every case -- the same
+result T3 recorded, and the reason flash is safe to ship.
+
+### Two process rules added by this session
+
+1. **Never pipe a long measurement run into `tail`.** `tail` buffers until EOF, so
+   a run that is interrupted (session end, timeout, a crash) produces *nothing*,
+   not even the arms that finished. A ~50-minute 24k decode sweep was lost this
+   way. Sweeps must append to a file per arm (`tee -a "$LOG"`), and the log path
+   must be outside the tool's stdout capture.
+2. **A measurement that has never been seen to fail is not a measurement.** See
+   §10.3. The positive control (does this instrument move at all?) has to pass
+   before any "the change did nothing" reading is believed.
+
+### Not run this session (limitations, not passes)
+
+* The **full workspace suite** was not re-run; a prior session recorded 4
+  pre-existing failures at base. Only the two attention suites were re-verified,
+  because only they cover the code that was touched.
+* **24k E2E was measured once per arm**, not interleaved over several rounds, so
+  the 67.10 / 55.42 pair carries this box's +-20% spread (OQ5). The 21% gap is
+  four times the 8k spread, so the *direction* is safe; the exact margin is not.
+* The decode split sweep at 24k (`KAPLUMBA_DECODE_SPLITS` 1/2/4/8/13/16) is
+  running now and its result is **not** in this file yet. `ATTENTION_SPLITS_MAX`
+  is 16, so the sweep cannot probe above it; if 16 is the best in range, the cap
+  itself is the next thing to question, and raising it enlarges the decode
+  partials buffer from `16 * q_heads * (head_dim + 2)` floats (4.2 MB at
+  `q_heads = 32, head_dim = 512`).
