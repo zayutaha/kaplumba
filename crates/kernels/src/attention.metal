@@ -1086,3 +1086,272 @@ KAPLUMBA_FA_SINGLE(attention_decode_single_256_2, 256, 2)
 KAPLUMBA_FA_SINGLE(attention_decode_single_512_8, 512, 8)
 KAPLUMBA_FA_COMBINE(attention_decode_combine_256, 256)
 KAPLUMBA_FA_COMBINE(attention_decode_combine_512, 512)
+
+// ===========================================================================
+// T1 (spec/prefill-120tps): simdgroup-MMA QK scoring, prefill path only.
+//
+// This body is `attention_gqa_body` with step 1 (the per-lane scalar dot at
+// :838-850) replaced by 8x8x8 `simdgroup_multiply_accumulate` tiles. Steps 2-4
+// (online softmax, double-buffered weight tile, PV) and the epilogue are copied
+// verbatim, so the barrier count per 32-key tile is unchanged in the fast path
+// and the weight/PV protocol is byte-for-byte the scalar one. The scalar body
+// is not modified, so every decode kernel (`KAPLUMBA_FA_DECODE`,
+// `KAPLUMBA_FA_SINGLE`) is untouched by construction.
+//
+// Fragment mapping (verified empirically by
+// `crates/engine/tests/attention_qk_mma_matches_scalar.rs`):
+//
+//   A = K tile, device load, no transpose   A[key][d] = K[k0+key][d8+d]
+//       (the proven `linear.metal:10391` pattern)
+//   B = Q, threadgroup load, TRANSPOSE      B[d][row] = qhstage[row][d8+d]
+//   C = A * B                               C[key][row] = dot(K, Q) pre-scale
+//
+// M is always the full 8 keys and N the full 8 rows of the threadgroup's wave,
+// so neither axis wastes lanes -- the 8x8 instruction executes N=8 whether or
+// not the lanes hold real rows, which is why each simdgroup computes all rows'
+// scores and keeps column `sg` (rows >= NSG in `qhstage` are deliberately
+// unwritten garbage; their C columns are discarded and never read).
+//
+// Extraction stays in registers: for the fp32 8x8 fragment, lane t holds
+// C[t >> 2][(t & 3) * 2 + {0, 1}] (first index = M = key, second = N = row),
+// so key m's value for row `sg` sits on lane 4m + (sg >> 1), one simd_shuffle
+// away, and lands directly in the scalar layout `lane = key within the 32-tile`
+// that steps 2-4 expect. No score buffer, no publish, no extra barrier.
+//
+// The tail sub-tile (k0 + 8 > range_end, at most once per pass and uniform
+// across the threadgroup) stages guarded rows into `kbuf` instead of reading
+// past `key_count`, so a dead key still never touches `keys` out of bounds.
+// ===========================================================================
+template <int HEAD_DIM, int NSG>
+static void attention_gqa_mma_body(
+    const device half *queries,
+    const device half *keys,
+    const device half *values,
+    const device uint *query_positions,
+    const device uint *key_positions,
+    device half *output,
+    constant AttentionParams &params,
+    uint tid,
+    uint tgid,
+    threadgroup float *wbuf,
+    threadgroup half *qhstage,
+    threadgroup half *kbuf) {
+    static_assert(HEAD_DIM % 256 == 0, "HEAD_DIM must be a multiple of 32 * 8");
+    // Same constant as the scalar body: finite, so `m_old - m` stays finite for
+    // a fully dead tile and `exp()` can never return NaN.
+    constexpr float NEG = -1.701411733864e+38f;
+    constexpr int VPT = 8;
+    constexpr int BLOCKS = HEAD_DIM / (32 * VPT);
+
+    const uint lane = tid & 31u;
+    const uint sg = tid >> 5u;
+    // Same barrier-safe `active` contract as the scalar body: an inactive
+    // simdgroup writes its own slot, runs every loop and every barrier, and
+    // only returns at the epilogue.
+    const uint groups = params.q_heads / params.kv_heads;
+    const bool active = sg < groups;
+    const uint head_in_kv = active ? sg : 0u;
+
+    const uint query = tgid / params.kv_heads;
+    const uint key_head = tgid - query * params.kv_heads;
+    const uint head = key_head * groups + head_in_kv;
+    const uint query_base = (query * params.q_heads + head) * uint(HEAD_DIM);
+    const uint q_abs = query_positions[query];
+    const uint kv_stride = params.kv_heads * uint(HEAD_DIM);
+    const uint head_base = key_head * uint(HEAD_DIM);
+    const device half *qrow = queries + query_base;
+    const uint range_end = params.key_count;
+
+    // This lane's slice of its own row: VPT consecutive dims, BLOCKS of them.
+    const uint lane_dim = lane * uint(VPT);
+    float4 acc[2 * BLOCKS];
+    for (int b = 0; b < BLOCKS; ++b) {
+        acc[2 * b + 0] = float4(0.0f);
+        acc[2 * b + 1] = float4(0.0f);
+    }
+    float m = NEG;
+    float s = 0.0f;
+
+    // Stage this simdgroup's Q row as halves: the transposed B load below reads
+    // qhstage as a half matrix, so unlike the scalar body's float `qfbuf` there
+    // is no half->float conversion here at all (the MMA consumes halves
+    // directly). Rows [NSG, 8) exist so the 8-row load is in bounds; they are
+    // never written and their C columns are discarded.
+    threadgroup half *qslot = qhstage + sg * uint(HEAD_DIM);
+    for (uint c = lane * 8u; c < uint(HEAD_DIM); c += 256u) {
+        *reinterpret_cast<threadgroup uint4 *>(qslot + c) =
+            *reinterpret_cast<const device uint4 *>(qrow + c);
+    }
+    // Barrier-safe exactly as scalar :816-818: every simdgroup writes a slot
+    // and every simdgroup's B load below reads all NSG slots.
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    threadgroup float *my_weights = wbuf + sg * 32u;
+
+    uint phase = 0u;
+    for (uint base = 0; base < range_end; base += 32u) {
+        const uint n = min(32u, range_end - base);
+        const uint k = base + lane;
+
+        // 1. score this lane's key with four 8-key MMA sub-tiles. `score` holds
+        //    the unnormalised dot until the live/scale step below, mirroring
+        //    scalar's `dot` at :837-851.
+        float score = NEG;
+        for (uint sub = 0u; sub < 4u; ++sub) {
+            const uint k0 = base + sub * 8u;
+            if (k0 >= range_end) {
+                // Uniform across the whole threadgroup (base and range_end are
+                // loop-invariant), so the break cannot strand a barrier.
+                break;
+            }
+            simdgroup_float8x8 dots = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
+            if (k0 + 8u <= range_end) {
+                for (int d8 = 0; d8 < HEAD_DIM; d8 += 8) {
+                    simdgroup_half8x8 kf, qf;
+                    simdgroup_load(kf, keys + k0 * kv_stride + head_base + d8,
+                                   kv_stride);
+                    simdgroup_load(qf, qhstage + d8, HEAD_DIM, ulong2(0, 0), true);
+                    simdgroup_multiply_accumulate(dots, kf, qf, dots);
+                }
+            } else {
+                // Tail: stage [k0, range_end) with zeros past the end so no
+                // out-of-bounds device read is ever issued; the scalar `live`
+                // test below forces those positions to NEG.
+                for (uint i = lane; i < 8u * uint(HEAD_DIM); i += 32u) {
+                    const uint row = i / uint(HEAD_DIM);
+                    const uint col = i % uint(HEAD_DIM);
+                    const uint pos = k0 + row;
+                    kbuf[i] = pos < range_end
+                        ? keys[pos * kv_stride + head_base + col]
+                        : half(0.0f);
+                }
+                threadgroup_barrier(mem_flags::mem_threadgroup);
+                for (int d8 = 0; d8 < HEAD_DIM; d8 += 8) {
+                    simdgroup_half8x8 kf, qf;
+                    simdgroup_load(kf, kbuf + d8, HEAD_DIM);
+                    simdgroup_load(qf, qhstage + d8, HEAD_DIM, ulong2(0, 0), true);
+                    simdgroup_multiply_accumulate(dots, kf, qf, dots);
+                }
+            }
+            // Lane map, decoded from the working GEMM store rather than
+            // guessed: linear.metal:10208-10209 defines
+            //   lane_fm = (lane >= 16 ? 4 : 0) + ((lane >> 1) & 3)   // M index
+            //   lane_fn = (lane & 8 ? 4 : 0) + ((lane & 1) << 1)      // N, even
+            // and linear.metal:10427-10433 stores thread_elements()[0] at
+            // (lane_fm, lane_fn) and [1] at (lane_fm, lane_fn + 1).
+            // Here M = key (A's rows), N = query row (B's cols), so key `m`,
+            // row `sg` lives on lane
+            //   src = (m >= 4 ? 16 : 0) + ((sg & ~1) >= 4 ? 8 : 0)
+            //        + 2 * (m & 3) + (sg & 1)
+            // at element index (sg & 1). Out-of-range lanes underflow `m`;
+            // src stays <= 31 by construction and their result is discarded
+            // by the guard below.
+            const float mine = dots.thread_elements()[sg & 1u];
+            const uint m = lane - sub * 8u;
+            const uint pair = sg >> 1u;
+            const uint src = ((m >= 4u) ? 16u : 0u)
+                + ((pair >= 2u) ? 8u : 0u)
+                + 2u * (m & 3u)
+                + (pair & 1u);
+            const float v = simd_shuffle(mine, ushort(src));
+            if (lane >= sub * 8u && lane < sub * 8u + 8u) {
+                score = v;
+            }
+        }
+
+        // Live-window test and scale: verbatim arithmetic from scalar
+        // :828-834 and :851, with the MMA dot standing in for `dot`.
+        bool live = active && (k < range_end);
+        if (live) {
+            const uint k_abs = key_positions[k];
+            live = (k_abs <= q_abs)
+                && (params.window == 0u || (q_abs - k_abs) < params.window);
+        }
+        score = live ? score * params.scale : NEG;
+
+        // 2. online softmax -- copied verbatim from scalar :854-862.
+        const float m_old = m;
+        m = simd_max(max(m, score));
+        const float ms = exp(m_old - m);
+        const float w = live ? exp(score - m) : 0.0f;
+        s = s * ms + simd_sum(w);
+        my_weights[phase * (NSG * 32u) + lane] = w;
+
+        // 3. one barrier per tile, double-buffered -- scalar :864-869.
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        // 4. PV -- copied verbatim from scalar :871-896.
+        const threadgroup float *tile = my_weights + phase * (NSG * 32u);
+        for (int b = 0; b < BLOCKS; ++b) {
+            const uint d = lane_dim + uint(b) * 32u * uint(VPT);
+            float4 lo = acc[2 * b + 0] * ms;
+            float4 hi = acc[2 * b + 1] * ms;
+            for (uint t = 0; t < n; ++t) {
+                const float wt = tile[t];
+                if (wt == 0.0f) {
+                    continue;
+                }
+                const device half *vrow =
+                    values + (base + t) * kv_stride + head_base + d;
+                const uint4 raw = *reinterpret_cast<const device uint4 *>(vrow);
+                const float2 vlo0 = unpack_half2(raw.x);
+                const float2 vlo1 = unpack_half2(raw.y);
+                const float2 vhi0 = unpack_half2(raw.z);
+                const float2 vhi1 = unpack_half2(raw.w);
+                lo += wt * float4(vlo0, vlo1);
+                hi += wt * float4(vhi0, vhi1);
+            }
+            acc[2 * b + 0] = lo;
+            acc[2 * b + 1] = hi;
+        }
+        phase ^= 1u;
+    }
+
+    if (!active) {
+        return;
+    }
+    // Reciprocal-multiply epilogue, same as the scalar prefill body :924-934.
+    const float norm = s > 0.0f ? 1.0f / s : 0.0f;
+    for (int b = 0; b < BLOCKS; ++b) {
+        const uint d = query_base + lane_dim + uint(b) * 32u * uint(VPT);
+        device half *orow = output + d;
+        const float4 lo = acc[2 * b + 0] * norm;
+        const float4 hi = acc[2 * b + 1] * norm;
+        *reinterpret_cast<device half2 *>(orow + 0) = half2(half(lo.x), half(lo.y));
+        *reinterpret_cast<device half2 *>(orow + 2) = half2(half(lo.z), half(lo.w));
+        *reinterpret_cast<device half2 *>(orow + 4) = half2(half(hi.x), half(hi.y));
+        *reinterpret_cast<device half2 *>(orow + 6) = half2(half(hi.z), half(hi.w));
+    }
+}
+
+// Prefill MMA kernel: same buffers as KAPLUMBA_FA_GQA, plus the Q-half staging
+// slot and the guarded tail tile. Threadgroup use at the worst instantiated
+// shape (NSG=8, HEAD_DIM=512): 2 KB wbuf + 8 KB qhstage + 8 KB kbuf = 18 KB.
+#define KAPLUMBA_FA_GQA_MMA(NAME, HEAD_DIM, NSG)                               \
+    kernel void NAME(                                                          \
+        const device half *queries [[buffer(0)]],                              \
+        const device half *keys [[buffer(1)]],                                 \
+        const device half *values [[buffer(2)]],                               \
+        const device uint *query_positions [[buffer(3)]],                      \
+        const device uint *key_positions [[buffer(4)]],                         \
+        device half *output [[buffer(5)]],                                     \
+        constant AttentionParams &params [[buffer(6)]],                        \
+        uint tid [[thread_position_in_threadgroup]],                           \
+        uint tgid [[threadgroup_position_in_grid]]) {                          \
+        threadgroup float wbuf[2 * (NSG) * 32];                                \
+        threadgroup half qhstage[8 * (HEAD_DIM)];                              \
+        threadgroup half kbuf[8 * (HEAD_DIM)];                                 \
+        attention_gqa_mma_body<HEAD_DIM, NSG>(queries, keys, values,           \
+            query_positions, key_positions, output, params, tid, tgid,         \
+            wbuf, qhstage, kbuf);                                              \
+    }
+
+// Same eight shapes as KAPLUMBA_FA_GQA: the host selects by gqa_index, and
+// pipeline_warmup_coverage requires every one of them to exist after new().
+KAPLUMBA_FA_GQA_MMA(online_attention_gqa_mma_256_1, 256, 1)
+KAPLUMBA_FA_GQA_MMA(online_attention_gqa_mma_256_2, 256, 2)
+KAPLUMBA_FA_GQA_MMA(online_attention_gqa_mma_256_4, 256, 4)
+KAPLUMBA_FA_GQA_MMA(online_attention_gqa_mma_256_8, 256, 8)
+KAPLUMBA_FA_GQA_MMA(online_attention_gqa_mma_512_1, 512, 1)
+KAPLUMBA_FA_GQA_MMA(online_attention_gqa_mma_512_2, 512, 2)
+KAPLUMBA_FA_GQA_MMA(online_attention_gqa_mma_512_4, 512, 4)
+KAPLUMBA_FA_GQA_MMA(online_attention_gqa_mma_512_8, 512, 8)

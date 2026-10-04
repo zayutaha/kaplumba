@@ -129,4 +129,52 @@ path split. Nothing in this worktree flips the default.
 
 ## Sabotage log (AGENTS.md §3.4)
 
-(filled in after the test is written — see bottom of file, updated as work proceeds)
+Test: `crates/engine/tests/attention_qk_mma_matches_scalar.rs` (12 cases: NSG
+1/2/4/8 × HEAD_DIM 256/512 × tails `<8`, `31/32/33`/`1000`/`2000` × window-dead
+and causal-dead keys × scale 1.0 and 1/sqrt(512); plus a second test pinning
+`encode_online_attention` == `AttentionQk::Scalar`).
+
+1. **Sabotage:** flipped the transposed Q load
+   (`simdgroup_load(qf, qhstage + d8, HEAD_DIM, ulong2(0,0), true)` → `false`,
+   both fast-path and tail sites). **Observed failure:** 12/12 cases diverge,
+   max abs diff per case 0.250977 … 1.308105 (clean run: 0.000000 on all 12),
+   NaN count 0, message: "MMA QK diverges from scalar on 12 case(s) … suspect
+   the simdgroup fragment layout (C[key][row] lane map), the extraction shuffle
+   source lane, the transposed Q load, the tail staging, or the post-extraction
+   scale". Diagnosable; reverted, test green again.
+2. Two earlier failing iterations were themselves the diagnosis (see below):
+   first the guessed fragment lane map (all cases 0.3–1.1 off, NSG=1 included),
+   then the sg>0 lane-selection term (NSG=1 exact, all others 0.5–1.4 off).
+
+**Clean-run measurement:** all 12 cases **bit-exact, max abs diff 0.000000** —
+the fp32 reassociation between the in-order scalar dot and the tensor-unit dot
+does not survive the fp16 store for these inputs (fp16-exact products of small
+values, partial sums well inside fp32's mantissa). The assertion still uses
+TOL = 5e-3 rather than 0, so the claim does not depend on that luck; the
+observed 0 is recorded here as the stronger empirical fact.
+
+## Findings recorded while implementing
+
+- **The fragment lane map is not the "row = lane>>2" layout.** The real map,
+  decoded from the working GEMM (`linear.metal:10208-10209` and the store macro
+  `linear.metal:10427-10433`): lane `t` holds elements
+  `(M, N) = (lane_fm, lane_fn)` and `(lane_fm, lane_fn + 1)` where
+  `lane_fm = (t >= 16 ? 4 : 0) + ((t >> 1) & 3)` and
+  `lane_fn = (t & 8 ? 4 : 0) + ((t & 1) << 1)`.
+  Extraction for key `m`, row `sg`: lane
+  `src = (m >= 4 ? 16 : 0) + ((sg>>1) >= 2 ? 8 : 0) + 2*(m & 3) + ((sg>>1) & 1)`,
+  element index `sg & 1`. First attempt used `sg&1` for the *lane* term too
+  (works for sg=0 only — NSG=1 passed while every other shape was O(1) wrong).
+- **`auto &&held = dots.thread_elements()` does not compile in MSL** ("reference
+  type must have explicit address space qualifier"); index inline
+  (`dots.thread_elements()[i]`), or the `thread` qualifier is lost.
+- `simdgroup_load` with a **device** source and no transpose is already proven
+  in this repo (`linear.metal:10391`); **threadgroup source with transpose**
+  (`true` as 5th arg) works on this hardware — that was the one unproven API in
+  the design and the sabotage run confirms it is load-bearing (removing it is
+  immediately visible).
+- **Pre-existing red on this branch, unrelated:** `probe_cache_hierarchy::
+  activation_loads_are_4_byte_alignable_and_collapse_2_to_1` fails identically
+  on a pristine `git stash`ed tree (it pins `linear_repacked.metal` line numbers
+  2121/2123/2160, a file untouched here).
+

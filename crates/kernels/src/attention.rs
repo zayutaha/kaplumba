@@ -413,6 +413,12 @@ pub struct AttentionKernels {
     /// `head_dim` is 256 or 512; `nsg` is the GQA ratio `q_heads / kv_heads`,
     /// which the kernel needs verbatim because it sizes the threadgroup.
     attention_gqa_pipelines: [ComputePipelineState; GQA_PIPELINES],
+    /// The same prefill shapes with the simdgroup-MMA QK scoring (T1,
+    /// `spec/prefill-120tps`), indexed by `gqa_index` like the scalar array.
+    /// Built eagerly in `new()` whether or not `attention_qk()` selects them:
+    /// `pipeline_warmup_coverage` fails on any pipeline a dispatch compiles
+    /// after construction.
+    attention_gqa_mma_pipelines: [ComputePipelineState; GQA_PIPELINES],
     /// The same body run over one split of the KV axis (flash-decoding).
     decode_split_pipelines: [ComputePipelineState; GQA_PIPELINES],
     /// The same body run over the whole KV axis in one threadgroup, writing the
@@ -444,6 +450,11 @@ fn gqa_pipeline_name(head_dim: usize, nsg: usize) -> String {
     format!("online_attention_gqa_{head_dim}_{nsg}")
 }
 
+/// Kernel name of the MMA-QK specialisation for one prefill shape.
+fn gqa_mma_pipeline_name(head_dim: usize, nsg: usize) -> String {
+    format!("online_attention_gqa_mma_{head_dim}_{nsg}")
+}
+
 /// The pipeline-array index a decode shape resolves to, or `None` when it has no
 /// specialisation and the prefill kernels take it. Public because
 /// [`AttentionKernels::encode_decode_single_pass`] and
@@ -468,6 +479,62 @@ fn decode_single_pass_name(head_dim: usize, nsg: usize) -> Option<String> {
         (256, 2) | (512, 8) => Some(format!("attention_decode_single_{head_dim}_{nsg}")),
         _ => None,
     }
+}
+
+/// Which prefill QK implementation `encode_online_attention` dispatches to.
+///
+/// The two arms are the T1 A/B (`spec/prefill-120tps`): `Scalar` is the
+/// per-lane dot product in `attention_gqa_body`, `Mma` is the simdgroup-8x8x8
+/// scoring in `attention_gqa_mma_body`. Both are reachable in-process through
+/// [`AttentionKernels::encode_online_attention_qk`], which is what
+/// `attention_qk_mma_matches_scalar` compares; the environment variable only
+/// picks which one the production entry point forwards.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AttentionQk {
+    Scalar,
+    Mma,
+}
+
+/// True for the spellings that mean "on"; anything else is off, so a typo can
+/// never silently select a path the caller did not ask for.
+fn qk_env_truthy(raw: &str) -> bool {
+    matches!(raw.trim(), "1" | "on" | "true" | "yes")
+}
+
+/// The process-wide prefill QK selection, read once (same `OnceLock` idiom as
+/// [`decode_single_pass_max_keys`]: it is consulted once per layer per prompt,
+/// and `getenv` takes a lock in some libc builds).
+///
+/// * `KAPLUMBA_SCALAR_ATTENTION=1|on|true|yes` -> [`AttentionQk::Scalar`],
+///   always wins: this is the brief's A/B spelling for forcing the baseline.
+/// * else `KAPLUMBA_MMA_ATTENTION=1|on|true|yes` -> [`AttentionQk::Mma`].
+/// * else the default, **`Scalar`**.
+///
+/// The default stays `Scalar` deliberately: `attention_single_pass_bit_exact`
+/// asserts the prefill GQA output equals the single-pass decode output in 0 of
+/// N fp16 elements, and the MMA's reassociated dot product cannot satisfy that.
+/// Flipping the default is a coordinator decision recorded in
+/// `spec/prefill-120tps/notes_T1_T2.md`, not something this knob does on its
+/// own. Decode never consults this: it goes through
+/// `encode_online_attention_split` / the single-pass path, neither of which
+/// calls `encode_online_attention`.
+pub fn attention_qk() -> AttentionQk {
+    static CACHE: std::sync::OnceLock<AttentionQk> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| {
+        if std::env::var("KAPLUMBA_SCALAR_ATTENTION")
+            .map(|raw| qk_env_truthy(&raw))
+            .unwrap_or(false)
+        {
+            return AttentionQk::Scalar;
+        }
+        if std::env::var("KAPLUMBA_MMA_ATTENTION")
+            .map(|raw| qk_env_truthy(&raw))
+            .unwrap_or(false)
+        {
+            return AttentionQk::Mma;
+        }
+        AttentionQk::Scalar
+    })
 }
 
 /// Threadgroups of `per_group` threads needed to cover `threads`, at least one.
@@ -497,16 +564,26 @@ impl AttentionKernels {
         let attention_tg2_256_pipeline = extra("online_attention_tg2_256")?;
         let attention_tg2_512_pipeline = extra("online_attention_tg2_512")?;
         let mut attention_gqa_pipelines = Vec::with_capacity(GQA_PIPELINES);
+        let mut attention_gqa_mma_pipelines = Vec::with_capacity(GQA_PIPELINES);
         let mut decode_split_pipelines = Vec::with_capacity(GQA_PIPELINES);
         for head_dim in GQA_HEAD_DIMS {
             for nsg in GQA_RATIOS {
                 attention_gqa_pipelines.push(extra(&gqa_pipeline_name(head_dim, nsg))?);
+                // T1: built unconditionally so the selection is an env-var
+                // choice between two already-compiled pipelines, never a
+                // compile inside a measured dispatch.
+                attention_gqa_mma_pipelines
+                    .push(extra(&gqa_mma_pipeline_name(head_dim, nsg))?);
                 decode_split_pipelines.push(extra(&decode_split_pipeline_name(head_dim, nsg))?);
             }
         }
         let attention_gqa_pipelines: [ComputePipelineState; GQA_PIPELINES] =
             attention_gqa_pipelines.try_into().map_err(|_| {
                 KernelError::Pipeline("unexpected transposed attention pipeline count".to_string())
+            })?;
+        let attention_gqa_mma_pipelines: [ComputePipelineState; GQA_PIPELINES] =
+            attention_gqa_mma_pipelines.try_into().map_err(|_| {
+                KernelError::Pipeline("unexpected MMA attention pipeline count".to_string())
             })?;
         let decode_split_pipelines: [ComputePipelineState; GQA_PIPELINES] =
             decode_split_pipelines.try_into().map_err(|_| {
@@ -544,6 +621,7 @@ impl AttentionKernels {
             attention_tg2_256_pipeline,
             attention_tg2_512_pipeline,
             attention_gqa_pipelines,
+            attention_gqa_mma_pipelines,
             decode_split_pipelines,
             decode_single_pipelines,
             decode_combine_256_pipeline,
@@ -902,14 +980,19 @@ impl AttentionKernels {
             (32 * groups) as u64,
         )
     }
-    pub fn encode_online_attention(
+    /// Prefill dispatch with the QK implementation passed in explicitly (T1,
+    /// `spec/prefill-120tps`): byte-for-byte the production body of
+    /// [`AttentionKernels::encode_online_attention`] below, minus the ablation
+    /// gate, plus an [`AttentionQk`] parameter. The explicit parameter is what
+    /// lets `attention_qk_mma_matches_scalar` run both paths inside one process
+    /// without fighting the `OnceLock` env cache. Grid geometry is identical
+    /// for both arms -- only the pipeline differs.
+    pub fn encode_online_attention_qk(
         &self,
         encoder: &mut crate::encoder::MetalEncoder,
         request: AttentionEncodeRequest<'_>,
+        qk: AttentionQk,
     ) -> Result<(), KernelError> {
-        if crate::ablated("attention") {
-            return Ok(());
-        }
         let AttentionEncodeRequest {
             queries,
             keys,
@@ -966,7 +1049,10 @@ impl AttentionKernels {
         // themselves and discard the surplus threads on an early return.
         let (pipeline, grid_groups, group_threads) = match gqa_index(head_dim, groups) {
             Some(index) => (
-                &self.attention_gqa_pipelines[index],
+                match qk {
+                    AttentionQk::Scalar => &self.attention_gqa_pipelines[index],
+                    AttentionQk::Mma => &self.attention_gqa_mma_pipelines[index],
+                },
                 (queries_count * kv_heads) as u64,
                 (32 * groups) as u64,
             ),
@@ -1002,6 +1088,25 @@ impl AttentionKernels {
             grid_groups,
             group_threads,
         )
+    }
+
+    /// Production prefill entry point: the ablation gate, then the QK
+    /// implementation the environment selected (see [`attention_qk`]).
+    ///
+    /// Decode does not come through here -- it dispatches through
+    /// `encode_online_attention_split` -- so `KAPLUMBA_ABLATE=attention`
+    /// remains a prefill-only switch, exactly what
+    /// `probe_budget_reconcile::the_attention_ablation_is_a_no_op_on_decode`
+    /// asserts.
+    pub fn encode_online_attention(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        request: AttentionEncodeRequest<'_>,
+    ) -> Result<(), KernelError> {
+        if crate::ablated("attention") {
+            return Ok(());
+        }
+        self.encode_online_attention_qk(encoder, request, attention_qk())
     }
 
     pub fn working_set_bytes(&self, request: &AttentionRequest<'_>) -> usize {
