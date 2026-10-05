@@ -1,0 +1,75 @@
+# SETTINGS AS PARSED: gb=8 rounds=9
+# crux2_bw  device=Apple M4 Pro  working set=8 GB  rounds=9  sabotage=false
+# 8 buffers x 58982400 uint4 = 58982400 elements; usable 7549747200 of 8000000000 bytes (94.37%)
+# CPU reference checksum over all buffers: 801966328 (0x2fcd08f8)
+# fill guard: position-pure OK; 64-byte-line sample 20000 over 117964800 lines -> 0 duplicates (birthday expectation 1.7)
+
+# coverage + bijection proof (host-side, mirrors the kernel index expression)
+  raster_burst1_buf1       per=81920  burst=1   iters=720    odd=1           bytes=943718400 (0.9437 GB) bijection OK
+  raster_burst24_buf1      per=81920  burst=24  iters=30     odd=1           bytes=943718400 (0.9437 GB) bijection OK
+  raster_burst6_buf1       per=81920  burst=6   iters=120    odd=1           bytes=943718400 (0.9437 GB) bijection OK
+  raster_burst12_buf1      per=81920  burst=12  iters=60     odd=1           bytes=943718400 (0.9437 GB) bijection OK
+  raster_burst48_buf1      per=81920  burst=48  iters=15     odd=1           bytes=943718400 (0.9437 GB) bijection OK
+  raster_burst1_buf8       per=10240  burst=1   iters=5760   odd=1           bytes=7549747200 (7.5497 GB) bijection OK
+  raster_burst24_buf8      per=10240  burst=24  iters=240    odd=1           bytes=7549747200 (7.5497 GB) bijection OK
+  CTRL_modidentity_b24     per=81920  burst=24  iters=30     odd=7           bytes=943718400 (0.9437 GB) bijection OK
+  stride0_b24_buf1         per=81920  burst=24  iters=30     odd=7           bytes=943718400 (0.9437 GB) bijection OK
+  stride1_b24_buf1         per=81920  burst=24  iters=30     odd=7           bytes=943718400 (0.9437 GB) bijection OK
+  stride2_b24_buf1         per=81920  burst=24  iters=30     odd=23          bytes=943718400 (0.9437 GB) bijection OK
+  stride3_b24_buf1         per=81920  burst=24  iters=30     odd=17          bytes=943718400 (0.9437 GB) bijection OK
+  stride4_b24_buf1         per=81920  burst=24  iters=30     odd=29          bytes=943718400 (0.9437 GB) bijection OK
+  stride0_b24_buf8         per=10240  burst=24  iters=240    odd=7           bytes=7549747200 (7.5497 GB) bijection OK
+  stride0_b1_buf1          per=81920  burst=1   iters=720    odd=241         bytes=943718400 (0.9437 GB) bijection OK
+  CONTROL_repeat           per=81920  burst=1   iters=720    odd=1           bytes=943718400 (0.9437 GB) bijection OK
+# round 0 done
+# round 1 done
+# round 2 done
+# round 3 done
+# round 4 done
+# round 5 done
+# round 6 done
+# round 7 done
+# round 8 done
+# round 9 done
+# round 10 done
+
+# CHECKSUM GATE (CPU reference 801966328)
+  raster_burst1_buf1       distinct=1 value=0xc5f9a11f want=expect_arm  PASS
+  raster_burst24_buf1      distinct=1 value=0xc5f9a11f want=expect_arm  PASS
+  raster_burst6_buf1       distinct=1 value=0xc5f9a11f want=expect_arm  PASS
+  raster_burst12_buf1      distinct=1 value=0xc5f9a11f want=expect_arm  PASS
+  raster_burst48_buf1      distinct=1 value=0xc5f9a11f want=expect_arm  PASS
+  raster_burst1_buf8       distinct=1 value=0x2fcd08f8 want=expect_arm  PASS
+  raster_burst24_buf8      distinct=1 value=0x2fcd08f8 want=expect_arm  PASS
+  CTRL_modidentity_b24     distinct=1 value=0xc5f9a11f want=expect_arm  PASS
+  stride0_b24_buf1         distinct=1 value=0xc5f9a11f want=expect_arm  PASS
+  stride1_b24_buf1         distinct=1 value=0xc5f9a11f want=expect_arm  PASS
+  stride2_b24_buf1         distinct=1 value=0xc5f9a11f want=expect_arm  PASS
+  stride3_b24_buf1         distinct=1 value=0xc5f9a11f want=expect_arm  PASS
+  stride4_b24_buf1         distinct=1 value=0xc5f9a11f want=expect_arm  PASS
+  stride0_b24_buf8         distinct=1 value=0x2fcd08f8 want=expect_arm  PASS
+  stride0_b1_buf1          distinct=1 value=0xc5f9a11f want=expect_arm  PASS
+  CONTROL_repeat           distinct=1 value=0xc5f9a11f want=expect_arm  PASS
+
+arm                         median       min       max   spread%   vs ref    %wire
+raster_burst1_buf1           231.6     222.2     237.7      6.72     0.00    84.8%
+raster_burst24_buf1          238.8     222.8     242.2      8.11     3.13    87.5%
+raster_burst6_buf1           235.3     228.4     241.5      5.58     1.59    86.2%
+raster_burst12_buf1          237.8     217.2     240.5      9.82     2.68    87.1%
+raster_burst48_buf1          234.7     228.0     243.0      6.41     1.35    86.0%
+raster_burst1_buf8           238.6     236.5     242.9      2.67     3.03    87.4%
+raster_burst24_buf8          240.3     235.5     243.4      3.29     3.77    88.0%
+CTRL_modidentity_b24         238.1     231.3     240.6      3.89     2.81    87.2%
+stride0_b24_buf1             232.9     224.0     242.4      7.87     0.58    85.3%
+stride1_b24_buf1             234.0     226.6     239.9      5.69     1.06    85.7%
+stride2_b24_buf1             236.5     227.5     240.7      5.61     2.11    86.6%
+stride3_b24_buf1             235.7     230.7     243.2      5.30     1.78    86.3%
+stride4_b24_buf1             236.5     227.5     241.8      6.06     2.14    86.6%
+stride0_b24_buf8             239.5     235.1     246.2      4.62     3.43    87.7%
+stride0_b1_buf1              234.5     223.6     240.3      7.12     1.25    85.9%
+CONTROL_repeat               232.8     221.8     237.3      6.66     0.55    85.3%
+
+# reference arm burst1_buf1 median = 231.6 GB/s
+# CONTROL_repeat difference = +0.55%  <-- the noise floor
+# nothing smaller than this may be reported as an effect
+# best arm = stride0_b24_buf8 at 246.2 GB/s (90.2% of wire)
