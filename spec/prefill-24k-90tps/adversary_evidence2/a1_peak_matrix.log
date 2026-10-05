@@ -1,0 +1,33 @@
+== run 1 ==
+mma_peak's kernel: 16 MMA sites, 8 stores -> 16 accumulators accumulated, 8 written out
+
+   MMAs  stores         ms  TFLOPS/src TFLOPS/live      vs 8/8
+     16       8      44.69       15.02        7.51      1.000
+     16      16      87.73        7.65        7.65      1.000
+     16      16      88.15        7.61        7.61      1.000
+     16      16      90.02        7.46        7.46      1.000
+      8       8      45.19        7.43        7.43      1.000
+      8      16      44.65        7.51        7.51      1.012
+     24      24     154.09        6.53        6.53      0.293
+== run 2 ==
+mma_peak's kernel: 16 MMA sites, 8 stores -> 16 accumulators accumulated, 8 written out
+
+   MMAs  stores         ms  TFLOPS/src TFLOPS/live      vs 8/8
+     16       8      45.15       14.86        7.43      1.000
+     16      16      88.45        7.59        7.59      1.000
+     16      16      88.63        7.57        7.57      1.000
+     16      16      87.53        7.67        7.67      1.000
+      8       8      44.02        7.62        7.62      1.000
+      8      16      44.55        7.53        7.53      0.988
+     24      24     152.66        6.59        6.59      0.288
+== run 3 ==
+mma_peak's kernel: 16 MMA sites, 8 stores -> 16 accumulators accumulated, 8 written out
+
+   MMAs  stores         ms  TFLOPS/src TFLOPS/live      vs 8/8
+     16       8      44.25       15.17        7.58      1.000
+     16      16      87.52        7.67        7.67      1.000
+     16      16      87.51        7.67        7.67      1.000
+     16      16      88.12        7.62        7.62      1.000
+      8       8      44.18        7.59        7.59      1.000
+      8      16      45.94        7.30        7.30      0.962
+     24      24     153.34        6.56        6.56      0.288

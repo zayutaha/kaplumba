@@ -1,0 +1,44 @@
+== run 1 ==
+      0      same, unroll forced x64      105.53     105.48     105.55        1.95     0.432
+      1                      batch 2       46.00      45.72      46.36        4.48     0.991
+      2                      batch 4       52.60      50.85      53.20        3.92     0.867
+      3                      batch 8       46.81      46.56      47.02        4.40     0.974
+      5     batch 4, DOUBLE BUFFERED       64.03      63.82      65.34        3.22     0.712
+      6   16 accumulators (reassoc.)       46.85      46.21      47.04        4.40     0.973
+     10     byte-identical twin of 0      107.39     105.89     107.82        1.92     0.425
+     11     kf from a fixed row (L1)      106.74     106.72     107.30        1.93     0.427
+     12              qf load deleted       88.28      87.53      89.37        2.34     0.517
+     13    SHIPPED, no unroll pragma       45.60      45.36      45.85        4.52     1.000
+== run 2 ==
+      0      same, unroll forced x64      105.66     105.50     107.41        1.95     0.428
+      1                      batch 2       46.02      45.90      47.16        4.48     0.984
+      2                      batch 4       50.81      49.98      51.33        4.06     0.891
+      3                      batch 8       45.91      45.78      46.33        4.49     0.986
+      5     batch 4, DOUBLE BUFFERED       64.30      63.88      64.98        3.21     0.704
+      6   16 accumulators (reassoc.)       46.29      46.10      47.17        4.45     0.978
+     10     byte-identical twin of 0      105.55     105.44     108.20        1.95     0.429
+     11     kf from a fixed row (L1)      108.48     106.95     108.56        1.90     0.417
+     12              qf load deleted       87.79      87.33      87.79        2.35     0.516
+     13    SHIPPED, no unroll pragma       45.27      44.54      45.99        4.55     1.000
+== run 3 ==
+      0      same, unroll forced x64      105.62     105.47     105.67        1.95     0.432
+      1                      batch 2       46.09      45.65      46.34        4.47     0.991
+      2                      batch 4       51.77      50.63      52.10        3.98     0.882
+      3                      batch 8       46.13      45.92      47.26        4.47     0.990
+      5     batch 4, DOUBLE BUFFERED       63.18      62.98      63.49        3.26     0.723
+      6   16 accumulators (reassoc.)       46.71      46.27      46.95        4.41     0.978
+     10     byte-identical twin of 0      107.89     107.61     108.61        1.91     0.423
+     11     kf from a fixed row (L1)      106.70     106.42     106.71        1.93     0.428
+     12              qf load deleted       87.81      87.47      88.18        2.35     0.520
+     13    SHIPPED, no unroll pragma       45.68      45.27      46.39        4.51     1.000
+== run 4 ==
+      0      same, unroll forced x64      107.66     107.36     107.71        1.91     0.418
+      1                      batch 2       46.15      45.70      46.56        4.47     0.975
+      2                      batch 4       50.70      50.61      51.84        4.07     0.887
+      3                      batch 8       45.79      45.57      46.04        4.50     0.983
+      5     batch 4, DOUBLE BUFFERED       63.75      62.40      63.87        3.23     0.706
+      6   16 accumulators (reassoc.)       46.35      46.06      47.37        4.45     0.971
+     10     byte-identical twin of 0      107.61     107.15     107.90        1.92     0.418
+     11     kf from a fixed row (L1)      108.76     106.53     109.13        1.90     0.414
+     12              qf load deleted       87.83      87.58      88.06        2.35     0.512
+     13    SHIPPED, no unroll pragma       45.00      44.97      46.14        4.58     1.000

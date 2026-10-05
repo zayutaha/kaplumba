@@ -1,0 +1,5 @@
+device: Apple M4 Pro tensor-core peak: 15.10 TFLOPS 
+device: Apple M4 Pro tensor-core peak: 15.22 TFLOPS 
+device: Apple M4 Pro tensor-core peak: 15.14 TFLOPS 
+device: Apple M4 Pro tensor-core peak: 14.98 TFLOPS 
+device: Apple M4 Pro tensor-core peak: 15.00 TFLOPS 

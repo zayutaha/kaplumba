@@ -1,0 +1,19 @@
+
+running 1 test
+
+      K       N                      shape worst_norm_err  vs 2.16e-3   verdict
+    128     128      test coverage (K=128)      5.0466e-4         0.2        OK
+    384     256      test coverage (K=384)      4.8742e-4         0.2        OK
+    512     512       beyond test coverage      5.2011e-4         0.2        OK
+   2048    1024       beyond test coverage      4.5038e-4         0.2        OK
+   4096    2048       beyond test coverage      3.1016e-4         0.1        OK
+   5376    4096      PRODUCTION k/v_proj K      3.1386e-4         0.1        OK
+   8192    2048 PRODUCTION o_proj K (full)      4.5459e-4         0.2        OK
+
+positive control on the metric: clean 5.0466e-4 -> +1e-3*peak on 1 element 1.0128e-3 (2.0x) -> +1e-1*peak 1.0001e-1 (198x)
+
+K 128 -> 8192: worst normalised error 5.0466e-4 -> 4.5459e-4 = 0.90x
+test gemm_error_grows_with_k_at_the_production_shapes ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 24.98s
+

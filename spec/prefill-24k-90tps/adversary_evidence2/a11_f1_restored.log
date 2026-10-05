@@ -1,0 +1,4 @@
+device: Apple M4 Pro
+flash_attention_available: true
+flash BQ=1: median   935.18 ms  [min 934.98 max 946.10]   output non-zero: true (sentinel 14143)
+flash BQ=2: median   884.41 ms  [min 883.47 max 884.99]   output non-zero: true (sentinel 14143)

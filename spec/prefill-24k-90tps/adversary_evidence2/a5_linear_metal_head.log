@@ -1,0 +1,14 @@
+
+running 7 tests
+test linear_rejects_invalid_shapes ... ok
+MASTER expected[0..3] = [-3.974316e-7, 0.0, 0.0]
+test metal_buffer_backed_linear_matches_slice_path ... ok
+test metal_linear_matches_cpu_fractional_matrix ... ok
+test metal_linear_matches_cpu_integer_matrix ... ok
+test metal_prefill_tiles_match_cpu_across_chunks_and_variants ... ok
+test metal_prefill_tiles_match_non_square_shapes ... ok
+mma_prefill_gemm_matches_cpu_reference: worst normalised error 2.1603336e-3
+test mma_prefill_gemm_matches_cpu_reference ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.11s
+
