@@ -1,0 +1,81 @@
+device: Apple M4 Pro | keys=24576 queries=1024 BQ=1 rounds=3
+  arm 0-shipped      lines changed vs shipping: +0
+  arm 1-unroll       lines changed vs shipping: +1
+  arm 2-unroll2      lines changed vs shipping: +1
+  arm 3-unroll4      lines changed vs shipping: +1
+  arm 4-unroll8      lines changed vs shipping: +1
+  arm 5-unroll16     lines changed vs shipping: +1
+  arm 6-unroll32     lines changed vs shipping: +1
+  arm spin           lines changed vs shipping: +4
+  arm empty          lines changed vs shipping: +1
+  arm noqk           lines changed vs shipping: +0
+  arm nopv           lines changed vs shipping: +0
+  arm noqk-nopv      lines changed vs shipping: +0
+  arm loads-l1       lines changed vs shipping: -2
+  arm noqf           lines changed vs shipping: -2
+  arm noaf           lines changed vs shipping: +0
+  arm noloads        lines changed vs shipping: -4
+  arm chains2        lines changed vs shipping: +10
+  arm chains4        lines changed vs shipping: +10
+
+--- correctness (bitwise vs arm 0, before any timing) ---
+  0-shipped                baseline | arm-0 non-zero u16: 16777216 of 16777216
+  1-unroll                 bytes differing:          0  worst norm diff: 0.000e0  (exact, as required)
+  2-unroll2                bytes differing:          0  worst norm diff: 0.000e0  (exact, as required)
+  3-unroll4                bytes differing:          0  worst norm diff: 0.000e0  (exact, as required)
+  4-unroll8                bytes differing:          0  worst norm diff: 0.000e0  (exact, as required)
+  5-unroll16               bytes differing:          0  worst norm diff: 0.000e0  (exact, as required)
+  6-unroll32               bytes differing:          0  worst norm diff: 0.000e0  (exact, as required)
+  spin                     bytes differing:          0  worst norm diff: 0.000e0  (exact, as required)
+  empty                    bytes differing:   33491080  worst norm diff: 1.000e0  (differs, as required)
+  noqk                     bytes differing:   33488285  worst norm diff: 1.000e0  (differs, as required)
+  nopv                     bytes differing:   33491080  worst norm diff: 1.000e0  (differs, as required)
+  noqk-nopv                bytes differing:   33491080  worst norm diff: 1.000e0  (differs, as required)
+  loads-l1                 bytes differing:   31625970  worst norm diff: 1.039e0  (differs, as required)
+  noqf                     bytes differing:   32502370  worst norm diff: 1.943e0  (differs, as required)
+  noaf                     bytes differing:   33466708  worst norm diff: 1.029e0  (differs, as required)
+  noloads                  bytes differing:   32504964  worst norm diff: 1.338e0  (differs, as required)
+  chains2                  bytes differing:     247368  worst norm diff: 6.601e-4  (bounded-ulp, as required)
+  chains4                  bytes differing:     228926  worst norm diff: 6.601e-4  (bounded-ulp, as required)
+
+--- timing, 3 interleaved rounds, median [min max] ms ---
+  0-shipped                   967.20 ms  [  964.74   973.73]    1.71 TFLOP/s  baseline
+  1-unroll                    968.83 ms  [  965.69   972.53]    1.70 TFLOP/s  
+  2-unroll2                   974.00 ms  [  965.37   974.82]    1.69 TFLOP/s  
+  3-unroll4                   970.65 ms  [  967.35   973.65]    1.70 TFLOP/s  
+  4-unroll8                   969.74 ms  [  963.57   970.43]    1.70 TFLOP/s  
+  5-unroll16                  970.68 ms  [  969.88   974.02]    1.70 TFLOP/s  
+  6-unroll32                 1001.91 ms  [  994.06  1002.27]    1.65 TFLOP/s  
+  spin                       4979.61 ms  [ 4979.03  4983.09]    0.33 TFLOP/s  
+  empty                         1.60 ms  [    1.32     1.78]  1030.39 TFLOP/s  
+  noqk                        441.21 ms  [  438.29   444.77]    3.74 TFLOP/s  
+  nopv                        421.57 ms  [  420.70   423.03]    3.91 TFLOP/s  
+  noqk-nopv                    12.85 ms  [   12.69    12.88]  128.32 TFLOP/s  
+  loads-l1                    766.72 ms  [  763.91   766.85]    2.15 TFLOP/s  
+  noqf                        791.19 ms  [  787.98   791.90]    2.08 TFLOP/s  
+  noaf                        934.32 ms  [  931.21   936.32]    1.77 TFLOP/s  
+  noloads                     460.72 ms  [  460.16   461.52]    3.58 TFLOP/s  
+  chains2                     965.90 ms  [  964.66   969.52]    1.71 TFLOP/s  
+  chains4                     972.58 ms  [  972.35   976.62]    1.70 TFLOP/s  
+
+--- ratios vs arm 0 (same process, same rounds) ---
+  1-unroll                 x 0.998    968.83 ms
+  2-unroll2                x 0.993    974.00 ms
+  3-unroll4                x 0.996    970.65 ms
+  4-unroll8                x 0.997    969.74 ms
+  5-unroll16               x 0.996    970.68 ms
+  6-unroll32               x 0.965   1001.91 ms
+  spin                     x 0.194   4979.61 ms
+  empty                    x604.261      1.60 ms
+  noqk                     x 2.192    441.21 ms
+  nopv                     x 2.294    421.57 ms
+  noqk-nopv                x75.250     12.85 ms
+  loads-l1                 x 1.261    766.72 ms
+  noqf                     x 1.222    791.19 ms
+  noaf                     x 1.035    934.32 ms
+  noloads                  x 2.099    460.72 ms
+  chains2                  x 1.001    965.90 ms
+  chains4                  x 0.994    972.58 ms
+
+control `spin`:    967.20 ms vs   4979.61 ms = x5.149 (the timer resolves a real change)
+control `empty` (§10's arm): 1.601 ms = 0.17% of the baseline (x604) -- the timing IS of the kernel body

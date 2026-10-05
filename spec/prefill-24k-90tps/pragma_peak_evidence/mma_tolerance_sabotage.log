@@ -1,0 +1,13 @@
+=== SABOTAGE 1: linear_gemm_mma output x1.005 (0.5% error), gate at 3e-3 ===
+thread 'mma_prefill_gemm_matches_cpu_reference' (39871653) panicked at crates/engine/tests/linear_metal.rs:876:5:
+integer bits=6: worst normalised error 3.8071708e-3 exceeds 3e-3
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.91s
+=== SABOTAGE 2: same 0.5% perturbation against the OLD gate (0.02) ===
+929:const MMA_TOLERANCE: f32 = 0.02;
+--- kernel x1.005 + MMA_TOLERANCE = 0.02 (the gate this spec shipped) ---
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 1.12s
+--- kernel x1.02 + MMA_TOLERANCE = 0.02 ---
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 1.83s
+--- kernel x1.03 + MMA_TOLERANCE = 0.02 ---
+integer bits=6: worst normalised error 2.053204e-2 exceeds 2e-2
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.83s

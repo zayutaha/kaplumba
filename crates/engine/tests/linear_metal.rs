@@ -885,7 +885,48 @@ fn assert_mma_close(label: &str, actual: &[f32], expected: &[f32], worst_so_far:
 /// accumulates 8x8 half products in a different order than the fp32 reference
 /// (64-wide chunks, four accumulator chains vs. one ascending loop). Both are
 /// documented in the kernel header (Q10, user decision 2026-09-27).
-const MMA_TOLERANCE: f32 = 0.02;
+///
+/// **This was 0.02 and enforced almost nothing** (`spec/prefill-24k-90tps` A5):
+/// AC5 states a 2.16e-3 bound, so the gate sat **9.3x above the spec's own
+/// limit**. A gate that loose cannot fail on anything short of a gross break.
+///
+/// **3e-3 is set against this test's own measured worst, not against a
+/// remembered figure.** The record, because two tighter values were tried and
+/// failed, which is what makes this a gate and not a decoration:
+///
+/// | `MMA_TOLERANCE` | result |
+/// |---|---|
+/// | 0.02 (was) | passes; 9.3x above the worst this test observes |
+/// | 5e-4 | **FAILS**: `integer bits=2: worst normalised error 5.628729e-4` |
+/// | 1e-3 | **FAILS**: `shape 128x256 queries=1: worst normalised error 2.1603336e-3` |
+/// | **3e-3** | passes; **1.39x** above the worst |
+///
+/// **AC5's 2.16e-3 is not stale -- it is this test's own worst**, at the small
+/// `128x256, queries=1` shape, and it was read off this test's output. So the
+/// correction to AC5 is not "the number is wrong"; it is that the gate was 9.3x
+/// above it.
+///
+/// The worst error at the shapes the engine actually **ships** is far lower.
+/// Measured through the production entry point
+/// (`spec/prefill-24k-90tps/adversary_evidence2/a5_gemm_error_budget.log`):
+///
+/// | K | N | shape | worst normalised error |
+/// |---|---|---|---|
+/// | 128 | 128 | test coverage | 5.05e-4 |
+/// | 384 | 256 | test coverage | 4.87e-4 |
+/// | 5376 | 4096 | production k/v_proj K | 3.14e-4 |
+/// | 8192 | 2048 | production o_proj K | **4.55e-4** |
+///
+/// so production sits **4.7x inside** AC5's bound and the error does **not** grow
+/// with K (0.90x from K=128 to K=8192 -- the metric normalises by the
+/// reference's peak magnitude, which grows with the dot product too). The
+/// residual is the fp16 rounding of every dequantized weight, which is a property
+/// of the weight format and not of K.
+///
+/// 3e-3 keeps 1.39x of headroom over the observed worst -- enough that a
+/// different compiler's rounding does not make the gate red for no reason -- and
+/// is **6.7x tighter** than what it replaced.
+const MMA_TOLERANCE: f32 = 3e-3;
 
 #[test]
 fn mma_prefill_gemm_matches_cpu_reference() {

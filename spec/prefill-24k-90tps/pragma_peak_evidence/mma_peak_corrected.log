@@ -1,0 +1,39 @@
+device: Apple M4 Pro
+pipeline: live1 (1024, 0 registers/lane)
+pipeline: live2 (1024, 0 registers/lane)
+pipeline: live4 (1024, 0 registers/lane)
+pipeline: live8 (1024, 0 registers/lane)
+pipeline: live16 (1024, 0 registers/lane)
+pipeline: live24 (1024, 0 registers/lane)
+pipeline: live32 (1024, 0 registers/lane)
+pipeline: dead8 (1024, 0 registers/lane)
+
+2048 simdgroups x 20000 iters, medians of 5 interleaved rounds
+   arm  chains   median_s      min_s      max_s    TFLOP/s  vs live8
+scale   live1    1 chains: measured/expected time = x1.051  (7.13 TFLOP/s)
+scale   live2    2 chains: measured/expected time = x1.017  (7.37 TFLOP/s)
+scale   live4    4 chains: measured/expected time = x0.994  (7.55 TFLOP/s)
+scale   live8    8 chains: measured/expected time = x1.000  (7.50 TFLOP/s)
+scale  live16   16 chains: measured/expected time = x0.983  (7.63 TFLOP/s)
+scale  live24   24 chains: measured/expected time = x0.904  (8.30 TFLOP/s)
+scale  live32   32 chains: measured/expected time = x0.925  (8.10 TFLOP/s)
+scale   dead8   16 chains: measured/expected time = x0.497  (15.08 TFLOP/s)
+ live1      1     0.0059     0.0057     0.0060       7.13    1.051
+ live2      2     0.0114     0.0111     0.0114       7.37    1.017
+ live4      4     0.0222     0.0220     0.0225       7.55    0.994
+ live8      8     0.0447     0.0442     0.0457       7.50    1.000
+live16     16     0.0880     0.0865     0.0888       7.63    0.983
+live24     24     0.1213     0.1205     0.1218       8.30    0.904
+live32     32     0.1656     0.1645     0.1678       8.10    0.925
+ dead8     16     0.0445     0.0444     0.0457      15.08    0.497
+
+--- controls ---
+live16 / live8  = x1.966  (expect ~2: twice the MMAs, twice the time)
+live8  / dead8  = x1.005  (expect ~2: the old kernel did 2x the live MMAs and, if the compiler had NOT deleted its dead chains, would take 2x as long)
+dead-store deletion reproduced: YES -- dead8 is the phantom peak, and it is ~2x too fast
+live16 at 1x iters 0.0888 s, at 2x iters 0.1761 s -> x1.984 (expect ~2)
+
+tensor-core peak (best live chain count, all accumulators stored): 8.30 TFLOPS
+  live8 7.50 | live16 7.63 | live24 8.30 | live32 8.10
+GEMM-only ceiling at this rate: 144.3 tok/s (attention at 0 ms)
+GEMM-only ceiling at 50% of peak: 72.1 tok/s

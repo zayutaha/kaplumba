@@ -1,0 +1,72 @@
+F1 REPRODUCTION — is §22.1's root cause ("a .metal edit does not reach the
+binary because of include_str!") true?
+
+Three checks, all through the ordinary build path. No env var, no --features, no
+touch, no clean.
+
+--- 1. cargo tracks the edit -------------------------------------------------
+$ cp crates/kernels/src/attention.metal /tmp/attention.metal.orig
+$ python3   # insert `if (tid < 256u) { return; }` at the top of
+            # attention_prefill_flash_body (§10's exact arm)
+$ cargo build --release -p kaplumba-engine --tests
+   Compiling kaplumba-kernels v0.1.0 (/Users/zayaantaha/coding/kaplumba/crates/kernels)
+    Finished `release` profile [optimized] target(s) in 11.92s
+
+So cargo recompiled the crate that `include_str!`s the file. The mechanism §22.1
+names does not apply.
+
+--- 2. the arm runs, and it collapses ----------------------------------------
+$ scripts/gpuq try -- cargo test --release --test attention_qk_mma_bench \
+      attention_arm_throughput_at_prefill_geometry -- --nocapture --exact
+  flash bq1    0.16 ms  [0.16 0.18]  3371.02 TFLOP/s      <- 8192 keys
+--- full    32q/4kv/d512 (NSG=8) keys=24576 queries=1024 (1649.27 GFLOP/iter) ---
+  flash bq1    0.18 ms  [0.16 0.23]  9158.37 TFLOP/s      <- 24576 keys
+test result: ok. 1 passed; 0 failed; ... finished in 47.88s
+
+§10 recorded 964.79 ms for this arm. Here it is 0.18 ms: a 5300x collapse,
+through the ordinary build path, no rebuild trickery.
+
+--- 3. restore, same command, kernel is back ---------------------------------
+$ cp /tmp/attention.metal.orig crates/kernels/src/attention.metal
+$ cargo build --release -p kaplumba-engine --tests
+    Finished `release` profile [optimized] target(s) in 11.73s
+$ scripts/gpuq try -- cargo test --release --test attention_qk_mma_bench \
+      attention_arm_throughput_at_prefill_geometry -- --nocapture --exact
+  flash bq1  288.78 ms  [287.56 293.10]    1.90 TFLOP/s
+  flash bq1  938.15 ms  [938.14 942.58]    1.76 TFLOP/s
+  flash bq1  237.53 ms  [237.48 238.42]    1.74 TFLOP/s
+  flash bq1 3728.72 ms  [3713.98 3733.57]  1.77 TFLOP/s
+test result: ok. 1 passed; 0 failed; ... finished in 87.87s
+
+--- 4. and a BROKEN .metal fails loudly, it does not fall back to a stale one -
+$ python3   # insert `this is not valid metal at all;`
+$ scripts/gpuq try -- cargo test --release ... > /tmp/brokenbuild.log 2>&1
+raw rc=101
+grep -cE "flash bq1" /tmp/brokenbuild.log   ->  0        (no timing printed at all)
+$ cargo test --release ... 2>&1 | grep -E "flash bq1|test result"
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 1 filtered out
+grep-pipeline rc=0
+
+Note the last line: through a grep-filtered view the exit status is grep's, i.e.
+0, on a FAILED build. That is §10.3's recorded process bug and it is the whole of
+why "the build returns 0" cannot establish anything on its own — but note what
+it does and does not produce: a build failure produces NO timing line, not a
+baseline-looking one. So §10's numbers are not build failures.
+
+CONCLUSION
+
+* §10's arm is a genuinely empty kernel (tid < 256 with 256 threads/group) and
+  it reads ~0.2 ms. F1's *conclusion* stands.
+* The arm reaches the binary by the ordinary build path. F1's stated *root
+  cause* — `include_str!` hiding the edit — is wrong.
+* §10's table also contains an arm that DID move (the 3 000 000-iteration
+  threadgroup spin, 4 828.96 ms against a 958.39 ms baseline). An added spin
+  cannot move a kernel that is not executing, so the edits were reaching the
+  shader in that run too. Both facts cannot hold of one binary.
+* The reconciliation is §10's own method: "tree restored with `git checkout`
+  after every arm". `git checkout` rewrites the file with a fresh mtime, and
+  cargo's freshness test for an `include_str!` input is mtime-based, so
+  edit -> build -> run -> checkout -> edit -> build -> run has a window in which
+  the next arm's build compiles the RESTORED source. That produces exactly §10's
+  signature: most arms at the baseline, one arm outside the window that moves.
+  It is a build-freshness race, not an include_str! limitation.
