@@ -1,0 +1,122 @@
+warning: unused import: `size_of_val`
+ --> crates/kernels/src/affine.rs:8:25
+  |
+8 | use std::mem::{size_of, size_of_val};
+  |                         ^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> crates/kernels/src/attention.rs:917:13
+    |
+917 |         let mut extra = |name: &str| -> Result<ComputePipelineState, KernelError> {
+    |             ----^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `attention_dim_256_pipeline` and `attention_dim_512_pipeline` are never read
+   --> crates/kernels/src/attention.rs:678:5
+    |
+671 | pub struct AttentionKernels {
+    |            ---------------- fields in this struct
+...
+678 |     attention_dim_256_pipeline: ComputePipelineState,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+679 |     attention_dim_512_pipeline: ComputePipelineState,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `zero_raw_pipeline`, `gemv_reduce_sk2_pipeline`, and `gemv_reduce_sk4_pipeline` are never read
+   --> crates/kernels/src/linear.rs:415:5
+    |
+356 | pub struct LinearKernels {
+    |            ------------- fields in this struct
+...
+415 |     zero_raw_pipeline: ComputePipelineState,
+    |     ^^^^^^^^^^^^^^^^^
+416 |     gemv_reduce_sk2_pipeline: Option<ComputePipelineState>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^
+417 |     gemv_reduce_sk4_pipeline: Option<ComputePipelineState>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ShardHeader`
+  --> crates/engine/src/drafter.rs:15:52
+   |
+15 | use crate::safetensors::{read_shard_header, DType, ShardHeader};
+   |                                                    ^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `phase` is never read
+    --> crates/engine/src/model.rs:4535:21
+     |
+4535 |                     phase = std::time::Instant::now();
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+4717 |         mark!(head_ms);
+     |         -------------- in this macro invocation
+     |
+     = help: maybe it is overwritten before being read?
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+     = note: this warning originates in the macro `mark` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `stream_len`
+    --> crates/engine/src/model.rs:5453:13
+     |
+5453 |         let stream_len = layer.gpu_cache.stream_len();
+     |             ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_stream_len`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `kv_heads` is never read
+  --> crates/engine/src/drafter_model.rs:36:5
+   |
+33 | struct Layer {
+   |        ----- field in this struct
+...
+36 |     kv_heads: usize,
+   |     ^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `integer_end` is never used
+   --> crates/engine/src/exl3.rs:305:4
+    |
+305 | fn integer_end(index: usize, bits: u8) -> usize {
+    |    ^^^^^^^^^^^
+
+warning: function `f16_scaled` is never used
+    --> crates/engine/src/model.rs:3348:4
+     |
+3348 | fn f16_scaled(bits: u16, scale: f32) -> f32 {
+     |    ^^^^^^^^^^
+
+warning: function `host_rng_step` is never used
+   --> crates/engine/src/sampler.rs:663:4
+    |
+663 | fn host_rng_step(state: u64) -> (f32, u64) {
+    |    ^^^^^^^^^^^^^
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> crates/engine/tests/attention_rescale_guard.rs:69:16
+   |
+69 |     fn encoder(&self) -> MetalEncoder {
+   |                ^^^^^     ^^^^^^^^^^^^ the same lifetime is hidden here
+   |                |
+   |                the lifetime is elided here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+   = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: use `'_` for type paths
+   |
+69 |     fn encoder(&self) -> MetalEncoder<'_> {
+   |                                      ++++
+
+
+running 8 tests
+........
+test result: ok. 8 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.23s
+

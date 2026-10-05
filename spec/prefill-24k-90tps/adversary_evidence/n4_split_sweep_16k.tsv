@@ -1,0 +1,10 @@
+# N4 decode split sweep (MMA kernel), keys=16384 rounds=2 splits=[13 16]
+# cap=16; arms above the cap are expected to CLAMP and are labelled as such
+# columns: round label requested_splits prompt_tokens decode_tok_s footprint
+r1 shipped -- prompt_tokens=16394 decode_tok_s=4.732 footprint=15.58GiB VALID  mem=[VALID polls=43 load-skipped=2 compressor_max=7.47GiB unused_min=0.08GiB] cpu=[sys-cpu 5.9% of wall (limit 2.0%)]
+r1 splits13 13 prompt_tokens=16394 decode_tok_s=12.375 footprint=15.55GiB VALID  mem=[VALID polls=42 load-skipped=2 compressor_max=6.67GiB unused_min=0.06GiB] cpu=[sys-cpu 4.9% of wall (limit 2.0%)]
+r1 splits16 16 prompt_tokens=16394 decode_tok_s=12.186 footprint=15.62GiB VALID  mem=[VALID polls=42 load-skipped=2 compressor_max=5.53GiB unused_min=0.09GiB] cpu=[sys-cpu 4.5% of wall (limit 2.0%)]
+r2 shipped -- prompt_tokens=16394 decode_tok_s=12.168 footprint=15.55GiB VALID  mem=[VALID polls=42 load-skipped=2 compressor_max=4.26GiB unused_min=0.08GiB] cpu=[sys-cpu 3.1% of wall (limit 2.0%)]
+r2 splits13 13 prompt_tokens=16394 decode_tok_s=12.393 footprint=15.58GiB VALID  mem=[VALID polls=42 load-skipped=2 compressor_max=7.76GiB unused_min=0.08GiB] cpu=[sys-cpu 3.7% of wall (limit 2.0%)]
+r2 splits16 16 prompt_tokens=16394 decode_tok_s=12.198 footprint=15.57GiB VALID  mem=[VALID polls=42 load-skipped=2 compressor_max=6.37GiB unused_min=0.08GiB] cpu=[sys-cpu 4.0% of wall (limit 2.0%)]
+SWEEP-DONE

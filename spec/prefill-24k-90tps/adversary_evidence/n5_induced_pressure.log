@@ -1,0 +1,45 @@
+=== E. N5 like-for-like: healthy vs induced compression at the SAME 16k context ===
+stage5.sh: line 13: 50370 Terminated: 15          bash "$ROOT/mempoll.sh" "$poll" > /dev/null 2>&1
+
+--- healthy (hog=0 GiB) rc=0 ---
+  swap: before [total = 3072.00M  used = 1894.38M  free = 1177.62M  (encrypted)]
+         after  [total = 3072.00M  used = 2220.19M  free = 851.81M  (encrypted)]
+  Pageins delta: 964765
+prefill_tok_s=75.976 decode_tok_s=12.154 
+  footprint=15.53GiB
+  real=228.70 user= sys=10.66 sys_pct_of_wall=4.7%
+  polls n=73 compressor_max=98M unused_min=
+stage5.sh: line 13: 52687 Terminated: 15          bash "$ROOT/mempoll.sh" "$poll" > /dev/null 2>&1
+stage5.sh: line 13: 52695 Terminated: 15          "$ROOT/hog" "$hog" 900 > "$OUT/hog_$hog.log" 2>&1
+
+--- hog4 (hog=4 GiB) rc=0 ---
+  swap: before [total = 3072.00M  used = 2220.19M  free = 851.81M  (encrypted)]
+         after  [total = 3072.00M  used = 2180.00M  free = 892.00M  (encrypted)]
+  Pageins delta: 1044141
+prefill_tok_s=75.865 decode_tok_s=12.158 
+  footprint=15.56GiB
+  real=230.41 user= sys=11.58 sys_pct_of_wall=5.0%
+  polls n=87 compressor_max=99M unused_min=
+stage5.sh: line 13: 55833 Terminated: 15          bash "$ROOT/mempoll.sh" "$poll" > /dev/null 2>&1
+
+--- healthy2 (hog=0 GiB) rc=0 ---
+  swap: before [total = 3072.00M  used = 2180.00M  free = 892.00M  (encrypted)]
+         after  [total = 4096.00M  used = 2500.62M  free = 1595.38M  (encrypted)]
+  Pageins delta: 1204887
+prefill_tok_s=74.943 decode_tok_s=12.029 
+  footprint=15.58GiB
+  real=229.60 user= sys=11.81 sys_pct_of_wall=5.1%
+  polls n=74 compressor_max=98M unused_min=
+stage5.sh: line 13: 57418 Terminated: 15          bash "$ROOT/mempoll.sh" "$poll" > /dev/null 2>&1
+stage5.sh: line 13: 57426 Terminated: 15          "$ROOT/hog" "$hog" 900 > "$OUT/hog_$hog.log" 2>&1
+
+--- hog7 (hog=7 GiB) rc=0 ---
+  swap: before [total = 4096.00M  used = 2484.62M  free = 1611.38M  (encrypted)]
+         after  [total = 4096.00M  used = 2494.75M  free = 1601.25M  (encrypted)]
+  Pageins delta: 990300
+prefill_tok_s=76.641 decode_tok_s=12.147 
+  footprint=15.58GiB
+  real=226.96 user= sys=10.42 sys_pct_of_wall=4.6%
+  polls n=86 compressor_max=99M unused_min=
+
+STAGE5-DONE

@@ -1,0 +1,179 @@
+warning: unused import: `size_of_val`
+ --> crates/kernels/src/affine.rs:8:25
+  |
+8 | use std::mem::{size_of, size_of_val};
+  |                         ^^^^^^^^^^^
+  |
+  = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: variable does not need to be mutable
+   --> crates/kernels/src/attention.rs:917:13
+    |
+917 |         let mut extra = |name: &str| -> Result<ComputePipelineState, KernelError> {
+    |             ----^^^^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `attention_dim_256_pipeline` and `attention_dim_512_pipeline` are never read
+   --> crates/kernels/src/attention.rs:678:5
+    |
+671 | pub struct AttentionKernels {
+    |            ---------------- fields in this struct
+...
+678 |     attention_dim_256_pipeline: ComputePipelineState,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+679 |     attention_dim_512_pipeline: ComputePipelineState,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `zero_raw_pipeline`, `gemv_reduce_sk2_pipeline`, and `gemv_reduce_sk4_pipeline` are never read
+   --> crates/kernels/src/linear.rs:415:5
+    |
+356 | pub struct LinearKernels {
+    |            ------------- fields in this struct
+...
+415 |     zero_raw_pipeline: ComputePipelineState,
+    |     ^^^^^^^^^^^^^^^^^
+416 |     gemv_reduce_sk2_pipeline: Option<ComputePipelineState>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^
+417 |     gemv_reduce_sk4_pipeline: Option<ComputePipelineState>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused import: `ShardHeader`
+  --> crates/engine/src/drafter.rs:15:52
+   |
+15 | use crate::safetensors::{read_shard_header, DType, ShardHeader};
+   |                                                    ^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: value assigned to `phase` is never read
+    --> crates/engine/src/model.rs:4535:21
+     |
+4535 |                     phase = std::time::Instant::now();
+     |                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+4717 |         mark!(head_ms);
+     |         -------------- in this macro invocation
+     |
+     = help: maybe it is overwritten before being read?
+     = note: `#[warn(unused_assignments)]` (part of `#[warn(unused)]`) on by default
+     = note: this warning originates in the macro `mark` (in Nightly builds, run with -Z macro-backtrace for more info)
+
+warning: unused variable: `stream_len`
+    --> crates/engine/src/model.rs:5453:13
+     |
+5453 |         let stream_len = layer.gpu_cache.stream_len();
+     |             ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_stream_len`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: field `kv_heads` is never read
+  --> crates/engine/src/drafter_model.rs:36:5
+   |
+33 | struct Layer {
+   |        ----- field in this struct
+...
+36 |     kv_heads: usize,
+   |     ^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `integer_end` is never used
+   --> crates/engine/src/exl3.rs:305:4
+    |
+305 | fn integer_end(index: usize, bits: u8) -> usize {
+    |    ^^^^^^^^^^^
+
+warning: function `f16_scaled` is never used
+    --> crates/engine/src/model.rs:3348:4
+     |
+3348 | fn f16_scaled(bits: u16, scale: f32) -> f32 {
+     |    ^^^^^^^^^^
+
+warning: function `host_rng_step` is never used
+   --> crates/engine/src/sampler.rs:663:4
+    |
+663 | fn host_rng_step(state: u64) -> (f32, u64) {
+    |    ^^^^^^^^^^^^^
+
+warning: hiding a lifetime that's elided elsewhere is confusing
+  --> crates/engine/tests/attention_rescale_guard.rs:69:16
+   |
+69 |     fn encoder(&self) -> MetalEncoder {
+   |                ^^^^^     ^^^^^^^^^^^^ the same lifetime is hidden here
+   |                |
+   |                the lifetime is elided here
+   |
+   = help: the same lifetime is referred to in inconsistent ways, making the signature confusing
+   = note: `#[warn(mismatched_lifetime_syntaxes)]` on by default
+help: use `'_` for type paths
+   |
+69 |     fn encoder(&self) -> MetalEncoder<'_> {
+   |                                      ++++
+
+
+running 8 tests
+. 1/8
+the_guard_is_exact_across_ragged_tiles --- FAILED
+the_guard_is_exact_when_the_max_never_moves_after_the_first_tile --- FAILED
+the_guard_is_exact_on_a_settled_max --- FAILED
+the_guard_is_exact_on_a_moving_max --- FAILED
+the_guard_is_exact_at_both_query_blocks_and_under_a_window --- FAILED
+the_guard_survives_a_very_long_key_range --- FAILED
+the_guard_is_exact_on_query_tails --- FAILED
+
+failures:
+
+---- the_guard_is_exact_across_ragged_tiles stdout ----
+
+thread 'the_guard_is_exact_across_ragged_tiles' (39260078) panicked at crates/engine/tests/attention_rescale_guard.rs:273:5:
+the guarded flash body is 0.24389648 from the scalar reference (queries=1024 keys=65 window=0 block=2, 2283638 of 16777216 values differ), above the 0.005 tolerance. A guard that fires when the max DID move is a wrong answer, not a rounding difference.
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+---- the_guard_is_exact_when_the_max_never_moves_after_the_first_tile stdout ----
+
+thread 'the_guard_is_exact_when_the_max_never_moves_after_the_first_tile' (39260083) panicked at crates/engine/tests/attention_rescale_guard.rs:273:5:
+the guarded flash body is 0.21362305 from the scalar reference (queries=1024 keys=1024 window=0 block=2, 12712960 of 16777216 values differ), above the 0.005 tolerance. A guard that fires when the max DID move is a wrong answer, not a rounding difference.
+
+---- the_guard_is_exact_on_a_settled_max stdout ----
+
+thread 'the_guard_is_exact_on_a_settled_max' (39260081) panicked at crates/engine/tests/attention_rescale_guard.rs:273:5:
+the guarded flash body is 0.38110352 from the scalar reference (queries=1024 keys=1024 window=0 block=2, 13080382 of 16777216 values differ), above the 0.005 tolerance. A guard that fires when the max DID move is a wrong answer, not a rounding difference.
+
+---- the_guard_is_exact_on_a_moving_max stdout ----
+
+thread 'the_guard_is_exact_on_a_moving_max' (39260080) panicked at crates/engine/tests/attention_rescale_guard.rs:273:5:
+the guarded flash body is 0.38110352 from the scalar reference (queries=1024 keys=4096 window=0 block=2, 13080342 of 16777216 values differ), above the 0.005 tolerance. A guard that fires when the max DID move is a wrong answer, not a rounding difference.
+
+---- the_guard_is_exact_at_both_query_blocks_and_under_a_window stdout ----
+
+thread 'the_guard_is_exact_at_both_query_blocks_and_under_a_window' (39260079) panicked at crates/engine/tests/attention_rescale_guard.rs:273:5:
+the guarded flash body is 0.38110352 from the scalar reference (queries=1024 keys=4096 window=0 block=1, 13080342 of 16777216 values differ), above the 0.005 tolerance. A guard that fires when the max DID move is a wrong answer, not a rounding difference.
+
+---- the_guard_survives_a_very_long_key_range stdout ----
+
+thread 'the_guard_survives_a_very_long_key_range' (39260085) panicked at crates/engine/tests/attention_rescale_guard.rs:273:5:
+the guarded flash body is 0.38110352 from the scalar reference (queries=1024 keys=24590 window=0 block=2, 13080342 of 16777216 values differ), above the 0.005 tolerance. A guard that fires when the max DID move is a wrong answer, not a rounding difference.
+
+---- the_guard_is_exact_on_query_tails stdout ----
+
+thread 'the_guard_is_exact_on_query_tails' (39260082) panicked at crates/engine/tests/attention_rescale_guard.rs:273:5:
+the guarded flash body is 0.38110352 from the scalar reference (queries=513 keys=4096 window=0 block=2, 5571488 of 8404992 values differ), above the 0.005 tolerance. A guard that fires when the max DID move is a wrong answer, not a rounding difference.
+
+
+failures:
+    the_guard_is_exact_across_ragged_tiles
+    the_guard_is_exact_at_both_query_blocks_and_under_a_window
+    the_guard_is_exact_on_a_moving_max
+    the_guard_is_exact_on_a_settled_max
+    the_guard_is_exact_on_query_tails
+    the_guard_is_exact_when_the_max_never_moves_after_the_first_tile
+    the_guard_survives_a_very_long_key_range
+
+test result: FAILED. 1 passed; 7 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.27s
+
+error: test failed, to rerun pass `-p kaplumba-engine --test attention_rescale_guard`

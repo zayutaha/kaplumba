@@ -1,0 +1,30 @@
+
+running 2 tests
+test attention_arm_throughput_at_prefill_geometry ... --- full    32q/4kv/d512 (NSG=8) keys=8192 queries=1024 (549.76 GFLOP/iter) ---
+  scalar       392.06 ms  [391.51 393.21]    1.40 TFLOP/s
+  mma          268.84 ms  [263.46 280.17]    2.04 TFLOP/s
+  flash bq1      0.18 ms  [0.17 0.18]  3115.51 TFLOP/s
+  flash bq2      0.16 ms  [0.16 0.17]  3450.36 TFLOP/s
+--- full    32q/4kv/d512 (NSG=8) keys=24576 queries=1024 (1649.27 GFLOP/iter) ---
+  scalar      1227.05 ms  [1222.67 1229.39]    1.34 TFLOP/s
+  mma          878.53 ms  [864.42 882.78]    1.88 TFLOP/s
+  flash bq1      0.19 ms  [0.19 0.21]  8591.77 TFLOP/s
+  flash bq2      0.18 ms  [0.16 0.30]  9124.58 TFLOP/s
+--- full    32q/4kv/d512 (NSG=8) keys=24576 queries=256 (412.32 GFLOP/iter) ---
+  scalar       305.08 ms  [303.98 305.30]    1.35 TFLOP/s
+  mma          204.37 ms  [203.93 224.93]    2.02 TFLOP/s
+  flash bq1      0.18 ms  [0.16 0.20]  2290.65 TFLOP/s
+  flash bq2      0.16 ms  [0.16 0.16]  2619.27 TFLOP/s
+--- full    32q/4kv/d512 (NSG=8) keys=24576 queries=4096 (6597.07 GFLOP/iter) ---
+  scalar      4936.80 ms  [4923.31 4948.73]    1.34 TFLOP/s
+  mma         3541.13 ms  [3525.46 3561.29]    1.86 TFLOP/s
+  flash bq1      0.19 ms  [0.19 1.04]  35396.75 TFLOP/s
+  flash bq2      0.17 ms  [0.17 0.19]  37724.49 TFLOP/s
+ok
+test attention_mma_bench_scalar_vs_mma ... full    32q/4kv/d512 (NSG=8) keys=8192 queries=16: scalar 9.22 ms [9.10 9.31] | mma 7.52 ms [7.50 7.62] | ratio mma/scalar = 0.816
+sliding 32q/16kv/d256 w1024 (NSG=2) keys=1024 queries=64: scalar 1.73 ms [1.69 1.75] | mma 2.65 ms [2.63 2.70] | ratio mma/scalar = 1.537
+sliding 32q/16kv/d256 w1024 (NSG=2) keys=8192 queries=16: scalar 1.23 ms [1.23 1.71] | mma 4.01 ms [3.99 4.65] | ratio mma/scalar = 3.245
+ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 49.39s
+

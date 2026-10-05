@@ -1,0 +1,6 @@
+# OQ9 prefill key-range pass A/B
+# keys=24590 prompt_tokens~24590 rounds=1 passes=[8192]
+# columns: round label pass_keys prompt_tokens prefill_tok_s decode_tok_s
+r1 onedispatch 0 prompt_tokens=24602 INVALID-NO-NUMBER footprint=17.07GiB rss=8.03GiB mem=[INVALID unused-dropped-to-0.03GiB (limit 0.05)] cpu=[sys-cpu 3.2% of wall (limit 2.0%)] marker=1791165041
+r1 pass8192 8192 prompt_tokens=24602 prefill_tok_s=68.401 decode_tok_s=0.000 footprint=17.01GiB rss=9.81GiB VALID mem=[VALID polls=70 load-skipped=2 compressor_max=7.12GiB unused_min=0.08GiB] cpu=[sys-cpu 3.9% of wall (limit 2.0%)] marker=1791165411
+SWEEP-DONE
