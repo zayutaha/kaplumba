@@ -695,3 +695,131 @@ is that the error was a symptom of the OQ8 memory stall (`unused` at 0.03-0.08 G
 on *good* runs), not a code path; that is a reading, not a finding. See
 implementation_notes.md §20.1 for what would be needed to pick it up again (a
 captured failing run's footprint + poll trace, not the prompt).
+---
+
+# Fixer pass (2026-10-05) — the nine adversary findings
+
+Work order: `adversary_report.md`. Full write-up: `fixer_report.md`.
+Durable technical record: `implementation_notes.md` §22 (F1) and §23 (F5).
+
+| # | finding | status | commit | where |
+|---|---|---|---|---|
+| **F1** | OQ7 answered; §10's ablation never reached the kernel; §10.2 #3 wrong | ✅ **FIXED** — instrument built, §9.1/§9.1b/§9.2/§10.2/§12.2/OQ7 corrected, cost split measured | `1a30427` (+ revert) | §22 |
+| **F2** | `PREFILL_PASS_MIN_GROUPS` gate is dead code | ✅ already fixed by the previous instance; the production-path test is committed | `a909028` | — |
+| **F3** | "default unchanged" is false; three documents disagree | ✅ **FIXED** — see below | (this commit) | §25 |
+| **F4** | the `workgroups` flip's quality evidence cannot fail | ✅ **FIXED** — measured at 1024/4096/16 394 tokens of context, where the two rules actually differ | (this commit) | §24 |
+| **F5** | AC2 arithmetic wrong by ~1.7x; AC2 may be unreachable | ✅ **FIXED** — re-derived; the o_proj lead killed; the ceiling stated honestly | (this commit) | §23 |
+| **F6** | "a third independent reproduction" | ✅ already withdrawn by the previous instance | `8a3d411` | — |
+| **F7** | filed crash | ✅ already withdrawn by the previous instance | `1d47bf8` | — |
+| **F8** | rescale guard: exact, never measured, control not in the tree | ✅ **FIXED** — **measured worth 4.9%**, so kept; the guard is *not* an unmeasured optimisation | `1a30427` (arm 9) | §26 |
+| **F9** | `LOG=` honoured in 1 of 3 harnesses | ✅ already fixed by the previous instance | `caf3631` | — |
+
+## F1 — the ablation instrument, and what it cost to be without one ✅
+
+* [x] Read `adversary_report.md` F1 and reproduce the sabotage **myself**, in one
+      binary, with a positive control. `attention_flash_ablation_arms`,
+      24 576 keys / 1024 queries, medians of 5 interleaved rounds:
+      **empty body 0.186 ms against 1 302.5 ms — 6 162x.**
+* [x] Establish *why* §10 read 964.79 ms for an empty kernel: `attention.metal` is
+      `include_str!`'d (`attention.rs:12`) and the flash path dispatches **256**
+      threads per threadgroup (`attention.rs:1609`), so `if (tid < 256u) { return; }`
+      retired *every* thread. The arms were measured against a stale build.
+* [x] Fix the class of bug, not the instance: the ablation selector travels in the
+      **uniform block**, so one build times every arm and a stale shader is
+      impossible. Arms interleaved; `flash_attention_available()` asserted first
+      (§10.2 #4); `ABL_ARMS=` to subset.
+* [x] **Sabotage every claim.** The harness's own positive control is arm 1: if
+      arm 1 does not read ~0.2 ms the sweep is meaningless. Arm 2 (no QK, x2.26) and
+      arm 3 (no PV, x1.68) must sum with the ~2% residual to 1.00 — they do
+      (55.8 + 40.5 + 3.7). Arm 9 (guard off, x0.97) is F8's measurement.
+* [x] Withdraw §9.1, §9.1b, §9.2, §10.2 #3, §12.2's reassurance, OQ7, and
+      NEXT.md §2 bullet 2 and §3 bullet 3. `spec.md`'s budget paragraph corrected.
+* [x] Record the cross-run drift (three runs of one unmodified geometry: 1143.6 /
+      1201.3 / 1302.5 ms, 14%) so the next reader does not compare across runs.
+* [x] **Revert the uniform field** with its own commit. A runtime branch through
+      the hot path to keep an instrument alive is the same mistake as F8's
+      unmeasured guard, pointed the other way.
+* [x] Use the instrument for the F5 hunt: `fixer_evidence/f1_ablation/*.log`,
+      three sweeps, 11 arms, 6 shapes.
+
+## F3 — decide the OQ9 default, and make code, notes and `spec.md` agree ✅
+
+The three-way disagreement, confirmed in the code before changing anything:
+`PREFILL_PASS_KEYS = 8192` **is** the default (`attention.rs:242`), so every
+prefill dispatch with `key_count > 8192` and a grid of >= 512 threadgroups slices.
+§16.4 ¶1 says "the default must stay one dispatch", ¶3 says "the gate ships on by
+default", and `spec.md` OQ9 says "off with `KAPLUMBA_PREFILL_PASS_KEYS=0`". Two of
+the three are false. **F2 landed in between**, so the cost had to be re-measured
+rather than inherited.
+
+* [x] Re-measure the cost of the shipped default on the wall at 16 394 tokens,
+      3 interleaved rounds, per-arm files. See §25 for the numbers and the
+      verdict.
+* [x] Per-kernel view (`KAPLUMBA_GPU_PROFILE=1`) of both arms, because the extra
+      dispatches are only visible there. See §25.
+* [x] **Positive control on the same instrument in the same session**, because a
+      "no measurable difference" is not believable without one.
+* [x] Check whether turning it off actually saves the 64 MiB state buffer — it
+      does **not**: `model.rs` sizes `prefill_pass_state_elements_widest` from
+      `tokens` unconditionally, so §16.4's "plus 64 MiB of scratch" is not a cost
+      of the default. That removes the strongest argument in §16.4 ¶1.
+* [x] Verify bit-exactness on **generated text**, not only in the 17 kernel-level
+      tests: the `passes0` arm of `scripts/bench_split_rule_quality.sh` at 1024 /
+      4096 / 16 394 tokens of context.
+* [x] Fix `spec.md` OQ9, §16.4 ¶1 vs ¶3, §16.5, and NEXT.md.
+
+## F4 — the `workgroups` flip, measured where it can actually differ ✅
+
+`decode_splits_with` ends in `wanted.min(key_count.div_ceil(64))`, so at the ~120
+tokens of the reference prompts **both rules return 2 splits** and N6's
+"byte-identical" was vacuous. The first differing `key_count` is **896**.
+
+* [x] Write the reason the flip is a 10-layer change: a sliding layer's key count
+      is `min(position, ring capacity)` = **the 1024-slot ring**, so both rules
+      return 16 at every position. Nobody had written this down.
+* [x] New harness `scripts/bench_split_rule_quality.sh`: one greedy generation per
+      (context, arm), `--show-ids` so the diff is on **token ids**, interleaved A/B,
+      per-arm files, never piped through `tail`.
+* [x] Measure at 1024 / 4096 / 16 394 tokens of context — all above the 896
+      boundary — 512 greedy tokens each, four arms: shipped, `workgroups`,
+      `KAPLUMBA_DECODE_SPLITS=13`, and `passes0`. See §24.
+* [x] Repetition-collapse check on every generation, with a deliberately collapsed
+      positive control (`scripts/check_repetition.sh`).
+* [x] **Recommend, do not flip.** See §24.
+
+## F5 — re-derive AC2, kill the o_proj lead, state the ceiling ✅
+
+* [x] Per-kernel decomposition of the 223.5 s of context-independent cost, with
+      FLOPs per projection computed from `config.json` — **including the fact that
+      `head_dim` is 512 on the 10 full layers and 256 on the 50 sliding ones**, so
+      `q_proj` and `o_proj` have two shapes and getting that wrong moves the FLOP
+      count by 8%. §23.2.
+* [x] **Kill the `spec/decode-20tps` o_proj lead for prefill**, with numbers: it is
+      an `M = 1` GEMV measurement; o_proj runs at 98% of `down_proj`'s efficiency
+      in prefill; the two slowest projections have the longest `K` and the fastest
+      has the shortest; and the chunked GEMM needs **1.27 GB/s of a 273 GB/s wire**.
+      §23.1.
+* [x] Re-split attention by layer kind, and check the arithmetic against two
+      independent sources before using it. §23.3.
+* [x] Re-derive the budget: **33.5 s for attention, not 56**; **3.8x, not 2.7x**;
+      **46% of tensor peak, not 22%**. Both in `spec.md` and `implementation_notes.md`.
+* [x] **Hunt, do not just declare.** Every lever the measured split suggests was
+      built and measured: hoisting the Q fragment out of the key-tile loop (**−92%**,
+      it spills), 2 and 4 independent QK accumulator chains (**1.00x / 0.96x**),
+      `KAPLUMBA_FLASH_BQ=1` (the free one). §23.3, §23.5.
+* [x] State the honest ceiling and say plainly what it would take. §23.6.
+* [x] **Do not change any acceptance target in `spec.md`.**
+
+## F8 — measure the rescale guard or withdraw it ✅
+
+* [x] Measure it, in the same sweep, as arm 9: `BQ=1` 1184.4 ms against 1143.6 ms
+      = **the guard is worth 4.9%**, and 1268.7 vs 1209.3 at `BQ=2`, and 420.5 vs
+      401.4 at 8 192 keys. Consistent at every shape.
+* [x] The instrument's own resolution is stated: arm 14 removes 11-12% of the
+      kernel's time by deleting loads, and arm 9 moves 4.9%, so the instrument
+      resolves changes of this size; arm 11 (0.0%) shows it resolves 0% too.
+* [x] **Keep it.** §17.1 argued exactness only, which was not enough to justify an
+      unmeasured optimisation in the hot path; 4.9% is. The cited sibling test
+      `a_misfiring_guard_is_caught` never existed — the control was a manual
+      `.metal` edit — so §26 records the numbers instead of pretending to a
+      citation.

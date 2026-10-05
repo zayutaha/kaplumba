@@ -1,0 +1,34 @@
+loading /Users/zayaantaha/.kaplumba/models/Gxma/Gxma ...
+loaded in 7725 ms
+# The Fabric of Reality: Understanding Einstein’s Theory of Relativity
+
+Albert Einstein’s theory of relativity is not a single theory but rather two interconnected theories: **Special Relativity** and **General Relativity**. Together, they fundamentally altered our understanding of space, time, and the universe. The core of the theory is that the laws of physics are the same for all observers, regardless of their motion relative to each other.
+
+### I. Special Relativity (1905)
+Special Relativity deals with the relationship between space and time. The core principles are:
+1. **Constancy of Light Speed:** The speed of light is constant for all observers, regardless of their motion. This is the fundamental constant of the theory.
+2. **Relativity:** The laws of physics are the same for all observers.
+
+These principles lead to several consequences:
+*   **Time Dilation:** A moving clock runs slower than a stationary one. This is called time dilation.
+*   **Length Contraction:** A moving object appears shorter than a stationary one. This is called length contraction.
+*   **Mass-Energy Equivalence:** This is expressed by the famous equation $E = mc^2$.
+
+### II. General Relativity (1915)
+General Relativity extends the special theory to include gravity. The core idea is that space-time is curved by matter. The consequences are:
+*   **Gravitational Time Dilation:** A clock in a gravitational field runs slower than a clock in a proper-time field.
+*   **Gravitational Redshift:** Light escaping from a massive body is shifted toward longer wavelengths.
+*   **Curvature:** The curvature of space-time is directly proportional to the energy density.
+
+### III. The Conceptual Synthesis
+The theory of relativity states that the universe is a four-dimensional continuum where gravity and light are intertwined. The fundamental idea is that the curvature of space-time is determined by the distribution of mass and energy.
+
+### Summary of the Theory
+The theory of relativity fundamentally changes our view of the universe. The core idea is that space-time is curved by matter. The consequences are:
+1. **Gravitational Time Dilation:** Time runs slower in regions of high gravitational potential.
+2. **Gravitational Redshift:** Light is shifted toward longer wavelengths when escaping a mass.
+3. **Curvature:** The curvature of space-time is determined by the mass-energy distribution.
+
+### Conclusion
+The theory of relativity fundamentally
+token_ids: 236865 669 43873 529 60176 236787 40411 44281 236858 236751 18188 529 135383 108 93480 44281 236858 236751 6073 529 74413 563 711 496 3161 6073 840 4319 1156 74647 21530 236787 5213 23244 135383 1018 532 5213 14947 135383 84750 29743 236764 901 51935 27200 1023 6611 529 2557 236764 990 236764 532 506 17748 236761 669 7157 529 506 6073 563 600 506 9734 529 16505 659 506 1638 573 784 52737 236764 17194 529 910 5776 6658 531 1546 1032 236761 108 10354 564 236761 10624 135383 568 236770 236819 236771 236810 236768 107 23244 135383 15663 607 506 4191 1534 2557 532 990 236761 669 7157 12466 659 236787 107 236770 236761 5213 9390 5710 529 10847 23902 53121 669 4249 529 2214 563 4512 573 784 52737 236764 17194 529 910 5776 236761 1174 563 506 11001 4512 529 506 6073 236761 107 236778 236761 5213 11146 31294 53121 669 9734 529 16505 659 506 1638 573 784 52737 236761 108 9208 12466 2080 531 3131 15169 236787 107 236829 139 1018 2866 622 13619 53121 562 6049 11072 8784 31878 1082 496 30755 886 236761 1174 563 2760 990 58692 236761 107 236829 139 1018 8615 2969 7405 53121 562 6049 2495 7412 20532 1082 496 30755 886 236761 1174 563 2760 3861 35975 236761 107 236829 139 1018 28335 236772 35741 8084 105888 53121 1174 563 8977 684 506 9639 4901 609 236788 578 41661 236884 236778 2104 108 10354 3664 236761 5884 135383 568 236770 236819 236770 236810 236768 107 14947 135383 6969 506 2803 6073 531 3204 18899 236761 669 7157 4317 563 600 2557 236772 2289 563 35666 684 4217 236761 669 15169 659 236787 107 236829 139 1018 73585 134930 7578 622 13619 53121 562 11072 528 496 39524 2135 8784 31878 1082 496 11072 528 496 2005 236772 2289 2135 236761 107 236829 139 1018 73585 134930 4855 17631 53121 10847 70075 699 496 12566 2742 563 29465 8797 4890 57583 236761 107 236829 139 1018 15413 137455 53121 669 32404 529 2557 236772 2289 563 5467 20688 531 506 2778 7620 236761 108 10354 8488 236761 669 105113 64656 107 818 6073 529 74413 5022 600 506 17748 563 496 2390 236772 12108 41181 1298 18899 532 2214 659 106166 236761 669 11001 4317 563 600 506 32404 529 2557 236772 2289 563 6185 684 506 5296 529 3413 532 2778 236761 108 10354 25252 529 506 18188 107 818 6073 529 74413 51935 3731 1023 1927 529 506 17748 236761 669 7157 4317 563 600 2557 236772 2289 563 35666 684 4217 236761 669 15169 659 236787 107 236770 236761 5213 73585 134930 7578 622 13619 53121 7578 8784 31878 528 9576 529 1494 39524 3435 236761 107 236778 236761 5213 73585 134930 4855 17631 53121 10847 563 29465 8797 4890 57583 1056 70075 496 3413 236761 107 236800 236761 5213 15413 137455 53121 669 32404 529 2557 236772 2289 563 6185 684 506 3413 236772 23325 5296 236761 108 10354 63916 107 818 6073 529 74413 51935

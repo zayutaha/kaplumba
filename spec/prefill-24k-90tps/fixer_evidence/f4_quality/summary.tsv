@@ -1,0 +1,15 @@
+# decode split-rule QUALITY A/B (adversary F4)
+# contexts=1024 4096 16394 max_new_tokens=512 temperature=0 seed=1234
+# ctx	arm	result
+1024	shipped	OK tokens=512
+1024	workgroups	OK tokens=512
+1024	splits13	OK tokens=512
+1024	passes0	OK tokens=512
+4096	shipped	OK tokens=512
+4096	workgroups	OK tokens=512
+4096	splits13	OK tokens=512
+4096	passes0	OK tokens=512
+16394	shipped	OK tokens=512
+16394	workgroups	OK tokens=512
+16394	splits13	OK tokens=512
+16394	passes0	OK tokens=512

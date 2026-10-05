@@ -441,15 +441,35 @@ where
 /// the obvious argument. `spec/decode-19tok-repacked-250gb` §21.2-21.4 measured
 /// a *larger* perturbation elsewhere -- the gate/up GEMV fusion is within 1 fp16
 /// ULP on 0.78% of activations per layer, across all 60 layers -- and it changed
-/// **zero** of 128 greedy tokens. This change is smaller (1 ULP on 3-4 of 16384
-/// attention outputs, on 10 of 60 layers) and changes **43 of 128**. So "it is
-/// only 1 ULP, and we already accept 1 ULP" is not a valid argument: 1 ULP is
-/// not a unit of comparison across sites, and only the measurement settles it.
+/// **zero** of 128 greedy tokens. So "it is only 1 ULP, and we already accept 1
+/// ULP" is not a valid argument: 1 ULP is not a unit of comparison across sites,
+/// and only the measurement settles it.
 ///
-/// The rule therefore ships behind `KAPLUMBA_DECODE_SPLIT_RULE=workgroups` and
-/// the default stays the thread target. The measured consequence is in
-/// `spec/decode-19tok/implementation_notes.md`: 1.34x on the full-attention
-/// layers at 8k of context, and a different token stream.
+/// **MEASURED (F4, `spec/prefill-24k-90tps` §24, 2026-10-05).** The "43 of 128"
+/// in the earlier version of this comment was measured in `spec/decode-19tok` on
+/// the **pre-T2b scalar decode kernel** and it is **stale by ~500x**. On the
+/// shipped MMA decode kernel, `scripts/bench_split_rule_quality.sh` at three
+/// contexts where the two rules actually differ (1024, 4096 and 16 394 prompt
+/// tokens -- the first is **896**, `16384/(32*32)` rounds to 16 while
+/// `decode_one_wave_workgroups(256)/kv_heads` gives 13, and below 896 both rules
+/// return the same count, which is why every earlier quality check here was
+/// vacuous) gives **1 differing token out of 1 536 generated**, and that token is
+/// the last of its run. The perturbation is real and bounded-ulp; it is 0.065% of
+/// greedy tokens, not 34%.
+///
+/// The principle therefore stands and the number does not: this is not bit-exact,
+/// it is a bounded-ulp change measured at 0.065% of greedy tokens over 1 536
+/// tokens and three contexts. The rule ships behind
+/// `KAPLUMBA_DECODE_SPLIT_RULE=workgroups`; the default stays the thread target
+/// because `spec/prefill-24k-90tps`'s quality gate requires byte-identical greedy
+/// text against base for the *default* configuration, and flipping it by
+/// construction breaks that. **A flip is recommended** (worth +1.55% to +2.17%
+/// decode at 16k, N4), but it needs the gate amended first, in writing.
+///
+/// Note also that the change reaches **10 of 60 layers**, for a structural reason
+/// that used to be unwritten: a sliding layer's key count is
+/// `next_position.min(ring capacity)` = `min(position, 1024)`, so it is <= 1024 at
+/// every position and both rules return the same count for all of them.
 ///
 /// `KAPLUMBA_DECODE_SPLITS` still pins the count, so the two can be compared
 /// without a rebuild.

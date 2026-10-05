@@ -1,3 +1,10 @@
 # OQ9 prefill key-range pass A/B
 # keys=16384 prompt_tokens~16384 rounds=3 passes=[8192]
 # columns: round label pass_keys prompt_tokens prefill_tok_s decode_tok_s
+r1 onedispatch 0 prompt_tokens=16394 prefill_tok_s=75.299 decode_tok_s=0.000 footprint=15.49GiB rss=8.81GiB VALID mem=[VALID polls=44 load-skipped=0 compressor_max=7.65GiB unused_min=0.08GiB] cpu=[sys-cpu 3.1% of wall (limit 2.0%)] marker=1791167502
+r1 pass8192 8192 prompt_tokens=16394 prefill_tok_s=74.955 decode_tok_s=0.000 footprint=15.56GiB rss=9.07GiB VALID mem=[VALID polls=45 load-skipped=0 compressor_max=6.76GiB unused_min=0.08GiB] cpu=[sys-cpu 3.7% of wall (limit 2.0%)] marker=1791167728
+r2 onedispatch 0 prompt_tokens=16394 prefill_tok_s=75.144 decode_tok_s=0.000 footprint=15.55GiB rss=9.05GiB VALID mem=[VALID polls=43 load-skipped=2 compressor_max=3.49GiB unused_min=0.08GiB] cpu=[sys-cpu 3.1% of wall (limit 2.0%)] marker=1791167963
+r2 pass8192 8192 prompt_tokens=16394 prefill_tok_s=75.133 decode_tok_s=0.000 footprint=15.50GiB rss=9.04GiB VALID mem=[VALID polls=43 load-skipped=2 compressor_max=4.62GiB unused_min=0.08GiB] cpu=[sys-cpu 3.2% of wall (limit 2.0%)] marker=1791168189
+r3 onedispatch 0 prompt_tokens=16394 prefill_tok_s=75.369 decode_tok_s=0.000 footprint=15.52GiB rss=9.12GiB VALID mem=[VALID polls=43 load-skipped=2 compressor_max=2.39GiB unused_min=0.08GiB] cpu=[sys-cpu 3.2% of wall (limit 2.0%)] marker=1791168417
+r3 pass8192 8192 prompt_tokens=16394 prefill_tok_s=75.427 decode_tok_s=0.000 footprint=15.55GiB rss=9.09GiB VALID mem=[VALID polls=42 load-skipped=2 compressor_max=3.63GiB unused_min=0.08GiB] cpu=[sys-cpu 3.1% of wall (limit 2.0%)] marker=1791168643
+SWEEP-DONE
