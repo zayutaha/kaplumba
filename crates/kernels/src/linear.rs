@@ -21,11 +21,23 @@ const SOURCE: &str = include_str!("linear.metal");
 /// `decode_state` and one compilation rather than becoming a second library.
 const REPACKED_SOURCE: &str = include_str!("linear_repacked.metal");
 
+/// `spec/decode-20tok-crux3`: the decode-algebra arms. Three instantiations of
+/// one macro, differing only in the body of the weight extract, dispatched only
+/// by `examples/crux3_decode_algebra.rs`. Nothing in this crate selects them, and
+/// arms B and C produce deliberately wrong values on purpose — see the file's
+/// header. Kept out of `linear_repacked.metal` because a transcription error in a
+/// hand-copied kernel body is exactly the failure this probe must not have, and
+/// `scripts/crux3_armA_equiv.py` proves arm A against the production source.
+const CRUX3_SOURCE: &str = include_str!("crux3_decode_algebra.metal");
+
 fn combined_source() -> String {
-    let mut combined = String::with_capacity(SOURCE.len() + REPACKED_SOURCE.len() + 1);
+    let mut combined =
+        String::with_capacity(SOURCE.len() + REPACKED_SOURCE.len() + CRUX3_SOURCE.len() + 2);
     combined.push_str(SOURCE);
     combined.push('\n');
     combined.push_str(REPACKED_SOURCE);
+    combined.push('\n');
+    combined.push_str(CRUX3_SOURCE);
     combined
 }
 

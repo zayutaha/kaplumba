@@ -1267,6 +1267,16 @@ impl AttentionKernels {
         splits: usize,
         flash: bool,
     ) -> Result<(), KernelError> {
+        // `KAPLUMBA_ABLATE=attention` was a prefill-only switch until here.
+        // `spec/decode-ceiling/findings/P02-dispatch-overhead.md` recorded that
+        // the decode path reaches this kernel and never consulted the flag, so
+        // every "everything ablated" decode residual in the repository still
+        // contained 60 live attention kernels streaming the whole KV window.
+        // Two early returns, no production effect (the flag is unset), and the
+        // measurement becomes able to fail when it should.
+        if crate::ablated("attention") {
+            return Ok(());
+        }
         if flash {
             if self.decode_flash_pipeline.is_none() {
                 return Err(KernelError::InvalidInput(
@@ -1421,6 +1431,11 @@ impl AttentionKernels {
         request: AttentionEncodeRequest<'_>,
         index: usize,
     ) -> Result<(), KernelError> {
+        // Second of the two decode-path gates P02 asked for. See
+        // `encode_decode_split_explicit` for why.
+        if crate::ablated("attention") {
+            return Ok(());
+        }
         let pipeline = self
             .decode_single_pipelines
             .get(index)

@@ -51,7 +51,15 @@ const FULL_KV_HEADS: usize = 4;
 const FULL_HEAD_DIM: usize = 512;
 const WINDOW: usize = 1024;
 /// Both shapes' KV are allocated this deep so the read window can move.
-const KV_DEPTH: usize = 8192;
+///
+/// `spec/decode-20tok-crux3`: raised from 8192 to **16384**. The 16 k context
+/// is the one the whole decode ceiling argument is made about, and the 10
+/// full-attention layers are the only term that grows without bound — at 8192
+/// keys this bench could not see the regime it exists to measure. Footprint of
+/// the two rigs at 16384: sliding 2 x 134 MiB, full 2 x 67 MiB, plus 2 x 4 KiB
+/// positions = ~400 MiB. Still nothing like the 12 GiB checkpoint, so the
+/// "no model, cannot collide" property holds.
+const KV_DEPTH: usize = 16384;
 const TIMED_ROUNDS: usize = 9;
 const WARMUP_ROUNDS: usize = 3;
 
@@ -291,7 +299,7 @@ fn main() {
     let rigs: Vec<Rig<'_>> = shapes.iter().map(|s| Rig::new(&device, &queue, s)).collect();
 
     // ---------------------------------------------------------------- sweep
-    let key_counts = [64usize, 128, 256, 512, 1024, 2048, 4096, 8192];
+    let key_counts = [64usize, 128, 256, 512, 1024, 2048, 4096, 8192, 12288, 16384];
     let mut variants: Vec<Variant> = Vec::new();
     for (shape_index, shape) in shapes.iter().enumerate() {
         for &key_count in &key_counts {
