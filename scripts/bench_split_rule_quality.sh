@@ -80,6 +80,15 @@ run_arm() { # <ctx> <arm-label> <pass-env...>
   text=$(grep -v '^loading \|^loaded in \|^token_ids: \|^metrics\|^peak_resident\|^load_ms\|^$' "$log")
   local n
   n=$(printf '%s' "$ids" | wc -w | tr -d ' ')
+  # A run that completes but emits no id line is a FAILURE, not a zero-token
+  # success: reporting `OK tokens=0` would make the diff loop compare an empty
+  # stream against a full one and print `differ=0`, i.e. a false "byte-identical".
+  # That is the same class of bug as an INVALID memory sample silently folding
+  # into a median, and it is caught by the arm-count assertion at the end.
+  if [ "${n:-0}" -lt 1 ]; then
+    printf '%s\t%s\tNO-IDS rc=0 (see %s)\n' "$ctx" "$label" "$log" >> "$SUMMARY"
+    return 0
+  fi
   printf '%s\t%s\tOK tokens=%s\n' "$ctx" "$label" "$n" >> "$SUMMARY"
   printf '%s' "$ids" > "$OUT/${ctx}_${label}.ids"
   printf '%s\n' "$text" > "$OUT/${ctx}_${label}.body"
@@ -105,6 +114,13 @@ for c in $CONTEXTS; do
 done
 
 cat "$SUMMARY"
+# A sweep that lost an arm to a crash or to GPU-busy must not read as a clean
+# result, so the accounting is asserted rather than assumed. `NO-IDS` is the case
+# this file was wrong about first: it used to be reported as `OK tokens=0`, which
+# diffs as `differ=0` against a full stream and reads "byte-identical".
+missing=$(grep -cE 'NO-IDS|FAILED|GPU-BUSY|SKIPPED' "$SUMMARY" || true)
+printf -- '--- %s arm(s) did not produce a usable sample ---\n' "$missing"
+grep -E 'NO-IDS|FAILED|GPU-BUSY|SKIPPED' "$SUMMARY" || true
 echo "--- per-context token diff (shipped vs workgroups) ---"
 for c in $CONTEXTS; do
   a="$OUT/${c}_shipped.ids"

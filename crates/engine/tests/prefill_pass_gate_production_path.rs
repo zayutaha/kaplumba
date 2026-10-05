@@ -183,10 +183,44 @@ fn u32_buf(device: &Device, v: &[u32]) -> Buffer {
     )
 }
 
+/// The pass size this binary enables. **Not** `attention::PREFILL_PASS_KEYS`,
+/// which is 0 since F3 \u2014 citing it here would make every "would dispatch" assertion
+/// vacuous.
+const ENABLED_PASSES: usize = 8192;
+
+/// The OQ9 pass chain is **off by default** since F3
+/// (`spec/prefill-24k-90tps` §25: `PREFILL_PASS_KEYS = 0`, because the mechanism
+/// has no measured benefit at any context this box can measure and a no-benefit
+/// mechanism should not be a default). That would make every test in this file
+/// pass for the **wrong reason** — production would decline before it ever reached
+/// the grid test — so this binary turns passes back on explicitly.
+///
+/// `prefill_pass_keys_for` reads the variable through a `OnceLock`, so it has to
+/// be set before anything in this process reads it. Every `#[test]` here calls
+/// this first, so whichever one the harness happens to run first populates the
+/// cache with 8192 and the other sees the same value; there is no ordering
+/// assumption. `prefill_pass_default_off.rs` is the separate binary that pins the
+/// shipped default, and it never sets this.
+///
+/// Rust 2024 makes `set_var` `unsafe`; the call is at the very start of a test
+/// binary, before any other thread has touched the environment, which is the
+/// condition the 2024 safety note is about.
+fn enable_passes() {
+    // SAFETY: single-threaded at this point in a fresh test binary.
+    unsafe { std::env::set_var("KAPLUMBA_PREFILL_PASS_KEYS", ENABLED_PASSES.to_string()) };
+    assert_eq!(
+        attention::prefill_pass_keys_for(1 << 20),
+        8192,
+        "KAPLUMBA_PREFILL_PASS_KEYS did not take effect; every test in this file \
+         would be testing the one-dispatch path"
+    );
+}
+
 /// F2: the last chunk of a 16 394-token prompt has a 20-threadgroup grid, and the
 /// documented gate (512) forbids slicing it. Production must decline.
 #[test]
 fn the_production_path_applies_the_documented_grid_gate() {
+    enable_passes();
     let case = Case::new(10, 16_394);
     assert!(
         case.kernels.prefill_pass_available(),
@@ -205,8 +239,12 @@ fn the_production_path_applies_the_documented_grid_gate() {
     );
     // Not for lack of eligibility: the same shape with the grid gate bypassed DOES
     // dispatch a chain, so a `false` from production can only be the gate.
+    //
+    // `ENABLED_PASSES`, not `attention::PREFILL_PASS_KEYS`: the shipped default is
+    // 0 since F3, so citing the constant here would pass 0, which is "no chain at
+    // all" and would make the assertion vacuous.
     assert!(
-        case.explicit_dispatched(attention::PREFILL_PASS_KEYS),
+        case.explicit_dispatched(ENABLED_PASSES),
         "the shape is not eligible for anything, so this test proves nothing about the gate"
     );
     assert!(
@@ -235,6 +273,7 @@ fn the_production_path_applies_the_documented_grid_gate() {
 /// production entry point never dispatches anything at all.
 #[test]
 fn the_production_path_still_slices_a_grid_above_the_gate() {
+    enable_passes();
     // 1024 queries x 4 kv heads at BQ=2 = 2048 threadgroups, well above 512.
     let case = Case::new(1024, 16_384);
     assert!(
@@ -266,6 +305,7 @@ fn the_production_path_still_slices_a_grid_above_the_gate() {
 /// queries -> 512 groups, 258 -> 516.
 #[test]
 fn the_gate_boundary_is_512_threadgroups_on_the_production_path() {
+    enable_passes();
     let at = Case::new(256, 16_384); // ceil(256/2) * 4 = 512
     let above = Case::new(258, 16_384); // ceil(258/2) * 4 = 516
     assert_eq!(at.block(), 2);

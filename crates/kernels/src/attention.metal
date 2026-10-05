@@ -19,10 +19,6 @@ struct AttentionParams {
     // is the one-dispatch behaviour and scans `[0, key_count)`.
     uint pass_begin;
     uint pass_keys;
-    // TEMPORARY (spec/prefill-24k-90tps F1): ablation arm. `0` is production and
-    // every consumer of it is a no-op. See `AttentionParams::ablate` in
-    // attention.rs; deleted together with the rest of the knob.
-    uint ablate;
 };
 
 template <int HEAD_DIM>
@@ -1491,32 +1487,6 @@ static void attention_prefill_flash_body(
     // Row stride of `state`: fp32 O[HEAD_DIM], then the running max and sum.
     constexpr uint SSTRIDE = uint(HEAD_DIM) + 2u;
 
-    // TEMPORARY (spec/prefill-24k-90tps F1). `params.ablate` selects which part
-    // of the body runs, so ONE build times every arm of the ablation. `0` is
-    // production and every arm below is a no-op. See `AttentionParams::ablate`.
-    //
-    //   1  empty body            -- return before anything (the control §10.3 says
-    //                                was never run)
-    //   2  no QK                 -- skip the whole QK block (loads + MMAs)
-    //   3  no PV MMAs            -- `ksteps = 0`
-    //   4  no softmax            -- skip the online-softmax update
-    //   5  K fragment from a fixed row -- same instruction count, L1-resident,
-    //                              so the delta is the DEVICE path of the K loads
-    //   6  V fragment from a fixed row -- likewise for V
-    //   7  qf hoisted out of the key-tile loop -- the `qstage` load is
-    //                              loop-invariant in `d8`-space per head and is
-    //                              re-executed once per tile today; this is both
-    //                              the ablation of the Q threadgroup-load cost
-    //                              and the candidate fix for it
-    //   8  K and V frags from fixed rows -- arms 5 and 6 together, so the MMAs are
-    //                              untouched and every fragment load is
-    //                              L1-resident: the whole device path
-    //   9  rescale guard removed (F8) -- always rescale, so arm 0 minus arm 9
-    //                              is the guard's measured benefit
-    const uint ABL = params.ablate;
-    if (ABL == 1u) {
-        return;
-    }
     const uint lane = tid & 31u;
     const uint sg = tid >> 5u;
     const uint groups = params.q_heads / params.kv_heads;
@@ -1625,26 +1595,6 @@ static void attention_prefill_flash_body(
 
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
-    // TEMPORARY (spec/prefill-24k-90tps F1, arm 7): the Q fragments are a
-    // function of `(b, d8, head)` only -- nothing in the key-tile loop changes
-    // them -- yet the shipped code re-executes `simdgroup_load(qf, qstage ...)`
-    // once per (tile, d8, b). Holding them in registers costs
-    // `BQ * HEAD_DIM/8` simdgroup registers per lane (64 at BQ=1) and removes
-    // `BQ * HEAD_DIM/8` threadgroup loads from every tile.
-    threadgroup half *qreg_scratch = qstage;
-    simdgroup_half8x8 qreg[BQ][NTILES];
-    if (ABL == 7u) {
-#pragma unroll
-        for (uint b = 0; b < uint(BQ); ++b) {
-#pragma unroll
-            for (uint t = 0; t < NTILES; ++t) {
-                simdgroup_load(qreg[b][t], qstage + (b * uint(NSG)) * uint(HEAD_DIM)
-                                    + t * 8u, HEAD_DIM, ulong2(0, 0), true);
-            }
-        }
-        (void)qreg_scratch;
-    }
-
     for (uint base = range_begin; base < range_end; base += TILE) {
         const uint live_in_tile = min(TILE, range_end - base);
         // Key sub-tile that straddles `range_end`, or NSUB when none does.
@@ -1674,25 +1624,15 @@ static void attention_prefill_flash_body(
             // once and reused by every query -- this reuse is the whole point of
             // query blocking, and it halves the K device traffic.
             simdgroup_float8x8 dots[BQ];
-            simdgroup_float8x8 dots2[BQ];
-            simdgroup_float8x8 dots3[BQ];
-            simdgroup_float8x8 dots4[BQ];
 #pragma unroll
             for (uint b = 0; b < uint(BQ); ++b) {
                 dots[b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-                dots2[b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-                dots3[b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-                dots4[b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
             }
-            if ((staged || k0 + 8u <= range_end) && ABL != 2u) {
+            if (staged || k0 + 8u <= range_end) {
                 for (int d8 = 0; d8 < HEAD_DIM; d8 += 8) {
                     simdgroup_half8x8 kf;
                     if (staged) {
                         simdgroup_load(kf, tail + d8, HEAD_DIM);
-                    } else if (ABL == 5u || ABL == 8u) {
-                        // Arm 5: identical instruction, L1-resident address. The
-                        // delta against arm 0 is the DEVICE path of the K loads.
-                        simdgroup_load(kf, keys + head_base + d8, kv_stride);
                     } else {
                         simdgroup_load(kf, keys + k0 * kv_stride + head_base + d8,
                                        kv_stride);
@@ -1703,69 +1643,10 @@ static void attention_prefill_flash_body(
                             continue;
                         }
                         simdgroup_half8x8 qf;
-                        if (ABL == 7u) {
-                            qf = qreg[b][d8 / 8];
-                        } else if (ABL == 13u) {
-                            // Arm 13: the Q fragment from a FIXED threadgroup
-                            // address. Same instruction (a transposing
-                            // `simdgroup_load`), L1-resident, so arm 0 minus arm
-                            // 13 is the cost of the per-tile qstage read.
-                            simdgroup_load(qf, qstage + d8, HEAD_DIM, ulong2(0, 0), true);
-                        } else if (ABL == 14u) {
-                            // Arm 14: no Q fragment load at all. Zero loads, same
-                            // MMA count and instruction mix otherwise.
-                            qf = make_filled_simdgroup_matrix<half, 8, 8>(half(0.5f));
-                        } else {
-                            simdgroup_load(qf,
-                                           qstage + (b * uint(NSG)) * uint(HEAD_DIM) + d8,
-                                           HEAD_DIM, ulong2(0, 0), true);
-                        }
-                        // Arms 11/12: two and four INDEPENDENT accumulator chains.
-                        // The QK dot is a 64-deep dependent chain into one
-                        // fragment, which is the only remaining candidate for the
-                        // MMA stall that arms 5-8 rule out (they show the loads
-                        // are worth 9% and the softmax 0.4%). If the chain is the
-                        // limiter, splitting it must move the kernel; if it does
-                        // not, the limiter is the MMA pipe itself.
-                        if (ABL == 11u) {
-                            if ((d8 >> 3) & 1) {
-                                simdgroup_multiply_accumulate(dots2[b], kf, qf, dots2[b]);
-                            } else {
-                                simdgroup_multiply_accumulate(dots[b], kf, qf, dots[b]);
-                            }
-                        } else if (ABL == 12u) {
-                            const uint chain = uint(d8 >> 3) & 3u;
-                            if (chain == 0u) {
-                                simdgroup_multiply_accumulate(dots[b], kf, qf, dots[b]);
-                            } else if (chain == 1u) {
-                                simdgroup_multiply_accumulate(dots2[b], kf, qf, dots2[b]);
-                            } else if (chain == 2u) {
-                                simdgroup_multiply_accumulate(dots3[b], kf, qf, dots3[b]);
-                            } else {
-                                simdgroup_multiply_accumulate(dots4[b], kf, qf, dots4[b]);
-                            }
-                        } else {
-                            simdgroup_multiply_accumulate(dots[b], kf, qf, dots[b]);
-                        }
-                    }
-                }
-            }
-            if (ABL == 11u) {
-#pragma unroll
-                for (uint b = 0; b < uint(BQ); ++b) {
-#pragma unroll
-                    for (uint e = 0; e < 2u; ++e) {
-                        dots[b].thread_elements()[e] += dots2[b].thread_elements()[e];
-                    }
-                }
-            } else if (ABL == 12u) {
-#pragma unroll
-                for (uint b = 0; b < uint(BQ); ++b) {
-#pragma unroll
-                    for (uint e = 0; e < 2u; ++e) {
-                        dots[b].thread_elements()[e] += dots2[b].thread_elements()[e];
-                        dots[b].thread_elements()[e] += dots3[b].thread_elements()[e];
-                        dots[b].thread_elements()[e] += dots4[b].thread_elements()[e];
+                        simdgroup_load(qf,
+                                       qstage + (b * uint(NSG)) * uint(HEAD_DIM) + d8,
+                                       HEAD_DIM, ulong2(0, 0), true);
+                        simdgroup_multiply_accumulate(dots[b], kf, qf, dots[b]);
                     }
                 }
             }
@@ -1796,20 +1677,6 @@ static void attention_prefill_flash_body(
 #pragma unroll
         for (uint b = 0; b < uint(BQ); ++b) {
             if (q0 + b >= params.queries) {
-                continue;
-            }
-            if (ABL == 4u) {
-                // Arm 4: skip every `exp`/`simd_sum`/`simd_max`, but still write
-                // `wq` and `msb` so the PV half reads defined values (otherwise the
-                // threadgroup memory is uninitialised and the arm would be timing
-                // NaN handling, not the softmax).
-                s[b] = 1.0f;
-                m[b] = 0.0f;
-                wq[(b * uint(NSG) + sg) * TILE + kt0] = half(1.0f);
-                wq[(b * uint(NSG) + sg) * TILE + kt0 + 1u] = half(1.0f);
-                if (lane == 0u) {
-                    msb[b * uint(NSG) + sg] = 1.0f;
-                }
                 continue;
             }
             const uint q_abs = query_positions[q0 + b];
@@ -1873,12 +1740,7 @@ static void attention_prefill_flash_body(
 #pragma unroll
         for (uint b = 0; b < uint(BQ); ++b) {
             const float msv = msb[b * uint(NSG) + fm];
-            if (ABL == 9u) {
-                // Arm 9 (F8): the OQ9 rescale guard REMOVED -- always rescale.
-                // Arm 0 keeps it. The difference is the guard's benefit, which
-                // `implementation_notes.md` 17.1 argues for on exactness alone
-                // and has never measured.
-            } else if (msv == 1.0f) {
+            if (msv == 1.0f) {
                 continue;
             }
 #pragma unroll
@@ -1896,18 +1758,12 @@ static void attention_prefill_flash_body(
         // is why the K fragment in the QK loop is loaded outside the query
         // loop. (Measured cost of getting this wrong: the T4 bench scored the
         // flash body at ~0.5 MMA/load, 42% below the MMA arm.)
-        const uint ksteps = (ABL == 3u) ? 0u : (live_in_tile + 7u) / 8u;
+        const uint ksteps = (live_in_tile + 7u) / 8u;
         for (uint kt = 0; kt < ksteps; ++kt) {
             simdgroup_half8x8 af[BQ];
 #pragma unroll
             for (uint b = 0; b < uint(BQ); ++b) {
-                if (ABL == 14u) {
-                    af[b] = make_filled_simdgroup_matrix<half, 8, 8>(half(0.5f));
-                } else if (ABL == 13u) {
-                    simdgroup_load(af[b], wq, TILE);
-                } else {
-                    simdgroup_load(af[b], wq + (b * uint(NSG)) * TILE + kt * 8u, TILE);
-                }
+                simdgroup_load(af[b], wq + (b * uint(NSG)) * TILE + kt * 8u, TILE);
             }
             const bool staged = (kt == partial_kt);
 #pragma unroll
@@ -1916,9 +1772,6 @@ static void attention_prefill_flash_body(
                 simdgroup_half8x8 bf;
                 if (staged) {
                     simdgroup_load(bf, tail + nt * 8u, HEAD_DIM);
-                } else if (ABL == 6u || ABL == 8u) {
-                    // Arm 6: the V device path, L1-resident address.
-                    simdgroup_load(bf, values + head_base + nt * 8u, kv_stride);
                 } else {
                     simdgroup_load(bf, values + (base + kt * 8u) * kv_stride
                                        + head_base + nt * 8u, kv_stride);

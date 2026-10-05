@@ -1,0 +1,14 @@
+# decode split-rule QUALITY A/B (adversary F4)
+# contexts=16394 max_new_tokens=512 temperature=0.7 seed=20260905
+# ctx	arm	result
+16394	shipped	OK tokens=512
+16394	workgroups	OK tokens=512
+16394	splits13	OK tokens=512
+16394	passes0	OK tokens=512
+--- per-context token diff (shipped vs workgroups) ---
+ctx=16394  n_shipped=512   n_workgroups=512   differ=99
+ctx=16394  n_shipped=512   n_splits13=512   differ=90
+ctx=16394  BODY differs (see .body files)
+ctx=16394  n_shipped=512   n_passes0=512   differ=0
+ctx=16394  vs passes0: BODY byte-identical
+QUALITY-SWEEP-DONE

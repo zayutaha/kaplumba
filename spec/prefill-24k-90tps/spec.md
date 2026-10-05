@@ -234,12 +234,32 @@ Additional for this spec:
   over **1M** keys (~85 vs ~103 TFLOPS); at 16k this engine's KV working set is
   134 MB per full layer and §10 already showed a 64x smaller K/V allocation buys
   6%. **There is no residency loss here to recover.** The implementation ships
-  (measured neutral, bit-exact, off with `KAPLUMBA_PREFILL_PASS_KEYS=0`) because it
-  is the only correct expression of the mechanism — and because building it forced
-  the discovery that **pass boundaries must land on tile boundaries**, a correctness
-  invariant of the online softmax: an unaligned boundary changes the output by one
-  fp16 ulp on ~1% of outputs, ten times inside the 5e-3 tolerance every other
-  attention test in this repo uses. See `implementation_notes.md` §16.
+  **off** (`PREFILL_PASS_KEYS = 0`; `KAPLUMBA_PREFILL_PASS_KEYS=8192` opts in),
+  because a mechanism with no measured benefit should not be a *default* — a
+  default is a claim. **F3 (2026-10-05) corrected the record**: the default was in
+  fact **8192** (so every prefill dispatch with `key_count > 8192` sliced), while
+  `implementation_notes.md` §16.4 said "the default must stay one dispatch" and this
+  question said "ships off with `KAPLUMBA_PREFILL_PASS_KEYS=0`". Two of the three
+  were false. Re-measured on the shipped body **after** F2's grid gate, 3
+  interleaved rounds at 16 394 tokens: **-0.13%** (75.172 vs 75.271 tok/s) inside a
+  0.30-0.63% spread. §16.4's other argument for turning it off — "plus 64 MiB of
+  scratch" — is **void**: `model.rs` sizes the pass-state buffer from `tokens`
+  unconditionally, so it is resident either way. What remains is the dispatch count,
+  which is measured neutral.
+
+  Turning it **on** is **exact**, and the evidence is on generated text rather than
+  only on synthetic buffers: with `KAPLUMBA_PREFILL_PASS_KEYS=8192` the output is
+  byte-identical to the one-dispatch body at 1024, 4096 and 16 394 tokens of context,
+  512 greedy tokens each, **and at `--temperature 0.7` with a fixed seed** — the
+  leg that matters, because a sampler turns a last-ulp logit difference into a
+  different token at the first near-tie and 512 draws found none. (The same run
+  shows the contrast: the `workgroups` decode-split change diverges at token 407.)
+
+  The durable output of N1 is the discovery that **pass boundaries must land on
+  tile boundaries**, a correctness invariant of the online softmax: an unaligned
+  boundary changes the output by one fp16 ulp on ~1% of outputs, ten times inside
+  the 5e-3 tolerance every other attention test in this repo uses. See
+  `implementation_notes.md` §16 and §25.
 
   *The original text of this question is preserved below, since the verdict is
   "no" and the reasoning above is easier to check against the claim being closed:*

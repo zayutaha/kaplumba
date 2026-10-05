@@ -1617,16 +1617,31 @@ cannot pay where there is no residency loss to fix.
 So the honest reading is: **N1's premise does not hold at any context this box can
 measure.** It would be expected to matter at 1M keys on hardware where it matters
 to oMLX, and this engine's 24k ceiling makes that unreachable. This is a
-**negative result with a bit-exact, fully tested implementation behind it** — the
+**negative result with an exact, fully tested implementation behind it** — the
 implementation is worth keeping (it is the only correct way to express the
 mechanism, and the tile-alignment invariant it forced is a real property of the
-kernel), but the *default must stay one dispatch*, because "no measurable
-difference" plus 64 MiB of scratch plus 2x the dispatch count is a net loss on
-anything that is not bandwidth-starved.
+kernel), but **the default must stay one dispatch**, because a mechanism with no
+measured benefit should not be a *default*: a default is a claim.
 
-The gate ships **on by default** because it is measured neutral and bit-exact;
-`KAPLUMBA_PREFILL_PASS_KEYS=0` restores a single dispatch. If a future session
-measures a context where it pays, that is the flag to reach for.
+> **F3 CORRECTION (2026-10-05).** This paragraph and the one after it contradicted
+> each other and one of them was false: the code shipped `PREFILL_PASS_KEYS = 8192`,
+> so *every* prefill dispatch with `key_count > 8192` sliced by default, while
+> "the default must stay one dispatch" and `spec.md` OQ9 both said off. **The
+> default is now `PREFILL_PASS_KEYS = 0`** and `KAPLUMBA_PREFILL_PASS_KEYS=8192`
+> is the opt-in. Re-measured on the shipped body **after** F2's grid gate, 3
+> interleaved rounds at 16 394 tokens: **-0.13%** (75.172 vs 75.271 tok/s), inside a
+> 0.30-0.63% arm spread — so the only surviving argument for "off" is the
+> default-is-a-claim one above.
+>
+> **The other argument in the original text, "plus 64 MiB of scratch", is VOID.**
+> `model.rs:3447` and `model.rs:4927` size `prefill_pass_state_elements_widest` from
+> `tokens` **unconditionally**, so the 64 MiB is resident whether or not the passes
+> engage — `phys_footprint` reads 15.49-15.56 GiB in both arms and *cannot* differ.
+> Do not use that argument again. Full record, including the positive control and
+> the exactness evidence on generated text, in **§25**.
+
+If a future session measures a context where the passes pay, that is the flag to
+reach for.
 
 ### 16.5 Invariants and facts worth keeping
 
@@ -1656,7 +1671,13 @@ measures a context where it pays, that is the flag to reach for.
 * The grid gate is `<= 512` threadgroups (oMLX's `n_groups < min_groups` is `<`,
   but their comment calls 512 the "wave or two" size, so the boundary belongs on
   the unsliced side). 128 queries x 4 kv heads at BQ=1 = 512 groups → one dispatch;
-  129 queries → sliced.
+  129 queries → sliced. **F2: this was the documented behaviour and not the
+  implemented one** — the gate was written on `prefill_pass_count` and applied
+  nowhere, so production sliced grids as small as 20 threadgroups (the last chunk of
+  a 16 394-token prompt: 10 queries x 4 kv heads at BQ=2). It is applied now, in
+  `encode_online_attention_passes`, by calling the tested function;
+  `crates/engine/tests/prefill_pass_gate_production_path.rs` pins it on the
+  production entry point.
 * `ATTENTION_SINGLE_PASS_MAX_KEYS` and `FLASH_QUERY_BLOCK_MIN_KEYS` are unrelated to
   this work and unchanged.
 
@@ -2711,3 +2732,229 @@ collapse to 0.74 TFLOPS, so it must be named locals, and this repo has already b
 burned by that trap once. If 16 chains really do give 15.49, the flash kernel's QK
 ceiling moves from 1.37 to something an order of magnitude better and AC2 is back
 in reach. That is a day's experiment and it is the only lever left standing.
+
+---
+
+## 25 — F3: the OQ9 prefill-pass default, decided and documented
+
+### 25.1 What was actually true
+
+| place | said | true? |
+|---|---|---|
+| `crates/kernels/src/attention.rs:242` | `PREFILL_PASS_KEYS = 8192`, returned by `prefill_pass_keys_for` when the env var is unset | **this is what shipped** |
+| `implementation_notes.md` §16.4 ¶1 | "the **default must stay one dispatch**" | **false** |
+| `implementation_notes.md` §16.4 ¶3 | "the gate ships **on by default**" | true |
+| `spec.md` OQ9 | "ships … off with `KAPLUMBA_PREFILL_PASS_KEYS=0`" | **false** |
+| commit `c61dcba` | "implementation kept, **default unchanged**" | **false** |
+
+So every prefill dispatch with `key_count > 8192`, the flash shape, and a grid of
+>= 512 threadgroups sliced. **F2 landed in between the adversary's measurement and
+this one**, so the cost had to be re-measured rather than inherited: F2 removed the
+20-threadgroup slices that the +77% inter-boundary-gap figure was taken on.
+
+### 25.2 The cost of the shipped default, re-measured
+
+`scripts/bench_prefill_passes.sh`, 16 394 tokens, `--max-new-tokens 1`, arms
+interleaved per round, poll file and verdict kept per arm, 3 rounds:
+
+| arm | r1 | r2 | r3 | mean | min-max | spread |
+|---|---|---|---|---|---|---|
+| `KAPLUMBA_PREFILL_PASS_KEYS=0` (one dispatch) | 75.299 | 75.144 | 75.369 | **75.271** | 75.144-75.369 | 0.30% |
+| default `8192` (2-3 passes) | 74.955 | 75.133 | 75.427 | **75.172** | 74.955-75.427 | 0.63% |
+
+**-0.13%, inside both arms' spread.** The adversary's pre-F2 figure was +0.13%, so
+the sign is noise either way and the honest reading is "below the resolution of this
+instrument at this context".
+
+**Where the cost actually shows up: the host side.** `KAPLUMBA_GPU_PROFILE=1`, both
+arms in the same session, 16 394 tokens:
+
+| term | default (8192) | one dispatch (0) | delta |
+|---|---|---|---|
+| attention `own_ms` | 64 425.0 | 64 206.0 | **+219.0 (+0.34%)** |
+| the seven projections | 158 051.4 | 158 092.8 | -41.4 (-0.03%) |
+| everything else | 2 200.3 | 1 998.7 | +201.6 |
+| **kernel sum** | **215 737.7** | **215 297.2** | **+440.5 (+0.20%)** |
+| **inter-boundary gap** | **15 801.4** | **10 625.6** | **+5 175.8 (+48.7%)** |
+| wall span | 237 234.3 | 230 323.7 | +6 910.6 (+3.0%) |
+| profiled `prefill_tok_s` | 69.104 | 71.176 | -2.9% |
+
+Attention itself is untouched (+0.34%, noise). The cost is **submission overhead**:
+the pass chain adds boundaries, and each boundary is a place where the host and the
+GPU can disagree. **F2 recovered about a third of it** — the adversary measured
+**+77%** of the gap at the pre-F2 commit, where the chain also sliced
+20-threadgroup grids; it is **+48.7%** now.
+
+**The two measurements disagree and both are right.** The *clean* wall says neutral
+because a pipelined run overlaps the extra submission with the GPU; the *profiled*
+wall says +3.0% because the profiler serialises at every boundary, which is exactly
+where the cost lives. Neither reading is a reason to ship a mechanism that recovers
+nothing. Both are a reason to ship it **off**, where production does not pay it at
+all. **Positive control** that the instrument can see a real attention change at
+all: §25.5.
+
+**The 64 MiB argument is void.** §16.4 ¶1 said the default costs "64 MiB of
+scratch". It does not: `model.rs:3447` and `model.rs:4927` size
+`prefill_pass_state_elements_widest` from `tokens` **unconditionally**, so the state
+buffer is resident whether the passes are on or off. `phys_footprint` reads
+15.49-15.56 GiB in both arms above, and it cannot differ: the allocation is the
+same. **That was the strongest argument for turning the default off and it is not
+one.**
+
+### 25.3 The decision: the default is ONE DISPATCH, and `KAPLUMBA_PREFILL_PASS_KEYS=8192` is the opt-in
+
+The reasoning, in the order that decided it:
+
+1. **It is exact, so this is not a quality decision.** §25.4.
+2. **It has no measured benefit at any context this box can measure** (§16.4's own
+   conclusion, re-confirmed), and no measured cost. A tie.
+3. **A tie does not justify a default.** A default is a claim. oMLX's 8192 is
+   oMLX's default on hardware where its mechanism has a measured effect at 1M keys;
+   copying the number without the effect is copying a constant. §16.4 ¶1's instinct
+   was right and its stated reason (the 64 MiB) was wrong; the reason that survives
+   is the one above.
+4. **Nothing is lost.** The implementation, its 17 bit-exactness tests and F2's
+   `PREFILL_PASS_MIN_GROUPS` gate all stay and all still pass. What changes is that
+   8192 becomes an explicit opt-in instead of a silent default, and production stops
+   paying extra dispatches for a mechanism that recovers nothing here.
+5. **The cost of being wrong is one environment variable**, and the flag is already
+   documented on the constant.
+
+### 25.4 It is EXACT, and here is the strongest evidence in this spec for it
+
+`scripts/bench_split_rule_quality.sh`, 16 394-token prompt, **512 tokens at
+`--temperature 0.7 --seed 20260905`** (fixed seed, so the sampler is
+deterministic), four arms, one generation each:
+
+| arm | token ids | vs `shipped` | first differing token |
+|---|---|---|---|
+| `shipped` (OQ9 passes ON, the old default) | 512 | — | — |
+| **`passes0` (`KAPLUMBA_PREFILL_PASS_KEYS=0`)** | 512 | **0 — byte-identical** | **never** |
+| `workgroups` decode split rule | 512 | 99 | **407** |
+| `splits13` decode split rule | 512 | 90 | **407** |
+
+**At a sampling temperature with a fixed seed, the pass chain and the one-dispatch
+body produce the same 512 tokens.** If a single logit had differed in the last ulp,
+the two streams would have diverged somewhere in 512 draws at temperature 0.7 —
+and they are identical for all 512. The same instrument, the same prompt and the
+same run shows the contrast that makes this meaningful: the **decode split-rule
+change diverges at token 407** and is 99 tokens different after that.
+
+So the two perturbations in this report are cleanly separated, and the labels are
+not interchangeable:
+
+| change | label | evidence |
+|---|---|---|
+| OQ9 passes on/off | **exact** | byte-identical text at temperature 0 **and** at temperature 0.7 with a fixed seed, at 1024 / 4096 / 16394 tokens of context |
+| decode split rule 16 -> 13 | **bounded-ulp** | 1 token in 1 536 greedy; at temperature 0.7 the first divergence is at token 407 |
+
+The temperature-0 result alone (byte-identical) is weaker than it looks, because a
+bounded-ulp change can be invisible to an argmax. **The temperature-0.7 result is
+the one that establishes exactness**, because a sampler converts a last-ulp logit
+difference into a different token at the first near-tie, and 512 draws found none.
+
+### 25.5 Positive control on the same instrument in the same session
+
+A "no measurable difference" is only believable after something moved the same
+instrument. `KAPLUMBA_SCALAR_ATTENTION=1` replaces the flash body with the scalar
+one, 16 394-token prompt, clean (unprofiled) runs, same session, same binary:
+
+| arm | `prefill_tok_s` | vs shipped |
+|---|---|---|
+| shipped | **74.975** | — |
+| `KAPLUMBA_SCALAR_ATTENTION=1` | **62.552** | **-16.6%** |
+
+The wall clock moves 16.6% on a real attention change and 0.13% on the pass chain,
+so the null is a null and not a broken instrument. (§16.3's original control read
+20%; 16.6% reproduces it.)
+
+### 25.6 What changed in the tree
+
+* `crates/kernels/src/attention.rs`: `PREFILL_PASS_KEYS = 0`, with the reasoning,
+  the measurement, the opt-in and the void 64 MiB argument on the constant's own
+  doc comment (so the next reader does not have to find this section).
+* `crates/engine/tests/prefill_pass_gate_production_path.rs`: every `#[test]` now
+  calls `enable_passes()` first, which sets `KAPLUMBA_PREFILL_PASS_KEYS=8192`
+  before anything in that binary reads the `OnceLock`. **Without this, F2's gate
+  test would pass for the wrong reason** — production would decline on the key-count
+  test rather than the grid test — which is exactly the "a test that calls a
+  different entry point than the one claimed" failure this spec has hit twice.
+* **New** `crates/engine/tests/prefill_pass_default_off.rs`: four tests pinning the
+  new default, with its own positive control (`the_shape_is_eligible_when_passes_are_enabled`
+  encodes a chain through the explicit entry point on the same buffers, so the
+  "production declines" assertions cannot pass because the device or the kernels
+  are broken). It is a **separate binary** because one process can only see one
+  value of a `OnceLock`-cached env var, and the two files deliberately cover
+  opposite halves of the rule.
+* `spec.md` OQ9, §16.4 ¶1 vs ¶3, §16.5 and NEXT.md are made to agree.
+
+### 23.7 `KAPLUMBA_FLASH_BQ=1` — the free lever, and it is not free
+
+§12.2 flagged `FLASH_QUERY_BLOCK_MIN_KEYS = 16_384` as suspect because it was
+chosen from §5's byte model, and §12 withdrew that model. It is one env var, so it
+was worth a single end-to-end A/B at the context that matters. §22's bench says
+`BQ=1` is **4-19% faster** than `BQ=2`; end to end, at a 24 602-token prompt,
+`--max-new-tokens 1`:
+
+| arm | `prefill_tok_s` | `phys_footprint` |
+|---|---|---|
+| default (`BQ=2` above 16 384 keys) | **66.257** | 17.09 GiB |
+| `KAPLUMBA_FLASH_BQ=1` forced | **65.675** | 17.08 GiB |
+
+**-0.9%: the 19% does not survive end to end.** With one round each at 24k this is
+not a ranking — OQ5 puts ±20% on a single 24k sample — so the honest statement is
+**"the two query blocks are within about 1% of each other at 24k, and the
+microbench's 19% is the bench's ranking failure showing up one more time."** The
+threshold is not worth changing: there is no win on either side of it.
+
+This is the **fifth** independent confirmation that
+`attention_arm_throughput_at_prefill_geometry` cannot rank arms: it has now been
+wrong about `scalar` vs `mma` vs `flash` (§8.7, §9.4, §11) and about `BQ=1` vs
+`BQ=2` (here, against §8.2's E2E `-2.0%`/`-6.2%`).
+
+**A second-order observation worth recording.** Both 24 590-token runs read
+**66.3 and 65.7 tok/s** against this spec's recorded **67.10** and the adversary's
+**68.40**, and `phys_footprint` reads **17.08-17.09 GiB** against the recorded
+**18.35 GiB**. Nothing in this pass changes the model, the weights or the scratch,
+so the footprint difference is a *measurement* difference between sessions, not a
+code difference — which is worth knowing before anyone treats 18.35 GiB as the
+number to beat for AC4.
+
+### 25.7 Confirmation in the shipping binary, and one sample that was discarded
+
+After the default was changed, a `KAPLUMBA_GPU_PROFILE=1` run of the **rebuilt**
+`target/release/kaplumba` at the same 16 394 tokens:
+
+| term | passes ON (old default) | one dispatch (old binary) | **default OFF (new binary)** |
+|---|---|---|---|
+| attention `own_ms` | 64 425.0 | 64 206.0 | **61 744.8** |
+| `down_proj` `own_ms` | 35 138.1 | 35 072.5 | 35 114.1 |
+| kernel sum | 215 737.7 | 215 297.2 | **212 874.0** |
+| **inter-boundary gap** | **15 801.4** | 10 625.6 | **9 678.8** |
+| wall span | 237 234.3 | 230 323.7 | 227 056.4 |
+| clean `prefill_tok_s` | 74.955 | -- | **76.529** |
+| `phys_footprint` | 15.49-15.56 GiB | 15.49-15.56 GiB | **15.53 GiB** |
+
+The gap is now at the **one-dispatch end**, which is the confirmation that the
+change reached the shipping binary: the extra command encoding is gone.
+`phys_footprint` is unchanged at 15.5 GiB, as §25.2 predicts it must be — the state
+buffer is allocated either way.
+
+**This is a consistency check, not the measurement.** The three columns are three
+different sessions and the box is faster in the later one (profiled
+`prefill_tok_s` 72.2 against 69.1/71.2, and the clean run reads the best prefill
+number of the whole pass). The measurement is the **like-for-like pair inside one
+session** in §25.2; this table only shows the new binary lands on the same side of
+it.
+
+**One sample discarded.** The first re-run of that profile read a gap of
+**40 847.7 ms** — four times either arm of the §25.2 pair — while the *clean* run
+of the same binary taken minutes earlier printed **76.529 tok/s**, the fastest
+prefill of this entire pass. A gap that quadruples while the GPU gets faster is the
+host being starved, not the kernel getting slower, so the whole row (gap, wall span,
+profiled tok/s) is discarded and **not reported as a result**. The `own_ms` columns
+from that run are the tightest cluster of the pass (down 35 070.1, gate 34 792.6,
+up 34 791.8) and are consistent with every other run, which is why they are
+mentioned here and the gap is not. The log is kept at
+`fixer_evidence/f3_default_after/profile.log` rather than deleted, because
+"discarded" should be checkable.

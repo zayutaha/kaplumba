@@ -1,3 +1,15 @@
 === [1/5] F4 quality sweep + temperature-0 gate ===
   rc=0 ; QUALITY-SWEEP-DONE
 === [2/5] F4/F5 quality gate at a sampling temperature (fixed seed) ===
+  rc=0 ; QUALITY-SWEEP-DONE
+=== [3/5] F3 profile arm=defaultpasses ===
+  rc=0  prefill_tok_s=69.104
+=== [3/5] F3 profile arm=onedispatch ===
+  rc=0  prefill_tok_s=71.176
+=== [4/5] F3 positive control (scalar attention vs shipped) ===
+  shipped rc=0  prefill_tok_s=74.975
+  scalar rc=0  prefill_tok_s=62.552
+=== [5/5] F5 KAPLUMBA_FLASH_BQ at 24 590 ===
+  bq2_default rc=0  prefill_tok_s=66.257  peak memory footprint
+  bq1_forced rc=0  prefill_tok_s=65.675  peak memory footprint
+FIXER-CHAIN-DONE

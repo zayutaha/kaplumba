@@ -1,0 +1,127 @@
+loading /Users/zayaantaha/.kaplumba/models/Gxma/Gxma ...
+
+=== GPU PROFILE (KAPLUMBA_GPU_PROFILE=1) ===
+tokens=2 chunks=1 layers=60 boundaries=906 stamps_ingested=906
+sum of per-kernel GPU own_ms = 1245.401 ms   inter-boundary gap = 298.938 ms   wall span = 1557.294 ms
+overhead floor: empty commit 0.0001 ms | one trivial dispatch 0.0074 ms (discount rows below this)
+  kernel                       count    total_ms     mean_ms
+  down_proj                       60     314.215      5.2369
+  gate_proj                       60     261.109      4.3518
+  up_proj                         60     260.545      4.3424
+  o_proj                          60     142.345      2.3724
+  q_proj                          60     133.799      2.2300
+  k_proj                          60      66.153      1.1026
+  v_proj                          60      56.842      0.9474
+  head/gemv                        1       4.349      4.3490
+  post_attn_norm_res              60       1.118      0.0186
+  post_ffn_out                    60       1.033      0.0172
+  norm_transform                  60       0.916      0.0153
+  pre_ffn_norm_transform          60       0.912      0.0152
+  kv_norm_rope                    60       0.851      0.0142
+  attention                       60       0.737      0.0123
+  gated_gelu                      60       0.226      0.0038
+  cache_append                    60       0.201      0.0034
+  head/final_norm                  1       0.014      0.0142
+  chunk/embedding                  1       0.013      0.0129
+  head/softcap                     1       0.011      0.0113
+  head/argmax                      1       0.009      0.0089
+  chunk/copy_last_row              1       0.003      0.0025
+  per-layer: 60 layers, sum 1241.002 ms, slowest layer00 33.568 ms, fastest layer36 19.980 ms
+  per-layer totals (slowest first): layer00=33.6 layer29=22.2 layer47=22.1 layer35=22.1 layer59=22.0 layer05=22.0 layer17=22.0 layer53=21.9 layer41=21.9 layer23=21.9 layer11=21.8 layer44=20.5 layer26=20.4 layer38=20.4 layer31=20.4 layer10=20.3 layer33=20.3 layer51=20.3 layer16=20.3 layer48=20.3 layer14=20.3 layer12=20.2 layer45=20.2 layer54=20.2 layer50=20.2 layer27=20.2 layer21=20.2 layer28=20.2 layer20=20.2 layer15=20.2 layer01=20.2 layer06=20.1 layer58=20.1 layer39=20.1 layer43=20.1 layer46=20.1 layer22=20.1 layer42=20.1 layer40=20.1 layer02=20.1 layer19=20.1 layer24=20.1 layer13=20.1 layer03=20.1 layer37=20.1 layer18=20.1 layer55=20.1 layer52=20.1 layer09=20.1 layer56=20.1 layer30=20.1 layer25=20.1 layer32=20.0 layer57=20.0 layer49=20.0 layer07=20.0 layer08=20.0 layer04=20.0 layer34=20.0 layer36=20.0 
+  MEASUREMENT per-chunk (rowcount/kernel, count, total_ms):
+    2r/attention                     60       0.737
+    2r/cache_append                  60       0.201
+    2r/down_proj                     60     314.215
+    2r/gate_proj                     60     261.109
+    2r/gated_gelu                    60       0.226
+    2r/k_proj                        60      66.153
+    2r/kv_norm_rope                  60       0.851
+    2r/norm_transform                60       0.916
+    2r/o_proj                        60     142.345
+    2r/post_attn_norm_res            60       1.118
+    2r/post_ffn_out                  60       1.033
+    2r/pre_ffn_norm_transform        60       0.912
+    2r/q_proj                        60     133.799
+    2r/up_proj                       60     260.545
+    2r/v_proj                        60      56.842
+loaded in 8279 ms
+
+=== GPU PROFILE (KAPLUMBA_GPU_PROFILE=1) ===
+tokens=16394 chunks=17 layers=60 boundaries=15322 stamps_ingested=15322
+sum of per-kernel GPU own_ms = 215737.687 ms   inter-boundary gap = 15801.421 ms   wall span = 237234.278 ms
+overhead floor: empty commit 0.0001 ms | one trivial dispatch 0.0021 ms (discount rows below this)
+  kernel                       count    total_ms     mean_ms
+  attention                     1020   64425.011     63.1618
+  down_proj                     1020   35138.097     34.4491
+  up_proj                       1020   34874.544     34.1907
+  gate_proj                     1020   34844.486     34.1613
+  q_proj                        1020   15927.402     15.6151
+  o_proj                        1020   15793.841     15.4842
+  k_proj                        1020    6590.795      6.4616
+  v_proj                        1020    5941.778      5.8253
+  kv_norm_rope                  1020     758.802      0.7439
+  gated_gelu                    1020     546.108      0.5354
+  post_ffn_out                  1020     337.745      0.3311
+  post_attn_norm_res            1020     212.345      0.2082
+  cache_append                  1020     183.814      0.1802
+  norm_transform                1020      74.982      0.0735
+  pre_ffn_norm_transform        1020      70.728      0.0693
+  head/gemv                        1      12.682     12.6821
+  chunk/embedding                 17       4.480      0.2636
+  head/final_norm                  1       0.017      0.0170
+  head/softcap                     1       0.014      0.0138
+  head/argmax                      1       0.012      0.0125
+  chunk/copy_last_row              1       0.002      0.0025
+  per-layer: 60 layers, sum 215720.479 ms, slowest layer23 8079.387 ms, fastest layer01 2695.968 ms
+  per-layer totals (slowest first): layer23=8079.4 layer47=8074.1 layer17=8070.9 layer35=8064.8 layer11=8062.6 layer41=8057.6 layer59=8050.3 layer53=8049.6 layer29=8047.3 layer05=8038.2 layer00=2737.0 layer37=2707.4 layer42=2707.3 layer08=2706.5 layer12=2706.3 layer58=2706.0 layer31=2705.9 layer20=2704.9 layer10=2704.6 layer18=2704.1 layer33=2704.0 layer56=2703.5 layer21=2702.9 layer45=2702.8 layer34=2702.7 layer04=2702.7 layer49=2702.6 layer30=2702.6 layer57=2702.5 layer09=2702.5 layer27=2702.4 layer46=2702.4 layer13=2702.2 layer06=2702.1 layer14=2702.0 layer40=2701.6 layer24=2701.6 layer55=2701.2 layer26=2701.1 layer03=2701.0 layer28=2700.9 layer07=2700.9 layer39=2700.7 layer54=2700.7 layer32=2700.7 layer52=2700.6 layer16=2700.5 layer15=2700.3 layer38=2700.3 layer22=2700.0 layer48=2699.9 layer43=2699.6 layer19=2699.5 layer25=2699.3 layer36=2699.1 layer02=2698.8 layer51=2698.5 layer44=2696.6 layer50=2696.5 layer01=2696.0 
+  MEASUREMENT per-chunk (rowcount/kernel, count, total_ms):
+    1024r/attention                 960   64284.146
+    1024r/cache_append              960     183.514
+    1024r/down_proj                 960   34824.712
+    1024r/gate_proj                 960   34578.166
+    1024r/gated_gelu                960     545.561
+    1024r/k_proj                    960    6524.634
+    1024r/kv_norm_rope              960     757.508
+    1024r/norm_transform            960      74.081
+    1024r/o_proj                    960   15648.767
+    1024r/post_attn_norm_res        960     211.155
+    1024r/post_ffn_out              959     336.245
+    1024r/pre_ffn_norm_transform    960      69.778
+    1024r/q_proj                    960   15793.748
+    1024r/up_proj                   960   34609.812
+    1024r/v_proj                    960    5883.351
+    10r/attention                    60     140.865
+    10r/cache_append                 60       0.300
+    10r/down_proj                    60     313.385
+    10r/gate_proj                    60     266.320
+    10r/gated_gelu                   60       0.546
+    10r/k_proj                       60      66.161
+    10r/kv_norm_rope                 60       1.295
+    10r/norm_transform               60       0.900
+    10r/o_proj                       60     145.074
+    10r/post_attn_norm_res           60       1.190
+    10r/post_ffn_out                 61       1.500
+    10r/pre_ffn_norm_transform       60       0.950
+    10r/q_proj                       60     133.654
+    10r/up_proj                      60     264.733
+    10r/v_proj                       60      58.427
+Because
+prompt_tokens=16394 generated_tokens=1 stopped_on_eos=false load_ms=8279.127 ttft_ms=237250.349 prefill_tok_s=69.104 decode_tok_s=0.000 peak_resident_pages_bytes=9754902528
+      246.66 real         0.96 user        38.05 sys
+          9754902528  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1177417  page reclaims
+              237092  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+              197165  voluntary context switches
+              209023  involuntary context switches
+        271939584661  instructions retired
+        152878892963  cycles elapsed
+         16685724032  peak memory footprint

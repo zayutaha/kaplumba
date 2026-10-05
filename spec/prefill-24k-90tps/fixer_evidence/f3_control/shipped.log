@@ -1,0 +1,4 @@
+loading /Users/zayaantaha/.kaplumba/models/Gxma/Gxma ...
+loaded in 7435 ms
+Because
+prompt_tokens=16394 generated_tokens=1 stopped_on_eos=false load_ms=7434.552 ttft_ms=218672.957 prefill_tok_s=74.975 decode_tok_s=0.000 peak_resident_pages_bytes=9159213056

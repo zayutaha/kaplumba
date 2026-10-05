@@ -191,17 +191,41 @@ longer than 8k tokens.
 
 **−0.13%, inside both arms' spread.** (The adversary's own figure, at the pre-F2
 commit, was +0.13% — i.e. the sign is noise either way, and the honest reading is
-"below the resolution of this instrument".)
+"below the resolution of this instrument at this context".)
 
-The §16.4 argument for turning it off does not survive contact with the code:
+**Where the cost actually shows up: the host side.** `KAPLUMBA_GPU_PROFILE=1`, both
+arms in the same session, 16 394 tokens:
 
-> "no measurable difference plus **64 MiB of scratch** plus 2x the dispatch count
-> is a net loss on anything that is not bandwidth-starved"
+| term | default (8192) | one dispatch (0) | delta |
+|---|---|---|---|
+| attention `own_ms` | 64 425.0 | 64 206.0 | **+219.0 (+0.34%)** |
+| the seven projections | 158 051.4 | 158 092.8 | −41.4 (−0.03%) |
+| everything else | 2 200.3 | 1 998.7 | +201.6 |
+| **kernel sum** | **215 737.7** | **215 297.2** | **+440.5 (+0.20%)** |
+| **inter-boundary gap** | **15 801.4** | **10 625.6** | **+5 175.8 (+48.7%)** |
+| wall span | 237 234.3 | 230 323.7 | +6 910.6 (**+3.0%**) |
+| profiled `prefill_tok_s` | 69.104 | 71.176 | −2.9% |
 
-`model.rs:3447` and `model.rs:4927` size `prefill_pass_state_elements_widest`
-from `tokens` **unconditionally**, so the 64 MiB is allocated whether or not the
-default is on. **The memory argument is void.** What is left is the dispatch count,
-which is now measured neutral.
+Attention itself is untouched (+0.34%, noise). The cost is **submission overhead** —
+the chain adds boundaries, and each boundary is a place where the host and the GPU
+can disagree. **F2 recovered about a third of it**: the adversary measured **+77%**
+of the gap at the pre-F2 commit, where the chain also sliced 20-threadgroup grids; it
+is **+48.7%** now. The clean wall says neutral because a pipelined run overlaps the
+extra submission with the GPU; the profiled wall says +3.0% because the profiler
+serialises at every boundary, which is exactly where the cost lives. Both readings
+point the same way: a mechanism that recovers nothing should not be paying this.
+
+**Positive control, same session, same instrument:** `KAPLUMBA_SCALAR_ATTENTION=1`
+reads **62.552 tok/s** against shipped's **74.975** — **−16.6%**. The wall clock
+moves 16.6% on a real attention change and 0.13% on the pass chain, so the null is a
+null rather than a broken instrument.
+
+**The §16.4 memory argument is void.** §16.4 ¶1 said the default costs "64 MiB of
+scratch". It does not: `model.rs:3447` and `model.rs:4927` size
+`prefill_pass_state_elements_widest` from `tokens` **unconditionally**, so the state
+buffer is resident whether or not the passes engage. `phys_footprint` reads
+15.49–15.56 GiB in both arms and *cannot* differ. **That was the strongest argument
+for turning the default off and it is not one.**
 
 ### The decision
 
@@ -211,24 +235,90 @@ statement.** The reasoning, in the order that decided it:
 1. **It is bit-exact, so this is not a quality decision.** Verified on generated
    text, not only in the 17 kernel-level tests: the `passes0` arm of
    `scripts/bench_split_rule_quality.sh` is **byte-identical** to the shipped
-   default at 1024, 4096 and 16 394 tokens of context, 512 greedy tokens each.
+   default at 1024, 4096 and 16 394 tokens of context, 512 greedy tokens each —
+   **and byte-identical at `--temperature 0.7` with a fixed seed**, which is the leg
+   that actually establishes exactness (a sampler turns a last-ulp logit difference
+   into a different token at the first near-tie; 512 draws found none).
 2. **It has no measured benefit at any context this box can measure** (§16.4's own
-   conclusion, re-confirmed), and no measured cost. A tie.
-3. **The tiebreak is not "it is neutral so leave it on".** The brief's steer was
-   right, and §16.4 ¶1's instinct was right, for a reason that is about
-   *defaults* rather than about this microbenchmark: a mechanism with no measured
-   benefit should not be a **default**, because a default is a claim. oMLX's 8192
-   is oMLX's default on hardware where its mechanism has a measured effect at 1M
-   keys; copying the number without the effect is cargo-culting a constant.
+   conclusion, re-confirmed) and a measurable-but-small cost: +48.7% of the
+   inter-boundary gap, +3.0% of the profiled wall, 0.13% of the clean wall.
+3. **The tiebreak is not "it is neutral so leave it on".** §16.4 ¶1's instinct
+   was right, for a reason that is about *defaults* rather than about this
+   microbenchmark: a mechanism with no measured benefit should not be a **default**,
+   because a default is a claim. oMLX's 8192 is oMLX's default on hardware where its
+   mechanism has a measured effect at 1M keys; copying the number without the effect
+   is copying a constant. And here the cost is not even zero — it is submission
+   overhead that a pipelined run partly hides and a serialised one does not.
 4. **Nothing is lost by turning it off, and something is gained.** The
    implementation, its 17 tests and F2's grid gate stay; what changes is that
    `KAPLUMBA_PREFILL_PASS_KEYS=<n>` becomes an explicit opt-in rather than the
-   silent default, and the F2 gate stops paying 512+ dispatches per prefill for a
-   mechanism that recovers nothing here.
+   silent default, and production stops paying extra dispatches for a mechanism that
+   recovers nothing here.
 5. **The cost of being wrong is one env var.** If a future session finds a context
    where passes pay — the mechanism's premise is real at 1M keys, and this engine's
    24k ceiling is what makes it unreachable — `KAPLUMBA_PREFILL_PASS_KEYS=8192`
    restores it with no rebuild.
+
+### It is EXACT — and the evidence that establishes that is not the greedy run
+
+`scripts/bench_split_rule_quality.sh`, 16 394-token prompt, **512 tokens at
+`--temperature 0.7 --seed 20260905`**, four arms:
+
+| arm | tokens | vs `shipped` | first differing token |
+|---|---|---|---|
+| `shipped` (OQ9 passes ON, the old default) | 512 | — | — |
+| **`passes0` (`KAPLUMBA_PREFILL_PASS_KEYS=0`)** | 512 | **0 — byte-identical** | **never** |
+| `workgroups` decode split rule | 512 | 99 | **407** |
+| `splits13` decode split rule | 512 | 90 | **407** |
+
+**At a sampling temperature with a fixed seed, the pass chain and the one-dispatch
+body produce the same 512 tokens.** If a single logit had differed in the last ulp,
+the sampler would have taken a different branch at the first near-tie, and 512
+draws found none. The temperature-0 result on its own is weaker than it looks — a
+bounded-ulp change can be invisible to an argmax — so **the temperature-0.7 run is
+what establishes exactness**, and the same instrument in the same run shows the
+contrast: the **decode split-rule change diverges at token 407**.
+
+That is also why the two perturbations in this report carry different labels:
+
+| change | label | evidence |
+|---|---|---|
+| OQ9 passes on/off | **exact** | byte-identical text at temperature 0 **and** at temperature 0.7 with a fixed seed, at 1024 / 4096 / 16394 tokens of context |
+| decode split rule 16 -> 13 | **bounded-ulp** | 1 token in 1 536 greedy; at temperature 0.7 the first divergence is at token 407 |
+
+### Confirmation in the shipping binary — and one sample discarded
+
+After the change, a `KAPLUMBA_GPU_PROFILE=1` run of the **rebuilt**
+`target/release/kaplumba` at the same 16 394 tokens:
+
+| term | passes ON (old default) | one dispatch (old binary) | **default OFF (new binary)** |
+|---|---|---|---|
+| attention `own_ms` | 64 425.0 | 64 206.0 | **61 744.8** |
+| `down_proj` `own_ms` | 35 138.1 | 35 072.5 | 35 114.1 |
+| kernel sum | 215 737.7 | 215 297.2 | **212 874.0** |
+| **inter-boundary gap** | **15 801.4** | 10 625.6 | **9 678.8** |
+| wall span | 237 234.3 | 230 323.7 | 227 056.4 |
+| clean `prefill_tok_s` | 74.955 | — | **76.529** |
+| `phys_footprint` | 15.49-15.56 GiB | 15.49-15.56 GiB | **15.53 GiB** |
+
+The gap sits at the **one-dispatch end**, which is the confirmation that the change
+reached the shipping binary: the extra command encoding is gone.
+`phys_footprint` is unchanged at 15.5 GiB, exactly as the "the buffer is allocated
+either way" argument predicts.
+
+**This is a consistency check, not the measurement** — three different sessions, and
+the box is faster in the later one (profiled 72.2 tok/s against 69.1/71.2). The
+measurement is the like-for-like pair inside one session, above.
+
+**One sample discarded and reported as discarded.** The first re-run of that profile
+read a gap of **40 847.7 ms** — four times either arm — while the *clean* run of the
+same binary minutes earlier printed **76.529 tok/s**, the fastest prefill of the
+whole pass. A gap that quadruples while the GPU gets faster is the host being
+starved, not the kernel slowing down, so that row is not reported as a result. Its
+`own_ms` columns are the tightest cluster of the pass (down 35 070.1, gate 34 792.6,
+up 34 791.8) and are consistent with every other run, which is why those are quoted
+and the gap is not. The log is kept at `fixer_evidence/f3_default_after/profile.log`
+rather than deleted, because "discarded" should be checkable.
 
 ### What changed in the tree
 
@@ -481,9 +571,26 @@ cheaper route: it is at 43% of peak, uniformly, and 8.1 TFLOP/s is **above**
 is a target change or a rewrite, not another lever-shaped session.** No acceptance
 target in `spec.md` was changed.
 
-### The one experiment still standing
+### The one free lever, and it is not free
 
-`mma_peak.rs` records that the tensor rate depends on the **number of independent
+`FLASH_QUERY_BLOCK_MIN_KEYS = 16_384` was chosen from §5's byte model, which §12
+withdrew, and §12.2 flagged it as suspect without testing it. §22's bench says
+`BQ=1` is 4-19% faster than `BQ=2`. End to end at a **24 602-token** prompt,
+`--max-new-tokens 1`, clean:
+
+| arm | `prefill_tok_s` | `phys_footprint` |
+|---|---|---|
+| default (`BQ=2` above 16 384 keys) | **66.257** | 17.09 GiB |
+| `KAPLUMBA_FLASH_BQ=1` forced | **65.675** | 17.08 GiB |
+
+**−0.9%: the 19% does not survive end to end.** One round each at 24k is not a
+ranking (OQ5 puts ±20% on a single 24k sample), so the honest statement is that
+**the two query blocks are within ~1% of each other at 24k and the microbench's 19%
+is its ranking failure showing up again** — the fifth independent confirmation
+(§8.7, §9.4, §11, and now `BQ=1` vs `BQ=2` against §8.2's E2E −2.0%/−6.2%). The
+threshold is not worth changing: there is no win on either side of it.
+
+### The one experiment still standing that the tensor rate depends on the **number of independent
 accumulator chains** and not on the loads (1 chain 5.75, 8 chains 7.65, 16 chains
 15.49 TFLOPS) — and that an *array* of 32 made the compiler spill and collapse to
 0.74. Arms 11/12 split the QK chain 2 and 4 ways and gained nothing, which suggests
@@ -583,13 +690,13 @@ long measurement into `tail`.
 
 | requirement | measurement | result |
 |---|---|---|
-| byte-identical greedy text vs base `f2b2da1` for the **default** configuration | — | **held by construction and by test**: the only behavioural default this pass changes is F3's, and OQ9 passes are bit-exact — verified on **generated text** (512 greedy tokens, byte-identical) at 1024 / 4096 / 16 394 tokens of context |
-| >= 512-token generations at temperature 0 | 512 tokens x 4 arms x 3 contexts | ✅ all completed, 512 tokens each |
-| >= 512-token generation at a sampling temperature | 512 tokens, `--temperature 0.7 --seed 20260905`, 16 394-token prompt | see `f4_quality_sampled/` |
-| no repetition collapse | distinct n-gram ratio + a deliberately collapsed control | ✅ `distinct_8` 0.958-0.966 against a control's 0.0085 |
+| byte-identical greedy text vs base `f2b2da1` for the **default** configuration | — | **held, and by measurement rather than by assertion**: the only behavioural default this pass changes is F3's, and OQ9 passes are **exact** — byte-identical text at temperature 0 **and** at `--temperature 0.7` with a fixed seed, at 1024 / 4096 / 16 394 tokens of context |
+| >= 512-token generations at temperature 0 | 512 tokens x 4 arms x 3 contexts | ✅ 12/12 completed, 512 tokens each |
+| >= 512-token generation at a sampling temperature | 512 tokens, `--temperature 0.7 --seed 20260905`, 16 394-token prompt, 4 arms | ✅ 4/4 completed |
+| no repetition collapse | distinct n-gram ratio + a deliberately collapsed control | ✅ `distinct_8` 0.958-1.000 against a control's 0.0085 |
 | no NaN/Inf | a non-finite logit is a hard `SamplerError` (`sampler.rs:446`) | ✅ a completed generation cannot contain one |
-| worst normalised GEMM error <= 2.16e-3 | **not re-measured** — no product numerics changed, only defaults and comments | n/a; see below |
-| weight footprint <= 11.51 GiB | `phys_footprint` from `/usr/bin/time -l` in every run | ✅ 15.49-15.56 GiB at 16 394 tokens, unchanged; the F3 default change cannot move it because the state buffer is allocated either way |
+| worst normalised GEMM error ≤ 2.16e-3 | `cargo test --release -p kaplumba-engine --test linear_metal` | **2.1603336e-3**, unchanged. **But:** the test's own gate is `MMA_TOLERANCE = 0.02` (`linear_metal.rs:888`), **9.3× looser than the number `spec.md` states**, so AC5's error bound is enforced by nothing today. Reported, not fixed — tightening a tolerance is a tuning action and out of scope here |
+| weight footprint ≤ 11.51 GiB | `phys_footprint` from `/usr/bin/time -l` in every run | ✅ 15.50–15.56 GiB at 16 394 tokens and 17.08–17.09 GiB at 24 602, unchanged by the F3 default change — as it must be, since the pass-state buffer is allocated either way |
 
 **Every numeric perturbation in this report is labelled.** F4's split-rule flip is
 **bounded-ulp**: 1 differing argmax token in 1 536, and the mechanism (fp addition
@@ -599,8 +706,18 @@ is bit-identical to the one-dispatch body, now checked on generated text and not
 on the 17 kernel-level cases. Nothing in this report is labelled "exact" on the
 strength of a tolerance.
 
-**Not re-measured, and it should not be read as a pass:** the worst normalised GEMM
-error. No GEMM, sampler or attention arithmetic was modified in this pass — only two
-defaults and a comment — so the number is unchanged by construction rather than by
-measurement. Anyone needing it as evidence should run
-`crates/engine/tests/linear_metal.rs` against base.
+**One thing the gate does not cover, and this pass found it.** AC5 states a worst
+normalised GEMM error of ≤ 2.16e-3. `crates/engine/tests/linear_metal.rs` prints
+**2.1603336e-3** (so the recorded number is current), but the assertion it makes is
+`worst < MMA_TOLERANCE` with `MMA_TOLERANCE = 0.02` (`linear_metal.rs:888`) —
+**9.3× looser than the stated bound, and 9.3× above the measured value.** So the
+GEMM error budget in `spec.md` is, today, enforced by nothing: a kernel that
+regressed to 0.019 would pass this suite and be described by this document as
+inside 2.16e-3. That is a pre-existing inconsistency, not something this pass
+introduced, and **not fixed here** — tightening a tolerance is a tuning action that
+belongs to whoever owns the bound, with the measured 2.1603e-3 in hand.
+
+**What this pass changed, in one line, for the record:** one behavioural default
+(F3), one source comment (F4's magnitude), and the temporary uniform field that
+existed only for the F1/F8 measurements and has been removed. No GEMM, sampler or
+attention arithmetic was touched.

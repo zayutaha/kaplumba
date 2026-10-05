@@ -1,5 +1,18 @@
 # F5 working arithmetic
 
+> **SUPERSEDED by `implementation_notes.md` §23 for the argument.** This file is
+> the per-projection FLOP derivation it is built on, kept because every number in
+> §23 traces to a line here and because the layer-kind FLOP counts are the part
+> that is easy to get wrong (`head_dim` is 512 on the 10 full layers and 256 on the
+> 50 sliding ones, so `q_proj` and `o_proj` have two shapes).
+>
+> **One correction inside it.** §4 below proposes hoisting the Q fragment into
+> registers to raise the instruction-issue ceiling from 8.25 to 9.5 TFLOP/s. §22
+> **measured** that: it is **92% slower** (arm 7), because 64-128
+> `simdgroup_half8x8` per lane spills. The instruction-count model is also
+> falsified in general — it predicts `BQ=2` should beat `BQ=1` by 1.33x and the
+> bench says it is 19% *worse*. §23.5 records this. **Do not use §4.**
+
 Every measured number below comes from `KAPLUMBA_GPU_PROFILE=1` at a 16 394-token
 prompt: 17 chunks x 60 layers = 1020 layer-chunks, `own_ms` per kernel, from
 `spec/prefill-24k-90tps/adversary_evidence/profile_16384_onedispatch.log`.

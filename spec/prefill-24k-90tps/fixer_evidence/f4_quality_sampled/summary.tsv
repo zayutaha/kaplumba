@@ -3,3 +3,5 @@
 # ctx	arm	result
 16394	shipped	OK tokens=512
 16394	workgroups	OK tokens=512
+16394	splits13	OK tokens=512
+16394	passes0	OK tokens=512

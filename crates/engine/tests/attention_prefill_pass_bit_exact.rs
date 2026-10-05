@@ -43,6 +43,36 @@
 use half::f16;
 use kaplumba_kernels::attention::{self, AttentionEncodeRequest, AttentionKernels, AttentionQk};
 use kaplumba_kernels::encoder::MetalEncoder;
+
+/// **F3 (2026-10-05): the OQ9 pass chain now ships OFF**
+/// (`PREFILL_PASS_KEYS = 0`, because the mechanism has no measured benefit at any
+/// context this box can measure and a no-benefit mechanism should not be a
+/// default). Every test in this file is about the mechanism, so this binary turns
+/// it back on explicitly -- otherwise all 17 would pass or fail for the wrong
+/// reason, which is the "a test that exercises a different path than the one
+/// claimed" failure this repo has hit three times.
+///
+/// `prefill_pass_keys_for` reads the variable through a `OnceLock`, so it has to be
+/// set before anything in this process reads it. Every `#[test]` here calls this
+/// first, so whichever one the harness runs first populates the cache with 8192 and
+/// the rest see the same value: no ordering assumption, and no test can be green
+/// because the default happened to be right.
+///
+/// The separate binary `prefill_pass_default_off.rs` pins the shipped default and
+/// never calls this.
+///
+/// Rust 2024 makes `set_var` `unsafe`; the call is at the very start of a test
+/// binary, before any other thread has touched the environment.
+fn enable_passes() {
+    // SAFETY: single-threaded at this point in a fresh test binary.
+    unsafe { std::env::set_var("KAPLUMBA_PREFILL_PASS_KEYS", "8192") };
+    assert_eq!(
+        attention::prefill_pass_keys_for(1 << 20),
+        8192,
+        "KAPLUMBA_PREFILL_PASS_KEYS did not take effect; every test in this file \
+         would then be testing the one-dispatch path"
+    );
+}
 use metal::{Buffer, CommandQueue, Device, MTLResourceOptions};
 
 /// Threadgroups per (query, KV head) pair for the shipped full-attention shape.
@@ -280,6 +310,7 @@ use attention::PREFILL_PASS_MIN_GROUPS;
 
 #[test]
 fn two_passes_at_the_shipping_context() {
+    enable_passes();
     // The production shape: a 1024-query chunk against 8192 keys, BQ = 2, sliced
     // into two halves. This is the case the N1 design targets.
     let fx = Fixture::new();
@@ -289,6 +320,7 @@ fn two_passes_at_the_shipping_context() {
 
 #[test]
 fn many_pass_counts_over_ragged_key_counts() {
+    enable_passes();
     // 24 590 keys is the measured 24k prompt. None of these pass sizes divides it
     // evenly except a couple, so most chains have ragged first and last passes.
     let fx = Fixture::new();
@@ -300,6 +332,7 @@ fn many_pass_counts_over_ragged_key_counts() {
 
 #[test]
 fn both_query_blocks() {
+    enable_passes();
     // BQ = 2 halves the grid, so 512 queries clear the gate at both blocks.
     let fx = Fixture::new();
     for block in [1usize, 2] {
@@ -312,6 +345,7 @@ fn both_query_blocks() {
 
 #[test]
 fn every_pass_size_is_bit_exact_at_ragged_key_counts() {
+    enable_passes();
     // The straddle staging (`partial_sub` / `partial_kt`) only runs when a tile
     // is not full, which after tile-aligned edges means the LAST tile of a pass
     // whose range ends off a tile edge. Ragged key counts with several pass
@@ -335,6 +369,7 @@ fn every_pass_size_is_bit_exact_at_ragged_key_counts() {
 
 #[test]
 fn pass_boundaries_are_snapped_to_the_key_tile() {
+    enable_passes();
     // The whole mechanism's bit-exactness rests on this: the online softmax
     // updates (m, s, O) once per 64-key tile, so a boundary inside a tile changes
     // every row's rescale sequence. Measured cost of getting it wrong is one fp16
@@ -409,6 +444,7 @@ fn pass_boundaries_are_snapped_to_the_key_tile() {
 
 #[test]
 fn pass_edges_tile_the_key_range_exactly() {
+    enable_passes();
     for count in [64usize, 100, 1000, 8192, 8193, 16_384, 24_576, 24_590] {
         for pass_keys in [64usize, 128, 512, 1024, 4096, 8192] {
             let edges = attention::prefill_pass_edges(count, pass_keys);
@@ -424,6 +460,7 @@ fn pass_edges_tile_the_key_range_exactly() {
 
 #[test]
 fn ragged_key_counts_around_the_tile() {
+    enable_passes();
     let fx = Fixture::new();
     for keys in [129usize, 191, 255, 257, 1000, 1023, 1025, 4095, 4097] {
         let case = fx.case(1024, keys, 0);
@@ -436,6 +473,7 @@ fn ragged_key_counts_around_the_tile() {
 
 #[test]
 fn query_tails_at_bq2() {
+    enable_passes();
     // At BQ = 2 an odd query count leaves the last threadgroup half out of
     // range. Its rows must be neither written to the state nor read back, and the
     // rows before it must be unaffected.
@@ -449,6 +487,7 @@ fn query_tails_at_bq2() {
 
 #[test]
 fn windowed_shapes() {
+    enable_passes();
     // The window test and the pass range interact: a row whose live keys all sit
     // inside one pass must still get the rescale its earlier keys owed it, and a
     // pass boundary inside the window must not change which keys are live.
@@ -461,6 +500,7 @@ fn windowed_shapes() {
 
 #[test]
 fn a_first_pass_with_every_key_masked_out() {
+    enable_passes();
     // Every query is at position 0, so only key 0 is visible to anything. Pass 0
     // (keys 0..1024 under `pass_keys = 1024`) is *not* empty -- it holds key 0 --
     // so make the cut coarser and the queries late enough that pass 0 is entirely
@@ -503,6 +543,7 @@ fn a_first_pass_with_every_key_masked_out() {
 
 #[test]
 fn a_long_chain_of_tiny_passes() {
+    enable_passes();
     // One key tile (64 keys) per pass over 8192 keys is 128 dispatches -- the
     // extreme of the mechanism. If any pass boundary loses a ulp, this is where it
     // shows.
@@ -518,6 +559,7 @@ fn a_long_chain_of_tiny_passes() {
 
 #[test]
 fn the_grid_gate_holds_small_grids_to_one_dispatch() {
+    enable_passes();
     // oMLX's `_PASS_MIN_GROUPS = 512`: below that the threadgroups stay in step
     // anyway, so a chain would cost state traffic for nothing.
     assert_eq!(PREFILL_PASS_MIN_GROUPS, 512);
@@ -574,6 +616,7 @@ fn the_grid_gate_holds_small_grids_to_one_dispatch() {
 
 #[test]
 fn a_short_key_range_declines() {
+    enable_passes();
     let fx = Fixture::new();
     let case = fx.case(1024, 4096, 0);
     for pass_keys in [4096usize, 8192, 1_000_000] {
@@ -599,6 +642,7 @@ fn a_short_key_range_declines() {
 
 #[test]
 fn a_declined_dispatch_encodes_nothing() {
+    enable_passes();
     // The caller falls through to the one-dispatch path on `false`, so a declined
     // dispatch must leave the encoder empty rather than half-encode. Verified by
     // running a declined arm and an empty encoder and comparing their outputs.
@@ -652,6 +696,7 @@ fn a_declined_dispatch_encodes_nothing() {
 
 #[test]
 fn a_short_state_buffer_is_an_error_not_a_truncation() {
+    enable_passes();
     // Every row of every pass writes its whole row unconditionally, so a short
     // buffer must be refused. Silently truncating would read uninitialised state.
     let fx = Fixture::new();
@@ -687,6 +732,7 @@ fn a_short_state_buffer_is_an_error_not_a_truncation() {
 
 #[test]
 fn the_state_buffer_is_fixed_size_and_context_independent() {
+    enable_passes();
     // AGENTS.md §8: scratch is fixed-size and independent of context length. The
     // row state depends on the CHUNK, never on `key_count` -- the function's
     // signature has no key count in it, which is the structural reason it cannot
@@ -723,6 +769,7 @@ fn the_state_buffer_is_fixed_size_and_context_independent() {
 
 #[test]
 fn bit_exactness_can_fail() {
+    enable_passes();
     // AGENTS.md §10.3: "a measurement that has never been seen to fail is not a
     // measurement". The same comparison, on deliberately different inputs, must
     // report a difference -- otherwise every assertion above could be passing on

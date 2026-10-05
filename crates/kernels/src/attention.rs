@@ -232,16 +232,39 @@ pub fn decode_partial_elements(q_heads: usize, head_dim: usize) -> usize {
 // OQ9: prefill key-range passes.
 // ---------------------------------------------------------------------------
 
-/// Keys per prefill pass. oMLX's `OMLX_NAX_ATTN_PASS_KEYS` default is **8192**
-/// (`omlx/utils/nax_attention.py:93`), and its measured reason is cache
-/// residency, not a byte budget: *"Every threadgroup of a dispatch streams this
-/// many keys of its KV head, so the key slice the threadgroups in flight share
-/// stays in the on-chip caches (one dispatch over 1M keys runs at ~85 TFLOPS
-/// against ~103 at 64k)"* (`:89-91`).
+/// Keys per prefill pass; **0, i.e. passes OFF by default**.
 ///
-/// `KAPLUMBA_PREFILL_PASS_KEYS=<n>` overrides it; **0 turns passes off** and
-/// restores the one-dispatch body.
-pub const PREFILL_PASS_KEYS: usize = 8192;
+/// oMLX's default is **8192** (`omlx/utils/nax_attention.py:93`) and its stated
+/// reason is cache residency, not a byte budget: *"Every threadgroup of a dispatch
+/// streams this many keys of its KV head, so the key slice the threadgroups in
+/// flight share stays in the on-chip caches (one dispatch over 1M keys runs at
+/// ~85 TFLOPS against ~103 at 64k)"* (`:89-91`).
+///
+/// **Why this engine ships it off** (F3, `spec/prefill-24k-90tps` §25). oMLX
+/// measured the mechanism over **1M keys**. This engine's 24k ceiling makes the
+/// premise unreachable: there is no residency loss here for the slices to
+/// recover, because at 16 394 tokens the whole KV working set of a full-attention
+/// layer is 134 MB and a 64x smaller K/V allocation has been measured to buy 6%
+/// (`implementation_notes.md` §10). Measured cost of turning passes **on**, on
+/// the shipped body and after the F2 grid gate, at 16 394 tokens, 3 interleaved
+/// rounds: **-0.13% (75.172 against 75.271 tok/s), inside a 0.30-0.63% arm
+/// spread.** So the mechanism is neither a win nor a loss here, and a mechanism
+/// with no measured benefit should not be a **default**: a default is a claim.
+///
+/// The implementation, its 17 bit-exactness tests and the `PREFILL_PASS_MIN_GROUPS`
+/// grid gate all stay, and they are **bit-exact** — verified on generated text, not
+/// only on synthetic buffers: with `KAPLUMBA_PREFILL_PASS_KEYS=8192` the output is
+/// byte-identical to the one-dispatch body at 1024, 4096 and 16 394 tokens of
+/// context, 512 greedy tokens each. **`KAPLUMBA_PREFILL_PASS_KEYS=8192` is the
+/// opt-in**, and it is the flag to reach for if a future session finds a context
+/// where the slices pay.
+///
+/// One argument that used to support "off" is **void** and is recorded here so it
+/// is not used again: the 64 MiB pass-state buffer is allocated **unconditionally**
+/// (`model.rs` sizes `prefill_pass_state_elements_widest` from `tokens` whatever
+/// the default is), so passes-off does not save it and §16.4's "plus 64 MiB of
+/// scratch" was not a cost of the default.
+pub const PREFILL_PASS_KEYS: usize = 0;
 
 /// Minimum number of threadgroups before passes are worth it.
 ///
@@ -653,45 +676,6 @@ struct AttentionParams {
     /// behaviour, `[0, key_count)`.
     pass_begin: u32,
     pass_keys: u32,
-    /// TEMPORARY (spec/prefill-24k-90tps F1): an ablation selector carried in
-    /// the uniform block so that ONE build can time every arm of the flash-body
-    /// ablation. `0` is production. Never set outside the ablation bench; this
-    /// field is deleted with the rest of the knob.
-    ablate: u32,
-}
-
-/// TEMPORARY (spec/prefill-24k-90tps F1). See [`attention::AttentionParams::ablate`].
-///
-/// A process-global rather than an env `OnceLock`, because the ablation bench
-/// needs to change arms **inside one process** so that every arm is timed by
-/// the same binary, the same Metal library and the same shader cache. The env
-/// var is only the default, read once.
-static ATTENTION_ABLATION_ARM: std::sync::atomic::AtomicU32 =
-    std::sync::atomic::AtomicU32::new(u32::MAX);
-
-/// TEMPORARY (spec/prefill-24k-90tps F1): read the ablation arm for one dispatch.
-pub fn attention_ablate_arm() -> u32 {
-    let slot = ATTENTION_ABLATION_ARM.load(std::sync::atomic::Ordering::Relaxed);
-    if slot != u32::MAX {
-        return slot;
-    }
-    let raw = std::env::var("KAPLUMBA_ATTENTION_ABLATE")
-        .ok()
-        .and_then(|v| v.trim().parse::<u32>().ok())
-        .unwrap_or(0);
-    ATTENTION_ABLATION_ARM.store(raw, std::sync::atomic::Ordering::Relaxed);
-    raw
-}
-
-/// TEMPORARY (spec/prefill-24k-90tps F1): pin the ablation arm for the rest of
-/// the process. `attention_ablation_arm()` returns what was set.
-pub fn set_attention_ablation_arm(arm: u32) {
-    ATTENTION_ABLATION_ARM.store(arm, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// TEMPORARY (spec/prefill-24k-90tps F1): the arm currently selected.
-pub fn attention_ablation_arm() -> u32 {
-    attention_ablate_arm()
 }
 
 #[derive(Clone, Copy)]
@@ -1130,7 +1114,6 @@ impl AttentionKernels {
             keys_per_split: 0,
             pass_begin: 0,
             pass_keys: 0,
-            ablate: attention_ablate_arm(),
         };
         // Resolve the pipeline before opening an encoder. Returning early from
         // inside `set_compute_pipeline_state` used to drop a live compute
@@ -1348,7 +1331,6 @@ impl AttentionKernels {
             keys_per_split: to_u32(keys_per_split, "keys per split")?,
             pass_begin: 0,
             pass_keys: 0,
-            ablate: attention_ablate_arm(),
         };
         let bytes = params_bytes(&params);
         let kv_groups = to_u32(kv_heads, "kv head count")?;
@@ -1488,7 +1470,6 @@ impl AttentionKernels {
             keys_per_split: 0,
             pass_begin: 0,
             pass_keys: 0,
-            ablate: attention_ablate_arm(),
         };
         debug_assert_eq!(
             gqa_index(head_dim, groups),
@@ -1583,7 +1564,6 @@ impl AttentionKernels {
             keys_per_split: 0,
             pass_begin: 0,
             pass_keys: 0,
-            ablate: attention_ablate_arm(),
         };
         // Prefill: one threadgroup per (query, KV HEAD), holding one simdgroup
         // per query head that shares that KV head. `groups` query heads read the
@@ -1872,7 +1852,6 @@ impl AttentionKernels {
                     pass_end.saturating_sub(pass_begin),
                     "prefill pass key count",
                 )?,
-                ablate: attention_ablate_arm(),
             };
             // `dispatch_groups` appends the params blob at `bindings.len()`, so the
             // extra buffer has to be inserted *before* it: `output` stays at 5
