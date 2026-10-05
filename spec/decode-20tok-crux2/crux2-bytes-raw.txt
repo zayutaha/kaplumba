@@ -1,0 +1,105 @@
+model /Users/zayaantaha/.kaplumba/models/Gxma/Gxma   sabotage=off
+geometry: h=5376 inter=21504 vocab=262144 heads=32 kv_heads=16 head_dim=256 g_kv_heads=4 g_head_dim=512 window=1024  -> 50 sliding / 10 full
+
+=== shard headers (raw) ===
+  model-00001-of-00002.safetensors   file=   8498844565 hdr=   133127 tensors= 1066 sum(off)=   8498711438 gaps=0 overlaps=0
+  model-00002-of-00002.safetensors   file=   7529513450 hdr=   174644 tensors= 1356 sum(off)=   7529338806 gaps=0 overlaps=0
+  TOTAL tensors=2422 sum(data_end-data_start)=16028050244 declared_total_size=16028050244 sum(file-hdr)=16028050244
+
+=== CONTROLS (positive controls; a wrong instrument must fail here) ===
+  C1  sum(offsets)            =    16028050244   vs declared    16028050244   delta              0
+  C2  sum(file_len - hdr_len) =    16028050244   vs declared    16028050244   delta              0
+  C3  sum(quant_cfg n_bytes)  =    14876563052   over 2006 stored tensors
+  C1 PASS
+  C2 PASS
+=== bytes/token, decomposed ===
+bucket                    bytes         GB    share
+q_proj               1156055040     1.1561    9.59%
+k_proj                454164480     0.4542    3.77%
+v_proj                412876800     0.4129    3.42%
+o_proj               1156055040     1.1561    9.59%
+gate_proj            2601123840     2.6011   21.57%
+up_proj              2601123840     2.6011   21.57%
+down_proj            2601123840     2.6011   21.57%
+lm_head              1056964608     1.0570    8.77%
+side .suh/.svh/.mcg         15840364     0.0158    0.13%
+norms+scalar            2663032     0.0027    0.02%
+embed row                 10752     0.0000    0.00%
+WEIGHTS TOTAL       12058001636    12.0580
+vision tower         1151487072     1.1515   (never read by text decode)
+
+=== selection control (per family) ===
+family               2nd pass           bucket    delta
+q_proj             1156055040       1156055040        0
+k_proj              454164480        454164480        0
+v_proj              412876800        412876800        0
+o_proj             1156055040       1156055040        0
+gate_proj          2601123840       2601123840        0
+up_proj            2601123840       2601123840        0
+down_proj          2601123840       2601123840        0
+lm_head            1056964608       1056964608        0
+  SELECTION CONTROL: PASS
+
+=== selection identity ===
+  weights-except-embed-row + full embed table + vision = 16028050244 B = 16.0281 GB
+  declared total_size                    = 16028050244 B = 16.0281 GB
+  unaccounted remainder                 = 0 B
+
+=== per-projection identity: header bytes vs config geometry ===
+matrix              trellis B   count      params(cfg)       bpw expected n
+q_proj             1156055040      60       3082813440    3.0000         60
+k_proj              454164480      60       1211105280    3.0000         60
+v_proj              412876800      50       1101004800    3.0000         50
+o_proj             1156055040      60       3082813440    3.0000         60
+gate_proj          2601123840      60       6936330240    3.0000         60
+up_proj            2601123840      60       6936330240    3.0000         60
+down_proj          2601123840      60       6936330240    3.0000         60
+lm_head            1056964608       1       1409286144    6.0000          1
+
+=== KV bytes/token (fp16, from config geometry) ===
+context      sliding MB       full MB       KV GB       %step      GB/token
+614               503.0          50.3      0.5533       4.59%       12.6113
+1024              838.9          83.9      0.9227       7.65%       12.9807
+2048              838.9         167.8      1.0066       8.35%       13.0646
+4096              838.9         335.5      1.1744       9.74%       13.2324
+8192              838.9         671.1      1.5099      12.52%       13.5680
+16384             838.9        1342.2      2.1810      18.09%       14.2390
+24576             838.9        2013.3      2.8521      23.65%       14.9101
+
+=== roofline: tok/s = GB/s / GB-per-token, ZERO overhead ===
+context      GB/token     @220   @239.8     @245   @253.6     @273     @285
+8192          13.5680    61.67    56.58    55.38    53.50   273.00    47.64
+16384         14.2390    64.72    59.38    58.12    56.15   273.00    50.00
+
+=== bytes/token that 20 tok/s demands, per achieved bandwidth ===
+  actual bytes/token @16k = 14.2390 GB
+      GB/s      budget GB   must cut to GB       cut GB        cut %
+     220.0        11.0000          11.0000       3.2390       22.75%
+     239.8        11.9900          11.9900       2.2490       15.79%
+     245.0        12.2500          12.2500       1.9890       13.97%
+     253.6        12.6800          12.6800       1.5590       10.95%
+     273.0        13.6500          13.6500       0.5890        4.14%
+
+  actual bytes/token @8k  = 13.5680 GB
+    @ 245.0 GB/s -> budget 12.2500 GB, SHORT by 1.3180 GB (9.71%)
+    @ 253.6 GB/s -> budget 12.6800 GB, SHORT by 0.8880 GB (6.54%)
+    @ 273.0 GB/s -> budget 13.6500 GB, OK, headroom 0.0820 GB (0.60%)
+
+=== layer bpw required for 20 tok/s @16k (head held at 6 bpw) ===
+  layer params    29286727680   head params     1409286144
+      GB/s     budget GB    for layers  layers bpw
+     239.8       11.9900        8.7520      2.3907
+     245.0       12.2500        9.0120      2.4617
+     253.6       12.6800        9.4420      2.5792
+     273.0       13.6500       10.4120      2.8442
+
+=== if EVERY parameter moved to a uniform rate, KV unchanged ===
+     bpw   GB/token       @245     @253.6       @273
+    2.00     9.8550      40.22      38.86      36.10
+    2.25    10.8143      44.14      42.64      39.61
+    2.40    11.3898      46.49      44.91      41.72
+    2.50    11.7735      48.06      46.43      43.13
+    2.75    12.7328      51.97      50.21      46.64
+    3.00    13.6920      55.89      53.99      50.15
+
+=== dtype cross-check (bf16 norms/scalars: params 1459820 x2 vs header bytes 2663032) ===

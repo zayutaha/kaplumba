@@ -1,0 +1,50 @@
+=== codebook (mcg, 256 states, the repo's own decoder) ===
+  max|q|        = 3.625000
+  RMS(q)        = 1.203422
+  max|q|/RMS(q) = 3.0122
+  mean(q)       = -0.000202   (nonzero mean would leak into every logit)
+  min/max       = -3.625000 / 3.238281
+
+=== lm_head scales, read from the checkpoint ===
+  lm_head.svh dtype=F16 shape=[262144] bytes=524288
+  lm_head.suh dtype=F16 shape=[5376] bytes=10752
+  svh (per output row, 262144): absmax=6.082031 min=-5.187500 max=6.082031 rms=1.002788
+  suh (per input col,  5376): absmax=0.172119 min=-0.172119 max=0.044556 rms=0.015341
+
+=== the exclusion bound ===
+  max|W[t,j]| <= max|svh| * max|suh| * max|q| = 6.082031 * 0.172119 * 3.625000 = 3.794773
+
+  Let L = SUM_j |h_j| * |suh[j]| * max|q|  (the per-row bound factor, shared by all rows
+  up to the row's own svh). Then the bound on the UNREAD part is  svh[t] * L.
+  config.json: final_logit_softcapping = 30.0  =>  |logit_t| <= 30 for EVERY token.
+
+  For the scheme to exclude even one token it needs   svh[t] * L < 30   for that token,
+  i.e. a token can only be excluded when its own row scale is below 30 / L.
+  L in turn is at least  max|suh| * max|q| * (something >= 1).
+
+  Lower bound on L with no knowledge of h at all: L >= max|suh| * max|q| * min_j |h_j|*...
+
+=== threshold ===
+  required  SUM_j |h_j|*|suh[j]|  <  30 / (svh[t] * max|q|)  for token t to be excludable
+  median |svh| = 0.850586  ->  threshold = 9.730
+  max    |svh| = 6.082031  ->  threshold = 1.361
+
+  With the usual post-RMSNorm |h_j| ~ 1, SUM_j |h_j||suh[j]| is of order
+  rms|suh| * h = 0.015341 * 5376 = 82.475
+  => the bound is about 8.5x the post-RMSNorm estimate of that sum, i.e. 8x the softcap.
+
+=== how much of the head may be SKIPPED? ===
+  SUM_j |suh[j]|  = 81.359   (real checkpoint data)
+  L1_all = SUM_j |h_j||suh[j]| ~ E|h| * SUM|suh| = 0.7979 * 81.359 = 64.916
+  full-head bound B_t = |svh| * C * L1_all = 0.8506 * 3.6250 * 64.916 = 200.2
+  softcap on ANY logit = 30.0  =>  the full-head bound is 6.7x the softcap
+
+  necessary condition to exclude the median-scale row: unread L1 mass < 9.730
+  => at most 14.99% of the head's columns may be left unread
+  => MAXIMUM bytes any EXACT two-stage head could ever save = 0.1584 GB of 1.0570 GB
+  (for the largest row scale |svh|=6.0820: at most 2.10% skippable)
+
+=== is even the MAXIMUM possible head saving enough for 20 tok/s? ===
+  actual (full head read every token)              14.2390 GB/token -> needs  284.8 GB/s (104.3% of the 273 wire peak)
+  head ENTIRELY FREE -- unreachable upper bound    13.1820 GB/token -> needs  263.6 GB/s (96.6% of the 273 wire peak)
+  head saving at the rigorous maximum above        14.0806 GB/token -> needs  281.6 GB/s (103.2% of the 273 wire peak)
