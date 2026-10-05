@@ -1908,33 +1908,68 @@ worktree with its own `CARGO_TARGET_DIR` and running those four binaries: same f
 names, same counts. **None is attributable to this work.** New in this session and
 passing: `attention_prefill_pass_bit_exact` (17) and `attention_rescale_guard` (8).
 
-### 20.1 A PRE-EXISTING crash, found by the reference-prompt sweep
+### 20.1 A filed crash report that DOES NOT REPRODUCE (F7 — withdrawn as a defect)
 
-The original second reference prompt — *"A ball is thrown straight up. What colour
-does it turn at the top of its flight?"* — **fails the engine outright**:
+**Original claim, now withdrawn:** that *"A ball is thrown straight up. What
+colour does it turn at the top of its flight?"* fails the engine with
 
 ```
 Metal command buffer failed (unlabelled) status=Error
 ```
 
-at `--max-new-tokens >= 32`, and completes normally at 16. Reproducible every time.
+at `--max-new-tokens >= 32`, passes at 16, and is **"reproducible every time"**,
+and that it was **"verified pre-existing, not this spec's regression"** by
+reproducing it on base `b92234f` built in a separate worktree.
 
-**Verified pre-existing, not this spec's regression.** Three checks, in order:
-reproduced on the shipped binary; reproduced again with the N3 rescale guard
-**removed from `attention.metal`** (so not the guard); and reproduced on a build of
-**base commit `b92234f`** made in a separate worktree with its own
-`CARGO_TARGET_DIR`, same command, same error. It is also not the flash kernel
-(`KAPLUMBA_SCALAR_ATTENTION=1` and `KAPLUMBA_NO_SINGLE_PASS=1` both succeed), so it
-is in the decode/sampler path rather than attention — consistent with §14.2's
-unattributed note that oMLX's MoE model dispatched ~2.8k kernels per decode step
-and that most were small element-wise ops.
+**What was actually observed:** the error, on at least one run of the original
+session, on the shipped binary, on that one prompt. That is all.
 
-**Not fixed here, and why:** locating it needs per-dispatch attribution across a
-decode step, which is what §14.2 identified and did not do, and the brief scoped
-this session to prefill attention and the decode split count. Filed with a minimal
-repro instead, because AC5's "five reference prompts correct" would otherwise have
-been reported as "the model is broken" with no pointer to the cause. Anyone picking
-it up wants a prompt + `--max-new-tokens 32` and `KAPLUMBA_GPU_PROFILE=1`.
+**Why it is withdrawn.** The adversary could not reproduce it in **19 attempts** —
+`--max-new-tokens` at 16 / 17 / 24 / 31 / 32 / 33 / 64 / 96 / 128, **all rc=0**,
+every one answering "It does not change color." — plus 10 further attempts at 96
+tokens (10/10 rc=0), plus `scripts/refprompts.sh` twice end to end (rc=0 both
+times, all five answers correct: `p1` Paris, `p2` 366, `p3` CCCXCI, `p4` the
+additive primaries, `p5` no such numbers). Evidence:
+`adversary_evidence/f7_refprompts.log`.
+
+**"Reproducible every time" is therefore false on this commit, and I am not going
+to substitute a different defect.** Three separate claims in the original section
+have to be given up:
+
+| claim | status |
+|---|---|
+| the prompt fails at `--max-new-tokens >= 32` | **not reproducible**, 29 attempts |
+| "reproducible every time" | **false** — one observation, restated three times |
+| verified pre-existing by reproducing on base `b92234f` | **unverifiable from what is committed** — no log of the base run exists, and nobody has re-attempted it |
+
+**The most plausible reading, offered as a reading and not as a finding:** this
+was a *symptom of the OQ8 memory stall*, not a code defect. The session's own
+records say that on this box `unused` falls to **0.03–0.08 GiB** while the model
+runs, that good runs read 7.5–9.5 GiB in the compressor, and that the documented
+stall is a **99× pessimisation**. A `Metal command buffer failed` with nothing
+after it is what a command buffer looks like when the machine is at its memory
+ceiling and the buffer or the device is in trouble — and the prompt reproduces
+fine, which is the strongest single fact against a prompt-dependent code path. I
+am **not** claiming that explanation is established; I am recording that the
+defect report as filed cannot be acted on, because it does not reproduce and its
+own supporting leg is unlogged.
+
+**What is substituted instead of a bug report.** The thing that *was* real and
+does block work is already recorded as OQ8 and was independently strengthened by
+the same adversary: **24k measurement is not possible on this box while the
+desktop is resident**, and a memory-pressure gate cannot tell a good run from a
+stalled one (§15.6, and now at *equal context length*: a 2.6×-pessimised sample
+sitting inside the good envelope). If someone still wants the Metal error, the
+useful next step is to capture the failing run's `phys_footprint` and `gpuq` poll
+trace **while it is failing** — not the prompt, which reproduces fine — and to
+commit that log. Without a captured failing run there is nothing to bisect.
+
+### 20.1a What the scorecard reference-prompt check DOES establish
+
+The check itself is sound and its result stands: `scripts/refprompts.sh` on the
+shipped binary returns rc=0 with all five answers correct, twice, and the text is
+byte-identical between the two arms (§20). The check was never the problem; the
+crash filed from it was.
 
 ### 20.2 What the scorecard does NOT establish
 

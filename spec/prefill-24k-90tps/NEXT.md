@@ -263,11 +263,16 @@ between arms. Full suite: 116 binaries ok, 4 failed, all four verified at base
   attention test here uses; it would have shipped as "exact".
 * **Pass boundaries must land on tile boundaries** — a correctness invariant of the
   online softmax, not a performance detail (§16.2).
-* **A PRE-EXISTING crash**, found by the reference-prompt sweep (§20.1): a short
-  prompt fails with `Metal command buffer failed (unlabelled) status=Error` at
-  `--max-new-tokens >= 32` and passes at 16. Verified on base `b92234f`, so not this
-  spec's; in the decode/sampler path, not attention. **Unfixed and worth someone's
-  time** — it is in the path AC5 tests and it would read as "the model is broken".
+* **WITHDRAWN (F7): the "PRE-EXISTING crash" this file used to list.** A short
+  prompt was filed as failing with `Metal command buffer failed (unlabelled)
+  status=Error` at `--max-new-tokens >= 32`, "reproducible every time", verified
+  on base `b92234f`. It **does not reproduce**: 29 attempts across nine token
+  counts all returned rc=0 with the right answer, and `refprompts.sh` returned
+  rc=0 twice with all five answers correct. The base-build leg was never logged.
+  **No defect is filed and no time should be spent on the prompt.** The plausible
+  reading — offered as a reading, not a finding — is that it was a symptom of the
+  OQ8 stall (`unused` at 0.03–0.08 GiB on *good* runs), not a code path. See
+  implementation_notes.md §20.1.
 
 ### 7.5 What is still open
 

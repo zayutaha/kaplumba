@@ -682,10 +682,16 @@ decode ≥ 12 @8k (12.911).
 (rebuilt in a separate worktree with its own `CARGO_TARGET_DIR`). New and passing
 this session: `attention_prefill_pass_bit_exact` (17), `attention_rescale_guard` (8).
 
-**A pre-existing crash found by the prompt sweep** (implementation_notes.md
-§20.1): *"A ball is thrown straight up…"* fails with `Metal command buffer failed
-(unlabelled) status=Error` at `--max-new-tokens >= 32` and passes at 16.
-Reproduced with the N3 guard removed **and** on a base build, so not this spec's;
-in the decode/sampler path rather than attention. Filed with a minimal repro
-rather than fixed — localising it needs per-dispatch decode attribution, which is
-outside this session's scope.
+**WITHDRAWN — a filed crash that does not reproduce (F7).** This task originally
+recorded a pre-existing crash found by the prompt sweep (implementation_notes.md
+§20.1): *"A ball is thrown straight up…"* failing with `Metal command buffer
+failed (unlabelled) status=Error` at `--max-new-tokens >= 32`, "reproducible every
+time", reproduced on a base build so not this spec's. **None of that holds up.**
+The adversary ran 29 attempts — token counts 16/17/24/31/32/33/64/96/128 plus ten
+more at 96 — and every one returned rc=0 with the correct answer; `refprompts.sh`
+returned rc=0 twice with all five answers correct. The base-build leg was never
+logged, so it cannot be checked. **No defect is filed.** The only reading offered
+is that the error was a symptom of the OQ8 memory stall (`unused` at 0.03-0.08 GiB
+on *good* runs), not a code path; that is a reading, not a finding. See
+implementation_notes.md §20.1 for what would be needed to pick it up again (a
+captured failing run's footprint + poll trace, not the prompt).
