@@ -1,0 +1,74 @@
+--- box state (start) ---
+    PhysMem: 10G used (3149M wired, 292M compressor), 13G unused.
+    kaplumba-shaped processes resident: 0
+device Apple M4 Pro ; max threads/threadgroup = 1024
+available (reclaimable) 13.0 GB ; requesting 6 GB working set
+
+--- SABOTAGE-FILL: historical tiled buffer ---
+  guard: 511 of 1 sampled lines are duplicates -> REJECTED (as it must be)
+
+=== crux_multibuffer: 6 GB working set, 9 arms, 7 rounds x 3 passes ===
+
+  buf 1_thr20480   checksum 0x8d096b5c == CPU reference (and arm-to-arm) OK; 5.998 GB working set
+
+--- SABOTAGE: half the elements, checksum must change ---
+  full 0x8d096b5c vs half 0x2965bc66 -> detected. The instrument has teeth.
+
+  buf 1_thr20480     252.5 GB/s  best   253.3  worst   250.3  spread 0.99x  (92.5% of wire)
+  buf 1_thr81920     234.2 GB/s  best   235.0  worst   233.6  spread 0.99x  (85.8% of wire)
+  buf 2_thr20480     252.6 GB/s  best   253.6  worst   246.2  spread 0.97x  (92.5% of wire)
+  buf 2_thr81920     233.1 GB/s  best   235.0  worst   232.0  spread 0.99x  (85.4% of wire)
+  buf 4_thr20480     252.8 GB/s  best   254.4  worst   251.8  spread 0.99x  (92.6% of wire)
+  buf 4_thr81920     233.9 GB/s  best   235.2  worst   232.8  spread 0.99x  (85.7% of wire)
+  buf 8_thr20480     252.8 GB/s  best   254.6  worst   250.4  spread 0.98x  (92.6% of wire)
+  buf 8_thr81920     234.2 GB/s  best   235.2  worst   233.5  spread 0.99x  (85.8% of wire)
+
+--- SABOTAGE: half the elements, checksum must change ---
+  full 0x8d096b5c vs half 0x2965bc66 -> detected. The instrument has teeth.
+
+  CONTROL_repeat     251.3 GB/s  best   253.4  worst   250.5  spread 0.99x  (92.1% of wire)
+
+=== AXIS M: does splitting the working set across N allocations help? ===
+  N_buf   thr20480   thr81920   (GB/s)
+     1      252.5      234.2
+     2      252.6      233.1
+     4      252.8      233.9
+     8      252.8      234.2
+
+  NOISE FLOOR (CONTROL_repeat vs a byte-, thread- and partition-identical arm): -0.49% of median
+
+  best median across every arm : 252.8 GB/s (92.6% of wire)
+  arms at or below the wire peak: 9 of 9
+--- box state (end) ---
+    PhysMem: 16G used (8929M wired, 292M compressor), 7578M unused.
+    kaplumba-shaped processes resident: 0
+
+=== 10 GB working set: INCONCLUSIVE, memory-bound ===
+run 1: box fell to 3625M unused; the probe's own control read -29.26%
+=== AXIS M: does splitting the working set across N allocations help? ===
+  N_buf   thr20480   thr81920   (GB/s)
+     1      252.0      233.0
+     2      250.8      232.4
+     4      249.3      154.5
+     8      223.0      149.5
+
+  NOISE FLOOR (CONTROL_repeat vs a byte-, thread- and partition-identical arm): -29.26% of median
+
+  best median across every arm : 252.0 GB/s (92.3% of wire)
+  arms at or below the wire peak: 9 of 9
+--- box state (end) ---
+    PhysMem: 20G used (13G wired, 231M compressor), 3625M unused.
+    kaplumba-shaped processes resident: 0
+run 2:
+=== AXIS M: does splitting the working set across N allocations help? ===
+  N_buf   thr20480   thr81920   (GB/s)
+     1      183.8      144.5
+     2      223.4      147.9
+     4      181.4      152.7
+     8      198.4      154.0
+
+  NOISE FLOOR (CONTROL_repeat vs a byte-, thread- and partition-identical arm): +0.38% of median
+
+  best median across every arm : 223.4 GB/s (81.8% of wire)
+  arms at or below the wire peak: 9 of 9
+interleaved crux_bandwidth controls around these: best 251.0 (before, noise +0.67%), 230.8 (after, noise +7.79%)

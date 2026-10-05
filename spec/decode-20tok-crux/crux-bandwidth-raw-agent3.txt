@@ -1,0 +1,80 @@
+=== 5 interleaved trials of crux_bandwidth (box-quiet window) ===
+trial  best_arm_GB/s  top_half_median  control_noise_floor  thr20480  thr81920
+1      250.0           242.5            +0.35%              250.0     244.4
+2      250.1           242.4            +0.05%              250.1     244.9
+3      250.5           243.5            +0.00%              250.5     245.8
+4      250.8           243.7            +0.09%              250.8     246.4
+5      249.3           242.8            +0.05%              249.3     243.0
+spread: best arm 0.6%, top-half median 0.5%
+
+=== full sweep, trial 3 (noise floor 0.00%) ===
+--- IS THIS DRAM? pass 1 vs pass 2 over the same bytes ---
+  pass 1 244.0 GB/s, pass 2 245.8 GB/s, ratio 1.007
+  pass 2 is not faster than pass 1 (1.007x), so the working set exceeds cache and the sweep below is DRAM traffic.
+
+=== AXIS A: occupancy (uint4 loads, tg=256, bytes in flight per thread fixed) ===
+  threads     median       best      worst    spread    GB/s @6GB waves@81920
+     2560      125.8      126.0      125.6     1.00x        125.8      0.03
+     5120      214.3      217.4      207.4     1.05x        214.3      0.06
+    10240      235.3      237.4      231.5     1.03x        235.3      0.12
+    20480      250.5      251.2      238.2     1.05x        250.5      0.25
+    30720      240.4      242.1      236.5     1.02x        240.4      0.38
+    40960      247.3      248.4      245.0     1.01x        247.3      0.50
+    61440      242.8      245.9      242.4     1.01x        242.8      0.75
+    81920      245.8      246.6      244.2     1.01x        245.8      1.00
+   122880      239.0      244.2      236.3     1.03x        239.0      1.50
+   163840      243.2      244.9      239.5     1.02x        243.2      2.00
+   245760      243.5      244.0      240.1     1.02x        243.5      3.00
+
+  best median on axis A: 250.5 GB/s
+  20,480 -> 81,920 threads: -1.9%   (the sweep decode-19tok never ran)
+  min median at >=20,480 threads = 239.0 GB/s; spread across that region = 1.05x
+
+=== AXIS B/C at full occupancy (81,920 threads, tg=256) ===
+arm                  B/load  in-flight     median    spread vs stream_u4 requests/GB
+CONTROL_repeat           16         16      244.8     1.02x         0.0%       62.5
+CONTROL_tg512            16         16      245.6     1.01x         0.3%       62.5
+stream_u1                 4          4      223.6     1.02x        -8.7%      250.0
+stream_u1_u4              4         16      178.2     1.01x       -27.2%      250.0
+stream_u1_u8              4         32      162.4     1.01x       -33.7%      250.0
+stream_u2                 8          8      243.6     1.06x        -0.5%      125.0
+stream_u4                16         16      244.8     1.02x         0.0%       62.5
+stream_u4_u16            16        256      205.1     1.03x       -16.2%       62.5
+stream_u4_u2             16         32      236.5     1.01x        -3.4%       62.5
+stream_u4_u4             16         64      236.0     1.02x        -3.6%       62.5
+stream_u4_u8             16        128      234.8     1.02x        -4.1%       62.5
+
+  requests/GB is in millions. stream_u1_u4 has the SAME bytes in flight as stream_u4 but 4x the requests.
+
+=== NOISE FLOOR ===
+  identical arms (stream_u4 vs CONTROL_repeat): +0.00% of median
+  same work, tg 256 -> 512 (CONTROL_tg512)  : +0.33% of median
+  stream_u2          -0.49%  MEASURABLE
+  stream_u4_u2       -3.39%  MEASURABLE
+  stream_u4_u4       -3.60%  MEASURABLE
+  stream_u4_u8       -4.10%  MEASURABLE
+  stream_u1          -8.66%  MEASURABLE
+  stream_u4_u16     -16.22%  MEASURABLE
+  stream_u1_u4      -27.23%  MEASURABLE
+  stream_u1_u8      -33.66%  MEASURABLE
+  arms whose difference from stream_u4 is WITHIN the noise floor (|d| <= 0.00%), i.e. indistinguishable: []
+
+=== AXIS S: independent address streams (81,920 threads, uint4) ===
+  streams     median       best      worst    spread  vs 1 stream
+        1      231.8      232.6      230.4     1.01x         0.0%
+        2      231.5      232.8      230.6     1.01x        -0.1%
+        4      231.8      235.7      229.6     1.03x        -0.0%
+        8      232.6      233.6      230.5     1.01x         0.3%
+       16      230.3      231.2      228.1     1.01x        -0.7%
+       32      223.4      225.1      220.4     1.02x        -3.6%
+       64      221.1      222.3      219.4     1.01x        -4.6%
+
+=== VERDICT INPUT: best sustained streaming GB/s on this box ===
+  best median across every arm : 250.5 GB/s
+  median of all arm medians     : 235.3 GB/s
+  as % of the 273 GB/s wire peak: 91.7% / 86.2%
+
+  arms at or below the 273 GB/s wire peak: 29 of 29
+  usable best  : 250.5 GB/s (91.7% of wire peak)
+  usable median: 235.3 GB/s (86.2% of wire peak)
+  top-half median of usable arms: 243.5 GB/s (89.2% of wire peak)  <- the number to use

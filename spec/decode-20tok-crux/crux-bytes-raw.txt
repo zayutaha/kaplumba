@@ -1,0 +1,86 @@
+checkpoint /Users/zayaantaha/.kaplumba/models/Gxma/Gxma : 2066 text tensors, 14.877 GB text, 16.028 GB all
+config: 60 layers, 50 sliding / 10 full, hidden 5376, intermediate 21504, vocab 262144, q_heads 32 kv_heads 16 head_dim 256, global_kv_heads 4 global_head_dim 512, window 1024
+
+=== WEIGHTS read per decode token (header-derived) ===
+bucket                  bytes        GB       %w
+q_proj             1156055040    1.1561    9.59%
+k_proj              454164480    0.4542    3.77%
+v_proj              412876800    0.4129    3.42%
+o_proj             1156055040    1.1561    9.59%
+gate_proj          2601123840    2.6011   21.57%
+up_proj            2601123840    2.6011   21.57%
+down_proj          2601123840    2.6011   21.57%
+lm_head            1056964608    1.0570    8.77%
+side(suh..)          15840364    0.0158    0.13%
+norms                 2663032    0.0027    0.02%
+embed row               10752    0.0000    0.00%
+vision                      0    0.0000    0.00%
+TOTAL             12058001636   12.0580
+
+=== side tensors (.suh/.svh/.mcg) by owning matrix ===
+  down_proj         3225840 B   0.0032 GB
+  gate_proj         3225840 B   0.0032 GB
+  k_proj            1095920 B   0.0011 GB
+  lm_head            535044 B   0.0005 GB
+  o_proj            1792240 B   0.0018 GB
+  q_proj            1792240 B   0.0018 GB
+  up_proj           3225840 B   0.0032 GB
+  v_proj             947400 B   0.0009 GB
+  TOTAL            15840364 B
+
+=== per-projection trellis, rate, and side overhead ===
+matrix            trellis B    count       each B implied bpw   side%
+q_proj           1156055040       60     19267584     3.000   0.15%
+k_proj            454164480       60      7569408     3.000   0.24%
+v_proj            412876800       50      8257536     3.000   0.23%
+o_proj           1156055040       60     19267584     3.000   0.15%
+gate_proj        2601123840       60     43352064     3.000   0.12%
+up_proj          2601123840       60     43352064     3.000   0.12%
+down_proj        2601123840       60     43352064     3.000   0.12%
+lm_head          1056964608        1   1056964608     6.000   0.05%
+
+=== cross-check: header bytes vs config geometry x declared rate ===
+  layer params    29286727680 x  3.00 bpw =    10982522880 B = 10.9825 GB
+  header layer quants (trellis + side)          =    10982522880 B = 10.9825 GB   delta +0.0000 GB (+0.000%)
+  head  params     1409286144 x  6.00 bpw =     1056964608 B =  1.0570 GB
+  header head (trellis + side)                 =     1057499652 B =  1.0575 GB   delta +0.0005 GB (+0.051%)
+
+=== KV cache read per decode token ===
+  geometry: 50 sliding x 2x2x4096 keys-in-window, 10 full x 2x2x2048 keys
+ context     sliding MB        full MB       total GB   %weights    tok/s@250
+      37           30.3            3.0         0.0333      0.28%        20.68
+     614          503.0           50.3         0.5533      4.59%        19.82
+    1024          838.9           83.9         0.9227      7.65%        19.26
+    2048          838.9          167.8         1.0066      8.35%        19.14
+    4096          838.9          335.5         1.1744      9.74%        18.89
+    8192          838.9          671.1         1.5099     12.52%        18.43
+   16384          838.9         1342.2         2.1810     18.09%        17.56
+   24576          838.9         2013.3         2.8521     23.65%        16.77
+
+=== roofline: tok/s = GBPS / bytes-per-token, ZERO overhead ===
+ context     GB/token       @203       @220       @250       @273       @306
+     614      12.6113      16.10      17.44      19.82      21.65      24.26
+    8192      13.5680      14.96      16.21      18.43      20.12      22.55
+   16384      14.2390      14.26      15.45      17.56      19.17      21.49
+
+=== what 20 tok/s at 16k demands ===
+   14.2390 GB/token; 50 ms/token -> 284.8 GB/s needed (104.3% of the 273 GB/s wire peak)
+    at   203 GB/s -> 70.143 ms ->  14.26 tok/s
+    at   220 GB/s -> 64.723 ms ->  15.45 tok/s
+    at   250 GB/s -> 56.956 ms ->  17.56 tok/s
+    at   273 GB/s -> 52.158 ms ->  19.17 tok/s
+    at   280 GB/s -> 50.854 ms ->  19.66 tok/s
+    at   300 GB/s -> 47.463 ms ->  21.07 tok/s
+    at   320 GB/s -> 44.497 ms ->  22.47 tok/s
+
+=== bytes/token budget for 20 tok/s at 16k, vs rate ===
+  weights 12.0580 GB + KV(16k) 2.1810 GB = 14.2390 GB/token
+    GB/s     budget GB   for weights  verdict |   layers bpw         @2.0         @2.5   @3.0 today
+     203       10.1500        7.9690    SHORT |        1.888        20.60        17.24        14.83
+     220       11.0000        8.8190    SHORT |        2.120        22.32        18.69        16.07
+     250       12.5000       10.3190    SHORT |        2.530        25.37        21.23        18.26
+     273       13.6500       11.4690    SHORT |        2.844        27.70        23.19        19.94
+     285       14.2400       12.0590       OK |        3.005        28.90        24.19        20.80
+     300       15.0000       12.8190       OK |        3.213        30.44        25.48        21.91
+     320       16.0000       13.8190       OK |        3.486        32.47        27.18        23.37
+  `layers bpw` holds the 6 bpw head at 6 bpw and gives the 29.29 G layer parameters the rest. The last three columns are tok/s at 16k if EVERY parameter moved to that uniform rate, KV unchanged.
