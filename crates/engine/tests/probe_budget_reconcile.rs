@@ -14,7 +14,7 @@
 //! | source | why it is not used |
 //! |---|---|
 //! | `decode-25tok-peak-bandwidth` §18.2 per-projection 126–150 GB/s | derived from `KAPLUMBA_ABLATE` marginal costs whose deltas sum to 87.59 ms inside a 63.1 ms step. Not additive, so not bandwidth. **Not used.** |
-//! | "7.32 ms residual with every kernel-side role ablated" | `ablated("attention")` appears once, at `attention.rs:910`, inside `encode_online_attention`. Decode calls `encode_online_attention_split` (`attention.rs:654`) or `encode_decode_single_pass` (`model.rs:1889`), neither of which consults it — **verified by `the_attention_ablation_is_a_no_op_on_decode` below.** So the residual still contains 60 live attention kernels. **Not used.** |
+//! | "7.32 ms residual with every kernel-side role ablated" | `ablated("attention")` appeared **once**, inside `encode_online_attention`. Decode calls `encode_online_attention_split` / `encode_decode_single_pass`, neither of which consulted it — so the residual still contained 60 live attention kernels. **Fixed by `spec/decode-20tok-crux3`**, which added the two missing decode gates; `the_attention_ablation_reaches_every_decode_path` below now pins the fixed state. The historical number stays **not used.** |
 //! | 546 dispatches | that is `GpuProfile::stamp` labels, which exist only under `KAPLUMBA_GPU_PROFILE=1`. **Not used.** |
 //! | the 1.71× profiler calibration | self-refuting (derived from the head row). **Not used.** |
 //! | 11.834 GB/token | charges sliding geometry to all 60 layers; 10 are full-attention (head_dim 512, 4 KV heads). **Not used** — `bench::per_token_weight_bytes` is used instead. |
@@ -596,28 +596,74 @@ fn the_activation_partition_reproduces_the_other_probes_pinned_totals() {
 
 /// **The corruption check the brief demands.** If this ever starts failing,
 /// every ablation-derived number in this tree is meaningless again.
+///
+/// **HISTORY — this test asserted the OPPOSITE until `spec/decode-20tok-crux3`.
+/// It used to require that there be exactly ONE `ablated("attention")` site and
+/// that it be unreachable from decode, i.e. it pinned the *broken* state that
+/// `P02-dispatch-overhead.md` identified as invalidating §18.1 of the previous
+/// spec ("7.32 ms residual with EVERY kernel-side role ablated" still contained
+/// 60 live attention kernels streaming ~860 MB of KV per step). The two decode
+/// gates P02 asked for have now landed, so the corruption this test watched for
+/// — *an ablation silently not firing* — is no longer possible: the flag now
+/// reaches every decode attention path. The test has been inverted to pin the
+/// fixed state, because a test that fails when a defect is fixed is a test that
+/// will block the next fix.
 #[test]
-fn the_attention_ablation_is_a_no_op_on_decode() {
+fn the_attention_ablation_reaches_every_decode_path() {
     let attn_rs = include_str!("../../kernels/src/attention.rs");
     let model_rs = include_str!("../src/model.rs");
-    assert_eq!(
-        attn_rs.matches("ablated(\"attention\")").count(),
-        1,
-        "a second ablated(\"attention\") site appeared; re-check which path it guards"
+
+    // Decode reaches attention through exactly two entry points. Both must now
+    // consult the flag, or `KAPLUMBA_ABLATE=attention` is still a partial
+    // measurement instrument and every residual that uses it is suspect.
+    let bodies: [(&str, &str); 2] = [
+        ("encode_decode_split_explicit(", "split"),
+        ("encode_decode_single_pass(", "single-pass"),
+    ];
+    for (signature, name) in bodies {
+        let start = attn_rs
+            .find(&format!("pub fn {signature}"))
+            .unwrap_or_else(|| panic!("decode attention entry point {name} moved or was renamed"));
+        // Brace-match the body so a guard anywhere inside it counts, and a
+        // guard in the *caller* does not.
+        let bytes = attn_rs.as_bytes();
+        let mut depth = 0usize;
+        let mut end = None;
+        for (offset, byte) in bytes[start..].iter().enumerate() {
+            match byte {
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = Some(start + offset + 1);
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let body = &attn_rs[start..end.expect("unbalanced braces in a decode entry point")];
+        assert!(
+            body.contains("ablated(\"attention\")"),
+            "the {name} decode attention path does not consult KAPLUMBA_ABLATE=attention, \
+             so an ablation-derived residual still contains live attention kernels"
+        );
+    }
+
+    // The prefill gate must survive: it guards a different dispatch, and
+    // removing it would silently change what prefill ablations mean.
+    assert!(
+        attn_rs.contains("pub fn encode_online_attention(")
+            && attn_rs.matches("ablated(\"attention\")").count() == 3,
+        "expected exactly three attention-ablation gates (prefill, split decode, \
+         single-pass decode); a fourth site means re-check which path it guards"
     );
-    // It is inside `encode_online_attention`, which decode does not call.
-    let guard = attn_rs.find("ablated(\"attention\")").unwrap();
-    let fn_start = attn_rs[..guard].rfind("pub fn encode_online_attention(").unwrap();
-    assert!(!attn_rs[fn_start..].contains("encode_decode_single_pass"));
-    // Decode calls the split path or the single-pass path.
+
+    // Decode really does call those two entry points — if it stopped, the two
+    // guards above would be guarding nothing.
     assert!(model_rs.contains("encode_online_attention_split("));
     assert!(model_rs.contains("encode_decode_single_pass("));
-    assert_eq!(
-        attn_rs.matches("ablated(\"attention\")").count(),
-        1,
-        "so `KAPLUMBA_ABLATE=attention` removes nothing on a decode run, and the \
-         '7.32 ms residual' it produced still contained 60 live attention kernels"
-    );
+
     // Therefore the 0.84 ms element term CANNOT contain attention, and the
     // attention row in the budget must be measured separately. Assert the
     // separation is explicit rather than assumed.
