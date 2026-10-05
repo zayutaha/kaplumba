@@ -1,0 +1,22 @@
+loading /Users/zayaantaha/.kaplumba/models/Gxma/Gxma ...
+loaded in 8040 ms
+Because
+prompt_tokens=24602 generated_tokens=1 stopped_on_eos=false load_ms=8039.520 ttft_ms=366226.033 prefill_tok_s=67.181 decode_tok_s=0.000 peak_resident_pages_bytes=9972645888
+      375.28 real         0.85 user        16.08 sys
+          9972645888  maximum resident set size
+                   0  average shared memory size
+                   0  average unshared data size
+                   0  average unshared stack size
+             1299105  page reclaims
+              237552  page faults
+                   0  swaps
+                   0  block input operations
+                   0  block output operations
+                   0  messages sent
+                   0  messages received
+                   0  signals received
+               31930  voluntary context switches
+              106103  involuntary context switches
+        152711568982  instructions retired
+         66723597625  cycles elapsed
+         18354188960  peak memory footprint

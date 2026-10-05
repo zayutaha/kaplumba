@@ -67,6 +67,40 @@ untouched.**
 > projection is a **decode GEMV (`M = 1`) measurement and does not transfer**: in
 > prefill o_proj runs at **98% of `down_proj`'s efficiency**. See §23 for the
 > re-derivation, the instrument that killed the lead, and the honest ceiling.
+>
+> **Corrected a third time (round 3) — every percentage above is out by 1.88x,
+> because the tensor peak they divide by was a phantom.**
+> `examples/mma_peak.rs` accumulated into 16 accumulators and stored **8**; the 8
+> unstored chains were dead stores the compiler deleted, so it reported 15.0
+> TFLOPS for MMAs a kernel doing **half** the work finished in the same time.
+> The instrument has been rewritten (every accumulator stored; the old kernel kept
+> as a `dead8` control; three assertions so it can fail) and the true ceiling for
+> that operand shape is **8.30 TFLOPS**. Against it:
+>
+> | | at 15.6 (wrong) | **at 8.30** |
+> |---|---|---|
+> | AC2's ask, 7.15 TFLOP/s | 46% of peak | **86%** |
+> | attention measured, 1.9 TFLOP/s | 12% | **23%** |
+> | the GEMM, 6.73 TFLOP/s | 43%, "uniform across all seven projections" | **81%**, and `v_proj` at **104%** |
+> | the 1.7x-GEMM alternative, 8.1 TFLOP/s | 52% | **98%** |
+> | §23.6's "8-chain peak" row | 49%, "a 0.8% margin" | **92%, no margin** |
+> | §23.4's flash-only refutation, 17.7 TFLOP/s | above the phantom peak | **213%** |
+>
+> **No acceptance target is changed.** AC2 stays 90 tok/s at 24 590 tokens. What
+> changes is what fraction of the hardware that is: **86%**, on a component
+> measured at 21-23% of peak, while the 239.7 s that precede it are already at
+> **81%** of peak.
+>
+> **And the shape of the ask is now known rather than guessed.** Measured on the
+> shipping kernel in one build: the flash body is **98.7%** MMA-issue-plus-its-loads
+> (QK 54.4%, PV 56.4% — the arms sum to 110.8% because both halves issue into the
+> same tensor pipe as dependent chains), the **fragment loads are 52.4%** of it,
+> and it issues **two loads per MMA** at `BQ=1`. Chain count is not a lever at
+> any count by any mechanism (compile-time 2 and 4 chains read x1.001/x0.994), and
+> `#pragma unroll` on the QK loop is worth 0.0-0.7% with `(32)` **3.5% slower**.
+> The one lever left standing is §9.1b's **key-split flash decode** — `BQ=2` with
+> the key axis split so the grid is preserved — which is **unbuilt, not refuted**,
+> and which §22.3 declared refuted on a load figure 4x too small.
 
 ## Non-goals / restrictions
 
@@ -164,7 +198,8 @@ Additional for this spec:
   and §12 shows §5's floor was wrong by ~350× because it counted L1/L2 requests
   as DRAM. Attention is **instruction-bound**: 1.74 TFLOP/s now, **3.4 TFLOP/s
   (22% of tensor peak) needed** for AC2. The BQ=2 + key-split + combine plan is
-  therefore **re-opened** — it was refuted using §9's split, which §10 withdrew.) With attention at the T1 lower bound of 86 s
+  therefore **re-opened** — it was refuted using §9's split, which §10 withdrew.)
+  With attention at the T1 lower bound of 86 s
   (the BQ=1 K/V-bandwidth floor, `implementation_notes.md` §5) the kernel sum is
   `214.8 + 86 + 3.2 = 304 s` -> **79 tok/s**, below the 90 target before the
   ~24 s inter-dispatch gap is even counted. The *only* arithmetic that reaches 90
@@ -178,6 +213,49 @@ Additional for this spec:
   bandwidth-bound, and if so what is the real limiter? — AC2 should be treated as
   unproven, not merely unmet.** The alternative to resolving it is a target
   change or a GEMM push, both of which need user direction.
+
+  > **ROUND 3 — this OQ4 is now answered, and the answer is not "unproven".**
+  > First the stale number: "22% of tensor peak" above is **41%**, because the peak
+  > was a phantom. `examples/mma_peak.rs` accumulated into 16 accumulators and
+  > stored **8**; the 8 unstored chains were dead stores the compiler deleted, so
+  > it reported 15.0 TFLOPS for MMAs a kernel doing **half** the work finished in
+  > the same time. The instrument is rewritten (every accumulator stored, the old
+  > kernel kept as a `dead8` control, three assertions so it can fail) and the true
+  > ceiling for that operand shape is **8.30 TFLOPS**. §23.4's later re-derivation
+  > put the ask at 3.8x / **7.15 TFLOP/s = 86% of peak**. **That is the operative
+  > number**, and the 3.4 TFLOP/s above is a T1-era figure kept for the record.
+  >
+  > Then the question itself. "Is the kernel latency-bound rather than
+  > bandwidth-bound, and if so what is the real limiter?" is **no longer a
+  > contradiction**: round 3 built the instrument to ask it, on the shipping
+  > source, with every arm compiled separately in one process. Measured at
+  > 24 576 keys / 1024 queries / `BQ=1`, medians of 3 interleaved rounds:
+  >
+  > | | |
+  > |---|---|
+  > | empty body (§10's arm) | **x604** — 0.17% of the baseline |
+  > | QK block removed | 54.4% of the kernel |
+  > | PV block removed | 56.4% (**the two sum to 110.8%** — they share the tensor pipe and each is a dependent chain) |
+  > | both | **98.7%** |
+  > | **all four fragment loads removed, MMA count untouched** | **52.4%** |
+  > | fragment loads from an L1-resident address | 20.7% |
+  > | compile-time 2 / 4 QK accumulator chains | **x1.001 / x0.994** |
+  > | `#pragma unroll` on the QK loop | **0.0-0.7%**, with `(32)` **3.5% slower**, every arm byte-identical |
+  > | §22's ablation harness, every arm inactive | **x0.995, 0 bytes differ** — arm 0 *was* the shipping kernel |
+  >
+  > **So the limiter is operand issue, not bandwidth, not occupancy, not the
+  > accumulator chain, and not the scheduler.** The kernel issues **two fragment
+  > loads per MMA** at `BQ=1`, and the loads are more than half of it. The lever
+  > that attacks this is **MMAs per load**, and the only identified way to raise it
+  > without halving the grid is §9.1b's **key-split flash decode** — `BQ=2` with
+  > the key axis split so the grid is preserved. That is **unbuilt, not refuted**:
+  > §22.3 declared it refuted on a load figure (8-12%) that is 4x too small.
+  >
+  > **AC2 itself is not answered, and this round does not answer it.** What it
+  > establishes is that 88% of the budget is already at **81% of the tensor peak**,
+  > that the remaining 12% has to absorb a **3.8x** cut, and that the component
+  > carrying the cut is at **21-23% of peak** with a known and structural reason.
+  > Full record: `pragma_peak_report.md`.
 - **OQ5 — 24k measurement is marginal under desktop load.** Two 24k A/B attempts
   in this session stalled: the model loaded (18 GiB wired) but the box
   entered compression (7.1 GiB compressor, <300 MiB free) once the 24k KV+scratch

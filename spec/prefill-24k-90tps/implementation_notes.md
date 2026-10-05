@@ -140,7 +140,12 @@ Full-attention FLOPs: causal (query,key) pairs `L²/2 = 2.87e8` × 4 kv_heads ×
 layers = **1.88e15 FLOP over 176.7 s = 1.06 TFLOPS**.
 
 That is **12% of the 8.76 TFLOPS SIMT fp32 peak and 7% of the 15.6 TFLOPS
-tensor peak** measured by `examples/mma_peak.rs`. At 6 TFLOPS attention would
+tensor peak** measured by `examples/mma_peak.rs`.
+
+> **CORRECTED (round 3).** That 15.6 is the phantom peak -- `mma_peak.rs` stored
+> 8 of its 16 accumulators, so half its MMAs were dead stores the compiler
+> deleted. The true ceiling for that operand shape is **8.30 TFLOPS**, so 1.06
+> TFLOP/s is **13%** of it, not 7%. At 6 TFLOPS attention would
 cost 31 s and the run would land at 214 + 31 + 16 = 261 s = **91.8 tok/s**. So
 AC2 is *arithmetically* reachable, but only through a genuine MMA flash-attention
 rewrite; no incremental change to the scalar PV loop or a 4→8 sub-tile publish
@@ -632,6 +637,14 @@ queries, 24 576 keys, warm, median of 3):
 is MMA issue plus the fragment loads that feed it. The kernel runs at 1.44 TFLOP/s
 = **9% of the 15.6 TFLOPS tensor peak** measured by `examples/mma_peak.rs`.
 
+> **CORRECTED (round 3): this whole §9 table is withdrawn AND its denominator was
+> wrong.** 1.44 TFLOP/s is **17%** of the true 8.30 TFLOPS ceiling, not 9%. The
+> table itself is invalid for the reason in the withdrawal note at the head of
+> this section -- §22 rebuilt it with a working instrument and got 56% QK / 40%
+> PV; round 3 re-measured the same split on the shipping source in one build and
+> got 54.4% / 56.4% / **98.7%** with the loads at **52.4%**, which is a
+> materially different picture from either. Use `pragma_peak_report.md` T6.
+
 Two sub-measurements separate loads from MMAs. Forcing the K and V device loads to
 re-read one cached row (same instruction count, same cache lines):
 
@@ -1057,6 +1070,14 @@ run at ~1.74 TFLOP/s in isolation (§10), so the target is **~3.4 TFLOP/s = 22%
 of the 15.6 TFLOPS tensor peak measured by `examples/mma_peak.rs`**. Twenty-two
 percent is an ordinary number for a hand-written attention kernel. It is not the
 2% the old arithmetic implied.
+
+> **CORRECTED (round 3).** 15.6 is the phantom peak (§ read-first banner); the
+> true ceiling is **8.30 TFLOPS**, so "~3.4 TFLOP/s = 22%" is **41%**, and the
+> sentence "twenty-two percent is an ordinary number for a hand-written attention
+> kernel" **does not hold** -- it is not an ordinary number, and no kernel in this
+> repo operates above 81% of that ceiling. The budget this section derives (149.7
+> -> 56 s) is unaffected; what changes is that its target rate is no longer
+> modest.
 
 **Therefore: OQ4's conclusion ("needs 7.6 TFLOPS of GEMM") and OQ6 (added an hour
 ago, "is the GEMM a wall?") are both wrong, and are withdrawn in the same commit
@@ -1606,6 +1627,51 @@ as AGENTS.md 10.3 warns; it is logged only as a contrast.
 
 ### 16.4 Why neutral is the expected answer, not a surprise
 
+> #### ROUND 3: N1 is now measured at **24k** too, and the 24k control that was
+> `INVALID-NO-NUMBER` for three sessions now exists
+>
+> `adversary_report2.md` A9 is right that the committed 24k evidence was one
+> number with no control: `adversary_evidence/n1_pass_ab_24k.tsv` carries
+> `r1 onedispatch ... INVALID-NO-NUMBER` and `r1 pass8192 ... 68.401 VALID` --
+> **the control arm was discarded by the memory gate and the treatment arm
+> survived**, which is the one arrangement that cannot support a null. Re-run,
+> interleaved, 2 rounds, both arms, same harness
+> (`scripts/bench_prefill_passes.sh`, 24 590-key prompt = 24 602 tokens,
+> `--max-new-tokens 1`, per-arm poll files, `KAPLUMBA_PREFILL_PASS_KEYS` per arm):
+>
+> | round | arm | `pass_keys` | prompt tokens | prefill tok/s | footprint | verdict |
+> |---|---|---|---|---|---|---|
+> | r1 | `onedispatch` | 0 | 24 602 | **66.829** | 17.04 GiB | **VALID** |
+> | r1 | `pass8192` | 8192 | 24 602 | **67.051** | 17.14 GiB | **VALID** |
+> | r2 | `onedispatch` | 0 | 24 602 | — | 17.09 GiB | **INVALID** (`unused-dropped-to-0.04GiB`, limit 0.05) |
+> | r2 | `pass8192` | 8192 | 24 602 | 67.794 | 17.15 GiB | **VALID** |
+>
+> Evidence: `adversary_evidence2/n1_pass_ab_24k_r3.tsv`,
+> `pragma_peak_evidence/n1_24k_*.log`.
+>
+> **Round 1 is a valid interleaved A/B at 24 602 tokens with both arms VALID:
+> 66.829 against 67.051, +0.33%.** That is the control the committed evidence
+> lacked. Round 2's *control* was discarded by the memory gate and only its
+> treatment survived, so **round 2 is not usable** and is recorded with no number
+> -- the same failure mode, in one of two attempts, which is the honest rate to
+> quote for 24k measurement on this box (OQ5, not OQ8).
+>
+> **So N1 is NEUTRAL at 16k and at 24k, each with a valid control**, and the null
+> no longer rests on a context below the one this spec is about. **The decision
+> does not change and does not depend on this:** §16.4's argument is that the
+> mechanism cannot pay where there is no cache-residency loss to fix, and turning
+> a mechanism with no measured benefit *off* is defensible on the byte-identity
+> argument alone, independent of how small the measured effect is.
+>
+> **How strong is the 24k null?** Weaker than the 16k one, and it should be quoted
+> with that said. The 24k arm difference is **0.33%** against a **single** valid
+> round, whereas the 16k leg had 3 rounds with a 0.30-0.84% spread and a positive
+> control (`KAPLUMBA_SCALAR_ATTENTION=1`, -16.6%) run in its own session. One
+> valid pair at 0.33% is consistent with "no effect" and is also consistent with
+> "an effect smaller than 0.33%", and it cannot distinguish them. **What it does
+> establish is the thing A9 asked for: the 24k claim now has a control arm, and
+> that control is not faster.**
+
 oMLX measured the mechanism on **a 1M-key context at ~85 TFLOPS against ~103 at
 64k** (`nax_attention.py:89-91`) — a 21% effect at 16x our context. At 16k our
 entire KV working set for a full layer is 134 MB, well inside what the caches
@@ -2030,6 +2096,37 @@ worktree with its own `CARGO_TARGET_DIR` and running those four binaries: same f
 names, same counts. **None is attributable to this work.** New in this session and
 passing: `attention_prefill_pass_bit_exact` (17) and `attention_rescale_guard` (8).
 
+> **ROUND 3 — AC5's number is now ENFORCED, and it was not before.**
+> `crates/engine/tests/linear_metal.rs` gated the MMA GEMM against the CPU
+> reference at `MMA_TOLERANCE = 0.02`, which is **9.3x above AC5's own 2.16e-3
+> bound** (`adversary_report2.md` A5). So the "AC5, five reference prompts,
+> byte-identical" claim above rests on **prompt-level** evidence only; the
+> kernel-level gate that looks like it enforces AC5 **enforced nothing**, and
+> nothing could have failed through it.
+>
+> Measured, and closed this session:
+>
+> | | |
+> |---|---|
+> | the gate before | `0.02`, 9.3x above AC5, and the shapes it covers (`in_features` 128/256/384) are not the shapes the engine ships (K = 5376, 8192, 21504) |
+> | the worst error this test observes | **2.1603336e-3** at `128x256, queries=1` -- i.e. **AC5's figure IS this test's worst**, read off its output |
+> | the worst at production shapes | **4.55e-4** at K=8192 (o_proj), 3.14e-4 at K=5376 (k/v_proj) -- **4.7x inside** AC5, and **not growing with K** (0.90x from K=128 to K=8192) |
+> | the gate now | **`3e-3`**, 1.39x above the observed worst, 6.7x tighter than before |
+> | sabotage: kernel output x1.005 (0.5% error) | **FAILS** at 3e-3 (`worst normalised error 3.8071708e-3`); **PASSES** at 0.02 |
+> | sabotage: kernel output x1.02 (2% error) | **PASSES** at 0.02 -- the old gate needed **3%** to fail |
+>
+> So: **nothing was hiding under the hole** (A5's verdict, confirmed), **AC5's
+> 2.16e-3 is not a stale figure but this test's own worst**, and the correction is
+> that the *gate* was 9.3x above it. Evidence:
+> `pragma_peak_evidence/mma_tolerance_{head,sabotage}.log`.
+>
+> **What AC5 does and does not establish, restated.** The prompt-level evidence
+> above (five reference prompts, byte-identical between arms, twice) is real and
+> is the stronger statement -- it is about the text a user sees. The kernel-level
+> gate is about the GEMM's worst normalised error over a shape sweep, and it is
+> now real for the first time. Both are needed; neither was sufficient alone, and
+> for three sessions the file's only numeric AC5 gate was 9.3x too loose to fail.
+
 ### 20.1 A filed crash report that DOES NOT REPRODUCE (F7 — withdrawn as a defect)
 
 **Original claim, now withdrawn:** that *"A ball is thrown straight up. What
@@ -2155,6 +2252,61 @@ diagnosed at all.
 
 ---
 
+> ## ⚠️ READ FIRST — three corrections to §20-§23 (2026-10-05, round 3)
+>
+> **Everything below that says "15.6 TFLOPS tensor peak" is wrong, and so is every
+> percentage written off it.** `examples/mma_peak.rs` accumulated into 16
+> accumulators and stored 8; the 8 unstored chains were dead stores the compiler
+> deleted, so it reported 15.0 TFLOPS for MMAs a kernel doing **half** the work
+> finished in the same time. The instrument has been rewritten (every
+> accumulator stored, the old kernel kept as a `dead8` control, three assertions
+> so it can fail) and the true ceiling for that operand shape is **8.30 TFLOPS**.
+> The corrections are re-derived inline below and set out in full in
+> `pragma_peak_report.md`; the logs are in `pragma_peak_evidence/`.
+>
+> | claim | at 15.6 (wrong) | at 8.30 (correct) |
+> |---|---|---|
+> | attention at 1.9 TFLOP/s | 12% of peak | **23%** |
+> | AC2's required 7.15 TFLOP/s | 46% | **86%** |
+> | the FFN GEMM at 6.73 | 43% | **81%** |
+> | the "1.7x GEMM" alternative at 8.1 | 52% | **98%** |
+> | §23.6's "8-chain peak" row at 7.65 | 49%, "0.8% margin" | **92%, no margin** |
+> | §23.4's flash-only refutation at 17.7 | above the phantom peak | **213% of peak** |
+>
+> Two of §22.3's conclusions also change, and both change in the direction that
+> matters:
+>
+> * **"the kernel is 88% MMA issue" is not a measurement and is not
+>   reproducible.** §22.3's own arms sum to 105-109%, which §22.6's rule exists
+>   to detect. Re-measured in one build, in the same process, against the
+>   shipping source: QK is **54.4%**, PV is **56.4%**, both **98.7%**, the loads
+>   **52.4%**, the empty body **99.8%**. The arms over-count by 11% because QK
+>   and PV issue into the same tensor pipe and each is a dependent chain, so
+>   removing either lets the other run. "MMA-issue-bound" is right; "88%" is not
+>   a number this instrument can produce.
+> * **§22.3's arm 0 WAS the shipping kernel.** Its scaffolding (`qreg[BQ][NTILES]`,
+>   64 registers/lane at BQ=1, plus `dots2/3/4`) compiles to a **bit-identical**
+>   kernel at **x0.995** when every arm is inactive. So the *baseline* is sound
+>   and the "the ablation measured a deoptimised loop" claim is refuted --
+>   which also retires §23.6's "16 named accumulator chains is the one lever
+>   left": at **compile time** 2 and 4 chains read x1.001 and x0.994.
+>
+> **The pragma question is closed and nothing changed.** `attention.metal:1632`
+> has no `#pragma unroll`, and on the **shipping** kernel the pragma is worth
+> **0.0-0.7%** at every factor, with `#pragma unroll(32)` **3.5% slower** -- all
+> arms byte-identical. The 2.3x in `adversary_report2.md` A2 is an artefact of a
+> standalone transcription and did not survive contact with the real kernel.
+>
+> **What this does to AC2.** Attention must go from 1.9 TFLOP/s (23% of peak)
+> to 7.15 TFLOP/s (**86%**) inside 33.5 s, while the context-independent 223.5 s
+> is **81% of peak** and cannot give any of it back. And this session measures
+> the kernel's actual limiter: **98.7% MMA-issue-plus-its-loads, with two
+> fragment loads per MMA at BQ=1**. That is not reachable by tuning -- the loads
+> are the MMAs' operands. It is reachable only by raising MMAs per load, and the
+> only identified way is a **key-split flash decode** (`BQ=2` with the grid
+> restored), which §9.1b proposed, §22.3 declared refuted on the strength of the
+> load figure, and which is **unbuilt rather than refuted**.
+
 ## 22 — F1: the microbench IS an attribution instrument, and the flash kernel's cost is 88% MMA issue
 
 This is the record for the single most consequential finding of the fixer pass.
@@ -2172,7 +2324,31 @@ const SOURCE: &str = include_str!("attention.metal");
 ```
 
 so editing the `.metal` has no effect until the crate that `include_str!`s it is
-recompiled. §10's decisive arm was
+recompiled.
+
+> #### 🔴 THE STATED ROOT CAUSE IS WRONG (round 3, `adversary_report2.md` A11)
+>
+> **Cargo tracks `include_str!` inputs.** `cargo build -v` says
+> *"the file `attention.metal` has changed"*, and this is reproducible three ways
+> (`pragma_peak_evidence/f1_reproduction.log`):
+>
+> 1. `cargo build --release -p kaplumba-engine --tests` after a one-line edit
+>    prints `Compiling kaplumba-kernels v0.1.0` and takes ~12 s.
+> 2. **§10's arm runs.** `if (tid < 256u) { return; }` at the top of
+>    `attention_prefill_flash_body`, then `cargo test --release --test
+>    attention_qk_mma_bench` through the ordinary path: **`flash bq1` 0.18 ms**
+>    at 24 576 keys / 1024 queries, 0.16 ms at 8 192. Restore the file and the
+>    same command reads **938.15 ms**.
+> 3. A **broken** `.metal` fails loudly: `cargo test` exits **101**,
+>    `test result: FAILED`, and prints **no timing line at all**. It does not
+>    silently fall back to a stale binary. (Note that through a `grep`-filtered
+>    view the exit status is grep's, i.e. 0, on a failed build — which is §10.3's
+>    recorded process bug, and it is *not* what happened here: a build failure
+>    produces no number, and §10's arms produced plausible ones.)
+>
+> **So the mechanism named above does not exist.** What replaced it is in §22.1b.
+
+§10's decisive arm was
 
 ```metal
     if (tid < 256u) { return; }        // top of attention_prefill_flash_body
@@ -2204,6 +2380,54 @@ wrong: `ksteps = 0` demonstrably reached the shader (it fails
 +0.9%. That cannot both be true of one build. The honest conclusion is that
 **these arms were produced across more than one build and no single build's
 contents were pinned.**
+
+### 22.1b What actually happened: a build-freshness race, not `include_str!`
+
+> **This subsection replaces the `include_str!` explanation above. The conclusion
+> is unchanged; the mechanism is different, and the difference is the actionable
+> part.**
+
+§10's own method note is the mechanism: *"tree restored with `git checkout` after
+every arm"*. Two facts about that sequence:
+
+1. **`git checkout` rewrites the file with a fresh mtime.**
+2. **Cargo's freshness test for an `include_str!` input is mtime-based.**
+
+So
+
+```
+edit arm N -> build -> run -> git checkout -> edit arm N+1 -> build -> run
+```
+
+has a window in which arm N+1's build compiles the **restored** source while the
+harness believes it compiled the arm. That produces exactly §10's signature:
+most arms landing within 1.8% of the baseline, because they measured the
+unmodified kernel, and the table looking internally coherent because every entry
+is individually plausible.
+
+**§10's own table proves the edits were landing**, which is what rules out a
+stale build as the explanation and is the strongest evidence for this one:
+
+| §10 arm | §10 reading |
+|---|---|
+| `if (tid < 256u) { return; }` | 964.79 ms |
+| 400 000-iteration float spin | 962.77 ms |
+| **3 000 000-iteration threadgroup-memory spin** | **4 828.96 ms** |
+| `mma` arm (untouched control) | 867-894 ms |
+
+The threadgroup spin **moved the number by 5x**. An added spin cannot move a
+kernel that is not executing. So in that run the `.metal` edits *were* reaching
+the shader — and yet the empty arm read the baseline. Both facts cannot hold of
+one binary, and a stale build cannot be the reconciler because the spin arm
+excludes it.
+
+**The lesson generalises past `include_str!`.** The failure is not "edits do not
+reach the binary"; it is **"a per-arm edit/rebuild/restore loop has no way to
+prove which source the binary it then ran was built from."** §22.2's remedy
+(carry the arm in the uniform block, one build) fixes it; round 3 removes the
+loop as well (`flash_qk_pragma_arms.rs` compiles every arm as a **separate
+library in one process**, so there is no restore step, no rebuild between arms
+and no window).
 
 ### 22.2 The fix: put the ablation in the uniform block
 
@@ -2265,7 +2489,9 @@ agree with the first run's arm 2 (2.00 → 2.13 → 2.26, all "QK is about half"
 | loads 44% | **all fragment loads together 8% (device) + 11% (threadgroup)** | **wrong by ~4x in the wrong direction** |
 | MMA issue 52% | **~77%** (QK + PV MMAs) | direction right, magnitude low |
 | softmax 3% | 0.4% | right |
-| "removing the QK and PV instructions moves nothing" | removing QK is 2.26x, removing PV is 1.68x | **the claim was an artefact of a stale build** |
+| "removing the QK and PV instructions moves nothing" | removing QK is 2.26x, removing PV is 1.68x | **the claim was an artefact of §10 measuring arms that were not in the binary it ran** (the mechanism is a build-freshness race, §22.1b -- **not** `include_str!`, which does not prevent edits reaching the binary) |
+| — round 3: the "88% MMA issue" conclusion itself | — | **"MMA-issue-bound" survives; "88%" does not.** Re-measured on the shipping source in one build: QK **54.4%**, PV **56.4%**, both **98.7%**, loads **52.4%**. The arms sum to **110.8%** because QK and PV share the tensor pipe and each is a dependent chain, so removing either lets the other issue. And the loads are **52%**, not the 8-19% this table's own arms imply, because those arms changed load *addresses* while the expensive thing is the load *instruction* |
+| — round 3: the ablation's baseline | — | **§22's arm 0 WAS the shipping kernel.** Compiling its whole declaration set (`qreg[BQ][NTILES]` = 64 registers/lane at BQ=1, `dots2/3/4[BQ]`) with every arm inactive gives **0 bytes of difference and x0.995**. So "the ablation measured a deoptimised loop" is refuted, and with it §23.6's "16 chains is the one lever left" — at **compile time**, 2 and 4 chains read x1.001 and x0.994 |
 | §10.2 #3: "invalid attribution instrument" | a 6 162x signal | **wrong** |
 
 **The flash kernel is MMA-issue-bound.** 88% of it is the
@@ -2305,6 +2531,18 @@ second half is the specific trap: `if (tid < 256u) { return; }` in a 256-thread
 kernel looks like "a quarter of the threads" to anyone who has not checked the
 dispatch. It is the whole kernel.
 
+> **Round 3 adds a third clause, from having hit the failure twice.** **Do not
+> attribute an ablation's null result to a mechanism you have not tested.** §22.1
+> blamed `include_str!`; cargo tracks it and §10's arm runs in 0.18 ms through the
+> ordinary build path. The real mechanism was a `git checkout`/mtime race in
+> §10's own edit-rebuild-restore loop (§22.1b). The rule that would have caught
+> it is narrower and more useful than "watch out for stale builds": **when an
+> ablation reads the baseline, the first thing to verify is that the control arm
+> of the *same* build moved** — and §10's threadgroup spin arm did move, 5x, in
+> the same table, which is the fact that should have been read first. A mechanism
+> named without a measurement is a guess, and a plausible one is more dangerous
+> than an obviously wrong one because it stops the search.
+
 ### 22.6 The knob is reverted, and the harness goes with it
 
 `AttentionParams::ablate`, `attention_ablate_arm()`,
@@ -2336,6 +2574,46 @@ they are about *reading* numbers rather than about taking them:
   residual add to 1.00. If they do not, the arms are not measuring what their labels
   say — which is exactly the failure that produced §9 and §10.
 
+> **THE RULE IS RIGHT AND THIS TABLE VIOLATES IT (round 3).** Applied to §22.3's
+> own numbers, the rule fires: arms 5/6/8 and 13/14 contribute 6+7+8+4+11 = **36%**
+> of load cost *on top of* arms 2/3's 55.8 + 40.5 = 96.3%, so the table reads
+> **105-109%** of the kernel. And the "1.00" this bullet claims arms 2 and 3 reach
+> was checked by hand, not by any code.
+>
+> Re-measured in one build against the shipping source
+> (`crates/engine/examples/flash_qk_pragma_arms.rs`, 24 576 keys / 1024 queries /
+> BQ=1, medians of 3 interleaved rounds, every arm bit-checked before timing):
+>
+> | arm | ratio | share of the kernel |
+> |---|---|---|
+> | `empty` (everything) | **x604** | 99.8% |
+> | `noqk` (QK MMAs + `kf`/`qf` loads + publish) | x2.192 | **54.4%** |
+> | `nopv` (PV MMAs + `af`/`bf` loads + rescale) | x2.294 | **56.4%** |
+> | `noqk-nopv` | **x75.3** | **98.7%** |
+> | `noloads` (all four fragment loads, MMA count untouched) | x2.099 | **52.4%** |
+> | `loads-l1` (device loads from a fixed L1 row) | x1.261 | 20.7% |
+> | `noqf` (Q fragment load deleted) | x1.222 | 18.2% |
+> | `noaf` (P fragment load deleted) | x1.035 | 3.3% |
+> | `chains2` / `chains4` (**compile-time** QK chains) | x1.001 / x0.994 | 0.0% |
+> | `scaffold` (§22's harness, every arm off) | x0.995, **0 bytes differ** | -- |
+>
+> **54.4 + 56.4 = 110.8%, and the overcount is the finding.** QK and PV issue into
+> the same tensor pipe inside the same key-tile loop, and each is a *dependent*
+> chain on its own accumulator, so removing either lets the other issue without
+> competing. Neither share is "the kernel is 88% MMA issue".
+>
+> **Also: §22.3 under-read the loads by ~4x.** `loads-l1` and `noqf` change load
+> *addresses*; `noloads` removes the load *instruction*, and that is 52.4% of the
+> kernel. On this hardware the issue slot is the expensive part, not the cache
+> line — which is why "the loads are worth 8%" and "the loads are worth 52%" were
+> both plausible-looking readings of the same kernel.
+>
+> **And §22's arm 0 was the shipping kernel.** The `scaffold` arm compiles §22's
+> whole declaration set (`qreg[BQ][NTILES]` = 64 registers/lane at BQ=1, plus
+> `dots2/3/4[BQ]`) with every ablation inactive: **bit-identical output, x0.995**.
+> So the baseline is sound and the "the ablation measured a deoptimised loop"
+> claim is refuted. Full record: `pragma_peak_report.md` T5, T6.
+
 ---
 
 ## 23 — F5: AC2 re-derived, the o_proj lead killed, and the honest ceiling
@@ -2355,14 +2633,28 @@ That measurement is `gemv_bandwidth.rs` at **`M = 1`** — a decode GEMV. Prefil
 `M = PREFILL_CHUNK = 1024`, and at that shape the projection is not
 bandwidth-bound at all. From the 16 394-token per-kernel profile:
 
-| projection | measured `own_ms` | TFLOP/s | % of the 15.6 TFLOPS peak |
-|---|---|---|---|
-| v_proj | 5 853.3 | **8.63** | 55% |
-| k_proj | 6 495.2 | **7.78** | 50% |
-| gate/up/down (each) | ~34 326 | **6.63** | 42% |
-| o_proj | 15 574.5 | **6.49** | 42% |
-| q_proj | 15 869.4 | **6.37** | 41% |
-| **all seven** | **146 770.2** | **6.73** | **43%** |
+| projection | measured `own_ms` | TFLOP/s | % of 15.6 (wrong) | **% of 8.30 (correct)** |
+|---|---|---|---|---|
+| v_proj | 5 853.3 | **8.63** | 55% | **104%** |
+| k_proj | 6 495.2 | **7.78** | 50% | **94%** |
+| gate/up/down (each) | ~34 326 | **6.63** | 42% | **80%** |
+| o_proj | 15 574.5 | **6.49** | 42% | **78%** |
+| q_proj | 15 869.4 | **6.37** | 41% | **77%** |
+| **all seven** | **146 770.2** | **6.73** | **43%** | **81%** |
+
+> **CORRECTED (round 3), and this is the sharpest consequence of the peak fix.**
+> The `own_ms` and TFLOP/s columns are untouched; only the denominator was wrong.
+> **v_proj is at 104% of the true 8.30 TFLOPS ceiling** -- i.e. at or slightly
+> past it, which is what a GEMM that keeps its operands in registers looks like
+> and is the strongest single piece of evidence that 8.30 is the right ceiling
+> and 15.6 was not: a projection cannot exceed the pipe's rate.
+>
+> **The FFN's three 6.63 TFLOP/s projections are at 80%, not 42%.** §23.2 called
+> 41-55% "a measured tensor peak with no spread worth attacking"; at 80% there is
+> essentially nothing left to attack, and the conclusion it drew -- "the GEMM is at
+> its wall" -- turns out to be **right for a reason 1.9x stronger than the one
+> given**. `spec/engine-performance`'s independent 6.13-6.44 TFLOPS for this GEMM
+> is 74-78% of the same ceiling, and its declared "7.5 TFLOPS wall" is **90%**.
 
 Three things kill the lead:
 
@@ -2395,15 +2687,22 @@ the answer is that there is nothing anomalous in it to decompose.
 | k_proj | 9.7 | 4.4% | 7.78 |
 | v_proj | 8.8 | 3.9% | 8.63 |
 | element kernels + head + norms | 3.3 | 1.5% | — |
-| **total** | **223.5** | | **6.73 = 43% of peak** |
+| **total** | **223.5** | | **6.73 = 81% of the true 8.30 ceiling** |
 
-**69% of it is the FFN**, and all of it is at 41-55% of a *measured* tensor peak
-with no spread worth attacking. `spec/engine-performance`'s independent record of
-6.13-6.44 TFLOPS for this GEMM, after rejecting 64x64 tiles, `KCHUNK=32`, staged
-`astage`, 32 accumulators, 8->4 simdgroups, the codebook LUT, `extract_bits`, concat
-fusion and resident weights, and declaring **7.5 TFLOPS a wall**, is consistent
-with 6.73 to within its own spread. **The GEMM is at its wall and there is no
-projection-shaped hole in it.**
+**69% of it is the FFN**, and all of it is at **77-104%** of the true tensor
+ceiling with no spread worth attacking. `spec/engine-performance`'s independent
+record of 6.13-6.44 TFLOPS for this GEMM, after rejecting 64x64 tiles,
+`KCHUNK=32`, staged `astage`, 32 accumulators, 8->4 simdgroups, the codebook LUT,
+`extract_bits`, concat fusion and resident weights, and declaring **7.5 TFLOPS a
+wall**, is consistent with 6.73 to within its own spread. **The GEMM is at its
+wall and there is no projection-shaped hole in it** — and the wall is at **81% of
+peak**, not 43%, so the seven named rejections were rejections of a component
+already within 20% of the hardware rate. The sentence is unchanged; its
+justification is now 1.9x stronger, and the 7.5 TFLOPS wall is **90% of peak**.
+
+> **CORRECTED (round 3): the "41-55% of a measured tensor peak" in the original
+> was measured against `mma_peak.rs`'s phantom 15.6 TFLOPS.** The seconds and the
+> TFLOP/s are untouched. See the read-first banner.
 
 ### 23.3 Attention, split by layer kind — and one free 5-19%
 
@@ -2411,10 +2710,10 @@ projection-shaped hole in it.**
 non-flash arm. Solving the per-layer `own_ms` totals (full 7 566.7 ms, sliding
 2 653.1 ms, each layer's own GEMM `FLOP`/6.73 TFLOP/s) for the attention share:
 
-| | attention per chunk per layer | FLOP at 16 394 | TFLOP/s | % peak |
-|---|---|---|---|---|
-| 10 full layers | 270.0 ms | 8.814e13 | **1.91** | 12% |
-| 50 sliding layers | 10.0 ms | 2.751e13 | **1.85** | 12% |
+| | attention per chunk per layer | FLOP at 16 394 | TFLOP/s | % of 15.6 (wrong) | **% of 8.30** |
+|---|---|---|---|---|---|
+| 10 full layers | 270.0 ms | 8.814e13 | **1.91** | 12% | **23%** |
+| 50 sliding layers | 10.0 ms | 2.751e13 | **1.85** | 12% | **22%** |
 
 **Both layer kinds land on 1.9 TFLOP/s.** That is the credibility check: it
 matches `attention_qk_mma_bench` on the same geometry (1.27-1.46 TFLOP/s across
@@ -2423,9 +2722,17 @@ runs) and it reproduces the adversary's *total* 24 590-token attention figure
 8.9 s sliding) does not reproduce; its total does, and the total is what AC2
 depends on. Two independently written attention kernels in this same file —
 `attention_prefill_flash_body` and `online_attention_qk_mma` — both converge on
-~1.8-1.9 TFLOP/s, which is 12% of the `mma_peak.rs` figure and is much more
-likely to be a property of the operand shape on this hardware than a bug in one
-of them.
+~1.8-1.9 TFLOP/s, which is **23%** of the true ceiling and is much more likely
+to be a property of the operand shape on this hardware than a bug in one of them.
+
+> **CORRECTED (round 3): 12% -> 23%.** And this session answers the "property of
+> the operand shape" question that this paragraph only gestured at: on the
+> shipping flash kernel, in one build, **all four fragment loads removed with the
+> MMA count untouched** is x2.099, i.e. the loads are **52.4%** of the kernel, and
+> the kernel issues **two loads per MMA** at `BQ=1`. It is a property of the
+> operand shape — specifically of there being one query per threadgroup — and it
+> is fixable in principle by raising MMAs per load, which is what a key-split
+> flash decode does. See `pragma_peak_report.md` T6.
 
 **One free finding.** `FLASH_QUERY_BLOCK_MIN_KEYS = 16_384` was chosen from §5's
 byte model, which §12 withdrew, and §12.2 flagged the threshold as suspect
@@ -2545,6 +2852,38 @@ same way, one cut at `"...proportional to the mass and"` and one at
 `"...proportional to the mass."` — the 512-token budget simply fell on the other side
 of a token.
 
+> #### ⚠️ ROUND 3: what this number is, stated so it cannot be over-read
+>
+> **1 event in 1 536 is not enough to call the rule safe, and this section should
+> not have implied that it was.** Three points, each checkable from the committed
+> `.ids` files:
+>
+> * **It is 1 event, not a rate.** By the rule of three, 1 in 1 536 gives a 95%
+>   upper confidence bound near **3/1536 = 0.2%**. The experiment cannot separate
+>   "the rule is safe" from "this template did not hit a near-tie".
+> * **The three contexts are one distribution, not three.** `build_prompt` is a
+>   repeated fixed string, so 1024 / 4096 / 16 394 are the *same* template at three
+>   lengths, not three independent prompts. It is 1 event in 1 536 draws from
+>   effectively one distribution.
+> * **🔴 The temperature-0.7 run is NOT a second data point and must not be shown
+>   as one** (`adversary_report2.md` A6, and it is right). `f4_quality.log` is
+>   `temperature=0 seed=1234`; `f4_quality_sampled.log` is
+>   **`temperature=0.7 seed=20260905`** — a different sampler *and* a different
+>   seed. Its first divergence at token 407 is not "inside" the 1 536; at
+>   temperature 0.7 the same arm differs in **99 of 512** tokens. It says nothing
+>   about the greedy perturbation's size, and `fixer_report.md`'s table places the
+>   two in one row, which invites exactly that reading. **It has been removed from
+>   that row here.**
+>
+> **What this section establishes, and what it does not.** It establishes a
+> **structural** fact — the rule reaches 10 of 60 layers, the sliding ring caps the
+> other 50, and the perturbation is therefore confined to the full-attention
+> layers — and a **bounded-ulp** magnitude measured at 0.065% of greedy tokens on
+> one template. It does not establish that the rule is safe at 16k+ contexts, and
+> §24.4's recommendation not to flip does not depend on it: the quality gate
+> requires byte-identical greedy text against base `f2b2da1` for the default
+> configuration, and any flip changes that by construction.
+
 **The `splits13` arm is NOT the rule, and the difference is the ring.**
 `KAPLUMBA_DECODE_SPLITS=13` returns `pinned` from `decode_splits_with` *before*
 `wanted.min(affordable)` runs, so it pins **every** layer kind; whereas
@@ -2623,22 +2962,133 @@ and the perturbation is confined to 10 of 60 layers by the sliding ring."
 
 ### 24.4 Recommendation: flip, but it is not free, and it is not done here
 
-* **Recommended:** make `workgroups` the default. It is worth +1.55% to +2.17%
-  decode at 16k (N4, re-confirmed by the adversary with an 8-arm curve monotone to
-  13 and a −1.5% cliff at 14), the quality cost is 1 greedy token in 1 536 measured
-  across three contexts above the 896 boundary, and the change touches 10 of 60
-  layers for structural reasons (§24.1).
-* **Not done here, for a reason that is not "it needs an owner":** this spec's own
-  quality gate requires **byte-identical greedy text against base `f2b2da1` for
-  the default configuration**, and flipping the default by construction changes
-  1 token in 1 536. A +2% decode win is not worth spending that gate on, and the
-  gate exists precisely so that a speed number attached to a numerics change is
-  not read as free. **Whoever wants the flip should amend the gate first, in
-  writing, with the 1/1536 number attached.**
-* **The comment at `attention.rs:433-454` must be corrected either way.** Leaving
-  "changes 43 of 128" in the shipped source, next to a `workgroups` opt-in, is the
-  thing that makes the next reader distrust the opt-in. Its *reason* (fp addition is
-  not associative) survives; its *magnitude* does not.
+> #### 🔴 ROUND 3 — THE "1 TOKEN IN 1 536" DOES NOT SURVIVE AT 8k. THE FLIP IS
+> **REJECTED**, NOT DEFERRED.
+>
+> The three contexts in §24.2 are 1 024 / 4 096 / 16 394 tokens. The
+> `workgroups` rule is byte-identical at 1 024, differs by **one last token** at
+> 4 096, and is byte-identical at 16 394 — so the summary reads "1 in 1 536". But
+> **8 204 tokens was never measured, and at 8 204 the perturbation is large.**
+>
+> `scripts/bench_split_rule_quality.sh`, 512 tokens, `--temperature 0
+> --seed 1234`, `--show-ids`, arms interleaved per context. Two contexts the
+> committed evidence does not cover, and a replicate of the 8k leg:
+>
+> | context | arm | generated | first differing token | differing |
+> |---|---|---|---|---|
+> | 2 048 | `shipped` | 512 | — | — |
+> | 2 048 | **`workgroups`** | 512 | **never** | **0 / 512** |
+> | 2 048 | `splits13` | 512 | never | 0 / 512 |
+> | 2 048 | `passes0` | 512 | never | **0 / 512** |
+> | 8 204 | `shipped` | 512 | — | — |
+> | 8 204 | **`workgroups`** | **476** | **token 39** | **434 / 476** |
+> | 8 204 | `splits13` | 512 | token 454 | 56 / 512 |
+> | 8 204 | `passes0` | 512 | never | **0 / 512** |
+> | 8 204, **replicate** `workgroups` | **476** | **token 39** | **434 / 476** |
+>
+> Evidence: `pragma_peak_evidence/quality_gate/t0_summary.tsv`,
+> `t0_8204_replicate_summary.tsv`, `t07_summary.tsv`, and the `.ids` streams beside
+> them.
+>
+> **The 8k result reproduces to the token**, in a separate run: same first
+> divergence (39), same length (476), same count (434). The `workgroups` arm
+> terminates **36 tokens early** -- it reaches a stop and the shipped arm does not.
+> That is a different *length*, not merely a different wording, and no
+> argmax-flip-lottery accounts for it.
+>
+> **The independent sampling-temperature leg does not rescue it either.** At
+> `--temperature 0.7 --seed 20260905`, 512 tokens, contexts 2 048 and 8 204:
+>
+> | context | `workgroups` | `splits13` | `passes0` |
+> |---|---|---|---|
+> | 2 048 | **0 / 512, never diverges** | 0 / 512 | **0 / 512** |
+> | 8 204 | **0 / 512, never diverges** | 308 / 490, from token 174 | **0 / 512** |
+>
+> So the two legs **disagree in direction**: under greedy the 8k `workgroups` arm
+> diverges at token 39; under sampling it does not diverge at all. That is the
+> signature of a **near-tie in a deep, self-reinforcing generation**, and it is
+> exactly the regime in which a single 512-token sample tells you almost nothing
+> about the next one. **The honest reading is that the perturbation's size at 8k
+> is not characterised**, and the committed "1 in 1 536" is a measurement of three
+> contexts that happened to miss the one where it is large.
+>
+> **Repetition check** (`scripts/check_repetition.sh`, distinct n-gram ratio), on
+> every stream above: the lowest `distinct_16` is **0.9474** (the 8 204
+> `splits13` sampled arm) and the shipped arms read **0.9577-1.0000**. The
+> harness's own collapsed control reads 0.0092. **No collapse, no NaN/Inf** (a
+> non-finite logit is a hard `SamplerError`, so a completed 512-token generation
+> cannot contain one).
+>
+> #### What this does to the flip decision
+>
+> | | §24.4 said | **round 3** |
+> |---|---|---|
+> | quality cost | 1 greedy token in 1 536, three contexts | **not characterised at 8k: 434/476 from token 39, reproduced**; byte-identical at 2 048 and at 8 204 *under sampling* |
+> | recommendation | **flip** | **reject.** Not "defer pending an owner": the evidence for the magnitude is wrong in a way that changes the sign of the recommendation |
+>
+> **The gate decides it, and it does not need the magnitude to.** The spec's
+> quality gate requires **byte-identical greedy text against base `f2b2da1` for
+> the default configuration**, and `workgroups` is not byte-identical under greedy
+> at 8 204 in two runs out of two. A +1.55-2.17% decode win does not buy that,
+> and the previous recommendation — "flip, it is not free" — was made on a cost
+> figure that a fourth context contradicts.
+>
+> **The shipped comment must change either way** (§24.3): "43 of 128" is stale,
+> and so is any sentence implying the perturbation is ~0.065%. The **measured**
+> range for this rule on the shipped kernel is now **0/512 at 2 048 tokens, 0/512
+> at 16 394 tokens, and 434/476 from token 39 at 8 204 tokens**, all greedy, all
+> reproducible. **A rule whose effect is 0% at two contexts and 91% at a third is
+> not characterised by either number.**
+>
+> #### What IS solid here, and it is the part that was the actual finding
+>
+> * **`passes0` is EXACT**, on generated text, at every context and both
+>   temperatures: **0 differing tokens in 512 at 2 048 and 8 204, greedy and
+>   sampled**, byte-identical bodies, reproduced at 8 204 in a separate run. That
+>   is F3's claim and it holds.
+> * **The `splits13` arm is a different configuration and is confirmed to be
+>   numerically sensitive**: 56/512 greedy from token 454 at 8 204, and 308/490
+>   sampled from token 174. Its calibration as a "sensitivity probe" (§24.2,
+>   "35% at 16k") stands.
+> * **The structural argument survives untouched**: the ring caps the 50 sliding
+>   layers at 16 splits either way, so the rule reaches **10 of 60 layers**. That
+>   is arithmetic from the code, not a measurement, and it is why `workgroups` and
+>   `splits13` differ at all.
+>
+> **This is the round-2 adversary's A6 point generalised, and it generalises
+> further than they put it.** They said the temperature-0.7 leg "is not a second
+> data point". True. The stronger statement is that **neither leg is
+> representative**, because they disagree, and the honest output of this
+> experiment is a characterisation of *where* the rule is safe (2 048, 16 394) and
+> a finding that it is not safe at 8 204 — not a single scalar.
+
+* **REJECTED (round 3).** The three bullets below are the §24.4 recommendation as
+  it was written and they are superseded by the block above; kept because the
+  supersession is the record.
+  * ~~**Recommended:** make `workgroups` the default.~~ — worth +1.55% to +2.17%
+    decode at 16k, but the quality cost is **not** 1 token in 1 536: it is
+    **434 of 476 greedy tokens from token 39 at 8 204 tokens**, reproduced in two
+    runs out of two, against 0/512 at 2 048 and 0/512 at 16 394. The speed number
+    stands; the cost figure it was traded against does not.
+  * ~~**Not done here, for a reason that is not "it needs an owner"** — flip the
+    default by construction changes 1 token in 1 536.~~ — **the gate is not the
+    binding constraint and never was.** At 8 204 it changes 434 of 476. The
+    binding constraint is the measurement, and it says the rule's effect is **not
+    characterised**: 0% at two contexts, 91% at a third, and the two temperature
+    legs disagree about which.
+  * **The comment at `attention.rs:433-454` must be corrected either way.** Leaving
+    "changes 43 of 128" in the shipped source, next to a `workgroups` opt-in, is the
+    thing that makes the next reader distrust the opt-in. Its *reason* (fp addition is
+    not associative) survives; its *magnitude* does not. **Round 3 has a
+    replacement magnitude and it is context-dependent, so the comment has to say
+    so rather than quote a scalar.**
+* **What would make the flip defensible, stated so the next person does not have
+  to re-derive it:** a characterisation of *where* the rule is safe. Two contexts
+  at 0/512 and one at 434/476, with the two temperature legs disagreeing, is not a
+  characterisation. The right experiment is a context sweep with both
+  temperatures, and it should be run **before** anyone argues about the gate --
+  because a rule that is 0% at 2k and 16k and 91% at 8k is not a rule anyone should
+  default on, gated or not.
 
 ### 23.4 The budget, re-derived
 
@@ -2673,6 +3123,31 @@ Against the 90 tok/s budget of 273.2 s:
   wall**, so 8.1 is *above* the wall this repo already established after seven
   named rejections. **Neither route is incremental.**
 
+> #### CORRECTED (round 3) — every percentage in §23.4, against the true ceiling
+>
+> The seconds and the FLOP counts are untouched; only the denominator was wrong
+> (`mma_peak.rs` stored 8 of 16 accumulators, so half its MMAs were dead stores
+> and it read 15.0 TFLOPS where the true ceiling is **8.30**).
+>
+> * **AC2's ask is 7.15 TFLOP/s = 86% of peak, not 46%.** Measured today it is
+>   1.9 TFLOP/s = **23%**. So the cut is still **3.8x** -- the multiplier was
+>   always right, because both sides move together when only the denominator is
+>   wrong -- but it is 3.8x *of 86% of the hardware's rate*, not 3.8x to reach a
+>   comfortable 46%. **No kernel in this repo operates above 81% of that
+>   ceiling.**
+> * **The "flash-only" refutation hardens from "above the (phantom) peak" to
+>   213% of peak.** 17.7 TFLOP/s against 8.30. Against the phantom 15.6 it was
+>   already impossible; against the real ceiling it is impossible by a factor of
+>   two, and no amount of kernel work closes that.
+> * **The 1.7x-GEMM alternative is at 98% of peak**, not 52%, and against
+>   `spec/engine-performance`'s declared 7.5 TFLOPS wall (itself **90%** of peak)
+>   it is 8%. So the GEMM route is not merely non-incremental, it is arithmetically
+>   unavailable: the measured GEMM is already at 81%.
+> * **And the 239.7 s "spent before attention begins" is 88% of the budget at 81%
+>   of the tensor peak.** AC2 is not a case of a cheap component being asked for
+>   3.8x; it is a case of the remaining 12% of the budget having to absorb a 3.8x
+>   cut while the other 88% is already near the pipe's rate.
+
 ### 23.5 The hunt: every lever the measured split suggests, and what it measured
 
 This is the part the brief asked for and the part §12 was missing: with the
@@ -2683,10 +3158,15 @@ was built and measured rather than argued about.
 |---|---|---|---|
 | halve the Q fragment loads by hoisting `qstage` into registers (`simdgroup_half8x8 qreg[BQ][NTILES]`, 64 registers/lane at `BQ=1`, 128 at `BQ=2`) | the loads are 12% and `qf` is loop-invariant in `(b, d8, head)` | **x0.52 / x0.50 — 92% SLOWER** | **negative.** It spills. This is the same trap `mma_peak.rs` records at 32 accumulators (15.49 -> 0.74 TFLOPS) |
 | break the QK accumulator dependency chain (2 and 4 independent chains) | `mma_peak.rs`: 1 chain 5.75 TFLOPS, 8 chains 7.65, 16 chains 15.49 | **x1.00 and x0.96** | **negative.** And it contradicts the peak table, which is itself the interesting fact |
+| — the same, at **compile time** (round 3) | as above, with `#pragma unroll` so the chain index folds away | **x1.001 and x0.994** | 🔴 **negative, and now definitive.** The arms above used a *runtime* `((d8 >> 3) & 1)` selector on a **rolled** loop, which cannot dual-issue; done properly it still buys nothing, because the corrected peak moves only 6% (7.18 -> 7.63) from 1 to 16 chains |
 | `KAPLUMBA_FLASH_BQ=1` (drop query blocking entirely; `BQ=2` halves the K/V bytes and the grid) | §9.1b: bytes are 8%, so removing them cannot pay | see §23.6 | the one free lever that survived |
 | kill the loads outright to find the floor | — | **x1.12** (arm 14) | so even a zero-load kernel is 12x the empty body |
+| **kill all four fragment loads, MMA count untouched** (round 3) | the loads are 8-12% (§22.3) | **x2.099 — 52.4% of the kernel** | 🔴 **§22.3 under-read the loads by ~4x.** `arm 14` and `arm 8` changed load *addresses*; this removes the load *instruction*, and on this hardware the issue slot is what costs. §23.6's "loads are 8%" was the load-bearing input to "nothing here is worth attacking" |
+| **break the QK accumulator chain at COMPILE time** (round 3) | §23.6's "the one concrete thing left to try" | **2 chains x1.001, 4 chains x0.994** | 🔴 **negative, definitively.** §22's arms 11/12 used a *runtime* selector on a rolled loop and could not have created ILP; at compile time it still does not help, because chain count moves the ceiling by 6% (7.18 -> 7.63 TFLOP/s from 1 to 16 chains) |
+| **add `#pragma unroll` to the QK loop** (round 3) | `adversary_report2.md` A2/A3, from a standalone transcription: 2.3x | **x0.993-x1.007 at every factor; `unroll(32)` x0.965. All arms byte-identical.** | 🔴 **negative.** Shipping is already the fast configuration. Measured on the shipping source, not the transcription |
 | attack the GEMM's o_proj (the lead `spec/decode-20tps` handed over) | "o_proj at half the bandwidth, worth 2-3 ms/token" | **refuted, §23.1** | there is no anomalous projection |
 | attack the 16.2 s inter-dispatch gap | 5.9% of the budget | it is profiler-inflated: the profiled wall is 224.6 s and the clean wall 218.4 s at the same prompt | not a production cost |
+| **key-split flash decode: `BQ=2` with the grid restored** (round 3) | the loads are 52% and MMAs/load is what caps the kernel | **not built** | 🟡 **the only lever left standing.** Untested, not refuted. §9.1b proposed it; §22.3/§23.3 "refuted" it on the strength of a load figure that is 4x too small |
 
 **The negative results are the finding.** Three independent candidate mechanisms
 for the MMA stall — memory, dependency chain, register pressure — are each
@@ -2706,7 +3186,35 @@ raise `BQ=2` to 9.5. Both predictions are wrong: **`BQ=2` is 19% SLOWER than
 is not what the MMA is waiting for. Any future work that reasons from instruction
 mix should read this paragraph first.
 
+> **CORRECTED (round 3): the denominator, and what survives.** Against the true
+> 8.30 TFLOPS ceiling the same count predicts **3.05** at `BQ=1` and **4.39** at
+> `BQ=2`. The predictions are still wrong in the same direction and by about the
+> same factor, so **the falsification stands** — but it now falsifies a *higher*
+> target, which strengthens it: a perfectly issue-bound kernel at `BQ=1` would
+> reach only 3.05 TFLOP/s against AC2's **7.15**, and AC2 needs 86% of peak. The
+> instruction count is not what the MMA is waiting for, and the pipe's ceiling is
+> not 4x above where the kernel sits.
+
 ### 23.6 The honest ceiling
+
+> #### ⚠️ ROUND 3: this section's two "ceiling" rows are built on the phantom peak
+> and its recommendation has been measured and is dead. Read the correction first.
+>
+> **The 15.49 TFLOPS row does not exist.** `mma_peak.rs` accumulated into 16
+> accumulators and stored 8, so 8 of its chains were dead stores the compiler
+> deleted; it reported 15.0 for work a kernel doing **half** of it finished in the
+> same time. The instrument now stores every accumulator and asserts the old bug
+> reproduces (`dead8` reads x0.990 of `live8`). **The ceiling is 8.30 TFLOPS** and
+> it is nearly flat in chain count: 7.18 at 1 chain, 7.59 at 8, 7.63 at 16, 8.30
+> at 24.
+>
+> **So the "8-chain peak" row is 7.65 = 92% of the real ceiling, not 49%.** The
+> row's *tok/s* figure (90.7) is unaffected — it never referenced the peak — but
+> "a 0.8% margin" was an artefact of dividing by a number that was 1.88x too
+> big, and against the true ceiling that scenario needs **86-92%** of the
+> hardware's rate.
+>
+> **And the recommendation below has been run.** It is dead. See below.
 
 Every number in this table is a **ceiling** — it assumes a component reaches the
 best rate it has ever been *observed* to reach, with zero overhead. It is an upper
@@ -2715,41 +3223,66 @@ bound on AC2, not a forecast.
 | scenario | attention | total s @24 590 | tok/s |
 |---|---|---|---|
 | measured today | 103.8 + 22.3 = 126.1 | 365.8 | **67.2** |
-| both attention kernels at their 15.49 TFLOPS **issue** peak (the `mma_peak.rs` 16-chain figure, with zero memory and zero everything else) | 12.8 + 2.7 = 15.5 | 255.2 | **96.4** |
-| both at the 8-chain peak (7.65 TFLOPS, the rate `mma_peak.rs` measures for an 8-way accumulator structure like PV's) | 25.9 + 5.4 = 31.3 | 271.0 | **90.7** |
+| both attention kernels at 15.49 TFLOPS — **DOES NOT EXIST** (the phantom peak; the real ceiling is 8.30) | ~~12.8 + 2.7 = 15.5~~ | ~~255.2~~ | ~~96.4~~ |
+| both at the measured 8-chain rate (7.65 TFLOPS) = **92% of the true ceiling** | 25.9 + 5.4 = 31.3 | 271.0 | **90.7** |
 | both at 3.8x, i.e. exactly the ask | 33.2 | 272.9 | **90.1** |
 | attention free | 0 | 239.7 | **102.6** |
 
 **Read honestly, this says three things.**
 
 1. **AC2 is arithmetically possible, but only just, and only through the tensor
-   cores.** The 8-chain row lands at 90.7 — a 0.8% margin. The 15.49 row lands at
-   96.4. Neither is reachable from 12%: the required lift is **4.0-8.2x on the MMA
-   issue rate of both attention kernels**, and every lever that the measured split
-   suggests is negative (§23.5).
-2. **The GEMM is not the cheaper route.** It is at 43% of tensor peak,
+   cores.** The 8-chain row lands at 90.7. The 15.49 row lands at 96.4 — but that
+   row was never real. Neither is reachable from 23% of peak: the required lift is
+   **3.8x on the MMA issue rate of both attention kernels**, and every lever that
+   the measured split suggests is negative (§23.5).
+2. **The GEMM is not the cheaper route.** It is at **81%** of tensor peak,
    *uniformly across all seven projections*, and `spec/engine-performance` already
-   declared 7.5 TFLOPS a wall there after seven named rejections. 8.1 TFLOP/s is
-   above that wall.
+   declared 7.5 TFLOPS a wall there after seven named rejections — itself **90%**
+   of peak. 8.1 TFLOP/s is **98%** of peak.
 3. **Therefore the honest recommendation is a target change or a rewrite, not
    another lever-shaped session.** Four levers have now been tried against this
    target (T3, T4f, T2b, N1) and a fifth (`KAPLUMBA_FLASH_BQ`, §23.7) is worth a
    few percent. The residual is 3.8x on a component whose cost is now *known* to
-   be 88% one instruction class, with no measured handle on that instruction
-   class's rate.
+   be 98.7% MMA-issue-plus-its-loads, with no measured handle on that rate.
 
-**The one concrete thing left to try, and it is cheap.** `mma_peak.rs` shows the
-tensor rate depends on the **number of independent accumulator chains** and not on
-the loads (1 chain 5.75, 8 chains 7.65, 16 chains 15.49 TFLOPS). The flash kernel
-issues QK through **one** chain per tile. Arms 11/12 split it 2 and 4 ways and
-gained nothing — which suggests the split was not actually made (the compiler kept
-the chains serial), not that ILP does not matter. **The experiment to run next is
-16 named scalar accumulator chains in the QK loop, exactly as `mma_peak.rs` does
-it** — the source itself records that an *array* of 32 made the compiler spill and
-collapse to 0.74 TFLOPS, so it must be named locals, and this repo has already been
-burned by that trap once. If 16 chains really do give 15.49, the flash kernel's QK
-ceiling moves from 1.37 to something an order of magnitude better and AC2 is back
-in reach. That is a day's experiment and it is the only lever left standing.
+**The one concrete thing left to try, and it is cheap** — 🔴 **RUN AND DEAD
+(round 3). This recommendation was wrong, and it was wrong for two independent
+reasons, both measurable.**
+
+> `mma_peak.rs` shows the tensor rate depends on the **number of independent
+> accumulator chains** and not on the loads (1 chain 5.75, 8 chains 7.65, 16 chains
+> 15.49 TFLOPS). The flash kernel issues QK through **one** chain per tile. Arms
+> 11/12 split it 2 and 4 ways and gained nothing — which suggests the split was
+> not actually made (the compiler kept the chains serial), not that ILP does not
+> matter. **The experiment to run next is 16 named scalar accumulator chains in
+> the QK loop** ... If 16 chains really do give 15.49, the flash kernel's QK
+> ceiling moves from 1.37 to something an order of magnitude better and AC2 is
+> back in reach.
+
+1. **The premise was a phantom.** With every accumulator stored, the chain count
+   barely moves the rate: **1 chain 7.18, 8 chains 7.59, 16 chains 7.63** TFLOP/s.
+   A **6%** spread from 1 to 16 chains, against the "2.7x" this paragraph relies
+   on. The old table's 1-chain arm (5.75) and 16-chain arm (15.49) were *different
+   kernels* in the only respect that mattered -- half of one of them was a dead
+   store.
+2. **The mechanism is real and still buys nothing.** §22's arms 11/12 selected
+   the chain with `if ((d8 >> 3) & 1)` on a **rolled** loop: a *runtime* branch
+   inside the loop body, so the two chains could not dual-issue. The right
+   experiment is to make the selector **compile-time**. Done, on the shipping
+   kernel, in one build (`#pragma unroll` makes `d8` a constant so
+   `(d8 >> 3) % N` folds away): **2 chains x1.001, 4 chains x0.994**, both
+   bit-bounded-ulp identical (worst normalised difference 6.6e-4, which is the
+   reassociation and nothing else).
+
+**So chain count is not a lever on this kernel, at any count, by any mechanism.**
+This paragraph is retired. The live lead is structural, and it is named in §9.1b:
+the QK loop issues **two fragment loads per MMA** at `BQ=1`, all four loads are
+**52.4%** of the kernel with the MMA count untouched, and the only identified way
+to raise MMAs per load without halving the grid is a **key-split flash decode**
+(`BQ=2` with the key axis split and a combine pass). That is unbuilt. §23.3
+called the naive `BQ=2` "the one free lever"; it is free and it is **slower**,
+because it halves the grid. The split version is the thing, and it has never been
+built.
 
 ---
 
@@ -2783,6 +3316,25 @@ interleaved per round, poll file and verdict kept per arm, 3 rounds:
 **-0.13%, inside both arms' spread.** The adversary's pre-F2 figure was +0.13%, so
 the sign is noise either way and the honest reading is "below the resolution of this
 instrument at this context".
+
+> **Round 3 adds the 24k leg, with a valid control.** The committed 24k evidence
+> had its control arm marked `INVALID-NO-NUMBER` (`adversary_report2.md` A9), so
+> "N1 is NEUTRAL" rested on 16 394 tokens while this spec is about 24 590. Re-run
+> at 24 590 keys, interleaved, 2 rounds:
+>
+> | round | arm | `pass_keys` | prompt tokens | prefill tok/s | verdict |
+> |---|---|---|---|---|---|
+> | r1 | one dispatch | 0 | 24 602 | **66.829** | **VALID** |
+> | r1 | two passes | 8192 | 24 602 | **67.051** | **VALID** |
+> | r2 | one dispatch | 0 | 24 602 | — | **INVALID** (control discarded by the memory gate) |
+> | r2 | two passes | 8192 | 24 602 | 67.794 | VALID |
+>
+> **Round 1 is a valid pair: +0.33%, i.e. neutral at 24k as well, and the control
+> is not faster.** Round 2's control was discarded so round 2 is unusable — one
+> valid pair in two attempts, which is the honest rate for 24k on this box.
+> Evidence: `adversary_evidence2/n1_pass_ab_24k_r3.tsv`. See §16.4 for what this
+> does and does not change about F3's decision (nothing: F3 rests on the
+> byte-identity argument, not on the size of the effect).
 
 **Where the cost actually shows up: the host side.** `KAPLUMBA_GPU_PROFILE=1`, both
 arms in the same session, 16 394 tokens:

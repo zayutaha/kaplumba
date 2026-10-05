@@ -297,7 +297,78 @@ That is also why the two perturbations in this report carry different labels:
 | change | label | evidence |
 |---|---|---|
 | OQ9 passes on/off | **exact** | byte-identical text at temperature 0 **and** at temperature 0.7 with a fixed seed, at 1024 / 4096 / 16394 tokens of context |
-| decode split rule 16 -> 13 | **bounded-ulp** | 1 token in 1 536 greedy; at temperature 0.7 the first divergence is at token 407 |
+| decode split rule 16 -> 13 | **bounded-ulp, NOT CHARACTERISED** | ~~1 token in 1 536 greedy~~ — **superseded: at 8 204 tokens it is 434 of 476 greedy tokens from token 39, reproduced in two runs. 0/512 at 2 048 and at 16 394. The two temperature legs disagree.** |
+
+> **Correction (round 3, `adversary_report2.md` A6). The second row's
+> temperature-0.7 figure has been removed from it, and the reason is that it is
+> not a second data point about the same quantity.** `f4_quality.log` is
+> `temperature=0 seed=1234`; `f4_quality_sampled.log` is
+> `temperature=0.7 seed=20260905` — a different sampler *on a different seed*.
+> Its "first divergence at token 407" (and 99/512 tokens differing overall) is
+> not "inside" the 1 536 and says nothing about the size of the greedy
+> perturbation. Placing both in one cell invited exactly that reading.
+>
+> **The temperature-0.7 run remains the load-bearing evidence for `passes0`, and
+> it is stronger there, not weaker.** For a claim of *byte-identity* the sampler
+> does not need to match: identical token ids under a sampling temperature are a
+> strictly stronger statement than identical greedy text, because a sampling
+> sampler exposes near-ties that `argmax` hides. The split between "this is a
+> second measurement of the same thing" and "this is a different and better test
+> of a different claim" is exactly what the old table did not make.
+>
+> ---
+>
+> ### 🔴 ROUND 3 SUPERSEDES THE SPLIT-RULE ROW ENTIRELY — the flip is REJECTED
+>
+> Removing the temperature-0.7 figure from the cell was not enough. Measuring the
+> contexts this report's evidence **does not cover** found that "1 in 1 536" is
+> not a small number, it is a number that missed.
+>
+> `scripts/bench_split_rule_quality.sh`, 512 tokens, `--show-ids`, interleaved arms,
+> plus a replicate:
+>
+> | context | temperature | `workgroups` | `splits13` | `passes0` |
+> |---|---|---|---|---|
+> | 2 048 | 0 | **0 / 512** | 0 / 512 | **0 / 512** |
+> | 2 048 | 0.7 | **0 / 512** | 0 / 512 | **0 / 512** |
+> | 8 204 | **0** | **434 / 476, from token 39** | 56 / 512, from token 454 | **0 / 512** |
+> | 8 204 | **0.7** | **0 / 512** | 308 / 490, from token 174 | **0 / 512** |
+> | 8 204 (replicate) | **0** | **434 / 476, from token 39** | — | **0 / 512** |
+>
+> **The 8k greedy result reproduces to the token** — same first divergence, same
+> length, same count — and the arm stops **36 tokens early**, which is a different
+> *length*, not a different wording. **The two temperature legs disagree in
+> direction**: under greedy the 8k `workgroups` arm diverges at token 39, under
+> sampling it does not diverge at all. That is the signature of a near-tie in a
+> deep generation, and it means **neither leg is representative**.
+>
+> **So the honest statement is that the rule's effect is not characterised**:
+> 0/512 at 2 048 tokens, 0/512 at 16 394 tokens, 434/476 at 8 204. The spec's
+> quality gate requires byte-identical greedy text against base `f2b2da1` for the
+> default configuration, and the rule is **not** byte-identical under greedy at
+> 8 204 in two runs out of two. **The flip is rejected**, and the +1.55-2.17%
+> decode win does not buy it. This supersedes §24.4's "Recommended: flip, but it
+> is not free, and it is not done here".
+>
+> **What is unaffected and now better established:**
+>
+> * **`passes0` is EXACT** — 0 differing tokens in 512 at every context and both
+>   temperatures, byte-identical bodies, reproduced. F3's claim holds.
+> * **`splits13`'s sensitivity calibration holds** — 56/512 greedy and 308/490
+>   sampled at 8 204.
+> * **The structural argument is untouched** — the sliding ring caps 50 of 60
+>   layers, so the rule reaches 10. That is arithmetic from the code.
+> * **Repetition:** lowest `distinct_16` over all 16 streams is **0.9474**; shipped
+>   arms read **0.9577-1.0000**; the harness's collapsed control reads 0.0092. No
+>   collapse, no NaN/Inf.
+>
+> Evidence: `spec/prefill-24k-90tps/pragma_peak_evidence/quality_gate/`.
+>
+> **A generalisable note, because this is the second time this report put two
+> things in one cell and lost a conclusion.** The temperature legs were run at one
+> context and read as a pair; they are two different experiments and they disagree
+> at 8 204. A measurement that survives only where its authors looked is not a
+> measurement of the quantity it is quoted for.
 
 ### Confirmation in the shipping binary — and one sample discarded
 

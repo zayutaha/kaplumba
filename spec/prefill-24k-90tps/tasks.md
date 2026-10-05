@@ -827,3 +827,146 @@ tokens of the reference prompts **both rules return 2 splits** and N6's
       `a_misfiring_guard_is_caught` never existed — the control was a manual
       `.metal` edit — so §26 records the numbers instead of pretending to a
       citation.
+
+---
+
+## Round 3 — the adversary's round-2 findings, answered ✅ `12a8546`
+
+Full record: `pragma_peak_report.md`. Evidence: `pragma_peak_evidence/`.
+
+* [x] **T1 — is the missing `#pragma unroll` a bug? NO, and nothing is changed.**
+      Measured on the **shipping** `attention.metal`, not a transcription, by
+      compiling every arm as a separate library in one process
+      (`crates/engine/examples/flash_qk_pragma_arms.rs`, which `include_str!`s
+      the shipping file and asserts arm 0 is it **verbatim**). 24 576 keys /
+      1024 queries / `BQ=1`, 3 interleaved rounds: no pragma 967.20 ms,
+      `#pragma unroll` x0.998, `(2)` x0.993, `(4)` x0.996, `(8)` x0.997,
+      `(16)` x0.996, **`(32)` x0.965**. Same at `BQ=2` (x1.007 / x0.928) and at
+      8 192 keys (x1.003 / x0.964). **Every arm byte-identical to the shipped
+      output.** Controls: `spin` x5.15, `empty` (§10's own arm) **x604**, both
+      asserted.
+* [x] **T1 — establish which direction is correct: shipping already is.**
+      The adversary's own first harness forced the unroll and read 2.3x *slower*;
+      the transcription's 2.3x does not survive on the real kernel.
+      `adversary_report2.md` A2's corollary ("the shipped kernel is 2.3x off its
+      own shipped self") is refuted, and so is its version of "the ablation
+      measured a deoptimised loop".
+* [x] **Sabotage both instruments.** (a) Making the pragma edit a no-op aborts
+      the run with "produced the shipping source unchanged"; (b) making the
+      exactness check self-compare aborts with "did not do what its name says".
+      Both observed, both reverted.
+* [x] **T2 — `mma_peak.rs` cannot report a phantom peak again.** Rewritten: every
+      accumulator stored into a `device float *`; the old 16-accumulate/8-store
+      kernel kept as a **`dead8` control**; chain count swept 1/2/4/8/16/24/32;
+      arms looked up by name, never by bare index. **Three assertions** so the
+      instrument can fail: `live16/live8` ~ 2, `dead8` **not** within 1.35x of
+      `live8`, `live16` linear in `iters`. Result: **live1 7.18 / live8 7.59 /
+      live16 7.63 / live24 8.30 / live32 8.10 TFLOPS, dead8 15.08** with
+      `live8/dead8 = x0.990` — the phantom reproduces, so the control is real.
+* [x] **T2 — re-derive every percentage in §20-§23 against 8.30.** attention
+      12% → **23%**; AC2's 7.15 ask 46% → **86%**; the FFN GEMM 43% → **81%**
+      (and v_proj at **104%**); the 1.7x-GEMM alternative 52% → **98%**;
+      §23.6's "8-chain peak" row 49% → **92%** and its "0.8% margin" → **none**;
+      §23.4's flash-only refutation 17.7 TFLOP/s → **213% of peak**.
+* [x] **T2 — fix §22.3's own table, which violates §22.6's sum rule.** Re-measured
+      in one build on the shipping source: `empty` x604, `noqk` x2.192 (54.4%),
+      `nopv` x2.294 (56.4%), `noqk-nopv` x75.3 (98.7%), `noloads` **x2.099
+      (52.4%)**, `loads-l1` x1.261, `noqf` x1.222, `noaf` x1.035, compile-time
+      `chains2`/`chains4` x1.001/x0.994, `scaffold` x0.995 and **bit-identical**.
+      **54.4 + 56.4 = 110.8%**, and the overcount is the finding: QK and PV share
+      the tensor pipe and each is a dependent chain.
+* [x] **T2 — retire §23.6's "16 chains is the one lever left".** Built and run at
+      **compile time** (which §22's arms 11/12 were not, being a runtime
+      selector on a rolled loop): **x1.001 / x0.994**, bounded-ulp identical. And
+      the premise was a phantom -- chain count moves the corrected ceiling by 6%
+      (7.18 → 7.63 from 1 to 16 chains), not the 2.7x the old table claimed.
+* [x] **T3/F1 — the `include_str!` root cause is wrong; it is a build-freshness
+      race.** Cargo tracks the edit (`Compiling kaplumba-kernels`, ~12 s); §10's
+      arm runs through the ordinary build path at **0.18 ms** against a **938 ms**
+      restored baseline; a *broken* `.metal` fails loudly with no timing line.
+      The real mechanism is §10's own "tree restored with `git checkout` after
+      every arm": `git checkout` sets a fresh mtime and cargo's freshness test is
+      mtime-based, so edit → build → run → checkout → edit → build → run races.
+      **§10's own threadgroup-spin arm moved 5x**, which is the fact that rules
+      out a stale build. Conclusion survives, mechanism corrected (§22.1b).
+* [x] **T3/F4 — the temperature-0.7 leg is not a second data point.** Removed from
+      the row it shared with the greedy result in `fixer_report.md`, with the
+      reason recorded: `temperature=0 seed=1234` vs `temperature=0.7
+      seed=20260905`. It is *stronger* evidence for `passes0` (a sampling sampler
+      exposes near-ties `argmax` hides) and *worthless* as a second measurement of
+      the greedy perturbation's size. The 1/1536 is restated as one event, 95%
+      upper bound ~0.2% by the rule of three, on one template at three lengths.
+* [x] **T3/F4 — QUALITY GATE, and it REJECTS the `workgroups` flip.** Two contexts
+      the committed evidence does not cover (2 048 and 8 204) plus a replicate, 512
+      tokens each, `--show-ids`, arms interleaved, **greedy** and again at
+      **`--temperature 0.7`**:
+      * **greedy, `seed 1234`:** `workgroups` is **0/512 at 2 048** and
+        **434 of 476 from token 39 at 8 204 — reproduced exactly in a second run**
+        (same first divergence, same length, same count). `splits13` 56/512 from
+        token 454. **`passes0` 0/512 at both contexts, and identical in the
+        replicate.**
+      * **`temperature 0.7`, `seed 20260905`:** `workgroups` **0/512 at both
+        contexts**; `splits13` 308/490 from token 174 at 8 204; **`passes0` 0/512 at
+        both.**
+      * **The two legs disagree in direction**, which is the finding: under greedy
+        the 8k `workgroups` arm diverges at token 39 and stops 36 tokens early; under
+        sampling it does not diverge at all. **"1 token in 1 536" is a measurement
+        of three contexts that missed the one where it is large.**
+      * **Repetition:** lowest `distinct_16` across all 16 streams is **0.9474**,
+        shipped arms **0.9577-1.0000**, the harness's collapsed control 0.0092. No
+        collapse; no NaN/Inf (a non-finite logit is a hard `SamplerError`).
+      * **Verdict: the flip is REJECTED, not deferred.** The gate requires
+        byte-identical greedy text against base `f2b2da1`, and `workgroups` is not
+        byte-identical under greedy at 8 204 in two runs out of two. Evidence:
+        `pragma_peak_evidence/quality_gate/`.
+      * **What survives unchanged:** `passes0` is EXACT on generated text at every
+        context and both temperatures; `splits13`'s sensitivity calibration stands;
+        and the structural argument (the sliding ring caps 50 of 60 layers, so the
+        rule reaches 10) is arithmetic from the code and untouched.
+* [x] **T3/N1 — a valid 24k control at last.** `adversary_evidence2/n1_pass_ab_24k_r3.tsv`,
+      2 interleaved rounds at 24 602 tokens: **r1 `onedispatch` 66.829 VALID vs
+      `pass8192` 67.051 VALID (+0.33%)**; r2's control was discarded by the memory
+      gate so r2 is unusable and is recorded with no number. The committed 24k
+      evidence had the *control* marked `INVALID-NO-NUMBER` and only the treatment
+      surviving, which cannot support a null. N1 is NEUTRAL at 16k **and** 24k,
+      each with a control, and the 24k null is quoted with its weakness stated:
+      **one** valid pair at 0.33%, versus 16k's 3 rounds with a positive control.
+* [x] **T3/A5 — `MMA_TOLERANCE` closed.** 0.02 → **3e-3**. AC5's 2.16e-3 is this
+      test's own worst, not a stale figure; the gate was 9.3x above it. **5e-4 and
+      1e-3 were tried and FAILED** (5.63e-4 and 2.16e-3) — the record that the
+      gate is real. Sabotage: a 0.5% kernel error **fails** at 3e-3 and **passes**
+      at 0.02; the old gate needed 3%.
+* [x] **T3/A7 — delete the citation of the test that does not exist.**
+      `attention_rescale_guard.rs` no longer cites
+      `a_misfiring_guard_is_caught`; it records that the control is **manual**,
+      gives the number (0.2136, 43x tolerance), and says why no in-tree
+      equivalent exists.
+* [x] **Do not change any acceptance target in `spec.md`.** AC2 stands at 90
+      tok/s @ 24k; the correction is to what fraction of the hardware's rate that
+      is, not to the target.
+* [x] **Quality gate: run, and it is the reason the F4 flip is rejected.**
+      Byte-identical greedy text against base `f2b2da1` **for the default
+      configuration** is satisfied by construction: **no product kernel changed**
+      (`git diff crates/kernels/` is empty across all three commits), so the default
+      configuration is bit-identical to base. The gate was then spent on the thing it
+      actually gates — the **proposed** `workgroups` flip — with ≥512-token
+      generations at **temperature 0** and at a **sampling temperature**, both
+      checked for repetition collapse and for NaN/Inf. See the F4 bullet above;
+      **the flip is rejected.** Every numeric perturbation is labelled **exact**
+      (every pragma arm: 0 of 33 491 072 bytes differ; `passes0`: 0 of 512 tokens
+      at every context and both temperatures) or **bounded-ulp** (the compile-time
+      chain arms: worst normalised difference 6.6e-4, which is the reassociation and
+      nothing else), never both. The chain arms are measurement-only and are not
+      proposed for shipping.
+
+### Still open after round 3
+
+* **24k decode (OQ8).** Untouched. Three prior invalid samples.
+* **The key-split flash decode** (`BQ=2` with the key axis split and a combine
+  pass) is the only lever this round's measurements leave standing. Unbuilt. It is
+  the difference between "AC2 needs 86% of peak" being a number and being an
+  observation.
+* **AC2 is not shown reachable, and is not shown unreachable.** What round 3
+  changes is the *shape* of the problem: 88% of the budget is already at 81% of
+  the tensor peak, and the remaining 12% has to absorb a 3.8x cut on a component
+  measured at 21% of peak with two fragment loads per MMA.

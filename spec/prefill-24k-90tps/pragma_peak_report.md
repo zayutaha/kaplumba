@@ -19,6 +19,8 @@
 | **T5** | §22's ablation measured a deoptimised loop | 🟢 **REFUTED for §22** | the harness's own scaffold, compiled with every arm inactive, is **bit-identical and x0.995** of the shipping kernel. §22 measured the shipping kernel |
 | **T6** | "16 accumulator chains is the one lever left" (§23.6) | 🔴 **dead twice over** | compile-time 2 and 4 chains are **x1.001 / x0.994**. Chain count was never the mechanism; §22's arms 11/12 used a *runtime* selector on a rolled loop and so created no ILP at all |
 | **T7** | `MMA_TOLERANCE = 0.02` is 9.3x looser than AC5 and enforced nothing | ✅ **closed** | tightened to **3e-3** against the test's own measured worst (2.16e-3). The old gate needed a **3%** error to fail; the new one fails at **0.5%** |
+| **T8** | F4: `workgroups` costs "1 greedy token in 1 536", so flip the default | 🔴 **the number is wrong where it was never measured** | at 8 204 tokens (a context the evidence does not cover) it is **434 of 476 greedy tokens from token 39, reproduced in two runs**, and it stops 36 tokens early. Under `--temperature 0.7` the same arm does not diverge at all — **the two legs disagree**, so the effect is **not characterised**. **The flip is rejected**, not deferred |
+| **T9** | N1: prefill passes are NEUTRAL, measured at 16 394 | ✅ **now also at 24 602, with a control** | r1: `onedispatch` **66.829** vs `pass8192` **67.051**, both VALID (+0.33%). r2's control was discarded by the memory gate so r2 is unusable — one valid pair in two attempts, which is the honest rate for 24k on this box |
 
 ---
 
@@ -585,10 +587,163 @@ asserted. Evidence: `pragma_peak_evidence/mma_tolerance_sabotage.log`,
 
 ---
 
+## T8 — the quality gate, and the F4 flip it rejects
+
+The brief's standing gate is **byte-identical greedy text against base `f2b2da1`
+for the default configuration**, plus ≥512-token generations at temperature 0 and
+at a sampling temperature, checked for repetition collapse.
+
+**The default configuration is byte-identical by construction: no product kernel
+changed.** `git diff crates/kernels/` is empty across all three commits of this
+round. So the gate, applied to what ships, passes trivially and no quality budget
+was spent to establish it.
+
+**The gate was then spent on what it actually gates: the proposed flip.** F4
+recommended making `workgroups` the default on a quality cost of "1 greedy token
+in 1 536" across contexts 1 024 / 4 096 / 16 394. Round 3 measured the contexts
+that evidence does not cover.
+
+`scripts/bench_split_rule_quality.sh`, 512 tokens, `--show-ids`, arms interleaved
+per context, plus a replicate of the 8k leg. Greedy is `temperature 0 seed 1234`;
+the sampled leg is `temperature 0.7 seed 20260905`.
+
+| context | temperature | `workgroups` | `splits13` | `passes0` |
+|---|---|---|---|---|
+| 2 048 | 0 | **0 / 512** | 0 / 512 | **0 / 512** |
+| 2 048 | 0.7 | **0 / 512** | 0 / 512 | **0 / 512** |
+| 8 204 | **0** | **434 / 476, from token 39** | 56 / 512, from token 454 | **0 / 512** |
+| 8 204 | **0.7** | **0 / 512** | 308 / 490, from token 174 | **0 / 512** |
+| 8 204 (replicate) | **0** | **434 / 476, from token 39** | — | **0 / 512** |
+
+### The 8k greedy result reproduces to the token
+
+Same first divergence (token 39), same generated length (476), same differing
+count (434), in a separate run of the harness. And the arm stops **36 tokens
+early** — a different *length*, not a different wording, which no argmax-flip
+lottery accounts for.
+
+### The two temperature legs disagree, and that is the finding
+
+Under greedy, `workgroups` at 8 204 diverges at token 39 and diverges nowhere
+else. Under sampling it does not diverge at all. Two hypotheses fit:
+
+* the rule's perturbation is small and the greedy 8k case hit a genuine near-tie
+  early in a long self-reinforcing generation, or
+* the perturbation is real and the sampled 8k run happened not to reach it.
+
+**Neither leg is representative**, and the experiment as designed cannot separate
+them: one 512-token sample per (context, temperature) at two contexts. The honest
+output is a **characterisation of where the rule is safe** (2 048 and 16 394:
+byte-identical) **and a finding that it is not safe at 8 204** — not a scalar.
+
+**So the effect is not characterised, and the recommendation inverts.** §24.4 said
+"Recommended: flip, but it is not free, and it is not done here", trading a +2%
+decode win against 1 token in 1 536. The gate requires byte-identical greedy text
+against base for the default configuration, and the rule is **not** byte-identical
+under greedy at 8 204 in two runs out of two. **The flip is rejected.**
+
+### What the gate confirmed
+
+* **`passes0` is EXACT**, on generated text: **0 differing tokens in 512** at every
+  context and both temperatures, byte-identical bodies, and reproduced at 8 204.
+  F3's claim holds and now rests on generated text at four (context, temperature)
+  points rather than on the kernel-level tests alone.
+* **`splits13` remains numerically sensitive**, as §24.2 calibrated it: 56/512
+  greedy and 308/490 sampled at 8 204.
+* **The structural argument is untouched** — the sliding ring caps 50 of 60 layers
+  at 16 splits either way, so the rule reaches 10. That is arithmetic from the
+  code, and it is why `workgroups` and `splits13` differ at all.
+
+### Repetition and NaN
+
+`scripts/check_repetition.sh`, distinct n-gram ratio, on all 16 streams:
+
+| | lowest `distinct_16` |
+|---|---|
+| shipped arms, greedy | 1.0000 (2 048) / 1.0000 (8 204) |
+| shipped arms, sampled | 0.9577 (2 048) / 0.9819 (8 204) |
+| any arm under test | **0.9474** (8 204 `splits13`, sampled) |
+| the harness's collapsed control | 0.0092 |
+
+**No collapse anywhere**, and no NaN/Inf: a non-finite logit is a hard
+`SamplerError`, so a 512-token generation that completed cannot contain one.
+Evidence: `pragma_peak_evidence/quality_gate/`.
+
+### Perturbation labels, as the brief requires
+
+| quantity | label |
+|---|---|
+| every `#pragma unroll` arm vs the shipping kernel | **exact** — 0 of 33 491 072 output bytes differ, at 8 192 and 24 576 keys, `BQ=1` and `BQ=2` |
+| §22's ablation scaffold, every arm inactive | **exact** — 0 bytes differ, x0.995 |
+| `spin` positive control | **exact** — 0 bytes differ |
+| compile-time `chains2` / `chains4` | **bounded-ulp** — worst normalised difference 6.6e-4, which is the dot-product reassociation and nothing else; measurement-only arms, not proposed for shipping |
+| the default configuration vs base `f2b2da1` | **exact by construction** — no product kernel changed |
+
+Nothing is labelled both.
+
+### A note on the harness's own positive control
+
+`passes0` at 2 048 tokens and at 16 394 tokens is the instrument's own control in
+this sweep: it is byte-identical at every context and both temperatures, which is
+what a working harness reads like. At 8 204 the `splits13` arm diverging at token
+454 (greedy) and 174 (sampled) is the contrast that shows the harness *can* see a
+difference. **Without that contrast the `workgroups` 0/512 rows would have been
+unfalsifiable**, which is the same failure §22.5 and §10.3 record.
+
+---
+
+## T9 — the N1 24k control, at last
+
+`adversary_report2.md` A9: the committed 24k evidence
+(`adversary_evidence/n1_pass_ab_24k.tsv`) has `onedispatch` marked
+`INVALID-NO-NUMBER` and only `pass8192` surviving at 68.401 tok/s. **A discarded
+control and a surviving treatment cannot support a null**, so "N1 is NEUTRAL" was
+established at 16 394 tokens while this spec is about 24 590.
+
+Re-run, `scripts/bench_prefill_passes.sh`, 24 590-key prompt = 24 602 tokens,
+`--max-new-tokens 1`, per-arm poll files, 2 interleaved rounds:
+
+| round | arm | `pass_keys` | prefill tok/s | footprint | verdict |
+|---|---|---|---|---|---|
+| r1 | `onedispatch` | 0 | **66.829** | 17.04 GiB | **VALID** |
+| r1 | `pass8192` | 8192 | **67.051** | 17.14 GiB | **VALID** |
+| r2 | `onedispatch` | 0 | — | 17.09 GiB | **INVALID** (`unused-dropped-to-0.04GiB`, limit 0.05) |
+| r2 | `pass8192` | 8192 | 67.794 | 17.15 GiB | VALID |
+
+**Round 1 is a valid interleaved A/B with both arms VALID: +0.33%.** The control
+the committed evidence lacked now exists, and it is not faster. Round 2's control
+was discarded, so round 2 is unusable — **one valid pair in two attempts**, which
+is the honest rate for 24k measurement on this box (OQ5, not OQ8), and it is the
+same failure mode as the evidence it replaces.
+
+**How strong is the null?** Weaker than the 16k leg, and quoted with that said:
+0.33% against a *single* valid round, versus 16k's three rounds at 0.30-0.84%
+spread with a positive control (`KAPLUMBA_SCALAR_ATTENTION=1`, -16.6%) in its own
+session. One valid pair at 0.33% is consistent with "no effect" and with "an
+effect below 0.33%", and cannot separate them. **What it establishes is the thing
+A9 asked for: the 24k claim has a control arm.**
+
+**F3's decision does not depend on this.** The default is one dispatch because a
+mechanism with no measured benefit should not be a *default* — a default is a
+claim — and because `passes0` is byte-identical, which the gate above re-confirms
+on generated text. A null at 24k strengthens that; it is not what it rests on.
+
+Evidence: `adversary_evidence2/n1_pass_ab_24k_r3.tsv`,
+`pragma_peak_evidence/n1_24k_*.log`.
+
+---
+
 ## What is NOT established
 
 * **24k decode (OQ8).** Untouched. Three prior invalid samples; a fourth would
-  be a fourth invalid one.
+  be a fourth invalid one. Note that round 3's own 24k *prefill* sweep lost one
+  control arm of two to the memory gate, which is the same class of problem and
+  is why the 24k N1 result is a single valid pair rather than three.
+* **The `workgroups` rule's effect is not characterised.** 0/512 at 2 048 and at
+  16 394, 434/476 at 8 204, and the two temperature legs disagree about 8 204.
+  That is a reason to reject the flip, not a description of the rule. The
+  experiment that would characterise it is a context sweep at both temperatures,
+  and it should run before anyone argues about the gate.
 * **F8's end-to-end benefit.** §26's 2.5-4.9% is a kernel-level number from the
   §22 harness, which T5 shows measured a bit-identical kernel -- so the number
   stands, but it is still not end-to-end.

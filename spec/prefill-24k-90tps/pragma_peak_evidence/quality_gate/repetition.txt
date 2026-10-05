@@ -1,0 +1,83 @@
+=== repetition, distinct n-gram ratio (scripts/check_repetition.sh) ===
+--- temperature 0, seed 1234
+spec/prefill-24k-90tps/pragma_peak_evidence/quality_gate/t0_2048_passes0.ids  tokens=512
+  distinct_4   0.9352  (509 windows, 476 unique)
+  distinct_8   0.9960  (505 windows, 503 unique)
+  distinct_16  1.0000  (497 windows, 497 unique)
+  distinct_32  1.0000  (481 windows, 481 unique)
+spec/prefill-24k-90tps/pragma_peak_evidence/quality_gate/t0_2048_shipped.ids  tokens=512
+  distinct_4   0.9352  (509 windows, 476 unique)
+  distinct_8   0.9960  (505 windows, 503 unique)
+  distinct_16  1.0000  (497 windows, 497 unique)
+  distinct_32  1.0000  (481 windows, 481 unique)
+spec/prefill-24k-90tps/pragma_peak_evidence/quality_gate/t0_2048_splits13.ids  tokens=512
+  distinct_4   0.9352  (509 windows, 476 unique)
+  distinct_8   0.9960  (505 windows, 503 unique)
+  distinct_16  1.0000  (497 windows, 497 unique)
+  distinct_32  1.0000  (481 windows, 481 unique)
+spec/prefill-24k-90tps/pragma_peak_evidence/quality_gate/t0_2048_workgroups.ids  tokens=512
+  distinct_4   0.9352  (509 windows, 476 unique)
+  distinct_8   0.9960  (505 windows, 503 unique)
+  distinct_16  1.0000  (497 windows, 497 unique)
+  distinct_32  1.0000  (481 windows, 481 unique)
+spec/prefill-24k-90tps/pragma_peak_evidence/quality_gate/t0_8204_passes0.ids  tokens=512
+  distinct_4   0.8900  (509 windows, 453 unique)
+  distinct_8   0.9802  (505 windows, 495 unique)
+  distinct_16  1.0000  (497 windows, 497 unique)
+  distinct_32  1.0000  (481 windows, 481 unique)
+spec/prefill-24k-90tps/pragma_peak_evidence/quality_gate/t0_8204_shipped.ids  tokens=512
+  distinct_4   0.8900  (509 windows, 453 unique)
+  distinct_8   0.9802  (505 windows, 495 unique)
+  distinct_16  1.0000  (497 windows, 497 unique)
+  distinct_32  1.0000  (481 windows, 481 unique)
+spec/prefill-24k-90tps/pragma_peak_evidence/quality_gate/t0_8204_splits13.ids  tokens=512
+  distinct_4   0.9175  (509 windows, 467 unique)
+  distinct_8   0.9861  (505 windows, 498 unique)
+  distinct_16  1.0000  (497 windows, 497 unique)
+  distinct_32  1.0000  (481 windows, 481 unique)
+spec/prefill-24k-90tps/pragma_peak_evidence/quality_gate/t0_8204_workgroups.ids  tokens=476
+  distinct_4   0.8837  (473 windows, 418 unique)
+  distinct_8   0.9403  (469 windows, 441 unique)
+  distinct_16  0.9675  (461 windows, 446 unique)
+  distinct_32  1.0000  (445 windows, 445 unique)
+--- temperature 0.7, seed 20260905
+spec/prefill-24k-90tps/pragma_peak_evidence/quality_gate/t07_2048_passes0.ids  tokens=512
+  distinct_4   0.6228  (509 windows, 317 unique)
+  distinct_8   0.8139  (505 windows, 411 unique)
+  distinct_16  0.9577  (497 windows, 476 unique)
+  distinct_32  0.9896  (481 windows, 476 unique)
+spec/prefill-24k-90tps/pragma_peak_evidence/quality_gate/t07_2048_shipped.ids  tokens=512
+  distinct_4   0.6228  (509 windows, 317 unique)
+  distinct_8   0.8139  (505 windows, 411 unique)
+  distinct_16  0.9577  (497 windows, 476 unique)
+  distinct_32  0.9896  (481 windows, 476 unique)
+spec/prefill-24k-90tps/pragma_peak_evidence/quality_gate/t07_2048_splits13.ids  tokens=512
+  distinct_4   0.6228  (509 windows, 317 unique)
+  distinct_8   0.8139  (505 windows, 411 unique)
+  distinct_16  0.9577  (497 windows, 476 unique)
+  distinct_32  0.9896  (481 windows, 476 unique)
+spec/prefill-24k-90tps/pragma_peak_evidence/quality_gate/t07_2048_workgroups.ids  tokens=512
+  distinct_4   0.6228  (509 windows, 317 unique)
+  distinct_8   0.8139  (505 windows, 411 unique)
+  distinct_16  0.9577  (497 windows, 476 unique)
+  distinct_32  0.9896  (481 windows, 476 unique)
+spec/prefill-24k-90tps/pragma_peak_evidence/quality_gate/t07_8204_passes0.ids  tokens=512
+  distinct_4   0.8291  (509 windows, 422 unique)
+  distinct_8   0.9208  (505 windows, 465 unique)
+  distinct_16  0.9819  (497 windows, 488 unique)
+  distinct_32  1.0000  (481 windows, 481 unique)
+spec/prefill-24k-90tps/pragma_peak_evidence/quality_gate/t07_8204_shipped.ids  tokens=512
+  distinct_4   0.8291  (509 windows, 422 unique)
+  distinct_8   0.9208  (505 windows, 465 unique)
+  distinct_16  0.9819  (497 windows, 488 unique)
+  distinct_32  1.0000  (481 windows, 481 unique)
+spec/prefill-24k-90tps/pragma_peak_evidence/quality_gate/t07_8204_splits13.ids  tokens=490
+  distinct_4   0.7864  (487 windows, 383 unique)
+  distinct_8   0.8778  (483 windows, 424 unique)
+  distinct_16  0.9474  (475 windows, 450 unique)
+  distinct_32  1.0000  (459 windows, 459 unique)
+spec/prefill-24k-90tps/pragma_peak_evidence/quality_gate/t07_8204_workgroups.ids  tokens=512
+  distinct_4   0.8291  (509 windows, 422 unique)
+  distinct_8   0.9208  (505 windows, 465 unique)
+  distinct_16  0.9819  (497 windows, 488 unique)
+  distinct_32  1.0000  (481 windows, 481 unique)

@@ -380,8 +380,18 @@ fn the_guard_is_exact_on_a_moving_max() {
     // difference is the QK dot product's reassociation growing with input magnitude,
     // which is not N3. Testing scale 32 against the scalar arm would fail on that,
     // not on the guard. The guard's exactness rests on `the_guard_is_load_bearing`
-    // (the arithmetic) and on the sabotage in `the_guard_is_load_bearing`'s sibling
-    // `a_misfiring_guard_is_caught`, where it reads 0.2136 -- 43x the tolerance.
+    // (the arithmetic). A misfiring-guard control exists and is **manual**, not a
+    // test: it removes the `if (msv == 1.0f) { continue; }` from
+    // `attention.metal`, rebuilds, and reads 0.2136 -- 43x this file's tolerance.
+    // That number is recorded in `spec/prefill-24k-90tps/implementation_notes.md`
+    // 26, which also carries the measured 2.5-4.9% the guard is worth. There is
+    // deliberately **no test named `a_misfiring_guard_is_caught`** and there
+    // never was: this comment used to cite one, so a reader would grep the name,
+    // find nothing, and have to re-derive that the control was run by hand.
+    // (Round 3, `adversary_report2.md` A7: delete the citation rather than
+    // re-describe it. An in-tree equivalent would need the sabotage to travel in a
+    // uniform field, which costs a runtime branch through the hot path on every
+    // dispatch in exchange for a number that is already recorded.)
     let fx = Fixture::new();
     for scale in [1.0f32, 2.0, 4.0] {
         let case = fx.case_with(1024, 4096, 0, ValueTable::Scaled(scale));
