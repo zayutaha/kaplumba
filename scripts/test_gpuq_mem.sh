@@ -309,7 +309,7 @@ GPUQ_BIN="$STUB2" KAPLUMBA_BIN="$STUBBIN" LOG="$LOG2" \
 if [ ! -s "$LOG2" ]; then
   echo "  FAIL: positive control wrote no log at all"; cat "$TD/out2" 2>/dev/null; fail=1
 elif grep -qE 'splits1 1 .* VALID' "$LOG2"; then
-  echo "  ok   healthy box dispatched the arm   $(grep -m1E ' VALID' "$LOG2" | cut -c1-96)"
+  echo "  ok   healthy box dispatched the arm   $(grep -m 1 -E ' VALID' "$LOG2" | cut -c1-96)"
 else
   echo "  FAIL: healthy box did not dispatch a VALID arm"; cat "$LOG2"; fail=1
 fi
@@ -329,6 +329,52 @@ if [ -e "$SENTINEL" ]; then
   echo "  FAIL: harness ran the model on a box it could not parse"; fail=1
 else
   echo "  ok   harness did not run the model on an unparseable box"
+fi
+
+# F9: the `LOG=` alias must be honoured by ALL THREE sweep harnesses, not just the
+# one f2b2da1 happened to fix. That commit added `SUMMARY=${LOG:-...}` to
+# bench_decode_splits.sh only, and left the identical defect live in
+# bench_prefill_passes.sh (`$OUTDIR/summary.tsv`) and scorecard.sh
+# (`$OUTDIR/scorecard.tsv`), so a caller passing `LOG=` wrote an empty file and the
+# numbers went somewhere else -- which is how the adversary lost a run.
+#
+# Two independent checks, because either alone is weak:
+#   (a) static: no harness may hard-code its summary path;
+#   (b) end-to-end: with a healthy stub gpuq + stub binary, each harness must create
+#       the file named by `LOG=`. (b) is the one that matters -- (a) can be
+#       satisfied by a comment, and a check that can be satisfied by a comment is
+#       not a check.
+echo "== F9: LOG= is honoured by all three sweep harnesses =="
+for h in bench_decode_splits bench_prefill_passes scorecard; do
+  if grep -nE '^[[:space:]]*SUMMARY="\$OUTDIR/' "scripts/$h.sh" >/dev/null 2>&1; then
+    echo "  FAIL $h hard-codes SUMMARY=\$OUTDIR/... (LOG= would be ignored)"
+    grep -nE '^[[:space:]]*SUMMARY="\$OUTDIR/' "scripts/$h.sh" | sed 's/^/        /'
+    fail=1
+  fi
+done
+[ "$fail" -eq 0 ] && echo "  ok   no harness hard-codes its summary path"
+# Reset so a static failure above cannot be masked by a passing end-to-end arm.
+LOGDRIFT="$TD/log_drift"; rm -f "$LOGDRIFT"
+GPUQ_BIN="$STUB2" KAPLUMBA_BIN="$STUBBIN" LOG="$LOGDRIFT" \
+  MIN_UNUSED_GIB=4 MAXNEW=1 POLL_SECS=1 ROUNDS=1 OUTDIR="$TD/logdrift" \
+  scripts/bench_prefill_passes.sh 64 32 > "$TD/out3" 2>&1 || true
+if [ ! -s "$LOGDRIFT" ]; then
+  echo "  FAIL bench_prefill_passes.sh wrote nothing at LOG= (wrote $TD/logdrift/summary.tsv instead?)"
+  cat "$TD/out3" 2>/dev/null | sed 's/^/        /'
+  fail=1
+else
+  echo "  ok   bench_prefill_passes.sh honours LOG=  $(grep -m 1 -E ' VALID( |$)' "$LOGDRIFT" | cut -c1-88)"
+fi
+LOGSC="$TD/log_scorecard"; rm -f "$LOGSC"
+GPUQ_BIN="$STUB2" KAPLUMBA_BIN="$STUBBIN" LOG="$LOGSC" \
+  MIN_UNUSED_GIB=4 MAXNEW=1 POLL_SECS=1 ROUNDS=1 OUTDIR="$TD/scdrift" CONTEXTS="64:1" \
+  scripts/scorecard.sh > "$TD/out4" 2>&1 || true
+if [ ! -s "$LOGSC" ]; then
+  echo "  FAIL scorecard.sh wrote nothing at LOG= (wrote $TD/scdrift/scorecard.tsv instead?)"
+  cat "$TD/out4" 2>/dev/null | sed 's/^/        /'
+  fail=1
+else
+  echo "  ok   scorecard.sh honours LOG=            $(grep -m 1 -E ' VALID( |$)' "$LOGSC" | cut -c1-88)"
 fi
 
 [ "$fail" -eq 0 ] && echo "ALL PASS" || echo "FAILURES PRESENT"

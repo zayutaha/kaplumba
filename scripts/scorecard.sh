@@ -41,7 +41,15 @@ MAXNEW=${MAXNEW:-32}
 CONTEXTS=${CONTEXTS:-"614:8 8192:32 16384:32"}
 
 mkdir -p "$OUTDIR"
-SUMMARY="$OUTDIR/scorecard.tsv"
+# `LOG` is accepted as an alias for the summary path, because that is the name the
+# other harnesses and scripts/test_gpuq_mem.sh use. Without it a caller passing
+# `LOG=` silently gets the summary in OUTDIR and nothing where it asked -- which is
+# exactly how F9 happened: f2b2da1 fixed this in bench_decode_splits.sh only, and
+# the same defect stayed live in this file and in bench_prefill_passes.sh. Do not
+# remove the `${LOG:-...}` form from any of the three harnesses;
+# scripts/test_gpuq_mem.sh has a check (F9) that fails if any of them hard-codes
+# the summary path again.
+SUMMARY=${LOG:-$OUTDIR/scorecard.tsv}
 : > "$SUMMARY"
 
 run_one() { # <label> <keys> <max_new> <round> <env...>

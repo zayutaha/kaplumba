@@ -35,7 +35,14 @@ shift || true
 PROMPT=$(printf 'Explain the theory of relativity. %.0s' $(seq 1 "$(( KEYS / 6 ))"))
 
 mkdir -p "$OUTDIR"
-SUMMARY="$OUTDIR/summary.tsv"
+# `LOG` is accepted as an alias for the summary path, because that is the name the
+# other harnesses and scripts/test_gpuq_mem.sh use. Without it a caller passing
+# `LOG=` silently gets the summary in OUTDIR and nothing where it asked -- which is
+# exactly how F9 happened: f2b2da1 fixed this in bench_decode_splits.sh only, and
+# the same defect stayed live in this file and in scorecard.sh. Do not remove the
+# `${LOG:-...}` form from any of the three harnesses; scripts/test_gpuq_mem.sh has a
+# check (F9) that fails if any of them hard-codes the summary path again.
+SUMMARY=${LOG:-$OUTDIR/summary.tsv}
 : > "$SUMMARY"
 
 run_arm() { # <label> <pass_keys> <round>
