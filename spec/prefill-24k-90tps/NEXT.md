@@ -338,7 +338,8 @@ between arms. Full suite: 116 binaries ok, 4 failed, all four verified at base
 * **The sliding-ring reason** (`key_count = min(position, 1024)`) written down for
   the first time, which is what actually makes the `workgroups` flip a 10-layer
   change rather than a 60-layer one.
-* **The rescale guard is worth 4.9%**, measured in the same sweep (F8). §17.1
-  argued exactness only; it is a real 5% and it stays.
+* **The rescale guard is worth 2.5-4.9%**, measured in the same sweep across six shapes (F8).
+  It is a real few percent, not an unmeasured optimisation. §17.1 argued exactness
+  only; it now has a number too.
 * **What is still missing**: a mechanism for the MMA issue rate. Every lever that
   follows from the measured split is negative (§22.3, §23.5).

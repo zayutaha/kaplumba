@@ -2305,18 +2305,36 @@ second half is the specific trap: `if (tid < 256u) { return; }` in a 256-thread
 kernel looks like "a quarter of the threads" to anyone who has not checked the
 dispatch. It is the whole kernel.
 
-### 22.6 The knob is reverted
+### 22.6 The knob is reverted, and the harness goes with it
 
-`AttentionParams::ablate`, `attention_ablate_arm()`, `set_attention_ablation_arm()`
-and the nine gated regions in `attention.metal` are **TEMPORARY and are removed
-again** once the campaign is recorded. Carrying a runtime branch through the hot
-path to keep an instrument alive is the same category of mistake as the
-unmeasured guard (F8): it costs a uniform load and a branch per region on every
-dispatch in exchange for numbers that are already in
-`fixer_evidence/f1_ablation/`. What survives is the *harness*
-(`attention_flash_ablation_arms`, which asserts the pipeline and interleaves) and
-the *rule*. If the ablation is ever needed again, re-add the field first and make
-`arm 1` read ~0.2 ms before believing anything else.
+`AttentionParams::ablate`, `attention_ablate_arm()`,
+`set_attention_ablation_arm()`, the nine gated regions in `attention.metal` **and
+`attention_flash_ablation_arms` itself** are removed again, in the commit that also
+lands F3. Keeping a runtime branch through the hot path to preserve an instrument is
+the same category of mistake as F8's unmeasured guard, pointed the other way: it
+costs a uniform load and a compare per region on every dispatch in exchange for
+numbers that are already in `fixer_evidence/f1_ablation/`. And a harness that calls
+a setter which no longer exists does not compile, so "keep the harness, drop the
+knob" was never available.
+
+**What survives is the rule, the evidence and the commit.**
+
+> **If the flash body ever needs ablating again: re-add the field first, and make
+> arm 1 read ~0.2 ms before believing any other arm.** The whole of §10's mistake
+> was a positive control that was available, cheap, and not run. The harness is
+> recoverable with
+> `git show 1a30427 -- crates/engine/tests/attention_qk_mma_bench.rs`
+> and the uniform field from the same commit; §22.2 lists the arms it defines.
+
+Two things from the campaign are worth keeping even without the harness, because
+they are about *reading* numbers rather than about taking them:
+
+* **Cross-run drift on this box is ~14% on an unmodified kernel** (1143.6 / 1201.3 /
+  1302.5 ms for one geometry). Only within-run ratios are comparable, and every
+  table in §22 and §26 is one run.
+* **The arms must sum.** Arm 2 (no QK, x2.26) and arm 3 (no PV, x1.68) plus a ~4%
+  residual add to 1.00. If they do not, the arms are not measuring what their labels
+  say — which is exactly the failure that produced §9 and §10.
 
 ---
 
@@ -2417,7 +2435,7 @@ End-to-end numbers are in §23.6.
 
 ---
 
-## 26 — F8: the `msv == 1` rescale guard is worth 4.9%, so it stays
+## 26 — F8: the `msv == 1` rescale guard is worth 2.5-4.9%, so it stays
 
 §17.1 justified this guard on **exactness alone**:
 

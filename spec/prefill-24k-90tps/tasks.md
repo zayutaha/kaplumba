@@ -704,15 +704,19 @@ Durable technical record: `implementation_notes.md` §22 (F1) and §23 (F5).
 
 | # | finding | status | commit | where |
 |---|---|---|---|---|
-| **F1** | OQ7 answered; §10's ablation never reached the kernel; §10.2 #3 wrong | ✅ **FIXED** — instrument built, §9.1/§9.1b/§9.2/§10.2/§12.2/OQ7 corrected, cost split measured | `1a30427` (+ revert) | §22 |
+| **F1** | OQ7 answered; §10's ablation never reached the kernel; §10.2 #3 wrong | ✅ **FIXED, and worse than reported** — §10's `tid < 256u` was an **empty** kernel (256 threads/group) that read 964.79 ms while an empty body costs **0.19 ms**; §9.1/§9.1b/§9.2/§10.2/§12.2/OQ7 corrected; the cost split is now measured | `1a30427` (knob reverted in `8b00add`) | §22 |
 | **F2** | `PREFILL_PASS_MIN_GROUPS` gate is dead code | ✅ already fixed by the previous instance; the production-path test is committed | `a909028` | — |
-| **F3** | "default unchanged" is false; three documents disagree | ✅ **FIXED** — see below | (this commit) | §25 |
-| **F4** | the `workgroups` flip's quality evidence cannot fail | ✅ **FIXED** — measured at 1024/4096/16 394 tokens of context, where the two rules actually differ | (this commit) | §24 |
-| **F5** | AC2 arithmetic wrong by ~1.7x; AC2 may be unreachable | ✅ **FIXED** — re-derived; the o_proj lead killed; the ceiling stated honestly | (this commit) | §23 |
+| **F3** | "default unchanged" is false; three documents disagree | ✅ **FIXED** — the default is now **one dispatch**; §16.4's 64 MiB argument is **void**; the cost is host-side submission overhead (+48.7% of the inter-boundary gap); it is **exact** on generated text | `8b00add` | §25 |
+| **F4** | the `workgroups` flip's quality evidence cannot fail | ✅ **FIXED** — **1 token in 1 536** across three contexts above the 896 boundary; the shipped "43 of 128" is **calibrated, not dismissed** (it is the 35% perturbation of a config that is *not* the rule); flip recommended, **not made** | `a4df8eb` | §24 |
+| **F5** | AC2 arithmetic wrong by ~1.7x; AC2 may be unreachable | ✅ **FIXED** — re-derived; the o_proj lead killed; **five** levers built and measured, four negative; the ceiling stated honestly | `a4df8eb` (BQ), `8b00add` | §23 |
 | **F6** | "a third independent reproduction" | ✅ already withdrawn by the previous instance | `8a3d411` | — |
 | **F7** | filed crash | ✅ already withdrawn by the previous instance | `1d47bf8` | — |
-| **F8** | rescale guard: exact, never measured, control not in the tree | ✅ **FIXED** — **measured worth 4.9%**, so kept; the guard is *not* an unmeasured optimisation | `1a30427` (arm 9) | §26 |
+| **F8** | rescale guard: exact, never measured, control not in the tree | ✅ **FIXED** — **measured worth 2.5–4.9%** across six shapes, so it stays, now on a measurement rather than on an IEEE-754 argument | `1a30427` (arm 9), `a4df8eb` (§26) | §26 |
 | **F9** | `LOG=` honoured in 1 of 3 harnesses | ✅ already fixed by the previous instance | `caf3631` | — |
+
+**Commits this pass:** `1a30427` (F1 + the temporary instrument) → `a4df8eb` (F4, F8, two
+new harnesses, `fixer_report.md`) → `8b00add` (F3, the F5 BQ refutation, the knob's
+removal, the sabotage checks).
 
 ## F1 — the ablation instrument, and what it cost to be without one ✅
 

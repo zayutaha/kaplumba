@@ -140,14 +140,23 @@ does not read ~0.2 ms the sweep is meaningless), and arms 2 and 3 must sum with 
 three claims I make about *other* things, and each moves the instrument by more than
 the per-round spread (arms 11 and 12 show it resolves 0% too).
 
-### The temporary knob is reverted
+### The temporary knob is reverted, and the harness goes with it
 
-`AttentionParams::ablate`, the three accessors and the nine gated regions are
-removed again in a follow-up commit. Keeping a runtime branch through the hot path
-to preserve an instrument is the same category of mistake as F8's unmeasured
-guard, pointed the other way. What survives is the harness, the evidence, and the
-rule: **if the ablation is ever needed again, re-add the field first and make
-arm 1 read ~0.2 ms before believing anything else.**
+`AttentionParams::ablate`, the three accessors, the nine gated regions **and
+`attention_flash_ablation_arms` itself** are removed again in `8b00add`. Keeping a
+runtime branch through the hot path to preserve an instrument is the same category
+of mistake as F8's unmeasured guard, pointed the other way; and a harness that calls
+a setter which no longer exists does not compile, so "keep the harness, drop the
+knob" was never on the table.
+
+**What survives is the rule, the evidence and the commit** (`git show 1a30427`).
+Re-add the field first if the flash body ever needs ablating again, and make **arm 1
+read ~0.2 ms** before believing any other arm: the whole of §10's mistake was a
+positive control that was available, cheap and not run. Two reading rules from the
+campaign survive too — cross-run drift here is ~14% on an unmodified kernel, so only
+within-run ratios are comparable; and the arms must sum (arm 2 at x2.26 plus arm 3 at
+x1.68 plus ~4% residual is 1.00), because if they do not, the arms are not measuring
+what their labels say.
 
 ---
 
@@ -590,7 +599,9 @@ is its ranking failure showing up again** — the fifth independent confirmation
 (§8.7, §9.4, §11, and now `BQ=1` vs `BQ=2` against §8.2's E2E −2.0%/−6.2%). The
 threshold is not worth changing: there is no win on either side of it.
 
-### The one experiment still standing that the tensor rate depends on the **number of independent
+### The one experiment still standing
+
+`mma_peak.rs` records that the tensor rate depends on the **number of independent
 accumulator chains** and not on the loads (1 chain 5.75, 8 chains 7.65, 16 chains
 15.49 TFLOPS) — and that an *array* of 32 made the compiler spill and collapse to
 0.74. Arms 11/12 split the QK chain 2 and 4 ways and gained nothing, which suggests
@@ -721,3 +732,55 @@ belongs to whoever owns the bound, with the measured 2.1603e-3 in hand.
 (F3), one source comment (F4's magnitude), and the temporary uniform field that
 existed only for the F1/F8 measurements and has been removed. No GEMM, sampler or
 attention arithmetic was touched.
+---
+
+## What this pass could not do, and what it deliberately did not do
+
+**Not done: the `workgroups` default flip.** Recommended, with 1 536 tokens of
+evidence across three contexts above the 896 boundary — and not made, because this
+spec's own quality gate demands byte-identical greedy text against base for the
+*default* configuration and a flip by construction changes 1 token in 1 536.
+Whoever wants the +1.55-2.17% should amend the gate first, in writing.
+
+**Not done: changing any acceptance target.** `spec.md`'s AC1/AC2 are untouched.
+F5 changed the *arithmetic* that AC2 rests on and gave the honest ceiling, which is
+the deliverable; whether to move the target is the user's call and the brief
+explicitly reserved it.
+
+**Not done: tightening `MMA_TOLERANCE`.** `linear_metal.rs:888` gates at 0.02 while
+`spec.md` states a 2.16e-3 budget, so the budget is enforced by nothing. Reported,
+not fixed — tightening a tolerance is a tuning action and this pass changed no
+numerics.
+
+**Not done: 24k decode.** AC1 is still unmeasurable on this box (OQ8). This pass
+touched the decode *split rule's* quality, not decode performance, and did not
+attempt a 24k decode sample: three attempts have already produced invalid ones and
+a fourth would have been a fourth invalid one.
+
+**Not done: the full test suite.** The adversary flagged that "116 binaries ok" is
+unverified and that it could not rule out collateral damage from the 112 it skipped.
+The diff here touches shared `.metal` (now reverted to byte-identical — `git diff
+crates/kernels/src/attention.metal` is empty), one `usize` constant, one doc comment
+and five test files. I ran the five suites that could be affected (17 + 8 + 8 + 4 +
+4, all passing) plus `linear_metal` (7/7). **That is not the same as the whole
+suite**, and the honest reading of "no regressions" here is "no regressions in the
+suites that touch what changed".
+
+**Could not do: explain the MMA stall.** This is the real limit of the pass. §22
+localised it to `simdgroup_multiply_accumulate` issue on this operand shape — 88% of
+the kernel — and eliminated four candidate mechanisms by measurement (memory,
+dependency chain, register pressure, occupancy). It did not explain it, and §23.6
+names the one experiment that might: **16 named scalar accumulator chains in the QK
+loop**, written the way `mma_peak.rs` writes them. `mma_peak.rs` records 5.75 TFLOPS
+at 1 chain, 7.65 at 8 and 15.49 at 16, and the flash kernel issues QK through one
+chain per tile; arms 11/12 split it 2 and 4 ways and gained nothing, which is more
+consistent with "the compiler kept them serial" than with "ILP does not matter".
+That is a day's experiment and it is the only lever still standing.
+
+**And the ceiling, stated once more, plainly.** AC2 asks for attention at 46% of
+tensor peak. The flash kernel is at 12%. Two independently written attention kernels
+in this same file both land at ~1.9 TFLOP/s, which is what makes "this is the shape's
+rate on this hardware" more likely than "this is a bug in one kernel". The 88%/12%
+split now tells you exactly where the time is, and every lever that follows from it
+is negative. **The recommendation is a target change or a rewrite, and the target
+change is the user's decision, not this pass's.**
