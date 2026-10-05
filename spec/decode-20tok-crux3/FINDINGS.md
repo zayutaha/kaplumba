@@ -94,9 +94,17 @@ this is measured, not argued:**
 2. **Even when the weights *are* made SRAM-resident, the kernel does not speed
    up.** `spec/decode-19tok-repacked-250gb` arm (d) folded the column footprint
    from 2.6 GB to a **129 KB L2-resident window, keeping every load and address →
-   −0.6%.** That is the direct test of "hit SRAM more": it is neutral. The GEMV
-   is **ALU/issue-bound**, not memory-bound (`MEMORY.md`: ~8:1 ALU:memory;
-   `decode-3bpw-amplification`).
+   ≈1% (`−0.8%` in `ROUND1-2-SUMMARY.md`, `+0.6%` in the 250gb rescue; the sign
+   is noise).** That is the direct test of "hit SRAM more": it is neutral. The
+   GEMV is **ALU/issue-bound**, not memory-bound (`MEMORY.md`: ~8:1 ALU:memory;
+   `decode-3bpw-amplification`), and the wall is the per-code extraction
+   (`decode_state_mcg` + the funnel shift), not the memory system.
+3. **A LUT cannot rescue it either.** Replacing `decode_state_mcg` with a
+   2^16-entry table is bit-exact, but the rows are ~29.3e9 pseudo-random 16-bit
+   windows per token; a 2-byte gather pulls a 32-byte cache line, so the table
+   traffic is ~16x its useful bytes — hundreds of GB/token of L2 sector traffic
+   *on top of* the 12.058 GB of DRAM. It trades an ALU wall for a worse memory
+   wall. Not built, and not worth building.
 
 So caching cannot help the weights, because the kernel is not waiting on memory
 in the first place. The only place SRAM could help is by **moving ALU work into
@@ -129,6 +137,26 @@ Today is ~14.2 at 2k and ~12.3 at 16k.
 3. **Fuse element-wise chains** (post_ffn_out, post_attn_pre_ffn_transform,
    norm_transform ≈ 1.9 ms/step in 1,080 dispatches).
 
+## 7b. The one real, unwired lever: the device sampler (temp>0 only)
+
+`spec/device-sampler` built the device-side top-k + draw kernels (`sample_topk_blocks`,
+`sample_draw` in `elements.metal`) but **T3 — wiring them into the pipelined loop —
+was never done** (`tasks.md`: T0–T2 checked, T3–T5 open). So at the shipped default
+`--temperature 1.0 --top-k 64` — exactly the configuration this goal names —
+`chat.rs:388` still gates the 1-deep pipeline on `self.greedy`, and the loop falls
+into a **barrier-per-token** host-sampler path.
+
+Measured here, interleaved at 2k, 64 tokens, same seed:
+
+| config | decode tok/s |
+|---|---:|
+| `--temperature 0` (greedy, pipelined) | **14.741 / 14.763** |
+| `--temperature 1 --top-k 64` (host sampler) | 8.025 / **14.208** |
+
+≈**+3.8% on the reported metric**, and the true wall-clock gap is larger because
+`--metrics`' decode bracket excludes the sampler (`generate.rs:383`). Real, legal,
+bit-exact on the greedy path — but it is ~4%, not 40%.
+
 ## 8. Target decision this folder cannot make
 
 20 tok/s **at 16k** is above the memory pins by 4.3% and is not reachable by any
@@ -136,3 +164,8 @@ kernel, cache scheme, or dispatch shape. The honest options are (a) retire the
 20 @16k target and pursue the ~17 ceiling, or (b) lift one of the standing
 restrictions (KV quantization, or verified speculation) deliberately. Recorded,
 not changed unilaterally.
+
+**Nothing in the above depends on the memory system being slow.** The decode
+cannot hit 20 @16k because 14.239 GB of bytes must cross a 273 GB/s bus in under
+50 ms, and 14.239 / 0.050 = 284.8 > 273. Faster kernels change *how close to the
+bus* the step runs; they cannot raise the bus.
