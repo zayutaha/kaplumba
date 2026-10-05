@@ -1662,8 +1662,11 @@ impl AttentionKernels {
     /// row unconditionally.
     ///
     /// Returns `false` without touching the encoder when this shape is not
-    /// eligible (see [`prefill_pass_count`]), so the caller falls back to the
-    /// one-dispatch dispatch and nothing is half-encoded.
+    /// eligible, so the caller falls back to the one-dispatch dispatch and nothing
+    /// is half-encoded. Eligibility is **exactly** [`prefill_pass_count`] >= 2 and
+    /// this function calls it (F2): before that, the grid gate was documented on
+    /// this function and applied nowhere, so `prefill_pass_count` had no production
+    /// caller and its tests tested a dead function.
     pub fn encode_online_attention_passes(
         &self,
         encoder: &mut crate::encoder::MetalEncoder,
@@ -1671,13 +1674,42 @@ impl AttentionKernels {
         block: usize,
         state: &Buffer,
     ) -> Result<bool, KernelError> {
+        let pass_keys = prefill_pass_keys_for(request.key_count);
+        // F2 (adversary_report.md): the grid gate was documented here and was not
+        // applied here. This function forwarded straight to `_explicit`, whose own
+        // comment claimed "the production caller applies [the gate] through
+        // encode_online_attention_passes" -- it did not, so `prefill_pass_count`
+        // had no production caller and the production path sliced grids as small as
+        // 20 threadgroups (the last chunk of a 16 394-token prompt: 10 queries x 4
+        // kv heads at BQ=2). The gate tests in
+        // `attention_prefill_pass_bit_exact.rs` exercised a function nothing called.
+        //
+        // The gate is applied HERE, where the claim lives, and it is applied by
+        // calling `prefill_pass_count` rather than by re-deriving the condition, so
+        // the tested function and the production function cannot drift apart again.
+        let passes = prefill_pass_count(
+            request.queries_count,
+            request.kv_heads,
+            request.key_count,
+            request.head_dim,
+            if request.q_heads == 0 {
+                0
+            } else {
+                request.q_heads / request.kv_heads.max(1)
+            },
+            block,
+            self.prefill_pass_available(),
+        );
+        if passes < 2 {
+            return Ok(false);
+        }
         Self::encode_online_attention_passes_explicit(
             self,
             encoder,
             request,
             block,
             state,
-            prefill_pass_keys_for(request.key_count),
+            pass_keys,
         )
     }
 
@@ -1686,10 +1718,12 @@ impl AttentionKernels {
     /// fighting the `KAPLUMBA_PREFILL_PASS_KEYS` `OnceLock` cache, and so a test
     /// can bypass the grid gate to exercise shapes production never takes.
     ///
-    /// `pass_keys` is honoured as given: the eligibility gate is
-    /// [`prefill_pass_count`]'s, and a caller that wants a chain regardless of the
-    /// grid size is asking for something production never asks for, which is
-    /// exactly what a correctness test wants.
+    /// `pass_keys` is honoured as given, and the grid-size gate
+    /// (`PREFILL_PASS_MIN_GROUPS`) is **deliberately not** applied here. This is a
+    /// test tool; the production entry point [`Self::encode_online_attention_passes`]
+    /// applies the gate itself, by calling [`prefill_pass_count`], so a caller that
+    /// wants a chain regardless of grid size is asking for something production
+    /// never asks for -- which is exactly what a correctness test wants.
     pub fn encode_online_attention_passes_explicit(
         &self,
         encoder: &mut crate::encoder::MetalEncoder,
@@ -1725,9 +1759,10 @@ impl AttentionKernels {
         let groups = q_heads / kv_heads;
         // Eligibility: the shape must have a pass kernel, and the key range must
         // actually need more than one pass. The grid-size gate
-        // (`PREFILL_PASS_MIN_GROUPS`) belongs to `prefill_pass_count`, which the
-        // production caller applies through `encode_online_attention_passes`;
-        // the `_explicit` entry point is a test tool and deliberately skips it.
+        // (`PREFILL_PASS_MIN_GROUPS`) is NOT applied here -- see the doc comment on
+        // this function. `encode_online_attention_passes` (the production entry
+        // point) applies it by calling `prefill_pass_count` before forwarding here
+        // (F2).
         if !self.prefill_pass_available() || !flash_supported(head_dim, groups) {
             return Ok(false);
         }
