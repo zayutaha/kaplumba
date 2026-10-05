@@ -225,3 +225,150 @@ kernel `flock`. Two concurrent instances exceed physical memory: measured 3.9 Gi
 of swap and a collapse to 1.4 tok/s, which invalidates every benchmark. Check
 `scripts/gpuq status`, then `try`; **exit 75 = busy, retry later**. Never
 bypass. Never block for 30 minutes.
+
+## AGENT LOOP CONVENTION (user directive 2026-10-05)
+
+Running `spec/prefill-24k-90tps` to completion via sequential subagents:
+implementer -> adversary -> fixer -> repeat. **The main thread does not do the
+work.**
+
+- **Subagents run on `opencode/big-pickle`, not Space Bunny.** Big Pickle is free
+  on input/output/cache, so it does not burn the Space Bunny quota we would
+  otherwise rate-limit on. Every `subagent` call therefore passes
+  `model: "opencode/big-pickle"`.
+- **The main thread stays `opencode/space-bunny-free`** and is switched back to it
+  explicitly once the loop is done. Note: **no opencode config sets a `model`
+  key**, so "switch back" = drop the `model` override on the call and the
+  session default applies. Nothing to restore in a config file.
+  Caveat: `~/.config/opencode/opencode.json` is **invalid JSON** (truncated,
+  missing its opening brace) and is being ignored; `opencode.jsonc` is valid but
+  near-empty. Fix that file before trying to pin a model in config.
+- **Every agent must write its findings down in a spec file**, not just report
+  them into the conversation. `implementation_notes.md` for implementers,
+  `adversary_report.md` for the adversary. A claim that exists only in a chat
+  transcript is lost.
+
+## QUALITY GATE — "100% coherent" (user directive 2026-10-05)
+
+Non-negotiable for any change under `spec/prefill-24k-90tps`. AGENTS.md §8 already
+forbids quality loss; this makes it measurable.
+
+**The existing gate is too weak.** `scripts/refprompts.sh` is 5 short factual
+prompts at `--max-new-tokens 96`, temperature 0. Five 96-token answers to "what is
+the capital of France" **cannot** detect long-form degeneration: repetition
+collapse, loop-fixation, drift over a reasoning chain, or entropy loss. Treat it
+as a *necessary but not sufficient* regression check.
+
+Required gate before any of this work is called done:
+
+1. **Byte-identical text vs base `b92234f`**, default build — not merely
+   "identical between the two arms of the same build", which is a much weaker
+   claim (it cannot catch a change that moved the numerics for both arms).
+2. **Long generation**: >=512 tokens at temperature 0, plus >=512 at a sampling
+   temperature. Look for repetition collapse and loop-fixation explicitly, not
+   just "it produced text".
+3. **No NaN/Inf** anywhere in logits or hidden state.
+4. Worst normalised GEMM error **<= 2.16e-3** (must not worsen).
+5. Every numeric perturbation explained as either *exact* or *bounded ulp*, with
+   the bound stated. "Bit-exact" and "changes by one ulp" must never appear in the
+   same claim about the same path.
+
+### Known numeric risks already on the table (2026-10-05)
+
+- **N1 prefill key passes**: `spec.md` calls it "bit-exact" AND says an unaligned
+  pass boundary "changes the output by one fp16 ulp on ~1% of outputs". Those
+  contradict. The ulp is in the **opt-in** path only (`KAPLUMBA_PREFILL_PASS_KEYS=0`
+  is the default), so the default is expected clean — but the wording must be
+  corrected, and the boundary invariant ("pass boundaries must land on tile
+  boundaries") must be *enforced*, not just documented.
+- **N4 decode splits 16 -> 13**: changing the split count changes the **combine
+  order** of the online-softmax partials, so it changes float reduction order and
+  is **inherently NOT bit-exact**. Shipped opt-in
+  (`KAPLUMBA_DECODE_SPLIT_RULE=workgroups`), default unchanged. Flipping the
+  default therefore puts byte-identical output at risk and needs an explicit,
+  measured waiver — not a silent default change.
+- **N3(a) rescale guard** claims *exact*. Verify rather than trust.
+- **Unfixed crash** (found by the implementer, pre-existing, reproduce on base):
+  "A ball is thrown straight up..." dies with `Metal command buffer failed
+  (unlabelled)` at `--max-new-tokens >= 32` and passes at 16. This is itself a
+  coherence failure and sits inside what AC5 exercises.
+
+## NEXT GOAL: 20 tok/s PURE DECODE (user directive 2026-10-05, after the
+## prefill-24k-90tps loop and the decode split fix)
+
+**Target: >= 20 tok/s decode at 16k context. PURE decode only.**
+
+Hard constraints, non-negotiable:
+- **NO speculative decoding.** No drafters, no MTP, no Medusa/Eagle, no
+  lookahead, no multi-token speculation. Note the branch is `mtp-speculation`,
+  so MTP machinery exists — it must be OFF and stay off for this goal.
+- **NO lookup tricks.** No prompt/n-gram lookup, no retrieval, no caching of
+  generated text, no "reuse the previous step's output".
+- Every token executes the full 60-layer forward.
+- **NO quality loss.** Greedy output must stay byte-identical. No KV cache
+  quantization (AGENTS.md §8). No lossy requantization. Same quality gate as
+  above: byte-identical vs base, >=512-token generations, no NaN/Inf.
+
+### THE PROBLEM: 20 tok/s is at or over the measured hardware ceiling
+
+The user's arithmetic "250 / 11 = 22.5" uses **250 GB/s**. That number is
+**explicitly disputed inside this repo** — it is a row in `spec/decode-19tok/spec.md`'s
+own table marked *"(disputed)"*.
+
+What has actually been **measured** on this box:
+
+| source | measured streaming rate | bytes/token | implied ceiling |
+|---|---|---|---|
+| `spec/decode-19tok` | **220 GB/s** | 13.145 GB | **16.7 tok/s** |
+| `spec/decode-20tps` | **203 GB/s** | 11.834 GB | **17.2 tok/s** |
+
+AGENTS.md §8's "273 GB/s" is the **theoretical** figure, and both specs say so
+("273 GB/s is arithmetic and the measured ceiling is ~220 GB/s"). Note the two
+specs also **disagree on bytes/token** (13.145 vs 11.834) — that discrepancy is
+unreconciled and must be settled before any roofline argument is trusted.
+
+So 20 tok/s needs **either a higher sustained streaming rate than has ever been
+measured here, or fewer bytes per token, or both.** It is not reachable by
+"rewriting the kernel" alone unless the rate lever exists.
+
+### The two questions that decide it (already framed in spec/decode-19tok)
+
+1. **Is 220 GB/s a bandwidth wall or a REQUEST-RATE wall?** Evidence it may be
+   the latter: bandwidth is **flat from 8 to 32 bytes in flight per thread**,
+   the signature of a limit on requests issued rather than bytes moved. The sweep
+   only reached 20,480 threads; **the device allows 81,920.** This is the single
+   highest-value open question and it is cheap. If it is a request-rate wall,
+   raising occupancy raises the ceiling and 20 tok/s comes back into range.
+2. **Must we move 13.145 GB/token?** At 220 GB/s every GB/token deleted is worth
+   ~4.5 ms (~0.6 tok/s). This lever does not depend on question 1. Candidate:
+   `spec/decode-19tok-repacked-250gb` (repacked weight layout).
+
+### Immovable bytes at 16k
+
+KV traffic sits ON TOP of the weights/token and cannot be reduced, because KV
+quantization is forbidden. At 16k, from this config (60 layers; 50 sliding with
+window 1024 / 16 kv heads / head_dim 256; 10 full with 4 global kv heads /
+global_head_dim 512), KV read per token is roughly **2.18 GB** — about **15% on
+top of the weight bytes**. Any 16k roofline must add it; a roofline quoted at
+weights-only understates bytes/token by ~15% and overstates tok/s by the same.
+
+### Process note
+
+AGENTS.md §2 requires a clarification interview and a `spec/<name>/{spec,plan,tasks}.md`
+before implementation. Do not start this on a one-line brief — the ceiling
+question above must be answered first, because it decides whether the target is
+even real.
+
+### MODEL FALLBACK (added 2026-10-05)
+
+- Default: subagents run on **`opencode/big-pickle`** (free on input/output/cache,
+  so it does not burn Space Bunny quota).
+- **If Big Pickle fails, stalls, returns a truncated/empty result, or its limit is
+  exhausted → relaunch the same task on `opencode/space-bunny-free`.** Do not wait
+  and do not stall the loop; the point is that the work completes. Falling back
+  spends the quota we were trying to conserve, which is the correct trade against
+  an idle loop.
+- A subagent returning an obvious provider error / rate-limit message is itself the
+  signal to switch. Do not interpret a provider failure as "the task is hard" or
+  as a finding.
+- The **main thread** stays `opencode/space-bunny-free` throughout.
