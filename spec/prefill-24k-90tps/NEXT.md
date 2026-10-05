@@ -204,11 +204,21 @@ between arms. Full suite: 116 binaries ok, 4 failed, all four verified at base
    invariant (§16.2): unaligned pass edges change the output by one fp16 ulp,
    10x inside the tolerance every other attention test here uses.
 3. **N4, the decode split sweep** (`d956e68`). The optimum is **13, not the shipped
-   16**, and `decode_one_wave_workgroups(256)/kv_heads = 54/4 = 13` predicts it — a
-   third independent reproduction of the rule `spec/decode-19tok` derived. Worth
-   **+2.17% decode @16k**, and the gain grows with context. Available as
+   16**, and `decode_one_wave_workgroups(256)/kv_heads = 54/4 = 13` predicts it.
+   Worth **+2.17% decode @16k**, and the gain grows with context. Available as
    `KAPLUMBA_DECODE_SPLIT_RULE=workgroups`; the default flip is one line and is not
    made here.
+
+   **F6 correction: this is a *reproduction*, not a third *independent*
+   reproduction.** `spec/decode-19tok` §2 read the budget of 54 off one sweep of
+   three shapes, and its `kv_heads = 4 → 13` row **is** the number this session
+   re-measured. The shapes that would make `budget / kv_heads` a rule rather than a
+   fit (`kv_heads` 5 and 6 → 10 and 9, built by holding `q_heads / kv_heads = 8`
+   and varying `kv_heads`) **are not in Gxma and have never been re-measured on
+   this machine**. The claim that survives, and is what the decision should rest
+   on, is that 13 is a **real wave boundary**: an interleaved 8-arm curve is
+   monotone rising to 13 and **cliffs −1.5% at 14** (13 → 52 workgroups, 14 → 56,
+   and 54 is one wave / 55 is two), recovering only to −0.9% at 16.
 4. **N5, the OQ5 gate** (`d6683a6`, `086073b`). Green, and the honest finding is
    negative: **a good run and a stalled run print the same memory numbers on this
    box** (a 626-token run at 100.9 tok/s reads 9.47 GiB compressor / 0.09 GiB

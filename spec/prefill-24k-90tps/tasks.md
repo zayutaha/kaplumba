@@ -561,8 +561,13 @@ those layers do not use the MMA kernel at all, so the question cannot arise here
 **Why 13, and why the shipped default is 16.** `decode_one_wave_workgroups(256) =
 54` and `54 / kv_heads(4) = 13` — the measured maximum, predicted by a rule
 `spec/decode-19tok` derived and swept on three shapes (`kv_heads` 4/5/6 → 13/10/9),
-bracketed from both sides (54 is one wave, 55 is two). **Third independent
-reproduction of 13.** The shipped default is 16 only because
+bracketed from both sides (54 is one wave, 55 is two). **Third reproduction of 13 —
+but NOT an independent one (F6): `kv_heads = 4 → 13` is the row the budget of 54
+was read off, so re-measuring it is a re-confirmation of the derivation case. The
+out-of-sample shapes (`kv_heads` 5, 6) are not in Gxma and have not been
+re-measured here.** The claim that does survive independently is that 13 is a wave
+boundary: an interleaved 8-arm curve is monotone to 13 and cliffs −1.5% at 14 (52
+vs 56 workgroups against a 54 budget). The shipped default is 16 only because
 `decode_split_rule()` returns `ThreadTarget`, whose arithmetic
 `16384 / (32 * q_heads) = 16` comes from a *thread* budget with nothing to do with
 workgroup residency.

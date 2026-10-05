@@ -227,9 +227,15 @@ Additional for this spec:
   context.** An interleaved 3-round sweep of `KAPLUMBA_DECODE_SPLITS` at 8204
   tokens with the MMA decode kernel gives 7.882 / 10.125 / 11.732 / 12.626 /
   **12.917** / 12.776 tok/s at splits 1 / 2 / 4 / 8 / **13** / 16, with effect arms
-  at ±0.05%. `decode_one_wave_workgroups(256) / kv_heads = 54 / 4 = 13` predicts the
-  measured maximum — a third independent reproduction of the rule
-  `spec/decode-19tok` derived and swept on three shapes. The shipped default is 16
+  at ±0.05%. `decode_one_wave_workgroups(256) / kv_heads = 54 / 4 = 13` matches the
+  measured maximum. **This is a third *reproduction*, not a third *independent*
+  one (F6): `spec/decode-19tok` §2 read the budget of 54 off one sweep of three
+  shapes, and `kv_heads = 4 → 13` is the row it was read off. The out-of-sample
+  shapes that make the rule a rule rather than a fit (`kv_heads` 5 and 6 → 10 and 9)
+  are not in Gxma and have not been re-measured here.** What *is* solid is the
+  maximum itself: an interleaved 8-arm curve is monotone rising to 13 and **cliffs
+  −1.5% at 14** (13 → 52 workgroups, 14 → 56, and 54 is one wave / 55 is two), so
+  13 is a real wave boundary. The shipped default is 16
   only because `decode_split_rule()` returns `ThreadTarget`, whose
   `16384 / (32 * q_heads) = 16` comes from a *thread* budget unrelated to
   workgroup residency. Confirmed at 16 394 tokens: **+2.17% decode** (12.067 →

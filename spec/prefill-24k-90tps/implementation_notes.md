@@ -1697,8 +1697,27 @@ is not the binding constraint, and probing above it would measure nothing.**
 measured maximum. That rule was implemented and swept in `spec/decode-19tok` and
 reproduced the optimum for three shapes (`kv_heads` 4/5/6 → 13/10/9), with the
 workgroup-count transition bracketed from both sides (54 is one wave, 55 is two,
-`attention.rs:583-594`). **This is now an independent third reproduction of 13, on
-different hardware state and with a different decode kernel.**
+`attention.rs:583-594`). **This is a third reproduction of 13, on different
+hardware state and with a different decode kernel — and it is NOT an independent
+one (F6, `adversary_report.md`).** `spec/decode-19tok` §2 read the budget of 54
+off **one** sweep of three shapes, and `kv_heads = 4 -> 13` **is the row the
+budget was read off**. Re-measuring the `kv_heads = 4` maximum here is therefore
+a re-confirmation of the derivation case, not an out-of-sample prediction of a
+rule. What makes the rule a rule rather than a fit to the 4-kv-head number is the
+*other two* shapes (`kv_heads` 5 and 6 → 10 and 9, built by holding
+`q_heads / kv_heads = 8` and varying `kv_heads`), and **neither of those shapes
+exists in Gxma and neither has been re-measured by anyone on this machine.**
+Recorded so the next reader does not credit this result with evidence it does not
+carry.
+
+**The optimum itself is solid, and for a reason that does not depend on the
+independence question.** The adversary's own interleaved 8-arm curve at 8 204
+tokens (8/10/11/12/13/14/16 + shipped) is monotone rising to 13 and **cliffs
+−1.5% at 14**, recovering only to −0.9% at 16, with round-to-round repeatability
+of 0.03–0.15%. 13 is 52 workgroups and 14 is 56, and 54/4 = 13 vs 14/4 = 14 → 56 >
+54, the documented two-wave boundary. So the maximum is a real wave boundary, not
+a point fit — which is the claim that matters for the decision, and it does not
+need the rule's out-of-sample shapes to be re-measured.
 
 The reason the shipped default is 16 and not 13 is a one-line default, not a
 calculation: `decode_split_rule()` returns `DecodeSplitRule::ThreadTarget`
@@ -1717,8 +1736,12 @@ calculation: `decode_split_rule()` returns `DecodeSplitRule::ThreadTarget`
 riding along on a sweep whose purpose was to answer a different question, and
 flipping a shipped default on the strength of a rule that has never been the default
 is exactly the move that `spec/decode-19tok` presumably declined to make for
-whatever reason it declined. The evidence for the change is now three independent
-measurements and it is written down; the decision is one line and belongs to whoever
+whatever reason it declined. The evidence for the change is now three
+measurements of the `kv_heads = 4` maximum — one of them (`decode-19tok` §2) the
+derivation itself, so this is a re-confirmation rather than an independent
+reproduction; see §18.3 for what does and does not follow from that. What the
+evidence does support is written down and is a wave boundary, not a fit. The
+decision is one line and belongs to whoever
 owns the shipping default. `KAPLUMBA_DECODE_SPLIT_RULE=workgroups` already ships it
 as an opt-in, so the claim is testable today without a rebuild.
 
