@@ -1,0 +1,104 @@
+--- box state (start) ---
+    PhysMem: 7837M used (3070M wired, 302M compressor), 16G unused.
+    total = 4096.00M  used = 2448.31M  free = 1647.69M  (encrypted)
+    parsed 'unused': 16.0 GB ; kaplumba-shaped processes resident: 0
+=== crux_bandwidth: 6 GB working set, 9 interleaved rounds, 4 passes/buffer ===
+device Apple M4 Pro ; max threads per threadgroup = 1024
+filling and faulting in 6 GB ...
+done; non-repeating fill verified (512 sampled lines, 0 duplicates)
+
+--- GATE: equal bytes, equal order, equal checksum ---
+  stream_u1      checksum 0xb9ed0c01  (reference)
+  stream_u2      checksum 0xb9ed0c01  MATCH
+  stream_u4      checksum 0xb9ed0c01  MATCH
+  stream_u4_u2   checksum 0xb9ed0c01  MATCH
+  stream_u4_u4   checksum 0xb9ed0c01  MATCH
+  stream_u4_u8   checksum 0xb9ed0c01  MATCH
+  stream_u4_u16  checksum 0xb9ed0c01  MATCH
+
+--- SABOTAGE: halve the element count, checksum must change ---
+  full 0xb9ed0c01 vs half 0x30712ab6 -> detected. The instrument has teeth.
+
+
+--- IS THIS DRAM? pass 1 vs pass 2 over the same bytes ---
+  pass 1 244.9 GB/s, pass 2 248.3 GB/s, ratio 1.014
+  pass 2 is not faster than pass 1 (1.014x), so the working set exceeds cache and the sweep below is DRAM traffic.
+
+=== AXIS A: occupancy (uint4 loads, tg=256, bytes in flight per thread fixed) ===
+  threads     median       best      worst    spread    GB/s @6GB waves@81920
+     2560      126.1      126.2      125.9     1.00x        126.1      0.03
+     5120      220.2      223.9      212.7     1.05x        220.2      0.06
+    10240      237.6      240.0      236.8     1.01x        237.6      0.12
+    20480      253.6      254.6      252.3     1.01x        253.6      0.25
+    30720      244.0      245.2      242.0     1.01x        244.0      0.38
+    40960      250.0      251.5      249.2     1.01x        250.0      0.50
+    61440      246.6      247.5      238.2     1.04x        246.6      0.75
+    81920      248.9      249.6      246.6     1.01x        248.9      1.00
+   122880      244.0      245.1      236.9     1.03x        244.0      1.50
+   163840      246.6      247.6      246.1     1.01x        246.6      2.00
+   245760      246.6      248.4      245.4     1.01x        246.6      3.00
+
+  best median on axis A: 253.6 GB/s
+  20,480 -> 81,920 threads: -1.8%   (the sweep decode-19tok never ran)
+  min median at >=20,480 threads = 244.0 GB/s; spread across that region = 1.04x
+
+=== AXIS B/C at full occupancy (81,920 threads, tg=256) ===
+arm                  B/load  in-flight     median    spread vs stream_u4 requests/GB
+CONTROL_repeat           16         16      247.8     1.01x         0.1%       62.5
+CONTROL_tg512            16         16      248.2     1.04x         0.3%       62.5
+stream_u1                 4          4      222.5     1.03x       -10.1%      250.0
+stream_u1_u4              4         16      178.7     1.01x       -27.8%      250.0
+stream_u1_u8              4         32      163.6     1.02x       -33.9%      250.0
+stream_u2                 8          8      245.6     1.02x        -0.8%      125.0
+stream_u4                16         16      247.6     1.02x         0.0%       62.5
+stream_u4_u16            16        256      208.0     1.03x       -16.0%       62.5
+stream_u4_u2             16         32      238.9     1.01x        -3.5%       62.5
+stream_u4_u4             16         64      237.7     1.02x        -4.0%       62.5
+stream_u4_u8             16        128      237.6     1.02x        -4.0%       62.5
+
+  requests/GB is in millions. stream_u1_u4 has the SAME bytes in flight as stream_u4 but 4x the requests.
+
+=== NOISE FLOOR ===
+  identical arms (stream_u4 vs CONTROL_repeat): +0.09% of median
+  same work, tg 256 -> 512 (CONTROL_tg512)  : +0.27% of median
+  stream_u2          -0.79%  MEASURABLE
+  stream_u4_u2       -3.50%  MEASURABLE
+  stream_u4_u4       -3.99%  MEASURABLE
+  stream_u4_u8       -4.02%  MEASURABLE
+  stream_u1         -10.14%  MEASURABLE
+  stream_u4_u16     -15.99%  MEASURABLE
+  stream_u1_u4      -27.81%  MEASURABLE
+  stream_u1_u8      -33.93%  MEASURABLE
+  arms whose difference from stream_u4 is WITHIN the noise floor (|d| <= 0.09%), i.e. indistinguishable: []
+  (none: every arm moved more than the instrument's own repeat spread)
+
+=== AXIS S: independent address streams (81,920 threads, uint4) ===
+  streams     median       best      worst    spread  vs 1 stream
+        1      232.7      234.2      231.1     1.01x         0.0%
+        2      233.1      233.9      229.8     1.02x         0.2%
+        4      235.5      236.5      232.8     1.02x         1.2%
+        8      234.4      236.9      233.3     1.02x         0.7%
+       16      231.9      234.0      231.1     1.01x        -0.4%
+       32      225.4      227.7      223.1     1.02x        -3.2%
+       64      222.5      224.2      219.9     1.02x        -4.4%
+
+=== VERDICT INPUT: best sustained streaming GB/s on this box ===
+  best median across every arm : 253.6 GB/s
+  median of all arm medians     : 237.7 GB/s
+  as % of the 273 GB/s wire peak: 92.9% / 87.1%
+
+  arms at or below the 273 GB/s wire peak: 29 of 29
+  usable best  : 253.6 GB/s (92.9% of wire peak)
+  usable median: 237.6 GB/s (87.0% of wire peak)
+  top-half median of usable arms: 246.6 GB/s (90.3% of wire peak)  <- the number to use
+--- box state (end) ---
+    PhysMem: 13G used (8900M wired, 304M compressor), 10G unused.
+    total = 4096.00M  used = 2440.31M  free = 1655.69M  (encrypted)
+    parsed 'unused': 10.0 GB ; kaplumba-shaped processes resident: 0
+
+--- SABOTAGE-FILL: the historical tiled buffer ---
+  guard: 384 of 512 sampled lines are duplicates -> REJECTED (as it must be)
+  tiled 256 MiB: pass 1 217.1 GB/s, pass 2 125.2 GB/s (ratio 0.577)
+  a tiled buffer re-reads the same addresses on pass 2, so whatever the ratio comes out as, the traffic is not compulsory. The load is L2/L3-served by construction, whatever the timer says.
+  honest 256 MiB: pass 1 127.9 GB/s, pass 2 218.5 GB/s (ratio 1.708)
+  the honest fill is rejected by neither guard. Note that at 256 MiB the ratio is not a clean discriminator on its own — the cache is big enough that even unique content partly survives, and pass 2 is 1.708x. The guard that detects the defect unambiguously is the duplicate-line check (384/512 duplicates, above); the pass ratio is corroboration at 6 GB, not a standalone test.
