@@ -293,6 +293,172 @@ fn attention_arm_throughput_at_prefill_geometry() {
     }
 }
 
+/// F1 (spec/prefill-24k-90tps): the flash-body ablation, with the control §10.3
+/// records as never having been run.
+///
+/// `attention_arm_throughput_at_prefill_geometry` was used four times to
+/// attribute the flash kernel's cost and produced a table in which deleting the
+/// QK and PV *instructions* moved nothing. The adversary showed that table
+/// cannot be right: an `if (true) { return; }` at the top of the same body, at
+/// the same grid and in the same binary, costs **0.19 ms** against 920 ms -- so
+/// the body is 4 800x of the cost and §10's arms retired 256 threads instead.
+///
+/// This test sweeps the ablation arms carried in `params.ablate`, so **one
+/// build times every arm** and every arm is the same binary, the same Metal
+/// library, the same buffers and the same grid as arm 0. Arms are interleaved
+/// (`0 1 2 ... 0 1 2 ...`) rather than run one-after-another, so a clock or
+/// thermal drift cannot masquerade as an arm difference.
+///
+/// Per §10.2 #4 it also prints `flash_attention_available()` and the pipeline
+/// function name for the arm, because a `.metal` edit that fails to compile
+/// falls back to the MMA kernel *silently* and the bench would print the label
+/// it was asked for rather than the kernel it got.
+#[test]
+fn attention_flash_ablation_arms() {
+    use kaplumba_kernels::attention::set_attention_ablation_arm;
+    let Some(fx) = Fixture::new() else {
+        return;
+    };
+    assert!(
+        fx.kernels.flash_attention_available(),
+        "F1: the flash pipeline did not compile. Without it every arm below would \
+         silently be measuring the MMA kernel, which is exactly the failure §10.2 #4 \
+         warns about."
+    );
+    const ROUNDS: usize = 5;
+    // arm -> (label, what it removes)
+    const ARMS: &[(u32, &str, &str)] = &[
+        (0, "baseline", "nothing"),
+        (1, "empty body", "EVERYTHING (the control §10.3 never ran)"),
+        (2, "no QK", "QK MMAs + kf/qf loads (sth still published as 0)"),
+        (3, "no PV MMAs", "PV MMAs + af/bf loads"),
+        (4, "no softmax", "exp/simd_sum/simd_max (wq, msb still written)"),
+        (5, "K frag fixed row", "nothing; the K device path (same instruction)"),
+        (6, "V frag fixed row", "nothing; the V device path (same instruction)"),
+        (7, "qf hoisted", "the per-tile qstage load (also the candidate fix)"),
+        (8, "K+V fixed rows", "nothing; every fragment load L1-resident, MMAs kept"),
+        (9, "rescale guard off", "F8: the `msv == 1` guard; arm 0 minus arm 9 IS its benefit"),
+        (11, "QK 2 chains", "nothing; 2 independent QK accumulator chains (ILP)"),
+        (12, "QK 4 chains", "nothing; 4 independent QK accumulator chains (ILP)"),
+        (13, "qf/af fixed addr", "nothing; the per-tile threadgroup loads, L1-resident"),
+        (14, "no qf/af load", "nothing; zero Q/P fragment loads, MMAs kept"),
+    ];
+    // `ABL_ARMS=0,2,7` restricts the sweep. The full ten-arm sweep over three
+    // shapes is ~18 minutes because arm 1 and arm 7 are 6 000x and 2x apart; a
+    // follow-up arm does not need the whole battery re-timed.
+    let wanted: Option<Vec<u32>> = std::env::var("ABL_ARMS").ok().map(|raw| {
+        raw.split(',')
+            .filter_map(|s| s.trim().parse::<u32>().ok())
+            .collect()
+    });
+    for (shape, key_count, queries_count) in [
+        (FULL, 24576usize, 1024usize),
+        (FULL, 24576, 4096),
+        (FULL, 8192, 1024),
+    ] {
+        let kv = key_count * shape.kv_heads * shape.head_dim;
+        let queries = queries_count * shape.q_heads * shape.head_dim;
+        let queries_buf = fx.row(queries, 3.0);
+        let keys_buf = fx.row(kv, 11.0);
+        let values_buf = fx.row(kv, 29.0);
+        let query_positions: Vec<u32> = (0..queries_count as u32)
+            .map(|i| key_count as u32 + i)
+            .collect();
+        let key_positions: Vec<u32> = (0..key_count as u32).collect();
+        let query_positions_buf = fx.u32(&query_positions);
+        let key_positions_buf = fx.u32(&key_positions);
+        let out = fx.device
+            .new_buffer((queries * 2) as u64, MTLResourceOptions::StorageModeShared);
+        let request = AttentionEncodeRequest {
+            queries: &queries_buf,
+            keys: &keys_buf,
+            values: &values_buf,
+            query_positions: &query_positions_buf,
+            key_positions: &key_positions_buf,
+            output: &out,
+            queries_count,
+            q_heads: shape.q_heads,
+            kv_heads: shape.kv_heads,
+            head_dim: shape.head_dim,
+            key_count,
+            scale: 1.0,
+            window: shape.window,
+        };
+        let flops = (queries_count * shape.q_heads * key_count * shape.head_dim * 4) as f64;
+        println!(
+            "\n=== F1 flash ablation: {} keys={key_count} queries={queries_count} \
+             ({:.2} GFLOP/iter) ===",
+            shape.name,
+            flops / 1e9
+        );
+        println!("flash_attention_available = {}", fx.kernels.flash_attention_available());
+        // Both query blocks: production selects BQ=2 at key_count >= 16384
+        // (`FLASH_QUERY_BLOCK_MIN_KEYS`), so 24576 must be reported for both.
+        for block in [1usize, 2] {
+            let mut samples: Vec<Vec<f64>> = vec![Vec::new(); ARMS.len()];
+            for round in 0..ROUNDS {
+                for (index, (arm, label, _)) in ARMS.iter().enumerate() {
+                    if let Some(ref list) = wanted {
+                        if !list.contains(arm) {
+                            continue;
+                        }
+                    }
+                    set_attention_ablation_arm(*arm);
+                    // One untimed warm per arm per round so first-touch and the
+                    // shader cache cannot land on whichever arm is measured first.
+                    {
+                        let mut enc = MetalEncoder::new(&fx.queue).expect("encoder");
+                        fx.kernels
+                            .encode_online_attention_qk_block(
+                                &mut enc, request, AttentionQk::Flash, block,
+                            )
+                            .expect("warm");
+                        enc.commit_and_wait().expect("wait");
+                    }
+                    let t0 = std::time::Instant::now();
+                    let mut enc = MetalEncoder::new(&fx.queue).expect("encoder");
+                    fx.kernels
+                        .encode_online_attention_qk_block(
+                            &mut enc, request, AttentionQk::Flash, block,
+                        )
+                        .expect("encode");
+                    enc.commit_and_wait().expect("wait");
+                    let ms = t0.elapsed().as_secs_f64() * 1e3;
+                    samples[index].push(ms);
+                    if round == 0 && index == 0 {
+                        println!("  (BQ={block}) arm {arm} = {label}: {ms:.3} ms");
+                    }
+                    let _ = label;
+                }
+            }
+            set_attention_ablation_arm(0);
+            println!("--- BQ={block}, median ms of {ROUNDS} interleaved rounds ---");
+            if samples[0].is_empty() {
+                println!("  (arm 0 not selected; no ratios printed)");
+                continue;
+            }
+            let base = median_f64(&mut samples[0].clone());
+            for (index, (arm, label, removes)) in ARMS.iter().enumerate() {
+                if samples[index].is_empty() {
+                    continue;
+                }
+                let mut v = samples[index].clone();
+                let med = median_f64(&mut v);
+                let lo = *v.first().unwrap();
+                let hi = *v.last().unwrap();
+                println!(
+                    "  arm {arm} {label:<18} {med:9.3} ms  [{lo:8.3} {hi:8.3}]  \
+                     {:6.2} TFLOP/s  x{:.2} of base   -- {removes}",
+                    flops / (med * 1e-3) / 1e12,
+                    base / med,
+                );
+                assert!(med.is_finite() && med >= 0.0, "bad timing for arm {arm}");
+            }
+        }
+    }
+    set_attention_ablation_arm(0);
+}
+
 fn median_f64(xs: &mut [f64]) -> f64 {
     xs.sort_by(|a, b| a.partial_cmp(b).unwrap());
     xs[xs.len() / 2]

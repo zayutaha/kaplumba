@@ -584,11 +584,36 @@ to reach 90 tok/s (266 s) without cutting ~125 s out of these two numbers.
 
 ## 9 — T4e: where the flash kernel's time actually goes (ablation, 24 576 keys)
 
-> **SUPERSEDED BY §10 — the ablation table below does not reproduce.** Re-run
-> against the post-T4f body, `ksteps = 0` gives 966.88 ms against a 958.39 ms
-> baseline (here: 433 against 1148), and so does every other arm. Do not quote
-> the cost split or anything derived from it. Kept as the record of what produced
-> T4f.
+> **WITHDRAWN TWICE, AND THE SECOND RETRACTION IS THE SERIOUS ONE (F1, §22).**
+>
+> 1. **§10** re-ran this table against the post-T4f body and found none of it
+>    reproduces. Do not quote the cost split or anything derived from it.
+> 2. **F1 found that neither §9's table nor §10's re-run ever measured the
+>    kernel.** `attention_prefill_flash_body` dispatched with
+>    `threads_per_group = 256` (`attention.rs:1609`), so §10's
+>    `if (tid < 256u) { return; }` was **not** "it only retired 256 threads" — it
+>    retired *every* thread, i.e. a genuinely empty kernel, and still read
+>    **964.79 ms** against a 958.39 ms baseline. An empty body at that grid, in
+>    the same binary, costs **0.19 ms** (§22, arm 1) — a **6 162x** signal. So the
+>    patched `.metal` did not reach the compiled shader, and the table is not a
+>    failed reproduction: **it is a measurement of the wrong binary.**
+>
+> The reason §10.1's ruled-out list missed it is worth recording: the checks
+> there were "the build returns 0", "`strings` finds `KAPLUMBA_ABLATE_exit` in the
+> binary", and "an `eprintln!` prints the right pipeline". None of them
+> establishes that **the specific edited lines** are in the shader being timed, and
+> the `.metal` is `include_str!`'d into the crate
+> (`attention.rs:12`), so an edit that is not accompanied by a recompile of that
+> crate silently does nothing. §22 fixes this by carrying the ablation selector
+> in the **uniform block**: one build, one binary, every arm.
+>
+> **Consequence for what was decided on this table.** §9.1 ("the loads are
+> near-minimal -- and that is the problem"), §9.1b ("BQ=2 with the grid
+> restored") and §9.2 ("what was tried against this split") were all reasoned
+> from a 44% loads / 52% MMA / 3% softmax split that no measurement ever
+> produced. They are withdrawn as a design basis, not merely as a number. The
+> correct split, measured in §22 with a working instrument, is **56% QK / 40% PV
+> / 4% everything else, with all fragment loads together worth 12-19%**.
 
 §7.5 and §8.1 blamed `simdgroup_load`s per MMA and occupancy. Both were wrong, and
 the reason they were wrong is that neither was measured on the kernel's real cost
@@ -621,6 +646,16 @@ So the strided device loads are ~509 ms of 1148 = **44%**, and the MMA issue is
 
 ### 9.1 The loads are near-minimal -- and that is the problem
 
+> **WITHDRAWN AS A BASIS (F1, §22).** The byte arithmetic below is *correct* -- a
+> `simdgroup_half8x8` is 32 lanes x 2 halfs = 128 B and the sub-tiles do not
+> overlap -- but the conclusion drawn from it ("44% of the kernel is these
+> strided device loads, so this is the lever") came from the invalid ablation.
+> Measured directly in §22: making **every** fragment load L1-resident buys
+> **8-9%**, and deleting the Q/P threadgroup loads outright buys **11-12%**. The
+> loads are not 44% of anything; they are ~12% of the kernel. The "175 GB/s =
+> 64% of DRAM" line is also wrong in the same way §12 later showed: those are L1/L2
+> requests, not DRAM traffic.
+
 Bytes read by the K/V loads, from the loop counters. One `simdgroup_half8x8` is
 8x8 halfs = **128 B**, and the sub-tiles are partitioned across simdgroups
 (`k0 = base + sg*8`, `nt = sg + j*NSG`), so there is **no redundancy**:
@@ -646,6 +681,15 @@ threadgroups.
 
 ### 9.1b Query blocking is the right lever used the wrong way
 
+> **RE-OPENED AND THEN CLOSED AGAIN (F1, §22).** §12.2 correctly re-opened this
+> on grounds that do not depend on §9 (the kernel is instruction-bound, so what
+> matters is MMAs per fragment load). §22 is the measurement that closes it:
+> BQ=2 is **19% slower** than BQ=1 on the bench at 24 576 keys and 4-12% slower
+> at 8 192, and the fragment loads that query blocking halves are worth 8% in
+> total. Query blocking cannot pay by removing bytes when the bytes are 8%.
+> Its measured verdicts stand: naive BQ=2 is −2.0% E2E at 8k (§8.2) and the
+> key-split + combine pass that would restore the grid is not worth building.
+
 BQ=2 halves the K/V bytes (each threadgroup reads a key once and reuses it for 2
 queries) but also halves the grid, 4096 -> 2048. §8.2 measured it as a 2% loss.
 The two effects cancel: the byte win is real, the parallelism loss is real. The
@@ -656,6 +700,19 @@ is the only change identified in this section that attacks the 44% load term
 without giving up the parallel term.
 
 ### 9.2 What was tried against this split, and the verdicts
+
+> **EVERY ROW BELOW IS UNRELIABLE (F1, §22).** All four are timed against the
+> same 1148 ms baseline that §22 shows is not the kernel's cost under ablation --
+> each edit was a separate one-line `.metal` change, and §10's `tid < 256u` arm
+> demonstrates that at least one of them never reached the shader at all. None of
+> these verdicts may be cited, including "neutral" and including the two that say
+> something is slower. The padding row and the `qstage`-removal row happen to
+> agree with §22's finding that the loads are cheap; the K-fragment software
+> pipeline row and the two-accumulator row are simply unmeasured.
+>
+> Re-measured properly in §22: the K-fragment pipeline is not a cost (loads are
+> 8%); the two-accumulator idea is not a cost (**2 and 4 independent QK
+> accumulator chains are 1.00x and 0.96x** -- arms 11/12).
 
 | change | result | why |
 |---|---|---|
@@ -745,8 +802,26 @@ is 225 s of it.
 ## 10 — T4g: the T4e ablation does not reproduce, and the microbench cannot be
 ## used for compile-time ablation at all
 
-**Read this before quoting any number in §9.** T4g re-ran the §9 ablation against
-the post-T4f body (`1254780`). None of it reproduces.
+> **THE WHOLE SECTION IS WITHDRAWN (F1, §22) — including its conclusion that the
+> microbench "cannot be used for compile-time ablation".** The table below did not
+> measure a failed reproduction; it measured **the wrong binary**. Proof, in one
+> line: the flash prefill path dispatches `threads_per_group = 256`, so this
+> section's `if (tid < 256u) { return; }` was a completely empty kernel, and an
+> empty kernel at this grid costs **0.19 ms** (§22 arm 1, same binary as the
+> baseline) against the **964.79 ms** recorded here. A 6 162x discrepancy.
+>
+> Two consequences that reverse this section's own conclusions:
+>
+> * **The microbench is a perfectly good attribution instrument.** One uniform
+>   field turns it into a full ablation sweep in one binary (§22). What it still
+>   cannot do is **rank arms end to end** (§8.7, §9.4, §11) -- that half of
+>   §10.2 #3 survives untouched, and it is the half that matters.
+> * **§10.2 #3 as written ("a valid throughput instrument and an *invalid*
+>   attribution instrument") is wrong and is replaced in §22.** The confusion is
+>   between *attribution* (which arm's cost is where -- this works) and *ranking*
+>   (which arm is faster end to end -- this does not).
+>
+> Kept below as the record of what produced the conclusion that had to be undone.
 
 Same bench (`attention_arm_throughput_at_prefill_geometry`), same shape (full
 32q/4kv/d512), 24 576 keys, 1024 queries, BQ=1 arm `flash bq1`, median of 3,
@@ -820,19 +895,30 @@ repeat them:
 
 ### 10.2 What this means for the spec
 
+> Items 1 and 3 are **wrong as written** and are corrected in §22. Item 2's
+> conclusion survives but for a different reason. Item 4 survives and is the
+> single most useful thing in this section.
+
 1. **§9's cost split (loads 44%, MMA 52%, softmax 3%) is not reproducible and
-   must not be used to justify a change.** It is kept above only as the record of
+   must not be used to justify a change.** *True, and stronger than this says:
+   it was never measured at all (§22). The measured split is 56% QK / 40% PV /
+   4% other.* It is kept above only as the record of
    what produced T4f's design; every conclusion drawn from it in §9.1, §9.1b and
    §9.2 rests on a measurement that does not survive a re-run.
 2. **§9.1b's "BQ=2 + key split + combine pass" stays refuted** — not because the
    byte arithmetic is wrong (it is right) but because it was justified by a split
    that does not reproduce. It is refuted *a fortiori*: the same reasoning
    predicted BQ=2 would help, and BQ=2 measured -2.0% (§8.2) and +0% E2E.
+   *§22 adds the direct reason: the loads query blocking halves are worth 8%.*
 3. **The microbench is a valid throughput instrument and an invalid attribution
    instrument.** It is stable (the `mma` control held 867-894 ms across ~12 runs,
    ±1.5%; `scalar` 1239-1258), linear, and it reproduces T4f's effect. It cannot
    attribute cost, and it cannot rank arms (§8.7, §9.4 — third confirmation).
    **E2E is the only instrument that has ever ranked anything correctly here.**
+   *WITHDRAWN as to attribution — see §22. It attributes with a 6 162x signal.
+   The ranking half is untouched and is the half that matters: four independent
+   confirmations (§8.7, §9.4, §11, and the BQ=1/BQ=2 inversion in §22, where the
+   bench says BQ=1 and the engine's own history says BQ=2).*
 4. **Open hazard for whoever picks this up:** `pipeline_audit::build(...).ok()`
    turns a Metal compile error into `None`, and the dispatch then falls back to
    the MMA kernel *silently*. The bench prints the arm name it was asked for, not
@@ -840,6 +926,11 @@ repeat them:
    plausible, stable, completely wrong number rather than an error. Any future
    ablation must assert `flash_attention_available()` and print
    `pipeline.function_name()` for the arm, not trust the label.
+   *§22 adds the hazard that actually bit: not a compile error but a **stale
+   build**. `attention.metal` is `include_str!`'d (`attention.rs:12`), so an edit
+   with no recompile of that crate leaves the old shader in the binary and every
+   measurement is of the previous kernel. The uniform-block ablation in §22 makes
+   the failure impossible rather than checking for it.*
 
 ### 10.3 Process failure worth recording
 
@@ -849,6 +940,12 @@ pipe, so a failed build read as success. Both are cheap checks; skipping them co
 more than the ablations were worth. The rule this suggests: **an ablation whose
 result is "the change did nothing" is only believable after a positive control
 has been shown to move the same instrument.**
+
+*F1 (2026-10-05): the control was then run, and it is the reason this section
+matters. §22 arm 1 is an empty body and it reads **0.19 ms** against 1 143 ms. So
+the control was cheap, it was available, and running it would have caught the
+mistake immediately instead of costing two sections of design reasoning (§9.1,
+§9.1b, §9.2) that had to be withdrawn afterwards.*
 
 ---
 
@@ -984,6 +1081,10 @@ ask is an attention-kernel ask, worth 56 s out of a 273 s budget.
   mix, not its bytes, is the wall. What still needs explaining is that removing
   the QK *and* PV *instructions* moves nothing -- that remains unexplained and
   is recorded as OQ7.
+  *F1: the premise is false. §22 measures the empty body at 0.19 ms, so the
+  instructions were never removed -- the patched shader was not in the binary. The
+  load finding above is confirmed and sharpened (all fragment loads together are
+  12-19%), and OQ7 is closed.*
 
 ---
 
@@ -2030,3 +2131,168 @@ rather than an absence.
 `TD_OVERRIDE` / `TD_KEEP` are exposed so a failing run's scratch directory can be
 inspected instead of being deleted by the EXIT trap — which is how (1) and (3) were
 diagnosed at all.
+
+---
+
+## 22 — F1: the microbench IS an attribution instrument, and the flash kernel's cost is 88% MMA issue
+
+This is the record for the single most consequential finding of the fixer pass.
+It withdraws a standing conclusion (OQ7, "open"), withdraws two sections of
+design reasoning (§9.1, §9.1b, §9.2) that rested on it, corrects §10.2 #3, and
+then — for the first time in this spec — produces a *usable* attribution of the
+flash kernel's time and spends it on the AC2 question (§23).
+
+### 22.1 The mistake, in one line
+
+`attention.metal` is `include_str!`'d into the crate (`attention.rs:12`):
+
+```rust
+const SOURCE: &str = include_str!("attention.metal");
+```
+
+so editing the `.metal` has no effect until the crate that `include_str!`s it is
+recompiled. §10's decisive arm was
+
+```metal
+    if (tid < 256u) { return; }        // top of attention_prefill_flash_body
+```
+
+and the flash prefill path dispatches `threads_per_group = 256`
+(`attention.rs:1609`, the `Some((pipeline, block))` arm). `tid` is
+`thread_position_in_threadgroup`, so `tid < 256u` is true for **every** thread:
+the arm was not "256 of 256 threads retired", it was **a completely empty
+kernel**. It read **964.79 ms** against a 958.39 ms baseline.
+
+An empty kernel at that grid, in the same binary, with the same buffers, costs
+**0.19 ms**. The table did not fail to reproduce; **it measured the wrong
+binary.**
+
+§10.1's ruled-out list did not catch this because every item in it is about
+whether a build succeeded or which *pipeline* was dispatched:
+
+| check | what it establishes | what it does not |
+|---|---|---|
+| `cargo build` returns 0 | the crate compiled | that the edited `.metal` was in it |
+| `strings … \| grep -c KAPLUMBA_ABLATE_exit` = 1 | *some* patched source string is in the binary | that it is the source of the *timed* kernel |
+| `eprintln!` prints `qk=Flash` | the right pipeline is dispatched | that its shader body is the edited one |
+| `ksteps = 0` fails a correctness test | *that edit* reached the shader | that any *other* edit did |
+
+The fourth row is why the section is internally inconsistent rather than simply
+wrong: `ksteps = 0` demonstrably reached the shader (it fails
+`attention_flash_matches_scalar_on_the_full_shape`) and yet moved the time by
++0.9%. That cannot both be true of one build. The honest conclusion is that
+**these arms were produced across more than one build and no single build's
+contents were pinned.**
+
+### 22.2 The fix: put the ablation in the uniform block
+
+One build, one binary, every arm. `AttentionParams` gained a `ablate: u32`
+(TEMPORARY, reverted — see §22.6) carried in the existing constant buffer, and
+`attention_prefill_flash_body` branches on it. Because the arm travels *with the
+dispatch*, it is impossible to time a stale shader: if the field is not in the
+shader, arm 1 cannot read 0.19 ms.
+
+`crates/engine/tests/attention_qk_mma_bench.rs::attention_flash_ablation_arms`
+then sweeps every arm, **interleaved** (`0 1 2 … 0 1 2 …`, 5 rounds, one untimed
+warm per arm per round) so clock and thermal drift cannot masquerade as an arm
+difference, and it asserts `flash_attention_available()` first — §10.2 #4's
+standing instruction. `ABL_ARMS=0,2,11` restricts the sweep, which matters
+because the full battery over three shapes is 18 minutes.
+
+Evidence: `fixer_evidence/f1_ablation/f1_flash_ablation.log` (arms 0-9),
+`f1_qk_ilp.log` (arms 11/12), `f1_threadgroup_loads.log` (arms 13/14).
+
+> **Cross-run drift, stated because it matters for reading these numbers.** Three
+> runs of the *same* baseline geometry (24 576 keys, 1024 queries, `BQ=1`) read
+> 1143.6, 1201.3 and 1302.5 ms — a 14% spread on an unmodified kernel. **Only
+> ratios within one run are comparable**, and every table below is one run.
+
+### 22.3 The result
+
+24 576 keys, 1024 queries, full 32q/4kv/d512, `flash`, 5 interleaved rounds,
+medians with their min/max. Ratios are against arm 0 in the same run.
+
+| arm | what it removes | `BQ=1` ms | ratio | share removed |
+|---|---|---|---|---|
+| 0 | nothing (baseline) | 1302.5 | 1.00 | — |
+| 1 | **EVERYTHING** (immediate return) | **0.186** | **6 162x** | 100% |
+| 2 | QK MMAs + its `kf`/`qf` loads | 576.9 | 2.26 | **55.8%** |
+| 3 | PV MMAs + its `af`/`bf` loads | 777.5 | 1.68 | **40.5%** |
+| 4 | `exp`/`simd_sum`/`simd_max` | ~baseline | 1.00 | **0.4%** |
+| 5 | nothing; K fragment from a fixed row (L1) | 1079.7\* | 1.06 | 6% |
+| 6 | nothing; V fragment from a fixed row (L1) | 1072.3\* | 1.07 | 7% |
+| 8 | nothing; **every** fragment load L1-resident | 1051.5\* | 1.09 | **8%** |
+| 13 | nothing; Q/P from fixed threadgroup addrs | 1256.6 | 1.04 | 4% |
+| 14 | nothing; Q/P fragment loads deleted | 1161.8 | 1.12 | **11%** |
+| 9 | the `msv == 1` rescale guard (F8) | 1184.4\* | 0.97 | **-4.9%** |
+| 7 | nothing; Q fragment hoisted into registers | 2198.7\* | 0.52 | **-92%** |
+| 11 | nothing; 2 independent QK accumulator chains | 1205.4 | 1.00 | 0% |
+| 12 | nothing; 4 independent QK accumulator chains | 1246.3 | 0.96 | -4% |
+
+\* from the first run (arms 0-9), whose baseline was 1143.6 ms; ratios are
+within-run. Arms 0/2/3/11/12/13/14 from the second and third runs; their ratios
+agree with the first run's arm 2 (2.00 → 2.13 → 2.26, all "QK is about half").
+
+`BQ=2` (which is what production selects at `key_count >= 16384`) is
+**4-19% slower than `BQ=1` on this bench** — 1554.7 vs 1302.5 ms at 24 576 keys,
+530.8 vs 435.8 at 8 192. See §23.3.
+
+**What survives, and what it costs to be wrong by:**
+
+| §9/§10 claimed | measured | verdict |
+|---|---|---|
+| loads 44% | **all fragment loads together 8% (device) + 11% (threadgroup)** | **wrong by ~4x in the wrong direction** |
+| MMA issue 52% | **~77%** (QK + PV MMAs) | direction right, magnitude low |
+| softmax 3% | 0.4% | right |
+| "removing the QK and PV instructions moves nothing" | removing QK is 2.26x, removing PV is 1.68x | **the claim was an artefact of a stale build** |
+| §10.2 #3: "invalid attribution instrument" | a 6 162x signal | **wrong** |
+
+**The flash kernel is MMA-issue-bound.** 88% of it is the
+`simdgroup_multiply_accumulate` instructions; every load together is 12-19%; the
+softmax is free; and the four candidate mechanisms for the MMA stall are all
+eliminated by measurement:
+
+* **not the accumulator dependency chain** — 2 and 4 independent QK chains are
+  1.00x and 0.96x (arms 11/12). This is the interesting one, because
+  `examples/mma_peak.rs` records 5.75 TFLOPS at 1 chain, 7.65 at 8 and 15.49 at
+  16, so a 64-deep dependent chain *should* be worth ~4x. It is not, which means
+  the MMA issue rate here is not set by the chain at all.
+* **not register pressure in the other direction** — hoisting the Q fragment into
+  registers is **-92%** (arm 7), i.e. `simdgroup_half8x8 qreg[BQ][NTILES]` (64
+  registers per lane at `BQ=1`, 128 at `BQ=2`) spills. This kills the one lever
+  §23's instruction-count model wanted.
+* **not the memory system** — arm 8, all fragment loads L1-resident with the MMA
+  count untouched, is 1.09x.
+* **not occupancy** — §9.2's threadgroup-memory reduction (19.5 -> 11.5 KB) was
+  neutral, which is discredited as a measurement, but arm 14 removes 11% of loads
+  *and* their latency without touching threadgroup memory at all.
+
+### 22.4 OQ7 is closed
+
+The question was "why does deleting the QK and PV instructions not speed the flash
+kernel up?". It was never a hardware mystery: **the instructions were not being
+deleted**, because the patched shader was never in the binary. The control §10.3
+says was too cheap to bother with is worth **0.19 ms**, and running it is what
+closes the question. `spec.md`'s OQ7 and NEXT.md §7.5 are corrected accordingly.
+
+### 22.5 OQ7's answer, restated as a design constraint
+
+**Do not ship an ablation whose result is "the change did nothing" until a
+positive control has moved the same instrument in the same binary, and do not
+believe a `threads_per_group`-sized early return has emptied a kernel.** The
+second half is the specific trap: `if (tid < 256u) { return; }` in a 256-thread
+kernel looks like "a quarter of the threads" to anyone who has not checked the
+dispatch. It is the whole kernel.
+
+### 22.6 The knob is reverted
+
+`AttentionParams::ablate`, `attention_ablate_arm()`, `set_attention_ablation_arm()`
+and the nine gated regions in `attention.metal` are **TEMPORARY and are removed
+again** once the campaign is recorded. Carrying a runtime branch through the hot
+path to keep an instrument alive is the same category of mistake as the
+unmeasured guard (F8): it costs a uniform load and a branch per region on every
+dispatch in exchange for numbers that are already in
+`fixer_evidence/f1_ablation/`. What survives is the *harness*
+(`attention_flash_ablation_arms`, which asserts the pipeline and interleaves) and
+the *rule*. If the ablation is ever needed again, re-add the field first and make
+`arm 1` read ~0.2 ms before believing anything else.

@@ -1,0 +1,57 @@
+
+running 1 test
+test attention_flash_ablation_arms ... 
+=== F1 flash ablation: full    32q/4kv/d512 (NSG=8) keys=24576 queries=1024 (1649.27 GFLOP/iter) ===
+flash_attention_available = true
+  (BQ=1) arm 0 = baseline: 1300.334 ms
+--- BQ=1, median ms of 5 interleaved rounds ---
+  arm 0 baseline            1302.513 ms  [1299.210 1307.749]    1.27 TFLOP/s  x1.00 of base   -- nothing
+  arm 2 no QK                576.938 ms  [ 572.970  578.314]    2.86 TFLOP/s  x2.26 of base   -- QK MMAs + kf/qf loads (sth still published as 0)
+  arm 3 no PV MMAs           777.539 ms  [ 777.056  778.180]    2.12 TFLOP/s  x1.68 of base   -- PV MMAs + af/bf loads
+  arm 13 qf/af fixed addr    1256.631 ms  [1253.354 1260.181]    1.31 TFLOP/s  x1.04 of base   -- nothing; the per-tile threadgroup loads, L1-resident
+  arm 14 no qf/af load       1161.771 ms  [1156.380 1164.616]    1.42 TFLOP/s  x1.12 of base   -- nothing; zero Q/P fragment loads, MMAs kept
+  (BQ=2) arm 0 = baseline: 1541.374 ms
+--- BQ=2, median ms of 5 interleaved rounds ---
+  arm 0 baseline            1554.731 ms  [1541.374 1559.608]    1.06 TFLOP/s  x1.00 of base   -- nothing
+  arm 2 no QK                670.534 ms  [ 666.072  676.825]    2.46 TFLOP/s  x2.32 of base   -- QK MMAs + kf/qf loads (sth still published as 0)
+  arm 3 no PV MMAs           879.283 ms  [ 875.152  883.716]    1.88 TFLOP/s  x1.77 of base   -- PV MMAs + af/bf loads
+  arm 13 qf/af fixed addr    1507.568 ms  [1504.682 1523.202]    1.09 TFLOP/s  x1.03 of base   -- nothing; the per-tile threadgroup loads, L1-resident
+  arm 14 no qf/af load       1403.606 ms  [1401.466 1406.676]    1.18 TFLOP/s  x1.11 of base   -- nothing; zero Q/P fragment loads, MMAs kept
+
+=== F1 flash ablation: full    32q/4kv/d512 (NSG=8) keys=24576 queries=4096 (6597.07 GFLOP/iter) ===
+flash_attention_available = true
+  (BQ=1) arm 0 = baseline: 5202.543 ms
+--- BQ=1, median ms of 5 interleaved rounds ---
+  arm 0 baseline            5202.543 ms  [5196.924 5526.602]    1.27 TFLOP/s  x1.00 of base   -- nothing
+  arm 2 no QK               2306.735 ms  [2305.885 2537.592]    2.86 TFLOP/s  x2.26 of base   -- QK MMAs + kf/qf loads (sth still published as 0)
+  arm 3 no PV MMAs          3099.942 ms  [3092.663 3160.965]    2.13 TFLOP/s  x1.68 of base   -- PV MMAs + af/bf loads
+  arm 13 qf/af fixed addr    5036.141 ms  [5020.109 5459.807]    1.31 TFLOP/s  x1.03 of base   -- nothing; the per-tile threadgroup loads, L1-resident
+  arm 14 no qf/af load       4790.425 ms  [4642.315 4997.220]    1.38 TFLOP/s  x1.09 of base   -- nothing; zero Q/P fragment loads, MMAs kept
+  (BQ=2) arm 0 = baseline: 6172.256 ms
+--- BQ=2, median ms of 5 interleaved rounds ---
+  arm 0 baseline            6187.212 ms  [6162.046 6197.320]    1.07 TFLOP/s  x1.00 of base   -- nothing
+  arm 2 no QK               2683.069 ms  [2679.507 2685.689]    2.46 TFLOP/s  x2.31 of base   -- QK MMAs + kf/qf loads (sth still published as 0)
+  arm 3 no PV MMAs          3493.912 ms  [3481.381 3509.764]    1.89 TFLOP/s  x1.77 of base   -- PV MMAs + af/bf loads
+  arm 13 qf/af fixed addr    6049.757 ms  [6035.960 6070.473]    1.09 TFLOP/s  x1.02 of base   -- nothing; the per-tile threadgroup loads, L1-resident
+  arm 14 no qf/af load       5555.386 ms  [5529.119 5584.081]    1.19 TFLOP/s  x1.11 of base   -- nothing; zero Q/P fragment loads, MMAs kept
+
+=== F1 flash ablation: full    32q/4kv/d512 (NSG=8) keys=8192 queries=1024 (549.76 GFLOP/iter) ===
+flash_attention_available = true
+  (BQ=1) arm 0 = baseline: 433.993 ms
+--- BQ=1, median ms of 5 interleaved rounds ---
+  arm 0 baseline             435.764 ms  [ 433.993  436.434]    1.26 TFLOP/s  x1.00 of base   -- nothing
+  arm 2 no QK                192.028 ms  [ 191.248  192.461]    2.86 TFLOP/s  x2.27 of base   -- QK MMAs + kf/qf loads (sth still published as 0)
+  arm 3 no PV MMAs           259.043 ms  [ 258.714  260.525]    2.12 TFLOP/s  x1.68 of base   -- PV MMAs + af/bf loads
+  arm 13 qf/af fixed addr     419.096 ms  [ 418.287  419.367]    1.31 TFLOP/s  x1.04 of base   -- nothing; the per-tile threadgroup loads, L1-resident
+  arm 14 no qf/af load        388.391 ms  [ 387.481  389.451]    1.42 TFLOP/s  x1.12 of base   -- nothing; zero Q/P fragment loads, MMAs kept
+  (BQ=2) arm 0 = baseline: 532.688 ms
+--- BQ=2, median ms of 5 interleaved rounds ---
+  arm 0 baseline             530.816 ms  [ 528.007  532.688]    1.04 TFLOP/s  x1.00 of base   -- nothing
+  arm 2 no QK                231.275 ms  [ 229.207  232.087]    2.38 TFLOP/s  x2.30 of base   -- QK MMAs + kf/qf loads (sth still published as 0)
+  arm 3 no PV MMAs           307.295 ms  [ 306.323  310.415]    1.79 TFLOP/s  x1.73 of base   -- PV MMAs + af/bf loads
+  arm 13 qf/af fixed addr     524.515 ms  [ 517.135  525.895]    1.05 TFLOP/s  x1.01 of base   -- nothing; the per-tile threadgroup loads, L1-resident
+  arm 14 no qf/af load        485.451 ms  [ 480.752  487.971]    1.13 TFLOP/s  x1.09 of base   -- nothing; zero Q/P fragment loads, MMAs kept
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 598.09s
+

@@ -1,0 +1,51 @@
+
+running 1 test
+test attention_flash_ablation_arms ... 
+=== F1 flash ablation: full    32q/4kv/d512 (NSG=8) keys=24576 queries=1024 (1649.27 GFLOP/iter) ===
+flash_attention_available = true
+  (BQ=1) arm 0 = baseline: 1202.853 ms
+--- BQ=1, median ms of 5 interleaved rounds ---
+  arm 0 baseline            1201.328 ms  [1193.818 1204.189]    1.37 TFLOP/s  x1.00 of base   -- nothing
+  arm 2 no QK                565.037 ms  [ 561.068  567.708]    2.92 TFLOP/s  x2.13 of base   -- QK MMAs + kf/qf loads (sth still published as 0)
+  arm 11 QK 2 chains         1205.417 ms  [1201.280 1212.195]    1.37 TFLOP/s  x1.00 of base   -- nothing; 2 independent QK accumulator chains (ILP)
+  arm 12 QK 4 chains         1246.314 ms  [1239.943 1250.093]    1.32 TFLOP/s  x0.96 of base   -- nothing; 4 independent QK accumulator chains (ILP)
+  (BQ=2) arm 0 = baseline: 1430.501 ms
+--- BQ=2, median ms of 5 interleaved rounds ---
+  arm 0 baseline            1412.845 ms  [1408.640 1430.501]    1.17 TFLOP/s  x1.00 of base   -- nothing
+  arm 2 no QK                682.596 ms  [ 678.956  683.306]    2.42 TFLOP/s  x2.07 of base   -- QK MMAs + kf/qf loads (sth still published as 0)
+  arm 11 QK 2 chains         1440.216 ms  [1422.047 1452.487]    1.15 TFLOP/s  x0.98 of base   -- nothing; 2 independent QK accumulator chains (ILP)
+  arm 12 QK 4 chains         1512.938 ms  [1506.859 1520.963]    1.09 TFLOP/s  x0.93 of base   -- nothing; 4 independent QK accumulator chains (ILP)
+
+=== F1 flash ablation: full    32q/4kv/d512 (NSG=8) keys=24576 queries=4096 (6597.07 GFLOP/iter) ===
+flash_attention_available = true
+  (BQ=1) arm 0 = baseline: 4794.869 ms
+--- BQ=1, median ms of 5 interleaved rounds ---
+  arm 0 baseline            4789.388 ms  [4786.482 4794.869]    1.38 TFLOP/s  x1.00 of base   -- nothing
+  arm 2 no QK               2261.147 ms  [2258.167 2267.043]    2.92 TFLOP/s  x2.12 of base   -- QK MMAs + kf/qf loads (sth still published as 0)
+  arm 11 QK 2 chains         4808.343 ms  [4805.271 4812.801]    1.37 TFLOP/s  x1.00 of base   -- nothing; 2 independent QK accumulator chains (ILP)
+  arm 12 QK 4 chains         4957.007 ms  [4955.202 4962.316]    1.33 TFLOP/s  x0.97 of base   -- nothing; 4 independent QK accumulator chains (ILP)
+  (BQ=2) arm 0 = baseline: 5619.580 ms
+--- BQ=2, median ms of 5 interleaved rounds ---
+  arm 0 baseline            5620.456 ms  [5619.580 5624.441]    1.17 TFLOP/s  x1.00 of base   -- nothing
+  arm 2 no QK               2704.875 ms  [2690.154 2724.459]    2.44 TFLOP/s  x2.08 of base   -- QK MMAs + kf/qf loads (sth still published as 0)
+  arm 11 QK 2 chains         5732.318 ms  [5713.495 5744.056]    1.15 TFLOP/s  x0.98 of base   -- nothing; 2 independent QK accumulator chains (ILP)
+  arm 12 QK 4 chains         5999.006 ms  [5995.999 6037.609]    1.10 TFLOP/s  x0.94 of base   -- nothing; 4 independent QK accumulator chains (ILP)
+
+=== F1 flash ablation: full    32q/4kv/d512 (NSG=8) keys=8192 queries=1024 (549.76 GFLOP/iter) ===
+flash_attention_available = true
+  (BQ=1) arm 0 = baseline: 399.475 ms
+--- BQ=1, median ms of 5 interleaved rounds ---
+  arm 0 baseline             399.385 ms  [ 397.267  399.958]    1.38 TFLOP/s  x1.00 of base   -- nothing
+  arm 2 no QK                188.353 ms  [ 187.226  189.114]    2.92 TFLOP/s  x2.12 of base   -- QK MMAs + kf/qf loads (sth still published as 0)
+  arm 11 QK 2 chains          399.739 ms  [ 398.326  400.872]    1.38 TFLOP/s  x1.00 of base   -- nothing; 2 independent QK accumulator chains (ILP)
+  arm 12 QK 4 chains          414.442 ms  [ 413.662  415.497]    1.33 TFLOP/s  x0.96 of base   -- nothing; 4 independent QK accumulator chains (ILP)
+  (BQ=2) arm 0 = baseline: 484.823 ms
+--- BQ=2, median ms of 5 interleaved rounds ---
+  arm 0 baseline             484.542 ms  [ 480.997  485.139]    1.13 TFLOP/s  x1.00 of base   -- nothing
+  arm 2 no QK                248.157 ms  [ 247.498  250.452]    2.22 TFLOP/s  x1.95 of base   -- QK MMAs + kf/qf loads (sth still published as 0)
+  arm 11 QK 2 chains          490.091 ms  [ 488.040  494.150]    1.12 TFLOP/s  x0.99 of base   -- nothing; 2 independent QK accumulator chains (ILP)
+  arm 12 QK 4 chains          512.091 ms  [ 511.015  518.910]    1.07 TFLOP/s  x0.95 of base   -- nothing; 4 independent QK accumulator chains (ILP)
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 494.89s
+

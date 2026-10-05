@@ -44,6 +44,30 @@ untouched.**
 > terms the full layers run at ~1.74 and need **~3.4**, which is 22% of the
 > 15.6 TFLOPS tensor peak: an ordinary number. OQ4 and OQ6 are withdrawn.
 
+> **Corrected again in §23 (F5) — the paragraph above is wrong by ~1.4x on the ask.**
+> "attention 149.7 s" was `366.6 − 216.9`, a **subtraction from a wall clock**, so
+> the residual silently contains the inter-dispatch gap, which is not attention and
+> cannot be removed by making attention faster. Measured per-kernel
+> (`KAPLUMBA_GPU_PROFILE=1`, 16 394 tokens), the real 24 590-token budget is:
+>
+> | | s at 24 590 | tok/s equivalent |
+> |---|---|---|
+> | GEMM + other, all seven projections | **223.5** | — |
+> | attention, measured (`8.81e13 + 2.75e13` FLOP) | **126.1** | — |
+> | inter-dispatch gap, 0.719 ms x ~22 530 boundaries | 16.2 | — |
+> | **total** | **365.8** | **67.2** (measured 67.10 / 68.40) |
+> | **AC2 budget** | **273.2** | **90** |
+>
+> So **239.7 s — 88% — is spent before attention begins**, attention has **33.5 s**
+> and not 56 s, and the ask is **3.8x**, not 2.7x: `2.394e14` FLOP in 33.5 s =
+> **7.15 TFLOP/s = 46% of the 15.6 TFLOPS tensor peak**, against a measured
+> **1.9 TFLOP/s (12%)** for both layer kinds. The GEMM's 223.5 s is **6.73
+> TFLOP/s = 43% of peak and uniform across all seven projections** — the
+> `spec/decode-20tps` lead that `o_proj` runs at half the bandwidth of every other
+> projection is a **decode GEMV (`M = 1`) measurement and does not transfer**: in
+> prefill o_proj runs at **98% of `down_proj`'s efficiency**. See §23 for the
+> re-derivation, the instrument that killed the lead, and the honest ceiling.
+
 ## Non-goals / restrictions
 
 Carried from `AGENTS.md` §8, non-negotiable:
@@ -172,13 +196,24 @@ Additional for this spec:
   **67.1 GB ≈ 0.25 s**. Attention must go 149.7 -> 56.1 s for AC2, and the GEMM
   is a fixed 216.9 s that does not have to move. Do **not** re-open the GEMM.
 - **OQ7 — Why does deleting the QK and PV instructions not speed the flash
-  kernel up?** **OPEN.** §10 is explicit: `ksteps = 0`, the QK loop off, both off,
-  and an immediate `return` all land within 1.8% of baseline, while the same
-  binary with an added spin loop costs +3.9 s. Every other explanation was
-  checked and eliminated (build, dispatched kernel, host cost, DRAM bandwidth,
-  work-proportionality — §10.1). Until this is answered, no attention change can
-  be *predicted*, only measured end to end, and the microbench must not be used
-  to attribute cost.
+  kernel up?** **CLOSED (F1), and it was never a hardware question.**
+  `attention.metal` is `include_str!`'d (`crates/kernels/src/attention.rs:12`), so
+  a `.metal` edit has no effect until that crate is recompiled, and §10's arms were
+  measured against a binary that did not contain them. The proof is one line: the
+  flash prefill path dispatches `threads_per_group = 256`, so §10's
+  `if (tid < 256u) { return; }` was **a completely empty kernel**, not "256 threads
+  retired" — and it read **964.79 ms** against a 958.39 ms baseline, while an empty
+  body at that grid in the same binary costs **0.19 ms** (a 6 162x signal).
+  Re-run with the ablation selector carried in the **uniform block**, so one build
+  times every arm and a stale shader is impossible: removing the QK is **2.26x**,
+  removing the PV MMAs is **1.68x**, the softmax is **0.4%**, and making every
+  fragment load L1-resident with the MMA count untouched is **1.09x**. The flash
+  kernel is **MMA-issue-bound: ~88% MMAs, ~12-19% all loads, 0.4% softmax**, and
+  the four candidate mechanisms (accumulator-chain ILP, register pressure, the
+  memory system, occupancy) are each eliminated by measurement — 2 and 4
+  independent QK chains are 1.00x/0.96x, hoisting Q into registers is **−92%**
+  (it spills), and the loads are worth 8%. **§9.1/§9.1b/§9.2 and §10.2 #3 are
+  withdrawn**; `implementation_notes.md` §22.
 - **OQ8 — 24k decode is unmeasurable on this box.** **OPEN, and it blocks AC1.**
   The 24k run's own `phys_footprint` is 18.35 GiB of a 24 GiB machine, so it
   evicts the desktop and the compressor then drives decode to **0.055 tok/s**

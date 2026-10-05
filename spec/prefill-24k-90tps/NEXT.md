@@ -37,9 +37,21 @@ These cost real time to find. Each is committed with its evidence.
    added spin loop costs +3.9 s. §9.1/§9.1b/§9.2 are **withdrawn as a design
    basis**. The microbench is a throughput instrument, **not** an attribution or
    ranking instrument (four independent confirmations it ranks arms wrongly).
+   **F1 CORRECTION (2026-10-05) — this bullet's premise is now known to be false,
+   and so is its conclusion.** The §10 arms never reached the kernel:
+   `attention.metal` is `include_str!`'d into the crate, and the flash path
+   dispatches 256 threads per threadgroup, so §10's `if (tid < 256u) { return; }`
+   was an **empty kernel** and read 964.79 ms while an empty body at that grid
+   costs **0.19 ms** — a 6 162x signal. The microbench **is** an attribution
+   instrument; what it cannot do is **rank arms end to end**, and that half
+   stands. §22 replaces §9.1/§9.1b/§9.2 and §10.2 #3, and closes OQ7.
 3. **§9.1b's "BQ=2 + key-split + combine" is re-opened, not refuted** — its
    refutation used the withdrawn §9 split. But naive BQ=2 still measures
    −2.0% @8k / −6.2% @24k, so the *grid* has to be restored too.
+   **F1 CLOSES IT (2026-10-05).** The loads that BQ halves are worth **8%**
+   (every fragment load L1-resident, MMA count untouched, is 1.09x — §22 arm 8),
+   and on the bench `BQ=1` is **4-19% faster** than `BQ=2` at both 8 192 and
+   24 576 keys. There is nothing for it to recover. Do not build the combine pass.
 4. **§14 — oMLX v0.7.0 independently reached our §6 decode diagnosis** (per-key
    `simd_sum` decode is ALU-bound at ~⅓ of DRAM). Ported; see §4.
 
@@ -276,10 +288,16 @@ between arms. Full suite: 116 binaries ok, 4 failed, all four verified at base
 
 ### 7.5 What is still open
 
+> **SUPERSEDED IN PART BY THE FIXER PASS (2026-10-05, `fixer_report.md`).** Read
+> this list together with §7.6 below; three of the five items have answers.
+
 * **AC2 (prefill ≥ 90 @24k): unmet, 20% short, and unmoved.** Four levers tried
   (T3, T4f, T2b, N1) against one target. §12.1's arithmetic still holds: attention
   must go 149.7 s → ≤ 56 s, a 2.7× kernel speedup, at 1.74 TFLOP/s against a ~3.4
   target. N1 was supposed to be the mechanism for it and does not apply here.
+  **F5: the arithmetic in that sentence is wrong by ~1.4x on the ask — see §23.**
+  88% of the budget is spent before attention starts, attention gets 33.5 s and
+  not 56 s, and the ask is **3.8x at 46% of tensor peak** against a measured 1.9.
 * **AC1 (decode ≥ 14 @24k): unmeasurable.** Needs a quieter box (OQ8) or a
   lower-footprint 24k configuration. The splits=13 result is the best decode lever
   this spec found and its effect is still rising at 16k.
@@ -287,6 +305,40 @@ between arms. Full suite: 116 binaries ok, 4 failed, all four verified at base
   from the flash kernel does not speed it up, and §16 adds that its bytes are not
   the constraint either. Whatever it is, it is not DRAM traffic and not instruction
   count as currently modelled.
+  **F1: CLOSED — and it was a stale build, not a mystery.** §10's arms never
+  reached the shader (§22). With the ablation carried in the uniform block, an
+  empty body reads **0.19 ms** against 1 143 ms, removing QK is **2.26x**, removing
+  PV is **1.68x**, the softmax is **0.4%** and every fragment load together is
+  **8-11%**. The kernel is **MMA-issue-bound**: ~88% `simdgroup_multiply_accumulate`,
+  with the accumulator-chain, register-pressure, memory and occupancy explanations
+  each eliminated by a measurement.
 * **The `workgroups` default flip.** One line, +2.17% @16k, provably a no-op for
   83% of layers. Needs an owner.
+  **F4: measured, and the reason it is a real decision.** The "no-op for 83% of
+  layers" is the **sliding ring** (`key_count = min(position, 1024)`), not the wave
+  budget, and the first context at which the two rules can differ is **896**, not
+  120 — so N6's "five reference prompts byte-identical" was vacuous. The greedy
+  token delta is in §24. **Not flipped here**: the quality decision is the owner's.
 * **The pre-existing Metal crash** (§20.1). Needs per-dispatch decode attribution.
+  **F7: WITHDRAWN — 29 attempts across nine token counts, rc=0 every time. No
+  defect is filed and no time should be spent on the prompt.**
+
+### 7.6 What the fixer pass added (2026-10-05)
+
+* **An attribution instrument that works** (§22), and the first real cost split of
+  the flash kernel. This is the durable output: not the numbers, the *method* — an
+  ablation selector in the uniform block, so one build times every arm and a stale
+  shader is impossible.
+* **The o_proj lead is dead for prefill** (§23.1). `spec/decode-20tps`'s
+  "o_proj at half the bandwidth" is a **decode GEMV (`M = 1`)** measurement. In
+  prefill all seven projections run at 6.4-8.6 TFLOP/s, o_proj at **98% of
+  down_proj's efficiency**, and the whole GEMM at **43% of tensor peak**. There is
+  no anomalous projection to fix and 273 GB/s is irrelevant (the chunked GEMM needs
+  1.3 GB/s of it).
+* **The sliding-ring reason** (`key_count = min(position, 1024)`) written down for
+  the first time, which is what actually makes the `workgroups` flip a 10-layer
+  change rather than a 60-layer one.
+* **The rescale guard is worth 4.9%**, measured in the same sweep (F8). §17.1
+  argued exactness only; it is a real 5% and it stays.
+* **What is still missing**: a mechanism for the MMA issue rate. Every lever that
+  follows from the measured split is negative (§22.3, §23.5).

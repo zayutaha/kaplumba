@@ -1,0 +1,87 @@
+
+running 1 test
+test attention_flash_ablation_arms ... 
+=== F1 flash ablation: full    32q/4kv/d512 (NSG=8) keys=24576 queries=1024 (1649.27 GFLOP/iter) ===
+flash_attention_available = true
+  (BQ=1) arm 0 = baseline: 1138.274 ms
+--- BQ=1, median ms of 5 interleaved rounds ---
+  arm 0 baseline            1143.618 ms  [1138.274 1150.403]    1.44 TFLOP/s  x1.00 of base   -- nothing
+  arm 1 empty body             0.186 ms  [   0.167    0.197]  8886.95 TFLOP/s  x6162.30 of base   -- EVERYTHING (the control §10.3 never ran)
+  arm 2 no QK                572.342 ms  [ 566.688  572.908]    2.88 TFLOP/s  x2.00 of base   -- QK MMAs + kf/qf loads (sth still published as 0)
+  arm 3 no PV MMAs           594.272 ms  [ 593.099  595.912]    2.78 TFLOP/s  x1.92 of base   -- PV MMAs + af/bf loads
+  arm 4 no softmax          1139.336 ms  [1131.404 1142.893]    1.45 TFLOP/s  x1.00 of base   -- exp/simd_sum/simd_max (wq, msb still written)
+  arm 5 K frag fixed row    1079.721 ms  [1075.930 1081.967]    1.53 TFLOP/s  x1.06 of base   -- nothing; the K device path (same instruction)
+  arm 6 V frag fixed row    1072.267 ms  [1071.124 1074.857]    1.54 TFLOP/s  x1.07 of base   -- nothing; the V device path (same instruction)
+  arm 7 qf hoisted          2198.694 ms  [2196.111 2203.555]    0.75 TFLOP/s  x0.52 of base   -- the per-tile qstage load (also the candidate fix)
+  arm 8 K+V fixed rows      1051.528 ms  [1047.791 1053.599]    1.57 TFLOP/s  x1.09 of base   -- nothing; every fragment load L1-resident, MMAs kept
+  arm 9 rescale guard off   1184.424 ms  [1180.631 1192.439]    1.39 TFLOP/s  x0.97 of base   -- F8: the `msv == 1` guard; arm 0 minus arm 9 IS its benefit
+  (BQ=2) arm 0 = baseline: 1183.397 ms
+--- BQ=2, median ms of 5 interleaved rounds ---
+  arm 0 baseline            1209.256 ms  [1183.397 1215.562]    1.36 TFLOP/s  x1.00 of base   -- nothing
+  arm 1 empty body             0.177 ms  [   0.153    0.192]  9328.86 TFLOP/s  x6839.99 of base   -- EVERYTHING (the control §10.3 never ran)
+  arm 2 no QK                634.164 ms  [ 631.933  634.626]    2.60 TFLOP/s  x1.91 of base   -- QK MMAs + kf/qf loads (sth still published as 0)
+  arm 3 no PV MMAs           579.348 ms  [ 571.462  582.378]    2.85 TFLOP/s  x2.09 of base   -- PV MMAs + af/bf loads
+  arm 4 no softmax          1193.514 ms  [1183.523 1201.431]    1.38 TFLOP/s  x1.01 of base   -- exp/simd_sum/simd_max (wq, msb still written)
+  arm 5 K frag fixed row    1122.812 ms  [1112.442 1145.233]    1.47 TFLOP/s  x1.08 of base   -- nothing; the K device path (same instruction)
+  arm 6 V frag fixed row    1138.124 ms  [1115.723 1140.210]    1.45 TFLOP/s  x1.06 of base   -- nothing; the V device path (same instruction)
+  arm 7 qf hoisted          2415.339 ms  [2390.973 2434.998]    0.68 TFLOP/s  x0.50 of base   -- the per-tile qstage load (also the candidate fix)
+  arm 8 K+V fixed rows      1060.367 ms  [1054.275 1062.100]    1.56 TFLOP/s  x1.14 of base   -- nothing; every fragment load L1-resident, MMAs kept
+  arm 9 rescale guard off   1268.738 ms  [1251.577 1284.580]    1.30 TFLOP/s  x0.95 of base   -- F8: the `msv == 1` guard; arm 0 minus arm 9 IS its benefit
+
+=== F1 flash ablation: full    32q/4kv/d512 (NSG=8) keys=24576 queries=4096 (6597.07 GFLOP/iter) ===
+flash_attention_available = true
+  (BQ=1) arm 0 = baseline: 4565.300 ms
+--- BQ=1, median ms of 5 interleaved rounds ---
+  arm 0 baseline            4570.246 ms  [4562.087 4576.601]    1.44 TFLOP/s  x1.00 of base   -- nothing
+  arm 1 empty body             0.241 ms  [   0.222    0.247]  27402.16 TFLOP/s  x18983.37 of base   -- EVERYTHING (the control §10.3 never ran)
+  arm 2 no QK               2279.584 ms  [2272.702 2282.246]    2.89 TFLOP/s  x2.00 of base   -- QK MMAs + kf/qf loads (sth still published as 0)
+  arm 3 no PV MMAs          2378.317 ms  [2377.620 2382.011]    2.77 TFLOP/s  x1.92 of base   -- PV MMAs + af/bf loads
+  arm 4 no softmax          4541.382 ms  [4532.968 4551.866]    1.45 TFLOP/s  x1.01 of base   -- exp/simd_sum/simd_max (wq, msb still written)
+  arm 5 K frag fixed row    4298.966 ms  [4291.672 4302.008]    1.53 TFLOP/s  x1.06 of base   -- nothing; the K device path (same instruction)
+  arm 6 V frag fixed row    4271.911 ms  [4269.123 4280.914]    1.54 TFLOP/s  x1.07 of base   -- nothing; the V device path (same instruction)
+  arm 7 qf hoisted          8779.796 ms  [8769.815 8794.244]    0.75 TFLOP/s  x0.52 of base   -- the per-tile qstage load (also the candidate fix)
+  arm 8 K+V fixed rows      4194.248 ms  [4192.433 4209.702]    1.57 TFLOP/s  x1.09 of base   -- nothing; every fragment load L1-resident, MMAs kept
+  arm 9 rescale guard off   4724.829 ms  [4711.618 4727.758]    1.40 TFLOP/s  x0.97 of base   -- F8: the `msv == 1` guard; arm 0 minus arm 9 IS its benefit
+  (BQ=2) arm 0 = baseline: 4810.647 ms
+--- BQ=2, median ms of 5 interleaved rounds ---
+  arm 0 baseline            4820.154 ms  [4810.647 4823.248]    1.37 TFLOP/s  x1.00 of base   -- nothing
+  arm 1 empty body             0.212 ms  [   0.205    0.222]  31148.81 TFLOP/s  x22758.91 of base   -- EVERYTHING (the control §10.3 never ran)
+  arm 2 no QK               2519.818 ms  [2508.124 2524.883]    2.62 TFLOP/s  x1.91 of base   -- QK MMAs + kf/qf loads (sth still published as 0)
+  arm 3 no PV MMAs          2307.393 ms  [2301.011 2313.661]    2.86 TFLOP/s  x2.09 of base   -- PV MMAs + af/bf loads
+  arm 4 no softmax          4759.832 ms  [4754.758 4769.145]    1.39 TFLOP/s  x1.01 of base   -- exp/simd_sum/simd_max (wq, msb still written)
+  arm 5 K frag fixed row    4478.497 ms  [4444.601 4490.704]    1.47 TFLOP/s  x1.08 of base   -- nothing; the K device path (same instruction)
+  arm 6 V frag fixed row    4506.123 ms  [4499.853 4526.165]    1.46 TFLOP/s  x1.07 of base   -- nothing; the V device path (same instruction)
+  arm 7 qf hoisted          9590.641 ms  [9577.805 9592.965]    0.69 TFLOP/s  x0.50 of base   -- the per-tile qstage load (also the candidate fix)
+  arm 8 K+V fixed rows      4231.346 ms  [4210.943 4232.598]    1.56 TFLOP/s  x1.14 of base   -- nothing; every fragment load L1-resident, MMAs kept
+  arm 9 rescale guard off   5032.953 ms  [5021.512 5052.746]    1.31 TFLOP/s  x0.96 of base   -- F8: the `msv == 1` guard; arm 0 minus arm 9 IS its benefit
+
+=== F1 flash ablation: full    32q/4kv/d512 (NSG=8) keys=8192 queries=1024 (549.76 GFLOP/iter) ===
+flash_attention_available = true
+  (BQ=1) arm 0 = baseline: 377.163 ms
+--- BQ=1, median ms of 5 interleaved rounds ---
+  arm 0 baseline             376.595 ms  [ 376.063  377.163]    1.46 TFLOP/s  x1.00 of base   -- nothing
+  arm 1 empty body             0.175 ms  [   0.165    0.265]  3142.95 TFLOP/s  x2153.00 of base   -- EVERYTHING (the control §10.3 never ran)
+  arm 2 no QK                189.915 ms  [ 189.164  190.171]    2.89 TFLOP/s  x1.98 of base   -- QK MMAs + kf/qf loads (sth still published as 0)
+  arm 3 no PV MMAs           196.774 ms  [ 196.168  197.661]    2.79 TFLOP/s  x1.91 of base   -- PV MMAs + af/bf loads
+  arm 4 no softmax           372.628 ms  [ 371.237  373.976]    1.48 TFLOP/s  x1.01 of base   -- exp/simd_sum/simd_max (wq, msb still written)
+  arm 5 K frag fixed row     359.759 ms  [ 359.403  360.487]    1.53 TFLOP/s  x1.05 of base   -- nothing; the K device path (same instruction)
+  arm 6 V frag fixed row     359.378 ms  [ 358.841  361.452]    1.53 TFLOP/s  x1.05 of base   -- nothing; the V device path (same instruction)
+  arm 7 qf hoisted           773.599 ms  [ 772.836  776.538]    0.71 TFLOP/s  x0.49 of base   -- the per-tile qstage load (also the candidate fix)
+  arm 8 K+V fixed rows       353.027 ms  [ 352.764  353.974]    1.56 TFLOP/s  x1.07 of base   -- nothing; every fragment load L1-resident, MMAs kept
+  arm 9 rescale guard off    385.889 ms  [ 383.929  386.293]    1.42 TFLOP/s  x0.98 of base   -- F8: the `msv == 1` guard; arm 0 minus arm 9 IS its benefit
+  (BQ=2) arm 0 = baseline: 400.654 ms
+--- BQ=2, median ms of 5 interleaved rounds ---
+  arm 0 baseline             401.447 ms  [ 400.266  407.099]    1.37 TFLOP/s  x1.00 of base   -- nothing
+  arm 1 empty body             0.172 ms  [   0.157    0.184]  3204.02 TFLOP/s  x2339.67 of base   -- EVERYTHING (the control §10.3 never ran)
+  arm 2 no QK                213.502 ms  [ 210.313  216.635]    2.57 TFLOP/s  x1.88 of base   -- QK MMAs + kf/qf loads (sth still published as 0)
+  arm 3 no PV MMAs           198.137 ms  [ 197.319  198.195]    2.77 TFLOP/s  x2.03 of base   -- PV MMAs + af/bf loads
+  arm 4 no softmax           397.535 ms  [ 393.777  399.379]    1.38 TFLOP/s  x1.01 of base   -- exp/simd_sum/simd_max (wq, msb still written)
+  arm 5 K frag fixed row     375.045 ms  [ 372.918  377.151]    1.47 TFLOP/s  x1.07 of base   -- nothing; the K device path (same instruction)
+  arm 6 V frag fixed row     379.849 ms  [ 373.349  383.305]    1.45 TFLOP/s  x1.06 of base   -- nothing; the V device path (same instruction)
+  arm 7 qf hoisted           886.751 ms  [ 876.697  889.173]    0.62 TFLOP/s  x0.45 of base   -- the per-tile qstage load (also the candidate fix)
+  arm 8 K+V fixed rows       356.536 ms  [ 355.147  358.465]    1.54 TFLOP/s  x1.13 of base   -- nothing; every fragment load L1-resident, MMAs kept
+  arm 9 rescale guard off    420.547 ms  [ 418.547  423.594]    1.31 TFLOP/s  x0.95 of base   -- F8: the `msv == 1` guard; arm 0 minus arm 9 IS its benefit
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 1101.88s
+
