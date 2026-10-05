@@ -15,17 +15,21 @@ main tree on `opencode/big-pickle`.
 | **F1** | OQ7 is open; §10's ablation is a real measurement; §10.2 #3 says the microbench cannot attribute | ✅ **FIXED, and worse than reported** | §10's `if (tid < 256u) { return; }` was an **empty kernel** (256 threads/group) and read 964.79 ms while an empty body costs **0.19 ms**. The table measured the wrong binary. OQ7 is closed; the instrument works; §9.1/§9.1b/§9.2/§10.2/§12.2 withdrawn |
 | **F2** | the grid gate is dead code | ✅ **already fixed** (`a909028`) | the gate is applied in `encode_online_attention_passes` by calling the tested `prefill_pass_count`; a production-path test pins it |
 | **F3** | "default unchanged" | ✅ **FIXED — the default was ON and two of three documents were false** | post-F2 the cost is **−0.13%**, inside a 0.30/0.63% spread. §16.4's strongest argument ("plus 64 MiB of scratch") is **void**: the state buffer is allocated unconditionally. Default decision + docs in §25 |
-| **F4** | the `workgroups` quality evidence cannot fail | ✅ **FIXED — measured at three contexts above the 896 boundary** | **1 differing token in 1 536.** The shipped "43 of 128" is stale by ~500x (it was measured pre-T2b on the scalar kernel). Flip is recommended and **not made**, because this spec's own gate demands byte-identity for the default |
-| **F5** | AC2 arithmetic wrong by ~1.7x | ✅ **FIXED — and the o_proj lead is dead** | 88% of the budget is spent before attention starts; the ask is **3.8x at 46% of tensor peak**, not 2.7x at 22%. The `spec/decode-20tps` o_proj lead is an **`M = 1` GEMV measurement** and does not transfer: o_proj runs at **98% of down_proj's efficiency** in prefill. Honest ceiling: **86-96 tok/s**, and only at the tensor-issue ceiling |
+| **F4** | the `workgroups` quality evidence cannot fail | ✅ **FIXED — measured at three contexts above the 896 boundary** | **1 differing token in 1 536.** The shipped "43 of 128" is not stale, it is **about a different configuration**: pinning 13 splits moves the 50 *sliding* layers too and perturbs 179/512 = 35% at 16k, which is the old 34%. The rule as written moves 10 of 60 layers and 0.065%. Flip recommended, **not made** — this spec's gate demands byte-identity for the default |
+| **F5** | AC2 arithmetic wrong by ~1.7x | ✅ **FIXED — and the o_proj lead is dead** | **88% of the budget is spent before attention starts**; the ask is **3.8x at 46% of tensor peak**, not 2.7x at 22%. The `spec/decode-20tps` o_proj lead is an **`M = 1` GEMV** measurement and does not transfer: o_proj runs at **98% of down_proj's efficiency** in prefill, and all seven projections sit at 6.4-8.6 TFLOP/s with no anomaly to fix. Five levers built and measured, **four negative** |
 | **F6** | a third independent reproduction | ✅ **already withdrawn** (`8a3d411`) | — |
 | **F7** | a reproducible pre-existing crash | ✅ **already withdrawn** (`1d47bf8`) | — |
 | **F8** | the rescale guard: exact, benefit never measured, cited control does not exist | ✅ **FIXED — measured worth 2.5-4.9%** | it is a real ~4% and it stays. §17.1's exactness argument was not a speed argument; now it does not have to be |
 | **F9** | `LOG=` honoured in 1 of 3 harnesses | ✅ **already fixed** (`caf3631`) | — |
 
-**Nothing is left open that was open at the start of this pass.** The one thing
-this pass adds that was not asked for is the method: an ablation selector carried
-in the uniform block, so one build times every arm and a stale shader becomes
-impossible rather than merely unlikely.
+**Nothing is left open that was open at the start of this pass**, and the one thing
+this pass adds that was not asked for is the *method*: an ablation selector carried in
+the uniform block, so one build times every arm and a stale shader becomes impossible
+rather than merely unlikely. The durable output is not the numbers — it is §22.3's
+cost split (**88% MMA issue, 8-12% all loads, 0.4% softmax**, with memory, ILP,
+registers and occupancy each eliminated by a measurement) and the honest ceiling in
+§23.6: AC2 is reachable **only at the tensor-issue ceiling**, where the margin is
+0.8%.
 
 ---
 
