@@ -254,3 +254,13 @@ which was explicitly ruled out.
   reply decays quadratically, (4) one-time `ensure_capacity` copies at KV
   rungs. No repo path produces a steady 0.x tok/s; `scripts/gpuq status` +
   swap usage is the 5-second discriminator.
+- **T9(a) (2026-10-06): fixed.** `model.rs:3229` `attended` is now
+  `u16_elements(max_tokens, q_max)` — the width both attention epilogues write.
+  Greedy hash unchanged (`15.847 tok/s`, same first tokens). Probe
+  `attended_is_sized_hidden_but_written_q_dim` inverted into
+  `attended_is_sized_for_the_q_dim_both_epilogues_write`.
+  **Sabotage:** reverting to `hidden` trips it, observed.
+- **T9(b) `_mul1`:** `Exl3Codebook::Mul1` + `decode_state_mul1` exist
+  (`linear.metal:128`, dispatcher `linear.rs:570`), and the tree's own 3 bpw
+  checkpoint exercises none of that path — the 2.61× cliff has no reproducible
+  configuration here. Recorded unsubstantiated; NOT "fixed".
