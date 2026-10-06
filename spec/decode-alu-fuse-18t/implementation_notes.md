@@ -219,3 +219,38 @@ which was explicitly ruled out.
   (`_colmajor_contig4:1992`, `_fused2:320`, `_colmajor:79`) were ALREADY
   4-trip unrolled, so R1's incremental value was always small; the synthetic
   1.096× did not transfer. AC1 still gated on 16-pair A/B.
+- **T5/T6 (2026-10-06): landed.** The decode head had NO `HeadPick::Sample`
+  branch at all (`encode_lm_head` fell straight through to argmax), so the
+  spec's "plumbing is already present" claim was half right: `HeadPick`,
+  `SamplerParams`, `device_sampler_supported`, `sample_topk_blocks`,
+  `sample_draw` and the staging buffers all existed, but nothing dispatched
+  them from the head. Added the branch (`model.rs:4864`, always softcaps —
+  softmax is not softcap-invariant — then top-k → draw into both `next_token`
+  and `host_token`), widened `chat.rs:388` to
+  `(self.greedy || device_params.is_some())`, seeded `rng_state` from the host
+  sampler's position after the first token, and sampled the first token on the
+  host (the prefill row is a host readback anyway).
+- Rewrote, did not delete, the probes that asserted the old gate:
+  `perf_probe_host_ops.rs` (gate + `host_tokens` census, which was counting a
+  two-line `let x =` / `device.new_buffer(` split and could never reach 1),
+  `perf_probe_concurrency_dependency_graph.rs` (single-queue needle, and
+  `no_device_side_sampler_exists` → `device_side_sampler_exists_and_the_decode_head_dispatches_it`,
+  kernel census 25 → 27).
+- **Sabotage (AGENTS.md §3.4):** reverting the gate to
+  `self.greedy && device_params.is_some()` makes
+  `single_queue_invariants_are_still_the_only_barrier` fail on the needle —
+  observed, reverted.
+- **Measurement — the claimed +2 tok/s did NOT reproduce.** Chat, temp 1.0,
+  default top_k 64, 128-token turn, interleaved with
+  `KAPLUMBA_NO_PIPELINE=1` as the host-sampler control:
+  device 15.35 / 15.22, host 15.55 / 15.42. Null, and the host arm is if
+  anything ahead. Reported as null. The old 14.37-vs-16.05 framing assumed
+  the host sampler costs ~2.2 ms/token on the critical path; on this box, with
+  `top_k_order` landed (`40e018d`), it does not.
+- **Subagent finding (16k `--chat` collapse), not yet acted on:** ranked
+  causes are (1) GPU contention / file-backed eviction, (2) the temp-1.0 chat
+  never pipelined — now largely fixed by T5/T6, (3) `Detokenizer::push` is
+  O(N²) per turn and sits between `wait()` and the next submit, so a long
+  reply decays quadratically, (4) one-time `ensure_capacity` copies at KV
+  rungs. No repo path produces a steady 0.x tok/s; `scripts/gpuq status` +
+  swap usage is the 5-second discriminator.
