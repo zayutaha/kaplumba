@@ -3226,7 +3226,16 @@ impl ForwardScratch {
             q: u16_elements(max_tokens, q_max)?,
             k: u16_elements(max_tokens, kv_max)?,
             v: u16_elements(max_tokens, kv_max)?,
-            attended: u16_elements(max_tokens, hidden)?,
+            // `q_max`-wide, NOT `hidden`-wide. Both attention epilogues write
+            // `q_heads * head_dim` elements per token into this buffer (8192 on
+            // the 50 sliding layers, 16384 on the 10 full ones), and
+            // `o_proj.in_features` is that same wider number. Sized at
+            // `hidden` this was a 22,016 B/layer/token overrun that survived
+            // only because Metal allocates page-granular, so it landed in the
+            // buffer's own padding — and out-of-bounds device writes are
+            // silently tolerated on AGX, which makes it live corruption rather
+            // than a near miss.
+            attended: u16_elements(max_tokens, q_max)?,
             proj: u16_elements(max_tokens, hidden)?,
             gate: u16_elements(max_tokens, inter)?,
             up: u16_elements(max_tokens, inter)?,

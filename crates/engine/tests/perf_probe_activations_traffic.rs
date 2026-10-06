@@ -294,38 +294,59 @@ fn resident_bytes_omits_raw_b_and_raw_c() {
     assert!((true_1024 - reported_1024) as f64 / 1024.0 / 1024.0 < 168.001);
 }
 
-/// Defect 1: `attended` is `hidden` wide in the allocator and `q_dim` wide in
-/// both attention epilogues.
+/// Defect 1, now FIXED: `attended` used to be `hidden` wide in the allocator
+/// while both attention epilogues write `q_dim`. T9 sized it `q_max`. The test
+/// is kept inverted: it now asserts the allocation covers the widest write,
+/// so re-introducing the `hidden`-wide allocation fails here.
 #[test]
-fn attended_is_sized_hidden_but_written_q_dim() {
-    let attended_1 = h(HIDDEN); // `model.rs:3012`
-    let attended_1024 = h(HIDDEN * 1024);
+fn attended_is_sized_for_the_q_dim_both_epilogues_write() {
+    // `model.rs:3229`, now `u16_elements(max_tokens, q_max)`.
+    let attended_1 = h(Q_HEADS * FULL_HEAD_DIM);
+    let attended_1024 = h(Q_HEADS * FULL_HEAD_DIM * 1024);
+    let model_rs =
+        std::fs::read_to_string(format!("{}/src/model.rs", env!("CARGO_MANIFEST_DIR")))
+            .expect("model.rs");
+    assert!(
+        model_rs.contains("attended: u16_elements(max_tokens, q_max)?,"),
+        "scratch.attended is no longer q_max-wide; the 22,016 B/layer/token \
+         overrun is back and is silent on AGX"
+    );
     for (label, q_dim) in [
         ("sliding", Q_HEADS * SLIDING_HEAD_DIM),
         ("full", Q_HEADS * FULL_HEAD_DIM),
     ] {
         assert!(
             q_dim > HIDDEN,
-            "{label}: q_dim {q_dim} no longer overruns `attended`; this finding is stale"
+            "{label}: q_dim {q_dim} no longer exceeds `hidden`; the sizing \
+             argument this fix is based on is stale"
+        );
+        assert!(
+            attended_1 >= h(q_dim),
+            "{label}: {q_dim} halves are written into a {}-half buffer",
+            attended_1 / 2
         );
         println!(
-            "{label}: writes {q_dim} halves into a {HIDDEN}-half buffer -> {}-half overrun \
-             ({} B at decode, {} B at 1024 rows)",
-            q_dim - HIDDEN,
-            h(q_dim) - attended_1,
-            h(q_dim * 1024) - attended_1024,
+            "{label}: writes {q_dim} halves into a {}-half buffer ({}-half headroom; \
+             the hidden-wide allocation underran this by {} B at decode and {} B at 1024 rows)",
+            attended_1 / 2,
+            (attended_1 - h(q_dim)) / 2,
+            h(q_dim) - h(HIDDEN),
+            h(q_dim * 1024) - h(HIDDEN * 1024),
         );
     }
-    assert_eq!(h(Q_HEADS * SLIDING_HEAD_DIM) - attended_1, 5_632);
-    assert_eq!(h(Q_HEADS * FULL_HEAD_DIM) - attended_1, 22_016);
+    assert_eq!(h(Q_HEADS * SLIDING_HEAD_DIM) - h(HIDDEN), 5_632);
+    assert_eq!(h(Q_HEADS * FULL_HEAD_DIM) - h(HIDDEN), 22_016);
+    // The old hidden-wide allocation's 1024-row overruns, kept as the record of
+    // what the fix removed. `attended_1024` is now the q_max-wide size.
     assert_eq!(
-        h(Q_HEADS * SLIDING_HEAD_DIM * 1024) - attended_1024,
+        h(Q_HEADS * SLIDING_HEAD_DIM * 1024) - h(HIDDEN * 1024),
         5_767_168
     );
     assert_eq!(
-        h(Q_HEADS * FULL_HEAD_DIM * 1024) - attended_1024,
+        h(Q_HEADS * FULL_HEAD_DIM * 1024) - h(HIDDEN * 1024),
         22_544_384
     );
+    assert!(attended_1024 >= h(Q_HEADS * FULL_HEAD_DIM * 1024));
     // The zero-cost variant: `transformed` is `inter` = 21504 halves, so it can
     // hold either q_dim, and it is DEAD when attention runs -- the qkv GEMV has
     // already consumed it and the o_proj `input_transform` overwrites it. So the
