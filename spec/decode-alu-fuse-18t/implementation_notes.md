@@ -203,3 +203,9 @@ which was explicitly ruled out.
   (`cargo build --release -p kaplumba-engine --example alu_boost`), binary at
   `target/release/examples/alu_boost`. Committed `d53a6d7`.
 - `scripts/gpuq status`: no model resident, 15.0 GiB reclaimable, 0 swap.
+- **T1 (2026-10-06): REPRODUCED.** `arm_decode` 149.5 GB/s vs
+  `arm_decode_u4` 163.9 GB/s = **1.096×**, matching the claimed 1.095×.
+  Ring 176.3 (85% of seq 208.1), +extract 159.3, +decode 149.5.
+  `arm_decode_h2` 0.931× (dead, not bit-exact). Control drift 80.6% — box
+  noisy, but ratio reproduced. p2_int still scales n² (instrument untrustworthy
+  for int); p2_fp plateaus ~118 G warp-instr/s. → R1 lives, proceed to T2.
