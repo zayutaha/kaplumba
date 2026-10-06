@@ -169,3 +169,23 @@ interleaved control +7.8%). Compute-bound work continues; measurement waits.
 ## 8. Log
 
 (append per task: command, median ± spread, control drift, verdict, commit)
+## 9. T0 — box ceiling re-confirmed (2026-10-06)
+
+`crux_bandwidth`, GPU free after the chat agent was cancelled:
+
+```
+best median across every arm : 254.5 GB/s   (93.2% of wire)
+top-half median of usable    : 249.4 GB/s   <- the number to use  (91.4%)
+median of all arm medians    : 239.5 GB/s   (87.7%)
+CONTROL_repeat drift         : -0.0%, noise floor +0.03%
+PhysMem end: 11.0 GB unused, 0 kaplumba-shaped processes
+```
+
+Consistent with the historical 245–253.6 GB/s (`crux.md §2.6`), so the box
+is in the state every rate in this spec assumes. T1 may proceed.
+
+## 10. T1 — the gate: Control R (head shape at 3 bpw)
+
+Pre-registered decision rule, restated before the run: `bw_ratio ≈ 0.5` →
+bits-per-code is the whole story (T5 is the work); `bw_ratio ≈ 1.0` → the
+head's advantage is shape (T5 dead).
