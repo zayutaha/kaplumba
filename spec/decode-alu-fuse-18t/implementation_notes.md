@@ -192,3 +192,14 @@ the `11.834 GB` budget (wrong geometry — phantom `v_proj` on 10 layers).
 split waiver, not 20.** The user asked for `22.5` normal / `20 @16k`; that is
 excluded by arithmetic, and the only remaining route past it is `tokens/byte`,
 which was explicitly ruled out.
+## T0 log (2026-10-06)
+
+- Branch: `spec/decode-alu-fuse-18t-impl` off HEAD `a6ff214` (the spec commit;
+  prior note said HEAD was `517bc4e` — stale by one commit).
+- MEMORY.md "master is broken" claim: **stale for HEAD.** At HEAD
+  `crates/kernels/src/lib.rs` declares both `pipeline_audit` (`:7`) and
+  `sweep` (`:8`), and both files exist on disk. No E0433 at build time.
+- `alu_boost.rs` restored from `33e8ead`, compiles
+  (`cargo build --release -p kaplumba-engine --example alu_boost`), binary at
+  `target/release/examples/alu_boost`. Committed `d53a6d7`.
+- `scripts/gpuq status`: no model resident, 15.0 GiB reclaimable, 0 swap.
