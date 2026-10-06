@@ -699,3 +699,38 @@ mod tests {
         assert_eq!(totals.decode_tok_s, 0.0);
     }
 }
+
+#[cfg(test)]
+mod device_sampler_gate_tests {
+    use super::*;
+    use crate::sampler::{Sampler, SamplerConfig, SamplerParams};
+
+    #[test]
+    fn the_shipped_default_config_is_servable_on_device() {
+        let config = SamplerConfig::default();
+        assert_eq!(config.temperature, 1.0, "DEFAULT_TEMPERATURE is 1.0");
+        assert!(
+            SamplerParams::from_config(config, 262_144).is_ok(),
+            "the shipped default (temp 1.0, top_k 64, top_p 0.95) must reach the \
+             device sampler, or the T5/T6 gate is dead code in practice"
+        );
+    }
+
+    #[test]
+    fn an_unstagable_top_k_is_refused_not_approximated() {
+        let mut config = SamplerConfig::default();
+        config.top_k = crate::sampler::device_top_k_limit(262_144) * 2;
+        assert!(
+            SamplerParams::from_config(config, 262_144).is_err(),
+            "a top_k past the kernel's staging capacity must be refused so chat \
+             falls back to the host sampler"
+        );
+    }
+
+    #[test]
+    fn the_host_sampler_still_works_on_the_default_config() {
+        let mut sampler = Sampler::new(SamplerConfig::default(), 1).unwrap();
+        let logits: Vec<f32> = (0..1024).map(|i| -(i as f32)).collect();
+        let _ = sampler.sample(&logits).unwrap();
+    }
+}
