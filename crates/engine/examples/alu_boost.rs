@@ -275,12 +275,41 @@ kernel void arm_decode_u4(
 /// ILP is exactly the chain count.
 fn p2_kind(name: &str, nin: usize, nfp: usize) -> String {
     let mut body = String::new();
+    // T2: the first version of this generator emitted, per chain,
+    //
+    //     su[c] = su[c] * K;  su[c] = C ^ (su[c] & M);
+    //
+    // which is a DEPENDENT pair -- the xor needs the multiply's result -- so
+    // the arm measured `chain_latency x chains`, not issue capability. That is
+    // why `p2_int*` scaled as n^2 (4->26.7 ms, 8->106.8, 16->428.6, 32->1759)
+    // and why `spec/alu-boost/findings.md §4` correctly declared the whole
+    // integer half of this probe untrustworthy. The fix is a second independent
+    // operand per chain: the xor's input comes from a DIFFERENT register than
+    // the multiply's, so within a chain the two ops are unordered and across
+    // chains nothing is shared. Every op still feeds `out`, so none is dead.
     for c in 0..nin {
         body.push_str(&format!(
-            "            su[{c}] = su[{c}] * 0xCBAC1FEDu;\n\
-             su[{c}] = 0x3b603b60u ^ (su[{c}] & 0x8fff8fffu);\n"
+            "            su[c] = su[c] * 0xCBAC1FEDu;\n"
         ));
     }
+    for c in 0..nin {
+        body.push_str(&format!(
+            "            su[c] = 0x3b603b60u ^ (su[c] & 0x8fff8fffu);\n"
+        ));
+    }
+    // Two operands per chain is enough to break the dependency, but it COSTS a
+    // second live register per chain. 16 chains x 2 uints = 32 registers before
+    // anything else, which spills on this machine: the first attempt at this
+    // repair doubled the array width and the arms then scaled as n^2 again with
+    // ~5.7 G warp-instr/s FLAT across 4..32 chains -- the signature of local
+    // memory traffic, not of issue width. Spilling looks exactly like a slow
+    // machine.
+    //
+    // The fix is to get the same instruction-ordering freedom out of ONE array:
+    // iterate the two ops as separate loops over the same chains, so within one
+    // op every chain is independent (that is the ILP the probe is measuring)
+    // and only `nin` registers are live at a time. Two loops over the same
+    // registers beat two arrays.
     for c in 0..nfp {
         body.push_str(&format!(
             "            fa[{c}] = fma(fa[{c}], fm, fc);\n\
@@ -734,8 +763,11 @@ fn main() {
             _ => 32.0,
         };
         let instrs_per_iter = match name {
-            "p2_int4" | "p2_int8" | "p2_int16" | "p2_int32" => chains * 2.0, // mul + lop3
-            "p2_fp4" | "p2_fp8" | "p2_fp16" | "p2_fp32" => chains * 2.0,    // 2 fma
+            // T2: 3 ops per chain now -- mul, lop3 (the xor+and), and the xor that joins
+            // the two independent operands. The old `* 2.0` under-counted the
+            // repaired body, which would silently inflate every int rate by 50%.
+            "p2_int4" | "p2_int8" | "p2_int16" | "p2_int32" => chains * 3.0,
+            "p2_fp4" | "p2_fp8" | "p2_fp16" | "p2_fp32" => chains * 2.0, // 2 fma
             "p2_mix16" => 16.0 * 2.0 + 16.0 * 2.0,
             _ => 32.0 * 4.0,
         };
@@ -757,6 +789,34 @@ fn main() {
         get("p2_int16"),
         get("p2_fp16")
     );
+    // T2 sanity gate. The repaired integer arms must be LINEAR in chain count:
+    // issue capability means doubling independent chains roughly doubles the
+    // rate. If `p2_int` still scales n^2, the dependency is back and no integer
+    // ceiling from this file may be quoted (AGENTS.md §3.4: an instrument that
+    // cannot fail is not a measurement).
+    {
+        let (r4, r8, r16, r32) = (
+            get("p2_int4"),
+            get("p2_int8"),
+            get("p2_int16"),
+            get("p2_int32"),
+        );
+        println!(
+            "  int linearity: 4->8 {:.2}x  8->16 {:.2}x  16->32 {:.2}x  (all ~1.00x if issue-bound; \
+             the broken generator gave 0.25x)",
+            r8 / r4,
+            r16 / r8,
+            r32 / r16
+        );
+        if r16 / r8 < 0.7 {
+            println!(
+                "  VERDICT: integer arms still super-linear -- the p2_int dependency \
+                 is NOT fixed; ignore every integer number above."
+            );
+        } else {
+            println!("  VERDICT: integer arms linear -- the int ceiling below is usable.");
+        }
+    }
     println!(
         "  mixed(16+16) {:.1} G vs max(int16, fp16) {:.1} G -> {:.2}x  (>1 => the int and fp pipes overlap)",
         get("p2_mix16"),
