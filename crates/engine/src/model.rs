@@ -4072,6 +4072,18 @@ impl TextModel {
         crate::sampler::SamplerParams::from_config(config, self.vocab_size).is_ok()
     }
 
+    pub fn device_sampler_supported_config(&self, config: crate::sampler::SamplerConfig) -> bool {
+        crate::sampler::SamplerParams::from_config(config, self.vocab_size).is_ok()
+    }
+
+    /// Seed the on-device sampler RNG for a new turn / draw sequence.
+    pub fn seed_device_sampler(&mut self, seed: u64) {
+        unsafe {
+            let rng = self.scratch.rng_state.contents() as *mut u64;
+            *rng = crate::sampler::Sampler::seed_state(seed);
+        }
+    }
+
     /// Overwrite `scratch.capped` with `values`, as fp16.
     ///
     /// Exists for the sampler's own tests, which need to feed the kernels rows
@@ -4861,6 +4873,59 @@ impl TextModel {
         // the chunk after the layer GEMMs, so it gets its own boundary rather
         // than hiding inside the head's phase total.
         profile.stamp(encoder, "head/gemv")?;
+        // T5/T6: the device sampler branch. `HeadPick::Sample` never reads the
+        // raw row: softcap is NOT monotone-invariant for softmax (unlike
+        // argmax), so it must always be applied here. The draw writes the
+        // picked token into both staging buffers the pipelined loop already
+        // reads: `next_token` (consumed on-device by the next step) and
+        // `host_token` (what the host reads via `read_host_token`).
+        if let HeadPick::Sample(params) = pick {
+            self.elements
+                .encode_softcap(
+                    encoder,
+                    &self.scratch.logits,
+                    &self.scratch.capped,
+                    vocab,
+                    self.final_softcap,
+                )
+                .map_err(ModelError::Kernel)?;
+            profile.stamp(encoder, "head/softcap")?;
+            self.elements
+                .encode_sample_topk_blocks(
+                    encoder,
+                    &self.scratch.capped,
+                    &self.scratch.sample_candidates,
+                    vocab,
+                    params.top_k as usize,
+                )
+                .map_err(ModelError::from)?;
+            let (next_token, host_token, ranked, step_idx) = match out {
+                Some(ref o) => (
+                    Some(o.next_token),
+                    Some(o.host_token),
+                    Some(&self.scratch.ranked_tokens),
+                    o.step_idx,
+                ),
+                None => (None, None, Some(&self.scratch.ranked_tokens), 0),
+            };
+            self.elements
+                .encode_sample_draw(
+                    encoder,
+                    &self.scratch.sample_candidates,
+                    &self.scratch.rng_state,
+                    next_token,
+                    host_token,
+                    ranked,
+                    vocab,
+                    params.top_k as usize,
+                    params.temperature,
+                    params.top_p,
+                    step_idx,
+                )
+                .map_err(ModelError::from)?;
+            profile.stamp(encoder, "head/sample")?;
+            return Ok(());
+        }
         // THE row this pick reads. Derived from `pick`, not from whether the
         // caller happens to have a staging buffer -- see `HeadPick`. Before this
         // was `pick`-independent, `Sample` inherited argmax's licence to read

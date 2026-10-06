@@ -385,7 +385,22 @@ impl<'a> ChatSession<'a> {
         // `KAPLUMBA_NO_PIPELINE` restores the barrier-per-token loop. It is the
         // control for exactly this attribution, which is why it exists rather
         // than the slow path being deleted.
-        let pipelined = self.greedy && std::env::var_os("KAPLUMBA_NO_PIPELINE").is_none();
+        // T5/T6: the pipelined loop now serves temperature > 0 when the device
+        // sampler can stage the top_k this model + config need. Greedy is
+        // byte-identical either way; the barrier-per-token loop stays as the
+        // A/B control (`KAPLUMBA_NO_PIPELINE`) and the fallback for unstagable
+        // top_k.
+        let device_params = if self.greedy {
+            None
+        } else {
+            crate::sampler::SamplerParams::from_config(
+                self.sampler.config(),
+                self.model.vocab_size(),
+            )
+            .ok()
+        };
+        let pipelined = (self.greedy || device_params.is_some())
+            && std::env::var_os("KAPLUMBA_NO_PIPELINE").is_none();
 
         if pipelined {
             let queue = self.model.forward_queue().clone();
@@ -415,7 +430,21 @@ impl<'a> ChatSession<'a> {
             // The first generated token comes from the prefill's own argmax,
             // read back with the logits above. It is the only token the host
             // supplies to the model; every later one is staged on the GPU.
-            let mut token = argmax_logits(&logits);
+            let mut token = if self.greedy {
+                argmax_logits(&logits)
+            } else {
+                let last: Vec<f32> = logits
+                    .iter()
+                    .map(|bits| half::f16::from_bits(*bits).to_f32())
+                    .collect();
+                self.sampler.sample(&last)?
+            };
+            if device_params.is_some() {
+                // Seed the device sampler from the host sampler's position in
+                // the same sequence, AFTER the host drew the first token.
+                let state = self.sampler.state();
+                self.model.seed_device_sampler(state);
+            }
             // The encoder for step N-1, submitted but not yet waited on. Exactly two
             // steps are in flight at any moment: `prev`, and the one this iteration
             // is about to build.
@@ -468,7 +497,18 @@ impl<'a> ChatSession<'a> {
                         if step == 0 { Some(token) } else { None },
                         step % 2,
                         step as u32,
-                        crate::model::HeadPick::Argmax,
+                        if self.greedy {
+                            crate::model::HeadPick::Argmax
+                        } else {
+                            match device_params {
+                                Some(params) => crate::model::HeadPick::Sample(params),
+                                // Unstagable top_k: this call is only reachable
+                                // when the device path is unsupported, in which
+                                // case `pipelined` is false. Keep the arm for
+                                // type completeness; it must be unreachable.
+                                None => crate::model::HeadPick::Argmax,
+                            }
+                        },
                     )
                     .map_err(ModelError::from)?;
                 encoder.commit_terminal().map_err(ModelError::from)?;

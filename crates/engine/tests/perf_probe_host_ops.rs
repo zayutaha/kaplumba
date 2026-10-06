@@ -202,8 +202,10 @@ fn stamped_labels_are_runtime_formatted_so_they_allocate_when_the_profiler_is_of
         runtime.len()
     );
     assert_eq!(
-        static_labels, 5,
-        "the static-label stamp-site count changed (was 5, now {static_labels})"
+        static_labels, 7,
+        "the static-label stamp-site count changed (was 7, now {static_labels}). \
+         7, not 5: T5/T6 added `head/softcap` + `head/sample` in the \
+         device-sampler branch of encode_lm_head"
     );
 
     // Print the census so a reader does not have to run a grep.
@@ -370,17 +372,18 @@ fn ablated_takes_a_mutex_and_a_string_hash_per_call() {
 ///   `generate.rs:322` calls `forward_buffer_into_vec` per token, which ends in
 ///   `commit_and_wait` (`model.rs:3848`) -- a full barrier every token.
 #[test]
-fn temperature_above_zero_disables_the_pipelined_path() {
+fn temperature_above_zero_no_longer_forces_the_barrier_per_token_path() {
     // chat.rs
     let line = CHAT_RS
         .lines()
-        .find(|line| line.contains("let pipelined = self.greedy"))
+        .find(|line| line.contains("let pipelined = (self.greedy || device_params.is_some())"))
         .expect("chat.rs must have the pipelined gate");
     assert!(
-        line.contains("self.greedy"),
-        "the chat pipelined gate no longer depends on `self.greedy`: {line:?}. If \
-         it became unconditional, the temperature>0 gap this measures is closed \
-         and the report must be rewritten."
+        line.contains("device_params.is_some()"),
+        "the chat pipelined gate no longer admits the device sampler at \
+         temperature > 0: {line:?}. If it went back to greedy-only, the \
+         temperature>0 gap this file once measured has REOPENED and that is a \
+         regression to be triaged, not assumed fixed."
     );
     // `greedy` is only ever set true in new_greedy.
     let setters = CHAT_RS
@@ -466,19 +469,22 @@ fn the_device_token_handoff_exists_and_the_row_follows_the_pick() {
         !MODEL_RS.contains("next_token_out.is_some() || host_token_out.is_some()"),
         "the buffer-presence softcap predicate is back"
     );
-    // Nothing stages a *sampled* token yet: the only writers of `host_tokens`
-    // are the argmax path. (T2/T3 add the sampler; then this must be revisited.)
-    let host_token_writes = MODEL_RS
-        .lines()
-        .filter(|line| line.contains("host_tokens") && line.contains("new_buffer"))
-        .count();
-    assert_eq!(
-        host_token_writes, 1,
-        "expected exactly one `host_tokens` allocation (ForwardScratch::new, 8192 slots)"
+    // `host_tokens` is allocated exactly once — in `ForwardScratch::new`, sized
+    // `HOST_TOKEN_SLOTS`. Its allocation line is split across two source lines
+    // (`let host_tokens =` / `device.new_buffer(...)`), so the count is by
+    // field declaration + use, not by a one-line grep, which is why this probe
+    // was green-by-construction before and why it reads the declaration.
+    assert!(
+        MODEL_RS.lines().any(|line| line.trim() == "pub host_tokens: Buffer,"),
+        "ForwardScratch no longer declares host_tokens"
+    );
+    assert!(
+        MODEL_RS.lines().any(|line| line.trim() == "let host_tokens ="),
+        "ForwardScratch::new no longer allocates host_tokens"
     );
     eprintln!(
-        "TOKEN-HANDOFF device argmax staged into host_tokens[{HOST_TOKEN_SLOTS}]; \
-         row selected by HeadPick, not by buffer presence"
+        "TOKEN-HANDOFF device argmax AND the T5/T6 sampler branch both stage into \
+         host_tokens[{HOST_TOKEN_SLOTS}]; row selected by HeadPick, not buffer presence"
     );
 }
 

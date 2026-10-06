@@ -368,7 +368,7 @@ const INVARIANTS: &[Invariant] = &[
     Invariant {
         what: "chat.rs gates pipelining on greedy",
         file: "engine/src/chat.rs",
-        needle: "let pipelined = self.greedy &&",
+        needle: "let pipelined = (self.greedy || device_params.is_some())",
         breaks: "Not a queue invariant, but it is why P06 exists: at the CLI default \
                  temperature of 1.0 the pipelined loop is unreachable.",
     },
@@ -1096,8 +1096,9 @@ fn temperature_positive_is_the_default_and_is_not_pipelined() {
     // chat gates on self.greedy, set only by ChatSession::new_greedy, which
     // cli/src/chat.rs calls only at temperature 0.
     assert!(
-        CHAT_RS.contains("let pipelined = self.greedy && std::env::var_os(\"KAPLUMBA_NO_PIPELINE\").is_none();"),
-        "chat.rs:388"
+        CHAT_RS.contains("device_params.is_some()"),
+        "chat.rs must admit the device sampler at temperature > 0; greedy-only \
+         gating is the regression class this probe guards"
     );
     assert!(
         CHAT_RS.contains("let token = if self.greedy {"),
@@ -1365,7 +1366,7 @@ fn the_verdict_survives_sabotage_and_the_sabotages_are_detected() {
 /// Sampling is entirely host-side. The device has an argmax; it has no top-k,
 /// no softmax and no RNG.
 #[test]
-fn no_device_side_sampler_exists() {
+fn device_side_sampler_exists_and_the_decode_head_dispatches_it() {
     // The argmax chain IS device-side, and sits inside forward_chunk.
     for needle in [
         "kernel void argmax_clear",
@@ -1377,24 +1378,21 @@ fn no_device_side_sampler_exists() {
             "{needle} should exist: the argmax is device-side"
         );
     }
-    // No sampling kernel. `softcap` is a tanh softcap on the logits, not a
-    // softmax, so it does not count.
-    for forbidden in [
-        "kernel void top_k",
-        "kernel void topk",
-        "kernel void softmax",
-        "kernel void sample",
-        "kernel void multinomial",
-        "kernel void philox",
-        "kernel void rng",
-        "kernel void gumbel",
-        "kernel void categorical",
-    ] {
+    // The sampler kernels, unlike the `softcap` tanh, DO exist now.
+    //
+    // SUPERSEDED (T5/T6): this probe used to assert that no sampling kernel
+    // exists at all, because P06's "the host must widen 262,144 fp16 and sample
+    // every token" arithmetic depended on it. `sample_topk_blocks` /
+    // `sample_draw` landed in `elements.metal` (`:755`, `:851`) and T5/T6 wired
+    // them into the decode head, so that verdict no longer holds for the
+    // temperature>0 path: the row is staged and drawn on device. P06's per-token
+    // host cost is still the *host sampler's*, kept as the control arm
+    // (`KAPLUMBA_NO_PIPELINE`) for unstagable top_k.
+    for required in ["kernel void sample_topk_blocks", "kernel void sample_draw"] {
         assert!(
-            !ELEMENTS_METAL.contains(forbidden),
-            "{forbidden} appeared in elements.metal. If a device sampler now \
-             exists, P06's arithmetic changes and this file's verdict must be \
-             re-derived."
+            ELEMENTS_METAL.contains(required),
+            "{required} vanished from elements.metal; T5/T6's head branch \
+             dispatches it, so its absence is a silent no-op, not a fallback."
         );
     }
     // The whole of `sampler.rs` is host code.
@@ -1432,21 +1430,13 @@ fn no_device_side_sampler_exists() {
         .filter_map(|line| line.trim().strip_prefix("kernel void "))
         .filter_map(|rest| rest.split('(').next())
         .collect();
-    eprintln!("=== elements.metal: {} kernels, none of them a sampler ===\n  {}",
+    eprintln!("=== elements.metal: {} kernels, sampler included ===\n  {}",
         kernels.len(), kernels.join("\n  "));
+    // 27, not 25: T5/T6 landed `sample_topk_blocks` + `sample_draw`.
     assert_eq!(
         kernels.len(),
-        25,
-        "the kernel list changed; check whether a sampler was added before \
-         trusting the absence assertion above"
-    );
-    assert!(
-        !kernels.iter().any(|name| {
-            let n = name.to_ascii_lowercase();
-            n.contains("top_k") || n.contains("topk") || n.contains("softmax")
-                || n.contains("sample") || n.contains("rng")
-        }),
-        "a kernel in {kernels:?} looks like a sampler; re-derive P06"
+        27,
+        "the kernel list changed; re-derive P06 and the sampler census"
     );
 }
 
