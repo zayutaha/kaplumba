@@ -209,3 +209,13 @@ which was explicitly ruled out.
   `arm_decode_h2` 0.931× (dead, not bit-exact). Control drift 80.6% — box
   noisy, but ratio reproduced. p2_int still scales n² (instrument untrustworthy
   for int); p2_fp plateaus ~118 G warp-instr/s. → R1 lives, proceed to T2.
+- **T2 (2026-10-06): landed, null e2e delta.** Widened the four remaining
+  2-trip kernels (`_colmajor_1col_sk2:2447`, `_colmajor_2col_sk2:2503`,
+  `_colmajor_2col_sk4:2717`, `_fused2_2col:434`) to 4-trip via exact body
+  duplication (per-thread tile order and mapping unchanged → bit-exact by
+  construction). `repacked_golden`, `fused_bit_exact` (3 pass),
+  `live_kernel_bit_exact` all green. Greedy run: 15.872 vs T0's 15.842 —
+  within noise. Note: the kernels the engine *actually* reaches most
+  (`_colmajor_contig4:1992`, `_fused2:320`, `_colmajor:79`) were ALREADY
+  4-trip unrolled, so R1's incremental value was always small; the synthetic
+  1.096× did not transfer. AC1 still gated on 16-pair A/B.
