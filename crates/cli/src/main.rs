@@ -1,5 +1,6 @@
 mod args;
 mod chat;
+mod paste;
 mod report;
 
 use std::env;

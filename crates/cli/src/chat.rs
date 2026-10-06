@@ -1,4 +1,4 @@
-use std::io::{self, BufRead, Write};
+use std::io::{self, Write};
 
 use kaplumba_engine::chat::{ChatRole, ChatSession};
 use kaplumba_engine::config::load_generation_config;
@@ -8,6 +8,7 @@ use kaplumba_engine::sampler::SamplerConfig;
 use kaplumba_engine::tokenizer::GemmaTokenizer;
 
 use crate::args::CliArgs;
+use crate::paste::TurnReader;
 
 const HELP: &str = "commands: /help /exit (/quit) /reset /history /stats";
 
@@ -16,6 +17,10 @@ fn print_help() {
     println!("  /reset    forget the conversation and start over");
     println!("  /history  show the conversation so far, with token counts");
     println!("  /stats    context used / limit, turns, last-turn and session tok/s");
+    println!();
+    println!("  Paste as much text as you like — every line of a paste is sent as one");
+    println!("  turn, and the line count is reported back. Type a line and press");
+    println!("  enter as usual.");
 }
 
 pub fn run(
@@ -58,20 +63,28 @@ pub fn run(
         "kaplumba chat (model loaded in {load_ms:.0} ms, {}k context). {HELP}",
         session.context_limit() / 1024
     );
-    let stdin = io::stdin();
-    let mut lines = stdin.lock().lines();
+    let mut reader = TurnReader::new();
     loop {
         print!("> ");
         io::stdout().flush().map_err(|error| error.to_string())?;
-        let line = match lines.next() {
-            None => break, // EOF (Ctrl-D) exits cleanly.
-            Some(line) => line.map_err(|error| error.to_string())?,
+        // `read_turn` joins an interactive paste into one turn, so a pasted page
+        // is answered once instead of once per line.
+        let turn = match reader.read_turn() {
+            Ok(None) => break, // EOF (Ctrl-D) exits cleanly.
+            Ok(Some(turn)) => turn,
+            Err(error) => return Err(error.to_string()),
         };
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        // Reported before the turn runs, so a long paste is legible as one
+        // block instead of being inferred from scrolled-back terminal echo.
+        if let Some(summary) = turn.summary() {
+            println!("{summary}");
+        }
+        if turn.is_empty() {
             continue;
         }
-        if let Some(command) = trimmed.strip_prefix('/') {
+        // A command only when it is the whole turn: a pasted block that happens
+        // to start with `/` is text to answer, not a command to run.
+        if let Some(command) = turn.is_command().then(|| turn.text.trim()).and_then(|t| t.strip_prefix('/')) {
             match command.to_ascii_lowercase().as_str() {
                 "help" => print_help(),
                 "exit" | "quit" => {
@@ -95,7 +108,7 @@ pub fn run(
         };
         // A failed turn returns to the prompt; only a failed load is fatal,
         // and the load already happened above.
-        match session.turn(&line, stream) {
+        match session.turn(&turn.text, stream) {
             Ok(_) => {
                 println!();
                 // Per turn, not only at exit. A tok/s figure you can only see by
