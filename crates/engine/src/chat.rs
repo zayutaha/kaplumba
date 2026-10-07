@@ -450,12 +450,8 @@ impl<'a> ChatSession<'a> {
             // is about to build.
             let mut prev: Option<kaplumba_kernels::encoder::MetalEncoder> = None;
             let mut step: usize = 0;
-            let mut t_encode = std::time::Duration::ZERO;
-            let mut t_wait = std::time::Duration::ZERO;
-            let mut t_detok = std::time::Duration::ZERO;
 
             loop {
-                let _t0 = std::time::Instant::now();
                 // Order matters and was wrong until T2: encode step N+1, commit
                 // it, and ONLY THEN wait on step N. This loop used to wait on
                 // `prev` at the top of the iteration, before building the next
@@ -497,9 +493,7 @@ impl<'a> ChatSession<'a> {
                     enc.commit_terminal().map_err(ModelError::from)?;
                     encoder = Some(enc);
                 }
-                t_encode += _t0.elapsed();
 
-                let _t1 = std::time::Instant::now();
                 if step > 0 {
                     // Step N-1 is now committed and this step's encode is
                     // already submitted, so the wait below overlaps step N+1's
@@ -510,14 +504,12 @@ impl<'a> ChatSession<'a> {
                     previous.wait();
                     token = self.model.read_host_token(step - 1);
                 }
-                t_wait += _t1.elapsed();
                 if self.eos_ids.contains(&token) {
                     if let Some(enc) = encoder {
                         enc.wait();
                     }
                     break;
                 }
-                let _t2 = std::time::Instant::now();
                 generated.push(token);
                 if let Some(chunk) = detokenizer.push(token)? {
                     if !chunk.is_empty() {
@@ -525,7 +517,6 @@ impl<'a> ChatSession<'a> {
                         on_text(&chunk).map_err(ChatError::from_output)?;
                     }
                 }
-                t_detok += _t2.elapsed();
                 if generated.len() >= self.max_new_tokens {
                     if let Some(enc) = encoder {
                         enc.wait();
@@ -541,19 +532,6 @@ impl<'a> ChatSession<'a> {
             // position is wrong.
             if let Some(pending) = prev.take() {
                 pending.wait();
-            }
-            if std::env::var_os("KAPLUMBA_CHAT_BREAKDOWN").is_some() {
-                eprintln!(
-                    "CHAT-BREAKDOWN steps={} encode={:.1}ms wait={:.1}ms detok={:.1}ms \
-                     per-step: encode={:.2}ms wait={:.2}ms detok={:.2}ms",
-                    step,
-                    t_encode.as_secs_f64() * 1e3,
-                    t_wait.as_secs_f64() * 1e3,
-                    t_detok.as_secs_f64() * 1e3,
-                    t_encode.as_secs_f64() * 1e3 / step.max(1) as f64,
-                    t_wait.as_secs_f64() * 1e3 / step.max(1) as f64,
-                    t_detok.as_secs_f64() * 1e3 / step.max(1) as f64,
-                );
             }
             let decode_s = decode_started.elapsed().as_secs_f64();
             if let Some(chunk) = detokenizer.finish()? {
