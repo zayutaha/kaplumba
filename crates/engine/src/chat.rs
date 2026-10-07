@@ -450,22 +450,36 @@ impl<'a> ChatSession<'a> {
             // is about to build.
             let mut prev: Option<kaplumba_kernels::encoder::MetalEncoder> = None;
             let mut step: usize = 0;
-            let decode_started = std::time::Instant::now();
+            let mut last_token_instant = std::time::Instant::now();
+            let show_token_timing = std::env::var_os("KAPLUMBA_TOKEN_TIMING").is_some();
+
+            if self.eos_ids.contains(&token) {
+                let decode_s = decode_started.elapsed().as_secs_f64();
+                self.record_turn(need, 0, decode_s, &reply);
+                return Ok(reply);
+            }
+            generated.push(token);
+            if show_token_timing {
+                let now = std::time::Instant::now();
+                let delta_ms = now.duration_since(last_token_instant).as_secs_f64() * 1000.0;
+                eprintln!("\n[timing] token 1 (immediate prefill): id={} delta={:.2} ms", token, delta_ms);
+                last_token_instant = now;
+            }
+            if let Some(chunk) = detokenizer.push(token)? {
+                if !chunk.is_empty() {
+                    reply.push_str(&chunk);
+                    on_text(&chunk).map_err(ChatError::from_output)?;
+                }
+            }
 
             loop {
-                // Order matters and was wrong until T2: encode step N+1, commit
-                // it, and ONLY THEN wait on step N. This loop used to wait on
-                // `prev` at the top of the iteration, before building the next
-                // encoder, so the GPU drained to idle and sat there for the whole
-                // of the host's `forward_step_pipelined` encode every single
-                // token. `generate.rs` has always had the right order
-                // (`generate.rs:1031` commits `next_enc`, `:1033` then waits on
-                // `in_flight_enc`).
-                //
-                // The invariant that forced the bad order -- "never read a
-                // GPU-staged token before waiting on the encoder that staged it"
-                // -- is still honoured: `read_host_token` only happens after the
-                // `wait()`, it is simply not the first thing in the iteration.
+                if generated.len() >= self.max_new_tokens {
+                    if let Some(enc) = prev.take() {
+                        enc.wait();
+                    }
+                    break;
+                }
+
                 let mut encoder = None;
                 if step + 1 < self.max_new_tokens {
                     let position = (base + need + step) as u32;
@@ -496,35 +510,33 @@ impl<'a> ChatSession<'a> {
                 }
 
                 if step > 0 {
-                    // Step N-1 is now committed and this step's encode is
-                    // already submitted, so the wait below overlaps step N+1's
-                    // GPU work with step N's drain instead of idling.
                     let previous = prev
                         .take()
                         .expect("step > 0 implies a previous encoder is in flight");
                     previous.wait();
                     token = self.model.read_host_token(step - 1);
-                }
-                if self.eos_ids.contains(&token) {
-                    if let Some(enc) = encoder {
-                        enc.wait();
-                        self.model.retract_gpu_caches(1);
+                    if self.eos_ids.contains(&token) {
+                        if let Some(enc) = encoder {
+                            enc.wait();
+                            self.model.retract_gpu_caches(1);
+                        }
+                        break;
                     }
-                    break;
-                }
-                generated.push(token);
-                if let Some(chunk) = detokenizer.push(token)? {
-                    if !chunk.is_empty() {
-                        reply.push_str(&chunk);
-                        on_text(&chunk).map_err(ChatError::from_output)?;
+                    generated.push(token);
+                    if show_token_timing {
+                        let now = std::time::Instant::now();
+                        let delta_ms = now.duration_since(last_token_instant).as_secs_f64() * 1000.0;
+                        eprintln!("\n[timing] token {}: id={} delta={:.2} ms", generated.len(), token, delta_ms);
+                        last_token_instant = now;
+                    }
+                    if let Some(chunk) = detokenizer.push(token)? {
+                        if !chunk.is_empty() {
+                            reply.push_str(&chunk);
+                            on_text(&chunk).map_err(ChatError::from_output)?;
+                        }
                     }
                 }
-                if generated.len() >= self.max_new_tokens {
-                    if let Some(enc) = encoder {
-                        enc.wait();
-                    }
-                    break;
-                }
+
                 prev = encoder;
                 step += 1;
             }
