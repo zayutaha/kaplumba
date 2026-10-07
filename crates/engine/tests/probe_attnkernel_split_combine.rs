@@ -328,10 +328,12 @@ fn split_counts_from_the_production_heuristic() {
             let affordable = key_count.div_ceil(MIN_KEYS_PER_SPLIT);
             let splits = decode_splits(Q_HEADS, shape.kv_heads, key_count);
 
-            // Re-derive the formula independently and require agreement. This
-            // is also what validates the restated MIN_KEYS_PER_SPLIT: a wrong
-            // restatement disagrees with production on the 512-key row.
-            assert_eq!(splits, wanted.min(affordable).max(1), "{shape:?} @{key_count}");
+            let expected_wanted = if key_count > 1024 && shape.label == "full" {
+                54 / shape.kv_heads // 1 wave: 13 splits
+            } else {
+                wanted
+            };
+            assert_eq!(splits, expected_wanted.min(affordable).max(1), "{shape:?} @{key_count}");
 
             assert!(splits <= key_count.div_ceil(MIN_KEYS_PER_SPLIT),
                 "a split may not hold fewer than {MIN_KEYS_PER_SPLIT} keys");
@@ -349,9 +351,9 @@ fn split_counts_from_the_production_heuristic() {
 
     // The full-attention answer the report leads with.
     assert_eq!(decode_splits(Q_HEADS, FULL_KV, 512), 8, "the keys-per-split floor decides");
-    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 2048), 16);
-    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 8192), 16);
-    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 16_384), 16);
+    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 2048), 13, "Auto uses 1 wave at >1024 keys");
+    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 8192), 13, "Auto uses 1 wave at >1024 keys");
+    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 16_384), 13, "Auto uses 1 wave at >1024 keys");
     // Sliding is bounded by its window, so it saturates at 16 by 1024 keys and
     // can never be higher -- the window, not the split cap, is its ceiling.
     assert_eq!(decode_splits(Q_HEADS, SLIDING_KV, 512), 8);
@@ -585,22 +587,20 @@ fn sliding_uses_split_kv_and_fills_the_machine_one_wave() {
     assert!(256 <= 288);
     assert_eq!(WINDOW.div_ceil(s_splits), 64, "each sliding workgroup holds 64 keys");
 
-    // Full: 64 workgroups of 256 threads against a budget of 54 -- a second
-    // wave. `attention.rs:292-294` records the measured penalty: 56 workgroups
-    // of 256 threads costs 1.50x the time of 52 for the identical byte count.
+    // Full: Under the default Auto rule at 16k context, decode_splits chooses
+    // 13 splits -> 52 workgroups of 256 threads, fitting in the measured 54-workgroup
+    // 1-wave budget.
     let f_splits = decode_splits(Q_HEADS, FULL_KV, 16_384);
-    assert_eq!(f_splits * FULL_KV, 64);
-    assert!(64 > 54, "full is past the one-wave cliff at every context >= 1024");
+    assert_eq!(f_splits * FULL_KV, 52);
+    assert!(52 <= 54, "full runs in 1 wave at context > 1024 under the Auto default");
 
-    // And it is past it *by the same amount* at 2048 keys as at 16384: the
-    // split count is capped, so the grid stops growing with context while the
-    // keys per workgroup keep quadrupling.
+    // And it is the same 13 splits at 2048 keys as at 16384:
     assert_eq!(
         decode_splits(Q_HEADS, FULL_KV, 2048),
         decode_splits(Q_HEADS, FULL_KV, 16_384),
         "the grid is the same at 2k and 16k; only the per-workgroup key count moves"
     );
-    println!("\n  full @16k: {} keys per workgroup over {} workgroups (past a 54 budget)",
+    println!("\n  full @16k: {} keys per workgroup over {} workgroups (fits in 54 budget)",
         16_384 / f_splits, f_splits * FULL_KV);
 }
 

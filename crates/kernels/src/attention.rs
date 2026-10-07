@@ -514,20 +514,23 @@ pub fn decode_splits(q_heads: usize, kv_heads: usize, key_count: usize) -> usize
 /// Which arithmetic [`decode_splits`] uses. See [`decode_split_rule`].
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum DecodeSplitRule {
-    /// The historical `ATTENTION_DECODE_THREADS_TARGET / (32 * q_heads)`. The
-    /// default, and bit-identical to what shipped before `kv_heads` was passed in.
+    /// Automatically use one-wave workgroup budget at long context (> 1024 keys),
+    /// while retaining historical thread target at short context (<= 1024 keys).
+    Auto,
+    /// The historical `ATTENTION_DECODE_THREADS_TARGET / (32 * q_heads)`.
     ThreadTarget,
     /// One wave of workgroups, sized by [`decode_one_wave_workgroups`].
     WorkgroupsPerCore,
 }
 
 /// `KAPLUMBA_DECODE_SPLIT_RULE` -> the arithmetic to use. Default
-/// [`DecodeSplitRule::ThreadTarget`].
+/// [`DecodeSplitRule::Auto`].
 ///
 /// | value | rule |
 /// |---|---|
-/// | unset, empty, `0`, `off`, `false`, `no`, `threads`, `legacy` | thread target (default) |
-/// | `workgroups`, `waves`, `one_wave`, `1`, `on`, `true`, `yes`, `auto` | one-wave workgroup budget |
+/// | unset, empty, `auto` | auto: 1 wave for > 1024 keys, thread target <= 1024 (default) |
+/// | `threads`, `legacy`, `0`, `off`, `false`, `no` | thread target |
+/// | `workgroups`, `waves`, `one_wave`, `1`, `on`, `true`, `yes` | one-wave workgroup budget |
 ///
 /// Parsed as a function so it is testable without touching the process
 /// environment, which Rust 2024 makes `unsafe` and which every other test in
@@ -537,10 +540,12 @@ pub enum DecodeSplitRule {
 /// change the numerics of the model.
 pub fn parse_split_rule(raw: &str) -> DecodeSplitRule {
     match raw.trim() {
-        "workgroups" | "waves" | "one_wave" | "1" | "on" | "true" | "yes" | "auto" => {
+        "auto" | "" => DecodeSplitRule::Auto,
+        "workgroups" | "waves" | "one_wave" | "1" | "on" | "true" | "yes" => {
             DecodeSplitRule::WorkgroupsPerCore
         }
-        _ => DecodeSplitRule::ThreadTarget,
+        "threads" | "legacy" | "0" | "off" | "false" | "no" => DecodeSplitRule::ThreadTarget,
+        _ => DecodeSplitRule::Auto,
     }
 }
 
@@ -554,7 +559,7 @@ pub fn decode_split_rule() -> DecodeSplitRule {
         std::env::var("KAPLUMBA_DECODE_SPLIT_RULE")
             .ok()
             .as_deref()
-            .map_or(DecodeSplitRule::ThreadTarget, parse_split_rule)
+            .map_or(DecodeSplitRule::Auto, parse_split_rule)
     })
 }
 
@@ -605,8 +610,11 @@ fn decode_splits_with(
         (DecodeSplitRule::WorkgroupsPerCore, Some(budget)) => {
             (budget / kv_heads).clamp(1, ATTENTION_SPLITS_MAX)
         }
-        // Either the default rule, or a width whose budget was never measured:
-        // the historical thread target, which is what ships.
+        (DecodeSplitRule::Auto, Some(budget)) if key_count > 1024 => {
+            (budget / kv_heads).clamp(1, ATTENTION_SPLITS_MAX)
+        }
+        // Either the thread target rule, short context in auto mode, or a width
+        // whose budget was never measured: the historical thread target.
         _ => {
             (ATTENTION_DECODE_THREADS_TARGET / (32 * q_heads.max(1))).clamp(1, ATTENTION_SPLITS_MAX)
         }
@@ -2076,17 +2084,14 @@ mod tests {
         wanted.clamp(1, ATTENTION_SPLITS_MAX).min(affordable).max(1)
     }
 
-    /// **The default must not move.** The one-wave rule is 1.34x faster on the
-    /// full-attention layers and it is *not* the default, because it changes the
-    /// token stream: the combine pass sums the per-split partials in a different
-    /// order and floating-point addition is not associative. So the shipped
-    /// default has to evaluate to the old arithmetic for every shape, and this
-    /// is where that is asserted rather than intended.
+    /// **Short context preserves legacy thread target.** The one-wave rule is 1.34x faster on the
+    /// full-attention layers at long context, but for short context (<= 1024 keys) the default
+    /// Auto rule preserves historical thread target arithmetic so short prompts are bit-identical.
     ///
     /// The reference is `legacy_thread_target`, i.e. the pre-change code's
     /// expression, not a transcribed table.
     #[test]
-    fn the_default_is_the_thread_target_and_the_one_wave_rule_is_opt_in() {
+    fn the_default_is_auto_matching_thread_target_at_short_context() {
         for (q, kv) in [
             (SLIDING_Q, SLIDING_KV),
             (FULL_Q, FULL_KV),
@@ -2094,17 +2099,20 @@ mod tests {
             (48, 6),
             (32, 32),
         ] {
-            for key_count in [1usize, 64, 65, 512, 1024, 2048, 4096, 8192] {
+            for key_count in [1usize, 64, 65, 512, 1024] {
                 assert_eq!(
-                    default_chosen(q, kv, key_count),
+                    decode_splits_with(q, kv, key_count, None, DecodeSplitRule::Auto),
                     legacy_thread_target(q, key_count),
-                    "{q}q/{kv}kv @{key_count}: the DEFAULT rule changed, which changes \
-                     the model's output and was not authorised",
+                    "{q}q/{kv}kv @{key_count}: auto mode at <= 1024 must match legacy thread target",
                 );
             }
         }
-        // And the two rules genuinely differ where they are meant to, so this
-        // test cannot pass by both being the same number.
+        // At long context (> 1024), Auto on full layers switches to 1 wave (13 splits).
+        assert_eq!(
+            decode_splits_with(FULL_Q, FULL_KV, 8192, None, DecodeSplitRule::Auto),
+            13
+        );
+        // While explicit ThreadTarget stays at 16 splits.
         assert_eq!(default_chosen(FULL_Q, FULL_KV, 8192), 16);
         assert_eq!(chosen(FULL_Q, FULL_KV, 8192), 13);
     }
@@ -2126,7 +2134,6 @@ mod tests {
             "on",
             "true",
             "yes",
-            "auto",
             " workgroups ",
         ] {
             assert_eq!(
@@ -2135,14 +2142,10 @@ mod tests {
                 "{on:?} should select the one-wave rule",
             );
         }
-        for off in [
+        for auto in [
             "",
-            "0",
-            "off",
-            "false",
-            "no",
-            "threads",
-            "legacy",
+            "auto",
+            " auto ",
             "abc",
             "2",
             "0x1",
@@ -2153,9 +2156,16 @@ mod tests {
             "Workgroups",
         ] {
             assert_eq!(
-                parse_split_rule(off),
+                parse_split_rule(auto),
+                DecodeSplitRule::Auto,
+                "{auto:?} must fall back to the shipped Auto default",
+            );
+        }
+        for threads in ["threads", "legacy", "0", "off", "false", "no"] {
+            assert_eq!(
+                parse_split_rule(threads),
                 DecodeSplitRule::ThreadTarget,
-                "{off:?} must fall back to the shipped default",
+                "{threads:?} should select ThreadTarget",
             );
         }
     }
