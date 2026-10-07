@@ -189,3 +189,66 @@ is in the state every rate in this spec assumes. T1 may proceed.
 Pre-registered decision rule, restated before the run: `bw_ratio ≈ 0.5` →
 bits-per-code is the whole story (T5 is the work); `bw_ratio ≈ 1.0` → the
 head's advantage is shape (T5 dead).
+
+## 11. T1 — Control R: six defects, then a physically impossible number
+
+The probe has now been *run*. It had never been executed, and it was broken in
+six independent ways. All six are in commit `d765774`.
+
+| # | defect | symptom | fix |
+|---|---|---|---|
+| 1 | `assert_live` read `scratch.output` as `u16` and ran `half::f16::from_bits` on each half | reinterpreted f32 as fp16; a 5-bit all-ones exponent hits ~1/32 per half, so with 262144 outputs `finite=false` **always** | read as `f32` |
+| 2 | `Scratch::new` sized `output: n * 2` (fp16) while every epilogue writes `device float *y` | half the buffer the kernel writes | `n * 4`; `raw`/`raw_b` two lines above already used `* 2 * 4`, which is what made it visible |
+| 3 | `dispatch_row` used `row.bits()` (declared rate) while `load_row` overrode the buffer's rate | `decodes 3 bpw but the request is 6 bpw` — the control **could not run at all** | `Loaded.bits`, the overridden rate |
+| 4 | kernel name built as `linear_gemv_ishizuki_k6` | that kernel does not exist; the lookup found nothing and the "timed" dispatch did nothing | `..._k6_colmajor_contig4_bench`, and the 3 bpw arm named `_k3_colmajor_contig4` |
+| 5 | `Row::bytes()` used `shape.weight_bytes()`, i.e. the declared rate | 3 bpw arm credited 6 bpw bytes → **411.4 GB/s = 1.51x the 273 GB/s pin rate** | `Row::loaded_bits` + `weight_bytes_at(shape, bits)` |
+| 6 | liveness checked `output` for `Route::Named` rows, which accumulate into `raw` and never finalize | "half written" — actually `output` was never the destination | `Scratch::liveness_buffer(row)` |
+
+Defect 6 was the expensive one: it produced a symptom indistinguishable from a
+kernel defect, and I chased the kernel for two rounds before isolating it with
+`probe_k6_half_output.rs`, which poisons a buffer with `-1.0e30` and dispatches
+`_k6_colmajor_contig4_bench` directly:
+
+```
+k6 direct: n=262144 groups=16384 written=262144 nonzero=262144
+first untouched index: None      last written index: Some(262143)
+```
+
+**The kernel covers every output slot.** All four symptoms were the harness.
+
+### The one thing still wrong, handed to an agent
+
+```
+ctl:head @6bpw   4.114 ms   256.9 GB/s   342.5 Gcodes/s   B/code=0.750
+ctl:head @3bpw   2.569 ms   411.4 GB/s   548.6 Gcodes/s   B/code=0.375
+Control R: bw_ratio 1.602   code_ratio 3.203
+```
+
+`B/code` is now correct and the 6 bpw arm (256.9 GB/s) sits exactly where
+`crux.md` says the head should be. But **411.4 GB/s exceeds the wire**, so the
+3 bpw arm is still not measuring what it claims.
+
+Leading hypothesis, **unverified**: `_k3_colmajor_contig4` strides
+`WORDS = (256*3)/32 = 24` u32 = 96 B/tile while
+`_k6_colmajor_contig4_bench` strides `48` u32 = 192 B/tile, and lm_head is
+**row-major** (`perm_mode` 0) while both dispatched kernels are the **colmajor**
+ones. If the production head does not use a colmajor kernel, both arms of
+Control R are measuring the wrong kernel and the control's premise is wrong —
+which would be a finding, not a failure.
+
+Decided by measurement, not argument: poison the buffer, dispatch, and map
+which words the kernel consumed. That answers "what does it actually read"
+without an arithmetic dispute.
+
+## 12. Self-correction: a 2-point fit I nearly built a plan on
+
+Separating each measured shape into `streaming + fixed per-dispatch` costs two
+points per kernel family. Fitting fused2 on `qkv` and `gate_up` gave a tidy
+`244.0 GB/s + 0.0715 ms/dispatch`, predicting both inputs *exactly* — as it
+must, being a 2-equation solve for 2 parameters — and implying
+**4.29 ms/step** of recoverable fixed cost, +1.15 tok/s.
+
+`qk_proj` is a third fused2 shape. It is off by **+8.4%**, so a single fixed
+cost does not describe the family. **The +1.15 tok/s is not established and no
+task was built on it.** Recorded because the failure mode is seductive: two
+points, two parameters, a perfect fit, and a physically plausible number.
