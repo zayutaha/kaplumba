@@ -2944,27 +2944,17 @@ kernel void linear_gemv_ishizuki_k3_colmajor_2col_sk2(
                 const device uint *t0_1 = col1 + (tk + 0u) * stride;
                 const device uint *t1_1 = col1 + (tk + 1u) * stride;
 
-                float v[8];
-                const uint w0_0_0 = t0_0[j0], w0_0_1 = t0_0[j1];
-                const uint w1_0_0 = t1_0[j0], w1_0_1 = t1_0[j1];
-                const uint w0_1_0 = t0_1[j0], w0_1_1 = t0_1[j1];
-                const uint w1_1_0 = t1_1[j0], w1_1_1 = t1_1[j1];
-
-                extract_v_mcg_32(w0_0_0, w0_0_1, sh0, rsh0, v);
-                acc0_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
-                acc0_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
-
-                extract_v_mcg_32(w1_0_0, w1_0_1, sh0, rsh0, v);
-                acc0_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
-                acc0_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
-
-                extract_v_mcg_32(w0_1_0, w0_1_1, sh0, rsh0, v);
-                acc1_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
-                acc1_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
-
-                extract_v_mcg_32(w1_1_0, w1_1_1, sh0, rsh0, v);
-                acc1_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
-                acc1_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+                decode_and_accum_4tile_2col(
+                    t0_0[j0], t0_0[j1],
+                    t1_0[j0], t1_0[j1],
+                    t0_1[j0], t0_1[j1],
+                    t1_1[j0], t1_1[j1],
+                    sh0, rsh0,
+                    p00, p01, p02, p03,
+                    p10, p11, p12, p13,
+                    acc0_0, acc0_1,
+                    acc1_0, acc1_1
+                );
             }
 
             // Trip 1: tk+step, tk+step+1
@@ -2980,27 +2970,17 @@ kernel void linear_gemv_ishizuki_k3_colmajor_2col_sk2(
                 const device uint *u0_1 = col1 + (tkx + 0u) * stride;
                 const device uint *u1_1 = col1 + (tkx + 1u) * stride;
 
-                float v[8];
-                const uint x0_0_0 = u0_0[j0], x0_0_1 = u0_0[j1];
-                const uint x1_0_0 = u1_0[j0], x1_0_1 = u1_0[j1];
-                const uint x0_1_0 = u0_1[j0], x0_1_1 = u0_1[j1];
-                const uint x1_1_0 = u1_1[j0], x1_1_1 = u1_1[j1];
-
-                extract_v_mcg_32(x0_0_0, x0_0_1, sh0, rsh0, v);
-                acc0_0 += q00 * v[0] + q01 * v[1] + q02 * v[2] + q03 * v[3];
-                acc0_1 += q00 * v[4] + q01 * v[5] + q02 * v[6] + q03 * v[7];
-
-                extract_v_mcg_32(x1_0_0, x1_0_1, sh0, rsh0, v);
-                acc0_0 += q10 * v[0] + q11 * v[1] + q12 * v[2] + q13 * v[3];
-                acc0_1 += q10 * v[4] + q11 * v[5] + q12 * v[6] + q13 * v[7];
-
-                extract_v_mcg_32(x0_1_0, x0_1_1, sh0, rsh0, v);
-                acc1_0 += q00 * v[0] + q01 * v[1] + q02 * v[2] + q03 * v[3];
-                acc1_1 += q00 * v[4] + q01 * v[5] + q02 * v[6] + q03 * v[7];
-
-                extract_v_mcg_32(x1_1_0, x1_1_1, sh0, rsh0, v);
-                acc1_0 += q10 * v[0] + q11 * v[1] + q12 * v[2] + q13 * v[3];
-                acc1_1 += q10 * v[4] + q11 * v[5] + q12 * v[6] + q13 * v[7];
+                decode_and_accum_4tile_2col(
+                    u0_0[j0], u0_0[j1],
+                    u1_0[j0], u1_0[j1],
+                    u0_1[j0], u0_1[j1],
+                    u1_1[j0], u1_1[j1],
+                    sh0, rsh0,
+                    q00, q01, q02, q03,
+                    q10, q11, q12, q13,
+                    acc0_0, acc0_1,
+                    acc1_0, acc1_1
+                );
             }
 
             // Trip 2: tk+2*step, tk+2*step+1
@@ -3016,27 +2996,17 @@ kernel void linear_gemv_ishizuki_k3_colmajor_2col_sk2(
                 const device uint *y0_1 = col1 + (tky + 0u) * stride;
                 const device uint *y1_1 = col1 + (tky + 1u) * stride;
 
-                float v[8];
-                const uint y0_0_0 = y0_0[j0], y0_0_1 = y0_0[j1];
-                const uint y1_0_0 = y1_0[j0], y1_0_1 = y1_0[j1];
-                const uint y0_1_0 = y0_1[j0], y0_1_1 = y0_1[j1];
-                const uint y1_1_0 = y1_1[j0], y1_1_1 = y1_1[j1];
-
-                extract_v_mcg_32(y0_0_0, y0_0_1, sh0, rsh0, v);
-                acc0_0 += r00 * v[0] + r01 * v[1] + r02 * v[2] + r03 * v[3];
-                acc0_1 += r00 * v[4] + r01 * v[5] + r02 * v[6] + r03 * v[7];
-
-                extract_v_mcg_32(y1_0_0, y1_0_1, sh0, rsh0, v);
-                acc0_0 += r10 * v[0] + r11 * v[1] + r12 * v[2] + r13 * v[3];
-                acc0_1 += r10 * v[4] + r11 * v[5] + r12 * v[6] + r13 * v[7];
-
-                extract_v_mcg_32(y0_1_0, y0_1_1, sh0, rsh0, v);
-                acc1_0 += r00 * v[0] + r01 * v[1] + r02 * v[2] + r03 * v[3];
-                acc1_1 += r00 * v[4] + r01 * v[5] + r02 * v[6] + r03 * v[7];
-
-                extract_v_mcg_32(y1_1_0, y1_1_1, sh0, rsh0, v);
-                acc1_0 += r10 * v[0] + r11 * v[1] + r12 * v[2] + r13 * v[3];
-                acc1_1 += r10 * v[4] + r11 * v[5] + r12 * v[6] + r13 * v[7];
+                decode_and_accum_4tile_2col(
+                    y0_0[j0], y0_0[j1],
+                    y1_0[j0], y1_0[j1],
+                    y0_1[j0], y0_1[j1],
+                    y1_1[j0], y1_1[j1],
+                    sh0, rsh0,
+                    r00, r01, r02, r03,
+                    r10, r11, r12, r13,
+                    acc0_0, acc0_1,
+                    acc1_0, acc1_1
+                );
             }
 
             // Trip 3: tk+3*step, tk+3*step+1
@@ -3052,29 +3022,20 @@ kernel void linear_gemv_ishizuki_k3_colmajor_2col_sk2(
                 const device uint *z0_1 = col1 + (tkz + 0u) * stride;
                 const device uint *z1_1 = col1 + (tkz + 1u) * stride;
 
-                float v[8];
-                const uint z0_0_0 = z0_0[j0], z0_0_1 = z0_0[j1];
-                const uint z1_0_0 = z1_0[j0], z1_0_1 = z1_0[j1];
-                const uint z0_1_0 = z0_1[j0], z0_1_1 = z0_1[j1];
-                const uint z1_1_0 = z1_1[j0], z1_1_1 = z1_1[j1];
-
-                extract_v_mcg_32(z0_0_0, z0_0_1, sh0, rsh0, v);
-                acc0_0 += s00 * v[0] + s01 * v[1] + s02 * v[2] + s03 * v[3];
-                acc0_1 += s00 * v[4] + s01 * v[5] + s02 * v[6] + s03 * v[7];
-
-                extract_v_mcg_32(z1_0_0, z1_0_1, sh0, rsh0, v);
-                acc0_0 += s10 * v[0] + s11 * v[1] + s12 * v[2] + s13 * v[3];
-                acc0_1 += s10 * v[4] + s11 * v[5] + s12 * v[6] + s13 * v[7];
-
-                extract_v_mcg_32(z0_1_0, z0_1_1, sh0, rsh0, v);
-                acc1_0 += s00 * v[0] + s01 * v[1] + s02 * v[2] + s03 * v[3];
-                acc1_1 += s00 * v[4] + s01 * v[5] + s02 * v[6] + s03 * v[7];
-
-                extract_v_mcg_32(z1_1_0, z1_1_1, sh0, rsh0, v);
-                acc1_0 += s10 * v[0] + s11 * v[1] + s12 * v[2] + s13 * v[3];
-                acc1_1 += s10 * v[4] + s11 * v[5] + s12 * v[6] + s13 * v[7];
+                decode_and_accum_4tile_2col(
+                    z0_0[j0], z0_0[j1],
+                    z1_0[j0], z1_0[j1],
+                    z0_1[j0], z0_1[j1],
+                    z1_1[j0], z1_1[j1],
+                    sh0, rsh0,
+                    s00, s01, s02, s03,
+                    s10, s11, s12, s13,
+                    acc0_0, acc0_1,
+                    acc1_0, acc1_1
+                );
             }
         }
+
 
         for (; tk < k_unroll_end; tk += step) {
             const device half *xr0 = x + (tk + 0u) * 16u + r0;
