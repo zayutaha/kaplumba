@@ -450,6 +450,7 @@ impl<'a> ChatSession<'a> {
             // is about to build.
             let mut prev: Option<kaplumba_kernels::encoder::MetalEncoder> = None;
             let mut step: usize = 0;
+            let decode_started = std::time::Instant::now();
 
             loop {
                 // Order matters and was wrong until T2: encode step N+1, commit
