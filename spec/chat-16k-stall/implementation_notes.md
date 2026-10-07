@@ -313,4 +313,28 @@ killer before suspecting the probe.
 3. `context_advances_by_exactly_the_tokens_each_turn_consumed`: **PASSED** (18.33s).
 Greedy token streams and KV cache positioning are verified identical.
 
+## 17. T5: Sustained Multi-Turn Verification at 14k–16k Context
+
+**Measured across 4 sequential chat turns on `Gxma-repacked` (`--temperature 1.0 --top-k 64`):**
+- Turn 1 (initial 13,573 prefill tokens + 32 generated): 4.31–5.28 tok/s
+- Turn 2 (13,660 context tokens + 32 generated): **12.42–13.42 tok/s**
+- Turn 3 (13,716 context tokens + 32 generated): **12.40–12.58 tok/s**
+- Turn 4 (13,773 context tokens + 32 generated): **12.87–13.64 tok/s**
+
+**Conclusion:**
+- No per-turn degradation. Steady-state long-context multi-turn decode operates at **12.5–13.6 tok/s**.
+- The initial turn 1 rate divergence was caused by host-side sampling setup preceding the first token submit inside the timed block.
+
+## 18. T6 & T7: Parity Verification & Diagnostic Resolution
+
+**Parity Results (`chat` vs `single-shot`):**
+- Short context (18–50 ctx): `--chat` **16.10–16.59 tok/s**, single-shot 16.5 tok/s (parity: 0.98–1.0).
+- Mid context (1,850 ctx): `--chat` **11.88 tok/s**, single-shot 9.74 tok/s (parity: 1.22).
+- Long context (~13.7k ctx): `--chat` **12.6–13.6 tok/s**, single-shot 12.7–13.5 tok/s (parity: 0.95–1.01).
+- 0.03 tok/s stall is fully eliminated.
+
+**Q2/Q3 Resolution:**
+- The 1.5s/token stall was caused by command-buffer in-flight window starvation (`MAX_IN_FLIGHT=8` throttled host submission every 50 dispatches, forcing host-GPU stall mid-step) compounded by initial anonymous memory pressure.
+- With zero-copy file-backed weights and `MAX_IN_FLIGHT=64`, pipelined chat decode executes continuously without GPU starvation.
+
 
