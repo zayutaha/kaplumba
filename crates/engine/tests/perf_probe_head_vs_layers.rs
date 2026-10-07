@@ -183,6 +183,9 @@ struct Row {
     /// (implementation_notes.md 16.3). Recorded so production and microbenchmark
     /// get printed side by side rather than one being quoted alone again.
     microbench_gbps: Option<f64>,
+    /// The rate this row's packed buffers were built at, when a control
+    /// overrode it. `None` means "use the shape's declared rate".
+    loaded_bits: Option<u8>,
 }
 
 impl Row {
@@ -194,7 +197,15 @@ impl Row {
             groups,
             gbps: None,
             microbench_gbps: None,
+            loaded_bits: None,
         }
+    }
+
+    /// Record the rate the buffers were built at, so byte accounting matches
+    /// what the kernel actually streamed.
+    fn loaded_at(mut self, bits: u8) -> Self {
+        self.loaded_bits = Some(bits);
+        self
     }
 
     fn with_microbench(mut self, gbps: f64) -> Self {
@@ -216,6 +227,13 @@ impl Row {
         shape(&self.parts[0]).bits
     }
 
+    /// Packed weight bytes for `shape` read at `bits`, rather than at the
+    /// shape's declared rate. Mirrors `bench::Shape::weight_bytes`, which is
+    /// `tiles_k * tiles_n * 16 * bits` u16.
+    fn weight_bytes_at(s: Shape, bits: u8) -> u64 {
+        (((s.in_features / 16) * (s.out_features / 16)) as u64) * 16 * bits as u64 * 2
+    }
+
     fn tiles_k(&self) -> u64 {
         (self.k() / 16) as u64
     }
@@ -225,9 +243,17 @@ impl Row {
     }
 
     fn bytes(&self) -> u64 {
+        // Rate-override aware. This used to call `shape(p).weight_bytes()`,
+        // which uses the shape's DECLARED rate, so a control that rebuilt its
+        // buffer at 3 bpw was still credited with 6 bpw bytes: the 3 bpw arm
+        // reported 413.1 GB/s, 1.51x the 273 GB/s pin rate, i.e. physically
+        // impossible and the tell that the divisor was wrong. The measured
+        // time was correct throughout. Now the row carries the rate it was
+        // actually loaded at, set by `load_row`'s `override_bits`.
+        let rate = self.loaded_bits.unwrap_or(self.bits());
         self.parts
             .iter()
-            .map(|p| shape(p).weight_bytes())
+            .map(|p| Row::weight_bytes_at(shape(p), rate))
             .sum()
     }
 
@@ -724,7 +750,39 @@ impl Scratch {
             transformed: device.new_buffer((k * 2) as u64, shared),
             raw: device.new_buffer((n * 2 * 4) as u64, shared),
             raw_b: device.new_buffer((n * 2 * 4) as u64, shared),
-            output: device.new_buffer((n * 2) as u64, shared),
+            // `n * 4`, not `n * 2`. Every GEMV epilogue writes
+            // `device float *y` with `sum` an f32, so the output is 4 bytes
+            // per element. This was `n * 2`, sizing it as fp16 -- half the
+            // buffer the kernel writes -- which is why the liveness guard saw
+            // exactly `n/2` non-zero values and could not tell a half-written
+            // buffer from a healthy one. `raw`/`raw_b` two lines up already
+            // used `* 2 * 4`, which is what made the inconsistency visible.
+            output: device.new_buffer((n * 4) as u64, shared),
+        }
+    }
+
+    /// Fill the output buffer with a sentinel, so `assert_live`'s
+    /// "untouched" count means something. A zeroed Metal buffer cannot
+    /// distinguish "never written" from "written as zero", which is precisely
+    /// how a half-sized output buffer hid here.
+    fn poison_output(&self) {
+        unsafe {
+            for buffer in [&self.output, &self.raw] {
+                let n = buffer.length() as usize / 4;
+                let p = buffer.contents() as *mut f32;
+                for i in 0..n {
+                    *p.add(i) = SENTINEL_F32;
+                }
+            }
+        }
+    }
+
+    /// The buffer this row's kernel writes, per `assert_live`'s note: `raw` for
+    /// every ishizuki/`Named` arm, `output` for the paths that run the finalize.
+    fn liveness_buffer(&self, row: &Row) -> &Buffer {
+        match row.path {
+            Route::Named(_) => &self.raw,
+            _ => &self.output,
         }
     }
 
@@ -803,20 +861,56 @@ fn time_ms<F: FnMut(&mut MetalEncoder)>(queue: &CommandQueue, label: &str, mut d
 
 /// Refuse to report a bandwidth for a kernel that produced nothing. A dead or
 /// all-skipped dispatch would otherwise report a spectacular GB/s.
+/// Which buffer a row's kernel actually writes.
+///
+/// This matters and the original code got it wrong in a way that produced a
+/// symptom indistinguishable from a kernel defect. `Route::Named` (and every
+/// ishizuki arm) accumulates into `request.raw` and then a separate `finalize`
+/// dispatch converts `raw` into `request.output`. So:
+///   * a row dispatched via `Route::Named` must be checked on **raw**, and
+///   * only rows whose path runs the finalize (Head, and the fused paths) end
+///     up with `output` written at all.
+///
+/// Checking `output` for a `Named` row found 131072 slots still holding the
+/// sentinel and read as "the kernel wrote half its output". It wrote all of
+/// `raw`; `output` was simply never the destination. `probe_k6_half_output.rs`
+/// confirms the k6 epilogue covers every slot when dispatched directly.
 fn assert_live(output: &Buffer, n: usize, label: &str) {
-    let ptr = output.contents() as *const u16;
-    let words = unsafe { std::slice::from_raw_parts(ptr, n) };
-    let nonzero = words.iter().filter(|w| **w != 0).count();
-    let finite = words
-        .iter()
-        .all(|w| half::f16::from_bits(*w).to_f32().is_finite());
+    // f32, not fp16 pairs. `scratch.output` is `raw`/`raw_a`, an f32 buffer
+    // written by the GEMV epilogue. This function read it as `u16` and ran
+    // `half::f16::from_bits` on each half, which reinterpreted f32 bit patterns
+    // as fp16: a 5-bit all-ones exponent occurs ~1/32 of the time per half, so
+    // with 262144 outputs the guard could never pass.
+    let ptr = output.contents() as *const f32;
+    let values = unsafe { std::slice::from_raw_parts(ptr, n) };
+    // Liveness is "the output buffer was WRITTEN", not "the values are finite".
+    //
+    // This probe synthesises its buffers from non-code bytes (a re-rate control
+    // has no checkpoint tensor at the changed rate), and `decode_state_mcg`
+    // computes `float(h.x + h.y)` where `h` is a `half2` -- a HALF add. Feeding
+    // it arbitrary bit patterns produces half `inf`/`NaN` encodings, and a
+    // 5376-term accumulation propagates them. That is a property of the
+    // synthetic input, not of the kernel: bandwidth is bytes/second and every
+    // byte is genuinely read, so finiteness is the wrong liveness test here.
+    //
+    // The real liveness test is the sentinel one, in
+    // `probe_k6_half_output.rs`: poison the buffer, dispatch, and require that
+    // no slot still holds the sentinel. It proved all 262144 slots written with
+    // `first untouched: None`, i.e. the k6 epilogue has full output coverage
+    // and this file's earlier "half written" symptom was its own undersized
+    // output buffer.
+    let untouched = values.iter().filter(|v| **v == SENTINEL_F32).count();
+    let nonzero = values.iter().filter(|v| **v != 0.0).count();
     assert!(
-        nonzero > n / 2 && finite,
-        "{label}: output has {nonzero}/{n} non-zero values and finite={finite}, so \
+        nonzero > n / 2 && untouched == 0,
+        "{label}: output has {nonzero}/{n} non-zero values and {untouched} untouched, so \
          the timed kernel did not produce a result -- a GB/s figure for it would \
          be measuring an idle machine"
     );
 }
+
+/// Sentinel for `assert_live`. Chosen so a decoded value cannot land on it.
+const SENTINEL_F32: f32 = -1.0e30;
 
 // ---------------------------------------------------------------------------
 // 4. The GPU probes.
@@ -828,6 +922,10 @@ struct Loaded {
     scratch: Scratch,
     packed: Vec<Buffer>,
     kernels: &'static LinearKernels,
+    /// The rate the packed buffers were actually built at -- `row.bits()`
+    /// unless a control overrode it. Carried here so `dispatch_row` cannot
+    /// re-derive the declared rate and lose the override.
+    bits: u8,
 }
 
 /// Upload a row's weights and build its scratch.
@@ -900,6 +998,7 @@ fn load_row(device: &Device, row: Row, model: Option<&Path>, override_bits: Opti
         // every row in the process dispatches through, as in the engine. Held
         // here so no row can compile a pipeline inside a timed loop.
         kernels: LinearKernels::shared().expect("linear kernels"),
+        bits,
     }
 }
 
@@ -912,7 +1011,13 @@ fn dispatch_row(enc: &mut MetalEncoder, l: &Loaded) {
     let row = &l.row;
     let k = row.k();
     let n_out = row.n();
-    let bits = row.bits();
+    // The rate the BUFFER was built at, which for a control is the control's
+    // point: `load_row` overrides it via `override_bits`. This used to be
+    // `row.bits()`, i.e. the row's *declared* rate, so a control that re-rated
+    // its buffer to 3 bpw still dispatched a 6 bpw request and the dispatcher
+    // rejected it -- `decodes 3 bpw but the request is 6 bpw`. The control could
+    // not run at all. `Loaded::bits` is the overridden value.
+    let bits = l.bits;
     // The head is row-major (`perm_mode` 0 -- model.rs:3525-3542 sets 1 only on
     // the seven layer linears); the colmajor layer kernels need 1.
     let perm = u32::from(!row.parts.iter().any(|p| p == "lm_head"));
@@ -1008,6 +1113,12 @@ fn dispatch_row(enc: &mut MetalEncoder, l: &Loaded) {
 /// a result and a minimum is the selection effect that produced the retracted
 /// 248.5/250.7 GB/s readings.
 fn measure_row(queue: &CommandQueue, l: &Loaded) -> f64 {
+    // Poison BEFORE any dispatch, not here at the end. The sentinel only
+    // identifies an unwritten slot if the kernel has not already written it;
+    // poisoning after the timing loop made every slot hold the sentinel again
+    // and `assert_live` reported "262144 non-zero AND 262144 untouched", which
+    // is self-contradictory and was the symptom of exactly this ordering bug.
+    l.scratch.poison_output();
     let mut samples: Vec<(f64, usize)> = Vec::new();
     for _ in 0..3 {
         samples.push(time_ms(queue, &l.row.label, |enc| {
@@ -1019,7 +1130,8 @@ fn measure_row(queue: &CommandQueue, l: &Loaded) -> f64 {
     // Every row, not just the production one: the controls dispatch kernels
     // against weights they were not written for, and a control that measured a
     // dispatch which read nothing would report an enormous GB/s rather than fail.
-    assert_live(&l.scratch.output, l.row.n(), &l.row.label);
+    let live_buffer = l.scratch.liveness_buffer(&l.row);
+    assert_live(live_buffer, l.row.n(), &l.row.label);
     let gbps = l.row.bytes() as f64 / (ms * 1e-3) / 1e9;
     println!(
         "  {:<28} {:>9.3} ms/call  {:>7.1} GB/s  {:>6.1} Gcodes/s  ({reps} reps, \
@@ -1072,7 +1184,7 @@ fn head_vs_layers_run_the_production_dispatch() {
     for row in production_rows() {
         let loaded = load_row(&device, row, Some(&model), None);
         let gbps = measure_row(&queue, &loaded);
-        let mut row = loaded.row.clone();
+        let mut row = loaded.row.clone().loaded_at(loaded.bits);
         row.gbps = Some(gbps);
         rows.push(row);
     }
@@ -1110,14 +1222,22 @@ fn head_shape_at_three_bpw() {
                 "ctl:head @3bpw"
             },
             &["lm_head"],
-            Route::Named(format!(
-                "linear_gemv_ishizuki_k{}",
-                if bits == 6 { 6 } else { 3 }
-            )),
+            // The 6 bpw kernel is `_k6_colmajor_contig4_bench`
+            // (linear_repacked.metal:3815), NOT `linear_gemv_ishizuki_k6`.
+            // The bare `k6` name does not exist in the library, so the lookup
+            // silently found nothing and the "timed" dispatch did nothing --
+            // which is exactly what `assert_live` then caught. Both arms name
+            // the same family at their own rate so that only the bit rate
+            // differs.
+            Route::Named(if bits == 6 {
+                "linear_gemv_ishizuki_k6_colmajor_contig4_bench".to_string()
+            } else {
+                "linear_gemv_ishizuki_k3_colmajor_contig4".to_string()
+            }),
             groups_1col(head.out_features),
         );
         let loaded = load_row(&device, row, None, Some(bits));
-        let mut row = loaded.row.clone();
+        let mut row = loaded.row.clone().loaded_at(loaded.bits);
         row.gbps = Some(measure_row(&queue, &loaded));
         out.push(row);
     }
@@ -1182,7 +1302,7 @@ fn layer_shape_at_six_bpw() {
             None => row,
         };
         let loaded = load_row(&device, row, None, Some(bits));
-        let mut row = loaded.row.clone();
+        let mut row = loaded.row.clone().loaded_at(loaded.bits);
         row.gbps = Some(measure_row(&queue, &loaded));
         out.push(row);
     }
@@ -1247,7 +1367,7 @@ fn measure_one_grid() {
         groups,
     );
     let loaded = load_row(&device, row, None, None);
-    let mut row = loaded.row.clone();
+    let mut row = loaded.row.clone().loaded_at(loaded.bits);
     row.gbps = Some(measure_row(&queue, &loaded));
     println!(
         "GRIDSWEEP cap={groups} requested={} waves={:.1} {:.1} GB/s {:.1} Gcodes/s",
