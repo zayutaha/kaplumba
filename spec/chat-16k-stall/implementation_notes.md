@@ -182,3 +182,91 @@ vm.swapusage:
 * **Contrast with MLX:** MLX maps weights directly via `mmap` (`new_buffer_with_bytes_no_copy`),
   keeping weights as clean file-backed pages (`SWAPPED = 0K`), which are never
   compressed or written to swapfiles.
+
+---
+
+## 8. 🔴 T2 RESULT — Bug B is REFUTED. The in-flight window is not the cause.
+
+The sweep finished:
+
+| `KAPLUMBA_MAX_IN_FLIGHT` | 8 | 16 | 32 | 64 |
+|---|---:|---:|---:|---:|
+| chat tok/s @11,299 | 0.23 | 0.27 | 0.31 | 0.17 |
+
+**Quadrupling the window changes nothing and is not monotonic.** The `8 < 12`
+arithmetic in §4 is true and the mechanism it implies is demonstrable, but
+raising the window to 64 — five times a whole step's worth of buffers — does not
+recover the stall. So `roll()`'s window pressure is **not** what is costing the
+time, and the fix I proposed is wrong. Recorded rather than quietly dropped.
+
+## 9. What the GPU profile actually says
+
+Chat decode, 1 token, 60 layers, 546 boundaries, at 11,299 context
+(`KAPLUMBA_GPU_PROFILE=1 KAPLUMBA_GPU_PROFILE_DECODE=1`):
+
+```
+sum of per-kernel GPU own_ms =  254.5 ms
+inter-boundary gap           = 1689.2 ms     <-- 86% of the step
+wall span                    = 1969.6 ms
+```
+
+**86% of the step is not kernel time.** The GPU is idle, or the host is not
+feeding it. Compare single-shot at 10,744 tokens: **14.45 tok/s = 69 ms/step.**
+
+Per-dispatch, chat vs single-shot, same kernels:
+
+| kernel | chat | single-shot | ratio |
+|---|---:|---:|---:|
+| `gate_up_gelu` | 1.816 ms | 1.412 ms | 1.29× |
+| `down_proj` | 0.902 | 0.707 | 1.28× |
+| `qkv_proj` | 0.701 | 0.554 | 1.27× |
+| `o_proj` | 0.422 | 0.327 | 1.29× |
+| `qk_proj` | 0.818 | 0.649 | 1.26× |
+| **`head/gemv`** | **14.69** | **4.61** | **3.19×** |
+| `attention` | 0.028 | 0.023 | 1.22× |
+
+So the kernels are only **1.3× slow** (and the head 3.2×), which accounts for
+maybe 90 ms of a ~3000 ms step. **The stall is not compute.**
+
+## 10. What is still unexplained, stated plainly
+
+Established:
+1. Single-shot is healthy: 13.45–13.51 tok/s @16,484; 14.45 @10,744.
+2. Chat collapses: 0.05–0.31 tok/s @11,299, and it is not a smooth curve —
+   0.05, 0.21, 0.23, 0.27, 0.31, 0.42, 0.67 across repeats of one binary.
+3. Chat's decode kernels are ~1.3× single-shot's (head 3.2×).
+4. **86% of chat's decode step is inter-boundary gap.**
+5. `MAX_IN_FLIGHT` 8 → 64 does not change it.
+6. Stack samples put the host in `waitUntilCompleted` inside `tick`/`roll`
+   inside `forward_chunk`, ~100% of samples.
+
+(4), (5) and (6) are in tension: if the host is blocked on the *oldest
+in-flight* buffer, raising the cap to 64 should remove the block, and it does
+not. Either the block is on a buffer that is genuinely slow for reasons the
+profile does not capture, or the wait is inside a different submission path than
+`roll`. **I have not isolated this.** Q2 in `spec.md` stands open.
+
+Also unresolved and possibly the same bug: `head/gemv` is 3.19× slower in chat.
+That is a single kernel with no context dependence of its own (1.057 GB, fixed),
+so something about chat's state changes it — and it is the largest single row
+in the table.
+
+## 11. Corrections to §2 and §4
+
+* §2 "Bug B — `MAX_IN_FLIGHT` is smaller than one decode step. NOT FIXED." →
+  the arithmetic stands, the **diagnosis does not**. See §8.
+* §4 R1's framing ("size the window so `roll()` never blocks mid-step") is
+  therefore the wrong lever and must not be T2. It becomes T2b at most, after
+  the real cause is found.
+
+## 12. Tooling gotcha, cost me a cycle
+
+`KAPLUMBA_GPU_PROFILE_DECODE=1` prints one table per forward, and a 16k chat
+turn produces hundreds. Selecting "the last table" picked a prefill chunk, and
+"the first" picked a 2-token forward — both looked like decode and neither was.
+The table header line (`tokens=N chunks=N boundaries=N`) is the only reliable
+selector, and `awk '/=== GPU PROFILE/{n++} n==2'` is how to get the decode one.
+
+Also: two profiling runs were SIGKILLed by the OS (not by me). At 16k the
+process is at the memory ceiling with a profiler attached; suspect the OOM
+killer before suspecting the probe.
