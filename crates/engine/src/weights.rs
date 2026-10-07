@@ -567,24 +567,20 @@ impl TextWeights {
             //
             // `lm_head.suh` / `lm_head.svh` / `lm_head.mcg` are sign side-tensors
             // read on the CPU via `read_f16` and always need their arena copy.
-            // Offload is the default. `KAPLUMBA_RESIDENT_WEIGHTS=1` forces
-            // everything back into the arena; `KAPLUMBA_ZERO_COPY_WEIGHTS` remains
-            // the pre-existing debug flag that maps *all* weights from the file
-            // and is known to drive heavy swap.
-            let all_zero_copy = std::env::var_os("KAPLUMBA_ZERO_COPY_WEIGHTS").is_some();
+            // Clean file-backed mapping by default for packed EXL3 weights.
+            // Copying 13.4 GiB of weights into dirty anonymous Metal buffers
+            // causes macOS to exhaust available RAM at 16k context (where KV cache
+            // adds ~3 GiB) and swap out 12.5 GiB to SSD, collapsing decode to 0.03 tok/s.
+            // Clean file-backed mmap pages cannot be compressed or swapped.
             let force_resident = std::env::var_os("KAPLUMBA_RESIDENT_WEIGHTS").is_some();
             let offload_embedding = !force_resident;
             let offload_head = !force_resident;
-            // The embedding is offloaded even though it is `converted`: the
-            // bf16 -> fp16 conversion moves into the embedding kernel, which
-            // reads one row per token and so touches only a few KiB of the
-            // 2.82 GB table. Converting up front meant holding a full anonymous
-            // copy of the table for the process lifetime.
             let offload_bf16_embedding =
                 offload_embedding && name == "model.language_model.embed_tokens.weight";
             let offload_head_trellis = offload_head && name == "lm_head.trellis";
-            let skip_copy =
-                offload_bf16_embedding || (!converted && (all_zero_copy || offload_head_trellis));
+            let offload_trellis = !force_resident && name.ends_with(".trellis");
+            let skip_copy = offload_bf16_embedding
+                || (!converted && (offload_trellis || offload_head_trellis));
             let spans = if skip_copy {
                 Vec::new()
             } else if dedicated {
@@ -1032,6 +1028,10 @@ impl ShardReader {
             path: path.to_path_buf(),
             message: "mmap returned null".to_string(),
         })?;
+        // Pre-fault clean pages sequentially to avoid minor faults on hot path.
+        unsafe {
+            libc::madvise(pointer.as_ptr().cast(), length, libc::MADV_WILLNEED);
+        }
         Ok(Self {
             file,
             pointer,
@@ -1257,20 +1257,13 @@ mod tests {
             .tensor("model.language_model.layers.0.self_attn.q_proj.trellis")
             .unwrap();
         assert_eq!(tensor.storage, WeightStorage::PackedExl3);
-        // By default trellis is copied into the arena so the whole 14.9 GiB of
-        // weights stays resident: decode streams every weight each token, and
-        // file-backed pages get evicted, which measured 3.9 GiB of swap and
-        // ~1.4 tok/s. Only KAPLUMBA_ZERO_COPY_WEIGHTS opts back into mapping.
-        let zero_copy = std::env::var_os("KAPLUMBA_ZERO_COPY_WEIGHTS").is_some();
-        if zero_copy {
-            assert!(
-                tensor.spans.is_empty(),
-                "zero-copy trellis should not occupy arena space"
-            );
-        } else {
+        // Default packed trellis is zero-copy file-backed to prevent swap thrashing.
+        // KAPLUMBA_RESIDENT_WEIGHTS forces arena copy.
+        let force_resident = std::env::var_os("KAPLUMBA_RESIDENT_WEIGHTS").is_some();
+        if force_resident {
             assert!(
                 !tensor.spans.is_empty(),
-                "default trellis must be resident in the arena"
+                "forced-resident trellis must be resident in the arena"
             );
             let buffer = weights
                 .tensor_buffer("model.language_model.layers.0.self_attn.q_proj.trellis")
@@ -1279,6 +1272,11 @@ mod tests {
             let mapped =
                 unsafe { std::slice::from_raw_parts(buffer.contents() as *const u8, byte_len) };
             assert_eq!(mapped, &[0x34, 0x12, 0x78, 0x56]);
+        } else {
+            assert!(
+                tensor.spans.is_empty(),
+                "default zero-copy trellis should not occupy arena space"
+            );
         }
         let view = weights
             .zero_copy_tensor_buffer("model.language_model.layers.0.self_attn.q_proj.trellis")

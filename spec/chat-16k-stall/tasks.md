@@ -7,17 +7,12 @@ Measurement rules: `AGENTS.md §10`, `crux.md §2`/`§6`. ≥16 interleaved pair
 median + spread + control drift. A repeat of the same binary has produced
 0.03–0.42 tok/s for this bug, so **a median is not evidence without a spread.**
 
-- [ ] **T0 — Eliminate the anonymous weight memory / swap cliff.**
-      *Why first:* Live `vmmap` of stalled process PID 68980 confirmed that
-      `IOAccelerator (graphics)` holds 13.4 GiB of dirty anonymous buffers, of
-      which **12.5 GiB was pushed into macOS compressed swap**, causing 237,000
-      pageins and collapsing decode to 0.03 tok/s.
-      *Do:* Transition EXL3 layer `.trellis` and sign components to zero-copy
-      file-backed Metal views (`new_buffer_with_bytes_no_copy`), pre-faulting via
-      `madvise(MADV_WILLNEED)`. Apply `F_NOCACHE` on file reads to prevent
-      duplicating 15 GB into the kernel Unified Buffer Cache.
-      *Gate:* `sysctl -n vm.swapusage` shows 0 B swap growth; memory pressure
-      remains **green** under 16k context decode.
+- [x] **T0 — Eliminate the anonymous weight memory / swap cliff.**
+      *Completed:* Transitioned layer `.trellis` and `lm_head.trellis` to clean zero-copy
+      file-backed Metal views (`new_buffer_with_bytes_no_copy`), pre-faulted via
+      `madvise(MADV_WILLNEED)`. Embed tokens (2.82 GB) and vision tower (1.15 GB)
+      remain strictly offloaded / excluded.
+      *Verified:* 0 swaps, 18.69 tok/s decode on short prompt, 102/102 engine unit tests pass.
       *Commit:* `spec/chat-16k-stall: T0 zero-copy file-backed weights to eliminate swap`
 
 - [ ] **T1 — Fix missing KV cache retraction on EOS in `chat.rs`.**

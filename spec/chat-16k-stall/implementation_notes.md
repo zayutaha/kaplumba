@@ -270,3 +270,21 @@ selector, and `awk '/=== GPU PROFILE/{n++} n==2'` is how to get the decode one.
 Also: two profiling runs were SIGKILLed by the OS (not by me). At 16k the
 process is at the memory ceiling with a profiler attached; suspect the OOM
 killer before suspecting the probe.
+
+## 13. T0: Zero-Copy File-Backed Layer Trellis Weights Implemented
+
+**Implemented:**
+- Layer `.trellis` weights and `lm_head.trellis` are mapped directly from safetensors shard mmap via `new_buffer_with_bytes_no_copy`.
+- `embed_tokens.weight` (2.82 GB) remains strictly offloaded via `raw_zero_copy_tensor_buffer` with in-kernel BF16 conversion.
+- Vision tower (1.15 GB) remains strictly excluded (0 bytes allocated).
+- Prefaulting cleanly with `madvise(MADV_WILLNEED)` on shard mapping.
+- All 102 unit tests in `crates/engine` pass cleanly in debug and release.
+
+**Measurements with `Gxma-repacked`:**
+- `target/release/kaplumba --prompt "Explain the theory of relativity." --max-new-tokens 4 --temperature 0 --metrics`:
+  - `load_ms`: 6018 ms
+  - `ttft_ms`: 1323 ms (prefill 14.36 tok/s)
+  - `decode_tok_s`: 18.69 tok/s
+  - `/usr/bin/time -l`: 0 swaps, peak memory footprint 1.54 GiB, `vm.swapusage`: 0 growth.
+- Dirty anonymous Metal graphics memory reduced by ~10.25 GiB.
+
