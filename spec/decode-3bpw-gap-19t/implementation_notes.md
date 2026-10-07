@@ -252,3 +252,53 @@ must, being a 2-equation solve for 2 parameters — and implying
 cost does not describe the family. **The +1.15 tok/s is not established and no
 task was built on it.** Recorded because the failure mode is seductive: two
 points, two parameters, a perfect fit, and a physically plausible number.
+
+## 13. T2 — the gap is NOT a kernel defect, and my headline number was wrong
+
+The agent's one-variable pair (row-major `k3` vs `k6`, same grid, same
+addressing, same 3 words/lane, same shape — **these are what production runs**):
+
+| | run 1 | run 2 | mean |
+|---|---:|---:|---:|
+| 6 bpw | 4.275 ms, **247.2 GB/s** | 4.235 ms, 249.6 GB/s | 248.4 |
+| 3 bpw | 3.210 ms, **164.7 GB/s** | 3.190 ms, 165.6 GB/s | 165.2 |
+| `bw_ratio` | **0.666** | **0.664** | 0.665 |
+
+Halving the bit rate at fixed request count cuts runtime **24.8%, not 50%**.
+Neither pre-registered reading survives: not `(d)` bits-per-code (0.5), and not
+the pure-shape reading (1.0). **~75% of the 6 bpw runtime is rate-independent
+per-code work.**
+
+### 🔴 RETRACTION — the +3.63 tok/s I quoted was arithmetic on the wrong rate
+
+I told the user, more than once, that the layer GEMVs run at 194 GB/s where the
+head runs 254.6, and that closing that was worth **+3.63 tok/s to 19.43**.
+
+**254.6 GB/s is the SIX bpw rate.** It is not a 3 bpw ceiling, and the layers are
+3 bpw. At 3 bpw this box, this kernel family, this grid, reaches **165.2 GB/s**.
+The measured layer shapes run **185–203 GB/s — already above the 3 bpw
+reference.** The layers are not underperforming and the +3.63 does not exist.
+
+The error was comparing a 3 bpw measurement against a 6 bpw one, which is the
+same class as the `alu_boost` n² arms and the four `crux.md` byte-count
+disagreements: a number quoted without checking which configuration produced it.
+
+### Corrected 16k budget (measured inputs only)
+
+`attention` achieves 256 GB/s (0.5533 GB / 2.1625 ms), so at 16k its 2.181 GB
+costs **8.52 ms**. With head 4.15 ms and elementwise 1.95 ms:
+
+| layers at | step | tok/s @16k |
+|---|---:|---:|
+| 165.2 (3 bpw reference) | 81.22 ms | 12.31 |
+| 185.1 (measured low) | 74.06 ms | 13.50 |
+| **194.0 (measured mean)** | **71.33 ms** | **14.02** |
+| 203.0 (measured high) | 68.82 ms | 14.53 |
+
+Measured single-shot at 16,484 tokens today: **13.45–13.51 tok/s** (3 runs),
+i.e. the layers are sitting near the bottom of their own 185–203 range.
+
+**14.0 tok/s at 16k needs the layers at 193.7 GB/s** — inside the measured
+spread. So the target is *not* excluded by the corrected physics; it is a
+~1 ms/step question about which end of that range the layers occupy. That is a
+far smaller and more tractable ask than the +3.63 I described.
