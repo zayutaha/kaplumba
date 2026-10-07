@@ -153,3 +153,32 @@ regimes.**
 ## 7. Log
 
 (append per task: command, median ± spread, control drift, verdict, commit)
+
+## 8. Live Memory & Swap Diagnosis (2026-10-07)
+
+Captured during live stall on PID 68980 (`kaplumba --chat ... --max-new-tokens 12`):
+
+```
+Physical footprint: 13.6G
+vmmap -summary 68980:
+  IOAccelerator (graphics): 13.4G VIRTUAL, 13.4G RESIDENT, 12.5G SWAPPED (1,440 regions)
+  mapped file:              15.8G VIRTUAL, 5.3M  RESIDENT,    0K SWAPPED
+top:
+  PhysMem: 23G used (3910M wired, 12G compressor), 155M unused
+  kaplumba: MEM 14G, CMPRS 11G, FAULTS 1,034,162, PAGEINS 237,027
+vm.swapusage:
+  total = 5120.00M, used = 3713.75M
+```
+
+* **Root Cause Found:** `weights.rs` loads weights into ~1,440 individual
+  `StorageModeShared` Metal buffers via `read_exact_at` (`pread`), turning 13.4 GiB
+  of model weights into dirty anonymous memory.
+* At 11k–16k context, KV cache adds ~3 GiB. Total dirty + wired memory reaches
+  25+ GiB, exceeding the 24 GiB RAM.
+* EXL3 bit-packed weights have Shannon entropy ~7.97 bits/byte (incompressible).
+  macOS dumps 12.5 GiB into compressed swap.
+* Decode cycles through all 60 layers on every token, incurring ~237,000 pageins
+  from SSD swap per token and collapsing throughput to 0.03 tok/s.
+* **Contrast with MLX:** MLX maps weights directly via `mmap` (`new_buffer_with_bytes_no_copy`),
+  keeping weights as clean file-backed pages (`SWAPPED = 0K`), which are never
+  compressed or written to swapfiles.

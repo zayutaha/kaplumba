@@ -33,49 +33,57 @@ At 2,234 tokens: **6.71 → 15.11–15.21 tok/s**, against single-shot
 
 This fix is real and kept. It is **not** the 16k bug.
 
-### Bug B — `MAX_IN_FLIGHT` is smaller than one decode step. NOT FIXED.
+### Bug B — The Memory / Swap Cliff. ROOT CAUSE OF 0.03 tok/s STALL.
 
-Sampled stacks during a 16k stall, three independent captures, 100% agreement:
-
-```
-forward_step_pipelined
-  forward_chunk
-    ... 1419/1513/1252 samples ...
-      MetalEncoder::tick
-        -[_MTLCommandBuffer waitUntilCompleted]   <-- the host, blocked
-```
-
-`tick()` → `roll()` (`crates/kernels/src/encoder.rs:524-549`) blocks on the
-oldest in-flight buffer as soon as the window is full. The arithmetic:
+Live process profiling (`sample` and `vmmap` on stalled process PID 68980 during
+a 16k stall) revealed the real mechanism:
 
 ```
-600 dispatches per decode step / 50 per buffer = 12 command buffers per step
-MAX_IN_FLIGHT = 8                                    <-- window is SMALLER than one step
+IOAccelerator (graphics): VIRTUAL 13.4G, RESIDENT 13.4G, SWAPPED 12.5G
+mapped file:              VIRTUAL 15.8G, RESIDENT 5.3M,  SWAPPED 0K
+TOTAL:                    VIRTUAL 417G,  RESIDENT 13.7G, SWAPPED 12.6G
 ```
 
-So the host finishes ~8 buffers of step N, blocks for step N's *first* buffer
-to drain, and only then continues encoding. Host and GPU are fully serialised.
+1. **Dirty Anonymous Weight Buffers:** `weights.rs` loads weights by allocating
+   ~1,440 separate `StorageModeShared` Metal buffers and copying from disk via
+   `read_exact_at` (`pread`). This turns 13.4 GiB of weights into dirty
+   anonymous memory (`IOAccelerator (graphics)`).
+2. **Exceeding Unified Memory Budget:** On a 24 GiB box with 8–9 GiB of macOS
+   wired memory, the 13.4 GiB model barely fits at short context. At 11k–16k
+   context, the KV cache adds ~3.0 GiB, pushing total demand past 25 GiB.
+3. **Compressor & Swap Thrashing:** Memory pressure turns yellow. EXL3 weights
+   have Shannon entropy ~7.97 bits/byte and are incompressible, forcing
+   **12.5 GiB into swap/compressor**.
+4. **Per-Token Disk I/O:** Every decode token reads all 60 layers (13.4 GiB of
+   weights), triggering continuous SSD swap-ins (~237,000 pageins, >1,000,000
+   faults). A 74 ms step turns into 18–30 seconds per token (**0.03 tok/s**).
+5. **Why `waitUntilCompleted` blocked:** Host `MetalEncoder::tick` / `roll` blocks
+   waiting on command buffers whose GPU completion is throttled by SSD swap paging.
+6. **Contrast with MLX:** MLX maps weights directly using `mmap` with clean
+   file-backed pages (`SWAPPED = 0K`), which are never compressed or swapped.
 
-**Why short context hid it.** Identical 600 dispatches, but at 29–2234 tokens
-each buffer drains in microseconds so the wait is invisible. At 16k each decode
-step is ~1.5 s of GPU work and the wait becomes the step.
+### Bug C — Missing KV cache retraction on EOS in `chat.rs`.
 
-**Why it looks superlinear in generated tokens, not context.** It is not. It is
-a serialisation whose cost per token is set by the *GPU* time of a step, so
-`tok/s ≈ 1/(host_encode + gpu_step)` — and the sampled `waitUntilCompleted`
-dominates. The 8/12/16/20-token runs (38.0 / 224.0 / 291.9 / 47.8 s) are the
-same bug sampled at different points, not a curve.
+In `crates/engine/src/chat.rs`, the pipelined decode loop speculatively encodes
+step $N+1$ before waiting on step $N$. When step $N$ produces an EOS token,
+`generate.rs:1050` calls `model.retract_gpu_caches(1)`, but `chat.rs:507`
+breaks without retracting. The KV cache cursor advances past the actual
+conversation on every turn.
 
 ## 3. Non-goals & restrictions
 
 * **No speculative decoding**, no MTP, no drafter, no n-gram, no lookup.
 * **No KV cache quantization** (`AGENTS.md §8`). At 16k KV is 2.181 GB and is
   immovable.
+* **Embed tokens (2.82 GB) remains strictly offloaded** via zero-copy file-backed
+  mapping (`raw_zero_copy_tensor_buffer` with in-kernel BF16 conversion touching 1 row/token).
+* **Vision tower (1.15 GB) remains strictly excluded / never loaded** (0 bytes allocated).
 * **No quality loss.** Greedy output byte-identical. The reorder in Bug A is
   explicitly a reordering of *when* buffers are submitted, not of arithmetic;
   the token-stream equivalence tests must prove it.
-* **No change to decode numerics.** Bug B is a submission-window defect, not a
-  kernel defect. No kernel, dispatch count, or reduction order may change.
+* **No change to decode numerics.** Bug B is a memory allocation defect (dirty
+  anonymous buffers vs clean file-backed pages), not a kernel defect. No kernel,
+  dispatch count, or reduction order may change.
 * **Not a bandwidth problem.** Single-shot at the same context is 13.45–13.51,
   so the hardware is delivering. Any fix that only helps the generator has
   missed the target.
@@ -84,6 +92,11 @@ same bug sampled at different points, not a curve.
 
 ## 4. Requirements
 
+* **R0 — Eliminate dirty anonymous weight memory.** Replace `allocate_dedicated`
+  + `read_exact_at` for layer weights with zero-copy file-backed Metal views
+  (`new_buffer_with_bytes_no_copy`), pre-faulted at load time via `madvise(MADV_WILLNEED)`.
+  Ensure `F_NOCACHE` is applied on shard file descriptors to prevent duplicating
+  into the kernel Unified Buffer Cache.
 * **R1 — Size the window from the work, not from a constant.** The window must
   be able to hold **one whole decode step**'s worth of command buffers with room
   to spare, so `roll()` never blocks mid-step. Derive it from the dispatch

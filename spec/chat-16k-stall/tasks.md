@@ -7,52 +7,39 @@ Measurement rules: `AGENTS.md §10`, `crux.md §2`/`§6`. ≥16 interleaved pair
 median + spread + control drift. A repeat of the same binary has produced
 0.03–0.42 tok/s for this bug, so **a median is not evidence without a spread.**
 
-- [ ] **T0 — Freeze the two baselines, on a quiet GPU.**
-      *Do:* `scripts/gpuq status` → must be idle.
-      * single-shot at 614 / 2,234 / 8,192 / 16,384, `--temperature 0`,
-        ≥3 repeats each, record median **and spread**.
-      * chat at the same four contexts, ≥3 repeats each.
-      *Record all of it in `implementation_notes.md` before changing anything.
-      This is the AC1 denominator and the spread is what makes a later
-      improvement distinguishable from the noise this bug already produced.
-      *Commit:* `spec/chat-16k-stall: T0 paired baselines`
+- [ ] **T0 — Eliminate the anonymous weight memory / swap cliff.**
+      *Why first:* Live `vmmap` of stalled process PID 68980 confirmed that
+      `IOAccelerator (graphics)` holds 13.4 GiB of dirty anonymous buffers, of
+      which **12.5 GiB was pushed into macOS compressed swap**, causing 237,000
+      pageins and collapsing decode to 0.03 tok/s.
+      *Do:* Transition EXL3 layer `.trellis` and sign components to zero-copy
+      file-backed Metal views (`new_buffer_with_bytes_no_copy`), pre-faulting via
+      `madvise(MADV_WILLNEED)`. Apply `F_NOCACHE` on file reads to prevent
+      duplicating 15 GB into the kernel Unified Buffer Cache.
+      *Gate:* `sysctl -n vm.swapusage` shows 0 B swap growth; memory pressure
+      remains **green** under 16k context decode.
+      *Commit:* `spec/chat-16k-stall: T0 zero-copy file-backed weights to eliminate swap`
 
-- [ ] **T1 — R5 FIRST: prove Bug A's reorder did not change any token.**
-      *Why first:* `8fbf487` reordered buffer submission and **has never been
-      shown output-identical**. It is the highest-risk unverified claim in the
-      repo right now, and everything else is worthless if it corrupted tokens.
+- [ ] **T1 — Fix missing KV cache retraction on EOS in `chat.rs`.**
+      *Why:* `generate.rs:1050` calls `model.retract_gpu_caches(1)` on EOS to
+      retract the speculatively encoded step $N+1$, while `chat.rs:507` breaks
+      without retracting, corrupting the KV cursor across multi-turn sessions.
+      *Do:* Add `self.model.retract_gpu_caches(1)` to `chat.rs` EOS path.
+      *Commit:* `spec/chat-16k-stall: T1 retract KV cache on EOS in chat`
+
+- [ ] **T2 — Fix `max_in_flight()` parser clamp and size the window.**
+      *Do:* Fix `encoder.rs:242` where `.filter(|value| (1..=MAX_IN_FLIGHT).contains(value))`
+      silently clamped any value $> 8$ to 8. Allow user configuration up to 64.
+      Ensure the window holds one decode step without mid-step blocking.
+      *Commit:* `spec/chat-16k-stall: T2 fix in-flight window parser and sizing`
+
+- [ ] **T3 — Prove token-stream equivalence across multi-turn sessions.**
       *Do:* `cargo test --release -p kaplumba-engine --test multi_turn_chat --
-      --ignored --nocapture`. Requires `KAPLUMBA_TEST_MODEL` and a release
-      binary; `gpuq try --`.
+      --ignored --nocapture`.
       *Gate:* `pipelined_and_barrier_decode_agree_across_a_multi_turn_session`,
       `a_single_greedy_turn_reproduces_the_counting_sequence`,
-      `context_advances_by_exactly_the_tokens_each_turn_consumed` all green,
-      plus the AC1 prompt byte-identical to `2fff2c97…`.
-      *If any fails:* **stop and revert `8fbf487`.** A fast chat that emits
-      wrong tokens is worse than a slow one.
-      *Commit:* `spec/chat-16k-stall: T1 token-stream equivalence for the reorder`
-
-- [ ] **T2 — R1: fix the window. Sweep first, then change the constant.**
-      *Do:* measure the in-flight sweep already queued:
-      `KAPLUMBA_MAX_IN_FLIGHT` ∈ {8, 16, 32, 64} at 16k, ≥2 repeats each.
-      Then decide, recording the decision and its memory consequence:
-        * **raise `MAX_IN_FLIGHT`** so it exceeds one step's buffer count (12),
-          or
-        * **raise `MAX_DISPATCHES_PER_BUFFER`** so a step needs fewer buffers.
-      Prefer whichever keeps `roll()` non-blocking AND bounds resident memory
-      (R3). Record the derivation at the constant — "8" was never justified and
-      is smaller than one step.
-      *Test:* `roll()` provably cannot block mid-step (R2); host `tick` wait ≈ 0
-      at 16k by stack sampling with sample counts printed (AC4).
-      *Commit:* `spec/chat-16k-stall: T2 size the in-flight window`
-
-- [ ] **T3 — R3: bound the back-pressure.**
-      Larger window must not become unbounded submission. Assert a maximum on
-      outstanding buffers, and measure `phys_footprint` via `/usr/bin/time -l`
-      (never `peak_resident_pages_bytes` — it understates by 5.5 GiB).
-      *Commit:* `spec/chat-16k-stall: T3 back-pressure bounds`
-
-- [ ] **T4 — R6: a regression test that can fail.**
+      `context_advances_by_exactly_the_tokens_each_turn_consumed` all green.
+      *Commit:* `spec/chat-16k-stall: T3 token-stream equivalence`
       The 16k stall is **invisible in the token stream**, exactly as the ordering
       bug was — that is why it survived. So the guard needs two parts:
       a structural/source assertion (window ≥ one step's buffers; commit before
