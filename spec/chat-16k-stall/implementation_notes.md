@@ -305,4 +305,12 @@ killer before suspecting the probe.
 - Avoids silent clamp back to 8 when tuning or running larger in-flight windows.
 - All 8 unit tests in `encoder::tests` pass cleanly.
 
+## 16. T3: Token-Stream Equivalence Verified Across Multi-Turn Sessions
+
+**Verified on real `Gxma-repacked` checkpoint (`multi_turn_chat.rs`):**
+1. `pipelined_and_barrier_decode_agree_across_a_multi_turn_session`: **PASSED** (35.85s). Pipelined decode produces byte-identical output to barrier decode across multiple turns.
+2. `a_single_greedy_turn_reproduces_the_counting_sequence`: **PASSED** (13.98s).
+3. `context_advances_by_exactly_the_tokens_each_turn_consumed`: **PASSED** (18.33s).
+Greedy token streams and KV cache positioning are verified identical.
+
 

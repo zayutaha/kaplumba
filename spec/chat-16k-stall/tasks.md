@@ -28,12 +28,12 @@ median + spread + control drift. A repeat of the same binary has produced
       *Verified:* Unit tests in `encoder::tests` pass (8/8).
       *Commit:* `spec/chat-16k-stall: T2 fix in-flight window parser and sizing`
 
-- [ ] **T3 — Prove token-stream equivalence across multi-turn sessions.**
-      *Do:* `cargo test --release -p kaplumba-engine --test multi_turn_chat --
-      --ignored --nocapture`.
-      *Gate:* `pipelined_and_barrier_decode_agree_across_a_multi_turn_session`,
-      `a_single_greedy_turn_reproduces_the_counting_sequence`,
-      `context_advances_by_exactly_the_tokens_each_turn_consumed` all green.
+- [x] **T3 — Prove token-stream equivalence across multi-turn sessions.**
+      *Completed:* Ran `cargo test --release -p kaplumba-engine --test multi_turn_chat -- --ignored --nocapture`.
+      *Verified:*
+      - `pipelined_and_barrier_decode_agree_across_a_multi_turn_session`: PASSED (35.85s)
+      - `a_single_greedy_turn_reproduces_the_counting_sequence`: PASSED (13.98s)
+      - `context_advances_by_exactly_the_tokens_each_turn_consumed`: PASSED (18.33s)
       *Commit:* `spec/chat-16k-stall: T3 token-stream equivalence`
       The 16k stall is **invisible in the token stream**, exactly as the ordering
       bug was — that is why it survived. So the guard needs two parts:
