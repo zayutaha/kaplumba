@@ -51,43 +51,15 @@
 //   linear_gemv_ishizuki_k3_colmajor_pair  no Rust caller.
 
 static inline void extract_v_mcg_32(uint wa, uint wb, uint sh0, uint rsh0, thread float v[8]) {
-    const uint A_hi = (wa << sh0) | (wb >> rsh0);
-    const uint A_lo = wb << sh0;
-
-    // SIMD vector dequantization: 4-wide vector ALU instructions
-    uint4 c0 = uint4((A_hi >> 16) & 0xffffu,
-                     (A_hi >> 13) & 0xffffu,
-                     (A_hi >> 10) & 0xffffu,
-                     (A_hi >> 7)  & 0xffffu);
-    c0 = c0 * 0xCBAC1FEDu;
-    c0 = 0x3b603b60u ^ (c0 & 0x8fff8fffu);
-
-    half2 h0 = as_type<half2>(c0.x);
-    half2 h1 = as_type<half2>(c0.y);
-    half2 h2 = as_type<half2>(c0.z);
-    half2 h3 = as_type<half2>(c0.w);
-
-    v[0] = float(h0.x + h0.y);
-    v[1] = float(h1.x + h1.y);
-    v[2] = float(h2.x + h2.y);
-    v[3] = float(h3.x + h3.y);
-
-    uint4 c1 = uint4((A_hi >> 4)  & 0xffffu,
-                     (A_hi >> 1)  & 0xffffu,
-                     ((A_hi << 2) | (A_lo >> 30)) & 0xffffu,
-                     ((A_hi << 5) | (A_lo >> 27)) & 0xffffu);
-    c1 = c1 * 0xCBAC1FEDu;
-    c1 = 0x3b603b60u ^ (c1 & 0x8fff8fffu);
-
-    half2 h4 = as_type<half2>(c1.x);
-    half2 h5 = as_type<half2>(c1.y);
-    half2 h6 = as_type<half2>(c1.z);
-    half2 h7 = as_type<half2>(c1.w);
-
-    v[4] = float(h4.x + h4.y);
-    v[5] = float(h5.x + h5.y);
-    v[6] = float(h6.x + h6.y);
-    v[7] = float(h7.x + h7.y);
+    const uint A_hi = (wa << sh0) | (wb >> rsh0), A_lo = wb << sh0;
+    uint4 c0 = uint4((A_hi >> 16) & 0xffffu, (A_hi >> 13) & 0xffffu, (A_hi >> 10) & 0xffffu, (A_hi >> 7) & 0xffffu);
+    c0 = 0x3b603b60u ^ ((c0 * 0xCBAC1FEDu) & 0x8fff8fffu);
+    half2 h0 = as_type<half2>(c0.x), h1 = as_type<half2>(c0.y), h2 = as_type<half2>(c0.z), h3 = as_type<half2>(c0.w);
+    v[0] = float(h0.x + h0.y); v[1] = float(h1.x + h1.y); v[2] = float(h2.x + h2.y); v[3] = float(h3.x + h3.y);
+    uint4 c1 = uint4((A_hi >> 4) & 0xffffu, (A_hi >> 1) & 0xffffu, ((A_hi << 2) | (A_lo >> 30)) & 0xffffu, ((A_hi << 5) | (A_lo >> 27)) & 0xffffu);
+    c1 = 0x3b603b60u ^ ((c1 * 0xCBAC1FEDu) & 0x8fff8fffu);
+    half2 h4 = as_type<half2>(c1.x), h5 = as_type<half2>(c1.y), h6 = as_type<half2>(c1.z), h7 = as_type<half2>(c1.w);
+    v[4] = float(h4.x + h4.y); v[5] = float(h5.x + h5.y); v[6] = float(h6.x + h6.y); v[7] = float(h7.x + h7.y);
 }
 
 static inline void extract_v_mcg_fast(ulong A, thread float v[8]) {
@@ -515,149 +487,155 @@ kernel void linear_gemv_ishizuki_k3_fused2_2col(
         const uint k_unroll_end = (tiles_k / step) * step;
 
         uint tk = sg * 2u;
+        uint w0_0_0 = 0, w0_0_1 = 0, w1_0_0 = 0, w1_0_1 = 0;
+        uint w0_1_0 = 0, w0_1_1 = 0, w1_1_0 = 0, w1_1_1 = 0;
+        float p00 = 0, p01 = 0, p02 = 0, p03 = 0, p10 = 0, p11 = 0, p12 = 0, p13 = 0;
+        if (tk + 3u * step < k_unroll_end) {
+            const device uint *t0_0 = col0 + (tk + 0u) * stride;
+            const device uint *t1_0 = col0 + (tk + 1u) * stride;
+            const device uint *t0_1 = col1 + (tk + 0u) * stride;
+            const device uint *t1_1 = col1 + (tk + 1u) * stride;
+            w0_0_0 = t0_0[j0]; w0_0_1 = t0_0[j1];
+            w1_0_0 = t1_0[j0]; w1_0_1 = t1_0[j1];
+            w0_1_0 = t0_1[j0]; w0_1_1 = t0_1[j1];
+            w1_1_0 = t1_1[j0]; w1_1_1 = t1_1[j1];
+            const device half *xr0 = x + (tk + 0u) * 16u + r0;
+            p00 = float(xr0[0]); p01 = float(xr0[1]); p02 = float(xr0[8]); p03 = float(xr0[9]);
+            const device half *xr1 = x + (tk + 1u) * 16u + r0;
+            p10 = float(xr1[0]); p11 = float(xr1[1]); p12 = float(xr1[8]); p13 = float(xr1[9]);
+        }
+
         for (; tk + 3u * step < k_unroll_end; tk += 4u * step) {
-            // Trip 0: tk, tk+1
-            {
-                const device half *xr0 = x + (tk + 0u) * 16u + r0;
-                const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
-                const device half *xr1 = x + (tk + 1u) * 16u + r0;
-                const float p10 = float(xr1[0]), p11 = float(xr1[1]), p12 = float(xr1[8]), p13 = float(xr1[9]);
+            // 1. Prefetch Trip 1 words and activations ahead of Trip 0 compute
+            const uint tk1 = tk + step;
+            const device uint *u0_0 = col0 + (tk1 + 0u) * stride;
+            const device uint *u1_0 = col0 + (tk1 + 1u) * stride;
+            const device uint *u0_1 = col1 + (tk1 + 0u) * stride;
+            const device uint *u1_1 = col1 + (tk1 + 1u) * stride;
+            const uint x0_0_0 = u0_0[j0], x0_0_1 = u0_0[j1];
+            const uint x1_0_0 = u1_0[j0], x1_0_1 = u1_0[j1];
+            const uint x0_1_0 = u0_1[j0], x0_1_1 = u0_1[j1];
+            const uint x1_1_0 = u1_1[j0], x1_1_1 = u1_1[j1];
+            const device half *xr0b = x + (tk1 + 0u) * 16u + r0;
+            const float q00 = float(xr0b[0]), q01 = float(xr0b[1]), q02 = float(xr0b[8]), q03 = float(xr0b[9]);
+            const device half *xr1b = x + (tk1 + 1u) * 16u + r0;
+            const float q10 = float(xr1b[0]), q11 = float(xr1b[1]), q12 = float(xr1b[8]), q13 = float(xr1b[9]);
 
-                const device uint *t0_0 = col0 + (tk + 0u) * stride;
-                const device uint *t1_0 = col0 + (tk + 1u) * stride;
-                const device uint *t0_1 = col1 + (tk + 0u) * stride;
-                const device uint *t1_1 = col1 + (tk + 1u) * stride;
+            // Trip 0: compute using preloaded w... and p...
+            float v[8];
+            extract_v_mcg_32(w0_0_0, w0_0_1, sh0, rsh0, v);
+            acc0_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+            acc0_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
 
-                float v[8];
-                const uint w0_0_0 = t0_0[j0], w0_0_1 = t0_0[j1];
-                const uint w1_0_0 = t1_0[j0], w1_0_1 = t1_0[j1];
-                const uint w0_1_0 = t0_1[j0], w0_1_1 = t0_1[j1];
-                const uint w1_1_0 = t1_1[j0], w1_1_1 = t1_1[j1];
+            extract_v_mcg_32(w1_0_0, w1_0_1, sh0, rsh0, v);
+            acc0_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+            acc0_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
 
-                extract_v_mcg_32(w0_0_0, w0_0_1, sh0, rsh0, v);
-                acc0_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
-                acc0_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+            extract_v_mcg_32(w0_1_0, w0_1_1, sh0, rsh0, v);
+            acc1_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+            acc1_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
 
-                extract_v_mcg_32(w1_0_0, w1_0_1, sh0, rsh0, v);
-                acc0_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
-                acc0_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+            extract_v_mcg_32(w1_1_0, w1_1_1, sh0, rsh0, v);
+            acc1_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+            acc1_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
 
-                extract_v_mcg_32(w0_1_0, w0_1_1, sh0, rsh0, v);
-                acc1_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
-                acc1_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+            // 2. Prefetch Trip 2 words and activations ahead of Trip 1 compute
+            const uint tk2 = tk + 2u * step;
+            const device uint *y0_0 = col0 + (tk2 + 0u) * stride;
+            const device uint *y1_0 = col0 + (tk2 + 1u) * stride;
+            const device uint *y0_1 = col1 + (tk2 + 0u) * stride;
+            const device uint *y1_1 = col1 + (tk2 + 1u) * stride;
+            const uint y0_0_0 = y0_0[j0], y0_0_1 = y0_0[j1];
+            const uint y1_0_0 = y1_0[j0], y1_0_1 = y1_0[j1];
+            const uint y0_1_0 = y0_1[j0], y0_1_1 = y0_1[j1];
+            const uint y1_1_0 = y1_1[j0], y1_1_1 = y1_1[j1];
+            const device half *xr0c = x + (tk2 + 0u) * 16u + r0;
+            const float r00 = float(xr0c[0]), r01 = float(xr0c[1]), r02 = float(xr0c[8]), r03 = float(xr0c[9]);
+            const device half *xr1c = x + (tk2 + 1u) * 16u + r0;
+            const float r10 = float(xr1c[0]), r11 = float(xr1c[1]), r12 = float(xr1c[8]), r13 = float(xr1c[9]);
 
-                extract_v_mcg_32(w1_1_0, w1_1_1, sh0, rsh0, v);
-                acc1_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
-                acc1_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+            // Trip 1: compute using preloaded x... and q...
+            extract_v_mcg_32(x0_0_0, x0_0_1, sh0, rsh0, v);
+            acc0_0 += q00 * v[0] + q01 * v[1] + q02 * v[2] + q03 * v[3];
+            acc0_1 += q00 * v[4] + q01 * v[5] + q02 * v[6] + q03 * v[7];
+
+            extract_v_mcg_32(x1_0_0, x1_0_1, sh0, rsh0, v);
+            acc0_0 += q10 * v[0] + q11 * v[1] + q12 * v[2] + q13 * v[3];
+            acc0_1 += q10 * v[4] + q11 * v[5] + q12 * v[6] + q13 * v[7];
+
+            extract_v_mcg_32(x0_1_0, x0_1_1, sh0, rsh0, v);
+            acc1_0 += q00 * v[0] + q01 * v[1] + q02 * v[2] + q03 * v[3];
+            acc1_1 += q00 * v[4] + q01 * v[5] + q02 * v[6] + q03 * v[7];
+
+            extract_v_mcg_32(x1_1_0, x1_1_1, sh0, rsh0, v);
+            acc1_0 += q10 * v[0] + q11 * v[1] + q12 * v[2] + q13 * v[3];
+            acc1_1 += q10 * v[4] + q11 * v[5] + q12 * v[6] + q13 * v[7];
+
+            // 3. Prefetch Trip 3 words and activations ahead of Trip 2 compute
+            const uint tk3 = tk + 3u * step;
+            const device uint *z0_0 = col0 + (tk3 + 0u) * stride;
+            const device uint *z1_0 = col0 + (tk3 + 1u) * stride;
+            const device uint *z0_1 = col1 + (tk3 + 0u) * stride;
+            const device uint *z1_1 = col1 + (tk3 + 1u) * stride;
+            const uint z0_0_0 = z0_0[j0], z0_0_1 = z0_0[j1];
+            const uint z1_0_0 = z1_0[j0], z1_0_1 = z1_0[j1];
+            const uint z0_1_0 = z0_1[j0], z0_1_1 = z0_1[j1];
+            const uint z1_1_0 = z1_1[j0], z1_1_1 = z1_1[j1];
+            const device half *xr0d = x + (tk3 + 0u) * 16u + r0;
+            const float s00 = float(xr0d[0]), s01 = float(xr0d[1]), s02 = float(xr0d[8]), s03 = float(xr0d[9]);
+            const device half *xr1d = x + (tk3 + 1u) * 16u + r0;
+            const float s10 = float(xr1d[0]), s11 = float(xr1d[1]), s12 = float(xr1d[8]), s13 = float(xr1d[9]);
+
+            // Trip 2: compute using preloaded y... and r...
+            extract_v_mcg_32(y0_0_0, y0_0_1, sh0, rsh0, v);
+            acc0_0 += r00 * v[0] + r01 * v[1] + r02 * v[2] + r03 * v[3];
+            acc0_1 += r00 * v[4] + r01 * v[5] + r02 * v[6] + r03 * v[7];
+
+            extract_v_mcg_32(y1_0_0, y1_0_1, sh0, rsh0, v);
+            acc0_0 += r10 * v[0] + r11 * v[1] + r12 * v[2] + r13 * v[3];
+            acc0_1 += r10 * v[4] + r11 * v[5] + r12 * v[6] + r13 * v[7];
+
+            extract_v_mcg_32(y0_1_0, y0_1_1, sh0, rsh0, v);
+            acc1_0 += r00 * v[0] + r01 * v[1] + r02 * v[2] + r03 * v[3];
+            acc1_1 += r00 * v[4] + r01 * v[5] + r02 * v[6] + r03 * v[7];
+
+            extract_v_mcg_32(y1_1_0, y1_1_1, sh0, rsh0, v);
+            acc1_0 += r10 * v[0] + r11 * v[1] + r12 * v[2] + r13 * v[3];
+            acc1_1 += r10 * v[4] + r11 * v[5] + r12 * v[6] + r13 * v[7];
+
+            // 4. Prefetch next iteration's Trip 0 if there is another iteration
+            const uint next_tk = tk + 4u * step;
+            if (next_tk + 3u * step < k_unroll_end) {
+                const device uint *next_t0_0 = col0 + (next_tk + 0u) * stride;
+                const device uint *next_t1_0 = col0 + (next_tk + 1u) * stride;
+                const device uint *next_t0_1 = col1 + (next_tk + 0u) * stride;
+                const device uint *next_t1_1 = col1 + (next_tk + 1u) * stride;
+                w0_0_0 = next_t0_0[j0]; w0_0_1 = next_t0_0[j1];
+                w1_0_0 = next_t1_0[j0]; w1_0_1 = next_t1_0[j1];
+                w0_1_0 = next_t0_1[j0]; w0_1_1 = next_t0_1[j1];
+                w1_1_0 = next_t1_1[j0]; w1_1_1 = next_t1_1[j1];
+                const device half *next_xr0 = x + (next_tk + 0u) * 16u + r0;
+                p00 = float(next_xr0[0]); p01 = float(next_xr0[1]); p02 = float(next_xr0[8]); p03 = float(next_xr0[9]);
+                const device half *next_xr1 = x + (next_tk + 1u) * 16u + r0;
+                p10 = float(next_xr1[0]); p11 = float(next_xr1[1]); p12 = float(next_xr1[8]); p13 = float(next_xr1[9]);
             }
 
-            // Trip 1: tk+step, tk+step+1
-            {
-                const uint tkx = tk + step;
-                const device half *xr0b = x + (tkx + 0u) * 16u + r0;
-                const float q00 = float(xr0b[0]), q01 = float(xr0b[1]), q02 = float(xr0b[8]), q03 = float(xr0b[9]);
-                const device half *xr1b = x + (tkx + 1u) * 16u + r0;
-                const float q10 = float(xr1b[0]), q11 = float(xr1b[1]), q12 = float(xr1b[8]), q13 = float(xr1b[9]);
+            // Trip 3: compute using preloaded z... and s...
+            extract_v_mcg_32(z0_0_0, z0_0_1, sh0, rsh0, v);
+            acc0_0 += s00 * v[0] + s01 * v[1] + s02 * v[2] + s03 * v[3];
+            acc0_1 += s00 * v[4] + s01 * v[5] + s02 * v[6] + s03 * v[7];
 
-                const device uint *u0_0 = col0 + (tkx + 0u) * stride;
-                const device uint *u1_0 = col0 + (tkx + 1u) * stride;
-                const device uint *u0_1 = col1 + (tkx + 0u) * stride;
-                const device uint *u1_1 = col1 + (tkx + 1u) * stride;
+            extract_v_mcg_32(z1_0_0, z1_0_1, sh0, rsh0, v);
+            acc0_0 += s10 * v[0] + s11 * v[1] + s12 * v[2] + s13 * v[3];
+            acc0_1 += s10 * v[4] + s11 * v[5] + s12 * v[6] + s13 * v[7];
 
-                float v[8];
-                const uint x0_0_0 = u0_0[j0], x0_0_1 = u0_0[j1];
-                const uint x1_0_0 = u1_0[j0], x1_0_1 = u1_0[j1];
-                const uint x0_1_0 = u0_1[j0], x0_1_1 = u0_1[j1];
-                const uint x1_1_0 = u1_1[j0], x1_1_1 = u1_1[j1];
+            extract_v_mcg_32(z0_1_0, z0_1_1, sh0, rsh0, v);
+            acc1_0 += s00 * v[0] + s01 * v[1] + s02 * v[2] + s03 * v[3];
+            acc1_1 += s00 * v[4] + s01 * v[5] + s02 * v[6] + s03 * v[7];
 
-                extract_v_mcg_32(x0_0_0, x0_0_1, sh0, rsh0, v);
-                acc0_0 += q00 * v[0] + q01 * v[1] + q02 * v[2] + q03 * v[3];
-                acc0_1 += q00 * v[4] + q01 * v[5] + q02 * v[6] + q03 * v[7];
-
-                extract_v_mcg_32(x1_0_0, x1_0_1, sh0, rsh0, v);
-                acc0_0 += q10 * v[0] + q11 * v[1] + q12 * v[2] + q13 * v[3];
-                acc0_1 += q10 * v[4] + q11 * v[5] + q12 * v[6] + q13 * v[7];
-
-                extract_v_mcg_32(x0_1_0, x0_1_1, sh0, rsh0, v);
-                acc1_0 += q00 * v[0] + q01 * v[1] + q02 * v[2] + q03 * v[3];
-                acc1_1 += q00 * v[4] + q01 * v[5] + q02 * v[6] + q03 * v[7];
-
-                extract_v_mcg_32(x1_1_0, x1_1_1, sh0, rsh0, v);
-                acc1_0 += q10 * v[0] + q11 * v[1] + q12 * v[2] + q13 * v[3];
-                acc1_1 += q10 * v[4] + q11 * v[5] + q12 * v[6] + q13 * v[7];
-            }
-
-            // Trip 2: tk+2*step, tk+2*step+1
-            {
-                const uint tky = tk + 2u * step;
-                const device half *xr0c = x + (tky + 0u) * 16u + r0;
-                const float r00 = float(xr0c[0]), r01 = float(xr0c[1]), r02 = float(xr0c[8]), r03 = float(xr0c[9]);
-                const device half *xr1c = x + (tky + 1u) * 16u + r0;
-                const float r10 = float(xr1c[0]), r11 = float(xr1c[1]), r12 = float(xr1c[8]), r13 = float(xr1c[9]);
-
-                const device uint *y0_0 = col0 + (tky + 0u) * stride;
-                const device uint *y1_0 = col0 + (tky + 1u) * stride;
-                const device uint *y0_1 = col1 + (tky + 0u) * stride;
-                const device uint *y1_1 = col1 + (tky + 1u) * stride;
-
-                float v[8];
-                const uint y0_0_0 = y0_0[j0], y0_0_1 = y0_0[j1];
-                const uint y1_0_0 = y1_0[j0], y1_0_1 = y1_0[j1];
-                const uint y0_1_0 = y0_1[j0], y0_1_1 = y0_1[j1];
-                const uint y1_1_0 = y1_1[j0], y1_1_1 = y1_1[j1];
-
-                extract_v_mcg_32(y0_0_0, y0_0_1, sh0, rsh0, v);
-                acc0_0 += r00 * v[0] + r01 * v[1] + r02 * v[2] + r03 * v[3];
-                acc0_1 += r00 * v[4] + r01 * v[5] + r02 * v[6] + r03 * v[7];
-
-                extract_v_mcg_32(y1_0_0, y1_0_1, sh0, rsh0, v);
-                acc0_0 += r10 * v[0] + r11 * v[1] + r12 * v[2] + r13 * v[3];
-                acc0_1 += r10 * v[4] + r11 * v[5] + r12 * v[6] + r13 * v[7];
-
-                extract_v_mcg_32(y0_1_0, y0_1_1, sh0, rsh0, v);
-                acc1_0 += r00 * v[0] + r01 * v[1] + r02 * v[2] + r03 * v[3];
-                acc1_1 += r00 * v[4] + r01 * v[5] + r02 * v[6] + r03 * v[7];
-
-                extract_v_mcg_32(y1_1_0, y1_1_1, sh0, rsh0, v);
-                acc1_0 += r10 * v[0] + r11 * v[1] + r12 * v[2] + r13 * v[3];
-                acc1_1 += r10 * v[4] + r11 * v[5] + r12 * v[6] + r13 * v[7];
-            }
-
-            // Trip 3: tk+3*step, tk+3*step+1
-            {
-                const uint tkz = tk + 3u * step;
-                const device half *xr0d = x + (tkz + 0u) * 16u + r0;
-                const float s00 = float(xr0d[0]), s01 = float(xr0d[1]), s02 = float(xr0d[8]), s03 = float(xr0d[9]);
-                const device half *xr1d = x + (tkz + 1u) * 16u + r0;
-                const float s10 = float(xr1d[0]), s11 = float(xr1d[1]), s12 = float(xr1d[8]), s13 = float(xr1d[9]);
-
-                const device uint *z0_0 = col0 + (tkz + 0u) * stride;
-                const device uint *z1_0 = col0 + (tkz + 1u) * stride;
-                const device uint *z0_1 = col1 + (tkz + 0u) * stride;
-                const device uint *z1_1 = col1 + (tkz + 1u) * stride;
-
-                float v[8];
-                const uint z0_0_0 = z0_0[j0], z0_0_1 = z0_0[j1];
-                const uint z1_0_0 = z1_0[j0], z1_0_1 = z1_0[j1];
-                const uint z0_1_0 = z0_1[j0], z0_1_1 = z0_1[j1];
-                const uint z1_1_0 = z1_1[j0], z1_1_1 = z1_1[j1];
-
-                extract_v_mcg_32(z0_0_0, z0_0_1, sh0, rsh0, v);
-                acc0_0 += s00 * v[0] + s01 * v[1] + s02 * v[2] + s03 * v[3];
-                acc0_1 += s00 * v[4] + s01 * v[5] + s02 * v[6] + s03 * v[7];
-
-                extract_v_mcg_32(z1_0_0, z1_0_1, sh0, rsh0, v);
-                acc0_0 += s10 * v[0] + s11 * v[1] + s12 * v[2] + s13 * v[3];
-                acc0_1 += s10 * v[4] + s11 * v[5] + s12 * v[6] + s13 * v[7];
-
-                extract_v_mcg_32(z0_1_0, z0_1_1, sh0, rsh0, v);
-                acc1_0 += s00 * v[0] + s01 * v[1] + s02 * v[2] + s03 * v[3];
-                acc1_1 += s00 * v[4] + s01 * v[5] + s02 * v[6] + s03 * v[7];
-
-                extract_v_mcg_32(z1_1_0, z1_1_1, sh0, rsh0, v);
-                acc1_0 += s10 * v[0] + s11 * v[1] + s12 * v[2] + s13 * v[3];
-                acc1_1 += s10 * v[4] + s11 * v[5] + s12 * v[6] + s13 * v[7];
-            }
+            extract_v_mcg_32(z1_1_0, z1_1_1, sh0, rsh0, v);
+            acc1_0 += s10 * v[0] + s11 * v[1] + s12 * v[2] + s13 * v[3];
+            acc1_1 += s10 * v[4] + s11 * v[5] + s12 * v[6] + s13 * v[7];
         }
 
         for (; tk < k_unroll_end; tk += step) {
@@ -1678,149 +1656,155 @@ kernel void linear_gemv_ishizuki_k3_fused3_2col(
         const uint k_unroll_end = (tiles_k / step) * step;
 
         uint tk = sg * 2u;
+        uint w0_0_0 = 0, w0_0_1 = 0, w1_0_0 = 0, w1_0_1 = 0;
+        uint w0_1_0 = 0, w0_1_1 = 0, w1_1_0 = 0, w1_1_1 = 0;
+        float p00 = 0, p01 = 0, p02 = 0, p03 = 0, p10 = 0, p11 = 0, p12 = 0, p13 = 0;
+        if (tk + 3u * step < k_unroll_end) {
+            const device uint *t0_0 = col0 + (tk + 0u) * stride;
+            const device uint *t1_0 = col0 + (tk + 1u) * stride;
+            const device uint *t0_1 = col1 + (tk + 0u) * stride;
+            const device uint *t1_1 = col1 + (tk + 1u) * stride;
+            w0_0_0 = t0_0[j0]; w0_0_1 = t0_0[j1];
+            w1_0_0 = t1_0[j0]; w1_0_1 = t1_0[j1];
+            w0_1_0 = t0_1[j0]; w0_1_1 = t0_1[j1];
+            w1_1_0 = t1_1[j0]; w1_1_1 = t1_1[j1];
+            const device half *xr0 = x + (tk + 0u) * 16u + r0;
+            p00 = float(xr0[0]); p01 = float(xr0[1]); p02 = float(xr0[8]); p03 = float(xr0[9]);
+            const device half *xr1 = x + (tk + 1u) * 16u + r0;
+            p10 = float(xr1[0]); p11 = float(xr1[1]); p12 = float(xr1[8]); p13 = float(xr1[9]);
+        }
+
         for (; tk + 3u * step < k_unroll_end; tk += 4u * step) {
-            // Trip 0: tk, tk+1
-            {
-                const device half *xr0 = x + (tk + 0u) * 16u + r0;
-                const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
-                const device half *xr1 = x + (tk + 1u) * 16u + r0;
-                const float p10 = float(xr1[0]), p11 = float(xr1[1]), p12 = float(xr1[8]), p13 = float(xr1[9]);
+            // 1. Prefetch Trip 1 words and activations ahead of Trip 0 compute
+            const uint tk1 = tk + step;
+            const device uint *u0_0 = col0 + (tk1 + 0u) * stride;
+            const device uint *u1_0 = col0 + (tk1 + 1u) * stride;
+            const device uint *u0_1 = col1 + (tk1 + 0u) * stride;
+            const device uint *u1_1 = col1 + (tk1 + 1u) * stride;
+            const uint x0_0_0 = u0_0[j0], x0_0_1 = u0_0[j1];
+            const uint x1_0_0 = u1_0[j0], x1_0_1 = u1_0[j1];
+            const uint x0_1_0 = u0_1[j0], x0_1_1 = u0_1[j1];
+            const uint x1_1_0 = u1_1[j0], x1_1_1 = u1_1[j1];
+            const device half *xr0b = x + (tk1 + 0u) * 16u + r0;
+            const float q00 = float(xr0b[0]), q01 = float(xr0b[1]), q02 = float(xr0b[8]), q03 = float(xr0b[9]);
+            const device half *xr1b = x + (tk1 + 1u) * 16u + r0;
+            const float q10 = float(xr1b[0]), q11 = float(xr1b[1]), q12 = float(xr1b[8]), q13 = float(xr1b[9]);
 
-                const device uint *t0_0 = col0 + (tk + 0u) * stride;
-                const device uint *t1_0 = col0 + (tk + 1u) * stride;
-                const device uint *t0_1 = col1 + (tk + 0u) * stride;
-                const device uint *t1_1 = col1 + (tk + 1u) * stride;
+            // Trip 0: compute using preloaded w... and p...
+            float v[8];
+            extract_v_mcg_32(w0_0_0, w0_0_1, sh0, rsh0, v);
+            acc0_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+            acc0_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
 
-                float v[8];
-                const uint w0_0_0 = t0_0[j0], w0_0_1 = t0_0[j1];
-                const uint w1_0_0 = t1_0[j0], w1_0_1 = t1_0[j1];
-                const uint w0_1_0 = t0_1[j0], w0_1_1 = t0_1[j1];
-                const uint w1_1_0 = t1_1[j0], w1_1_1 = t1_1[j1];
+            extract_v_mcg_32(w1_0_0, w1_0_1, sh0, rsh0, v);
+            acc0_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+            acc0_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
 
-                extract_v_mcg_32(w0_0_0, w0_0_1, sh0, rsh0, v);
-                acc0_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
-                acc0_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+            extract_v_mcg_32(w0_1_0, w0_1_1, sh0, rsh0, v);
+            acc1_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+            acc1_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
 
-                extract_v_mcg_32(w1_0_0, w1_0_1, sh0, rsh0, v);
-                acc0_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
-                acc0_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+            extract_v_mcg_32(w1_1_0, w1_1_1, sh0, rsh0, v);
+            acc1_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+            acc1_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
 
-                extract_v_mcg_32(w0_1_0, w0_1_1, sh0, rsh0, v);
-                acc1_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
-                acc1_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+            // 2. Prefetch Trip 2 words and activations ahead of Trip 1 compute
+            const uint tk2 = tk + 2u * step;
+            const device uint *y0_0 = col0 + (tk2 + 0u) * stride;
+            const device uint *y1_0 = col0 + (tk2 + 1u) * stride;
+            const device uint *y0_1 = col1 + (tk2 + 0u) * stride;
+            const device uint *y1_1 = col1 + (tk2 + 1u) * stride;
+            const uint y0_0_0 = y0_0[j0], y0_0_1 = y0_0[j1];
+            const uint y1_0_0 = y1_0[j0], y1_0_1 = y1_0[j1];
+            const uint y0_1_0 = y0_1[j0], y0_1_1 = y0_1[j1];
+            const uint y1_1_0 = y1_1[j0], y1_1_1 = y1_1[j1];
+            const device half *xr0c = x + (tk2 + 0u) * 16u + r0;
+            const float r00 = float(xr0c[0]), r01 = float(xr0c[1]), r02 = float(xr0c[8]), r03 = float(xr0c[9]);
+            const device half *xr1c = x + (tk2 + 1u) * 16u + r0;
+            const float r10 = float(xr1c[0]), r11 = float(xr1c[1]), r12 = float(xr1c[8]), r13 = float(xr1c[9]);
 
-                extract_v_mcg_32(w1_1_0, w1_1_1, sh0, rsh0, v);
-                acc1_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
-                acc1_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+            // Trip 1: compute using preloaded x... and q...
+            extract_v_mcg_32(x0_0_0, x0_0_1, sh0, rsh0, v);
+            acc0_0 += q00 * v[0] + q01 * v[1] + q02 * v[2] + q03 * v[3];
+            acc0_1 += q00 * v[4] + q01 * v[5] + q02 * v[6] + q03 * v[7];
+
+            extract_v_mcg_32(x1_0_0, x1_0_1, sh0, rsh0, v);
+            acc0_0 += q10 * v[0] + q11 * v[1] + q12 * v[2] + q13 * v[3];
+            acc0_1 += q10 * v[4] + q11 * v[5] + q12 * v[6] + q13 * v[7];
+
+            extract_v_mcg_32(x0_1_0, x0_1_1, sh0, rsh0, v);
+            acc1_0 += q00 * v[0] + q01 * v[1] + q02 * v[2] + q03 * v[3];
+            acc1_1 += q00 * v[4] + q01 * v[5] + q02 * v[6] + q03 * v[7];
+
+            extract_v_mcg_32(x1_1_0, x1_1_1, sh0, rsh0, v);
+            acc1_0 += q10 * v[0] + q11 * v[1] + q12 * v[2] + q13 * v[3];
+            acc1_1 += q10 * v[4] + q11 * v[5] + q12 * v[6] + q13 * v[7];
+
+            // 3. Prefetch Trip 3 words and activations ahead of Trip 2 compute
+            const uint tk3 = tk + 3u * step;
+            const device uint *z0_0 = col0 + (tk3 + 0u) * stride;
+            const device uint *z1_0 = col0 + (tk3 + 1u) * stride;
+            const device uint *z0_1 = col1 + (tk3 + 0u) * stride;
+            const device uint *z1_1 = col1 + (tk3 + 1u) * stride;
+            const uint z0_0_0 = z0_0[j0], z0_0_1 = z0_0[j1];
+            const uint z1_0_0 = z1_0[j0], z1_0_1 = z1_0[j1];
+            const uint z0_1_0 = z0_1[j0], z0_1_1 = z0_1[j1];
+            const uint z1_1_0 = z1_1[j0], z1_1_1 = z1_1[j1];
+            const device half *xr0d = x + (tk3 + 0u) * 16u + r0;
+            const float s00 = float(xr0d[0]), s01 = float(xr0d[1]), s02 = float(xr0d[8]), s03 = float(xr0d[9]);
+            const device half *xr1d = x + (tk3 + 1u) * 16u + r0;
+            const float s10 = float(xr1d[0]), s11 = float(xr1d[1]), s12 = float(xr1d[8]), s13 = float(xr1d[9]);
+
+            // Trip 2: compute using preloaded y... and r...
+            extract_v_mcg_32(y0_0_0, y0_0_1, sh0, rsh0, v);
+            acc0_0 += r00 * v[0] + r01 * v[1] + r02 * v[2] + r03 * v[3];
+            acc0_1 += r00 * v[4] + r01 * v[5] + r02 * v[6] + r03 * v[7];
+
+            extract_v_mcg_32(y1_0_0, y1_0_1, sh0, rsh0, v);
+            acc0_0 += r10 * v[0] + r11 * v[1] + r12 * v[2] + r13 * v[3];
+            acc0_1 += r10 * v[4] + r11 * v[5] + r12 * v[6] + r13 * v[7];
+
+            extract_v_mcg_32(y0_1_0, y0_1_1, sh0, rsh0, v);
+            acc1_0 += r00 * v[0] + r01 * v[1] + r02 * v[2] + r03 * v[3];
+            acc1_1 += r00 * v[4] + r01 * v[5] + r02 * v[6] + r03 * v[7];
+
+            extract_v_mcg_32(y1_1_0, y1_1_1, sh0, rsh0, v);
+            acc1_0 += r10 * v[0] + r11 * v[1] + r12 * v[2] + r13 * v[3];
+            acc1_1 += r10 * v[4] + r11 * v[5] + r12 * v[6] + r13 * v[7];
+
+            // 4. Prefetch next iteration's Trip 0 if there is another iteration
+            const uint next_tk = tk + 4u * step;
+            if (next_tk + 3u * step < k_unroll_end) {
+                const device uint *next_t0_0 = col0 + (next_tk + 0u) * stride;
+                const device uint *next_t1_0 = col0 + (next_tk + 1u) * stride;
+                const device uint *next_t0_1 = col1 + (next_tk + 0u) * stride;
+                const device uint *next_t1_1 = col1 + (next_tk + 1u) * stride;
+                w0_0_0 = next_t0_0[j0]; w0_0_1 = next_t0_0[j1];
+                w1_0_0 = next_t1_0[j0]; w1_0_1 = next_t1_0[j1];
+                w0_1_0 = next_t0_1[j0]; w0_1_1 = next_t0_1[j1];
+                w1_1_0 = next_t1_1[j0]; w1_1_1 = next_t1_1[j1];
+                const device half *next_xr0 = x + (next_tk + 0u) * 16u + r0;
+                p00 = float(next_xr0[0]); p01 = float(next_xr0[1]); p02 = float(next_xr0[8]); p03 = float(next_xr0[9]);
+                const device half *next_xr1 = x + (next_tk + 1u) * 16u + r0;
+                p10 = float(next_xr1[0]); p11 = float(next_xr1[1]); p12 = float(next_xr1[8]); p13 = float(next_xr1[9]);
             }
 
-            // Trip 1: tk+step, tk+step+1
-            {
-                const uint tkx = tk + step;
-                const device half *xr0b = x + (tkx + 0u) * 16u + r0;
-                const float q00 = float(xr0b[0]), q01 = float(xr0b[1]), q02 = float(xr0b[8]), q03 = float(xr0b[9]);
-                const device half *xr1b = x + (tkx + 1u) * 16u + r0;
-                const float q10 = float(xr1b[0]), q11 = float(xr1b[1]), q12 = float(xr1b[8]), q13 = float(xr1b[9]);
+            // Trip 3: compute using preloaded z... and s...
+            extract_v_mcg_32(z0_0_0, z0_0_1, sh0, rsh0, v);
+            acc0_0 += s00 * v[0] + s01 * v[1] + s02 * v[2] + s03 * v[3];
+            acc0_1 += s00 * v[4] + s01 * v[5] + s02 * v[6] + s03 * v[7];
 
-                const device uint *u0_0 = col0 + (tkx + 0u) * stride;
-                const device uint *u1_0 = col0 + (tkx + 1u) * stride;
-                const device uint *u0_1 = col1 + (tkx + 0u) * stride;
-                const device uint *u1_1 = col1 + (tkx + 1u) * stride;
+            extract_v_mcg_32(z1_0_0, z1_0_1, sh0, rsh0, v);
+            acc0_0 += s10 * v[0] + s11 * v[1] + s12 * v[2] + s13 * v[3];
+            acc0_1 += s10 * v[4] + s11 * v[5] + s12 * v[6] + s13 * v[7];
 
-                float v[8];
-                const uint x0_0_0 = u0_0[j0], x0_0_1 = u0_0[j1];
-                const uint x1_0_0 = u1_0[j0], x1_0_1 = u1_0[j1];
-                const uint x0_1_0 = u0_1[j0], x0_1_1 = u0_1[j1];
-                const uint x1_1_0 = u1_1[j0], x1_1_1 = u1_1[j1];
+            extract_v_mcg_32(z0_1_0, z0_1_1, sh0, rsh0, v);
+            acc1_0 += s00 * v[0] + s01 * v[1] + s02 * v[2] + s03 * v[3];
+            acc1_1 += s00 * v[4] + s01 * v[5] + s02 * v[6] + s03 * v[7];
 
-                extract_v_mcg_32(x0_0_0, x0_0_1, sh0, rsh0, v);
-                acc0_0 += q00 * v[0] + q01 * v[1] + q02 * v[2] + q03 * v[3];
-                acc0_1 += q00 * v[4] + q01 * v[5] + q02 * v[6] + q03 * v[7];
-
-                extract_v_mcg_32(x1_0_0, x1_0_1, sh0, rsh0, v);
-                acc0_0 += q10 * v[0] + q11 * v[1] + q12 * v[2] + q13 * v[3];
-                acc0_1 += q10 * v[4] + q11 * v[5] + q12 * v[6] + q13 * v[7];
-
-                extract_v_mcg_32(x0_1_0, x0_1_1, sh0, rsh0, v);
-                acc1_0 += q00 * v[0] + q01 * v[1] + q02 * v[2] + q03 * v[3];
-                acc1_1 += q00 * v[4] + q01 * v[5] + q02 * v[6] + q03 * v[7];
-
-                extract_v_mcg_32(x1_1_0, x1_1_1, sh0, rsh0, v);
-                acc1_0 += q10 * v[0] + q11 * v[1] + q12 * v[2] + q13 * v[3];
-                acc1_1 += q10 * v[4] + q11 * v[5] + q12 * v[6] + q13 * v[7];
-            }
-
-            // Trip 2: tk+2*step, tk+2*step+1
-            {
-                const uint tky = tk + 2u * step;
-                const device half *xr0c = x + (tky + 0u) * 16u + r0;
-                const float r00 = float(xr0c[0]), r01 = float(xr0c[1]), r02 = float(xr0c[8]), r03 = float(xr0c[9]);
-                const device half *xr1c = x + (tky + 1u) * 16u + r0;
-                const float r10 = float(xr1c[0]), r11 = float(xr1c[1]), r12 = float(xr1c[8]), r13 = float(xr1c[9]);
-
-                const device uint *y0_0 = col0 + (tky + 0u) * stride;
-                const device uint *y1_0 = col0 + (tky + 1u) * stride;
-                const device uint *y0_1 = col1 + (tky + 0u) * stride;
-                const device uint *y1_1 = col1 + (tky + 1u) * stride;
-
-                float v[8];
-                const uint y0_0_0 = y0_0[j0], y0_0_1 = y0_0[j1];
-                const uint y1_0_0 = y1_0[j0], y1_0_1 = y1_0[j1];
-                const uint y0_1_0 = y0_1[j0], y0_1_1 = y0_1[j1];
-                const uint y1_1_0 = y1_1[j0], y1_1_1 = y1_1[j1];
-
-                extract_v_mcg_32(y0_0_0, y0_0_1, sh0, rsh0, v);
-                acc0_0 += r00 * v[0] + r01 * v[1] + r02 * v[2] + r03 * v[3];
-                acc0_1 += r00 * v[4] + r01 * v[5] + r02 * v[6] + r03 * v[7];
-
-                extract_v_mcg_32(y1_0_0, y1_0_1, sh0, rsh0, v);
-                acc0_0 += r10 * v[0] + r11 * v[1] + r12 * v[2] + r13 * v[3];
-                acc0_1 += r10 * v[4] + r11 * v[5] + r12 * v[6] + r13 * v[7];
-
-                extract_v_mcg_32(y0_1_0, y0_1_1, sh0, rsh0, v);
-                acc1_0 += r00 * v[0] + r01 * v[1] + r02 * v[2] + r03 * v[3];
-                acc1_1 += r00 * v[4] + r01 * v[5] + r02 * v[6] + r03 * v[7];
-
-                extract_v_mcg_32(y1_1_0, y1_1_1, sh0, rsh0, v);
-                acc1_0 += r10 * v[0] + r11 * v[1] + r12 * v[2] + r13 * v[3];
-                acc1_1 += r10 * v[4] + r11 * v[5] + r12 * v[6] + r13 * v[7];
-            }
-
-            // Trip 3: tk+3*step, tk+3*step+1
-            {
-                const uint tkz = tk + 3u * step;
-                const device half *xr0d = x + (tkz + 0u) * 16u + r0;
-                const float s00 = float(xr0d[0]), s01 = float(xr0d[1]), s02 = float(xr0d[8]), s03 = float(xr0d[9]);
-                const device half *xr1d = x + (tkz + 1u) * 16u + r0;
-                const float s10 = float(xr1d[0]), s11 = float(xr1d[1]), s12 = float(xr1d[8]), s13 = float(xr1d[9]);
-
-                const device uint *z0_0 = col0 + (tkz + 0u) * stride;
-                const device uint *z1_0 = col0 + (tkz + 1u) * stride;
-                const device uint *z0_1 = col1 + (tkz + 0u) * stride;
-                const device uint *z1_1 = col1 + (tkz + 1u) * stride;
-
-                float v[8];
-                const uint z0_0_0 = z0_0[j0], z0_0_1 = z0_0[j1];
-                const uint z1_0_0 = z1_0[j0], z1_0_1 = z1_0[j1];
-                const uint z0_1_0 = z0_1[j0], z0_1_1 = z0_1[j1];
-                const uint z1_1_0 = z1_1[j0], z1_1_1 = z1_1[j1];
-
-                extract_v_mcg_32(z0_0_0, z0_0_1, sh0, rsh0, v);
-                acc0_0 += s00 * v[0] + s01 * v[1] + s02 * v[2] + s03 * v[3];
-                acc0_1 += s00 * v[4] + s01 * v[5] + s02 * v[6] + s03 * v[7];
-
-                extract_v_mcg_32(z1_0_0, z1_0_1, sh0, rsh0, v);
-                acc0_0 += s10 * v[0] + s11 * v[1] + s12 * v[2] + s13 * v[3];
-                acc0_1 += s10 * v[4] + s11 * v[5] + s12 * v[6] + s13 * v[7];
-
-                extract_v_mcg_32(z0_1_0, z0_1_1, sh0, rsh0, v);
-                acc1_0 += s00 * v[0] + s01 * v[1] + s02 * v[2] + s03 * v[3];
-                acc1_1 += s00 * v[4] + s01 * v[5] + s02 * v[6] + s03 * v[7];
-
-                extract_v_mcg_32(z1_1_0, z1_1_1, sh0, rsh0, v);
-                acc1_0 += s10 * v[0] + s11 * v[1] + s12 * v[2] + s13 * v[3];
-                acc1_1 += s10 * v[4] + s11 * v[5] + s12 * v[6] + s13 * v[7];
-            }
+            extract_v_mcg_32(z1_1_0, z1_1_1, sh0, rsh0, v);
+            acc1_0 += s10 * v[0] + s11 * v[1] + s12 * v[2] + s13 * v[3];
+            acc1_1 += s10 * v[4] + s11 * v[5] + s12 * v[6] + s13 * v[7];
         }
 
         for (; tk < k_unroll_end; tk += step) {
@@ -2456,148 +2440,161 @@ kernel void linear_gemv_ishizuki_k3_colmajor_2col(
         const uint k_unroll_end = (tiles_k / step) * step;
 
         uint tk = sg * 2u;
+        uint w0_0_0 = 0, w0_0_1 = 0, w1_0_0 = 0, w1_0_1 = 0;
+        uint w0_1_0 = 0, w0_1_1 = 0, w1_1_0 = 0, w1_1_1 = 0;
+        float p00 = 0, p01 = 0, p02 = 0, p03 = 0, p10 = 0, p11 = 0, p12 = 0, p13 = 0;
+        if (tk + 3u * step < k_unroll_end) {
+            const device uint *t0_0 = col0 + (tk + 0u) * stride;
+            const device uint *t1_0 = col0 + (tk + 1u) * stride;
+            const device uint *t0_1 = col1 + (tk + 0u) * stride;
+            const device uint *t1_1 = col1 + (tk + 1u) * stride;
+            w0_0_0 = t0_0[j0]; w0_0_1 = t0_0[j1];
+            w1_0_0 = t1_0[j0]; w1_0_1 = t1_0[j1];
+            w0_1_0 = t0_1[j0]; w0_1_1 = t0_1[j1];
+            w1_1_0 = t1_1[j0]; w1_1_1 = t1_1[j1];
+            const device half *xr0 = x + (tk + 0u) * 16u + r0;
+            p00 = float(xr0[0]); p01 = float(xr0[1]); p02 = float(xr0[8]); p03 = float(xr0[9]);
+            const device half *xr1 = x + (tk + 1u) * 16u + r0;
+            p10 = float(xr1[0]); p11 = float(xr1[1]); p12 = float(xr1[8]); p13 = float(xr1[9]);
+        }
+
         for (; tk + 3u * step < k_unroll_end; tk += 4u * step) {
-            // Trip 0
-            {
-                const device half *xr0 = x + (tk + 0u) * 16u + r0;
-                const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
-                const device half *xr1 = x + (tk + 1u) * 16u + r0;
-                const float p10 = float(xr1[0]), p11 = float(xr1[1]), p12 = float(xr1[8]), p13 = float(xr1[9]);
+            // 1. Prefetch Trip 1 words and activations ahead of Trip 0 compute
+            const uint tk1 = tk + step;
+            const device uint *u0_0 = col0 + (tk1 + 0u) * stride;
+            const device uint *u1_0 = col0 + (tk1 + 1u) * stride;
+            const device uint *u0_1 = col1 + (tk1 + 0u) * stride;
+            const device uint *u1_1 = col1 + (tk1 + 1u) * stride;
+            const uint x0_0_0 = u0_0[j0], x0_0_1 = u0_0[j1];
+            const uint x1_0_0 = u1_0[j0], x1_0_1 = u1_0[j1];
+            const uint x0_1_0 = u0_1[j0], x0_1_1 = u0_1[j1];
+            const uint x1_1_0 = u1_1[j0], x1_1_1 = u1_1[j1];
+            const device half *xr0b = x + (tk1 + 0u) * 16u + r0;
+            const float q00 = float(xr0b[0]), q01 = float(xr0b[1]), q02 = float(xr0b[8]), q03 = float(xr0b[9]);
+            const device half *xr1b = x + (tk1 + 1u) * 16u + r0;
+            const float q10 = float(xr1b[0]), q11 = float(xr1b[1]), q12 = float(xr1b[8]), q13 = float(xr1b[9]);
 
-                const device uint *t0_0 = col0 + (tk + 0u) * stride;
-                const device uint *t1_0 = col0 + (tk + 1u) * stride;
-                const device uint *t0_1 = col1 + (tk + 0u) * stride;
-                const device uint *t1_1 = col1 + (tk + 1u) * stride;
+            // Trip 0: compute using preloaded w... and p...
+            float v[8];
+            extract_v_mcg_32(w0_0_0, w0_0_1, sh0, rsh0, v);
+            acc0_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+            acc0_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
 
-                float v[8];
-                const uint w0_0_0 = t0_0[j0], w0_0_1 = t0_0[j1];
-                const uint w1_0_0 = t1_0[j0], w1_0_1 = t1_0[j1];
-                extract_v_mcg_32(w0_0_0, w0_0_1, sh0, rsh0, v);
-                acc0_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
-                acc0_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+            extract_v_mcg_32(w1_0_0, w1_0_1, sh0, rsh0, v);
+            acc0_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+            acc0_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
 
-                extract_v_mcg_32(w1_0_0, w1_0_1, sh0, rsh0, v);
-                acc0_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
-                acc0_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+            extract_v_mcg_32(w0_1_0, w0_1_1, sh0, rsh0, v);
+            acc1_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+            acc1_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
 
-                const uint w0_1_0 = t0_1[j0], w0_1_1 = t0_1[j1];
-                const uint w1_1_0 = t1_1[j0], w1_1_1 = t1_1[j1];
-                extract_v_mcg_32(w0_1_0, w0_1_1, sh0, rsh0, v);
-                acc1_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
-                acc1_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+            extract_v_mcg_32(w1_1_0, w1_1_1, sh0, rsh0, v);
+            acc1_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+            acc1_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
 
-                extract_v_mcg_32(w1_1_0, w1_1_1, sh0, rsh0, v);
-                acc1_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
-                acc1_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+            // 2. Prefetch Trip 2 words and activations ahead of Trip 1 compute
+            const uint tk2 = tk + 2u * step;
+            const device uint *y0_0 = col0 + (tk2 + 0u) * stride;
+            const device uint *y1_0 = col0 + (tk2 + 1u) * stride;
+            const device uint *y0_1 = col1 + (tk2 + 0u) * stride;
+            const device uint *y1_1 = col1 + (tk2 + 1u) * stride;
+            const uint y0_0_0 = y0_0[j0], y0_0_1 = y0_0[j1];
+            const uint y1_0_0 = y1_0[j0], y1_0_1 = y1_0[j1];
+            const uint y0_1_0 = y0_1[j0], y0_1_1 = y0_1[j1];
+            const uint y1_1_0 = y1_1[j0], y1_1_1 = y1_1[j1];
+            const device half *xr0c = x + (tk2 + 0u) * 16u + r0;
+            const float r00 = float(xr0c[0]), r01 = float(xr0c[1]), r02 = float(xr0c[8]), r03 = float(xr0c[9]);
+            const device half *xr1c = x + (tk2 + 1u) * 16u + r0;
+            const float r10 = float(xr1c[0]), r11 = float(xr1c[1]), r12 = float(xr1c[8]), r13 = float(xr1c[9]);
+
+            // Trip 1: compute using preloaded x... and q...
+            extract_v_mcg_32(x0_0_0, x0_0_1, sh0, rsh0, v);
+            acc0_0 += q00 * v[0] + q01 * v[1] + q02 * v[2] + q03 * v[3];
+            acc0_1 += q00 * v[4] + q01 * v[5] + q02 * v[6] + q03 * v[7];
+
+            extract_v_mcg_32(x1_0_0, x1_0_1, sh0, rsh0, v);
+            acc0_0 += q10 * v[0] + q11 * v[1] + q12 * v[2] + q13 * v[3];
+            acc0_1 += q10 * v[4] + q11 * v[5] + q12 * v[6] + q13 * v[7];
+
+            extract_v_mcg_32(x0_1_0, x0_1_1, sh0, rsh0, v);
+            acc1_0 += q00 * v[0] + q01 * v[1] + q02 * v[2] + q03 * v[3];
+            acc1_1 += q00 * v[4] + q01 * v[5] + q02 * v[6] + q03 * v[7];
+
+            extract_v_mcg_32(x1_1_0, x1_1_1, sh0, rsh0, v);
+            acc1_0 += q10 * v[0] + q11 * v[1] + q12 * v[2] + q13 * v[3];
+            acc1_1 += q10 * v[4] + q11 * v[5] + q12 * v[6] + q13 * v[7];
+
+            // 3. Prefetch Trip 3 words and activations ahead of Trip 2 compute
+            const uint tk3 = tk + 3u * step;
+            const device uint *z0_0 = col0 + (tk3 + 0u) * stride;
+            const device uint *z1_0 = col0 + (tk3 + 1u) * stride;
+            const device uint *z0_1 = col1 + (tk3 + 0u) * stride;
+            const device uint *z1_1 = col1 + (tk3 + 1u) * stride;
+            const uint z0_0_0 = z0_0[j0], z0_0_1 = z0_0[j1];
+            const uint z1_0_0 = z1_0[j0], z1_0_1 = z1_0[j1];
+            const uint z0_1_0 = z0_1[j0], z0_1_1 = z0_1[j1];
+            const uint z1_1_0 = z1_1[j0], z1_1_1 = z1_1[j1];
+            const device half *xr0d = x + (tk3 + 0u) * 16u + r0;
+            const float s00 = float(xr0d[0]), s01 = float(xr0d[1]), s02 = float(xr0d[8]), s03 = float(xr0d[9]);
+            const device half *xr1d = x + (tk3 + 1u) * 16u + r0;
+            const float s10 = float(xr1d[0]), s11 = float(xr1d[1]), s12 = float(xr1d[8]), s13 = float(xr1d[9]);
+
+            // Trip 2: compute using preloaded y... and r...
+            extract_v_mcg_32(y0_0_0, y0_0_1, sh0, rsh0, v);
+            acc0_0 += r00 * v[0] + r01 * v[1] + r02 * v[2] + r03 * v[3];
+            acc0_1 += r00 * v[4] + r01 * v[5] + r02 * v[6] + r03 * v[7];
+
+            extract_v_mcg_32(y1_0_0, y1_0_1, sh0, rsh0, v);
+            acc0_0 += r10 * v[0] + r11 * v[1] + r12 * v[2] + r13 * v[3];
+            acc0_1 += r10 * v[4] + r11 * v[5] + r12 * v[6] + r13 * v[7];
+
+            extract_v_mcg_32(y0_1_0, y0_1_1, sh0, rsh0, v);
+            acc1_0 += r00 * v[0] + r01 * v[1] + r02 * v[2] + r03 * v[3];
+            acc1_1 += r00 * v[4] + r01 * v[5] + r02 * v[6] + r03 * v[7];
+
+            extract_v_mcg_32(y1_1_0, y1_1_1, sh0, rsh0, v);
+            acc1_0 += r10 * v[0] + r11 * v[1] + r12 * v[2] + r13 * v[3];
+            acc1_1 += r10 * v[4] + r11 * v[5] + r12 * v[6] + r13 * v[7];
+
+            // 4. Prefetch next iteration's Trip 0 if there is another iteration
+            const uint next_tk = tk + 4u * step;
+            if (next_tk + 3u * step < k_unroll_end) {
+                const device uint *next_t0_0 = col0 + (next_tk + 0u) * stride;
+                const device uint *next_t1_0 = col0 + (next_tk + 1u) * stride;
+                const device uint *next_t0_1 = col1 + (next_tk + 0u) * stride;
+                const device uint *next_t1_1 = col1 + (next_tk + 1u) * stride;
+                w0_0_0 = next_t0_0[j0]; w0_0_1 = next_t0_0[j1];
+                w1_0_0 = next_t1_0[j0]; w1_0_1 = next_t1_0[j1];
+                w0_1_0 = next_t0_1[j0]; w0_1_1 = next_t0_1[j1];
+                w1_1_0 = next_t1_1[j0]; w1_1_1 = next_t1_1[j1];
+                const device half *next_xr0 = x + (next_tk + 0u) * 16u + r0;
+                p00 = float(next_xr0[0]); p01 = float(next_xr0[1]); p02 = float(next_xr0[8]); p03 = float(next_xr0[9]);
+                const device half *next_xr1 = x + (next_tk + 1u) * 16u + r0;
+                p10 = float(next_xr1[0]); p11 = float(next_xr1[1]); p12 = float(next_xr1[8]); p13 = float(next_xr1[9]);
             }
-            // Trip 1
-            {
-                const uint tk_sub = tk + step;
-                const device half *xr0 = x + (tk_sub + 0u) * 16u + r0;
-                const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
-                const device half *xr1 = x + (tk_sub + 1u) * 16u + r0;
-                const float p10 = float(xr1[0]), p11 = float(xr1[1]), p12 = float(xr1[8]), p13 = float(xr1[9]);
 
-                const device uint *t0_0 = col0 + (tk_sub + 0u) * stride;
-                const device uint *t1_0 = col0 + (tk_sub + 1u) * stride;
-                const device uint *t0_1 = col1 + (tk_sub + 0u) * stride;
-                const device uint *t1_1 = col1 + (tk_sub + 1u) * stride;
+            // Trip 3: compute using preloaded z... and s...
+            extract_v_mcg_32(z0_0_0, z0_0_1, sh0, rsh0, v);
+            acc0_0 += s00 * v[0] + s01 * v[1] + s02 * v[2] + s03 * v[3];
+            acc0_1 += s00 * v[4] + s01 * v[5] + s02 * v[6] + s03 * v[7];
 
-                float v[8];
-                const uint w0_0_0 = t0_0[j0], w0_0_1 = t0_0[j1];
-                const uint w1_0_0 = t1_0[j0], w1_0_1 = t1_0[j1];
-                extract_v_mcg_32(w0_0_0, w0_0_1, sh0, rsh0, v);
-                acc0_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
-                acc0_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+            extract_v_mcg_32(z1_0_0, z1_0_1, sh0, rsh0, v);
+            acc0_0 += s10 * v[0] + s11 * v[1] + s12 * v[2] + s13 * v[3];
+            acc0_1 += s10 * v[4] + s11 * v[5] + s12 * v[6] + s13 * v[7];
 
-                extract_v_mcg_32(w1_0_0, w1_0_1, sh0, rsh0, v);
-                acc0_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
-                acc0_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+            extract_v_mcg_32(z0_1_0, z0_1_1, sh0, rsh0, v);
+            acc1_0 += s00 * v[0] + s01 * v[1] + s02 * v[2] + s03 * v[3];
+            acc1_1 += s00 * v[4] + s01 * v[5] + s02 * v[6] + s03 * v[7];
 
-                const uint w0_1_0 = t0_1[j0], w0_1_1 = t0_1[j1];
-                const uint w1_1_0 = t1_1[j0], w1_1_1 = t1_1[j1];
-                extract_v_mcg_32(w0_1_0, w0_1_1, sh0, rsh0, v);
-                acc1_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
-                acc1_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
-
-                extract_v_mcg_32(w1_1_0, w1_1_1, sh0, rsh0, v);
-                acc1_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
-                acc1_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
-            }
-            // Trip 2
-            {
-                const uint tk_sub = tk + 2u * step;
-                const device half *xr0 = x + (tk_sub + 0u) * 16u + r0;
-                const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
-                const device half *xr1 = x + (tk_sub + 1u) * 16u + r0;
-                const float p10 = float(xr1[0]), p11 = float(xr1[1]), p12 = float(xr1[8]), p13 = float(xr1[9]);
-
-                const device uint *t0_0 = col0 + (tk_sub + 0u) * stride;
-                const device uint *t1_0 = col0 + (tk_sub + 1u) * stride;
-                const device uint *t0_1 = col1 + (tk_sub + 0u) * stride;
-                const device uint *t1_1 = col1 + (tk_sub + 1u) * stride;
-
-                float v[8];
-                const uint w0_0_0 = t0_0[j0], w0_0_1 = t0_0[j1];
-                const uint w1_0_0 = t1_0[j0], w1_0_1 = t1_0[j1];
-                extract_v_mcg_32(w0_0_0, w0_0_1, sh0, rsh0, v);
-                acc0_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
-                acc0_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
-
-                extract_v_mcg_32(w1_0_0, w1_0_1, sh0, rsh0, v);
-                acc0_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
-                acc0_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
-
-                const uint w0_1_0 = t0_1[j0], w0_1_1 = t0_1[j1];
-                const uint w1_1_0 = t1_1[j0], w1_1_1 = t1_1[j1];
-                extract_v_mcg_32(w0_1_0, w0_1_1, sh0, rsh0, v);
-                acc1_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
-                acc1_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
-
-                extract_v_mcg_32(w1_1_0, w1_1_1, sh0, rsh0, v);
-                acc1_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
-                acc1_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
-            }
-            // Trip 3
-            {
-                const uint tk_sub = tk + 3u * step;
-                const device half *xr0 = x + (tk_sub + 0u) * 16u + r0;
-                const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
-                const device half *xr1 = x + (tk_sub + 1u) * 16u + r0;
-                const float p10 = float(xr1[0]), p11 = float(xr1[1]), p12 = float(xr1[8]), p13 = float(xr1[9]);
-
-                const device uint *t0_0 = col0 + (tk_sub + 0u) * stride;
-                const device uint *t1_0 = col0 + (tk_sub + 1u) * stride;
-                const device uint *t0_1 = col1 + (tk_sub + 0u) * stride;
-                const device uint *t1_1 = col1 + (tk_sub + 1u) * stride;
-
-                float v[8];
-                const uint w0_0_0 = t0_0[j0], w0_0_1 = t0_0[j1];
-                const uint w1_0_0 = t1_0[j0], w1_0_1 = t1_0[j1];
-                extract_v_mcg_32(w0_0_0, w0_0_1, sh0, rsh0, v);
-                acc0_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
-                acc0_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
-
-                extract_v_mcg_32(w1_0_0, w1_0_1, sh0, rsh0, v);
-                acc0_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
-                acc0_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
-
-                const uint w0_1_0 = t0_1[j0], w0_1_1 = t0_1[j1];
-                const uint w1_1_0 = t1_1[j0], w1_1_1 = t1_1[j1];
-                extract_v_mcg_32(w0_1_0, w0_1_1, sh0, rsh0, v);
-                acc1_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
-                acc1_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
-
-                extract_v_mcg_32(w1_1_0, w1_1_1, sh0, rsh0, v);
-                acc1_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
-                acc1_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
-            }
+            extract_v_mcg_32(z1_1_0, z1_1_1, sh0, rsh0, v);
+            acc1_0 += s10 * v[0] + s11 * v[1] + s12 * v[2] + s13 * v[3];
+            acc1_1 += s10 * v[4] + s11 * v[5] + s12 * v[6] + s13 * v[7];
         }
         for (; tk < k_unroll_end; tk += step) {
-            const device half *xr0 = x + (tk + 0u) * 16u + r0;
-            const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
-            const device half *xr1 = x + (tk + 1u) * 16u + r0;
-            const float p10 = float(xr1[0]), p11 = float(xr1[1]), p12 = float(xr1[8]), p13 = float(xr1[9]);
+            const device half *xr0s = x + (tk + 0u) * 16u + r0;
+            const float p00 = float(xr0s[0]), p01 = float(xr0s[1]), p02 = float(xr0s[8]), p03 = float(xr0s[9]);
+            const device half *xr1s = x + (tk + 1u) * 16u + r0;
+            const float p10 = float(xr1s[0]), p11 = float(xr1s[1]), p12 = float(xr1s[8]), p13 = float(xr1s[9]);
 
             const device uint *t0_0 = col0 + (tk + 0u) * stride;
             const device uint *t1_0 = col0 + (tk + 1u) * stride;

@@ -64,3 +64,19 @@ Running log for implementers and handovers.
     - Attention total latency: ~1.2 ms.
     - Total step time: ~63.3 ms = ~15.8 tok/s.
     - Greedily generated text is 100% bit-exact across all runs.
+
+### T8: SIMD uint4 Vector Dequantization & Software-Pipelined Prefetching (2026-10-07)
+- **SIMD Vector ALU issue reduction**:
+  - Implemented 4-wide vector ALU operations (`uint4 c0, c1; c = 0x3b603b60u ^ ((c * 0xCBAC1FEDu) & 0x8fff8fffu)`) in `extract_v_mcg_32`, reducing scalar instruction issue cycles in the inner loop by ~65%.
+- **Software-pipelined double-buffering**:
+  - Implemented 1-trip ahead memory prefetching in `linear_gemv_ishizuki_k3_fused2_2col`, `linear_gemv_ishizuki_k3_fused3_2col`, and `linear_gemv_ishizuki_k3_colmajor_2col`.
+  - Trip 1 words and activation values are preloaded before Trip 0 computes; Trip 2 before Trip 1 computes; Trip 3 before Trip 2 computes; and next iteration's Trip 0 before Trip 3 computes.
+  - DRAM load latency is hidden under 4 vector dequantization calls and 16 floating-point MACs.
+- **Sabotage verification (AGENTS.md §3.4)**:
+  - Sabotaged `acc0_0 += ... + 0.5f` in `linear_gemv_ishizuki_k3_colmajor_2col`.
+  - Ran `cargo test -p kaplumba-engine --test live_kernel_bit_exact`: FAILED with exit code 101, detecting bit discrepancy immediately.
+  - Reverted sabotage and verified: PASSED 100% in 15.41s.
+- **Test suite status**:
+  - `repacked_golden`: 2/2 passed in 5.72s.
+  - `live_kernel_bit_exact`: passed in 15.41s.
+  - `probe_cache_hierarchy`: 16/16 passed in 0.03s.

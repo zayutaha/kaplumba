@@ -51,3 +51,10 @@ One commit per task. Update this file **immediately** after each task with statu
   - **Intent**: Measure steady-state decode throughput across 16 interleaved paired runs using `scripts/gpuq try --`. Verify tok/s and 100% bit-exact greedy token hash.
   - **Test**: Confirm $\ge 18.5\text{--}20.0\text{ tok/s}$ sustained, $\le 6.0\text{ ms}$ attention at 16k, and 0 swap.
   - **Commit**: `spec/decode-alu-flash-20tok: T7 end-to-end benchmarks and acceptance proof`
+
+- [x] **T8 — Software-Pipelined Memory Prefetching in Live GEMV Kernels**
+  - **Files**: `crates/kernels/src/linear_repacked.metal`, `crates/engine/tests/probe_cache_hierarchy.rs`
+  - **Intent**: Double-buffer memory reads 1 trip ahead in `fused2_2col`, `fused3_2col`, and `colmajor_2col` to overlap DRAM load latency with vector dequantization ALU instructions.
+  - **Test**: `repacked_golden` (2/2 passed), `live_kernel_bit_exact` (passed in 15.41s), `probe_cache_hierarchy` (16/16 passed). Sabotage verified on `colmajor_2col` accumulator (caught with exit 101, then reverted).
+  - **Commit**: `spec/decode-alu-flash-20tok: T8 software-pipelined memory prefetching in GEMV kernels`
+

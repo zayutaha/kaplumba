@@ -841,9 +841,9 @@ fn activation_loads_are_4_byte_alignable_and_collapse_2_to_1() {
         "xr0 and xr1 in the unrolled body, xr0 in the remainder loop"
     );
     for (line, text) in [
-        (2121u32, "const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);"),
-        (2123, "const float p10 = float(xr1[0]), p11 = float(xr1[1]), p12 = float(xr1[8]), p13 = float(xr1[9]);"),
-        (2160, "const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);"),
+        (2109u32, "const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);"),
+        (2111, "const float p10 = float(xr1[0]), p11 = float(xr1[1]), p12 = float(xr1[8]), p13 = float(xr1[9]);"),
+        (2141, "const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);"),
     ] {
         let actual = REPACKED.lines().nth(line as usize - 1).unwrap_or("");
         assert_eq!(
@@ -854,7 +854,7 @@ fn activation_loads_are_4_byte_alignable_and_collapse_2_to_1() {
     }
     // And `r0` itself, the sole determinant of the alignment.
     assert_eq!(
-        REPACKED.lines().nth(2093 - 1).unwrap_or("").trim(),
+        REPACKED.lines().nth(2075 - 1).unwrap_or("").trim(),
         "const uint r0 = (lane % 4u) * 2u;",
         "r0 moved; the 4-byte alignment proof depends on it"
     );
