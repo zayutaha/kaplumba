@@ -239,7 +239,7 @@ fn max_in_flight() -> usize {
         std::env::var("KAPLUMBA_MAX_IN_FLIGHT")
             .ok()
             .and_then(|value| value.trim().parse::<usize>().ok())
-            .filter(|value| (1..=MAX_IN_FLIGHT).contains(value))
+            .filter(|value| (1..=64).contains(value))
             .unwrap_or(MAX_IN_FLIGHT)
     })
 }

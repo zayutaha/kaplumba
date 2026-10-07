@@ -298,3 +298,11 @@ killer before suspecting the probe.
   - Re-ran test: failed with `the pipelined chat loop must actively call self.model.retract_gpu_caches(1) on EOS`.
   - Reverted sabotage: test passed cleanly.
 
+## 15. T2: `max_in_flight()` Range Extended to 64
+
+**Implemented:**
+- In `crates/kernels/src/encoder.rs:242`, changed `.filter(|value| (1..=MAX_IN_FLIGHT).contains(value))` to `.filter(|value| (1..=64).contains(value))`.
+- Avoids silent clamp back to 8 when tuning or running larger in-flight windows.
+- All 8 unit tests in `encoder::tests` pass cleanly.
+
+

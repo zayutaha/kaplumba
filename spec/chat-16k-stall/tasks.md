@@ -22,10 +22,10 @@ median + spread + control drift. A repeat of the same binary has produced
       and pass when restored).
       *Commit:* `spec/chat-16k-stall: T1 retract KV cache on EOS in chat`
 
-- [ ] **T2 — Fix `max_in_flight()` parser clamp and size the window.**
-      *Do:* Fix `encoder.rs:242` where `.filter(|value| (1..=MAX_IN_FLIGHT).contains(value))`
-      silently clamped any value $> 8$ to 8. Allow user configuration up to 64.
-      Ensure the window holds one decode step without mid-step blocking.
+- [x] **T2 — Fix `max_in_flight()` parser clamp and size the window.**
+      *Completed:* Extended `max_in_flight()` parser filter from `1..=8` to `1..=64` in
+      `crates/kernels/src/encoder.rs:242`.
+      *Verified:* Unit tests in `encoder::tests` pass (8/8).
       *Commit:* `spec/chat-16k-stall: T2 fix in-flight window parser and sizing`
 
 - [ ] **T3 — Prove token-stream equivalence across multi-turn sessions.**
