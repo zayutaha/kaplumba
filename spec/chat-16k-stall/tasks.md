@@ -15,11 +15,11 @@ median + spread + control drift. A repeat of the same binary has produced
       *Verified:* 0 swaps, 18.69 tok/s decode on short prompt, 102/102 engine unit tests pass.
       *Commit:* `spec/chat-16k-stall: T0 zero-copy file-backed weights to eliminate swap`
 
-- [ ] **T1 — Fix missing KV cache retraction on EOS in `chat.rs`.**
-      *Why:* `generate.rs:1050` calls `model.retract_gpu_caches(1)` on EOS to
-      retract the speculatively encoded step $N+1$, while `chat.rs:507` breaks
-      without retracting, corrupting the KV cursor across multi-turn sessions.
-      *Do:* Add `self.model.retract_gpu_caches(1)` to `chat.rs` EOS path.
+- [x] **T1 — Fix missing KV cache retraction on EOS in `chat.rs`.**
+      *Completed:* Added `self.model.retract_gpu_caches(1)` to `chat.rs` EOS break.
+      *Verified:* Added structural regression test `the_pipelined_chat_loop_retracts_kv_cache_on_eos`
+      in `multi_turn_chat.rs`. Sabotage test verified per AGENTS.md §3.4 (saw it fail on comment-out,
+      and pass when restored).
       *Commit:* `spec/chat-16k-stall: T1 retract KV cache on EOS in chat`
 
 - [ ] **T2 — Fix `max_in_flight()` parser clamp and size the window.**

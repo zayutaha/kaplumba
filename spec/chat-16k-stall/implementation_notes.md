@@ -288,3 +288,13 @@ killer before suspecting the probe.
   - `/usr/bin/time -l`: 0 swaps, peak memory footprint 1.54 GiB, `vm.swapusage`: 0 growth.
 - Dirty anonymous Metal graphics memory reduced by ~10.25 GiB.
 
+## 14. T1: KV Cache Retraction on EOS in `chat.rs`
+
+**Implemented:**
+- Added `self.model.retract_gpu_caches(1)` when breaking on EOS in `chat.rs:510`.
+- Added regression test `the_pipelined_chat_loop_retracts_kv_cache_on_eos` in `crates/engine/tests/multi_turn_chat.rs`.
+- **Sabotage Verified (per AGENTS.md §3.4):**
+  - Commented out `self.model.retract_gpu_caches(1)`.
+  - Re-ran test: failed with `the pipelined chat loop must actively call self.model.retract_gpu_caches(1) on EOS`.
+  - Reverted sabotage: test passed cleanly.
+

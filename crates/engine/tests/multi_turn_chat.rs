@@ -605,3 +605,39 @@ fn a_staged_token_is_read_after_its_encoder_is_waited_on() {
          synchronisation of its own; this ordering was a shipped bug."
     );
 }
+
+/// On EOS, the speculatively encoded step N+1 in flight must have its KV cache
+/// advance retracted via `retract_gpu_caches(1)`, identical to `generate.rs:1050`.
+/// Otherwise the KV cursor drifts forward by phantom tokens on every turn.
+#[test]
+fn the_pipelined_chat_loop_retracts_kv_cache_on_eos() {
+    let src = std::fs::read_to_string(format!(
+        "{}/src/chat.rs",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("chat.rs");
+    let pipelined = src
+        .split("loop {")
+        .nth(1)
+        .and_then(|body| body.split("Fallback: barrier per token").next())
+        .expect("pipelined decode loop");
+
+    let eos_block = pipelined
+        .split("if self.eos_ids.contains(&token) {")
+        .nth(1)
+        .expect("EOS branch in pipelined decode loop");
+    let eos_body = eos_block
+        .split("break;")
+        .next()
+        .expect("EOS branch body before break");
+
+    let has_active_call = eos_body.lines().any(|line| {
+        let trimmed = line.trim();
+        !trimmed.starts_with("//") && trimmed.contains("self.model.retract_gpu_caches(1)")
+    });
+    assert!(
+        has_active_call,
+        "the pipelined chat loop must actively call self.model.retract_gpu_caches(1) on EOS \
+         to retract speculatively queued tokens; without it, KV cursor drifts."
+    );
+}

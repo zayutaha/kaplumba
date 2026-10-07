@@ -507,6 +507,7 @@ impl<'a> ChatSession<'a> {
                 if self.eos_ids.contains(&token) {
                     if let Some(enc) = encoder {
                         enc.wait();
+                        self.model.retract_gpu_caches(1);
                     }
                     break;
                 }
@@ -534,6 +535,11 @@ impl<'a> ChatSession<'a> {
                 pending.wait();
             }
             let decode_s = decode_started.elapsed().as_secs_f64();
+            // Chat never reported the decode profile, so `--chat` had no
+            // per-kernel attribution at all and its rate could only be guessed
+            // at from stacks. `KAPLUMBA_DECODE_PROFILE=kernel` now works here,
+            // which is what located the 16k stall's cost inside the GPU.
+            crate::decode_profile::report();
             if let Some(chunk) = detokenizer.finish()? {
                 if !chunk.is_empty() {
                     reply.push_str(&chunk);
