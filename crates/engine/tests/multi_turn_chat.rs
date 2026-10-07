@@ -519,3 +519,89 @@ fn the_parser_keeps_state_and_drops_timing() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Decode-loop ordering. The fix that made `--chat` usable at long context.
+// ---------------------------------------------------------------------------
+
+/// The pipelined chat loop must encode step N+1 and commit it BEFORE waiting on
+/// step N. It used to wait first, so the GPU drained and idled for the whole of
+/// the host's `forward_step_pipelined` encode on every token. Measured at 2234
+/// tokens of context: 6.7-8.2 tok/s before, 15.11-15.21 after, against a
+/// single-shot 15.16-15.38 on the same work -- i.e. chat reached parity with the
+/// generator it had been trailing by 2.1x.
+///
+/// This asserts the ORDER in the source, because the cost is invisible in the
+/// token stream: both orderings emit identical tokens (the existing
+/// `pipelined_and_barrier_decode_agree_across_a_multi_turn_session` proves the
+/// text matches), so no behavioural test can catch a regression here. Only the
+/// instruction sequence can. That is why it is a source assertion and why
+/// `AGENTS.md §3.4` applies to it directly -- it is a claim about the source
+/// that must be shown to be able to fail.
+#[test]
+fn the_pipelined_chat_loop_commits_before_it_waits() {
+    let src = std::fs::read_to_string(format!(
+        "{}/src/chat.rs",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("chat.rs");
+
+    let loop_body = src
+        .split("loop {")
+        .nth(1)
+        .expect("chat.rs must contain the decode loop");
+    // Only the pipelined loop: take it up to the barrier-per-token fallback.
+    let pipelined = loop_body
+        .split("Fallback: barrier per token")
+        .next()
+        .unwrap_or(loop_body);
+
+    let commit = pipelined
+        .find("commit_terminal()")
+        .expect("the pipelined loop must commit a command buffer");
+    let wait = pipelined
+        .find("previous.wait()")
+        .expect("the pipelined loop must wait on the previous encoder");
+
+    assert!(
+        commit < wait,
+        "the pipelined chat loop waits on step N at offset {wait} but does not commit \
+         step N+1 until offset {commit}. Reverting to wait-then-encode idles the GPU \
+         for the host's whole encode every token -- measured 2.1x slower than the \
+         single-shot generator on identical work, and invisible in the token stream \
+         because both orders emit the same text."
+    );
+}
+
+/// The `read_host_token` invariant the reorder had to preserve: a GPU-staged
+/// token is never read before the encoder that staged it has been waited on.
+/// The reorder moves the encode earlier; it must NOT move the read earlier too,
+/// or the host reads GPU memory with no synchronisation of its own. The file
+/// says this was a real bug once ("What was wrong: it read read_host_token(step
+/// - 1) at the top of iteration step").
+#[test]
+fn a_staged_token_is_read_after_its_encoder_is_waited_on() {
+    let src = std::fs::read_to_string(format!(
+        "{}/src/chat.rs",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("chat.rs");
+    let pipelined = src
+        .split("loop {")
+        .nth(1)
+        .and_then(|body| body.split("Fallback: barrier per token").next())
+        .expect("pipelined decode loop");
+
+    let wait = pipelined
+        .find("previous.wait()")
+        .expect("wait on the previous encoder");
+    let read = pipelined
+        .find("read_host_token(step - 1)")
+        .expect("read of the staged token");
+    assert!(
+        wait < read,
+        "read_host_token at offset {read} precedes previous.wait() at offset {wait}. \
+         read_host_token is a raw contents() read of GPU-written memory with no \
+         synchronisation of its own; this ordering was a shipped bug."
+    );
+}

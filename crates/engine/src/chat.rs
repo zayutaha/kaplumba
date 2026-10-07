@@ -450,24 +450,74 @@ impl<'a> ChatSession<'a> {
             // is about to build.
             let mut prev: Option<kaplumba_kernels::encoder::MetalEncoder> = None;
             let mut step: usize = 0;
+            let mut t_encode = std::time::Duration::ZERO;
+            let mut t_wait = std::time::Duration::ZERO;
+            let mut t_detok = std::time::Duration::ZERO;
 
             loop {
+                let _t0 = std::time::Instant::now();
+                // Order matters and was wrong until T2: encode step N+1, commit
+                // it, and ONLY THEN wait on step N. This loop used to wait on
+                // `prev` at the top of the iteration, before building the next
+                // encoder, so the GPU drained to idle and sat there for the whole
+                // of the host's `forward_step_pipelined` encode every single
+                // token. `generate.rs` has always had the right order
+                // (`generate.rs:1031` commits `next_enc`, `:1033` then waits on
+                // `in_flight_enc`).
+                //
+                // The invariant that forced the bad order -- "never read a
+                // GPU-staged token before waiting on the encoder that staged it"
+                // -- is still honoured: `read_host_token` only happens after the
+                // `wait()`, it is simply not the first thing in the iteration.
+                let mut encoder = None;
+                if step + 1 < self.max_new_tokens {
+                    let position = (base + need + step) as u32;
+                    let mut enc =
+                        kaplumba_kernels::encoder::MetalEncoder::new(&queue).map_err(ModelError::from)?;
+                    enc.set_max_dispatches(
+                        kaplumba_kernels::encoder::decode_max_dispatches_per_buffer(),
+                    );
+                    self.model
+                        .forward_step_pipelined(
+                            &mut enc,
+                            position,
+                            if step == 0 { Some(token) } else { None },
+                            step % 2,
+                            step as u32,
+                            if self.greedy {
+                                crate::model::HeadPick::Argmax
+                            } else {
+                                match device_params {
+                                    Some(params) => crate::model::HeadPick::Sample(params),
+                                    None => crate::model::HeadPick::Argmax,
+                                }
+                            },
+                        )
+                        .map_err(ModelError::from)?;
+                    enc.commit_terminal().map_err(ModelError::from)?;
+                    encoder = Some(enc);
+                }
+                t_encode += _t0.elapsed();
+
+                let _t1 = std::time::Instant::now();
                 if step > 0 {
-                    // Step N-1 was submitted at the bottom of the previous
-                    // iteration, so it has had the whole of the host's emit and
-                    // encode to run. NOW its staged token is safe to read, and the
-                    // wait has to come first: `read_host_token` is a raw
-                    // `contents()` read of GPU-written memory with no
-                    // synchronisation of its own.
+                    // Step N-1 is now committed and this step's encode is
+                    // already submitted, so the wait below overlaps step N+1's
+                    // GPU work with step N's drain instead of idling.
                     let previous = prev
                         .take()
                         .expect("step > 0 implies a previous encoder is in flight");
                     previous.wait();
                     token = self.model.read_host_token(step - 1);
                 }
+                t_wait += _t1.elapsed();
                 if self.eos_ids.contains(&token) {
+                    if let Some(enc) = encoder {
+                        enc.wait();
+                    }
                     break;
                 }
+                let _t2 = std::time::Instant::now();
                 generated.push(token);
                 if let Some(chunk) = detokenizer.push(token)? {
                     if !chunk.is_empty() {
@@ -475,44 +525,14 @@ impl<'a> ChatSession<'a> {
                         on_text(&chunk).map_err(ChatError::from_output)?;
                     }
                 }
+                t_detok += _t2.elapsed();
                 if generated.len() >= self.max_new_tokens {
+                    if let Some(enc) = encoder {
+                        enc.wait();
+                    }
                     break;
                 }
-
-                // Step `step` consumes the token at position `base + need + step`
-                // and produces the next one. `step == 0` needs the host-supplied
-                // token; every later step passes `None`, because the previous
-                // step's argmax already wrote this step's input slot on the GPU
-                // (`forward_step_pipelined` points the argmax at
-                // `token_ids_decode[1 - slot]`), and passing a host value would
-                // overwrite it.
-                let position = (base + need + step) as u32;
-                let mut encoder =
-                    kaplumba_kernels::encoder::MetalEncoder::new(&queue).map_err(ModelError::from)?;
-                encoder.set_max_dispatches(kaplumba_kernels::encoder::decode_max_dispatches_per_buffer());
-                self.model
-                    .forward_step_pipelined(
-                        &mut encoder,
-                        position,
-                        if step == 0 { Some(token) } else { None },
-                        step % 2,
-                        step as u32,
-                        if self.greedy {
-                            crate::model::HeadPick::Argmax
-                        } else {
-                            match device_params {
-                                Some(params) => crate::model::HeadPick::Sample(params),
-                                // Unstagable top_k: this call is only reachable
-                                // when the device path is unsupported, in which
-                                // case `pipelined` is false. Keep the arm for
-                                // type completeness; it must be unreachable.
-                                None => crate::model::HeadPick::Argmax,
-                            }
-                        },
-                    )
-                    .map_err(ModelError::from)?;
-                encoder.commit_terminal().map_err(ModelError::from)?;
-                prev = Some(encoder);
+                prev = encoder;
                 step += 1;
             }
 
@@ -521,6 +541,19 @@ impl<'a> ChatSession<'a> {
             // position is wrong.
             if let Some(pending) = prev.take() {
                 pending.wait();
+            }
+            if std::env::var_os("KAPLUMBA_CHAT_BREAKDOWN").is_some() {
+                eprintln!(
+                    "CHAT-BREAKDOWN steps={} encode={:.1}ms wait={:.1}ms detok={:.1}ms \
+                     per-step: encode={:.2}ms wait={:.2}ms detok={:.2}ms",
+                    step,
+                    t_encode.as_secs_f64() * 1e3,
+                    t_wait.as_secs_f64() * 1e3,
+                    t_detok.as_secs_f64() * 1e3,
+                    t_encode.as_secs_f64() * 1e3 / step.max(1) as f64,
+                    t_wait.as_secs_f64() * 1e3 / step.max(1) as f64,
+                    t_detok.as_secs_f64() * 1e3 / step.max(1) as f64,
+                );
             }
             let decode_s = decode_started.elapsed().as_secs_f64();
             if let Some(chunk) = detokenizer.finish()? {
