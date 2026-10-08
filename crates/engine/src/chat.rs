@@ -481,6 +481,7 @@ impl<'a> ChatSession<'a> {
                 }
 
                 let mut encoder = None;
+                let encode_started = std::time::Instant::now();
                 if step + 1 < self.max_new_tokens {
                     let position = (base + need + step) as u32;
                     let mut enc =
@@ -508,13 +509,21 @@ impl<'a> ChatSession<'a> {
                     enc.commit_terminal().map_err(ModelError::from)?;
                     encoder = Some(enc);
                 }
+                let encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
 
                 if step > 0 {
                     let previous = prev
                         .take()
                         .expect("step > 0 implies a previous encoder is in flight");
+                    let wait_started = std::time::Instant::now();
                     previous.wait();
                     token = self.model.read_host_token(step - 1);
+                    let wait_ms = wait_started.elapsed().as_secs_f64() * 1000.0;
+                    if show_token_timing {
+                        eprintln!(
+                            "[step] step={step} encode={encode_ms:.2}ms wait={wait_ms:.2}ms"
+                        );
+                    }
                     if self.eos_ids.contains(&token) {
                         if let Some(enc) = encoder {
                             enc.wait();
