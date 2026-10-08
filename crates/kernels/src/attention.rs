@@ -1391,7 +1391,7 @@ impl AttentionKernels {
             combine,
             &[Some(partials), Some(request.output)],
             bytes,
-            (q_heads * head_dim) as u64,
+            ((q_heads * head_dim) / 4) as u64,
             64,
         )
     }

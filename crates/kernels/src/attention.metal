@@ -957,8 +957,8 @@ static void attention_decode_combine_body(
     device half *output,
     constant AttentionParams &params,
     uint gid) {
-    const uint dimension = gid % params.head_dim;
-    const uint head = gid / params.head_dim;
+    const uint d4 = (gid % (params.head_dim / 4u)) * 4u;
+    const uint head = gid / (params.head_dim / 4u);
     if (head >= params.q_heads) {
         return;
     }
@@ -967,16 +967,18 @@ static void attention_decode_combine_body(
     for (uint i = 0; i < params.splits; ++i) {
         global_max = max(global_max, partials[(i * params.q_heads + head) * stride]);
     }
-    float numerator = 0.0f;
-    float denominator = 0.0f;
+    float4 num4 = float4(0.0f);
+    float den = 0.0f;
     for (uint i = 0; i < params.splits; ++i) {
         const device float *row = partials + (i * params.q_heads + head) * stride;
         const float factor = exp(row[0] - global_max);
-        denominator += factor * row[1];
-        numerator += factor * row[2u + dimension];
+        den += factor * row[1];
+        const device float4 *val4 = reinterpret_cast<const device float4 *>(row + 2u + d4);
+        num4 += factor * (*val4);
     }
-    const float value = denominator > 0.0f ? numerator / denominator : 0.0f;
-    output[head * params.head_dim + dimension] = half(value);
+    const float inv_den = den > 0.0f ? 1.0f / den : 0.0f;
+    device half4 *out4 = reinterpret_cast<device half4 *>(output + head * params.head_dim + d4);
+    *out4 = half4(num4 * inv_den);
 }
 
 #define KAPLUMBA_FA_GQA(NAME, HEAD_DIM, NSG)                                   \
