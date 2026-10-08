@@ -121,3 +121,80 @@ KAPLUMBA_TOKEN_TIMING=1 scripts/gpuq try -- bash -c 'cat /tmp/prompt_17k.txt | \
 ```
 The 6k arm is the same with `* 1000`. One 17.5k arm costs ~3.5 min (load 13 s +
 prefill ~180 s).
+
+---
+
+## 22. Lever B (software-pipelined K-loop in `fused2_co`): bit-exact, and NULL
+
+**Implemented and measured, then reverted.** Trip N+1's eight weight words are
+issued before trip N's `extract_v_mcg_32`/FMA body, so they are in flight across
+it. Only the **weight** loads are prefetched: `x` is a 5376-element activation
+whose four `half` reads per trip are L1-hot, and `fused2_co4` already showed that
+spending registers here loses (26.2 -> 29.8 ms, §5 Finding 2).
+
+**Bit-exact on the real model.** With the pipelined loop, greedy token IDs were
+identical to the shipped kernel at both contexts:
+
+* 6k: `17574 611 4733 672 2934 1551 2782 236764`
+* 17.5k: `17574 611 4733 834 1551 2782 236764 564 795 2847`
+
+**Performance: null.** Steady state medians, same box, same prompt:
+
+| context | pipelined | shipped |
+|---|---:|---:|
+| 6,014 | 72.0 ms | 71.9 ms |
+| 17,486 (trellis pinned) | 77.8 ms | 78.0 ms |
+
+Within the interleaving noise, and it makes the hot loop harder to fold (the
+prefetch adds 8 live registers), so it is reverted rather than shipped. The
+shipped loop is already eight loads deep per trip after `32830cb`; the
+loop-carried dependency was not the binding constraint.
+
+### The sabotage that did *not* fail — `fused2_co` has no synthetic test
+
+Per AGENTS.md §3.4 the change was sabotaged in the prefetch before being
+believed: `n1_a0` was changed from `t1_a[j0]` to `t0_a[j0]`. **`fused_bit_exact`
+stayed 3/3 green.** So that suite does *not* cover this kernel.
+
+`KAPLUMBA_TRACE_GEMV=1` on the real checkpoint shows why: both
+`linear_gemv_ishizuki_k3_fused2_2col` and `linear_gemv_ishizuki_k3_fused2_co
+(mlp)` dispatch. The MLP path reaches `_co` through
+`encode_gemv_fused2_mlp` (`linear.rs:2683`), while `fused_bit_exact` calls the
+`encode_gemv_fused2` entry, which selects `_2col`. Its "fused2" case therefore
+tests a different kernel, and its 3/3 pass says nothing about `_co`.
+
+**This is the exact failure mode AGENTS.md §3.4 was written about.** The
+end-to-end token-ID comparison above is the only bit-exactness evidence `_co`
+has, and it exists only because this experiment was run. A synthetic
+`_co` case in `fused_bit_exact` (routing through `encode_gemv_fused2_mlp`) is
+the fix and is **not done**.
+
+## 23. Pinning the arena and the KV cache: measured no, and why
+
+* **Arena (~1.1 GiB):** `WeightArena::pin_pages` `mlock`ed all 1654 segments and
+  reported **+0.02 GiB** actually pinned -- the great majority of the calls
+  fail on those Metal allocations, and only failures are counted. Token 2 went
+  608 -> 508 ms, which is **inside** the 445-873 ms band this same measurement
+  has produced across runs, so it is not an effect. Reverted.
+* **KV cache (~2.6 GiB at 16k):** not attempted. `sysctl vm.user_wire_limit` is
+  **18.24 GiB** (`19585050869` bytes; `ulimit -l` is `unlimited`). The trellis
+  already pins 11.21 GiB and the OS carries ~3.3 GiB wired of its own, so adding
+  the KV puts the total at ~18 GiB with no headroom -- and the KV ladder
+  **reallocates on every rung**, so it would need re-pinning inside
+  `GpuKvCache::ensure_capacity`. The payoff is bounded by one token: steady state
+  is already 78 ms with the KV unpinned, so this can only remove the first-step
+  transient.
+
+**Conclusion: pinning beyond the trellis is not worth it.** The residual is in
+token 2's variance, not in a fixable residency defect.
+
+## 24. Pre-existing failures on HEAD (not caused by this work)
+
+`cargo test -p kaplumba-engine --test probe_unroll_kloop_dag` is **4 passed,
+4 failed** at HEAD. The failures are `dependency_graph_...`, `detectors_can_fail`,
+`fused2_co_burst_order_...` and `loads_in_flight_table_covers_every_live_kernel`,
+and the first assertion is `fused2_co must read 4 of 8 as shipped` with
+`left: (8, 8), right: (4, 8)`. The probe was written for the pre-hoist shape;
+commit `32830cb` hoisted `fused2_co` to 8 of 8 and the probe was not updated.
+`git status` on `linear_repacked.metal` is clean at HEAD, which is how this was
+told apart from a regression from the Lever B experiment.

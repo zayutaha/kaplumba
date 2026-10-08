@@ -29,9 +29,26 @@
     3 162 -> 873 ms with the trellis pinned, against a 78 ms steady state.
     **Still open** — pinning the whole mapping reached 445 ms, so the residual is
     the compressible arena + KV.
-- [ ] **Task 3: Implement software-pipelined K-loop in `linear_gemv_ishizuki_k3_fused2_co`**
-  - Files touched: `crates/kernels/src/linear_repacked.metal`
-  - Action: Prefetch trip $N+1$ column words while computing trip $N$ dequant and multiply.
+- [x] **Task 3: Implement software-pipelined K-loop in `linear_gemv_ishizuki_k3_fused2_co`** — DONE, NULL
+  - Files touched: `crates/kernels/src/linear_repacked.metal` (reverted)
+  - Result: prefetching trip N+1's 8 weight words ahead of trip N's arithmetic is
+    **bit-exact on the real model** (identical greedy token IDs at 6k and 17.5k)
+    but **neutral**: 6k 72.0 vs 71.9 ms, 17.5k 77.8 vs 78.0 ms. Reverted.
+  - **Coverage gap found:** sabotaging the prefetch left `fused_bit_exact` 3/3
+    green, because that suite routes through `encode_gemv_fused2` -> `fused2_2col`
+    while the live MLP path is `encode_gemv_fused2_mlp` -> `fused2_co`
+    (`KAPLUMBA_TRACE_GEMV=1` confirms both dispatch). `_co` has **no synthetic
+    bit-exact test**; the token-ID A/B is its only evidence. Adding one is open.
+  - A follow-up should also fix the 4 stale `probe_unroll_kloop_dag` failures on
+    HEAD (instrument keeps expecting `(4, 8)`; `32830cb` shipped `(8, 8)`).
+  - See `implementation_notes.md` §22-§24.
+
+- [x] **Task 8: Decide whether the arena and KV cache should be pinned too**
+  - Result: **No.** Arena `mlock` pinned only +0.02 GiB of 1654 segments and
+    moved token 2 from 608 to 508 ms -- inside the 445-873 ms run-to-run band.
+    KV is ~2.6 GiB at 16k and `vm.user_wire_limit` is 18.24 GiB against 11.21 GiB
+    already pinned plus ~3.3 GiB of OS wired pages, with the ladder reallocating
+    on every rung. See `implementation_notes.md` §23.
 - [ ] **Task 4: Investigate and eliminate Token 2 post-prefill stall** — PARTIAL
   - Files touched: `crates/engine/src/chat.rs`, `crates/engine/src/model.rs`
   - Measured: host encode 2 ms, GPU wait 1560 ms (6k) / 3162 ms (17.5k).
