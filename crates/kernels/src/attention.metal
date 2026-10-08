@@ -1631,12 +1631,15 @@ static void attention_prefill_flash_body(
                 dots[b] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
             }
             if (staged || k0 + 8u <= range_end) {
-                for (int d8 = 0; d8 < HEAD_DIM; d8 += 8) {
-                    simdgroup_half8x8 kf;
+                for (int d8 = 0; d8 < HEAD_DIM; d8 += 16) {
+                    simdgroup_half8x8 kf0, kf1;
                     if (staged) {
-                        simdgroup_load(kf, tail + d8, HEAD_DIM);
+                        simdgroup_load(kf0, tail + d8, HEAD_DIM);
+                        simdgroup_load(kf1, tail + d8 + 8, HEAD_DIM);
                     } else {
-                        simdgroup_load(kf, keys + k0 * kv_stride + head_base + d8,
+                        simdgroup_load(kf0, keys + k0 * kv_stride + head_base + d8,
+                                       kv_stride);
+                        simdgroup_load(kf1, keys + k0 * kv_stride + head_base + d8 + 8,
                                        kv_stride);
                     }
 #pragma unroll
@@ -1644,11 +1647,15 @@ static void attention_prefill_flash_body(
                         if (q0 + b >= params.queries) {
                             continue;
                         }
-                        simdgroup_half8x8 qf;
-                        simdgroup_load(qf,
+                        simdgroup_half8x8 qf0, qf1;
+                        simdgroup_load(qf0,
                                        qstage + (b * uint(NSG)) * uint(HEAD_DIM) + d8,
                                        HEAD_DIM, ulong2(0, 0), true);
-                        simdgroup_multiply_accumulate(dots[b], kf, qf, dots[b]);
+                        simdgroup_load(qf1,
+                                       qstage + (b * uint(NSG)) * uint(HEAD_DIM) + d8 + 8,
+                                       HEAD_DIM, ulong2(0, 0), true);
+                        simdgroup_multiply_accumulate(dots[b], kf0, qf0, dots[b]);
+                        simdgroup_multiply_accumulate(dots[b], kf1, qf1, dots[b]);
                     }
                 }
             }
