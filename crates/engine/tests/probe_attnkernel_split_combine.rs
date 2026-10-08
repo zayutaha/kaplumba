@@ -328,8 +328,11 @@ fn split_counts_from_the_production_heuristic() {
             let affordable = key_count.div_ceil(MIN_KEYS_PER_SPLIT);
             let splits = decode_splits(Q_HEADS, shape.kv_heads, key_count);
 
+            // Full-attention shape at >1024 keys: the one-wave workgroup budget
+            // (`54 / 4 = 13`), not the old 512-key block split. 54 is the
+            // measured budget asserted below at `decode_one_wave_workgroups`.
             let expected_wanted = if key_count > 1024 && shape.label == "full" {
-                key_count.div_ceil(512).clamp(1, ATTENTION_SPLITS_MAX)
+                (54usize / shape.kv_heads).clamp(1, 16)
             } else {
                 wanted
             };
@@ -351,9 +354,9 @@ fn split_counts_from_the_production_heuristic() {
 
     // The full-attention answer the report leads with.
     assert_eq!(decode_splits(Q_HEADS, FULL_KV, 512), 8, "the keys-per-split floor decides");
-    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 2048), 4, "Auto uses 512-key block splits at >1024 keys");
-    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 8192), 16, "Auto uses 512-key block splits at >1024 keys");
-    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 16_384), 32, "Auto uses 512-key block splits at >1024 keys");
+    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 2048), 13, "Auto uses the one-wave budget at >1024 keys");
+    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 8192), 13, "Auto uses the one-wave budget at >1024 keys");
+    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 16_384), 13, "Auto uses the one-wave budget at >1024 keys");
     // Sliding is bounded by its window, so it saturates at 16 by 1024 keys and
     // can never be higher -- the window, not the split cap, is its ceiling.
     assert_eq!(decode_splits(Q_HEADS, SLIDING_KV, 512), 8);
@@ -587,12 +590,18 @@ fn sliding_uses_split_kv_and_fills_the_machine_one_wave() {
     assert!(256 <= 288);
     assert_eq!(WINDOW.div_ceil(s_splits), 64, "each sliding workgroup holds 64 keys");
 
-    // Full: Under the default Auto rule at 16k context, decode_splits chooses
-    // 64 splits -> 256 workgroups of 256 threads (12.8 workgroups per core across 20 cores),
-    // chunking keys into 256-key blocks so full attention latency remains <= 2.0 ms.
+    // Full: under the default Auto rule at 16k context, `decode_splits` returns
+    // the one-wave workgroup budget, `54 / 4 = 13` -> 52 workgroups of 256
+    // threads against a measured one-wave budget of 54. The old rule was
+    // `key_count.div_ceil(512)` = 32 splits -> 128 workgroups, i.e. three waves
+    // for a step that is DRAM-bound on the KV read. Measured on `Gxma-repacked`
+    // at 16.5k, `--chat --temperature 0`, median of 25: 74.49 -> 74.02 ms, with
+    // the greedy token ids identical.
     let f_splits = decode_splits(Q_HEADS, FULL_KV, 16_384);
-    assert_eq!(f_splits * FULL_KV, 128);
-    assert_eq!(16_384 / f_splits, 512, "each full workgroup holds 512 keys");
+    assert_eq!(f_splits, 13);
+    assert_eq!(f_splits * FULL_KV, 52);
+    assert!(52 <= 54, "the grid must stay inside the one-wave budget");
+    assert_eq!(16_384 / f_splits, 1260, "each full workgroup holds 1260 keys");
     println!("\n  full @16k: {} keys per workgroup over {} workgroups",
         16_384 / f_splits, f_splits * FULL_KV);
 }

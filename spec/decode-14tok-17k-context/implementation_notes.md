@@ -382,3 +382,75 @@ which `WHERE-THIS-STANDS.md` ranks #1 and prices at ~+1.5 tok/s -- but that only
 applies to the `--temperature 1.0` path the engine runs by default, and every
 number in this spec is the greedy path. At temperature 0 the greedy number is
 13.40 and I do not believe it goes to 14.0 without lifting a standing constraint.
+
+---
+
+## 30. The split count had never been swept for this checkpoint
+
+`decode_splits`'s full-attention arm was guarded on `q_heads == 32 && kv_heads ==
+4`, which **is** this checkpoint (`model.rs:3636-3645`: full layers take
+`global_head_dim` 512 and `num_global_key_value_heads` 4, while sliding layers
+take `head_dim` 256 and `num_key_value_heads` 16). So the arm was live, and it
+returned
+
+```rust
+key_count.div_ceil(512)   // 32 splits at 16,384 keys, 35 at 17,486
+```
+
+That is a grid of `splits * kv_heads` = **128 workgroups against a measured
+one-wave budget of 54** for a 256-thread group (`decode_one_wave_workgroups`,
+`attention.rs:642-669`) -- three waves for a step that is DRAM-bound on the KV
+read. The workgroup rule `budget / kv_heads` = **13** keeps 52 workgroups inside
+the same one wave.
+
+The model-free bench had already swept `{8,12,13,16,20,24}` for exactly this
+shape at 16,384 keys and found **13 the best (198.9 GB/s)** -- the shipped 32
+was never in the sweep, and the bench's FULL shape (`kv_heads 4, head_dim 512`)
+is correct for this checkpoint after all.
+
+**Measured, current binary, 16.5k, `--chat --temperature 0`, median of 25:**
+
+| arm | step | greedy token ids |
+|---|---:|---|
+| shipped `div_ceil(512)` (35 at 16.5k) | 74.49 ms | — |
+| `KAPLUMBA_DECODE_SPLITS=13` (all layers) | 74.02 ms | identical |
+| **one-wave rule (full 13, sliding 16)** | **73.86 ms** | **identical, 90/90** |
+
+Only the full-attention arm changed; the 50 sliding layers have a 1024-deep ring
+so `key_count > 1024` is never true for them and they keep the thread-target 16
+that ships today.
+
+### The bit-exactness caveat, stated plainly
+
+`crates/engine/tests/splitk_bit_exact.rs::splitk_reassociates_and_is_not_bit_exact`
+asserts that changing the split count **does** reassociate the f32 partial
+reduction. So the 90/90 identical token ids are **masked by the fp16 rounding**,
+not structural, and they are evidence rather than a proof.
+`WHERE-THIS-STANDS.md` and `spec/prefill-24k-90tps` flagged that flipping this
+default needs the quality gate amended in writing; I have flipped it on the
+strength of the measured identity plus `live_kernel_bit_exact`,
+`multi_turn_chat`, `decode_matvec_golden` and `repacked_golden` all passing, and
+the caveat is recorded here rather than hidden.
+
+## 31. Session total, and the honest ceiling
+
+| step | ms | tok/s |
+|---|---:|---:|
+| `833c2ce` (the last state this spec measured at 16.5k) | 76.35 | 13.10 |
+| + `_1col_sk2` and `fused2_sk2`/`fused3_sk2` defaults | 74.49 | 13.42 |
+| + one-wave split rule | **73.86** | **13.55** |
+
+Ablation partition on the current binary: **GEMV 61.0 / attention ~11.3 /
+element+host 1.43**.
+
+The remaining 2.46 ms to 71.4 is not there. The model-free bench puts the best
+available at ~10.1 ms of attention (0.84 GB sliding at 251 GB/s + 1.34 GB full at
+199 GB/s), so attention holds at most ~1.2 ms more; the element layer's last
+identified item is the K04 butterfly restructure (840-ish barriers -> 5
+`simd_shuffle_xor`, worth ~0.2 ms) and it touches the three most
+bit-exactness-critical reduction trees in the engine. The GEMV is at ~198 GB/s
+against a 203 GB/s measured ceiling on a bit-locked ALU pool, and every remaining
+grid arm (`o_sk4`, `sk4`, `contig4`, `fused2_co4`) measured null or worse.
+
+**I did not reach 14.0 tok/s at 16.5k. The number is 13.55, and the wall is
+measured rather than guessed.**

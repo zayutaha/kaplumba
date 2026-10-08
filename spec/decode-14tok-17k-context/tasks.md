@@ -106,3 +106,23 @@
     bit-locked ALU pool. Element/finalize/host holds at most ~0.5 ms more.
   - The only lever big enough is byte reduction (`lm_head` at 6 bpw costs 4.18
     ms/token), which is a quality decision. Logged, not taken.
+
+- [x] **Task 12: Sweep the decode attention split count for this checkpoint** — 74.49 -> 73.86 ms
+  - Files: `crates/kernels/src/attention.rs`
+  - The full-attention arm shipped `key_count.div_ceil(512)` = 35 splits at 16.5k,
+    i.e. 128 workgroups against a **measured one-wave budget of 54**. The
+    workgroup rule gives 54/4 = **13** and keeps 52 workgroups in one wave.
+  - The model-free bench had already found 13 best of `{8,12,13,16,20,24}` for
+    exactly this shape; the shipped 32 was never in the sweep.
+  - Sliding layers unchanged (1024-deep ring never satisfies `key_count > 1024`).
+  - Measured 13.42 -> 13.55 tok/s; greedy token ids identical 90/90.
+  - **Caveat recorded, not hidden:** `splitk_bit_exact.rs:115` asserts split counts
+    *do* reassociate the f32 partials, so the identity is masked by fp16 rounding,
+    not structural. `spec/prefill-24k-90tps` required the gate amended in writing
+    before this flip; notes §30 says so.
+
+- [ ] **Task 5 (final): 16.5k chat benchmark = 73.86 ms / 13.55 tok/s** — target
+  71.4 ms **not reached**, and notes §31 records the measured wall rather than a
+  guess: attention holds <=1.2 ms more, element holds ~0.2 ms and it is the
+  bit-exactness-critical reduction tree, the GEMV is at ~198 of a 203 GB/s
+  measured ceiling on a bit-locked ALU pool.

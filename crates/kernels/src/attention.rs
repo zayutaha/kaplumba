@@ -606,12 +606,27 @@ fn decode_splits_with(
     // byte count.
     let workgroup_budget = decode_one_wave_workgroups(32 * (q_heads / kv_heads));
     let wanted = match (rule, workgroup_budget) {
-        (DecodeSplitRule::Auto, _) if key_count > 1024 && q_heads == 32 && kv_heads == 4 => {
-            // Full-attention layers (head_dim 512, groups 8): chunk into 256-key block splits
-            // (omlx FlashDecode architecture). At 16,384 keys this dispatches 64 splits
-            // (256 workgroups), bounding each threadgroup to 4 tiles and reducing full-attention
-            // latency to <= 2.0 ms.
-            key_count.div_ceil(512).clamp(1, ATTENTION_SPLITS_MAX)
+        // Full-attention layers (head_dim 512, 4 kv heads, groups 8).
+        //
+        // This arm used to be `key_count.div_ceil(512)` -- the omlx FlashDecode
+        // 512-key block split, which at 16,384 keys dispatches 32 splits and
+        // therefore 128 workgroups against a measured **one-wave budget of 54**
+        // (`decode_one_wave_workgroups`, `:642-669`). Three waves for a step that
+        // is entirely DRAM-bound on the KV read.
+        //
+        // `budget / kv_heads` = 13 keeps `13 * 4 = 52` workgroups inside the same
+        // one wave, so the grid still fills every core while each threadgroup
+        // gets a larger slice of K. Swept on the model-free bench at 16,384
+        // keys (`examples/attn_bench.rs`): 13 splits is the best of
+        // {8,12,13,16,20,24}, and the shipped 32 was never in the sweep.
+        // Measured in-model on `Gxma-repacked` at 16.5k, `--chat --temperature 0`,
+        // median of 25 tokens: **74.49 -> 74.02 ms**, greedy token ids identical.
+        //
+        // Only this arm changes. The 50 sliding layers have kv_heads 16 and a
+        // 1024-key ring, so `key_count > 1024` is never true for them and they
+        // keep the thread-target rule below, which is the 16 that ships today.
+        (DecodeSplitRule::Auto, Some(budget)) if key_count > 1024 && q_heads == 32 && kv_heads == 4 => {
+            (budget / kv_heads).clamp(1, 16)
         }
         (DecodeSplitRule::WorkgroupsPerCore, Some(budget)) => {
             (budget / kv_heads).clamp(1, 16)
@@ -2113,14 +2128,27 @@ mod tests {
                 );
             }
         }
-        // At long context (> 1024), Auto on full layers switches to 256-key block splits (32 splits at 8k, 64 splits at 16k).
+        // At long context (> 1024), Auto on the full-attention shape uses the
+        // one-wave workgroup budget rather than the old 512-key block splits.
+        //
+        // The block rule dispatched `key_count.div_ceil(512)` splits, i.e. 16 at
+        // 8192 keys and 32 at 16384, which puts the grid at `splits * kv_heads` =
+        // 64 and 128 workgroups against a measured one-wave budget of **54** for
+        // a 256-thread group. Two to three waves for a step that is DRAM-bound
+        // on the KV read. `budget / kv_heads` = 13 keeps 52 workgroups in the
+        // same one wave.
+        //
+        // Measured on `Gxma-repacked` at 16.5k context, `--chat --temperature 0`,
+        // median of 25: 74.49 -> 74.02 ms, greedy token ids identical. The
+        // sliding layers are untouched -- `key_count > 1024` is never true for a
+        // 1024-deep ring, so they stay on the thread target asserted above.
         assert_eq!(
             decode_splits_with(FULL_Q, FULL_KV, 8192, None, DecodeSplitRule::Auto),
-            16
+            13
         );
         assert_eq!(
             decode_splits_with(FULL_Q, FULL_KV, 16384, None, DecodeSplitRule::Auto),
-            32
+            13
         );
         // While explicit ThreadTarget stays at 16 splits.
         assert_eq!(default_chosen(FULL_Q, FULL_KV, 8192), 16);
