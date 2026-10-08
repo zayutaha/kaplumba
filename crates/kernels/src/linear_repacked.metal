@@ -1027,12 +1027,15 @@ kernel void linear_gemv_ishizuki_k3_fused2_co(
             const device uint *t0_b = col_b + (tk + 0u) * stride;
             const device uint *t1_b = col_b + (tk + 1u) * stride;
 
+            // Load Col A and Col B weights concurrently (8 words in flight)
+            const uint w0_a0 = t0_a[j0], w0_a1 = t0_a[j1];
+            const uint w1_a0 = t1_a[j0], w1_a1 = t1_a[j1];
+            const uint w0_b0 = t0_b[j0], w0_b1 = t0_b[j1];
+            const uint w1_b0 = t1_b[j0], w1_b1 = t1_b[j1];
+
             float v[8];
 
             // Col A: 2 contiguous sub-steps along K
-            const uint w0_a0 = t0_a[j0], w0_a1 = t0_a[j1];
-            const uint w1_a0 = t1_a[j0], w1_a1 = t1_a[j1];
-
             extract_v_mcg_32(w0_a0, w0_a1, sh0, rsh0, v);
             acc_a0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
             acc_a1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
@@ -1042,9 +1045,6 @@ kernel void linear_gemv_ishizuki_k3_fused2_co(
             acc_a1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
 
             // Col B: 2 contiguous sub-steps along K
-            const uint w0_b0 = t0_b[j0], w0_b1 = t0_b[j1];
-            const uint w1_b0 = t1_b[j0], w1_b1 = t1_b[j1];
-
             extract_v_mcg_32(w0_b0, w0_b1, sh0, rsh0, v);
             acc_b0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
             acc_b1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
