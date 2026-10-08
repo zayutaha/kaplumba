@@ -9,6 +9,7 @@ half = { workspace = true }
 kaplumba-kernels = { path = "../kernels" }
 libc = { workspace = true }
 metal = { workspace = true }
+objc = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }

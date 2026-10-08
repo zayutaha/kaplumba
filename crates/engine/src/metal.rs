@@ -42,6 +42,8 @@ pub enum MetalError {
     AllocationSizeMismatch { requested: u64, actual: u64 },
     #[error("Metal shared buffer has no accessible contents")]
     ContentsUnavailable,
+    #[error("Metal residency set error: {0}")]
+    ResidencySetUnavailable(String),
 }
 
 pub struct MetalContext {
@@ -101,5 +103,94 @@ pub fn shared_contents(buffer: &Buffer) -> Result<*mut std::ffi::c_void, MetalEr
         Err(MetalError::ContentsUnavailable)
     } else {
         Ok(contents)
+    }
+}
+
+use objc::runtime::Object;
+use objc::{msg_send, sel, sel_impl};
+use metal::foreign_types::ForeignType;
+
+/// Standing Metal 3 residency set holding weight buffers resident on the GPU
+/// without triggering POSIX `mlock` (avoiding wired-memory exhaustion in macOS).
+pub struct ResidencySet {
+    raw: *mut Object,
+}
+
+unsafe impl Send for ResidencySet {}
+unsafe impl Sync for ResidencySet {}
+
+impl Drop for ResidencySet {
+    fn drop(&mut self) {
+        if !self.raw.is_null() {
+            unsafe {
+                let () = msg_send![self.raw, release];
+            }
+        }
+    }
+}
+
+impl ResidencySet {
+    pub fn new(device: &Device, initial_capacity: usize) -> Result<Self, MetalError> {
+        unsafe {
+            let class = objc::runtime::Class::get("MTLResidencySetDescriptor");
+            let Some(class) = class else {
+                return Err(MetalError::ResidencySetUnavailable(
+                    "MTLResidencySetDescriptor class unavailable".to_string(),
+                ));
+            };
+            let desc: *mut Object = msg_send![class, new];
+            if desc.is_null() {
+                return Err(MetalError::ResidencySetUnavailable(
+                    "failed to allocate MTLResidencySetDescriptor".to_string(),
+                ));
+            }
+            if initial_capacity > 0 {
+                let () = msg_send![desc, setInitialCapacity: initial_capacity];
+            }
+            let mut error: *mut Object = std::ptr::null_mut();
+            let device_ptr = device.as_ptr() as *mut Object;
+            let set: *mut Object = msg_send![device_ptr, newResidencySetWithDescriptor:desc error:&mut error];
+            let () = msg_send![desc, release];
+            if set.is_null() {
+                return Err(MetalError::ResidencySetUnavailable(
+                    "device failed to create MTLResidencySet".to_string(),
+                ));
+            }
+            Ok(Self { raw: set })
+        }
+    }
+
+    pub fn add_allocation(&self, buffer: &Buffer) {
+        if !self.raw.is_null() {
+            unsafe {
+                let buf_ptr = buffer.as_ptr() as *mut Object;
+                let () = msg_send![self.raw, addAllocation: buf_ptr];
+            }
+        }
+    }
+
+    pub fn commit(&self) {
+        if !self.raw.is_null() {
+            unsafe {
+                let () = msg_send![self.raw, commit];
+            }
+        }
+    }
+
+    pub fn request_residency(&self) {
+        if !self.raw.is_null() {
+            unsafe {
+                let () = msg_send![self.raw, requestResidency];
+            }
+        }
+    }
+
+    pub fn attach_to_queue(&self, queue: &CommandQueue) {
+        if !self.raw.is_null() {
+            unsafe {
+                let q_ptr = queue.as_ptr() as *mut Object;
+                let () = msg_send![q_ptr, addResidencySet: self.raw];
+            }
+        }
     }
 }

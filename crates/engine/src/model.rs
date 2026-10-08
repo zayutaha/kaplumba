@@ -3350,6 +3350,7 @@ pub struct TextModel {
     /// it. Sized by nothing but [`Self::SPIN_THREADS`], so it does not grow with
     /// context length (AGENTS.md §8).
     spin_scratch: Option<Buffer>,
+    _residency_set: Option<crate::metal::ResidencySet>,
 }
 
 /// f16 bit pattern scaled by `scale`, returned as f32. Used by the speculative
@@ -3469,6 +3470,13 @@ impl TextModel {
             attn_partials,
             attn_pass_state,
         )?;
+        let forward_queue = device.new_command_queue();
+        let residency_set = checkpoint_weights
+            .as_ref()
+            .and_then(|w| w.create_residency_set().ok());
+        if let Some(ref set) = residency_set {
+            set.attach_to_queue(&forward_queue);
+        }
         Ok(Self {
             embedding,
             embedding_buffer,
@@ -3483,11 +3491,12 @@ impl TextModel {
             _checkpoint_weights: checkpoint_weights,
             elements: ElementKernels::shared()?,
             linear: LinearKernels::shared()?,
-            forward_queue: device.new_command_queue(),
+            forward_queue,
             final_norm_buffer,
             scratch,
             scratch_tokens: 1,
             spin_scratch: None,
+            _residency_set: residency_set,
         })
     }
 
@@ -3882,6 +3891,10 @@ impl TextModel {
 
     pub fn layer_count(&self) -> usize {
         self.layers.len()
+    }
+
+    pub fn has_residency_set(&self) -> bool {
+        self._residency_set.is_some()
     }
 
     /// The head rate is whatever the checkpoint declared, not a constant: the

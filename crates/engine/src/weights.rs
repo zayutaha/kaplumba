@@ -389,6 +389,17 @@ impl WeightArena {
         }
         Ok(capacity)
     }
+
+    pub fn create_residency_set(&self) -> Result<crate::metal::ResidencySet, WeightError> {
+        let set = crate::metal::ResidencySet::new(self.context.device(), self.segments.len())
+            .map_err(WeightError::Metal)?;
+        for seg in &self.segments {
+            set.add_allocation(&seg.buffer);
+        }
+        set.commit();
+        set.request_residency();
+        Ok(set)
+    }
 }
 
 fn span_total(spans: &[ArenaSpan]) -> Result<u64, WeightError> {
@@ -576,7 +587,13 @@ impl TextWeights {
             let offload_embedding = !force_resident;
             let offload_bf16_embedding =
                 offload_embedding && name == "model.language_model.embed_tokens.weight";
-            let skip_copy = offload_bf16_embedding;
+            // NOT gated on `!dedicated` -- see the regression note above in
+            // `pin_trellis_pages`. `dedicated` is true for every production load
+            // (`model.rs` uses `load_dedicated`), so the guard as written sent
+            // all 12.04 GiB of trellis into dirty anonymous Metal shared buffers
+            // and collapsed long-context decode.
+            let offload_trellis = !force_resident && name.ends_with(".trellis");
+            let skip_copy = offload_bf16_embedding || offload_trellis;
             let spans = if skip_copy {
                 Vec::new()
             } else if dedicated || name.ends_with(".trellis") {
@@ -682,6 +699,16 @@ impl TextWeights {
                 },
             );
         }
+        // Retain only the shards that contain tensors with zero-copy views (e.g. embed_tokens).
+        // Shards whose tensors are all copied into the arena are dropped immediately, unmapping
+        // gigabytes of unused file memory from the process address space.
+        let needed_shards: std::collections::BTreeSet<&str> = tensors
+            .values()
+            .filter(|t| t.spans.is_empty())
+            .map(|t| t.shard.as_str())
+            .collect();
+        shards.retain(|name, _| needed_shards.contains(name.as_str()));
+
         Ok(Self {
             arena,
             tensors,
@@ -720,6 +747,14 @@ impl TextWeights {
 
     pub fn logical_bytes(&self) -> u64 {
         self.arena.logical_bytes()
+    }
+
+    pub fn retained_shards(&self) -> usize {
+        self.shards.len()
+    }
+
+    pub fn create_residency_set(&self) -> Result<crate::metal::ResidencySet, WeightError> {
+        self.arena.create_residency_set()
     }
 
     pub fn read_tensor(&self, name: &str) -> Result<Vec<u8>, WeightError> {
@@ -1024,10 +1059,8 @@ impl ShardReader {
             path: path.to_path_buf(),
             message: "mmap returned null".to_string(),
         })?;
-        // Pre-fault clean pages sequentially to avoid minor faults on hot path.
-        unsafe {
-            libc::madvise(pointer.as_ptr().cast(), length, libc::MADV_WILLNEED);
-        }
+        // Clean file-backed mapping; do not call MADV_WILLNEED to avoid forcing
+        // unused or already-copied shard pages into the OS page cache.
         Ok(Self {
             file,
             pointer,
@@ -1423,6 +1456,71 @@ mod tests {
                 Err(error) => error.to_string(),
             };
         assert!(error.contains("unsupported source dtype"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn prunes_unused_shards_and_only_retains_zero_copy_shards() {
+        let Some(context) = context_or_skip() else {
+            return;
+        };
+        let dir = temp_dir("prune-shards");
+        let shard1 = dir.join("model-00001-of-00002.safetensors");
+        let shard2 = dir.join("model-00002-of-00002.safetensors");
+        write_shard(
+            &shard1,
+            vec![(
+                "model.language_model.embed_tokens.weight",
+                DType::BF16,
+                vec![2],
+                vec![0, 0, 0, 0],
+            )],
+        );
+        write_shard(
+            &shard2,
+            vec![(
+                "model.language_model.layers.0.self_attn.q_proj.trellis",
+                DType::I16,
+                vec![1, 1, 2],
+                vec![0x34, 0x12, 0x78, 0x56],
+            )],
+        );
+        let index_path = dir.join("model.safetensors.index.json");
+        let mut map = serde_json::Map::new();
+        map.insert(
+            "model.language_model.embed_tokens.weight".to_string(),
+            json!("model-00001-of-00002.safetensors"),
+        );
+        map.insert(
+            "model.language_model.layers.0.self_attn.q_proj.trellis".to_string(),
+            json!("model-00002-of-00002.safetensors"),
+        );
+        fs::write(
+            &index_path,
+            serde_json::to_vec(&json!({
+                "metadata": {"total_size": 8},
+                "weight_map": map
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let index = read_index(&index_path).unwrap();
+        let selection = crate::safetensors::load_text_selection(&dir, index).unwrap();
+        let weights =
+            TextWeights::load_dedicated(&dir, &selection, context, 1024 * 1024)
+                .unwrap();
+
+        if std::env::var_os("KAPLUMBA_SABOTAGE_SHARD_PRUNING").is_some() {
+            // Sabotage: assert that both shards are retained, which must fail
+            assert_eq!(weights.retained_shards(), 2, "sabotage expects 2 retained shards");
+        } else {
+            // Only shard 1 (which holds embed_tokens) should be retained. Shard 2 must be pruned.
+            assert_eq!(
+                weights.retained_shards(),
+                1,
+                "only shard holding zero-copy tensor must be retained"
+            );
+        }
         fs::remove_dir_all(dir).unwrap();
     }
 }

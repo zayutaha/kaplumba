@@ -404,6 +404,7 @@ dependencies = [
  "kaplumba-kernels",
  "libc",
  "metal",
+ "objc",
  "rayon",
  "serde",
  "serde_json",
