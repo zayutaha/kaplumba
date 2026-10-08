@@ -329,7 +329,7 @@ fn split_counts_from_the_production_heuristic() {
             let splits = decode_splits(Q_HEADS, shape.kv_heads, key_count);
 
             let expected_wanted = if key_count > 1024 && shape.label == "full" {
-                key_count.div_ceil(256).clamp(1, ATTENTION_SPLITS_MAX)
+                key_count.div_ceil(512).clamp(1, ATTENTION_SPLITS_MAX)
             } else {
                 wanted
             };
@@ -351,9 +351,9 @@ fn split_counts_from_the_production_heuristic() {
 
     // The full-attention answer the report leads with.
     assert_eq!(decode_splits(Q_HEADS, FULL_KV, 512), 8, "the keys-per-split floor decides");
-    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 2048), 8, "Auto uses 256-key block splits at >1024 keys");
-    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 8192), 32, "Auto uses 256-key block splits at >1024 keys");
-    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 16_384), 64, "Auto uses 256-key block splits at >1024 keys");
+    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 2048), 4, "Auto uses 512-key block splits at >1024 keys");
+    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 8192), 16, "Auto uses 512-key block splits at >1024 keys");
+    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 16_384), 32, "Auto uses 512-key block splits at >1024 keys");
     // Sliding is bounded by its window, so it saturates at 16 by 1024 keys and
     // can never be higher -- the window, not the split cap, is its ceiling.
     assert_eq!(decode_splits(Q_HEADS, SLIDING_KV, 512), 8);
@@ -591,8 +591,8 @@ fn sliding_uses_split_kv_and_fills_the_machine_one_wave() {
     // 64 splits -> 256 workgroups of 256 threads (12.8 workgroups per core across 20 cores),
     // chunking keys into 256-key blocks so full attention latency remains <= 2.0 ms.
     let f_splits = decode_splits(Q_HEADS, FULL_KV, 16_384);
-    assert_eq!(f_splits * FULL_KV, 256);
-    assert_eq!(16_384 / f_splits, 256, "each full workgroup holds 256 keys");
+    assert_eq!(f_splits * FULL_KV, 128);
+    assert_eq!(16_384 / f_splits, 512, "each full workgroup holds 512 keys");
     println!("\n  full @16k: {} keys per workgroup over {} workgroups",
         16_384 / f_splits, f_splits * FULL_KV);
 }

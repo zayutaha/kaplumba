@@ -611,7 +611,7 @@ fn decode_splits_with(
             // (omlx FlashDecode architecture). At 16,384 keys this dispatches 64 splits
             // (256 workgroups), bounding each threadgroup to 4 tiles and reducing full-attention
             // latency to <= 2.0 ms.
-            key_count.div_ceil(256).clamp(1, ATTENTION_SPLITS_MAX)
+            key_count.div_ceil(512).clamp(1, ATTENTION_SPLITS_MAX)
         }
         (DecodeSplitRule::WorkgroupsPerCore, Some(budget)) => {
             (budget / kv_heads).clamp(1, 16)
@@ -2116,11 +2116,11 @@ mod tests {
         // At long context (> 1024), Auto on full layers switches to 256-key block splits (32 splits at 8k, 64 splits at 16k).
         assert_eq!(
             decode_splits_with(FULL_Q, FULL_KV, 8192, None, DecodeSplitRule::Auto),
-            32
+            16
         );
         assert_eq!(
             decode_splits_with(FULL_Q, FULL_KV, 16384, None, DecodeSplitRule::Auto),
-            64
+            32
         );
         // While explicit ThreadTarget stays at 16 splits.
         assert_eq!(default_chosen(FULL_Q, FULL_KV, 8192), 16);
