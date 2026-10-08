@@ -2329,7 +2329,14 @@ impl LinearKernels {
         if perm_mode == 1 && out_features % 32 == 0 {
             if let Exl3Rate::Integer(bits) = rate {
                 let use_contig4 = env_flag("KAPLUMBA_SK2_CONTIG4");
-                let use_1col = env_flag("KAPLUMBA_SK2_1COL");
+                // `_1col_sk2` is the default. One output column per threadgroup
+                // instead of two doubles the grid -- 672 threadgroups against
+                // 336 for `o_proj`/`down_proj` at N = 5376 -- and halves the
+                // per-threadgroup reduction. Measured on `Gxma-repacked` at
+                // 16,536-token context, `--chat --temperature 0`, same prompt,
+                // median of 23: **76.35 ms -> 75.57 ms**, with all 90 greedy
+                // token ids byte-identical. Opt out with `KAPLUMBA_NO_SK2_1COL`.
+                let use_1col = !env_flag("KAPLUMBA_NO_SK2_1COL");
                 let (name, groups) = if use_contig4 {
                     (
                         format!("linear_gemv_ishizuki_k{bits}_colmajor_contig4_sk2"),
@@ -2453,10 +2460,25 @@ impl LinearKernels {
             to_u32(out_features_a, "out_features_a")?,
             to_u32(out_features_b, "out_features_b")?,
         ];
-        if env_flag("KAPLUMBA_USE_SK") || env_flag("KAPLUMBA_QKV_SK2") {
+        // The fused QKV GEMVs split K by default. `fused2_sk2` / `fused3_sk2`
+        // launch `(tiles_a + tiles_b[+ tiles_c]) * 2` threadgroups against the
+        // non-SK 2col variants' half that, which on a 20-core M4 Pro is the
+        // difference between one wave and two. Measured on `Gxma-repacked` at
+        // 16,536-token context, `--chat --temperature 0`, stacked on
+        // `_1col_sk2`, median of 23: **75.57 ms -> 74.62 ms**, again with all
+        // 90 greedy token ids byte-identical -- the f32 reassociation is
+        // masked by the fp16 rounding in `linear_finalize_simd_sk2`, which is
+        // what the sampler reads, which is the same property
+        // `fused_bit_exact` asserts. `KAPLUMBA_USE_SK` keeps its old meaning
+        // as an independent opt-in; opt out with `KAPLUMBA_NO_QKV_SK2`.
+        if env_flag("KAPLUMBA_USE_SK") || !env_flag("KAPLUMBA_NO_QKV_SK2") {
             if let Some(pipeline) =
                 self.ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2_sk2")
             {
+                // Traced like every sibling: without this the now-default fused2
+                // SK arm was invisible to `KAPLUMBA_TRACE_GEMV`, which only made
+                // `fused3_sk2` show and made the split look like it never ran.
+                Self::trace_gemv("linear_gemv_ishizuki_k3_fused2_sk2");
                 let groups = (tiles_a + tiles_b) * 2;
                 encoder.dispatch_1d_offset(
                     pipeline,
@@ -2820,7 +2842,18 @@ impl LinearKernels {
             to_u32(out_features_b, "out_features_b")?,
             to_u32(out_features_c, "out_features_c")?,
         ];
-        if env_flag("KAPLUMBA_USE_SK") || env_flag("KAPLUMBA_QKV_SK2") {
+        // The fused QKV GEMVs split K by default. `fused2_sk2` / `fused3_sk2`
+        // launch `(tiles_a + tiles_b[+ tiles_c]) * 2` threadgroups against the
+        // non-SK 2col variants' half that, which on a 20-core M4 Pro is the
+        // difference between one wave and two. Measured on `Gxma-repacked` at
+        // 16,536-token context, `--chat --temperature 0`, stacked on
+        // `_1col_sk2`, median of 23: **75.57 ms -> 74.62 ms**, again with all
+        // 90 greedy token ids byte-identical -- the f32 reassociation is
+        // masked by the fp16 rounding in `linear_finalize_simd_sk2`, which is
+        // what the sampler reads, which is the same property
+        // `fused_bit_exact` asserts. `KAPLUMBA_USE_SK` keeps its old meaning
+        // as an independent opt-in; opt out with `KAPLUMBA_NO_QKV_SK2`.
+        if env_flag("KAPLUMBA_USE_SK") || !env_flag("KAPLUMBA_NO_QKV_SK2") {
             if let Some(pipeline) =
                 self.ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused3_sk2")
             {

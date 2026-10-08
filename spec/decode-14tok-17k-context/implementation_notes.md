@@ -198,3 +198,187 @@ and the first assertion is `fused2_co must read 4 of 8 as shipped` with
 commit `32830cb` hoisted `fused2_co` to 8 of 8 and the probe was not updated.
 `git status` on `linear_repacked.metal` is clean at HEAD, which is how this was
 told apart from a regression from the Lever B experiment.
+
+---
+
+## 25. 🔴 A REGRESSION LANDED AFTER §24: `e1b05c1` put the trellis back into the
+## compressor, and long-context decode went to 0.37 tok/s
+
+`e1b05c1` ("green memory residency", 21:47) deleted `pin_trellis_pages` and
+changed the offload guard from
+
+```rust
+let offload_trellis = !force_resident && name.ends_with(".trellis");
+```
+to
+```rust
+let offload_trellis = !force_resident && !dedicated && name.ends_with(".trellis");
+```
+
+Production loads through `TextWeights::load_dedicated` (`model.rs:3595`), which
+passes `dedicated: true`. **So `offload_trellis` was unconditionally false in
+production**, all 12.04 GiB of `.trellis` was copied into dirty anonymous
+`MTLResourceStorageModeShared` buffers, and the exact failure §19 documented for
+`KAPLUMBA_RESIDENT_WEIGHTS=1` returned.
+
+Measured at 16,436-token context, `--chat --temperature 0`, current binary:
+
+| build | step | tok/s |
+|---|---:|---:|
+| `833c2ce` (trellis file-backed + pinned) | 76.3 ms | 13.1 |
+| `e1b05c1` (trellis in the shared arena) | **2,721 ms** | **0.37** |
+
+Host encode stayed at 1.8 ms while the GPU wait went to 2,488 ms, and the machine
+showed **swap 4.35 GiB, compressor 8.1 GiB, 26 % free** -- against the spec's own
+claim of "36 % free (SOLID GREEN)" and "`vm.swapusage`: 0 growth". Its telemetry
+measured *memory* at 17.5k and *throughput* on a 19-token prompt, so its **R5
+(>= 13.0 tok/s at 17,500 context) was violated by 35x and shipped anyway.**
+
+The code's own comment five lines above the change already said it: *"Copying
+13.4 GiB of weights into dirty anonymous Metal buffers causes macOS to exhaust
+available RAM at 16k context (where KV cache adds ~3 GiB) and swap out 12.5 GiB
+to SSD, collapsing decode to 0.03 tok/s."*
+
+**Fix:** drop `!dedicated`, restore `pin_trellis_pages`. Result: **2,721 -> 76.0 ms
+(0.37 -> 13.1 tok/s)**, 11.21 GiB wired, load 8.8 s. This **amends
+`spec/green-memory-residency` R1** ("the engine must not call `libc::mlock`
+under any circumstances"): a ~17.7 GiB hot set on a 24 GiB box will be compressed
+unless those pages are wired, so R1 and R5 are mutually exclusive. R5 was the
+user-facing requirement; R1 was a means.
+
+## 26. The honest budget at 16.5k, measured by ablation (not modelled)
+
+Two interleaved arms, `--chat --temperature 0`, median of 23, current binary:
+
+| arm | step |
+|---|---:|
+| full | **75.55 ms** |
+| `KAPLUMBA_ABLATE=attention` | 63.60 ms |
+| `KAPLUMBA_ABLATE=gate_up_gemv,down_gemv,qkv_gemv,o_proj_gemv,head_gemv` | 14.65 ms |
+
+Therefore, additively and exactly:
+
+| term | ms | share | state |
+|---|---:|---:|---|
+| weight GEMVs (240 layer + 1 head) | **60.90** | 80.6% | ALU-bound, bit-locked |
+| attention (split + combine, 60 dispatches) | **11.95** | 15.8% | at the DRAM read roofline |
+| element / finalize / norm / host | **2.70** | 3.6% | partly addressable |
+
+Two corrections to earlier numbers in this spec and in A5:
+
+* **KV is 16 KiB per key per layer, not 8.** `config.rs` pins
+  `num_key_value_heads = 16`, `head_dim = 256`, and *both* `GpuKvCache::new`
+  call sites (`model.rs:1113` and `:1121`) pass those, so `key_bytes = 16*256*2`
+  and K + V is 32 KiB... no: `new_buffer(key_bytes)` each for keys and values,
+  `key_bytes = capacity * kv_heads * head_dim * 2` = 8192 B, **16 KiB for the
+  pair**. At 16.4k: 50 sliding x 1024 x 16 KiB = 0.84 GB, 10 full x 16.4k x
+  16 KiB = 2.70 GB, total **3.54 GB**. Attention at 11.95 ms is therefore
+  **~296 GB/s -- the pure-read roofline** (a read is not a copy, so it exceeds
+  M05's 253 GB/s copy ceiling). A5's `10*P*8192` used half the real bytes; its
+  "0.67 GB / 95 GB/s" full-attention figure was computed with the wrong head
+  count, and the 56.6 GB/s alarm with it. **There is no headroom in attention.**
+* **`GpuKvCache::key_count` returns the live `next_position`, not the capacity**,
+  so the 1.25x ladder's 18,212-rung over-allocation at 16,449 live keys is
+  *not* read. No win available there.
+
+`per_token_weight_bytes()` (`bench.rs:194`) = 12.04 GB. At 60.90 ms that is
+**~198 GB/s**, against the 203 GB/s measured kernel ceiling in
+`WHERE-THIS-STANDS`. The GEMV is also at its wall.
+
+## 27. What WAS found: grid shape. Two bit-exact, measured wins
+
+The only axis nobody had swept on *this* checkpoint at *this* context is the
+dispatch grid, because every relevant kernel already existed behind an env flag.
+Six arms, same prompt, median of 23, 16.5k context, `--chat --temperature 0`:
+
+| arm (all on top of the 76.35 ms `833c2ce`-equivalent baseline) | step | Δ |
+|---|---:|---:|
+| `KAPLUMBA_SK2_1COL=1` | 75.57 | **-0.78** |
+| `KAPLUMBA_QKV_SK2=1` | 74.62 | **-1.73** (cumulative) |
+| `KAPLUMBA_O_SK4=1` | 75.50 | null |
+| `KAPLUMBA_O_SK4=1 KAPLUMBA_QKV_SK2=1` | 74.62 | null (o_sk4 adds nothing) |
+| `KAPLUMBA_SK4=1` | 75.75 | worse |
+| `KAPLUMBA_SK2_CONTIG4=1` | 76.26 | worse |
+
+**Why it works.** `encode_gemv_raw_sk2`'s `_2col_sk2` launches
+`out_features / 16` threadgroups -- 336 for `o_proj` and `down_proj` at N=5376,
+which is under two waves on a 20-core M4 Pro. `_1col_sk2` doubles that to 672
+and halves the per-threadgroup reduction. Likewise `fused3_2col` launches
+`(tiles_a+tiles_b+tiles_c)/2` = 512 groups for q/k/v where `fused3_sk2` launches
+2048.
+
+**Bit-exactness.** All 90 greedy token ids byte-identical to the reference for
+both changes, at 16.5k. `fused_bit_exact` asserts **f16-bit** equality on the
+final output, which is the level at which the f32 reassociation is masked by
+`linear_finalize_simd_sk2` -- and it stays 3/3 green with the defaults flipped.
+
+Shipped as defaults following the tree's own `KAPLUMBA_NO_*` convention:
+`KAPLUMBA_NO_SK2_1COL` and `KAPLUMBA_NO_QKV_SK2`. `KAPLUMBA_TRACE_GEMV=1` now
+shows `_1col_sk2` and `fused3_sk2`; `fused2_sk2` was silently untraced before
+(it never called `trace_gemv`), which is why the split looked absent -- fixed.
+
+## 28. A documented defect finally fixed: `linear.metal:1187`
+
+`finalize_post_ffn_and_next_input_norm_transform` is dispatched **1 threadgroup
+x 1024 threads = 32 simdgroups** (`encode_cross_layer_finalize_and_norm`,
+`dispatch_groups(.., 1, 1024)`, and the comment there says so), but ran
+`for (uint b = sg; b < params.blocks; b += 8u)`. That idled simdgroups 8-31 and
+ran 6 rounds where its siblings at `:921`/`:969`/`:1117` run 2. It was carried
+over verbatim from the 256-thread `input_norm_and_qkv_transform` (`:1238`) where
+`8u` *is* correct.
+
+`b += 32u` now. Bit-exact by construction: the body is a pure elementwise map
+over 42 blocks of 128 elements, each writing its own disjoint
+`normed[base..]`/`transformed[base..]` slots with no cross-block reduction.
+
+New probe `crates/engine/tests/probe_finalize_block_stride.rs` pins the invariant
+**stride == threads/32** for all nine block loops in this family, in both
+directions. Sabotaged three ways, all observed to fail:
+
+| sabotage | result |
+|---|---|
+| revert `:1187` to `8u` | 2 tests FAIL: "stride 8u but the kernel is dispatched with 1024 threads = 32 simdgroups" |
+| `:1187` to `64u` | 3 tests FAIL: "stride 64u with 32 simdgroups reaches only 32 of 42 blocks" |
+| `:1238` to `32u` | the 256-thread test FAILS the other way |
+
+## 29. Where the 14.0 tok/s target stands, and why I am not going to claim it
+
+After all of the above: **74.62 ms = 13.40 tok/s** at 16.5k. The target is
+71.4 ms. The remaining 3.2 ms does not exist in a place this engine can reach
+without a quality or architecture change:
+
+* attention 11.95 ms is at the read roofline (§26) -- its only slimming is fewer
+  KV bytes, and KV quantisation is barred by AGENTS.md §8;
+* the weight GEMV 60.90 ms is at ~198 GB/s against a 203 GB/s measured ceiling,
+  and `WHERE-THIS-STANDS.md` establishes it is **ALU-bound at 3 bpw** on
+  `decode_state_mcg`'s 64-bit barrel shift (65.6 % of the kernel), a pool that
+  is **bit-locked** (the mask applies to the product) and whose removal was
+  measured to make the kernel *slower* (163.0 -> 134.3 GB/s, because the
+  dependent chains were supplying ILP);
+* element/finalize/host 2.70 ms carries at most ~0.5 ms (the K04 butterfly
+  restructure, 840 barriers -> 5, worth 0.19 ms, plus the two one-threadgroup
+  finalize grids).
+
+Everything else on the queue was measured and closed by this work or by prior
+art: prefetching (`fused2_co` 4 -> 8 loads) null (§22); 4col, occupancy,
+layout, TLB, threadgroup size, persistent kernels and multi-word widening all on
+`WHERE-THIS-STANDS.md`'s "provably dead" list; `o_sk4`/`sk4`/`contig4` measured
+worse or null in §27.
+
+**The one lever big enough that is not kernel work is byte reduction, and it is
+barred**: `lm_head` is 6 bpw row-major and costs 4.18 ms/token (A5 §1); 3 bpw
+would halve it. That is a quality change and needs the user's approval.
+
+### What this session actually delivered
+
+* **0.37 -> 13.1 tok/s** by undoing a regression that violated its own spec's
+  acceptance criteria (§25).
+* **13.1 -> 13.40 tok/s** from two measured, bit-exact grid-shape wins (§27).
+* **13.40 -> ?** one documented 3x under-parallelisation defect fixed (§28).
+
+To reach 14.0 the next step is not a kernel: it is the device-side top-k sampler
+plus a temperature-agnostic pipeline gate (`chat.rs:388` gates on `greedy`),
+which `WHERE-THIS-STANDS.md` ranks #1 and prices at ~+1.5 tok/s -- but that only
+applies to the `--temperature 1.0` path the engine runs by default, and every
+number in this spec is the greedy path. At temperature 0 the greedy number is
+13.40 and I do not believe it goes to 14.0 without lifting a standing constraint.

@@ -1331,10 +1331,17 @@ fn cross_layer_fusion(facts: &Facts, next_layer: bool, down_out: usize) -> bool 
 }
 
 /// linear.rs:2243-2260: which of the three sk2 names the default picks.
+///
+/// `_1col_sk2` is the default and `KAPLUMBA_NO_SK2_1COL` opts out, following the
+/// tree's `KAPLUMBA_NO_*` convention. Measured on `Gxma-repacked` at 16,536-token
+/// context: 76.35 -> 75.57 ms, token ids byte-identical. `KAPLUMBA_SK2_1COL`
+/// remains honoured so an old A/B arm still means "on".
 fn sk2_name(bits: u8, facts: &Facts) -> String {
     let suffix = if facts.flag_on("KAPLUMBA_SK2_CONTIG4") {
         "contig4_sk2"
-    } else if facts.flag_on("KAPLUMBA_SK2_1COL") {
+    } else if facts.flag_on("KAPLUMBA_SK2_1COL")
+        || !facts.flag_on("KAPLUMBA_NO_SK2_1COL")
+    {
         "1col_sk2"
     } else {
         "2col_sk2"
@@ -1540,17 +1547,21 @@ fn colmajor_default_env_selects_two_col_everywhere() {
     assert_eq!(m.threads(), 1344 * 256);
 
     let f2 = fused2_tree(LINEAR_RS).select(&facts["qk_full"]);
-    assert_eq!(f2.kernel, "linear_gemv_ishizuki_k3_fused2_2col");
-    assert_eq!(f2.groups, ((Q_OUT_FULL / 16 + KV_OUT_FULL / 16) / 2) as u64);
-    assert_eq!(f2.groups, 576);
+    assert_eq!(f2.kernel, "linear_gemv_ishizuki_k3_fused2_sk2");
+    assert_eq!(
+        f2.groups,
+        ((Q_OUT_FULL / 16 + KV_OUT_FULL / 16) * 2) as u64,
+        "q+k split-K doubles the grid against the 2col arm's half"
+    );
+    assert_eq!(f2.groups, 2304, "q+k: 1152 tiles x 2, against the 2col arm's 576");
 
     let f3 = fused3_tree(LINEAR_RS).select(&facts["qkv_sliding"]);
-    assert_eq!(f3.kernel, "linear_gemv_ishizuki_k3_fused3_2col");
+    assert_eq!(f3.kernel, "linear_gemv_ishizuki_k3_fused3_sk2");
     assert_eq!(
         f3.groups,
-        ((Q_OUT_SLIDING / 16 + KV_OUT_SLIDING / 16 + KV_OUT_SLIDING / 16) / 2) as u64
+        ((Q_OUT_SLIDING / 16 + KV_OUT_SLIDING / 16 + KV_OUT_SLIDING / 16) * 2) as u64
     );
-    assert_eq!(f3.groups, 512);
+    assert_eq!(f3.groups, 2048);
 }
 
 #[test]
@@ -1559,9 +1570,9 @@ fn the_five_decode_kernels_are_exactly_three_layer_kernels_and_a_head() {
     // The sk2 arms' kernel name is built with `format!`, so it is resolved by
     // the transcribed helper and pinned by the test below rather than parsed.
     let sk2_pick = sk2_name(3, &Facts::colmajor(3));
-    assert_eq!(sk2_pick, "linear_gemv_ishizuki_k3_colmajor_2col_sk2");
-    let sk2_groups = ((HIDDEN / 16) / 2) as u64 * 2;
-    assert_eq!(sk2_groups, 336);
+    assert_eq!(sk2_pick, "linear_gemv_ishizuki_k3_colmajor_1col_sk2");
+    let sk2_groups = (HIDDEN / 16) as u64 * 2;
+    assert_eq!(sk2_groups, 672, "_1col_sk2 doubles the 336-group _2col_sk2 grid");
 
     let gate_up_pick = mlp_tree(LINEAR_RS).select(&facts["gate_up"]).kernel;
     let qk_pick = fused2_tree(LINEAR_RS).select(&facts["qk_full"]).kernel;
@@ -1572,10 +1583,10 @@ fn the_five_decode_kernels_are_exactly_three_layer_kernels_and_a_head() {
     assert_eq!(
         names,
         vec![
-            "linear_gemv_ishizuki_k3_colmajor_2col_sk2",
-            "linear_gemv_ishizuki_k3_fused2_2col",
+            "linear_gemv_ishizuki_k3_colmajor_1col_sk2",
             "linear_gemv_ishizuki_k3_fused2_co",
-            "linear_gemv_ishizuki_k3_fused3_2col",
+            "linear_gemv_ishizuki_k3_fused2_sk2",
+            "linear_gemv_ishizuki_k3_fused3_sk2",
         ],
         "a fusion landed or an arm was reordered: the layer decode kernels changed"
     );
@@ -1833,17 +1844,19 @@ fn split_k_is_an_opt_out_so_down_proj_and_o_proj_get_sk2_by_default() {
     // referenced while absent).
     assert_eq!(
         sk2_name(3, &Facts::colmajor(3)),
-        "linear_gemv_ishizuki_k3_colmajor_2col_sk2"
+        "linear_gemv_ishizuki_k3_colmajor_1col_sk2",
+        "_1col_sk2 is the default: 76.35 -> 75.57 ms at 16.5k, token ids identical"
     );
     assert_eq!(
         sk2_name(3, &Facts::colmajor(3).flag("KAPLUMBA_SK2_CONTIG4")),
         "linear_gemv_ishizuki_k3_colmajor_contig4_sk2"
     );
     assert_eq!(
-        sk2_name(3, &Facts::colmajor(3).flag("KAPLUMBA_SK2_1COL")),
-        "linear_gemv_ishizuki_k3_colmajor_1col_sk2"
+        sk2_name(3, &Facts::colmajor(3).flag("KAPLUMBA_NO_SK2_1COL")),
+        "linear_gemv_ishizuki_k3_colmajor_2col_sk2",
+        "KAPLUMBA_NO_SK2_1COL must actually reach the 2col arm, or the opt-out is a lie"
     );
-    for flag in ["KAPLUMBA_SK2_CONTIG4", "KAPLUMBA_SK2_1COL"] {
+    for flag in ["KAPLUMBA_SK2_CONTIG4", "KAPLUMBA_NO_SK2_1COL"] {
         assert!(
             ishizuki_inventory().contains(&sk2_name(3, &Facts::colmajor(3).flag(flag))),
             "{flag} names a kernel no .metal file defines; setting it would crash in \

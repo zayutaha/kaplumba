@@ -1184,7 +1184,22 @@ kernel void finalize_post_ffn_and_next_input_norm_transform(
     // Exactly `input_norm_and_qkv_transform`'s step 3, including the fp16
     // rounding of the normed value BEFORE the sign multiply: `n0` is a half, and
     // `float(n0)` is what the transform consumes.
-    for (uint b = sg; b < params.blocks; b += 8u) {
+    //
+    // `b += 32u`, matching this kernel's own first loop (`:1117`) and the two
+    // strides in `linear_finalize_o_proj_and_pre_ffn_transform_sk2` (`:921`,
+    // `:969`). This dispatch is **1 threadgroup of 1024 threads** = 32
+    // simdgroups (`linear.rs` `encode_finalize_post_ffn_...`,
+    // `dispatch_groups(.., 1, 1024)`), so a stride of 8 left simdgroups 8-31
+    // idle and ran 6 rounds where the siblings run 2 -- a missed edit in T5.6,
+    // carried over verbatim from the 256-thread
+    // `input_norm_and_qkv_transform` (`:1238`) where `8u` *is* correct.
+    //
+    // Bit-exact by construction: the body is a pure elementwise map over
+    // `blocks` of 128 elements, each block writing its own disjoint
+    // `normed[base..]` and `transformed[base..]` slots with no cross-block
+    // reduction and no accumulation across iterations, so the block ->
+    // simdgroup assignment cannot change a value.
+    for (uint b = sg; b < params.blocks; b += 32u) {
         const uint base = b * 128u + lane;
         const half n0 = half(float(input_shared[base]) * inv * float(next_input_norm[base]));
         const half n1 = half(float(input_shared[base + 32u]) * inv * float(next_input_norm[base + 32u]));

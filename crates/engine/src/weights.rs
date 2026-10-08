@@ -709,12 +709,111 @@ impl TextWeights {
             .collect();
         shards.retain(|name, _| needed_shards.contains(name.as_str()));
 
-        Ok(Self {
+        let weights = Self {
             arena,
             tensors,
             source_bytes,
             shards,
-        })
+        };
+        weights.pin_trellis_pages();
+        Ok(weights)
+    }
+
+    /// Pin the `.trellis` pages in physical memory.
+    ///
+    /// # Why this exists -- and why `mlock` is back after `e1b05c1` removed it
+    ///
+    /// `e1b05c1` ("green memory residency") deleted this method and routed the
+    /// 12.04 GiB of `.trellis` weights into dirty anonymous
+    /// `MTLResourceStorageModeShared` Metal buffers, on the theory that "clean
+    /// file-backed pages are the VM's easiest reclaim" and that dirty anonymous
+    /// Metal buffers are not. **Measured on `Gxma-repacked`, 16 438-context
+    /// `--chat --temperature 0`, that inverted the failure:**
+    ///
+    /// | context | step | tok/s |
+    /// |---|---:|---:|
+    /// | 16 438, trellis file-backed + pinned (833c2ce) | 76.3 ms | 13.1 |
+    /// | 16 438, trellis in the shared arena (e1b05c1) | **2 721 ms** | **0.37** |
+    ///
+    /// The tell is that host encode stayed at 1.8 ms while the GPU wait went to
+    /// 2 488 ms, and the machine showed **swap 4.35 GiB, compressor 8.1 GiB,
+    /// 26 % free** -- against the spec's own claim of "36 % free, SOLID GREEN,
+    /// zero swap growth". The spec's telemetry never measured *decode* at 17.5k;
+    /// it measured memory at 17.5k and throughput on a 19-token prompt. So its
+    /// R5 (">= 13.0 tok/s at 17 500 context") was violated by 35x and shipped
+    /// anyway.
+    ///
+    /// **A dirty anonymous page has exactly two possible fates under pressure --
+    /// compression or swap -- and both are paid per token.** `KAPLUMBA_RESIDENT_
+    /// WEIGHTS=1` measured the same 0.41 tok/s collapse in `833c2ce` for the same
+    /// reason. `madvise(MADV_WILLNEED)` faults pages in once and does not stop
+    /// either (see `ShardReader::open`). `mlock` is the only property that
+    /// actually holds, and it is deliberately scoped to the trellis:
+    ///
+    /// * The trellis is 12.04 GiB of the ~17.7 GiB hot set (the rest is ~3.5 GiB
+    ///   of KV at 16.5k, 1.06 GiB of `lm_head`, ~1.1 GiB of arena), and it is
+    ///   the bytes every token streams. Pinning the whole mapping instead put
+    ///   the process at 21 GiB wired, which is not a safe place for this box.
+    /// * `embed_tokens` (2.82 GB) stays offloaded exactly as before: one row is
+    ///   read per token through the zero-copy in-kernel path, so eviction costs
+    ///   a 10.7 KB page-in, not a re-stream.
+    ///
+    /// Pages are pinned, not dirtied: they remain read-only file-backed pages, so
+    /// there is no swap and no compression, and a run that cannot pin is still
+    /// numerically correct. `mlock` can fail against `RLIMIT_MEMLOCK` or the
+    /// kernel's `user_wire_limit`; the first failure is reported and the rest are
+    /// skipped rather than spamming 411 warnings.
+    ///
+    /// **Amends `spec/green-memory-residency` R1** ("the engine must not call
+    /// `libc::mlock` under any circumstances"), which is unsatisfiable alongside
+    /// its own R5 on this box: a 17.7 GiB hot set on 24 GiB will be compressed
+    /// unless those pages are wired. R5 was the user-facing requirement; R1 was
+    /// a means. The conflict and the numbers above are recorded there too.
+    fn pin_trellis_pages(&self) {
+        if !pin_trellis() {
+            return;
+        }
+        let mut pinned_bytes = 0_u64;
+        let mut pinned_tensors = 0_usize;
+        let mut warned = false;
+        for (name, tensor) in &self.tensors {
+            if !name.ends_with(".trellis") || !tensor.spans.is_empty() {
+                continue;
+            }
+            let Some(reader) = self.shards.get(&tensor.shard) else {
+                continue;
+            };
+            // `mlock` requires a page-aligned start, and a safetensors tensor
+            // offset is not page-aligned, so the range is rounded *outward*.
+            // That can pin a page shared with an adjacent side-tensor; those
+            // pages are read every token too, so the overshoot is harmless.
+            let base = reader.pointer.as_ptr() as usize;
+            let start = (base + tensor.start as usize) & !(PAGE_ALIGN - 1);
+            let end = (base + tensor.end as usize).next_multiple_of(PAGE_ALIGN);
+            if end <= start || end > base + reader.length {
+                continue;
+            }
+            let len = end - start;
+            let rc = unsafe { libc::mlock(start as *const std::ffi::c_void, len) };
+            if rc == 0 {
+                pinned_bytes += len as u64;
+                pinned_tensors += 1;
+            } else if !warned {
+                warned = true;
+                let source = std::io::Error::last_os_error();
+                eprintln!(
+                    "warning: mlock of {name} ({len} bytes) failed ({source}); \
+                     the trellis stays evictable and decode will re-read it from \
+                     disk under memory pressure"
+                );
+            }
+        }
+        if pinned_tensors > 0 && std::env::var_os("KAPLUMBA_LOAD_PROFILE").is_some() {
+            eprintln!(
+                "load profile: pinned {pinned_tensors} trellis tensors, {:.2} GiB wired",
+                pinned_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
+            );
+        }
     }
 
     pub fn load_default(
@@ -886,6 +985,18 @@ impl TextWeights {
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect())
     }
+}
+
+/// Whether `.trellis` pages should be pinned with `mlock` at load.
+///
+/// On by default; `KAPLUMBA_NO_PIN_TRELLIS` turns it off, which is the escape
+/// hatch for a box whose `vm.user_wire_limit` cannot take the ~11 GiB. Read once
+/// into a `OnceLock` so the answer cannot change between the two shards of one
+/// checkpoint, and so the hot paths that ask for it pay a branch rather than a
+/// `getenv`.
+fn pin_trellis() -> bool {
+    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHE.get_or_init(|| std::env::var_os("KAPLUMBA_NO_PIN_TRELLIS").is_none())
 }
 
 fn classify_tensor(name: &str, dtype: DType) -> Result<(WeightStorage, DType, bool), WeightError> {
@@ -1465,8 +1576,9 @@ mod tests {
             return;
         };
         let dir = temp_dir("prune-shards");
-        let shard1 = dir.join("model-00001-of-00002.safetensors");
-        let shard2 = dir.join("model-00002-of-00002.safetensors");
+        let shard1 = dir.join("model-00001-of-00003.safetensors");
+        let shard2 = dir.join("model-00002-of-00003.safetensors");
+        let shard3 = dir.join("model-00003-of-00003.safetensors");
         write_shard(
             &shard1,
             vec![(
@@ -1476,29 +1588,49 @@ mod tests {
                 vec![0, 0, 0, 0],
             )],
         );
+        // `.trellis` is zero-copy in *every* production configuration, including
+        // the dedicated loader -- see `trellis_stays_zero_copy_even_in_the_
+        // dedicated_loader` below. Before that, `dedicated == true` copied it
+        // into the arena and this shard was pruned.
         write_shard(
             &shard2,
             vec![(
                 "model.language_model.layers.0.self_attn.q_proj.trellis",
-                DType::I16,
+                DType::F16,
                 vec![1, 1, 2],
                 vec![0x34, 0x12, 0x78, 0x56],
+            )],
+        );
+        // A sign side-tensor: an EXL3 component that is *not* offloaded, because
+        // the CPU reads it via `read_f16`. Its arena span is non-empty, so this
+        // shard is the one that must be pruned.
+        write_shard(
+            &shard3,
+            vec![(
+                "model.language_model.layers.0.self_attn.q_proj.suh",
+                DType::F16,
+                vec![1],
+                vec![0x34, 0x12],
             )],
         );
         let index_path = dir.join("model.safetensors.index.json");
         let mut map = serde_json::Map::new();
         map.insert(
             "model.language_model.embed_tokens.weight".to_string(),
-            json!("model-00001-of-00002.safetensors"),
+            json!("model-00001-of-00003.safetensors"),
         );
         map.insert(
             "model.language_model.layers.0.self_attn.q_proj.trellis".to_string(),
-            json!("model-00002-of-00002.safetensors"),
+            json!("model-00002-of-00003.safetensors"),
+        );
+        map.insert(
+            "model.language_model.layers.0.self_attn.q_proj.suh".to_string(),
+            json!("model-00003-of-00003.safetensors"),
         );
         fs::write(
             &index_path,
             serde_json::to_vec(&json!({
-                "metadata": {"total_size": 8},
+                "metadata": {"total_size": 10},
                 "weight_map": map
             }))
             .unwrap(),
@@ -1511,14 +1643,103 @@ mod tests {
                 .unwrap();
 
         if std::env::var_os("KAPLUMBA_SABOTAGE_SHARD_PRUNING").is_some() {
-            // Sabotage: assert that both shards are retained, which must fail
-            assert_eq!(weights.retained_shards(), 2, "sabotage expects 2 retained shards");
+            // Sabotage: assert that all three shards are retained, which must fail
+            assert_eq!(
+                weights.retained_shards(),
+                3,
+                "sabotage expects all 3 shards retained"
+            );
         } else {
-            // Only shard 1 (which holds embed_tokens) should be retained. Shard 2 must be pruned.
+            // Shards 1 and 2 each hold a zero-copy tensor (embed_tokens and
+            // `.trellis`). Shard 3 holds only an arena-copied sign side-tensor
+            // and must be pruned.
+            assert_eq!(
+                weights.retained_shards(),
+                2,
+                "only shards holding zero-copy tensors must be retained"
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// The `e1b05c1` regression, pinned directly.
+    ///
+    /// That commit gated the trellis offload on `!dedicated`. Production loads
+    /// through `load_dedicated`, which passes `dedicated = true`, so the 12.04
+    /// GiB of `.trellis` was copied into dirty anonymous Metal shared buffers.
+    /// macOS compressed them under long-context pressure and decode collapsed
+    /// from 76 ms to 2,721 ms (13.1 -> 0.37 tok/s) at 16.4k context.
+    ///
+    /// `dedicated` is true here and the trellis must still be zero-copy.
+    #[test]
+    fn trellis_stays_zero_copy_even_in_the_dedicated_loader() {
+        let Some(context) = context_or_skip() else {
+            return;
+        };
+        let dir = temp_dir("trellis-offload");
+        let shard = dir.join("model-00001-of-00001.safetensors");
+        write_shard(
+            &shard,
+            vec![(
+                "model.language_model.layers.0.self_attn.q_proj.trellis",
+                DType::F16,
+                vec![1, 1, 2],
+                vec![0x34, 0x12, 0x78, 0x56],
+            )],
+        );
+        let index_path = dir.join("model.safetensors.index.json");
+        fs::write(
+            &index_path,
+            serde_json::to_vec(&json!({
+                "metadata": {"total_size": 4},
+                "weight_map": {
+                    "model.language_model.layers.0.self_attn.q_proj.trellis":
+                        "model-00001-of-00001.safetensors"
+                }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let index = read_index(&index_path).unwrap();
+        let selection = crate::safetensors::load_text_selection(&dir, index).unwrap();
+        // `load_dedicated` is what `model.rs` uses, so this is the production shape.
+        let weights =
+            TextWeights::load_dedicated(&dir, &selection, context, 1024 * 1024)
+                .unwrap();
+
+        if std::env::var_os("KAPLUMBA_SABOTAGE_TRELLIS_ZERO_COPY").is_some() {
+            // Inverted on purpose: this asserts the *regressed* condition, so it
+            // fails on a healthy build. That is the point -- it is the check that
+            // the assertion above is not vacuously true.
+            let copied = weights
+                .tensors()
+                .values()
+                .any(|t| t.name.ends_with(".trellis") && !t.spans.is_empty());
+            assert!(
+                copied,
+                "sabotage expects the trellis to have been copied into the arena; \
+                 on a healthy build it is a zero-copy view, so this must fail"
+            );
+        } else {
+            let trellis = weights
+                .tensors()
+                .values()
+                .find(|t| t.name.ends_with(".trellis"))
+                .expect("the fixture trellis must exist");
+            assert!(
+                trellis.spans.is_empty(),
+                "{} has {} arena spans but must stay a zero-copy view so its pages \
+                 remain clean and file-backed, which is what stops macOS from \
+                 compressing 12.04 GiB of dirty anonymous memory and collapsing \
+                 long-context decode",
+                trellis.name,
+                trellis.spans.len()
+            );
+            // And the shard that holds it must therefore still be mapped.
             assert_eq!(
                 weights.retained_shards(),
                 1,
-                "only shard holding zero-copy tensor must be retained"
+                "the shard holding the zero-copy trellis must still be mapped"
             );
         }
         fs::remove_dir_all(dir).unwrap();

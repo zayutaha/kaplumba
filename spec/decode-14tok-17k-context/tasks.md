@@ -59,3 +59,50 @@
     last compressible pages.
 - [ ] **Task 5: End-to-end 17.5k context chat benchmark**
   - Run `/tmp/test_16k_tokens.py` and verify steady-state delta drops below 71.4 ms ($\ge 14.0\text{ tok/s}$).
+
+---
+
+## Session of 2026-10-08
+
+- [x] **Task 9: Undo the `e1b05c1` residency regression** — 0.37 -> 13.1 tok/s at 16.5k
+  - Files: `crates/engine/src/weights.rs`
+  - `offload_trellis` was gated on `!dedicated`, and production always loads via
+    `load_dedicated`, so all 12.04 GiB of trellis went into dirty anonymous Metal
+    shared buffers and got compressed (swap 4.35 GiB, compressor 8.1 GiB).
+  - Dropped `!dedicated`; restored `pin_trellis_pages` (`mlock` on the 411
+    `.trellis` ranges only, offloads untouched). Measured: **2,721 -> 76.0 ms**.
+  - Amends `spec/green-memory-residency` R1; R1 and its own R5 are unsatisfiable
+    together on a 24 GiB box. See notes §25.
+  - New regression guard `trellis_stays_zero_copy_even_in_the_dedicated_loader`,
+    sabotaged three ways, all observed to fail.
+
+- [x] **Task 10: Two bit-exact grid-shape wins, shipped as defaults** — 13.1 -> 13.40 tok/s
+  - Files: `crates/kernels/src/linear.rs`
+  - `KAPLUMBA_SK2_1COL` (now default, opt out `KAPLUMBA_NO_SK2_1COL`):
+    `_1col_sk2` doubles the decode GEMV grid to `out_features/16*2`.
+  - `KAPLUMBA_QKV_SK2` (now default, opt out `KAPLUMBA_NO_QKV_SK2`): fused q/k/v
+    go through `fused2_sk2`/`fused3_sk2`, 2048 groups against 512.
+  - Six-arm sweep, all arms in notes §27. Both bit-exact (90/90 token ids
+    identical); `fused_bit_exact` stays 3/3.
+  - Also: `fused2_sk2` never called `trace_gemv`, so the split was invisible to
+    `KAPLUMBA_TRACE_GEMV`. Fixed.
+  - Probe `probe_mlpdispatch_tree` updated to the new defaults (it was 19/19 green,
+    so the 2 failures it threw came from the default flip and are now fixed).
+
+- [x] **Task 11: Fix the documented `linear.metal:1187` under-parallelisation**
+  - Files: `crates/kernels/src/linear.metal`, new `crates/engine/tests/probe_finalize_block_stride.rs`
+  - A 1024-thread dispatch running `b += 8u`: 24 of 32 simdgroups idle, 6 rounds
+    instead of 2. Now `b += 32u`, matching its three siblings.
+  - Bit-exact by construction (pure elementwise map, disjoint output slots).
+  - New probe pins **stride == threads/32** for all nine block loops, both
+    directions; sabotaged three ways (8u, 64u, and over-striding a 256-thread
+    kernel) and every failure observed.
+
+- [ ] **Task 5: End-to-end 16.5k context chat benchmark — 74.48 ms (13.40 tok/s)**
+  - Target 71.4 ms / 14.0 tok/s **not reached** and, on the evidence in §26, not
+    reachable at `--temperature 0` without lifting a standing constraint:
+    attention is at the DRAM read roofline (3.54 GB / 11.95 ms = ~296 GB/s) and
+    the weight GEMV is at ~198 GB/s against a 203 GB/s measured ceiling on a
+    bit-locked ALU pool. Element/finalize/host holds at most ~0.5 ms more.
+  - The only lever big enough is byte reduction (`lm_head` at 6 bpw costs 4.18
+    ms/token), which is a quality decision. Logged, not taken.
