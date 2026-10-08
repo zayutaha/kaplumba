@@ -221,7 +221,7 @@ pub const MAX_DISPATCHES_PER_BUFFER: u32 = 50;
 /// (`mlx/transforms.cpp`); past it the host blocks on a condvar. We measured
 /// `new_command_buffer()` blocking ~175 ms once ~64 buffers were outstanding,
 /// so staying well under that is deliberate.
-pub const MAX_IN_FLIGHT: usize = 8;
+pub const MAX_IN_FLIGHT: usize = 32;
 
 /// MEASUREMENT OVERRIDE: `KAPLUMBA_MAX_IN_FLIGHT=N` shrinks the in-flight
 /// window, and 1 serialises completely (every rolled command buffer is waited
