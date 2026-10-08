@@ -53,14 +53,41 @@
 static inline void extract_v_mcg_32(uint wa, uint wb, uint sh0, uint rsh0, thread float v[8]) {
     const uint A_hi = (wa << sh0) | (wb >> rsh0);
     const uint A_lo = wb << sh0;
-    v[0] = decode_state_mcg((A_hi >> 16) & 0xffffu);
-    v[1] = decode_state_mcg((A_hi >> 13) & 0xffffu);
-    v[2] = decode_state_mcg((A_hi >> 10) & 0xffffu);
-    v[3] = decode_state_mcg((A_hi >> 7) & 0xffffu);
-    v[4] = decode_state_mcg((A_hi >> 4) & 0xffffu);
-    v[5] = decode_state_mcg((A_hi >> 1) & 0xffffu);
-    v[6] = decode_state_mcg(((A_hi << 2) | (A_lo >> 30)) & 0xffffu);
-    v[7] = decode_state_mcg(((A_hi << 5) | (A_lo >> 27)) & 0xffffu);
+
+    // SIMD vector dequantization: 4-wide vector ALU instructions
+    uint4 c0 = uint4((A_hi >> 16) & 0xffffu,
+                     (A_hi >> 13) & 0xffffu,
+                     (A_hi >> 10) & 0xffffu,
+                     (A_hi >> 7)  & 0xffffu);
+    c0 = c0 * 0xCBAC1FEDu;
+    c0 = 0x3b603b60u ^ (c0 & 0x8fff8fffu);
+
+    half2 h0 = as_type<half2>(c0.x);
+    half2 h1 = as_type<half2>(c0.y);
+    half2 h2 = as_type<half2>(c0.z);
+    half2 h3 = as_type<half2>(c0.w);
+
+    v[0] = float(h0.x + h0.y);
+    v[1] = float(h1.x + h1.y);
+    v[2] = float(h2.x + h2.y);
+    v[3] = float(h3.x + h3.y);
+
+    uint4 c1 = uint4((A_hi >> 4)  & 0xffffu,
+                     (A_hi >> 1)  & 0xffffu,
+                     ((A_hi << 2) | (A_lo >> 30)) & 0xffffu,
+                     ((A_hi << 5) | (A_lo >> 27)) & 0xffffu);
+    c1 = c1 * 0xCBAC1FEDu;
+    c1 = 0x3b603b60u ^ (c1 & 0x8fff8fffu);
+
+    half2 h4 = as_type<half2>(c1.x);
+    half2 h5 = as_type<half2>(c1.y);
+    half2 h6 = as_type<half2>(c1.z);
+    half2 h7 = as_type<half2>(c1.w);
+
+    v[4] = float(h4.x + h4.y);
+    v[5] = float(h5.x + h5.y);
+    v[6] = float(h6.x + h6.y);
+    v[7] = float(h7.x + h7.y);
 }
 
 static inline void extract_v_mcg_fast(ulong A, thread float v[8]) {
