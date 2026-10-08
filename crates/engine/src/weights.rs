@@ -574,16 +574,12 @@ impl TextWeights {
             // Clean file-backed mmap pages cannot be compressed or swapped.
             let force_resident = std::env::var_os("KAPLUMBA_RESIDENT_WEIGHTS").is_some();
             let offload_embedding = !force_resident;
-            let offload_head = !force_resident;
             let offload_bf16_embedding =
                 offload_embedding && name == "model.language_model.embed_tokens.weight";
-            let offload_head_trellis = offload_head && name == "lm_head.trellis";
-            let offload_trellis = !force_resident && name.ends_with(".trellis");
-            let skip_copy = offload_bf16_embedding
-                || (!converted && (offload_trellis || offload_head_trellis));
+            let skip_copy = offload_bf16_embedding;
             let spans = if skip_copy {
                 Vec::new()
-            } else if dedicated {
+            } else if dedicated || name.ends_with(".trellis") {
                 arena.allocate_dedicated(source_len)?
             } else {
                 arena.allocate(source_len)?
@@ -686,101 +682,12 @@ impl TextWeights {
                 },
             );
         }
-        let weights = Self {
+        Ok(Self {
             arena,
             tensors,
             source_bytes,
             shards,
-        };
-        weights.pin_trellis_pages();
-        Ok(weights)
-    }
-
-    /// Pin the `.trellis` pages in physical memory.
-    ///
-    /// # Why this exists
-    ///
-    /// The trellis is bound straight from the shard mapping, so its pages are
-    /// clean and file-backed -- which is the right default, and it is why this
-    /// costs no anonymous memory and no compressor. But "clean and file-backed"
-    /// also means **the VM may reclaim them at any moment**, and at long context
-    /// it does. Measured on `Gxma-repacked`, `--chat --temperature 0`:
-    ///
-    /// | context | steady-state step |
-    /// |---|---|
-    /// | 23 | 77 ms (12.9 tok/s) |
-    /// | 6,014 | **71.9 ms (13.9 tok/s)** |
-    /// | 17,486 | **2,700 ms (0.37 tok/s)** |
-    ///
-    /// The tell is that the per-kernel profiles are unchanged and the host is
-    /// blocked in `waitUntilCompleted`: the box is simply re-reading the weights.
-    /// At 17.5k the process holds 4.3 GiB while `vmmap -summary` reports the two
-    /// shard mappings at `RESIDENT 0K`, and macOS puts 8-11 GiB into the
-    /// compressor. 12 GiB / 2.7 s = 4.4 GB/s is NVMe speed, not DRAM.
-    ///
-    /// `madvise(MADV_WILLNEED)` in [`ShardReader::open`] does not prevent this --
-    /// it only faults the pages in once. Neither does copying the trellis into
-    /// the arena (`KAPLUMBA_RESIDENT_WEIGHTS`): measured 0.41 tok/s at the same
-    /// context, because the compressor then takes the dirty anonymous pages
-    /// instead of the page cache. `mlock` is the property that actually has to
-    /// hold, and it is deliberately scoped to the trellis:
-    ///
-    /// * The trellis is 12.04 GiB of the 14.9 GiB of shards, and it is the
-    ///   bytes every token streams. Pinning the whole mapping instead put the
-    ///   process at 21 GiB wired, which is not a safe place for this box.
-    /// * `embed_tokens`, `lm_head`, and the vision tower stay offloaded exactly
-    ///   as they were. The method only walks names ending in `.trellis`.
-    ///
-    /// Pages are pinned, not dirtied: they remain read-only file-backed pages,
-    /// so there is no swap and no compression, and a run that cannot pin is
-    /// still numerically correct. `mlock` can fail against `RLIMIT_MEMLOCK` or
-    /// the kernel's `user_wire_limit`; the first failure is reported and the
-    /// rest are skipped rather than spamming 411 warnings.
-    fn pin_trellis_pages(&self) {
-        if !pin_trellis() {
-            return;
-        }
-        let mut pinned_bytes = 0_u64;
-        let mut pinned_tensors = 0_usize;
-        let mut warned = false;
-        for (name, tensor) in &self.tensors {
-            if !name.ends_with(".trellis") {
-                continue;
-            }
-            let Some(reader) = self.shards.get(&tensor.shard) else {
-                continue;
-            };
-            // `mlock` requires a page-aligned start, and a safetensors tensor
-            // offset is not page-aligned, so the range is rounded *outward*.
-            // That can pin a page shared with an adjacent side-tensor; those
-            // pages are read every token too, so the overshoot is harmless.
-            let base = reader.pointer.as_ptr() as usize;
-            let start = (base + tensor.start as usize) & !(PAGE_ALIGN - 1);
-            let end = (base + tensor.end as usize).next_multiple_of(PAGE_ALIGN);
-            if end <= start || end > base + reader.length {
-                continue;
-            }
-            let len = end - start;
-            let rc = unsafe { libc::mlock(start as *const std::ffi::c_void, len) };
-            if rc == 0 {
-                pinned_bytes += len as u64;
-                pinned_tensors += 1;
-            } else if !warned {
-                warned = true;
-                let source = std::io::Error::last_os_error();
-                eprintln!(
-                    "warning: mlock of {name} ({len} bytes) failed ({source}); \
-                     the trellis stays evictable and decode will re-read it from \
-                     disk under memory pressure"
-                );
-            }
-        }
-        if pinned_tensors > 0 && std::env::var_os("KAPLUMBA_LOAD_PROFILE").is_some() {
-            eprintln!(
-                "load profile: pinned {pinned_tensors} trellis tensors, {:.2} GiB wired",
-                pinned_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
-            );
-        }
+        })
     }
 
     pub fn load_default(
@@ -977,15 +884,6 @@ fn classify_tensor(name: &str, dtype: DType) -> Result<(WeightStorage, DType, bo
             dtype,
         }),
     }
-}
-
-/// Pinned by default; `KAPLUMBA_NO_PIN_TRELLIS` turns it off.
-///
-/// Read once into a `OnceLock` so the answer cannot change between the two
-/// shards of one checkpoint.
-fn pin_trellis() -> bool {
-    static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHE.get_or_init(|| std::env::var_os("KAPLUMBA_NO_PIN_TRELLIS").is_none())
 }
 
 fn is_exl3_component(name: &str) -> bool {

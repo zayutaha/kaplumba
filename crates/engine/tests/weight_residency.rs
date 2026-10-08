@@ -81,8 +81,8 @@ fn bulk_read_mostly_tensors_are_mapped_by_default() {
         "{EMBED} (2.82 GB) should be mapped: one row is read per token"
     );
     assert!(
-        is_mapped(&weights, HEAD),
-        "{HEAD} (1.06 GB) should be mapped: measured -1.00 GiB, output unchanged"
+        !is_mapped(&weights, HEAD),
+        "{HEAD} (1.06 GB) is resident in the shared arena to prevent NVMe eviction under memory pressure"
     );
 }
 
