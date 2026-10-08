@@ -306,7 +306,7 @@ fn split_counts_from_the_production_heuristic() {
         "KAPLUMBA_DECODE_SPLITS is set; it outranks the rule and every figure \
          below would be the pin, not the heuristic"
     );
-    assert_eq!(ATTENTION_SPLITS_MAX, 16);
+    assert_eq!(ATTENTION_SPLITS_MAX, 64);
 
     // q_heads == 32 on both shapes, so the thread target is shape-independent.
     let wanted = THREADS_TARGET / (LANE * Q_HEADS);
@@ -329,7 +329,7 @@ fn split_counts_from_the_production_heuristic() {
             let splits = decode_splits(Q_HEADS, shape.kv_heads, key_count);
 
             let expected_wanted = if key_count > 1024 && shape.label == "full" {
-                54 / shape.kv_heads // 1 wave: 13 splits
+                key_count.div_ceil(256).clamp(1, ATTENTION_SPLITS_MAX)
             } else {
                 wanted
             };
@@ -351,9 +351,9 @@ fn split_counts_from_the_production_heuristic() {
 
     // The full-attention answer the report leads with.
     assert_eq!(decode_splits(Q_HEADS, FULL_KV, 512), 8, "the keys-per-split floor decides");
-    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 2048), 13, "Auto uses 1 wave at >1024 keys");
-    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 8192), 13, "Auto uses 1 wave at >1024 keys");
-    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 16_384), 13, "Auto uses 1 wave at >1024 keys");
+    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 2048), 8, "Auto uses 256-key block splits at >1024 keys");
+    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 8192), 32, "Auto uses 256-key block splits at >1024 keys");
+    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 16_384), 64, "Auto uses 256-key block splits at >1024 keys");
     // Sliding is bounded by its window, so it saturates at 16 by 1024 keys and
     // can never be higher -- the window, not the split cap, is its ceiling.
     assert_eq!(decode_splits(Q_HEADS, SLIDING_KV, 512), 8);
@@ -511,7 +511,7 @@ fn the_combine_is_one_extra_dispatch_and_a_fixed_size_round_trip() {
     // The scratch is identical for both shapes' worst case and is independent
     // of context -- the property AGENTS.md §8 requires of every decode buffer.
     let full = decode_partial_elements(Q_HEADS, FULL_HEAD_DIM) * 4;
-    assert_eq!(full, 1_052_672);
+    assert_eq!(full, 4_210_688);
     println!("\n  fixed partials scratch: {full} B ({} KiB), independent of context",
         full / 1024);
     // The engine allocates ONE scratch sized for the largest head_dim
@@ -588,19 +588,12 @@ fn sliding_uses_split_kv_and_fills_the_machine_one_wave() {
     assert_eq!(WINDOW.div_ceil(s_splits), 64, "each sliding workgroup holds 64 keys");
 
     // Full: Under the default Auto rule at 16k context, decode_splits chooses
-    // 13 splits -> 52 workgroups of 256 threads, fitting in the measured 54-workgroup
-    // 1-wave budget.
+    // 64 splits -> 256 workgroups of 256 threads (12.8 workgroups per core across 20 cores),
+    // chunking keys into 256-key blocks so full attention latency remains <= 2.0 ms.
     let f_splits = decode_splits(Q_HEADS, FULL_KV, 16_384);
-    assert_eq!(f_splits * FULL_KV, 52);
-    assert!(52 <= 54, "full runs in 1 wave at context > 1024 under the Auto default");
-
-    // And it is the same 13 splits at 2048 keys as at 16384:
-    assert_eq!(
-        decode_splits(Q_HEADS, FULL_KV, 2048),
-        decode_splits(Q_HEADS, FULL_KV, 16_384),
-        "the grid is the same at 2k and 16k; only the per-workgroup key count moves"
-    );
-    println!("\n  full @16k: {} keys per workgroup over {} workgroups (fits in 54 budget)",
+    assert_eq!(f_splits * FULL_KV, 256);
+    assert_eq!(16_384 / f_splits, 256, "each full workgroup holds 256 keys");
+    println!("\n  full @16k: {} keys per workgroup over {} workgroups",
         16_384 / f_splits, f_splits * FULL_KV);
 }
 

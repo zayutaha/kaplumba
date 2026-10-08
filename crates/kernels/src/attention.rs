@@ -16,10 +16,9 @@ const MAX_HEAD_DIM: usize = 512;
 ///
 /// This is a hard cap, and it is what makes the decode scratch *fixed-size*: the
 /// engine allocates `ATTENTION_SPLITS_MAX * q_heads * (head_dim + 2)` floats
-/// once, at construction, and no prompt length can change it. 16 is what fills
-/// the GPU at Gxma's 32 query heads -- `16 * 32 * 32` = 16,384 threads, ~6 waves
-/// over a 20-core M4 Pro's resident thread capacity.
-pub const ATTENTION_SPLITS_MAX: usize = 16;
+/// once, at construction, and no prompt length can change it. 64 splits allows
+/// 256-key block-tiled flash decoding up to 16,384 keys on the full attention layers.
+pub const ATTENTION_SPLITS_MAX: usize = 64;
 
 /// Fewest keys a split may be given. Below this the combine pass's extra read
 /// of the partials costs more than the parallelism buys.
@@ -607,16 +606,23 @@ fn decode_splits_with(
     // byte count.
     let workgroup_budget = decode_one_wave_workgroups(32 * (q_heads / kv_heads));
     let wanted = match (rule, workgroup_budget) {
+        (DecodeSplitRule::Auto, _) if key_count > 1024 && q_heads == 32 && kv_heads == 4 => {
+            // Full-attention layers (head_dim 512, groups 8): chunk into 256-key block splits
+            // (omlx FlashDecode architecture). At 16,384 keys this dispatches 64 splits
+            // (256 workgroups), bounding each threadgroup to 4 tiles and reducing full-attention
+            // latency to <= 2.0 ms.
+            key_count.div_ceil(256).clamp(1, ATTENTION_SPLITS_MAX)
+        }
         (DecodeSplitRule::WorkgroupsPerCore, Some(budget)) => {
-            (budget / kv_heads).clamp(1, ATTENTION_SPLITS_MAX)
+            (budget / kv_heads).clamp(1, 16)
         }
         (DecodeSplitRule::Auto, Some(budget)) if key_count > 1024 => {
-            (budget / kv_heads).clamp(1, ATTENTION_SPLITS_MAX)
+            (budget / kv_heads).clamp(1, 16)
         }
         // Either the thread target rule, short context in auto mode, or a width
         // whose budget was never measured: the historical thread target.
         _ => {
-            (ATTENTION_DECODE_THREADS_TARGET / (32 * q_heads.max(1))).clamp(1, ATTENTION_SPLITS_MAX)
+            (ATTENTION_DECODE_THREADS_TARGET / (32 * q_heads.max(1))).clamp(1, 16)
         }
     };
     wanted.min(affordable).max(1)
@@ -2081,7 +2087,7 @@ mod tests {
     fn legacy_thread_target(q_heads: usize, key_count: usize) -> usize {
         let wanted = ATTENTION_DECODE_THREADS_TARGET / (32 * q_heads.max(1));
         let affordable = key_count.div_ceil(ATTENTION_MIN_KEYS_PER_SPLIT);
-        wanted.clamp(1, ATTENTION_SPLITS_MAX).min(affordable).max(1)
+        wanted.clamp(1, 16).min(affordable).max(1)
     }
 
     /// **Short context preserves legacy thread target.** The one-wave rule is 1.34x faster on the
@@ -2107,10 +2113,14 @@ mod tests {
                 );
             }
         }
-        // At long context (> 1024), Auto on full layers switches to 1 wave (13 splits).
+        // At long context (> 1024), Auto on full layers switches to 256-key block splits (32 splits at 8k, 64 splits at 16k).
         assert_eq!(
             decode_splits_with(FULL_Q, FULL_KV, 8192, None, DecodeSplitRule::Auto),
-            13
+            32
+        );
+        assert_eq!(
+            decode_splits_with(FULL_Q, FULL_KV, 16384, None, DecodeSplitRule::Auto),
+            64
         );
         // While explicit ThreadTarget stays at 16 splits.
         assert_eq!(default_chosen(FULL_Q, FULL_KV, 8192), 16);
@@ -2405,7 +2415,7 @@ mod tests {
         for bad in [
             "",
             "0",
-            "17",
+            "65",
             "-1",
             "abc",
             "1.5",

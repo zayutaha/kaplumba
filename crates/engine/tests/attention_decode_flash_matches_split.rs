@@ -204,6 +204,8 @@ fn decode_flash_matches_scalar_split_on_the_full_shape() {
         (8192, 5),  // ragged with an odd split count
         (24576, 16),
         (24576, 13),
+        (16384, 64), // ATTENTION_SPLITS_MAX = 64
+        (16384, 32),
         // key_count below splits * 64: some splits are EMPTY, which must fall
         // out as m = NEG, s = 0, O = 0 and weigh nothing in the combine.
         (100, 16),
