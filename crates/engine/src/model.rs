@@ -4038,7 +4038,8 @@ impl TextModel {
             *pos_ptr = position;
         }
 
-        let mut gpu = GpuProfile::new(false);
+        let profile = env_flag("KAPLUMBA_GPU_PROFILE") && env_flag("KAPLUMBA_GPU_PROFILE_DECODE");
+        let mut gpu = GpuProfile::new(profile);
         gpu.tokens = 1;
         gpu.layers = self.layers.len();
         gpu.chunks = 1;
@@ -4060,6 +4061,10 @@ impl TextModel {
                 step_idx,
             }),
         )?;
+        if profile {
+            gpu.drain(encoder)?;
+            self.report_gpu_profile(&gpu);
+        }
         Ok(())
     }
 
