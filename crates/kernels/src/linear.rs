@@ -2675,14 +2675,6 @@ impl LinearKernels {
             let pipe = self.ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2_4col").unwrap();
             Self::trace_gemv("linear_gemv_ishizuki_k3_fused2_4col (mlp)");
             (pipe, (tiles_a + tiles_b) / 4)
-        } else if !env_flag("KAPLUMBA_NO_FUSED2_2COL")
-            && out_features_gate % 32 == 0
-            && out_features_up % 32 == 0
-            && self.ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2_2col").is_some()
-        {
-            let pipe = self.ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2_2col").unwrap();
-            Self::trace_gemv("linear_gemv_ishizuki_k3_fused2_2col (mlp)");
-            (pipe, (tiles_a + tiles_b) / 2)
         } else if out_features_gate == out_features_up && !env_flag("KAPLUMBA_NO_FUSED2_CO") {
             if out_features_gate % 32 == 0 && env_flag("KAPLUMBA_FUSED2_CO4") {
                 if let Some(pipe) = self.ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2_co4") {
@@ -2716,6 +2708,14 @@ impl LinearKernels {
                     tiles_a + tiles_b,
                 )
             }
+        } else if !env_flag("KAPLUMBA_NO_FUSED2_2COL")
+            && out_features_gate % 32 == 0
+            && out_features_up % 32 == 0
+            && self.ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2_2col").is_some()
+        {
+            let pipe = self.ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2_2col").unwrap();
+            Self::trace_gemv("linear_gemv_ishizuki_k3_fused2_2col (mlp)");
+            (pipe, (tiles_a + tiles_b) / 2)
         } else {
             (
                 self.ishizuki_gemv_pipeline_by_name("linear_gemv_ishizuki_k3_fused2")

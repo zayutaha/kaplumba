@@ -1024,7 +1024,7 @@ fn the_decode_step_rolls_so_the_finding_04_host_gap_does_not_apply() {
     // CPU at the older dispatch count) hides behind 62.3 ms of GPU work.
     // MAX_IN_FLIGHT = 8 at 50 dispatches per buffer is 400 dispatches of
     // lookahead, which is more than the whole step's ~665.
-    assert_eq!(kaplumba_kernels::encoder::MAX_IN_FLIGHT, 8);
+    assert_eq!(kaplumba_kernels::encoder::MAX_IN_FLIGHT, 32);
 }
 
 // ---------------------------------------------------------------------------
