@@ -454,3 +454,25 @@ grid arm (`o_sk4`, `sk4`, `contig4`, `fused2_co4`) measured null or worse.
 
 **I did not reach 14.0 tok/s at 16.5k. The number is 13.55, and the wall is
 measured rather than guessed.**
+
+---
+
+## 32. The measurement rig is validated (`KAPLUMBA_TOKEN_TIMING` is free)
+
+Because every number in this spec comes from `delta=` under
+`KAPLUMBA_TOKEN_TIMING=1`, it is worth having checked that the flag is not part
+of what it measures. Same binary, same prompt, `--metrics`:
+
+```
+with    KAPLUMBA_TOKEN_TIMING=1   decode_tok_s = 15.465
+without                            decode_tok_s = 15.464
+```
+
+Identical to four figures, so the trace's two `eprintln`s per token cost nothing
+measurable and the `delta=` medians above are the real step.
+
+Short context, for the record: non-chat `--metrics` 15.465 tok/s (63.9 ms
+including the post-prefill stall), chat mode 64.39 ms steady state. The ~2 ms
+chat-vs-CLI gap is pre-existing and untouched here; it is *not* a regression from
+this work, which was confirmed by A/B'ing the new defaults against the old GEMV
+selection at short context: 65.09 -> 64.39 ms, the same direction as at 16.5k.
