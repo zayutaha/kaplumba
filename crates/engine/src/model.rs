@@ -3873,6 +3873,29 @@ impl TextModel {
         // Decode: one query at position 0.
         let _ = self.forward_buffer(&[1], &[0]).map_err(warmup_error("decode"))?;
         self.reset_caches()?;
+        // Pipelined decode: exercises forward_step_pipelined with HeadPick::Argmax,
+        // ensuring the device argmax and pipelined decode dispatches are compiled and loaded
+        // into GPU instruction memory prior to session start (eliminating the 1.76s Turn 1 stall).
+        let queue = self.forward_queue.clone();
+        let mut warmup_enc = MetalEncoder::new(&queue)
+            .map_err(ModelError::from)
+            .map_err(warmup_error("pipelined_encoder"))?;
+        warmup_enc.set_max_dispatches(kaplumba_kernels::encoder::decode_max_dispatches_per_buffer());
+        self.forward_step_pipelined(
+            &mut warmup_enc,
+            0,
+            Some(1),
+            0,
+            0,
+            HeadPick::Argmax,
+        )
+        .map_err(warmup_error("pipelined_forward"))?;
+        warmup_enc
+            .commit_and_wait()
+            .map_err(ModelError::from)
+            .map_err(warmup_error("pipelined_commit"))?;
+        self.reset_caches()?;
+        self.reset_gpu_caches();
         // Arm the audit *after* the warmup, so the mark is the state a timed
         // loop starts from. After, not before: a mark taken first would include
         // the warmup's own builds in `builds_since` and report them as late.
