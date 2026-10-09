@@ -423,6 +423,14 @@ pub struct LinearKernels {
     /// this re-measures it behind regpipe, which moved the dequant into the
     /// MMA basic block. Selected by `KAPLUMBA_REGPIPE_K32` or the test hook.
     gemm_mma_regpipe_k32_pipeline: ComputePipelineState,
+    mrhs_repacked_m4: ComputePipelineState,
+    mrhs_repacked_m8: ComputePipelineState,
+    mrhs_repacked_m16: ComputePipelineState,
+    mrhs_repacked_m32: ComputePipelineState,
+    mrhs_exl3_m4: ComputePipelineState,
+    mrhs_exl3_m8: ComputePipelineState,
+    mrhs_exl3_m16: ComputePipelineState,
+    mrhs_exl3_m32: ComputePipelineState,
     finalize_rows_pipeline: ComputePipelineState,
     zero_raw_pipeline: ComputePipelineState,
     gemv_reduce_sk2_pipeline: Option<ComputePipelineState>,
@@ -698,6 +706,34 @@ impl LinearKernels {
             pipeline_audit::build(&device, &library, "linear_gemm_mma_4sg")?;
         let gemm_mma_regpipe_k32_pipeline =
             pipeline_audit::build(&device, &library, "linear_gemm_mma_regpipe_k32")?;
+        let mrhs_repacked_m4 = pipeline_audit::build(
+            &device,
+            &library,
+            "linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_m4",
+        )?;
+        let mrhs_repacked_m8 = pipeline_audit::build(
+            &device,
+            &library,
+            "linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_m8",
+        )?;
+        let mrhs_repacked_m16 = pipeline_audit::build(
+            &device,
+            &library,
+            "linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_m16",
+        )?;
+        let mrhs_repacked_m32 = pipeline_audit::build(
+            &device,
+            &library,
+            "linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_m32",
+        )?;
+        let mrhs_exl3_m4 =
+            pipeline_audit::build(&device, &library, "linear_gemv_mrhs_exl3_k3_mcg_m4")?;
+        let mrhs_exl3_m8 =
+            pipeline_audit::build(&device, &library, "linear_gemv_mrhs_exl3_k3_mcg_m8")?;
+        let mrhs_exl3_m16 =
+            pipeline_audit::build(&device, &library, "linear_gemv_mrhs_exl3_k3_mcg_m16")?;
+        let mrhs_exl3_m32 =
+            pipeline_audit::build(&device, &library, "linear_gemv_mrhs_exl3_k3_mcg_m32")?;
         let finalize_rows_pipeline =
             pipeline_audit::build(&device, &library, "linear_finalize_rows")?;
         let zero_raw_pipeline = pipeline_audit::build(&device, &library, "linear_zero_raw")?;
@@ -753,6 +789,14 @@ impl LinearKernels {
             gemm_mma_regpipe_pipeline,
             gemm_mma_4sg_pipeline,
             gemm_mma_regpipe_k32_pipeline,
+            mrhs_repacked_m4,
+            mrhs_repacked_m8,
+            mrhs_repacked_m16,
+            mrhs_repacked_m32,
+            mrhs_exl3_m4,
+            mrhs_exl3_m8,
+            mrhs_exl3_m16,
+            mrhs_exl3_m32,
             finalize_rows_pipeline,
             zero_raw_pipeline,
             gemv_reduce_sk2_pipeline,
@@ -3542,6 +3586,227 @@ impl LinearKernels {
             64,
         )
     }
+
+    pub fn mrhs_repacked_pipeline(&self, queries: usize) -> &ComputePipelineState {
+        if queries <= 4 {
+            &self.mrhs_repacked_m4
+        } else if queries <= 8 {
+            &self.mrhs_repacked_m8
+        } else if queries <= 16 {
+            &self.mrhs_repacked_m16
+        } else {
+            &self.mrhs_repacked_m32
+        }
+    }
+
+    pub fn mrhs_exl3_pipeline(&self, queries: usize) -> &ComputePipelineState {
+        if queries <= 4 {
+            &self.mrhs_exl3_m4
+        } else if queries <= 8 {
+            &self.mrhs_exl3_m8
+        } else if queries <= 16 {
+            &self.mrhs_exl3_m16
+        } else {
+            &self.mrhs_exl3_m32
+        }
+    }
+
+    /// Dispatches high-bandwidth Multi-RHS GEMV for short token batches (queries <= 32).
+    ///
+    /// Streams model weights from DRAM at full bandwidth (~185 GB/s) while keeping weights
+    /// in registers to compute across all query rows with zero inner-loop threadgroup barriers.
+    /// Falls back to tensor-core `encode_gemm` when queries > 32 or when MRHS is disabled.
+    pub fn encode_gemv_mrhs(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        request: PrefillEncodeRequest<'_>,
+    ) -> Result<(), KernelError> {
+        let PrefillEncodeRequest {
+            packed,
+            packed_offset,
+            perm_mode,
+            input,
+            input_signs,
+            output_signs,
+            transformed,
+            raw,
+            output,
+            queries,
+            in_features,
+            out_features,
+            rate,
+            codebook,
+        } = request;
+
+        validate_encode(in_features, out_features, rate, codebook)?;
+
+        if queries == 0 {
+            return Ok(());
+        }
+
+        // Fallback to MMA if MRHS is disabled, queries > 32, rate is not 3 bpw, or codebook is not MCG
+        if env_flag("KAPLUMBA_DISABLE_MRHS")
+            || queries > 32
+            || rate != Exl3Rate::Integer(3)
+            || codebook != Exl3Codebook::Mcg
+        {
+            return self.encode_gemm(
+                encoder,
+                PrefillEncodeRequest {
+                    packed,
+                    packed_offset,
+                    perm_mode,
+                    input,
+                    input_signs,
+                    output_signs,
+                    transformed,
+                    raw,
+                    output,
+                    queries,
+                    in_features,
+                    out_features,
+                    rate,
+                    codebook,
+                },
+            );
+        }
+
+        let row_params = PrefillRowParams {
+            in_features: to_u32(in_features, "input dimension")?,
+            out_features: to_u32(out_features, "output dimension")?,
+            queries: to_u32(queries, "query count")?,
+            perm_mode,
+        };
+        let input_elements = checked_product(queries, in_features, "input element count")?;
+        let output_elements = checked_product(queries, out_features, "output element count")?;
+
+        // 1. Transform all query rows of activations
+        encoder.dispatch_1d(
+            &self.input_rows_pipeline,
+            &[Some(input), Some(input_signs), Some(transformed)],
+            params_bytes(&row_params),
+            (input_elements / 128) as u64,
+            64,
+        )?;
+
+        // 2. Dispatch MRHS GEMV kernel
+        let tiles = (out_features / 16) as u64;
+        let groups = tiles.min(gemv_max_groups()).max(1);
+
+        if perm_mode == 1 {
+            let shape_values = [
+                to_u32(in_features, "input dimension")?,
+                to_u32(out_features, "output dimension")?,
+                to_u32(queries, "query count")?,
+            ];
+            let pipeline = self.mrhs_repacked_pipeline(queries);
+            encoder.dispatch_1d_offset(
+                pipeline,
+                &[
+                    TensorRef::new(packed, packed_offset),
+                    TensorRef::new(transformed, 0),
+                    TensorRef::new(raw, 0),
+                ],
+                params_bytes(&shape_values),
+                groups * 256,
+                256,
+            )?;
+        } else {
+            let linear_params = LinearParams {
+                in_features: to_u32(in_features, "input dimension")?,
+                out_features: to_u32(out_features, "output dimension")?,
+                tile_columns: to_u32(out_features / 16, "tile column count")?,
+                packed_words: to_u32(rate.packed_words(), "packed shape")?,
+                rate: rate.encoded(),
+                codebook: codebook.encoded(),
+                queries: to_u32(queries, "query count")?,
+                perm_mode,
+            };
+            let pipeline = self.mrhs_exl3_pipeline(queries);
+            encoder.dispatch_1d_offset(
+                pipeline,
+                &[
+                    TensorRef::new(packed, packed_offset),
+                    TensorRef::new(transformed, 0),
+                    TensorRef::new(raw, 0),
+                ],
+                params_bytes(&linear_params),
+                groups * 256,
+                256,
+            )?;
+        }
+
+        // 3. Finalize all query rows
+        encoder.dispatch_1d(
+            &self.finalize_rows_pipeline,
+            &[Some(raw), Some(output_signs), Some(output)],
+            params_bytes(&row_params),
+            (output_elements / 128) as u64,
+            64,
+        )
+    }
+
+    /// Convenience wrapper for unit testing MRHS prefill on host-provided slices.
+    pub fn gemv_mrhs(
+        &self,
+        request: PrefillRequest<'_>,
+        perm_mode: u32,
+    ) -> Result<Vec<u16>, KernelError> {
+        validate_prefill_dimensions(&request)?;
+        let PrefillRequest {
+            packed,
+            input,
+            input_signs,
+            output_signs,
+            queries,
+            in_features,
+            out_features,
+            rate,
+            codebook,
+        } = request;
+        let input_buffer = self.make_buffer(input)?;
+        let input_sign_buffer = self.make_buffer(input_signs)?;
+        let output_sign_buffer = self.make_buffer(output_signs)?;
+        let packed_buffer = self.make_buffer(packed)?;
+        let input_elements = checked_product(queries, in_features, "input shape")?;
+        let output_elements = checked_product(queries, out_features, "output shape")?;
+        let transformed = self.device.new_buffer(
+            (input_elements * size_of::<u16>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let raw = self.device.new_buffer(
+            (output_elements * size_of::<f32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        zero_f32_buffer(&raw, output_elements)?;
+        let output = self.device.new_buffer(
+            (output_elements * size_of::<u16>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let mut encoder = crate::encoder::MetalEncoder::new(&self.queue)?;
+        self.encode_gemv_mrhs(
+            &mut encoder,
+            PrefillEncodeRequest {
+                packed: &packed_buffer,
+                packed_offset: 0,
+                perm_mode,
+                input: &input_buffer,
+                input_signs: &input_sign_buffer,
+                output_signs: &output_sign_buffer,
+                transformed: &transformed,
+                raw: &raw,
+                output: &output,
+                queries,
+                in_features,
+                out_features,
+                rate,
+                codebook,
+            },
+        )?;
+        encoder.commit_and_wait()?;
+        read_u16_buffer(&output)
+    }
+
 
     fn encode(
         &self,

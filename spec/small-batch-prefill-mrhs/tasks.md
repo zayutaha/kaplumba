@@ -5,10 +5,10 @@
   - **Intent**: Implement multi-RHS GEMV kernels supporting $M \in [1, 32]$ query vectors with register accumulators, single weight fetch, and zero threadgroup barriers in the $K$-loop for both column-major repacked and row-major EXL3 MCG 3 bpw weights.
   - **Testing**: `cargo test --package kaplumba-kernels --test packed_offset_selects_the_decoder`.
 
-- [ ] **Task 2: Implement `encode_gemv_mrhs` wrapper in `crates/kernels/src/linear.rs` (R2)**
+- [x] **Task 2: Implement `encode_gemv_mrhs` wrapper in `crates/kernels/src/linear.rs` (R2)**
   - **Files Touched**: `crates/kernels/src/linear.rs`
-  - **Intent**: Compile pipeline state, expose `encode_gemv_mrhs`, set grid geometry to 640 threadgroups, and bind multi-row activation inputs and outputs.
-  - **Testing**: `cargo test --package kaplumba-kernels --lib linear`.
+  - **Intent**: Compile pipeline states for m4, m8, m16, and m32 variants of repacked and EXL3 MRHS kernels, expose `encode_gemv_mrhs` and `gemv_mrhs`, set grid geometry to `out_features / 16` groups of 256 threads, and bind multi-row activation inputs and outputs.
+  - **Testing**: `cargo test --package kaplumba-kernels --test packed_offset_selects_the_decoder`.
 
 - [ ] **Task 3: Unit test probe & sabotage verification in `crates/kernels/tests/linear_mrhs.rs` (AC1, AC2)**
   - **Files Touched**: `crates/kernels/tests/linear_mrhs.rs`
