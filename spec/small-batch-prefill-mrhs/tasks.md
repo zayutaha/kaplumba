@@ -18,10 +18,11 @@
   - **Testing**: `cargo test --package kaplumba-kernels --test linear_mrhs`.
   - **Commit**: `5c12ac9`.
 
-- [ ] **Task 4: Dynamic shape routing in `crates/engine/src/model.rs` (R3)**
+- [x] **Task 4: Dynamic shape routing in `crates/engine/src/model.rs` (R3)**
   - **Files Touched**: `crates/engine/src/model.rs`
   - **Intent**: In `DecoderLayer::encode_linear` and `Layer::forward_buffer`, route $1 < \text{tokens} \le 32$ to `encode_gemv_mrhs`, while keeping `tokens > 32` on `encode_gemm`. Guard with `KAPLUMBA_DISABLE_MRHS` fallback.
   - **Testing**: `cargo test --package kaplumba-engine --lib model`.
+  - **Commit**: `<pending>`.
 
 - [ ] **Task 5: End-to-end benchmark and verification on Gemma 4 31B (R4, R5, AC3, AC4)**
   - **Files Touched**: `spec/small-batch-prefill-mrhs/implementation_notes.md`

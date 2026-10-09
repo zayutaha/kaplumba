@@ -50,3 +50,30 @@ not allowed inside a `static inline` template in MSL — it must be passed as a 
 from the kernel entry point). The test now panics with `LinearKernels::new failed: {e}`
 instead of skipping, which is what surfaced the compile error. Never `return`-skip a GPU
 parity test.
+
+## 3. T4: routing in `encode_linear` (model.rs)
+
+Routing extracted into a pure function `route_linear(tokens) -> LinearRoute`
+(enum `DecodeGemv | SmallBatchMrhs | LargeBatchGemm`), so the table is
+unit-testable without a checkpoint on the GPU — the alternative was a test that
+silently skips on a box without a Metal device, which is exactly the failure mode
+T3 recorded above.
+
+Routing table: `0|1 -> DecodeGemv`, `2..=32 -> SmallBatchMrhs`, `33+ -> LargeBatchGemm`.
+`MRHS_MAX_QUERIES = 32` is public and documented; the boundary matches the compiled
+m4/m8/m16/m32 register buckets (`mrhs_repacked_pipeline` / `mrhs_exl3_pipeline`
+round queries up into the next bucket).
+
+`encode_gemv_mrhs` keeps its own eligibility gate (rate/codebook must be MCG 3 bpw,
+`KAPLUMBA_DISABLE_MRHS`), so the engine-side arm only means "prefer MRHS".
+`ForwardScratch::raw` is `(max_tokens * inter).max(vocab)` f32, already large enough
+for `queries * out_features` at any routed batch; no scratch change was needed.
+
+Sabotage verification (all caught, then reverted):
+- boundary lowered to 16: `small_batches_take_mrhs` FAILED (21 tokens),
+  `boundaries_match_the_compiled_mrhs_buckets` FAILED (17 -> m32 bucket).
+- lower boundary moved to include 2 rows on the decode path:
+  `small_batches_take_mrhs` FAILED (2 tokens).
+
+`cargo test --package kaplumba-engine --lib`: 112 passed, 2 pre-existing ignores
+(require KAPLUMBA_TEST_MODEL).

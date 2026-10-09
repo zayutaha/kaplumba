@@ -120,6 +120,50 @@ use crate::weights::{TextWeights, WeightError};
 /// (head_dim + 2)` floats, fixed, with no dependence on context length.
 pub const PREFILL_CHUNK: usize = 1024;
 
+/// Largest token batch routed to the multi-RHS GEMV prefill fast path.
+///
+/// `encode_linear` sends `2..=MRHS_MAX_QUERIES` rows to
+/// `LinearKernels::encode_gemv_mrhs` and everything larger to `encode_gemm`.
+/// The kernels are register-specialised at m4/m8/m16/m32 (a query count is
+/// rounded up into the next bucket), so 32 is the largest compiled bucket; a
+/// larger batch would have to fall back anyway. On the roofline, M4 Pro tensor
+/// cores beat a plain-FMA GEMV for this weight shape past ~128 rows, so the
+/// MMA tile wins well before the register pressure of m64 would hurt.
+///
+/// `encode_gemv_mrhs` also rejects ineligible shapes itself (rate/codebook is
+/// not MCG 3 bpw, `KAPLUMBA_DISABLE_MRHS`), so this constant only sets where the
+/// fast path is *preferred*, never the only possible dispatch.
+pub const MRHS_MAX_QUERIES: usize = 32;
+
+/// Which kernel family a batch of `tokens` activation rows is routed to.
+///
+/// [`crate::model::DecoderLayer::encode_linear`] dispatches on this; the enum
+/// exists so the routing table is a pure function that can be unit-tested
+/// without a 12 GB checkpoint on the GPU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LinearRoute {
+    /// One row: the decode GEMV (fused paths, split-K attention downstream).
+    DecodeGemv,
+    /// 2..=[`MRHS_MAX_QUERIES`] rows: multi-RHS GEMV, one weight sweep per
+    /// linear, register accumulators, no threadgroup barriers in the K-loop.
+    SmallBatchMrhs,
+    /// More than [`MRHS_MAX_QUERIES`] rows: the tensor-core MMA tile, where the
+    /// arithmetic intensity makes the window bigger than the code.
+    LargeBatchGemm,
+}
+
+/// The routing table for [`LinearRoute`].
+///
+/// `tokens == 0` keeps the decode arm: `encode_gemv` already refuses zero work
+/// and the encode paths treat an empty batch as a no-op.
+pub fn route_linear(tokens: usize) -> LinearRoute {
+    match tokens {
+        0 | 1 => LinearRoute::DecodeGemv,
+        n if n <= MRHS_MAX_QUERIES => LinearRoute::SmallBatchMrhs,
+        _ => LinearRoute::LargeBatchGemm,
+    }
+}
+
 /// MEASUREMENT OVERRIDE: `KAPLUMBA_PREFILL_CHUNK=N` replaces [`PREFILL_CHUNK`]
 /// for this process so one binary can A/B chunk sizes without a rebuild per
 /// value. Falls back to the constant unless the variable names a power of two
@@ -2558,46 +2602,76 @@ let use_sk4 = env_flag("KAPLUMBA_O_SK4")
         let output_signs = linear.output_signs_buffer.as_ref().ok_or_else(|| {
             ModelError::InvalidWeights("linear output signs are not resident".to_string())
         })?;
-        if tokens == 1 {
-            self.linear.encode_gemv(
-                encoder,
-                LinearEncodeRequest {
-                    packed,
-                    packed_offset: linear.metal_offset,
-                    perm_mode: linear.permutation_mode,
-                    input,
-                    input_signs,
-                    output_signs,
-                    transformed: &scratch.transformed,
-                    raw: &scratch.raw,
-                    output,
-                    in_features: linear.in_features,
-                    out_features: linear.out_features,
-                    rate: linear.rate,
-                    codebook: linear.codebook,
-                    pretransformed,
-                },
-            )?;
-        } else {
-            self.linear.encode_gemm(
-                encoder,
-                PrefillEncodeRequest {
-                    packed,
-                    packed_offset: linear.metal_offset,
-                    perm_mode: linear.permutation_mode,
-                    input,
-                    input_signs,
-                    output_signs,
-                    transformed: &scratch.transformed,
-                    raw: &scratch.raw,
-                    output,
-                    queries: tokens,
-                    in_features: linear.in_features,
-                    out_features: linear.out_features,
-                    rate: linear.rate,
-                    codebook: linear.codebook,
-                },
-            )?;
+        match route_linear(tokens) {
+            LinearRoute::DecodeGemv => {
+                self.linear.encode_gemv(
+                    encoder,
+                    LinearEncodeRequest {
+                        packed,
+                        packed_offset: linear.metal_offset,
+                        perm_mode: linear.permutation_mode,
+                        input,
+                        input_signs,
+                        output_signs,
+                        transformed: &scratch.transformed,
+                        raw: &scratch.raw,
+                        output,
+                        in_features: linear.in_features,
+                        out_features: linear.out_features,
+                        rate: linear.rate,
+                        codebook: linear.codebook,
+                        pretransformed,
+                    },
+                )?;
+            }
+            LinearRoute::SmallBatchMrhs => {
+                // Small-batch prefill: stream the weights once at GEMV bandwidth
+                // (~185 GB/s) with register accumulators across all query rows.
+                // Falls back to `encode_gemm` internally for ineligible shapes
+                // (rate/codebook != MCG 3 bpw, queries > 32) and when
+                // `KAPLUMBA_DISABLE_MRHS` is set, so this arm only means
+                // "prefer MRHS", never "MRHS at any cost".
+                self.linear.encode_gemv_mrhs(
+                    encoder,
+                    PrefillEncodeRequest {
+                        packed,
+                        packed_offset: linear.metal_offset,
+                        perm_mode: linear.permutation_mode,
+                        input,
+                        input_signs,
+                        output_signs,
+                        transformed: &scratch.transformed,
+                        raw: &scratch.raw,
+                        output,
+                        queries: tokens,
+                        in_features: linear.in_features,
+                        out_features: linear.out_features,
+                        rate: linear.rate,
+                        codebook: linear.codebook,
+                    },
+                )?;
+            }
+            LinearRoute::LargeBatchGemm => {
+                self.linear.encode_gemm(
+                    encoder,
+                    PrefillEncodeRequest {
+                        packed,
+                        packed_offset: linear.metal_offset,
+                        perm_mode: linear.permutation_mode,
+                        input,
+                        input_signs,
+                        output_signs,
+                        transformed: &scratch.transformed,
+                        raw: &scratch.raw,
+                        output,
+                        queries: tokens,
+                        in_features: linear.in_features,
+                        out_features: linear.out_features,
+                        rate: linear.rate,
+                        codebook: linear.codebook,
+                    },
+                )?;
+            }
         }
         Ok(())
     }
@@ -5983,6 +6057,66 @@ mod packed_alignment_tests {
                 error.to_string().contains("overrun.trellis"),
                 "error does not name the tensor: {error}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod linear_route_tests {
+    use super::{LinearRoute, MRHS_MAX_QUERIES, route_linear};
+
+    /// The decode path must stay on the decode path: a one-row batch is a decode
+    /// step, and every fused decode kernel (qkv, split-K attention, sampler) is
+    /// downstream of that choice.
+    #[test]
+    fn single_and_empty_rows_take_the_decode_gemv() {
+        assert_eq!(route_linear(0), LinearRoute::DecodeGemv);
+        assert_eq!(route_linear(1), LinearRoute::DecodeGemv);
+    }
+
+    /// Interactive chat turns: the chat template makes "Hi" 14 tokens and a
+    /// follow-up turn 21 delta tokens, so 2..=32 is where the MRHS bucket has to
+    /// land. This is the whole point of the spec.
+    #[test]
+    fn small_batches_take_mrhs() {
+        assert_eq!(route_linear(2), LinearRoute::SmallBatchMrhs);
+        assert_eq!(route_linear(14), LinearRoute::SmallBatchMrhs);
+        assert_eq!(route_linear(21), LinearRoute::SmallBatchMrhs);
+        assert_eq!(
+            route_linear(MRHS_MAX_QUERIES),
+            LinearRoute::SmallBatchMrhs,
+            "the largest compiled MRHS bucket (m32) must be reachable"
+        );
+    }
+
+    /// Past the largest compiled register bucket there is nothing to dispatch
+    /// into, and by then the tensor-core tile is faster anyway.
+    #[test]
+    fn large_batches_stay_on_mma() {
+        assert_eq!(
+            route_linear(MRHS_MAX_QUERIES + 1),
+            LinearRoute::LargeBatchGemm
+        );
+        assert_eq!(route_linear(128), LinearRoute::LargeBatchGemm);
+        assert_eq!(route_linear(614), LinearRoute::LargeBatchGemm);
+    }
+
+    /// The buckets the kernels compile to are exactly 4/8/16/32; the routing
+    /// boundary must agree with them, or a query count lands in a pipeline whose
+    /// M_CAP is smaller than the batch (rows silently dropped or, with the
+    /// clamping in the kernel, rows computed from the wrong activations).
+    #[test]
+    fn boundaries_match_the_compiled_mrhs_buckets() {
+        for (queries, bucket) in [(1usize, 4), (4, 4), (5, 8), (8, 8), (9, 16), (16, 16), (17, 32)] {
+            let route = route_linear(queries);
+            let expected = if queries <= 1 {
+                LinearRoute::DecodeGemv
+            } else if bucket <= MRHS_MAX_QUERIES {
+                LinearRoute::SmallBatchMrhs
+            } else {
+                unreachable!("every bucket is <= MRHS_MAX_QUERIES")
+            };
+            assert_eq!(route, expected, "queries={queries} bucket=m{bucket}");
         }
     }
 }
