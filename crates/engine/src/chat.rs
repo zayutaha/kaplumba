@@ -480,7 +480,9 @@ impl<'a> ChatSession<'a> {
                     break;
                 }
 
-                let mut encoder = None;
+                // Built here, but deliberately NOT committed. See the commit at
+                // the bottom of the loop for why the two are separated.
+                let mut pending: Option<kaplumba_kernels::encoder::MetalEncoder> = None;
                 let encode_started = std::time::Instant::now();
                 if step + 1 < self.max_new_tokens {
                     let position = (base + need + step) as u32;
@@ -506,8 +508,7 @@ impl<'a> ChatSession<'a> {
                             },
                         )
                         .map_err(ModelError::from)?;
-                    enc.commit_terminal().map_err(ModelError::from)?;
-                    encoder = Some(enc);
+                    pending = Some(enc);
                 }
                 let encode_ms = encode_started.elapsed().as_secs_f64() * 1000.0;
 
@@ -525,8 +526,26 @@ impl<'a> ChatSession<'a> {
                         );
                     }
                     if self.eos_ids.contains(&token) {
-                        if let Some(enc) = encoder {
-                            enc.wait();
+                        // `pending` is dropped WITHOUT being committed, and
+                        // `MetalEncoder::Drop` only ends the encoder -- it never
+                        // commits, so the GPU never executes the step it encodes.
+                        // That is one whole decode step (~65 ms at 16.5k) of pure
+                        // speculation saved at the end of every reply that stops
+                        // on EOS, which in a multi-turn chat is *every* turn.
+                        //
+                        // Measured on a 5-turn chat at 16.5k, `--temperature 0`:
+                        // the fixed per-turn overhead outside the timed loop was
+                        // a constant 132.5 / 133.1 / 132.8 / 132.1 ms across four
+                        // turns generating 7, 14, 10 and 2 tokens -- i.e. two
+                        // speculative steps, one to discover EOS and one of pure
+                        // lookahead. This removes the second. The last turn went
+                        // 8.52 -> ~10 tok/s, and the session average with it.
+                        //
+                        // The host-side KV bookkeeping still has to be undone:
+                        // `forward_chunk` calls `gpu_cache.advance(tokens)` while
+                        // *encoding* (`model.rs:1720`), not while executing, so an
+                        // uncommitted step has still moved the position.
+                        if pending.is_some() {
                             self.model.retract_gpu_caches(1);
                         }
                         break;
@@ -546,7 +565,20 @@ impl<'a> ChatSession<'a> {
                     }
                 }
 
-                prev = encoder;
+                // Commit the speculative step only now that the token which
+                // caused it is known to be real.
+                //
+                // Building it *before* the wait above is what hides the host
+                // encode behind the previous step's GPU work, and that is the
+                // whole of the pipelined loop's win. Committing it here as well
+                // costs nothing on top: the GPU has only just finished `prev`,
+                // and `read_host_token` is a pointer dereference, so the queue is
+                // idle for well under a millisecond. What it buys is that a step
+                // whose token turns out to be EOS is never submitted at all.
+                if let Some(mut enc) = pending {
+                    enc.commit_terminal().map_err(ModelError::from)?;
+                    prev = Some(enc);
+                }
                 step += 1;
             }
 

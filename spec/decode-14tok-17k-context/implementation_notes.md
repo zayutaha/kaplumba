@@ -476,3 +476,98 @@ including the post-prefill stall), chat mode 64.39 ms steady state. The ~2 ms
 chat-vs-CLI gap is pre-existing and untouched here; it is *not* a regression from
 this work, which was confirmed by A/B'ing the new defaults against the old GEMV
 selection at short context: 65.09 -> 64.39 ms, the same direction as at 16.5k.
+
+---
+
+## 33. Multi-turn chat paid 132 ms per turn on a speculative step nobody reads
+
+`--chat`'s pipelined loop built **and committed** the next decode step before
+waiting on the current one, which is what hides the host encode behind the
+previous step's GPU work. But it committed that speculative step *before* knowing
+whether the token that caused it was EOS, so a reply that stopped on EOS still
+submitted — and then waited on — a step whose result is discarded.
+
+Localised by comparing each turn's `decode_s` against the sum of its `[timing]
+token` deltas: the difference is a **constant 132.5 / 133.1 / 132.8 / 132.1 ms**
+across four turns generating 7, 14, 10 and 2 tokens. Constant, so it is not
+per-token work; and absent on turn 1, which hit `--max-new-tokens` instead of
+EOS and so never discarded anything. Two speculative steps: one to *discover*
+EOS, one of pure lookahead.
+
+**Fix:** build the next step's encoder but do not `commit_terminal()` it until
+after the EOS check. `MetalEncoder::Drop` only calls `end()` (`encoder.rs:816`),
+so dropping it uncommitted means the command buffer is never submitted and the
+GPU never runs that step. The host encode still overlaps the previous step's GPU
+work, so nothing is lost; the queue is idle for well under a millisecond longer,
+because `read_host_token` is a pointer dereference.
+
+The host-side KV bookkeeping still needs undoing: `forward_chunk` calls
+`gpu_cache.advance(tokens)` while *encoding* (`model.rs:1720`), not while
+executing, so an uncommitted step has already moved the position. `retract_gpu_
+caches(1)` is kept, and now fires whenever `pending.is_some()` rather than
+whenever a committed speculative encoder existed.
+
+**Measured, 5-turn chat, `--temperature 0`, 48-token cap:**
+
+| | before | after |
+|---|---:|---:|
+| per-turn overhead outside the timed loop | 132 ms | **66 ms** |
+| session decode rate | 14.06 tok/s | **14.86 tok/s** |
+| last turn (2 tokens, "Say hello...") | 8.52 tok/s | **11.55 tok/s** |
+| steady-state step | 73.9 ms | 73.9 ms |
+
+The remaining 66 ms is one decode step spent discovering EOS, which is
+irreducible: the model has to produce the EOS token before anyone can know it is
+EOS.
+
+### Verification (bit-exactness of the pipelined path)
+
+* `pipelined_and_barrier_decode_agree_across_a_multi_turn_session` — **pass**.
+  The pipelined and barrier paths agree byte-for-byte across a 3-turn session,
+  which is the invariant the comment block at `chat.rs:408-428` exists to
+  protect (it documents a bug where the pipelined path read a GPU-staged token
+  before waiting on the encoder that staged it).
+* `context_advances_by_exactly_the_tokens_each_turn_consumed` — **pass**. The
+  KV resume position is right every turn, which is what `retract_gpu_caches`
+  protects.
+* `a_single_greedy_turn_reproduces_the_counting_sequence` — **pass**.
+* 16.5k 3-turn chat, `--temperature 0`: **90/90 greedy token ids identical** to
+  the pre-change binary, steady state 73.85 vs 74.23 ms (within noise).
+
+## 34. `decode_rate_is_sustained_across_a_growing_session` was measuring the
+## prompt, not the engine
+
+That test failed at **8.26 tok/s on the parent commit** (`c4236e1`, verified in
+a worktree at that revision), so it was not a regression from this work. Its
+last turn asked "Say hello in one short sentence.", which produces **2 tokens**,
+and the floor was 12.0.
+
+The arithmetic that makes it unpassable: every turn pays one irreducible
+EOS-discovery step, so a turn generating g tokens takes at least
+`(g + 1) * 65 ms`. At g = 2 that is 195 ms, i.e. **10.2 tok/s even with zero
+other overhead** — and the first turn of the same session generates 48 tokens
+and runs at 15.3. The "the last turn must not be the slow one" assertion was
+therefore comparing a 2-token turn against a 48-token one and reporting token
+count as if it were latency. The floor is a *per-token* rate; the failure was a
+*per-turn* constant.
+
+**Fixed the test, not the threshold:** the last turn is now a counting prompt
+("Count from 1 to 40: 1, 2, 3,"), so its token count is comparable to the first
+turn's and the assertion is a genuine decode-rate signal. The reasoning is in
+the test's doc comment. With the §33 fix this turn generates 30+ tokens and the
+test passes at ~14 tok/s.
+
+I deliberately did **not** lower `FLOOR_TOK_S`. The collapse this guard exists to
+catch — a broken pipelined loop or a reintroduced host barrier — still drops a
+48-token turn to single digits, so the floor retains its discrimination.
+
+## 35. `generate.rs` still has the speculative step; chat no longer does
+
+`generate.rs`'s pipelined loop (`decode_rate_is_sustained`'s non-chat sibling,
+`generate.rs:1040-1055`) has the identical waste: it commits `next_enc` before
+the EOS check and then `next_enc.wait()`s it at `:1049`. Fixed only in `chat.rs`
+because the two loops have different shapes — generate.rs rotates in-flight
+encoders with an `in_flight_step` index rather than `prev`, so the same
+defer-commit there is a larger and riskier edit, and the user-facing request was
+`--chat`. The cost is ~66 ms once per generation, which at 200 generated tokens
+is 0.4 % of `decode_tok_s`. Worth doing; not done.

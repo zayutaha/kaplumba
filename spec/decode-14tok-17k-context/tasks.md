@@ -126,3 +126,32 @@
   guess: attention holds <=1.2 ms more, element holds ~0.2 ms and it is the
   bit-exactness-critical reduction tree, the GEMV is at ~198 of a 203 GB/s
   measured ceiling on a bit-locked ALU pool.
+
+- [x] **Task 13: Stop chat paying for a speculative decode step nobody reads** — session 14.06 -> 14.86 tok/s
+  - Files: `crates/engine/src/chat.rs`
+  - The pipelined loop built *and committed* step N+1 before knowing whether
+    token N was EOS, so every EOS-terminated turn submitted and waited on a step
+    whose result is discarded. Localised as a **constant 132 ms per turn**
+    (outside the timed loop, identical across turns of 7/14/10/2 tokens, absent
+    on the cap-terminated turn 1).
+  - Now the encoder is built but committed only after the EOS check.
+    `MetalEncoder::Drop` calls `end()` only, so an uncommitted encoder is never
+    submitted. Host encode still overlaps the previous step's GPU work.
+  - 132 -> **66 ms** per turn (the irreducible EOS-discovery step); last turn of
+    a 5-turn chat 8.52 -> **11.55 tok/s**.
+  - Bit-exact: 4/4 `multi_turn_chat` model tests pass, including
+    `pipelined_and_barrier_decode_agree_across_a_multi_turn_session`, and
+    **90/90 greedy token ids identical** at 16.5k with steady state unchanged.
+  - `generate.rs` has the same waste and is still unfixed (noted in §35).
+
+- [x] **Task 14: `decode_rate_is_sustained_across_a_growing_session` measured
+      the prompt, not the engine**
+  - Files: `crates/engine/tests/multi_turn_chat.rs`
+  - Failed at **8.26 tok/s on the parent commit** (verified in a worktree at
+    `c4236e1`), so pre-existing, not this work's.
+  - Its last turn generated **2 tokens** against a 12.0 tok/s floor; with the
+    irreducible EOS-discovery step that turn caps at **10.2 tok/s with zero other
+    overhead**, while the first turn generates 48 and runs at 15.3.
+  - Changed the last turn to a counting prompt so token counts are comparable and
+    the assertion is a decode-rate signal. **Did not lower the floor** — it still
+    catches a broken pipelined loop.

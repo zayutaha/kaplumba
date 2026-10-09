@@ -372,6 +372,27 @@ fn context_advances_by_exactly_the_tokens_each_turn_consumed() {
 /// implementation notes, measured with `scripts/abbench`.
 ///
 /// The floor is 12.0 tok/s against a measured 14.9-15.4, i.e. ~80%.
+///
+/// ## Why the last turn is a counting prompt, and why it used not to be
+///
+/// This turn used to be "Say hello in one short sentence.", and the last-turn
+/// assertion below failed against it (8.26 tok/s) for a reason that has nothing
+/// to do with decode rate: **that prompt produces 2 tokens**, and every turn
+/// pays a fixed cost in decode steps — one step to *discover* EOS, which is
+/// unavoidable because you cannot know a token is EOS until the model has
+/// produced it. At 65 ms/step, 2 tokens plus one EOS-discovery step is 196 ms,
+/// so the turn's rate caps at **10.2 tok/s even with zero other overhead**. The
+/// first turn, by contrast, generated 48 tokens and ran at 15.3.
+///
+/// So the "the last turn must not be the slow one" assertion was comparing a
+/// 2-token turn against a 48-token one and reporting token count as if it were
+/// latency. The assertion is only a decode-rate signal when the turns generate
+/// comparable amounts, which is what a counting prompt does. The fixed per-turn
+/// overhead itself *was* real and *was* worth fixing — that is what removed the
+/// second speculative step and took the session from 14.06 to 14.86 tok/s
+/// (`chat.rs`, commit note in `spec/decode-14tok-17k-context/implementation_notes.md`
+/// §33) — but it is a per-turn constant, not a per-token cost, and the floor
+/// below is a per-token rate.
 #[test]
 #[ignore = "requires KAPLUMBA_TEST_MODEL and a release binary; one 5-turn session"]
 fn decode_rate_is_sustained_across_a_growing_session() {
@@ -383,7 +404,11 @@ fn decode_rate_is_sustained_across_a_growing_session() {
             "What is the capital of France?",
             "Name three prime numbers.",
             "What colour is the sky on a clear day?",
-            "Say hello in one short sentence.",
+            // A counting prompt, so this turn's token count is comparable to the
+            // first turn's. See the module comment: a 2-token turn caps at
+            // ~10.2 tok/s for arithmetic reasons, and asserting 12.0 against one
+            // measures the prompt rather than the engine.
+            "Count from 1 to 40: 1, 2, 3,",
         ],
         48,
         false,
