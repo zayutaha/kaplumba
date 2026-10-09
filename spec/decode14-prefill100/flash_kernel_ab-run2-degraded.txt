@@ -1,0 +1,26 @@
+device: max threadgroup memory 32 KiB, max threads/threadgroup 1024
+decode flash arm encodable: true   (the sliding shape is never eligible: head_dim 256 != 512)
+
+== interleaved kernel A/B: 9 variants, 9 timed rounds each, window rotated every round, GPU-stamped
+   shape     keys kernel splits  median_us    best_us   worst_us  spread    GB/s   kv_MB  GFLOPS
+   full      2048 scalar     16     1464.0      389.9     2875.9    7.38    11.5    16.8   91.68
+   full      2048  flash     16     1565.9      136.3     2674.6   19.62    10.7    16.8   85.71
+   full      4096 scalar     16     1845.0      754.2     3520.2    4.67    18.2    33.6  145.50
+   full      4096  flash     16     2818.6     1241.6     5266.6    4.24    11.9    33.6   95.24
+   full      8192 scalar     16     2454.8     1589.5     3834.8    2.41    27.3    67.1  218.71
+   full      8192  flash     16     1799.2      890.4     3868.6    4.34    37.3    67.1  298.39
+   full     16384 scalar     16     3869.6     2769.2     7247.5    2.62    34.7   134.2  277.48
+   full     16384  flash     16     2819.0     2121.9     4771.9    2.25    47.6   134.2  380.89
+   sliding   1024 scalar     16     1816.3      220.7     4445.0   20.14     9.2    16.8   18.47
+
+== C2: flash vs scalar at the same shape and key count (within-round ratios)
+     keys   scalar_us    flash_us flash/scalar    verdict
+     2048      1464.0      1565.9      1.070 flash SLOWER
+     4096      1845.0      2818.6      1.528 flash SLOWER
+     8192      2454.8      1799.2      0.733 flash faster
+    16384      3869.6      2819.0      0.728 flash faster
+
+   clock check: full@1024 scalar was 1464.0 us in the sweep, 935.5 us re-measured at the end
+
+== positive control (must move): scalar full, 2048 -> 16384 keys reads 8x the KV
+   scalar 2048 = 1464.0 us, scalar 16384 = 3869.6 us, ratio 2.64x

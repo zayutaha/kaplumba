@@ -1,0 +1,41 @@
+diff --git a/crates/engine/src/chat.rs b/crates/engine/src/chat.rs
+index 1fcaa12..0c80d4c 100644
+--- a/crates/engine/src/chat.rs
++++ b/crates/engine/src/chat.rs
+@@ -357,7 +357,7 @@ impl<'a> ChatSession<'a> {
+         let mut detokenizer = Detokenizer::new(self.tokenizer);
+         let mut reply = String::new();
+         let mut generated: Vec<u32> = Vec::new();
+-        let mut decode_started = std::time::Instant::now();
++        let decode_started = std::time::Instant::now();
+ 
+         // The loop below is the PIPELINED decode, and it exists because the
+         // obvious loop is ~3.5 tok/s slower.
+@@ -471,9 +471,6 @@ impl<'a> ChatSession<'a> {
+                     on_text(&chunk).map_err(ChatError::from_output)?;
+                 }
+             }
+-            // Reset decode_started here so that prefill argmax emission and host setup
+-            // do not artificially depress decode tok/s calculation for subsequent GPU decode steps.
+-            decode_started = std::time::Instant::now();
+ 
+             loop {
+                 if generated.len() >= self.max_new_tokens {
+@@ -632,16 +629,11 @@ impl<'a> ChatSession<'a> {
+         self.total_prefill_tokens += prefill;
+         self.total_generated_tokens += generated;
+         self.total_decode_s += decode_s;
+-        let decode_steps = generated.saturating_sub(1);
+         self.last_stats = Some(TurnStats {
+             prefill_tokens: prefill,
+             generated_tokens: generated,
+             decode_tok_s: if decode_s > 0.0 {
+-                if decode_steps > 0 {
+-                    decode_steps as f64 / decode_s
+-                } else {
+-                    generated as f64 / decode_s
+-                }
++                generated as f64 / decode_s
+             } else {
+                 0.0
+             },

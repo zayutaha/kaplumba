@@ -1,0 +1,162 @@
+diff --git a/crates/engine/tests/attention_decode_flash_matches_split.rs b/crates/engine/tests/attention_decode_flash_matches_split.rs
+index 2513b8a..f48f364 100644
+--- a/crates/engine/tests/attention_decode_flash_matches_split.rs
++++ b/crates/engine/tests/attention_decode_flash_matches_split.rs
+@@ -204,6 +204,8 @@ fn decode_flash_matches_scalar_split_on_the_full_shape() {
+         (8192, 5),  // ragged with an odd split count
+         (24576, 16),
+         (24576, 13),
++        (16384, 64), // ATTENTION_SPLITS_MAX = 64
++        (16384, 32),
+         // key_count below splits * 64: some splits are EMPTY, which must fall
+         // out as m = NEG, s = 0, O = 0 and weigh nothing in the combine.
+         (100, 16),
+diff --git a/crates/engine/tests/probe_attnkernel_split_combine.rs b/crates/engine/tests/probe_attnkernel_split_combine.rs
+index 44b5c10..6baeba4 100644
+--- a/crates/engine/tests/probe_attnkernel_split_combine.rs
++++ b/crates/engine/tests/probe_attnkernel_split_combine.rs
+@@ -306,7 +306,7 @@ fn split_counts_from_the_production_heuristic() {
+         "KAPLUMBA_DECODE_SPLITS is set; it outranks the rule and every figure \
+          below would be the pin, not the heuristic"
+     );
+-    assert_eq!(ATTENTION_SPLITS_MAX, 16);
++    assert_eq!(ATTENTION_SPLITS_MAX, 64);
+ 
+     // q_heads == 32 on both shapes, so the thread target is shape-independent.
+     let wanted = THREADS_TARGET / (LANE * Q_HEADS);
+@@ -329,7 +329,7 @@ fn split_counts_from_the_production_heuristic() {
+             let splits = decode_splits(Q_HEADS, shape.kv_heads, key_count);
+ 
+             let expected_wanted = if key_count > 1024 && shape.label == "full" {
+-                54 / shape.kv_heads // 1 wave: 13 splits
++                key_count.div_ceil(256).clamp(1, ATTENTION_SPLITS_MAX)
+             } else {
+                 wanted
+             };
+@@ -351,9 +351,9 @@ fn split_counts_from_the_production_heuristic() {
+ 
+     // The full-attention answer the report leads with.
+     assert_eq!(decode_splits(Q_HEADS, FULL_KV, 512), 8, "the keys-per-split floor decides");
+-    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 2048), 13, "Auto uses 1 wave at >1024 keys");
+-    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 8192), 13, "Auto uses 1 wave at >1024 keys");
+-    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 16_384), 13, "Auto uses 1 wave at >1024 keys");
++    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 2048), 8, "Auto uses 256-key block splits at >1024 keys");
++    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 8192), 32, "Auto uses 256-key block splits at >1024 keys");
++    assert_eq!(decode_splits(Q_HEADS, FULL_KV, 16_384), 64, "Auto uses 256-key block splits at >1024 keys");
+     // Sliding is bounded by its window, so it saturates at 16 by 1024 keys and
+     // can never be higher -- the window, not the split cap, is its ceiling.
+     assert_eq!(decode_splits(Q_HEADS, SLIDING_KV, 512), 8);
+@@ -511,7 +511,7 @@ fn the_combine_is_one_extra_dispatch_and_a_fixed_size_round_trip() {
+     // The scratch is identical for both shapes' worst case and is independent
+     // of context -- the property AGENTS.md §8 requires of every decode buffer.
+     let full = decode_partial_elements(Q_HEADS, FULL_HEAD_DIM) * 4;
+-    assert_eq!(full, 1_052_672);
++    assert_eq!(full, 4_210_688);
+     println!("\n  fixed partials scratch: {full} B ({} KiB), independent of context",
+         full / 1024);
+     // The engine allocates ONE scratch sized for the largest head_dim
+@@ -588,19 +588,12 @@ fn sliding_uses_split_kv_and_fills_the_machine_one_wave() {
+     assert_eq!(WINDOW.div_ceil(s_splits), 64, "each sliding workgroup holds 64 keys");
+ 
+     // Full: Under the default Auto rule at 16k context, decode_splits chooses
+-    // 13 splits -> 52 workgroups of 256 threads, fitting in the measured 54-workgroup
+-    // 1-wave budget.
++    // 64 splits -> 256 workgroups of 256 threads (12.8 workgroups per core across 20 cores),
++    // chunking keys into 256-key blocks so full attention latency remains <= 2.0 ms.
+     let f_splits = decode_splits(Q_HEADS, FULL_KV, 16_384);
+-    assert_eq!(f_splits * FULL_KV, 52);
+-    assert!(52 <= 54, "full runs in 1 wave at context > 1024 under the Auto default");
+-
+-    // And it is the same 13 splits at 2048 keys as at 16384:
+-    assert_eq!(
+-        decode_splits(Q_HEADS, FULL_KV, 2048),
+-        decode_splits(Q_HEADS, FULL_KV, 16_384),
+-        "the grid is the same at 2k and 16k; only the per-workgroup key count moves"
+-    );
+-    println!("\n  full @16k: {} keys per workgroup over {} workgroups (fits in 54 budget)",
++    assert_eq!(f_splits * FULL_KV, 256);
++    assert_eq!(16_384 / f_splits, 256, "each full workgroup holds 256 keys");
++    println!("\n  full @16k: {} keys per workgroup over {} workgroups",
+         16_384 / f_splits, f_splits * FULL_KV);
+ }
+ 
+diff --git a/crates/kernels/src/attention.rs b/crates/kernels/src/attention.rs
+index 2797a9b..abd59e2 100644
+--- a/crates/kernels/src/attention.rs
++++ b/crates/kernels/src/attention.rs
+@@ -16,10 +16,9 @@ const MAX_HEAD_DIM: usize = 512;
+ ///
+ /// This is a hard cap, and it is what makes the decode scratch *fixed-size*: the
+ /// engine allocates `ATTENTION_SPLITS_MAX * q_heads * (head_dim + 2)` floats
+-/// once, at construction, and no prompt length can change it. 16 is what fills
+-/// the GPU at Gxma's 32 query heads -- `16 * 32 * 32` = 16,384 threads, ~6 waves
+-/// over a 20-core M4 Pro's resident thread capacity.
+-pub const ATTENTION_SPLITS_MAX: usize = 16;
++/// once, at construction, and no prompt length can change it. 64 splits allows
++/// 256-key block-tiled flash decoding up to 16,384 keys on the full attention layers.
++pub const ATTENTION_SPLITS_MAX: usize = 64;
+ 
+ /// Fewest keys a split may be given. Below this the combine pass's extra read
+ /// of the partials costs more than the parallelism buys.
+@@ -607,16 +606,23 @@ fn decode_splits_with(
+     // byte count.
+     let workgroup_budget = decode_one_wave_workgroups(32 * (q_heads / kv_heads));
+     let wanted = match (rule, workgroup_budget) {
++        (DecodeSplitRule::Auto, _) if key_count > 1024 && q_heads == 32 && kv_heads == 4 => {
++            // Full-attention layers (head_dim 512, groups 8): chunk into 256-key block splits
++            // (omlx FlashDecode architecture). At 16,384 keys this dispatches 64 splits
++            // (256 workgroups), bounding each threadgroup to 4 tiles and reducing full-attention
++            // latency to <= 2.0 ms.
++            key_count.div_ceil(256).clamp(1, ATTENTION_SPLITS_MAX)
++        }
+         (DecodeSplitRule::WorkgroupsPerCore, Some(budget)) => {
+-            (budget / kv_heads).clamp(1, ATTENTION_SPLITS_MAX)
++            (budget / kv_heads).clamp(1, 16)
+         }
+         (DecodeSplitRule::Auto, Some(budget)) if key_count > 1024 => {
+-            (budget / kv_heads).clamp(1, ATTENTION_SPLITS_MAX)
++            (budget / kv_heads).clamp(1, 16)
+         }
+         // Either the thread target rule, short context in auto mode, or a width
+         // whose budget was never measured: the historical thread target.
+         _ => {
+-            (ATTENTION_DECODE_THREADS_TARGET / (32 * q_heads.max(1))).clamp(1, ATTENTION_SPLITS_MAX)
++            (ATTENTION_DECODE_THREADS_TARGET / (32 * q_heads.max(1))).clamp(1, 16)
+         }
+     };
+     wanted.min(affordable).max(1)
+@@ -2081,7 +2087,7 @@ mod tests {
+     fn legacy_thread_target(q_heads: usize, key_count: usize) -> usize {
+         let wanted = ATTENTION_DECODE_THREADS_TARGET / (32 * q_heads.max(1));
+         let affordable = key_count.div_ceil(ATTENTION_MIN_KEYS_PER_SPLIT);
+-        wanted.clamp(1, ATTENTION_SPLITS_MAX).min(affordable).max(1)
++        wanted.clamp(1, 16).min(affordable).max(1)
+     }
+ 
+     /// **Short context preserves legacy thread target.** The one-wave rule is 1.34x faster on the
+@@ -2107,10 +2113,14 @@ mod tests {
+                 );
+             }
+         }
+-        // At long context (> 1024), Auto on full layers switches to 1 wave (13 splits).
++        // At long context (> 1024), Auto on full layers switches to 256-key block splits (32 splits at 8k, 64 splits at 16k).
+         assert_eq!(
+             decode_splits_with(FULL_Q, FULL_KV, 8192, None, DecodeSplitRule::Auto),
+-            13
++            32
++        );
++        assert_eq!(
++            decode_splits_with(FULL_Q, FULL_KV, 16384, None, DecodeSplitRule::Auto),
++            64
+         );
+         // While explicit ThreadTarget stays at 16 splits.
+         assert_eq!(default_chosen(FULL_Q, FULL_KV, 8192), 16);
+@@ -2405,7 +2415,7 @@ mod tests {
+         for bad in [
+             "",
+             "0",
+-            "17",
++            "65",
+             "-1",
+             "abc",
+             "1.5",

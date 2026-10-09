@@ -1,0 +1,39 @@
+device: max threadgroup memory 32 KiB, max threads/threadgroup 1024
+decode flash arm encodable: true   (the sliding shape is never eligible: head_dim 256 != 512)
+
+== interleaved kernel A/B: 9 variants, 9 timed rounds each, window rotated every round, GPU-stamped
+   shape     keys kernel splits  median_us    best_us   worst_us  spread    GB/s   kv_MB  GFLOPS
+   full      2048 scalar     16      288.9      283.5      291.7    1.03    58.1    16.8  464.62
+   full      2048  flash     16      126.8      115.1      136.4    1.19   132.3    16.8 1058.57
+   full      4096 scalar     16      548.9      531.6      564.7    1.06    61.1    33.6  489.06
+   full      4096  flash     16      235.0      201.5      248.0    1.23   142.8    33.6 1142.28
+   full      8192 scalar     16     1100.7     1047.5     1211.1    1.16    61.0    67.1  487.73
+   full      8192  flash     16      442.0      414.0      468.2    1.13   151.8    67.1 1214.75
+   full     16384 scalar     16     2192.1     2100.3     2211.7    1.05    61.2   134.2  489.82
+   full     16384  flash     16      860.8      788.0      918.5    1.17   155.9   134.2 1247.33
+   sliding   1024 scalar     16       85.4       81.7       87.4    1.07   196.5    16.8  393.02
+
+== C2: flash vs scalar at the same shape and key count (within-round ratios)
+     keys   scalar_us    flash_us flash/scalar    verdict
+     2048       288.9       126.8      0.439 flash faster
+     4096       548.9       235.0      0.428 flash faster
+     8192      1100.7       442.0      0.402 flash faster
+    16384      2192.1       860.8      0.393 flash faster
+
+   clock check: full@2048 scalar was 288.9 us in the sweep, 291.9 us re-measured at the end (1.011x)
+
+== split-count sweep, full shape, FLASH kernel, 256-thread groups (one-wave budget = 54 workgroups)
+     keys splits     grid    waves   median_us    best_us   spread     GB/s   speedup
+     8192      4       16        1       855.5      818.5     1.06     78.4 0.524x vs 16
+     8192      8       32        1       487.3      477.2     1.07    137.7 0.919x vs 16
+     8192     12       48        1       421.2      406.5     1.05    159.3 1.063x vs 16
+     8192     13       52        1       390.6      384.8     1.04    171.8 1.147x vs 16
+     8192     16       64        2       447.9      388.9     1.21    149.8 1.000x vs 16
+    16384      4       16        1      1688.0     1632.8     1.06     79.5 0.525x vs 16
+    16384      8       32        1       966.5      944.9     1.12    138.9 0.916x vs 16
+    16384     12       48        1       810.9      794.2     1.08    165.5 1.092x vs 16
+    16384     13       52        1       762.3      757.2     1.04    176.1 1.162x vs 16
+    16384     16       64        2       885.5      778.5     1.19    151.6 1.000x vs 16
+
+== positive control (must move): scalar full, 2048 -> 16384 keys reads 8x the KV
+   scalar 2048 = 288.9 us, scalar 16384 = 2192.1 us, ratio 7.59x
