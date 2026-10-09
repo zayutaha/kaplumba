@@ -16,7 +16,7 @@
   - **Files Touched**: `crates/kernels/tests/linear_mrhs.rs`
   - **Intent**: Write unit probe asserting `encode_gemv_mrhs` produces parity against single-vector GEMV across $M \in [1, 16]$. Sabotage multi-RHS accumulation (drop row $m > 0$), confirm test failure with diagnostic message, revert sabotage, and confirm pass.
   - **Testing**: `cargo test --package kaplumba-kernels --test linear_mrhs`.
-  - **Commit**: `<pending>`.
+  - **Commit**: `5c12ac9`.
 
 - [ ] **Task 4: Dynamic shape routing in `crates/engine/src/model.rs` (R3)**
   - **Files Touched**: `crates/engine/src/model.rs`
