@@ -130,11 +130,12 @@ pub struct ChatMessage {
     pub text: String,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TurnStats {
     pub prefill_tokens: usize,
     pub generated_tokens: usize,
     pub decode_tok_s: f64,
+    pub ttft_ms: f64,
 }
 
 /// Cumulative decode work over a whole session. See [`ChatSession::totals`].
@@ -342,6 +343,7 @@ impl<'a> ChatSession<'a> {
         F: FnMut(&str) -> Result<(), String>,
     {
         self.pending_user_text = text.to_string();
+        let turn_started = std::time::Instant::now();
         let ids = if self.turns == 0 {
             render_first_turn(self.tokenizer, text)?
         } else {
@@ -354,6 +356,7 @@ impl<'a> ChatSession<'a> {
         let mut logits = Vec::new();
         self.model
             .forward_buffer_into_vec(&ids, &positions, &mut logits)?;
+        let ttft_ms = turn_started.elapsed().as_secs_f64() * 1000.0;
         let mut detokenizer = Detokenizer::new(self.tokenizer);
         let mut reply = String::new();
         let mut generated: Vec<u32> = Vec::new();
@@ -455,7 +458,7 @@ impl<'a> ChatSession<'a> {
 
             if self.eos_ids.contains(&token) {
                 let decode_s = decode_started.elapsed().as_secs_f64();
-                self.record_turn(need, 0, decode_s, &reply);
+                self.record_turn(need, 0, decode_s, ttft_ms, &reply);
                 return Ok(reply);
             }
             generated.push(token);
@@ -591,8 +594,6 @@ impl<'a> ChatSession<'a> {
             let decode_s = decode_started.elapsed().as_secs_f64();
             // Chat never reported the decode profile, so `--chat` had no
             // per-kernel attribution at all and its rate could only be guessed
-            // at from stacks. `KAPLUMBA_DECODE_PROFILE=kernel` now works here,
-            // which is what located the 16k stall's cost inside the GPU.
             crate::decode_profile::report();
             if let Some(chunk) = detokenizer.finish()? {
                 if !chunk.is_empty() {
@@ -600,7 +601,7 @@ impl<'a> ChatSession<'a> {
                     on_text(&chunk).map_err(ChatError::from_output)?;
                 }
             }
-            self.record_turn(need, generated.len(), decode_s, &reply);
+            self.record_turn(need, generated.len(), decode_s, ttft_ms, &reply);
             return Ok(reply);
         }
 
@@ -650,14 +651,21 @@ impl<'a> ChatSession<'a> {
                 on_text(&chunk).map_err(ChatError::from_output)?;
             }
         }
-        self.record_turn(need, generated.len(), decode_s, &reply);
+        self.record_turn(need, generated.len(), decode_s, ttft_ms, &reply);
         Ok(reply)
     }
 
     /// Book-keeping shared by both decode paths, so they cannot disagree about
     /// what a "turn" recorded. The two loops differ in how they submit work, not
     /// in what they count.
-    fn record_turn(&mut self, prefill: usize, generated: usize, decode_s: f64, reply: &str) {
+    fn record_turn(
+        &mut self,
+        prefill: usize,
+        generated: usize,
+        decode_s: f64,
+        ttft_ms: f64,
+        reply: &str,
+    ) {
         self.messages.push(ChatMessage {
             role: ChatRole::User,
             text: std::mem::take(&mut self.pending_user_text),
@@ -678,6 +686,7 @@ impl<'a> ChatSession<'a> {
             } else {
                 0.0
             },
+            ttft_ms,
         });
     }
 }
@@ -698,7 +707,7 @@ pub fn default_context_limit() -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::{fits_in_context, ChatError, SessionTotals};
+    use super::{fits_in_context, ChatError, SessionTotals, TurnStats};
 
     #[test]
     fn context_limit_boundary() {
@@ -768,6 +777,20 @@ mod tests {
     fn zero_elapsed_time_with_tokens_present_still_reports_zero() {
         let totals = SessionTotals::from_accumulated(1, 5, 1, 0.0);
         assert_eq!(totals.decode_tok_s, 0.0);
+    }
+
+    #[test]
+    fn turn_stats_records_ttft_ms() {
+        let stats = TurnStats {
+            prefill_tokens: 15,
+            generated_tokens: 30,
+            decode_tok_s: 16.5,
+            ttft_ms: 125.4,
+        };
+        assert_eq!(stats.prefill_tokens, 15);
+        assert_eq!(stats.generated_tokens, 30);
+        assert_eq!(stats.decode_tok_s, 16.5);
+        assert_eq!(stats.ttft_ms, 125.4);
     }
 }
 

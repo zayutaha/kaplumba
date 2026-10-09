@@ -3,12 +3,13 @@
 - [x] **Task 1: Warmup `forward_step_pipelined` in `model.rs` (R1)**
   - **Files Touched**: `crates/engine/src/model.rs`
   - **Intent**: Exercise `forward_step_pipelined` with dummy inputs in `warmup_decode` so all Metal pipelines and device-side argmax/sampling kernels are pre-compiled and resident in GPU instruction memory prior to Turn 1.
+  - **Commit**: `2515904`
   - **Testing**: `cargo test --package kaplumba-engine --lib model` (6/6 passed).
 
-- [ ] **Task 2: Token 1 immediate streaming and `TurnStats::ttft_ms` in `chat.rs` (R2, R3, R4)**
+- [x] **Task 2: Token 1 immediate streaming and `TurnStats::ttft_ms` in `chat.rs` (R2, R3, R4)**
   - **Files Touched**: `crates/engine/src/chat.rs`
   - **Intent**: Track `turn_started`, record `ttft_ms` immediately after prefill completes, stream Token 1 text via `on_text` without delay, and store `ttft_ms` in `TurnStats`.
-  - **Testing**: `cargo test --package kaplumba-engine --lib chat`.
+  - **Testing**: `cargo test --package kaplumba-engine --lib chat` (8/8 passed, including `turn_stats_records_ttft_ms` with sabotage check).
 
 - [ ] **Task 3: Turn Rate TTFT telemetry in `crates/cli/src/chat.rs` (R3)**
   - **Files Touched**: `crates/cli/src/chat.rs`
