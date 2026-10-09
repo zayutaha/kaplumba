@@ -88,6 +88,7 @@ fn main() {
 
         let mut timings = Vec::new();
         let mut dispatches = 0usize;
+        let mut encode_ms = 0.0f64;
         for attempt in 0..5 {
             model.reset_caches().expect("reset_caches");
             model.reset_gpu_caches();
@@ -96,9 +97,14 @@ fn main() {
             model
                 .forward_buffer_into(&tokens, &positions, &mut encoder)
                 .expect("prefill");
+            let encoded = started.elapsed();
             dispatches = encoder.dispatches_encoded();
             encoder.commit_and_wait().expect("commit");
             let ms = started.elapsed().as_secs_f64() * 1e3;
+            // Host encode time vs GPU+commit time. A prefill that is host-bound
+            // shows encode_ms ~= ms; the GPU profile then only sees the part the
+            // host was slow enough to hide.
+            encode_ms = encoded.as_secs_f64() * 1e3;
             timings.push(ms);
             if attempt == 0 {
                 // Read the logits back so the compiler cannot elide the work, and
@@ -127,6 +133,11 @@ fn main() {
             100.0 * (hi - lo) / warm_med,
             length as f64 / cold * 1e3,
             length as f64 / warm_med * 1e3,
+        );
+        eprintln!(
+            "  L={length}: last-attempt host encode {encode_ms:.2} ms of {:.2} ms total, {dispatches} dispatches ({:.1} us/dispatch)",
+            timings[timings.len() - 1],
+            encode_ms / dispatches.max(1) as f64 * 1e3
         );
         warm_points.push((length, warm_med));
     }

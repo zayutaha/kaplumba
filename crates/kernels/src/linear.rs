@@ -162,6 +162,19 @@ fn decode_nr0() -> u32 {
 /// `scripts/gen_exl3_gemv.py`; a test asserts every name here resolves, which is
 /// what catches the two drifting apart.
 pub const NR0_VARIANTS: [u32; 3] = [2, 4, 8];
+/// Rows above 16 are dispatched as 8-row blocks instead of one launch; see
+/// `encode_gemv_mrhs`. Measured end-to-end on the real checkpoint, not
+/// principled: the m32 register bucket (64 accumulator floats per thread) runs
+/// the 17-32 row range at ~1.0-1.1 s TTFT per turn while three or four m8
+/// blocks run the same rows at 0.41-0.59 s, because the weights are re-streamed
+/// once per block but no accumulator ever spills.
+pub const MRHS_SINGLE_PASS_MAX_ROWS: usize = 16;
+
+/// Largest query count `encode_gemv_mrhs` accepts; past this it falls back to
+/// `encode_gemm`. Blocked passes above [`MRHS_SINGLE_PASS_MAX_ROWS`] make this
+/// the largest batch the design is willing to re-stream weights for.
+pub const MRHS_MAX_QUERIES: usize = 32;
+
 /// `KAPLUMBA_GEMV_MAX_GROUPS`, read once. `u64::MAX` (no cap) when unset.
 fn gemv_max_groups() -> u64 {
     static CAP: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
@@ -426,11 +439,9 @@ pub struct LinearKernels {
     mrhs_repacked_m4: ComputePipelineState,
     mrhs_repacked_m8: ComputePipelineState,
     mrhs_repacked_m16: ComputePipelineState,
-    mrhs_repacked_m32: ComputePipelineState,
     mrhs_exl3_m4: ComputePipelineState,
     mrhs_exl3_m8: ComputePipelineState,
     mrhs_exl3_m16: ComputePipelineState,
-    mrhs_exl3_m32: ComputePipelineState,
     finalize_rows_pipeline: ComputePipelineState,
     zero_raw_pipeline: ComputePipelineState,
     gemv_reduce_sk2_pipeline: Option<ComputePipelineState>,
@@ -721,19 +732,15 @@ impl LinearKernels {
             &library,
             "linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_m16",
         )?;
-        let mrhs_repacked_m32 = pipeline_audit::build(
-            &device,
-            &library,
-            "linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_m32",
-        )?;
+        // The m32 bucket is deliberately not compiled: 17-32 rows are served by
+        // row blocks of the m8 kernel, which measured 0.41-0.59 s TTFT per turn
+        // against ~1.0-1.1 s for the spilling 64-accumulator single-pass kernel.
         let mrhs_exl3_m4 =
             pipeline_audit::build(&device, &library, "linear_gemv_mrhs_exl3_k3_mcg_m4")?;
         let mrhs_exl3_m8 =
             pipeline_audit::build(&device, &library, "linear_gemv_mrhs_exl3_k3_mcg_m8")?;
         let mrhs_exl3_m16 =
             pipeline_audit::build(&device, &library, "linear_gemv_mrhs_exl3_k3_mcg_m16")?;
-        let mrhs_exl3_m32 =
-            pipeline_audit::build(&device, &library, "linear_gemv_mrhs_exl3_k3_mcg_m32")?;
         let finalize_rows_pipeline =
             pipeline_audit::build(&device, &library, "linear_finalize_rows")?;
         let zero_raw_pipeline = pipeline_audit::build(&device, &library, "linear_zero_raw")?;
@@ -792,11 +799,9 @@ impl LinearKernels {
             mrhs_repacked_m4,
             mrhs_repacked_m8,
             mrhs_repacked_m16,
-            mrhs_repacked_m32,
             mrhs_exl3_m4,
             mrhs_exl3_m8,
             mrhs_exl3_m16,
-            mrhs_exl3_m32,
             finalize_rows_pipeline,
             zero_raw_pipeline,
             gemv_reduce_sk2_pipeline,
@@ -3592,10 +3597,8 @@ impl LinearKernels {
             &self.mrhs_repacked_m4
         } else if queries <= 8 {
             &self.mrhs_repacked_m8
-        } else if queries <= 16 {
-            &self.mrhs_repacked_m16
         } else {
-            &self.mrhs_repacked_m32
+            &self.mrhs_repacked_m16
         }
     }
 
@@ -3604,10 +3607,8 @@ impl LinearKernels {
             &self.mrhs_exl3_m4
         } else if queries <= 8 {
             &self.mrhs_exl3_m8
-        } else if queries <= 16 {
-            &self.mrhs_exl3_m16
         } else {
-            &self.mrhs_exl3_m32
+            &self.mrhs_exl3_m16
         }
     }
 
@@ -3646,7 +3647,7 @@ impl LinearKernels {
 
         // Fallback to MMA if MRHS is disabled, queries > 32, rate is not 3 bpw, or codebook is not MCG
         if env_flag("KAPLUMBA_DISABLE_MRHS")
-            || queries > 32
+            || queries > MRHS_MAX_QUERIES
             || rate != Exl3Rate::Integer(3)
             || codebook != Exl3Codebook::Mcg
         {
@@ -3693,25 +3694,67 @@ impl LinearKernels {
         let tiles = (out_features / 16) as u64;
         let groups = tiles.min(gemv_max_groups()).max(1);
 
+        // 2. Dispatch MRHS GEMV kernel. Past the m16 bucket the rows go through
+        // `ceil(rows/8)` passes of the m8 kernel instead, with the activation and
+        // raw pointers advanced per block: the m32 bucket needs 64 accumulator
+        // floats per thread, spills, and measured ~1.0-1.1 s TTFT per turn
+        // end-to-end against 0.41-0.59 s for the blocks.
+        let blocked_rows = queries > MRHS_SINGLE_PASS_MAX_ROWS;
+        const MEMORY_BLOCK_ROWS: usize = 8;
+
         if perm_mode == 1 {
-            let shape_values = [
-                to_u32(in_features, "input dimension")?,
-                to_u32(out_features, "output dimension")?,
-                to_u32(queries, "query count")?,
-            ];
-            let pipeline = self.mrhs_repacked_pipeline(queries);
-            encoder.dispatch_1d_offset(
-                pipeline,
-                &[
-                    TensorRef::new(packed, packed_offset),
-                    TensorRef::new(transformed, 0),
-                    TensorRef::new(raw, 0),
-                ],
-                params_bytes(&shape_values),
-                groups * 256,
-                256,
-            )?;
-        } else {
+            if !blocked_rows {
+                let shape_values = [
+                    to_u32(in_features, "input dimension")?,
+                    to_u32(out_features, "output dimension")?,
+                    to_u32(queries, "query count")?,
+                ];
+                let pipeline = self.mrhs_repacked_pipeline(queries);
+                encoder.dispatch_1d_offset(
+                    pipeline,
+                    &[
+                        TensorRef::new(packed, packed_offset),
+                        TensorRef::new(transformed, 0),
+                        TensorRef::new(raw, 0),
+                    ],
+                    params_bytes(&shape_values),
+                    groups * 256,
+                    256,
+                )?;
+            } else {
+                let mut row = 0usize;
+                while row < queries {
+                    let block = MEMORY_BLOCK_ROWS.min(queries - row);
+                    let shape_values = [
+                        to_u32(in_features, "input dimension")?,
+                        to_u32(out_features, "output dimension")?,
+                        to_u32(block, "query count")?,
+                    ];
+                    let pipeline = self.mrhs_repacked_pipeline(block);
+                    // Row `block` of `transformed` starts `block * in_features`
+                    // halfs in, and row `block` of `raw` `block * out_features`
+                    // floats in. The kernels take the row index as relative to
+                    // the bound base, so both offsets are in ELEMENTS, and Metal
+                    // `set_buffer` takes a BYTE offset. Getting this wrong was
+                    // caught by the parity probe at M=17 row=8; see
+                    // spec/small-batch-prefill-mrhs T6.
+                    let x_offset = (row * in_features * size_of::<u16>()) as u64;
+                    let raw_offset = (row * out_features * size_of::<f32>()) as u64;
+                    encoder.dispatch_1d_offset(
+                        pipeline,
+                        &[
+                            TensorRef::new(packed, packed_offset),
+                            TensorRef::new(transformed, x_offset),
+                            TensorRef::new(raw, raw_offset),
+                        ],
+                        params_bytes(&shape_values),
+                        groups * 256,
+                        256,
+                    )?;
+                    row += block;
+                }
+            }
+        } else if !blocked_rows {
             let linear_params = LinearParams {
                 in_features: to_u32(in_features, "input dimension")?,
                 out_features: to_u32(out_features, "output dimension")?,
@@ -3734,6 +3777,36 @@ impl LinearKernels {
                 groups * 256,
                 256,
             )?;
+        } else {
+            let mut row = 0usize;
+            while row < queries {
+                let block = MEMORY_BLOCK_ROWS.min(queries - row);
+                let linear_params = LinearParams {
+                    in_features: to_u32(in_features, "input dimension")?,
+                    out_features: to_u32(out_features, "output dimension")?,
+                    tile_columns: to_u32(out_features / 16, "tile column count")?,
+                    packed_words: to_u32(rate.packed_words(), "packed shape")?,
+                    rate: rate.encoded(),
+                    codebook: codebook.encoded(),
+                    queries: to_u32(block, "query count")?,
+                    perm_mode,
+                };
+                let pipeline = self.mrhs_exl3_pipeline(block);
+                let x_offset = (row * in_features * size_of::<u16>()) as u64;
+                let raw_offset = (row * out_features * size_of::<f32>()) as u64;
+                encoder.dispatch_1d_offset(
+                    pipeline,
+                    &[
+                        TensorRef::new(packed, packed_offset),
+                        TensorRef::new(transformed, x_offset),
+                        TensorRef::new(raw, raw_offset),
+                    ],
+                    params_bytes(&linear_params),
+                    groups * 256,
+                    256,
+                )?;
+                row += block;
+            }
         }
 
         // 3. Finalize all query rows

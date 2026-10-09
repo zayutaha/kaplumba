@@ -152,8 +152,10 @@ fn mrhs_parity_against_single_row_gemv() {
 
     // Test both perm_mode == 0 (row-major) and perm_mode == 1 (colmajor repacked)
     for perm_mode in [0u32, 1u32] {
-        // Test multiple batch sizes spanning all M_CAP buckets: 1, 2, 4, 7, 14, 16
-        for &m in &[1usize, 2, 4, 7, 14, 16] {
+        // Test multiple batch sizes spanning all M_CAP buckets and the
+        // multi-pass row-block path past MRHS_SINGLE_PASS_MAX_ROWS:
+        // 1, 2, 4, 7, 14, 16 (single pass), 17, 24, 32 (blocked passes).
+        for &m in &[1usize, 2, 4, 7, 14, 16, 17, 24, 32] {
             let act = activations(m, in_features);
             let mrhs_out = run_mrhs(
                 &kernels,

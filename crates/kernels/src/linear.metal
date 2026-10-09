@@ -11691,16 +11691,6 @@ kernel void linear_gemv_mrhs_exl3_k3_mcg_m16(
     linear_gemv_mrhs_exl3_k3_mcg_impl<16u>(packed, input, output, params, gid, lid, sg, tn, tgdim, red);
 }
 
-kernel void linear_gemv_mrhs_exl3_k3_mcg_m32(
-    const device ushort *packed [[buffer(0)]],
-    const device half *input [[buffer(1)]],
-    device float *output [[buffer(2)]],
-    constant LinearParams &params [[buffer(3)]],
-    uint gid [[thread_position_in_grid]],
-    uint lid [[thread_position_in_threadgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint tn [[threadgroup_position_in_grid]],
-    uint tgdim [[threads_per_threadgroup]]) {
-    threadgroup float red[8][16];
-    linear_gemv_mrhs_exl3_k3_mcg_impl<32u>(packed, input, output, params, gid, lid, sg, tn, tgdim, red);
-}
+// The m32 instantiation is deliberately absent: with 64 accumulator floats per
+// thread it spills, and the host serves 17-32 rows with row blocks of the m8
+// kernel instead (0.41-0.59 s vs ~1.0-1.1 s TTFT per turn, measured).

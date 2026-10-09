@@ -4309,6 +4309,29 @@ kernel void linear_gemv_ishizuki_k6_colmajor_contig4_bench(
 // then accumulated across M query rows with zero threadgroup barriers in the inner
 // K-loop, achieving full DRAM streaming bandwidth (~185 GB/s).
 
+/// The four halfs a lane needs from one 16-element K-tile, as two 4-byte loads.
+///
+/// `x[r0], x[r0+1]` and `x[r0+8], x[r0+9]` each share a word, and `r0` is always
+/// even, so both loads are 4-byte aligned. Four half loads became two word
+/// loads: at M=16 the inner loop issues 256 x-load instructions against 512
+/// FMAs per lane per unrolled iteration, and the LSU is the co-bottleneck.
+static inline void mrhs_load_tile_x(
+    const device half *xm,
+    uint k_base,
+    uint r0,
+    thread float &p0,
+    thread float &p1,
+    thread float &p2,
+    thread float &p3) {
+    const device uint *words = (const device uint *)(xm + k_base + r0);
+    const half2 lo = as_type<half2>(words[0]);
+    const half2 hi = as_type<half2>(words[4]);
+    p0 = float(lo.x);
+    p1 = float(lo.y);
+    p2 = float(hi.x);
+    p3 = float(hi.y);
+}
+
 template <uint M_CAP>
 static inline void linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_impl(
     const device ushort *packed,
@@ -4368,10 +4391,10 @@ static inline void linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_impl(
             for (uint m = 0; m < M_CAP; ++m) {
                 const uint m_clamped = m < valid_m ? m : (valid_m - 1u);
                 const device half *xm = x + m_clamped * K;
-                const device half *xr0 = xm + (tk + 0u) * 16u + r0;
-                const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
-                acc0[m] += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
-                acc1[m] += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+                float p00, p01, p02, p03;
+                mrhs_load_tile_x(xm, (tk + 0u) * 16u, r0, p00, p01, p02, p03);
+                acc0[m] = fma(p03, v[3], fma(p02, v[2], fma(p01, v[1], fma(p00, v[0], acc0[m]))));
+                acc1[m] = fma(p03, v[7], fma(p02, v[6], fma(p01, v[5], fma(p00, v[4], acc1[m]))));
             }
 
             extract_v_mcg_32(t1[j0], t1[j1], sh0, rsh0, v);
@@ -4379,10 +4402,10 @@ static inline void linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_impl(
             for (uint m = 0; m < M_CAP; ++m) {
                 const uint m_clamped = m < valid_m ? m : (valid_m - 1u);
                 const device half *xm = x + m_clamped * K;
-                const device half *xr1 = xm + (tk + 1u) * 16u + r0;
-                const float p10 = float(xr1[0]), p11 = float(xr1[1]), p12 = float(xr1[8]), p13 = float(xr1[9]);
-                acc0[m] += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
-                acc1[m] += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+                float p10, p11, p12, p13;
+                mrhs_load_tile_x(xm, (tk + 1u) * 16u, r0, p10, p11, p12, p13);
+                acc0[m] = fma(p13, v[3], fma(p12, v[2], fma(p11, v[1], fma(p10, v[0], acc0[m]))));
+                acc1[m] = fma(p13, v[7], fma(p12, v[6], fma(p11, v[5], fma(p10, v[4], acc1[m]))));
             }
 
             extract_v_mcg_32(t2[j0], t2[j1], sh0, rsh0, v);
@@ -4390,10 +4413,10 @@ static inline void linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_impl(
             for (uint m = 0; m < M_CAP; ++m) {
                 const uint m_clamped = m < valid_m ? m : (valid_m - 1u);
                 const device half *xm = x + m_clamped * K;
-                const device half *xr2 = xm + (tk + 2u) * 16u + r0;
-                const float p20 = float(xr2[0]), p21 = float(xr2[1]), p22 = float(xr2[8]), p23 = float(xr2[9]);
-                acc0[m] += p20 * v[0] + p21 * v[1] + p22 * v[2] + p23 * v[3];
-                acc1[m] += p20 * v[4] + p21 * v[5] + p22 * v[6] + p23 * v[7];
+                float p20, p21, p22, p23;
+                mrhs_load_tile_x(xm, (tk + 2u) * 16u, r0, p20, p21, p22, p23);
+                acc0[m] = fma(p23, v[3], fma(p22, v[2], fma(p21, v[1], fma(p20, v[0], acc0[m]))));
+                acc1[m] = fma(p23, v[7], fma(p22, v[6], fma(p21, v[5], fma(p20, v[4], acc1[m]))));
             }
 
             extract_v_mcg_32(t3[j0], t3[j1], sh0, rsh0, v);
@@ -4401,10 +4424,10 @@ static inline void linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_impl(
             for (uint m = 0; m < M_CAP; ++m) {
                 const uint m_clamped = m < valid_m ? m : (valid_m - 1u);
                 const device half *xm = x + m_clamped * K;
-                const device half *xr3 = xm + (tk + 3u) * 16u + r0;
-                const float p30 = float(xr3[0]), p31 = float(xr3[1]), p32 = float(xr3[8]), p33 = float(xr3[9]);
-                acc0[m] += p30 * v[0] + p31 * v[1] + p32 * v[2] + p33 * v[3];
-                acc1[m] += p30 * v[4] + p31 * v[5] + p32 * v[6] + p33 * v[7];
+                float p30, p31, p32, p33;
+                mrhs_load_tile_x(xm, (tk + 3u) * 16u, r0, p30, p31, p32, p33);
+                acc0[m] = fma(p33, v[3], fma(p32, v[2], fma(p31, v[1], fma(p30, v[0], acc0[m]))));
+                acc1[m] = fma(p33, v[7], fma(p32, v[6], fma(p31, v[5], fma(p30, v[4], acc1[m]))));
             }
         }
 
@@ -4418,10 +4441,10 @@ static inline void linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_impl(
             for (uint m = 0; m < M_CAP; ++m) {
                 const uint m_clamped = m < valid_m ? m : (valid_m - 1u);
                 const device half *xm = x + m_clamped * K;
-                const device half *xr0 = xm + tk * 16u + r0;
-                const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
-                acc0[m] += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
-                acc1[m] += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
+                float p0, p1, p2, p3;
+                mrhs_load_tile_x(xm, tk * 16u, r0, p0, p1, p2, p3);
+                acc0[m] = fma(p3, v[3], fma(p2, v[2], fma(p1, v[1], fma(p0, v[0], acc0[m]))));
+                acc1[m] = fma(p3, v[7], fma(p2, v[6], fma(p1, v[5], fma(p0, v[4], acc1[m]))));
             }
         }
 
@@ -4493,18 +4516,8 @@ kernel void linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_m16(
     linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_impl<16u>(packed, x, y, shape, lid, lane, sg, tgid, ntg, red);
 }
 
-kernel void linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_m32(
-    const device ushort *packed [[buffer(0)]],
-    const device half *x [[buffer(1)]],
-    device float *y [[buffer(2)]],
-    constant const uint *shape [[buffer(3)]],
-    uint lid [[thread_position_in_threadgroup]],
-    uint lane [[thread_index_in_simdgroup]],
-    uint sg [[simdgroup_index_in_threadgroup]],
-    uint tgid [[threadgroup_position_in_grid]],
-    uint ntg [[threadgroups_per_grid]]) {
-    threadgroup float red[8][16];
-    linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_impl<32u>(packed, x, y, shape, lid, lane, sg, tgid, ntg, red);
-}
+// The m32 instantiation is deliberately absent, for the reason the row-major
+// file gives: 64 accumulator floats per thread spill, and the host serves
+// 17-32 rows with row blocks of the m8 kernel instead.
 
 
