@@ -9,12 +9,13 @@
 - [x] **Task 2: Token 1 immediate streaming and `TurnStats::ttft_ms` in `chat.rs` (R2, R3, R4)**
   - **Files Touched**: `crates/engine/src/chat.rs`
   - **Intent**: Track `turn_started`, record `ttft_ms` immediately after prefill completes, stream Token 1 text via `on_text` without delay, and store `ttft_ms` in `TurnStats`.
+  - **Commit**: `42f9d60`
   - **Testing**: `cargo test --package kaplumba-engine --lib chat` (8/8 passed, including `turn_stats_records_ttft_ms` with sabotage check).
 
-- [ ] **Task 3: Turn Rate TTFT telemetry in `crates/cli/src/chat.rs` (R3)**
+- [x] **Task 3: Turn Rate TTFT telemetry in `crates/cli/src/chat.rs` (R3)**
   - **Files Touched**: `crates/cli/src/chat.rs`
   - **Intent**: Update `print_turn_rate` to display `[ttft: {stats.ttft_ms:.0} ms, ...]` on every turn.
-  - **Testing**: `cargo check --workspace`.
+  - **Testing**: `cargo check --workspace` and `cargo test --package kaplumba-engine --test multi_turn_chat -- --skip ignore` (6/6 passed).
 
 - [ ] **Task 4: Automated test probe & sabotage verification (AC1, AC2)**
   - **Files Touched**: `crates/engine/tests/probe_chat_ttft.rs`, `spec/chat-ttft-300ms/implementation_notes.md`

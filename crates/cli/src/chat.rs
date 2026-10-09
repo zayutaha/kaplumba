@@ -141,7 +141,8 @@ fn print_turn_rate(session: &ChatSession) {
     };
     let totals = session.totals();
     println!(
-        "[{:.2} tok/s last turn, {:.2} tok/s session, turn {}: {} prefill + {} generated, {} ctx]",
+        "[ttft: {:.0} ms, {:.2} tok/s last turn, {:.2} tok/s session, turn {}: {} prefill + {} generated, {} ctx]",
+        stats.ttft_ms,
         stats.decode_tok_s,
         totals.decode_tok_s,
         totals.turns,
@@ -200,8 +201,8 @@ fn print_stats(session: &ChatSession) {
     );
     match session.last_stats() {
         Some(stats) => println!(
-            "last turn: {} prefill + {} generated tokens, {:.2} tok/s",
-            stats.prefill_tokens, stats.generated_tokens, stats.decode_tok_s
+            "last turn: {} prefill + {} generated tokens, {:.2} tok/s, ttft: {:.0} ms",
+            stats.prefill_tokens, stats.generated_tokens, stats.decode_tok_s, stats.ttft_ms
         ),
         None => println!("no turns yet"),
     }
