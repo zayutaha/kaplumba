@@ -571,3 +571,24 @@ encoders with an `in_flight_step` index rather than `prev`, so the same
 defer-commit there is a larger and riskier edit, and the user-facing request was
 `--chat`. The cost is ~66 ms once per generation, which at 200 generated tokens
 is 0.4 % of `decode_tok_s`. Worth doing; not done.
+
+### Sabotage log for the §33 source-probe (AGENTS.md §3.4)
+
+`the_pipelined_chat_loop_commits_before_it_waits` pinned the *old* ordering --
+"commit before wait" -- so it failed the moment the two were split, which is
+correct behaviour for an instrument test and is why it was updated rather than
+worked around. Its replacement,
+`the_pipelined_chat_loop_encodes_before_it_waits_and_commits_after`, asserts the
+pair of independent properties, and both halves were sabotaged and observed to
+fail:
+
+| sabotage | observed failure |
+|---|---|
+| re-add `enc.commit_terminal()` immediately after the build | FAILS: "commits step N+1 at offset 1776, before waiting on step N at offset 2236" |
+| insert a textual `previous.wait();` ahead of the encode | FAILS: "waits on step N at offset 249 but does not encode step N+1 until offset 1038" |
+
+Both were reverted; `cargo test -p kaplumba-engine --test multi_turn_chat` is
+6 passed / 0 failed and `chat.rs` is byte-identical to `321b828`.
+
+Note the first sabotage is a *compile-valid* form of the old behaviour, so the
+updated probe is not merely asserting a shape that cannot recur.

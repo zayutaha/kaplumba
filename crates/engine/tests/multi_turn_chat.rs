@@ -549,9 +549,11 @@ fn the_parser_keeps_state_and_drops_timing() {
 // Decode-loop ordering. The fix that made `--chat` usable at long context.
 // ---------------------------------------------------------------------------
 
-/// The pipelined chat loop must encode step N+1 and commit it BEFORE waiting on
-/// step N. It used to wait first, so the GPU drained and idled for the whole of
-/// the host's `forward_step_pipelined` encode on every token. Measured at 2234
+/// The pipelined chat loop must **encode** step N+1 before waiting on step N, and
+/// **commit** it only after the EOS check.
+///
+/// It used to wait first, so the GPU drained and idled for the whole of the
+/// host's `forward_step_pipelined` encode on every token. Measured at 2234
 /// tokens of context: 6.7-8.2 tok/s before, 15.11-15.21 after, against a
 /// single-shot 15.16-15.38 on the same work -- i.e. chat reached parity with the
 /// generator it had been trailing by 2.1x.
@@ -563,8 +565,23 @@ fn the_parser_keeps_state_and_drops_timing() {
 /// instruction sequence can. That is why it is a source assertion and why
 /// `AGENTS.md §3.4` applies to it directly -- it is a claim about the source
 /// that must be shown to be able to fail.
+///
+/// ## The two halves are independent, and both matter
+///
+/// * **encode before wait** is the pipelining win: it overlaps the host's encode
+///   with the previous step's GPU execution. Move it after the wait and chat is
+///   the barrier-per-token path, ~2.1x slower.
+/// * **commit after the EOS check** is what stops a discarded step being
+///   submitted. This used to be an unconditional "commit before wait" and cost a
+///   constant ~132 ms on every EOS-terminated turn; splitting the two is worth
+///   ~66 ms per turn (see
+///   `spec/decode-14tok-17k-context/implementation_notes.md` §33).
+///
+/// So the assertion is a *pair*: `forward_step_pipelined` precedes
+/// `previous.wait()`, and `commit_terminal()` follows it. Reverting either half
+/// fails.
 #[test]
-fn the_pipelined_chat_loop_commits_before_it_waits() {
+fn the_pipelined_chat_loop_encodes_before_it_waits_and_commits_after() {
     let src = std::fs::read_to_string(format!(
         "{}/src/chat.rs",
         env!("CARGO_MANIFEST_DIR")
@@ -581,20 +598,31 @@ fn the_pipelined_chat_loop_commits_before_it_waits() {
         .next()
         .unwrap_or(loop_body);
 
-    let commit = pipelined
-        .find("commit_terminal()")
-        .expect("the pipelined loop must commit a command buffer");
+    let encode = pipelined
+        .find("forward_step_pipelined(")
+        .expect("the pipelined loop must encode a step");
     let wait = pipelined
         .find("previous.wait()")
         .expect("the pipelined loop must wait on the previous encoder");
+    let commit = pipelined
+        .find("commit_terminal()")
+        .expect("the pipelined loop must commit a command buffer");
 
     assert!(
-        commit < wait,
-        "the pipelined chat loop waits on step N at offset {wait} but does not commit \
-         step N+1 until offset {commit}. Reverting to wait-then-encode idles the GPU \
+        encode < wait,
+        "the pipelined chat loop waits on step N at offset {wait} but does not encode \
+         step N+1 until offset {encode}. Reverting to wait-then-encode idles the GPU \
          for the host's whole encode every token -- measured 2.1x slower than the \
          single-shot generator on identical work, and invisible in the token stream \
          because both orders emit the same text."
+    );
+
+    assert!(
+        wait < commit,
+        "the pipelined chat loop commits step N+1 at offset {commit}, before waiting \
+         on step N at offset {wait}. Committing before the EOS check submits a step \
+         whose result is then discarded -- a constant ~132 ms on every EOS-terminated \
+         turn, which in a multi-turn chat is most of them."
     );
 }
 
