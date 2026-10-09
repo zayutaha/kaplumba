@@ -24,6 +24,11 @@
   - **Testing**: `cargo test --package kaplumba-engine --lib model`.
   - **Commit**: `ef9ce9b`.
 
+- [ ] **Task 6: rows-per-simdgroup accumulator mapping (fixes the m8/m16/m32 register-spill wall)**
+  - **Files Touched**: `crates/kernels/src/linear_repacked.metal`, `crates/kernels/src/linear.metal`, `crates/kernels/src/linear.rs`, `crates/engine/src/model.rs`, `crates/engine/examples/mrhs_shape.rs`
+  - **Intent**: Give each simdgroup a disjoint slice of the M rows (R = ceil(M/8) rows per simdgroup, buckets r1..r4), keeping the same-rows m4 kernel for M ≤ 4, so per-thread accumulator count is capped at 2R floats. Weight tiles stay strided per simdgroup as today. Re-measure the M-curve.
+  - **Testing**: `cargo test --package kaplumba-kernels --test linear_mrhs` + `scripts/gpuq run -- ./target/release/examples/mrhs_shape`.
+
 - [ ] **Task 5: End-to-end benchmark and verification on Gemma 4 31B (R4, R5, AC3, AC4)**
   - **Files Touched**: `spec/small-batch-prefill-mrhs/implementation_notes.md`
   - **Intent**: Run `cargo test --workspace --lib` and `multi_turn_chat.rs`. Measure TTFT with release binary on 14-token and 21-token chat turns to verify TTFT drops below 200 ms.

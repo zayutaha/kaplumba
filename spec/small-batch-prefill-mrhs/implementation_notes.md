@@ -77,3 +77,47 @@ Sabotage verification (all caught, then reverted):
 
 `cargo test --package kaplumba-engine --lib`: 112 passed, 2 pre-existing ignores
 (require KAPLUMBA_TEST_MODEL).
+
+## 4. T5 (partial): first end-to-end measurement, and the register-spill wall
+
+Interleaved A/B, `--max-new-tokens 1 --temperature 0 --metrics`, median of 3,
+`Hi` (14 template tokens):
+
+| arm | TTFT ms | prefill tok/s |
+|---|---:|---:|
+| MRHS (default) | **392.4** | 35.7 |
+| GEMM (`KAPLUMBA_DISABLE_MRHS=1`) | **1307.8** | 10.7 |
+
+3.33x, but AC4 wants <= 200 ms. `KAPLUMBA_GPU_PROFILE=1` at M=14:
+every projection at ~16-19 GB/s of weight bytes while the same tensors stream
+at ~185 GB/s in decode.
+
+`examples/mrhs_shape.rs` (new probe, cold 1.6 GB working set, 5 interleaved
+rounds, 5376x21504 @3bpw) isolates why -- time per projection, median ms:
+
+    arm                     med ms     GB/s   vs decode
+    decode gemv (perm1)     0.4347     99.7    1.000x
+    mrhs m1  (m4 bucket)    0.4397     98.6    0.988x
+    mrhs m4  (m4 bucket)    0.4468     97.0    0.973x
+    mrhs m8  (m8 bucket)    0.6223     69.7    0.699x
+    mrhs m16 (m16 bucket)   1.5179     28.6    0.286x
+    mrhs m32 (m32 bucket)   6.5805      6.6    0.066x
+    (same at perm0: 83.5 / 80.7 / 57.5 / 34.9 / 10.3 GB/s)
+
+Marginal per-row cost GROWS with the bucket: (m8-m4)/4 = 0.044 ms/row,
+(m16-m8)/8 = 0.112 ms/row, (m32-m16)/16 = 0.316 ms/row. A bandwidth-limited
+kernel would show a *flat* per-row cost near zero and a *constant* time; this is
+the signature of register spilling — m32 needs 64 accumulator floats plus the
+weight window and spills to private memory, and every reload in the K-loop grows
+the per-row cost. This also explains the earlier end-to-end cliff at the bucket
+boundary: 14/15/16-token prompts (m16) ran ~392 ms while 19-22/31-token prompts
+(m32) ran 1461-1701 ms.
+
+Consequence for the design: accumulate at most 4 rows **per simdgroup** (8
+accumulator floats, the measured m4 profile) and cover a 32-row batch by giving
+each of the 8 simdgroups a disjoint 4-row slice. Weight tiles stay disjoint per
+simdgroup (the decode `tk += SG` stride is unchanged), so DRAM traffic and
+memory-level parallelism are unchanged; only the accumulator count per thread
+drops. Buckets become R = ceil(M/8) rows per simdgroup, with the existing
+same-rows m4 kernel kept for M <= 4 (it uses all 8 simdgroups on <= 4 rows and
+measures 97-99 GB/s).
