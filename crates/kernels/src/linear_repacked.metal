@@ -4319,7 +4319,8 @@ static inline void linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_impl(
     uint lane,
     uint sg,
     uint tgid,
-    uint ntg) {
+    uint ntg,
+    threadgroup float (&red)[8][16]) {
     constexpr uint KA = 3u;
     constexpr uint RING = 256u * KA;
     constexpr uint WORDS = RING / 32u;
@@ -4329,7 +4330,6 @@ static inline void linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_impl(
     const uint tiles_n = N / 16u;
     const uint tiles_k = K / 16u;
     constexpr int SG = 8;
-    threadgroup float red[SG][16];
     const uint r0 = (lane % 4u) * 2u;
 
     const uint lo0 = (lane * 8u + 1u) * 3u + RING - 16u;
@@ -4461,7 +4461,8 @@ kernel void linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_m4(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]],
     uint ntg [[threadgroups_per_grid]]) {
-    linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_impl<4u>(packed, x, y, shape, lid, lane, sg, tgid, ntg);
+    threadgroup float red[8][16];
+    linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_impl<4u>(packed, x, y, shape, lid, lane, sg, tgid, ntg, red);
 }
 
 kernel void linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_m8(
@@ -4474,7 +4475,8 @@ kernel void linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_m8(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]],
     uint ntg [[threadgroups_per_grid]]) {
-    linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_impl<8u>(packed, x, y, shape, lid, lane, sg, tgid, ntg);
+    threadgroup float red[8][16];
+    linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_impl<8u>(packed, x, y, shape, lid, lane, sg, tgid, ntg, red);
 }
 
 kernel void linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_m16(
@@ -4487,7 +4489,8 @@ kernel void linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_m16(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]],
     uint ntg [[threadgroups_per_grid]]) {
-    linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_impl<16u>(packed, x, y, shape, lid, lane, sg, tgid, ntg);
+    threadgroup float red[8][16];
+    linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_impl<16u>(packed, x, y, shape, lid, lane, sg, tgid, ntg, red);
 }
 
 kernel void linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_m32(
@@ -4500,6 +4503,8 @@ kernel void linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_m32(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint tgid [[threadgroup_position_in_grid]],
     uint ntg [[threadgroups_per_grid]]) {
-    linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_impl<32u>(packed, x, y, shape, lid, lane, sg, tgid, ntg);
+    threadgroup float red[8][16];
+    linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_impl<32u>(packed, x, y, shape, lid, lane, sg, tgid, ntg, red);
 }
+
 

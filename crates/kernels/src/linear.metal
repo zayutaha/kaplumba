@@ -11588,9 +11588,9 @@ static inline void linear_gemv_mrhs_exl3_k3_mcg_impl(
     uint lid,
     uint sg,
     uint tn,
-    uint tgdim) {
+    uint tgdim,
+    threadgroup float (&red)[8][16]) {
     const uint KA = 3;
-    threadgroup float red[8][16];
     const uint lane = lid % 32u;
     const uint r0 = (lane % 4u) * 2u;
     const uint tiles_n = params.out_features / 16u;
@@ -11659,7 +11659,8 @@ kernel void linear_gemv_mrhs_exl3_k3_mcg_m4(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
-    linear_gemv_mrhs_exl3_k3_mcg_impl<4u>(packed, input, output, params, gid, lid, sg, tn, tgdim);
+    threadgroup float red[8][16];
+    linear_gemv_mrhs_exl3_k3_mcg_impl<4u>(packed, input, output, params, gid, lid, sg, tn, tgdim, red);
 }
 
 kernel void linear_gemv_mrhs_exl3_k3_mcg_m8(
@@ -11672,7 +11673,8 @@ kernel void linear_gemv_mrhs_exl3_k3_mcg_m8(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
-    linear_gemv_mrhs_exl3_k3_mcg_impl<8u>(packed, input, output, params, gid, lid, sg, tn, tgdim);
+    threadgroup float red[8][16];
+    linear_gemv_mrhs_exl3_k3_mcg_impl<8u>(packed, input, output, params, gid, lid, sg, tn, tgdim, red);
 }
 
 kernel void linear_gemv_mrhs_exl3_k3_mcg_m16(
@@ -11685,7 +11687,8 @@ kernel void linear_gemv_mrhs_exl3_k3_mcg_m16(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
-    linear_gemv_mrhs_exl3_k3_mcg_impl<16u>(packed, input, output, params, gid, lid, sg, tn, tgdim);
+    threadgroup float red[8][16];
+    linear_gemv_mrhs_exl3_k3_mcg_impl<16u>(packed, input, output, params, gid, lid, sg, tn, tgdim, red);
 }
 
 kernel void linear_gemv_mrhs_exl3_k3_mcg_m32(
@@ -11698,5 +11701,6 @@ kernel void linear_gemv_mrhs_exl3_k3_mcg_m32(
     uint sg [[simdgroup_index_in_threadgroup]],
     uint tn [[threadgroup_position_in_grid]],
     uint tgdim [[threads_per_threadgroup]]) {
-    linear_gemv_mrhs_exl3_k3_mcg_impl<32u>(packed, input, output, params, gid, lid, sg, tn, tgdim);
+    threadgroup float red[8][16];
+    linear_gemv_mrhs_exl3_k3_mcg_impl<32u>(packed, input, output, params, gid, lid, sg, tn, tgdim, red);
 }
