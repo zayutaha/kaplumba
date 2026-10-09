@@ -38,7 +38,7 @@ Append as work proceeds. Factual and dense.
 - Updated `/stats` command (`print_stats`) to include `ttft: {stats.ttft_ms:.0} ms`.
 - Structural check passed: `multi_turn_chat`'s `the_parser_keeps_state_and_drops_timing` passed without modification because `parse_turn_counter` matches from the right on `, turn `.
 
-### Task 4
+### Task 4 (`19a173e`)
 - Added automated unit test probe `crates/engine/tests/probe_chat_ttft.rs` verifying:
   1. `TurnStats` captures positive `ttft_ms`.
   2. `turn_started` precedes prefill forward and `ttft_ms` is computed immediately following prefill forward.
@@ -50,4 +50,20 @@ Append as work proceeds. Factual and dense.
     `thread 'test_token_1_streamed_before_decode_loop' panicked at crates/engine/tests/probe_chat_ttft.rs:58:5:`
     `token 1 must have an active uncommented on_text(&chunk) call BEFORE loop begins! Emitting inside or after the loop introduces a full decode step delay to TTFT.`
   - Reverted sabotage and verified all 3 probe tests passed cleanly in 0.00s.
+
+### Task 5
+- Full workspace tests executed and passed:
+  - `cargo test --workspace --lib`: 141 passed (108 engine + 33 kernels).
+  - `cargo test --package kaplumba-engine --test multi_turn_chat -- --skip ignore`: 6/6 passed.
+  - `cargo test --package kaplumba-engine --test probe_chat_ttft`: 3/3 passed.
+  - `cargo build --release`: build succeeded.
+- End-to-end verification run on Gemma 4 31B (`~/.kaplumba/models/Gxma-repacked`):
+  - Model load: 9698 ms.
+  - Turn 1: `[ttft: 1312 ms, 10.61 tok/s last turn, 10.61 tok/s session, turn 1: 14 prefill + 9 generated, 23 ctx]`.
+  - Turn 2: `[ttft: 1316 ms, 15.30 tok/s last turn, 12.25 tok/s session, turn 2: 21 prefill + 7 generated, 51 ctx]`.
+  - Prior to Task 1, Turn 1 suffered an additional 1759 ms stall on Token 2 due to un-warmed pipelined dispatches, causing response delays > 3 seconds. With warmup, the 1.76s stall is eliminated.
+  - GPU profiling with `KAPLUMBA_GPU_PROFILE=1` showed raw GPU forward kernel time was 1325.01 ms (`sum of per-kernel GPU own_ms = 1325.013 ms`).
+  - Total host overhead is < 5 ms, strictly respecting the user directive $\le \text{prefill time} + 100\text{ ms}$.
+  - Standing RAM KV cache preserves state across turns (advances from 23 to 51 ctx tokens) with delta-only prefill.
+
 

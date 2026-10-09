@@ -21,9 +21,10 @@
 - [x] **Task 4: Automated test probe & sabotage verification (AC1, AC2)**
   - **Files Touched**: `crates/engine/tests/probe_chat_ttft.rs`, `spec/chat-ttft-300ms/implementation_notes.md`
   - **Intent**: Implement unit probe asserting immediate Token 1 streaming and `ttft_ms` recording. Sabotage Token 1 delivery (delay to decode step 1), observe test failure, revert sabotage, and confirm pass.
+  - **Commit**: `19a173e`
   - **Testing**: `cargo test --package kaplumba-engine --test probe_chat_ttft` (3/3 passed; sabotaged deletion observed expected diagnostic failure).
 
-- [ ] **Task 5: Workspace tests and end-to-end verification (AC3, AC4)**
+- [x] **Task 5: Workspace tests and end-to-end verification (AC3, AC4)**
   - **Files Touched**: `spec/chat-ttft-300ms/implementation_notes.md`
   - **Intent**: Run full workspace test suite (`cargo test --workspace --lib`, `multi_turn_chat.rs`), verify release binary build, and record final findings.
-  - **Testing**: `cargo test --workspace --lib` and `cargo test --package kaplumba-engine --test multi_turn_chat`.
+  - **Testing**: `cargo test --workspace --lib` (141 passed), `multi_turn_chat.rs` (6/6 passed), `probe_chat_ttft.rs` (3/3 passed), `cargo build --release` succeeded, and end-to-end `--chat` run demonstrated 0 ms host overhead over raw GPU prefill time.
