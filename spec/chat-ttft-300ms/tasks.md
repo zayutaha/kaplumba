@@ -27,4 +27,5 @@
 - [x] **Task 5: Workspace tests and end-to-end verification (AC3, AC4)**
   - **Files Touched**: `spec/chat-ttft-300ms/implementation_notes.md`
   - **Intent**: Run full workspace test suite (`cargo test --workspace --lib`, `multi_turn_chat.rs`), verify release binary build, and record final findings.
+  - **Commit**: `1d80d2b`
   - **Testing**: `cargo test --workspace --lib` (141 passed), `multi_turn_chat.rs` (6/6 passed), `probe_chat_ttft.rs` (3/3 passed), `cargo build --release` succeeded, and end-to-end `--chat` run demonstrated 0 ms host overhead over raw GPU prefill time.
