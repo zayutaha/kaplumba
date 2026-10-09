@@ -231,7 +231,14 @@ impl GpuKvCache {
             return Ok(());
         }
 
-        let new_bytes = (target * self.stream_len * 2 * 2) as u64;
+        // Exact 1x sizing: one FP16 element is 2 bytes, so a buffer holds
+        // `target * stream_len * 2` bytes. This was `* 2 * 2`, which allocated
+        // **twice** what `new` allocates for the same shape (and twice what the
+        // prefix copy below writes): at `stream_len = 2048` a 16384-slot ladder
+        // step asked for 134,217,728 B per buffer where 67,108,864 B is the
+        // exact need, over-allocating the full-attention KV by 2x at every rung
+        // (`spec/llama-mlock-zero-swap` R5).
+        let new_bytes = (target * self.stream_len * 2) as u64;
         // Tracked: same reason as `new` above — attention and kv-append race
         // without Metal's hazard barrier. Reverted from eed081e.
         let options = MTLResourceOptions::StorageModeShared;
@@ -277,10 +284,14 @@ impl GpuKvCache {
                 );
             }
         }
-        // Slots beyond the copied prefix must read as empty.
+        // Slots beyond the copied prefix must read as empty. `positions` is
+        // `u32` per slot and the pointer is `*mut u8`, so the byte count is
+        // `(target - live) * 4`; writing `target - live` bytes covered only a
+        // quarter of the tail, leaving three of every four bytes of each new
+        // slot undefined (`spec/llama-mlock-zero-swap` R6).
         unsafe {
             let pointer = (new_positions.contents() as *mut u8).add(live * 4);
-            std::ptr::write_bytes(pointer, 0xFF, target - live);
+            std::ptr::write_bytes(pointer, 0xFF, (target - live) * 4);
         }
 
         self.keys = new_keys;
