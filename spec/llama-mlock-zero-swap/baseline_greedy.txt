@@ -1,0 +1,3 @@
+loading /Users/zayaantaha/.kaplumba/models/Gxma/Gxma ...
+loaded in 105040 ms
+The capital of

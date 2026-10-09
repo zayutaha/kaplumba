@@ -5,12 +5,15 @@ use std::os::fd::AsRawFd;
 use std::os::unix::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::ptr::NonNull;
+use std::sync::Mutex;
 
+use metal::foreign_types::ForeignType;
 use metal::Buffer;
 use rayon::prelude::*;
 use thiserror::Error;
 
 use crate::metal::{DEFAULT_RESIDENT_LIMIT_BYTES, DEFAULT_SEGMENT_BYTES, MetalContext, MetalError};
+use crate::model::EXL3_PACKED_ALIGNMENT;
 use crate::safetensors::{DType, TextTensorSelection};
 
 const COPY_CHUNK_BYTES: usize = 8 * 1024 * 1024;
@@ -391,10 +394,30 @@ impl WeightArena {
     }
 
     pub fn create_residency_set(&self) -> Result<crate::metal::ResidencySet, WeightError> {
-        let set = crate::metal::ResidencySet::new(self.context.device(), self.segments.len())
-            .map_err(WeightError::Metal)?;
+        self.create_residency_set_with(&[])
+    }
+
+    /// [`Self::create_residency_set`] plus extra allocations.
+    ///
+    /// R4: the zero-copy weight views are `StorageModeShared` buffers over the
+    /// shard mappings and must sit in the same `MTLResidencySet` as the arena
+    /// segments, so the driver's GPU working set covers *all* weights -- a
+    /// resident arena with an unregistered mapped trellis would still let the
+    /// GPU re-fault those pages token after token.
+    pub fn create_residency_set_with(
+        &self,
+        extra: &[Buffer],
+    ) -> Result<crate::metal::ResidencySet, WeightError> {
+        let set = crate::metal::ResidencySet::new(
+            self.context.device(),
+            self.segments.len() + extra.len(),
+        )
+        .map_err(WeightError::Metal)?;
         for seg in &self.segments {
             set.add_allocation(&seg.buffer);
+        }
+        for buffer in extra {
+            set.add_allocation(buffer);
         }
         set.commit();
         set.request_residency();
@@ -418,6 +441,21 @@ pub struct TextWeights {
     /// zero-copy Metal buffers alias these pages; dropping them would leave the
     /// GPU reading freed memory.
     shards: BTreeMap<String, ShardReader>,
+    /// Every distinct zero-copy Metal view handed out by [`Self::raw_view`],
+    /// kept alive here and registered with the residency set by
+    /// [`Self::create_residency_set`] (R4). The views alias shard mappings that
+    /// [`Self::shards`] keeps alive for exactly as long as these buffers can be
+    /// touched.
+    zero_copy_views: Mutex<Vec<Buffer>>,
+    /// What [`Self::pin_trellis_pages`] actually wired: `(tensor name, bytes)`
+    /// for every `.trellis` range a [`LlamaMlock`] locked successfully. Probes
+    /// assert from this set that `embed_tokens` is never wired (R3) and that the
+    /// wired total tracks the trellis size, without re-deriving the ranges.
+    pinned: Mutex<Vec<(String, u64)>>,
+    /// R3: `Some(ok)` after [`Self::advise_embedding_random`] ran on a *mapped*
+    /// embedding (`ok` = `madvise(MADV_RANDOM)` succeeded), `None` when the
+    /// table is arena-resident and the advice does not apply.
+    embedding_madvise_random: Mutex<Option<bool>>,
 }
 
 impl TextWeights {
@@ -714,7 +752,13 @@ impl TextWeights {
             tensors,
             source_bytes,
             shards,
+            zero_copy_views: Mutex::new(Vec::new()),
+            pinned: Mutex::new(Vec::new()),
+            embedding_madvise_random: Mutex::new(None),
         };
+        // R3 first: the embedding must never be wired, only advised for
+        // single-row access. Then R2: wire the trellis.
+        weights.advise_embedding_random();
         weights.pin_trellis_pages();
         Ok(weights)
     }
@@ -773,9 +817,14 @@ impl TextWeights {
         if !pin_trellis() {
             return;
         }
-        let mut pinned_bytes = 0_u64;
-        let mut pinned_tensors = 0_usize;
-        let mut warned = false;
+        // Group the mapped `.trellis` ranges by shard, then merge only ranges
+        // that *touch* after the outward rounding: one `LlamaMlock` per merged
+        // run, grown incrementally once per tensor -- the same driver pattern
+        // as `llama-model-loader.cpp:1662`. A gap between two ranges means
+        // something else lives in between, so runs never bridge a gap; that is
+        // what keeps R3 ("`embed_tokens` is never wired") true even when the
+        // embedding shares a shard with trellis tensors.
+        let mut by_shard: BTreeMap<String, Vec<(usize, usize, String)>> = BTreeMap::new();
         for (name, tensor) in &self.tensors {
             if !name.ends_with(".trellis") || !tensor.spans.is_empty() {
                 continue;
@@ -783,37 +832,135 @@ impl TextWeights {
             let Some(reader) = self.shards.get(&tensor.shard) else {
                 continue;
             };
-            // `mlock` requires a page-aligned start, and a safetensors tensor
+            // `mlock` wants a page-aligned start, and a safetensors tensor
             // offset is not page-aligned, so the range is rounded *outward*.
             // That can pin a page shared with an adjacent side-tensor; those
             // pages are read every token too, so the overshoot is harmless.
+            let page = page_size();
             let base = reader.pointer.as_ptr() as usize;
-            let start = (base + tensor.start as usize) & !(PAGE_ALIGN - 1);
-            let end = (base + tensor.end as usize).next_multiple_of(PAGE_ALIGN);
-            if end <= start || end > base + reader.length {
+            let start = (base + tensor.start as usize) & !(page - 1);
+            // Clamp the outward rounding to the mapping instead of skipping on
+            // overshoot: `mmap` covers whole pages, so locking up to the file's
+            // last (possibly partial) page is legal -- while the old
+            // `end > base + length -> continue` silently skipped every tensor
+            // whose rounded end passed EOF, i.e. the last tensor of every shard
+            // whose file length is not page-aligned, and *all* tensors of a
+            // sub-page fixture shard.
+            let end = (base + tensor.end as usize)
+                .next_multiple_of(page)
+                .min(base + reader.length);
+            if end <= start {
                 continue;
             }
-            let len = end - start;
-            let rc = unsafe { libc::mlock(start as *const std::ffi::c_void, len) };
-            if rc == 0 {
-                pinned_bytes += len as u64;
-                pinned_tensors += 1;
-            } else if !warned {
-                warned = true;
-                let source = std::io::Error::last_os_error();
-                eprintln!(
-                    "warning: mlock of {name} ({len} bytes) failed ({source}); \
-                     the trellis stays evictable and decode will re-read it from \
-                     disk under memory pressure"
-                );
+            // A tensor whose absolute shard offset is not a multiple of
+            // `EXL3_PACKED_ALIGNMENT` (4) cannot be bound zero-copy:
+            // `align_packed_view` (`model.rs:5689`) copies it into an anonymous
+            // realigned buffer and the GPU reads THAT for the whole session,
+            // never these file pages. Wiring them would wire a dead second
+            // copy. Measured on `Gxma`: 311 of 411 tensors, 8.61 GiB of wired
+            // file pages living beside 8.61 GiB of live anonymous copies --
+            // 19.8 GiB of process for an 11.2 GiB model, with the *live*
+            // copies the side the compressor ate (9040 MB compressed, decode
+            // crawled). `pin_realigned_copy` wires the live copy instead, and
+            // this tensor's file range is then never faulted at all.
+            if tensor.start % EXL3_PACKED_ALIGNMENT != 0 {
+                continue;
+            }
+            by_shard
+                .entry(tensor.shard.clone())
+                .or_default()
+                .push((start, end, name.clone()));
+        }
+
+        let mut pinned_bytes = 0_u64;
+        let mut pinned_tensors = 0_usize;
+        let mut record = self
+            .pinned
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        for (_shard, mut ranges) in by_shard {
+            ranges.sort();
+            let mut runs: Vec<Vec<(usize, usize, String)>> = Vec::new();
+            for range in ranges {
+                match runs.last_mut() {
+                    Some(run) if range.0 <= run.last().map_or(usize::MAX, |last| last.1) => {
+                        run.push(range);
+                    }
+                    _ => runs.push(vec![range]),
+                }
+            }
+            for mut run in runs {
+                // `ranges` was sorted by start, so the first element is the
+                // run's lowest address -- the lock's base.
+                let run_start = run.first().map_or(0, |first| first.0);
+                run.sort_by_key(|range| range.1);
+                let mut lock = LlamaMlock::init(run_start as *const std::ffi::c_void);
+                for range in &run {
+                    lock.grow_to(range.1 - run_start);
+                }
+                // A failed run locks only up to `size()`; record exactly the
+                // tensors whose range is fully inside that prefix.
+                let locked_upto = run_start + lock.size();
+                for (start, end, name) in run {
+                    if end <= locked_upto {
+                        let bytes = (end - start) as u64;
+                        pinned_bytes += bytes;
+                        pinned_tensors += 1;
+                        record.push((name, bytes));
+                    }
+                }
             }
         }
+        drop(record);
         if pinned_tensors > 0 && std::env::var_os("KAPLUMBA_LOAD_PROFILE").is_some() {
             eprintln!(
                 "load profile: pinned {pinned_tensors} trellis tensors, {:.2} GiB wired",
                 pinned_bytes as f64 / (1024.0 * 1024.0 * 1024.0)
             );
         }
+    }
+
+    /// R3: keep `embed_tokens` an *unwired* clean mapping and turn off
+    /// readahead on it.
+    ///
+    /// The table serves one row per token (~10.7 KB), so readahead would pull
+    /// an order of magnitude more per token for nothing -- and, decisively,
+    /// the pages must stay reclaimable to keep the process under Darwin's
+    /// `vm.user_wire_limit` (~18.24 GiB) alongside the wired trellis. This is
+    /// deliberately the opposite treatment from `pin_trellis_pages`, which is
+    /// why the two live in separate passes over different name sets.
+    fn advise_embedding_random(&self) {
+        const EMBED: &str = "model.language_model.embed_tokens.weight";
+        let Some(tensor) = self.tensors.get(EMBED) else {
+            return;
+        };
+        if !tensor.spans.is_empty() {
+            // Resident in the arena; there is no file mapping to advise.
+            return;
+        }
+        let result = self
+            .shards
+            .get(&tensor.shard)
+            .ok_or_else(|| WeightError::Range {
+                shard: tensor.shard.clone(),
+            })
+            .and_then(|reader| {
+                reader.advise_random(tensor.start, tensor.end - tensor.start)
+            });
+        let ok = match result {
+            Ok(ok) => ok,
+            Err(_) => false,
+        };
+        if !ok {
+            eprintln!(
+                "warning: madvise(MADV_RANDOM) on {EMBED} failed; the mapping is \
+                 correct but the VM will read ahead on a one-row-per-token table"
+            );
+        }
+        *self
+            .embedding_madvise_random
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = Some(ok);
     }
 
     pub fn load_default(
@@ -852,8 +999,52 @@ impl TextWeights {
         self.shards.len()
     }
 
+    /// Arena segments **plus** every zero-copy view handed out so far (R4).
+    ///
+    /// Called by `TextModel::finish_construction` (`model.rs`) after the layer
+    /// build, which is after every trellis view and the embedding view exist,
+    /// so one set covers the whole weight footprint.
     pub fn create_residency_set(&self) -> Result<crate::metal::ResidencySet, WeightError> {
-        self.arena.create_residency_set()
+        let views = self
+            .zero_copy_views
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        self.arena.create_residency_set_with(&views)
+    }
+
+    /// Number of distinct zero-copy views registered so far (R4 probe hook).
+    pub fn zero_copy_view_count(&self) -> usize {
+        self.zero_copy_views
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .len()
+    }
+
+    /// `(name, bytes)` of every `.trellis` range actually wired by
+    /// [`Self::pin_trellis_pages`] (R2/R3 probe hook).
+    pub fn pinned_tensors(&self) -> Vec<(String, u64)> {
+        self.pinned
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
+    }
+
+    /// Total bytes this load wired through `LlamaMlock` (R2 probe hook).
+    pub fn pinned_bytes(&self) -> u64 {
+        self.pinned
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .iter()
+            .map(|(_, bytes)| *bytes)
+            .sum()
+    }
+
+    /// R3 probe hook: see [`Self::embedding_madvise_random`].
+    pub fn embedding_madvise_random(&self) -> Option<bool> {
+        *self
+            .embedding_madvise_random
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     pub fn read_tensor(&self, name: &str) -> Result<Vec<u8>, WeightError> {
@@ -919,7 +1110,23 @@ impl TextWeights {
             return Ok(None);
         };
         let (start, end) = (tensor.start, tensor.end);
-        Ok(Some(reader.no_copy_view(device, start, end - start)?))
+        let (buffer, offset) = reader.no_copy_view(device, start, end - start)?;
+        // R4 ledger: remember the view so `create_residency_set` can register
+        // it (and so its lifetime is pinned to this struct's, independent of
+        // whether the caller keeps the buffer it received).
+        {
+            let mut views = self
+                .zero_copy_views
+                .lock()
+                .unwrap_or_else(|error| error.into_inner());
+            if !views
+                .iter()
+                .any(|existing| existing.as_ptr() == buffer.as_ptr())
+            {
+                views.push(buffer.clone());
+            }
+        }
+        Ok(Some((buffer, offset)))
     }
 
     pub fn tensor_buffer(&self, name: &str) -> Result<Buffer, WeightError> {
@@ -997,6 +1204,108 @@ impl TextWeights {
 fn pin_trellis() -> bool {
     static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *CACHE.get_or_init(|| std::env::var_os("KAPLUMBA_NO_PIN_TRELLIS").is_none())
+}
+
+/// Port of `llama.cpp`'s `llama_mlock` (`reference/llama.cpp/src/llama-mmap.cpp:694`),
+/// the memory-locking engine behind llama.cpp's `--mlock` (R2).
+///
+/// Semantics kept 1:1 with `llama_mlock::impl`:
+///
+/// * [`Self::lock_granularity`] is `sysconf(_SC_PAGESIZE)` (16384 on this
+///   box), and [`Self::grow_to`] rounds the target *up* to it before locking.
+/// * Locking is **incremental**: only `[addr + size, target)` is passed to
+///   `mlock`, so a later grow wires just the new slice -- the property
+///   `llama-model-loader.cpp:1662` relies on when it grows one mapping once
+///   per tensor (`lmlock->grow_to(weight->offs + n_size)`).
+/// * A failed `mlock` (`ENOMEM` from `vm.user_wire_limit`/`RLIMIT_MEMLOCK`, or
+///   `EPERM`) sets `failed_already`: the failure is logged once with llama.cpp's
+///   Darwin-side suggestion, every later `grow_to` is a no-op, and the caller
+///   keeps loading. Wiring is a performance property; correctness never
+///   depends on it (the mapping stays readable either way).
+///
+/// Deliberate divergences from llama.cpp:
+///
+/// * **No `Drop` unlock.** `llama_mlock` owns memory it releases; here the
+///   region belongs to `ShardReader`'s `mmap`, and unlocking on drop would undo
+///   `pin_trellis_pages` the moment it returned. `munmap` in `ShardReader`s
+///   `Drop` releases the wire.
+/// * The failure warning is printed once per *process* rather than once per
+///   lock object: a checkpoint wires ~411 ranges against one shared wire
+///   limit, so the per-object repetition is pure spam.
+pub struct LlamaMlock {
+    addr: usize,
+    size: usize,
+    failed_already: bool,
+}
+
+impl LlamaMlock {
+    /// Bind the lock to `addr`; nothing is wired until [`Self::grow_to`].
+    pub fn init(addr: *const std::ffi::c_void) -> Self {
+        Self {
+            addr: addr as usize,
+            size: 0,
+            failed_already: false,
+        }
+    }
+
+    /// `sysconf(_SC_PAGESIZE)`, llama.cpp's POSIX `lock_granularity()`.
+    pub fn lock_granularity() -> usize {
+        page_size()
+    }
+
+    /// Wire `[addr, target_size)` if that reaches past what is already locked.
+    ///
+    /// `saturating_add` instead of llama.cpp's plain `+` before the rounding:
+    /// an absurd target (the soft-failure case `probe_llama_mlock` exercises)
+    /// must reach `mlock` and come back `ENOMEM`, not overflow-panic in a debug
+    /// build.
+    pub fn grow_to(&mut self, target_size: usize) {
+        if self.failed_already {
+            return;
+        }
+        let granularity = Self::lock_granularity();
+        let target_size = target_size.saturating_add(granularity - 1) & !(granularity - 1);
+        if target_size > self.size {
+            let slice = (self.addr + self.size) as *const std::ffi::c_void;
+            let len = target_size - self.size;
+            let rc = unsafe { libc::mlock(slice, len) };
+            if rc == 0 {
+                self.size = target_size;
+            } else {
+                let source = std::io::Error::last_os_error();
+                self.failed_already = true;
+                warn_mlock_once(len, self.size, source);
+            }
+        }
+    }
+
+    /// Bytes currently wired by this lock (a multiple of the granularity after
+    /// every successful `grow_to`).
+    pub fn size(&self) -> usize {
+        self.size
+    }
+
+    /// `true` once any `grow_to` failed; later calls are no-ops (R2: graceful
+    /// soft clamp instead of an aborted model load).
+    pub fn failed(&self) -> bool {
+        self.failed_already
+    }
+}
+
+/// First `mlock` failure in the process gets llama.cpp's `MLOCK_SUGGESTION`
+/// for `__APPLE__` (`llama-mmap.cpp:706`); later ones are dropped.
+fn warn_mlock_once(len: usize, already: usize, source: std::io::Error) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static WARNED: AtomicBool = AtomicBool::new(false);
+    if WARNED.swap(true, Ordering::Relaxed) {
+        return;
+    }
+    eprintln!(
+        "warning: failed to mlock {len}-byte range (after previously locking {already} bytes): {source}\n\
+         Try increasing the sysctl values 'vm.user_wire_limit' and 'vm.global_user_wire_limit' and/or \
+         decreasing 'vm.global_no_user_wire_amount'. Also try increasing RLIMIT_MEMLOCK (ulimit -l).\n\
+         The range stays evictable; decode will re-read it from disk under memory pressure"
+    );
 }
 
 fn classify_tensor(name: &str, dtype: DType) -> Result<(WeightStorage, DType, bool), WeightError> {
@@ -1109,15 +1418,13 @@ fn read_exact_at(
     Ok(())
 }
 
-/// A safetensors shard opened for positional reads.
+/// A safetensors shard opened for positional reads and zero-copy Metal binding.
 ///
 /// Bulk tensor bytes are pulled with `read_at` straight into their destination
-/// Metal buffers. Reading through an mmap instead costs one minor fault per page;
-/// with several threads faulting unrelated file offsets at once the kernel's
-/// readahead collapses and a full text load drops to roughly a quarter of the
-/// drive's sequential rate, while `read_at` keeps the same data moving at full
-/// sequential speed.
+/// Metal arena buffers. Zero-copy tensors (trellis and embed_tokens) are bound
+/// directly out of the shard's Metal buffer (`metal_buffer`).
 struct ShardReader {
+    metal_buffer: Mutex<Option<Buffer>>,
     file: File,
     pointer: NonNull<u8>,
     length: usize,
@@ -1131,6 +1438,11 @@ impl ShardReader {
             path: path.to_path_buf(),
             source,
         })?;
+        // On Darwin, set F_NOCACHE to disable unified page cache pollution during pread
+        #[cfg(target_os = "macos")]
+        unsafe {
+            libc::fcntl(file.as_raw_fd(), libc::F_NOCACHE, 1);
+        }
         let length = file
             .metadata()
             .map_err(|source| WeightError::Io {
@@ -1170,9 +1482,8 @@ impl ShardReader {
             path: path.to_path_buf(),
             message: "mmap returned null".to_string(),
         })?;
-        // Clean file-backed mapping; do not call MADV_WILLNEED to avoid forcing
-        // unused or already-copied shard pages into the OS page cache.
         Ok(Self {
+            metal_buffer: Mutex::new(None),
             file,
             pointer,
             length,
@@ -1181,12 +1492,36 @@ impl ShardReader {
         })
     }
 
-    /// Wrap `[offset, offset+len)` of this shard in a Metal buffer without
-    /// copying, returning the buffer and the tensor's byte offset inside it.
+    /// Wrap the entire mapped shard into a single page-aligned Metal buffer
+    /// (StorageModeShared).
     ///
-    /// The mapping is page aligned, but a safetensors tensor offset is not, so
-    /// the buffer starts at the page-aligned address below the tensor and the
-    /// caller binds at the returned offset.
+    /// The mmap base address is naturally page-aligned (16 KiB on Apple Silicon),
+    /// and length is rounded to whole pages. Tensors index into this buffer by byte offset,
+    /// matching llama.cpp's `ggml_metal_buffer_map`.
+    fn metal_buffer(&self, device: &metal::Device) -> Result<Buffer, WeightError> {
+        let mut guard = self.metal_buffer.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(ref buffer) = *guard {
+            return Ok(buffer.clone());
+        }
+        let page = page_size();
+        let length_aligned = self.length.next_multiple_of(page);
+        let max_len = device.max_buffer_length() as usize;
+        if length_aligned > max_len {
+            return Err(WeightError::InvalidSegmentSize(length_aligned as u64));
+        }
+        let buffer = device.new_buffer_with_bytes_no_copy(
+            self.pointer.as_ptr() as *const std::ffi::c_void,
+            length_aligned as u64,
+            metal::MTLResourceOptions::StorageModeShared
+                | metal::MTLResourceOptions::HazardTrackingModeUntracked,
+            None,
+        );
+        *guard = Some(buffer.clone());
+        Ok(buffer)
+    }
+
+    /// Wrap `[offset, offset+len)` of this shard in a Metal buffer without
+    /// copying, returning the shard-level buffer and the tensor's byte offset inside it.
     fn no_copy_view(
         &self,
         device: &metal::Device,
@@ -1194,26 +1529,36 @@ impl ShardReader {
         len: u64,
     ) -> Result<(Buffer, u64), WeightError> {
         self.check_range(offset, len)?;
+        let buffer = self.metal_buffer(device)?;
+        Ok((buffer, offset))
+    }
+
+    /// R3: `madvise(MADV_RANDOM)` over the tensor's outward-rounded page range
+    /// (no readahead for a one-row-at-a-time region). Returns whether the
+    /// advice was accepted; a `false`/`Err` never fails the load, because the
+    /// mapping is correct either way -- only the readahead waste differs.
+    fn advise_random(&self, offset: u64, len: u64) -> Result<bool, WeightError> {
+        self.check_range(offset, len)?;
+        let page = page_size();
         let base = self.pointer.as_ptr() as usize;
-        let start = base
-            .checked_add(offset as usize)
-            .ok_or(WeightError::ArithmeticOverflow)?;
-        let aligned = start & !(PAGE_ALIGN - 1);
-        let delta = start - aligned;
-        let end = start
-            .checked_add(len as usize)
-            .ok_or(WeightError::ArithmeticOverflow)?;
-        if end > base + self.length {
-            return Err(WeightError::ArithmeticOverflow);
+        let start = (base + offset as usize) & !(page - 1);
+        let map_end = base + self.length;
+        let end = (base + offset as usize + len as usize)
+            .next_multiple_of(page)
+            .min(map_end);
+        if end <= start {
+            return Err(WeightError::Range {
+                shard: self.path.display().to_string(),
+            });
         }
-        let buffer = device.new_buffer_with_bytes_no_copy(
-            aligned as *const std::ffi::c_void,
-            (end - aligned) as u64,
-            metal::MTLResourceOptions::StorageModeShared
-                | metal::MTLResourceOptions::HazardTrackingModeUntracked,
-            None,
-        );
-        Ok((buffer, delta as u64))
+        let rc = unsafe {
+            libc::madvise(
+                start as *mut std::ffi::c_void,
+                end - start,
+                libc::MADV_RANDOM,
+            )
+        };
+        Ok(rc == 0)
     }
 
     fn check_range(&self, offset: u64, len: u64) -> Result<(), WeightError> {
@@ -1236,13 +1581,24 @@ unsafe impl Send for ShardReader {}
 
 impl Drop for ShardReader {
     fn drop(&mut self) {
+        if let Ok(mut buf) = self.metal_buffer.lock() {
+            buf.take();
+        }
         unsafe {
             libc::munmap(self.pointer.as_ptr().cast(), self.length);
         }
     }
 }
 
-const PAGE_ALIGN: usize = 4096;
+/// Dynamic page size query (16 KiB on Apple Silicon, sysconf(_SC_PAGESIZE)).
+pub fn page_size() -> usize {
+    let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if value > 0 {
+        value as usize
+    } else {
+        16384
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -1282,6 +1638,7 @@ mod tests {
                 DType::I16 => "I16",
                 DType::I32 => "I32",
                 DType::F32 => "F32",
+                DType::U8 => "U8",
                 other => panic!("unsupported test dtype {other:?}"),
             };
             header.insert(
@@ -1310,19 +1667,9 @@ mod tests {
         let shard = dir.join("model.safetensors");
         write_shard(&shard, entries.clone());
         let index_path = dir.join("model.safetensors.index.json");
-        let weight_map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
-        let mut map = weight_map;
-        let names: Vec<String> = vec![
-            "model.language_model.norm.weight".to_string(),
-            "model.language_model.layers.0.self_attn.q_proj.trellis".to_string(),
-            "model.vision_tower.weight".to_string(),
-        ];
-        let used_names = names
-            .into_iter()
-            .filter(|name| entries.iter().any(|(entry, _, _, _)| *entry == name))
-            .collect::<Vec<_>>();
-        for name in used_names {
-            map.insert(name, json!("model.safetensors"));
+        let mut map: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+        for (name, _, _, _) in &entries {
+            map.insert(name.to_string(), json!("model.safetensors"));
         }
         fs::write(
             &index_path,
@@ -1568,6 +1915,186 @@ mod tests {
             };
         assert!(error.contains("unsupported source dtype"));
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Phase 2.5 releases exactly the *copied* ranges' page cache, and never the
+    /// zero-copy ones -- the fix for "the model loads twice."
+    ///
+    /// `WeightArena::read_into` `pread`s the tensor straight into the Metal
+    /// buffer, and `read_at` populates the unified page cache as a side effect,
+    /// so every copied tensor is resident twice until this pass drops it (11.00
+    /// GiB at 3 bpw, 14.66 GiB at 4 bpw -- `spec/memory-swap-cliff/
+    /// implementation_notes.md` §5.1). That duplicate is what drove the
+    /// Zero-copy shard views are backed by a single page-aligned Metal buffer
+    /// per shard file (StorageModeShared), matching llama.cpp's `ggml_metal_buffer_map`.
+    #[test]
+    fn shard_metal_buffer_is_page_aligned_and_covers_entire_shard() {
+        let Some(context) = context_or_skip() else {
+            return;
+        };
+        let dir = temp_dir("shard-align");
+        let embed = "model.language_model.embed_tokens.weight";
+        let selection = selection_for(
+            &dir,
+            vec![(embed, DType::BF16, vec![2048], vec![0_u8; 4096])],
+        );
+        let weights =
+            TextWeights::load_with_segment_size(&dir, &selection, context, 1024 * 1024, 64)
+                .unwrap();
+        let (buf, offset) = weights
+            .raw_zero_copy_tensor_buffer(embed)
+            .unwrap()
+            .expect("embed is zero copy");
+        let page = page_size();
+        assert_eq!(
+            buf.length() as usize % page,
+            0,
+            "shard metal buffer length must be a multiple of page size ({page})"
+        );
+        let ptr = buf.contents() as usize;
+        assert_eq!(
+            ptr % page,
+            0,
+            "shard metal buffer base address must be page aligned ({page})"
+        );
+        assert!(offset < buf.length(), "offset must be within the buffer");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Multiple zero-copy tensors from the same shard reuse the exact same
+    /// Metal buffer instance, eliminating fragile sub-buffer slicing.
+    #[test]
+    fn no_copy_views_share_shard_metal_buffer() {
+        let Some(context) = context_or_skip() else {
+            return;
+        };
+        let dir = temp_dir("shard-share");
+        let trellis1 = "model.language_model.layers.0.self_attn.q_proj.trellis";
+        let trellis2 = "model.language_model.layers.0.self_attn.k_proj.trellis";
+        let selection = selection_for(
+            &dir,
+            vec![
+                (trellis1, DType::F16, vec![64], vec![1_u8; 128]),
+                (trellis2, DType::F16, vec![64], vec![2_u8; 128]),
+            ],
+        );
+        let weights =
+            TextWeights::load_with_segment_size(&dir, &selection, context, 1024 * 1024, 64)
+                .unwrap();
+        let (buf1, off1) = weights
+            .zero_copy_tensor_buffer(trellis1)
+            .unwrap()
+            .expect("trellis1 zero copy");
+        let (buf2, off2) = weights
+            .zero_copy_tensor_buffer(trellis2)
+            .unwrap()
+            .expect("trellis2 zero copy");
+
+        assert_eq!(
+            buf1.as_ptr(),
+            buf2.as_ptr(),
+            "both tensors belong to the same shard and must share the same Metal buffer"
+        );
+        assert_ne!(off1, off2, "tensors must have distinct offsets in the shard");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// Which trellis tensors get their FILE range wired, and why.
+    ///
+    /// `align_packed_view` copies every tensor whose absolute shard offset is
+    /// 4-misaligned; the GPU then reads the anonymous copy forever. Pinning the
+    /// file range of such a tensor wires a dead second copy -- that is the
+    /// "two instances, 20 instead of 10 GiB" bug (measured on `Gxma`:
+    /// 311/411 tensors, 8.61 GiB wired-dead beside 8.61 GiB live-anonymous,
+    /// 9040 MB of the live side in the compressor). So:
+    ///
+    ///   * offset % 4 == 0  -> zero-copy view is used -> FILE range must be wired;
+    ///   * offset % 4 != 0  -> realigned copy is used -> FILE range must NOT be
+    ///     wired (`pin_realigned_copy` wires the copy instead, exercised in
+    ///     [`pin_realigned_copy_wires_and_records_the_live_copy`]).
+    ///
+    /// The fixture brute-forces the payload pad until the trellis' *measured*
+    /// absolute offset has the wanted residue -- header length shifts with the
+    /// pad, so predicting instead of measuring is how this would go vacuous.
+    #[test]
+    fn pinning_follows_the_realigned_copy_split() {
+        let trellis = "model.language_model.layers.0.self_attn.q_proj.trellis";
+        let embed = "model.language_model.embed_tokens.weight";
+        for &target in &[0_u64, 1_u64] {
+            let Some(context) = context_or_skip() else {
+                return;
+            };
+            let (dir, selection, start) = fixture_with_trellis_residue(trellis, embed, target);
+            let weights =
+                TextWeights::load_with_segment_size(&dir, &selection, context, 1024 * 1024, 64)
+                    .unwrap();
+            let pinned: Vec<String> = weights
+                .pinned_tensors()
+                .into_iter()
+                .map(|(name, _bytes)| name)
+                .collect();
+            let zero_copy_used = start % EXL3_PACKED_ALIGNMENT == 0;
+            assert_eq!(
+                pinned.iter().any(|name| name == trellis),
+                zero_copy_used,
+                "trellis at absolute offset {start} (residue {}): pin_trellis_pages {} -- \
+                 a misaligned tensor is copied by align_packed_view, so wiring its FILE \
+                 range wires a dead second copy (the 20-vs-10 GiB bug); an aligned \
+                 tensor is read zero-copy and its file range IS the live instance",
+                start % EXL3_PACKED_ALIGNMENT,
+                if zero_copy_used {
+                    "must pin the file range"
+                } else {
+                    "must NOT pin the file range"
+                },
+            );
+            assert!(
+                !pinned.iter().any(|name| name == embed),
+                "embed_tokens must never be wired (R3)"
+            );
+            fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// Write the fixture with a payload pad until the trellis tensor's absolute
+    /// shard offset lands on `target mod EXL3_PACKED_ALIGNMENT`, *measured* from
+    /// the written file. Returns `(dir, selection, absolute_offset)`.
+    fn fixture_with_trellis_residue(
+        trellis: &str,
+        embed: &str,
+        target: u64,
+    ) -> (PathBuf, TextTensorSelection, u64) {
+        for pad in 1..65_usize {
+            let dir = temp_dir(&format!("pin-split-{target}-{pad}"));
+            // `pad.bytes` shifts every later tensor's absolute offset by
+            // `pad` bytes; it is loaded as an ordinary small raw tensor and
+            // cannot be pinned (not `.trellis`), so it only moves the residue.
+            let selection = selection_for(
+                &dir,
+                vec![
+                    ("pad.bytes", DType::U8, vec![pad], vec![0_u8; pad]),
+                    (trellis, DType::F16, vec![64], vec![7_u8; 128]),
+                    (embed, DType::BF16, vec![64], vec![0_u8; 128]),
+                ],
+            );
+            let bytes = fs::read(dir.join("model.safetensors")).unwrap();
+            let header_len =
+                u64::from_le_bytes(bytes[0..8].try_into().expect("8-byte length")) as usize;
+            let header: serde_json::Value =
+                serde_json::from_slice(&bytes[8..8 + header_len]).expect("header json");
+            let rel = header[trellis]["data_offsets"][0]
+                .as_u64()
+                .expect("trellis data_offsets");
+            let absolute = (8 + header_len) as u64 + rel;
+            if absolute % EXL3_PACKED_ALIGNMENT == target {
+                return (dir, selection, absolute);
+            }
+            fs::remove_dir_all(&dir).unwrap();
+        }
+        panic!(
+            "no pad in 1..65 produced residue {target}; header growth is \
+             pathological and the branch coverage claim would be void"
+        );
     }
 
     #[test]

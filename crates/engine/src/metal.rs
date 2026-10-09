@@ -114,6 +114,10 @@ use metal::foreign_types::ForeignType;
 /// without triggering POSIX `mlock` (avoiding wired-memory exhaustion in macOS).
 pub struct ResidencySet {
     raw: *mut Object,
+    /// How many allocations were added -- the probe hook that lets
+    /// `probe_shared_weights_footprint` assert R4 (arena segments *and*
+    /// zero-copy views registered) without poking at Objective-C state.
+    allocations: std::sync::atomic::AtomicUsize,
 }
 
 unsafe impl Send for ResidencySet {}
@@ -156,7 +160,10 @@ impl ResidencySet {
                     "device failed to create MTLResidencySet".to_string(),
                 ));
             }
-            Ok(Self { raw: set })
+            Ok(Self {
+                raw: set,
+                allocations: std::sync::atomic::AtomicUsize::new(0),
+            })
         }
     }
 
@@ -166,7 +173,14 @@ impl ResidencySet {
                 let buf_ptr = buffer.as_ptr() as *mut Object;
                 let () = msg_send![self.raw, addAllocation: buf_ptr];
             }
+            self.allocations
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+    }
+
+    /// Number of buffers registered via [`Self::add_allocation`].
+    pub fn allocation_count(&self) -> usize {
+        self.allocations.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     pub fn commit(&self) {
@@ -181,15 +195,6 @@ impl ResidencySet {
         if !self.raw.is_null() {
             unsafe {
                 let () = msg_send![self.raw, requestResidency];
-            }
-        }
-    }
-
-    pub fn attach_to_queue(&self, queue: &CommandQueue) {
-        if !self.raw.is_null() {
-            unsafe {
-                let q_ptr = queue.as_ptr() as *mut Object;
-                let () = msg_send![q_ptr, addResidencySet: self.raw];
             }
         }
     }

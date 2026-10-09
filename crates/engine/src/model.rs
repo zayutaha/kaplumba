@@ -3474,9 +3474,6 @@ impl TextModel {
         let residency_set = checkpoint_weights
             .as_ref()
             .and_then(|w| w.create_residency_set().ok());
-        if let Some(ref set) = residency_set {
-            set.attach_to_queue(&forward_queue);
-        }
         Ok(Self {
             embedding,
             embedding_buffer,
