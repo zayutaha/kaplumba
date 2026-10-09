@@ -11570,12 +11570,133 @@ kernel void linear_gemv_fast8(
     output[gid] = (a0 + a1) + (a2 + a3);
 }
 
+// ============================================================================
+// Multi-RHS (MRHS) GEMV for Row-Major MCG 3 bpw Weights
+// ============================================================================
+// Dispatches M in [1, 32] query vectors concurrently against row-major EXL3
+// MCG 3 bpw weights. Weights are fetched and dequantized once per tile into registers,
+// then accumulated across M query rows with zero threadgroup barriers in the inner
+// K-loop.
 
+template <uint M_CAP>
+static inline void linear_gemv_mrhs_exl3_k3_mcg_impl(
+    const device ushort *packed,
+    const device half *input,
+    device float *output,
+    constant LinearParams &params,
+    uint gid,
+    uint lid,
+    uint sg,
+    uint tn,
+    uint tgdim) {
+    const uint KA = 3;
+    threadgroup float red[8][16];
+    const uint lane = lid % 32u;
+    const uint r0 = (lane % 4u) * 2u;
+    const uint tiles_n = params.out_features / 16u;
+    const uint tiles_k = params.in_features / 16u;
+    const uint valid_m = params.queries;
+    const uint simdgroups = tgdim / 32u;
+    const uint out_base = tn * 16u;
 
+    float acc0[M_CAP];
+    float acc1[M_CAP];
+    #pragma unroll
+    for (uint m = 0; m < M_CAP; ++m) {
+        acc0[m] = 0.0f;
+        acc1[m] = 0.0f;
+    }
 
+    for (uint tk = sg; tk < tiles_k; tk += simdgroups) {
+        float v[8];
+        exl3_decode8_mcg<true>(packed, tk * tiles_n + tn, lane, KA, v);
+        const uint xbase = tk * 16u;
+        #pragma unroll
+        for (uint m = 0; m < M_CAP; ++m) {
+            const uint m_clamped = m < valid_m ? m : (valid_m - 1u);
+            const device half *xm = input + m_clamped * params.in_features;
+            const float x0 = float(xm[xbase + r0 + 0u]);
+            const float x1 = float(xm[xbase + r0 + 1u]);
+            const float x2 = float(xm[xbase + r0 + 8u]);
+            const float x3 = float(xm[xbase + r0 + 9u]);
+            acc0[m] = fma(x3, v[3], fma(x2, v[2], fma(x1, v[1], fma(x0, v[0], acc0[m]))));
+            acc1[m] = fma(x3, v[7], fma(x2, v[6], fma(x1, v[5], fma(x0, v[4], acc1[m]))));
+        }
+    }
 
+    #pragma unroll
+    for (uint m = 0; m < M_CAP; ++m) {
+        acc0[m] += simd_shuffle_xor(acc0[m], 1u);
+        acc0[m] += simd_shuffle_xor(acc0[m], 2u);
+        acc1[m] += simd_shuffle_xor(acc1[m], 1u);
+        acc1[m] += simd_shuffle_xor(acc1[m], 2u);
+    }
 
+    for (uint m = 0; m < valid_m; ++m) {
+        if (lane % 4u == 0u) {
+            red[sg][lane / 4u] = acc0[m];
+            red[sg][lane / 4u + 8u] = acc1[m];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        if (lid < 16u) {
+            float s = 0.0f;
+            for (uint g = 0u; g < simdgroups; ++g) {
+                s += red[g][lid];
+            }
+            output[m * params.out_features + out_base + lid] = s;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+}
 
+kernel void linear_gemv_mrhs_exl3_k3_mcg_m4(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    linear_gemv_mrhs_exl3_k3_mcg_impl<4u>(packed, input, output, params, gid, lid, sg, tn, tgdim);
+}
 
+kernel void linear_gemv_mrhs_exl3_k3_mcg_m8(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    linear_gemv_mrhs_exl3_k3_mcg_impl<8u>(packed, input, output, params, gid, lid, sg, tn, tgdim);
+}
 
+kernel void linear_gemv_mrhs_exl3_k3_mcg_m16(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    linear_gemv_mrhs_exl3_k3_mcg_impl<16u>(packed, input, output, params, gid, lid, sg, tn, tgdim);
+}
 
+kernel void linear_gemv_mrhs_exl3_k3_mcg_m32(
+    const device ushort *packed [[buffer(0)]],
+    const device half *input [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant LinearParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tn [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    linear_gemv_mrhs_exl3_k3_mcg_impl<32u>(packed, input, output, params, gid, lid, sg, tn, tgdim);
+}

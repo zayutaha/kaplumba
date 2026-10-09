@@ -4300,3 +4300,206 @@ kernel void linear_gemv_ishizuki_k6_colmajor_contig4_bench(
         threadgroup_barrier(mem_flags::mem_threadgroup);
     }
 }
+
+// ============================================================================
+// Multi-RHS (MRHS) GEMV for Small-Batch High-Bandwidth Prefill
+// ============================================================================
+// Dispatches M in [1, 32] query vectors concurrently against 3 bpw column-major
+// repacked weights. Weights are fetched and dequantized once per tile into registers,
+// then accumulated across M query rows with zero threadgroup barriers in the inner
+// K-loop, achieving full DRAM streaming bandwidth (~185 GB/s).
+
+template <uint M_CAP>
+static inline void linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_impl(
+    const device ushort *packed,
+    const device half *x,
+    device float *y,
+    constant const uint *shape,
+    uint lid,
+    uint lane,
+    uint sg,
+    uint tgid,
+    uint ntg) {
+    constexpr uint KA = 3u;
+    constexpr uint RING = 256u * KA;
+    constexpr uint WORDS = RING / 32u;
+    const uint K = shape[0];
+    const uint N = shape[1];
+    const uint valid_m = shape[2];
+    const uint tiles_n = N / 16u;
+    const uint tiles_k = K / 16u;
+    constexpr int SG = 8;
+    threadgroup float red[SG][16];
+    const uint r0 = (lane % 4u) * 2u;
+
+    const uint lo0 = (lane * 8u + 1u) * 3u + RING - 16u;
+    const uint sh0 = lo0 % 32u;
+    const uint rsh0 = 32u - sh0;
+    const uint hi0 = lo0 / 32u;
+    const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
+    const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
+
+    for (uint tn = tgid; tn < tiles_n; tn += ntg) {
+        float acc0[M_CAP];
+        float acc1[M_CAP];
+        #pragma unroll
+        for (uint m = 0; m < M_CAP; ++m) {
+            acc0[m] = 0.0f;
+            acc1[m] = 0.0f;
+        }
+
+        const device uint *column = (const device uint *)packed + tn * (tiles_k * WORDS);
+        const uint stride = WORDS;
+
+        const uint step = SG * 4u;
+        const uint k_unroll_end = (tiles_k / step) * step;
+
+        uint tk = sg * 4u;
+        for (; tk < k_unroll_end; tk += step) {
+            const device uint *t0 = column + (tk + 0u) * stride;
+            const device uint *t1 = column + (tk + 1u) * stride;
+            const device uint *t2 = column + (tk + 2u) * stride;
+            const device uint *t3 = column + (tk + 3u) * stride;
+
+            float v[8];
+
+            extract_v_mcg_32(t0[j0], t0[j1], sh0, rsh0, v);
+            #pragma unroll
+            for (uint m = 0; m < M_CAP; ++m) {
+                const uint m_clamped = m < valid_m ? m : (valid_m - 1u);
+                const device half *xm = x + m_clamped * K;
+                const device half *xr0 = xm + (tk + 0u) * 16u + r0;
+                const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
+                acc0[m] += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+                acc1[m] += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+            }
+
+            extract_v_mcg_32(t1[j0], t1[j1], sh0, rsh0, v);
+            #pragma unroll
+            for (uint m = 0; m < M_CAP; ++m) {
+                const uint m_clamped = m < valid_m ? m : (valid_m - 1u);
+                const device half *xm = x + m_clamped * K;
+                const device half *xr1 = xm + (tk + 1u) * 16u + r0;
+                const float p10 = float(xr1[0]), p11 = float(xr1[1]), p12 = float(xr1[8]), p13 = float(xr1[9]);
+                acc0[m] += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+                acc1[m] += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+            }
+
+            extract_v_mcg_32(t2[j0], t2[j1], sh0, rsh0, v);
+            #pragma unroll
+            for (uint m = 0; m < M_CAP; ++m) {
+                const uint m_clamped = m < valid_m ? m : (valid_m - 1u);
+                const device half *xm = x + m_clamped * K;
+                const device half *xr2 = xm + (tk + 2u) * 16u + r0;
+                const float p20 = float(xr2[0]), p21 = float(xr2[1]), p22 = float(xr2[8]), p23 = float(xr2[9]);
+                acc0[m] += p20 * v[0] + p21 * v[1] + p22 * v[2] + p23 * v[3];
+                acc1[m] += p20 * v[4] + p21 * v[5] + p22 * v[6] + p23 * v[7];
+            }
+
+            extract_v_mcg_32(t3[j0], t3[j1], sh0, rsh0, v);
+            #pragma unroll
+            for (uint m = 0; m < M_CAP; ++m) {
+                const uint m_clamped = m < valid_m ? m : (valid_m - 1u);
+                const device half *xm = x + m_clamped * K;
+                const device half *xr3 = xm + (tk + 3u) * 16u + r0;
+                const float p30 = float(xr3[0]), p31 = float(xr3[1]), p32 = float(xr3[8]), p33 = float(xr3[9]);
+                acc0[m] += p30 * v[0] + p31 * v[1] + p32 * v[2] + p33 * v[3];
+                acc1[m] += p30 * v[4] + p31 * v[5] + p32 * v[6] + p33 * v[7];
+            }
+        }
+
+        for (tk = k_unroll_end + sg; tk < tiles_k; tk += SG) {
+            const device uint *t0 = column + tk * stride;
+            const uint a0 = t0[j0], a1 = t0[j1];
+            float v[8];
+            extract_v_mcg_32(a0, a1, sh0, rsh0, v);
+
+            #pragma unroll
+            for (uint m = 0; m < M_CAP; ++m) {
+                const uint m_clamped = m < valid_m ? m : (valid_m - 1u);
+                const device half *xm = x + m_clamped * K;
+                const device half *xr0 = xm + tk * 16u + r0;
+                const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
+                acc0[m] += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
+                acc1[m] += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
+            }
+        }
+
+        #pragma unroll
+        for (uint m = 0; m < M_CAP; ++m) {
+            acc0[m] += simd_shuffle_xor(acc0[m], 1u);
+            acc0[m] += simd_shuffle_xor(acc0[m], 2u);
+            acc1[m] += simd_shuffle_xor(acc1[m], 1u);
+            acc1[m] += simd_shuffle_xor(acc1[m], 2u);
+        }
+
+        for (uint m = 0; m < valid_m; ++m) {
+            if (lane % 4u == 0u) {
+                red[sg][lane / 4u] = acc0[m];
+                red[sg][lane / 4u + 8u] = acc1[m];
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+            if (lid < 16u) {
+                float sum = 0.0f;
+                for (int g = 0; g < SG; ++g) {
+                    sum += red[g][lid];
+                }
+                y[m * N + tn * 16u + lid] = sum;
+            }
+            threadgroup_barrier(mem_flags::mem_threadgroup);
+        }
+    }
+}
+
+kernel void linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_m4(
+    const device ushort *packed [[buffer(0)]],
+    const device half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant const uint *shape [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_impl<4u>(packed, x, y, shape, lid, lane, sg, tgid, ntg);
+}
+
+kernel void linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_m8(
+    const device ushort *packed [[buffer(0)]],
+    const device half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant const uint *shape [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_impl<8u>(packed, x, y, shape, lid, lane, sg, tgid, ntg);
+}
+
+kernel void linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_m16(
+    const device ushort *packed [[buffer(0)]],
+    const device half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant const uint *shape [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_impl<16u>(packed, x, y, shape, lid, lane, sg, tgid, ntg);
+}
+
+kernel void linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_m32(
+    const device ushort *packed [[buffer(0)]],
+    const device half *x [[buffer(1)]],
+    device float *y [[buffer(2)]],
+    constant const uint *shape [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint lane [[thread_index_in_simdgroup]],
+    uint sg [[simdgroup_index_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint ntg [[threadgroups_per_grid]]) {
+    linear_gemv_mrhs_ishizuki_k3_colmajor_contig4_impl<32u>(packed, x, y, shape, lid, lane, sg, tgid, ntg);
+}
+

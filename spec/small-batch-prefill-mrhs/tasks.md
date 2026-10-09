@@ -1,9 +1,9 @@
 # Task Checklist: Small-Batch High-Bandwidth Prefill (Multi-RHS GEMV)
 
-- [ ] **Task 1: Implement `linear_gemv_mrhs_exl3_k3_mcg` in `linear.metal` (R1)**
-  - **Files Touched**: `crates/kernels/src/linear.metal`
-  - **Intent**: Implement multi-RHS GEMV kernel supporting $M \in [1, 32]$ query vectors with register accumulators, single weight fetch, and zero threadgroup barriers in the $K$-loop.
-  - **Testing**: `cargo check --package kaplumba-kernels`.
+- [x] **Task 1: Implement `linear_gemv_mrhs_exl3_k3_mcg` and repacked MRHS kernels in Metal (R1)**
+  - **Files Touched**: `crates/kernels/src/linear.metal`, `crates/kernels/src/linear_repacked.metal`
+  - **Intent**: Implement multi-RHS GEMV kernels supporting $M \in [1, 32]$ query vectors with register accumulators, single weight fetch, and zero threadgroup barriers in the $K$-loop for both column-major repacked and row-major EXL3 MCG 3 bpw weights.
+  - **Testing**: `cargo test --package kaplumba-kernels --test packed_offset_selects_the_decoder`.
 
 - [ ] **Task 2: Implement `encode_gemv_mrhs` wrapper in `crates/kernels/src/linear.rs` (R2)**
   - **Files Touched**: `crates/kernels/src/linear.rs`
