@@ -15,12 +15,13 @@
 - [x] **Task 3: Turn Rate TTFT telemetry in `crates/cli/src/chat.rs` (R3)**
   - **Files Touched**: `crates/cli/src/chat.rs`
   - **Intent**: Update `print_turn_rate` to display `[ttft: {stats.ttft_ms:.0} ms, ...]` on every turn.
+  - **Commit**: `4406903`
   - **Testing**: `cargo check --workspace` and `cargo test --package kaplumba-engine --test multi_turn_chat -- --skip ignore` (6/6 passed).
 
-- [ ] **Task 4: Automated test probe & sabotage verification (AC1, AC2)**
+- [x] **Task 4: Automated test probe & sabotage verification (AC1, AC2)**
   - **Files Touched**: `crates/engine/tests/probe_chat_ttft.rs`, `spec/chat-ttft-300ms/implementation_notes.md`
   - **Intent**: Implement unit probe asserting immediate Token 1 streaming and `ttft_ms` recording. Sabotage Token 1 delivery (delay to decode step 1), observe test failure, revert sabotage, and confirm pass.
-  - **Testing**: `cargo test --package kaplumba-engine --test probe_chat_ttft`.
+  - **Testing**: `cargo test --package kaplumba-engine --test probe_chat_ttft` (3/3 passed; sabotaged deletion observed expected diagnostic failure).
 
 - [ ] **Task 5: Workspace tests and end-to-end verification (AC3, AC4)**
   - **Files Touched**: `spec/chat-ttft-300ms/implementation_notes.md`
