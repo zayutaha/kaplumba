@@ -2021,3 +2021,130 @@ KAPLUMBA_FA_GQA_MMA(online_attention_gqa_mma_512_1, 512, 1)
 KAPLUMBA_FA_GQA_MMA(online_attention_gqa_mma_512_2, 512, 2)
 KAPLUMBA_FA_GQA_MMA(online_attention_gqa_mma_512_4, 512, 4)
 KAPLUMBA_FA_GQA_MMA(online_attention_gqa_mma_512_8, 512, 8)
+
+// ---------------------------------------------------------------------------
+// spec/dflash-correctness R8: block attention for the DFlash drafter.
+//
+// The drafter's query is a 16-row block. Its keys are the concatenation of
+// (a) the context rows, which are the target model's fused tap features
+// projected by the drafter's own k_proj, and (b) the block's own rows. The
+// mask is per-layer:
+//
+//   * sliding_attention layers: causal within the block AND a `window`-wide
+//     trailing window (`q_pos - k_pos < window`).
+//   * full_attention layer: NO mask at all -- block rows see every key,
+//     including the block rows ahead of them.
+//
+// `online_attention` above cannot express that: its `live` test is
+// unconditional (`k_abs <= q_abs` at attention.metal:836), so a bidirectional
+// block needs this kernel. It is O(rows) working set -- one threadgroup per
+// (block row, kv head) with an online softmax, no mask buffer and no score
+// matrix, which is what AGENTS.md section 8 requires.
+//
+// One threadgroup per (row, kv head); `nsg = q_heads / kv_heads` simdgroups,
+// one per query head in the group. Each lane owns `head_dim / 32` dimensions.
+struct DflashBlockParams {
+    uint rows;            // block rows, == queries
+    uint n_ctx;           // context rows before the block
+    uint q_heads;
+    uint kv_heads;
+    uint head_dim;
+    float scale;
+    uint window;          // 0 = no window
+    uint bidirectional;   // 1 = no causal mask (the full_attention layer)
+};
+
+kernel void dflash_block_attn(
+    const device half *queries [[buffer(0)]],
+    const device half *ctx_keys [[buffer(1)]],
+    const device half *ctx_values [[buffer(2)]],
+    const device half *block_keys [[buffer(3)]],
+    const device half *block_values [[buffer(4)]],
+    const device uint *key_positions [[buffer(5)]],
+    device half *output [[buffer(6)]],
+    constant DflashBlockParams &params [[buffer(7)]],
+    uint tid [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]]) {
+    const uint groups = params.q_heads / params.kv_heads;
+    const uint row = tgid / params.kv_heads;
+    const uint key_head = tgid % params.kv_heads;
+    if (row >= params.rows) {
+        return;
+    }
+    const uint nsg = tid / 32u;
+    const uint lane = tid % 32u;
+    if (nsg >= groups) {
+        return;
+    }
+    const uint q_head = key_head * groups + nsg;
+    const uint q_pos = key_positions[params.n_ctx + row];
+
+    // Each lane's own slice of the head dimension.
+    const uint dims_per_lane = params.head_dim / 32u;
+    const uint dim_base = lane * dims_per_lane;
+    const uint q_base = (row * params.q_heads + q_head) * params.head_dim;
+    const uint k_base = key_head * params.head_dim;
+
+    float q_reg[16];
+    for (uint d = 0; d < dims_per_lane; ++d) {
+        q_reg[d] = float(queries[q_base + dim_base + d]);
+    }
+
+    const uint total_keys = params.n_ctx + params.rows;
+    float m = -INFINITY;
+    float l = 0.0f;
+    float acc[16];
+    for (uint d = 0; d < dims_per_lane; ++d) {
+        acc[d] = 0.0f;
+    }
+
+    for (uint k = 0; k < total_keys; ++k) {
+        const bool past_ok = (params.bidirectional != 0u)
+            ? true
+            : (key_positions[k] <= q_pos);
+        const uint gap = q_pos - key_positions[k];
+        const bool window_ok = (params.window == 0u) || (gap < params.window);
+        if (!(past_ok && window_ok)) {
+            continue;
+        }
+        const bool in_ctx = k < params.n_ctx;
+        const device half *krow = in_ctx
+            ? ctx_keys + (k * params.kv_heads + key_head) * params.head_dim
+            : block_keys + ((k - params.n_ctx) * params.kv_heads + key_head) * params.head_dim;
+        const device half *vrow = in_ctx
+            ? ctx_values + (k * params.kv_heads + key_head) * params.head_dim
+            : block_values + ((k - params.n_ctx) * params.kv_heads + key_head) * params.head_dim;
+
+        float dot = 0.0f;
+        for (uint d = 0; d < dims_per_lane; ++d) {
+            dot += q_reg[d] * float(krow[dim_base + d]);
+        }
+        // Every lane must end up with the SAME total, not just lane 0: `m`, `l`
+        // and the `acc[i]` rescale below are per-lane state that the online
+        // softmax merges across lanes, so a lane holding a partial sum would
+        // silently corrupt the normaliser. `simd_sum` is a butterfly, so all 32
+        // lanes end with the true total.
+        dot = simd_sum(dot);
+        const float score = dot * params.scale;
+
+        // `score` and `m` are both uniform across the simdgroup (the score by
+        // the `simd_sum` above, `m` because it is only ever written from
+        // `score`), so this is a scalar max -- no reduction. The running max
+        // MUST include the current key: taking `simd_max(m)` alone leaves
+        // `m == -inf` on the first key and the whole row normalises to zero.
+        const float m_new = max(m, score);
+        const float alpha = (m == -INFINITY) ? 0.0f : metal::exp(m - m_new);
+        const float weight = metal::exp(score - m_new);
+        for (uint d = 0; d < dims_per_lane; ++d) {
+            acc[d] = acc[d] * alpha + weight * float(vrow[dim_base + d]);
+        }
+        l = l * alpha + weight;
+        m = m_new;
+    }
+
+    const float inv = (l > 0.0f) ? 1.0f / l : 0.0f;
+    const uint o_base = (row * params.q_heads + q_head) * params.head_dim;
+    for (uint d = 0; d < dims_per_lane; ++d) {
+        output[o_base + dim_base + d] = half(acc[d] * inv);
+    }
+}

@@ -721,6 +721,46 @@ pub struct AttentionRequest<'a> {
     pub window: usize,
 }
 
+/// spec/dflash-correctness R8: inputs to the DFlash drafter's block attention.
+///
+/// Queries are the 16 block rows; keys/values are the context rows (the
+/// target's fused tap features, projected by this layer's k_proj/v_proj)
+/// followed by the block's own rows. `key_positions` therefore has
+/// `n_ctx + rows` entries, in that order.
+#[derive(Clone, Copy)]
+pub struct DflashBlockRequest<'a> {
+    pub queries: &'a [u16],
+    pub ctx_keys: &'a [u16],
+    pub ctx_values: &'a [u16],
+    pub block_keys: &'a [u16],
+    pub block_values: &'a [u16],
+    pub key_positions: &'a [u32],
+    pub rows: usize,
+    pub n_ctx: usize,
+    pub q_heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub scale: f32,
+    /// `0` means no window; otherwise `q_pos - k_pos < window`.
+    pub window: usize,
+    /// The `full_attention` layer: no causal mask at all, so block rows see the
+    /// block rows ahead of them.
+    pub bidirectional: bool,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct DflashBlockParams {
+    rows: u32,
+    n_ctx: u32,
+    q_heads: u32,
+    kv_heads: u32,
+    head_dim: u32,
+    scale: f32,
+    window: u32,
+    bidirectional: u32,
+}
+
 /// GPU-resident attention request: every buffer is caller-owned so attention
 /// can be encoded into the same command buffer as the rest of the layer.
 #[derive(Clone, Copy)]
@@ -745,6 +785,7 @@ pub struct AttentionKernels {
     queue: CommandQueue,
     _library: Library,
     online_attention_pipeline: ComputePipelineState,
+    dflash_block_pipeline: ComputePipelineState,
     online_attention_256_pipeline: ComputePipelineState,
     online_attention_512_pipeline: ComputePipelineState,
     attention_dim_256_pipeline: ComputePipelineState,
@@ -993,6 +1034,7 @@ impl AttentionKernels {
             crate::pipeline_audit::build(&device, &library, name)
         };
         let online_attention_pipeline = extra("online_attention")?;
+        let dflash_block_pipeline = extra("dflash_block_attn")?;
         let online_attention_256_pipeline = extra("online_attention_256")?;
         let online_attention_512_pipeline = extra("online_attention_512")?;
         let attention_dim_256_pipeline = extra("online_attention_dim_256")?;
@@ -1074,6 +1116,7 @@ impl AttentionKernels {
             queue,
             _library: library,
             online_attention_pipeline,
+            dflash_block_pipeline,
             online_attention_256_pipeline,
             online_attention_512_pipeline,
             attention_dim_256_pipeline,
@@ -1922,6 +1965,138 @@ impl AttentionKernels {
             )?;
         }
         Ok(true)
+    }
+
+    /// spec/dflash-correctness R8/R9: the DFlash drafter's block attention.
+    ///
+    /// One threadgroup per (block row, kv head), each with
+    /// `q_heads / kv_heads` simdgroups. Online softmax, so the working set is
+    /// `rows * q_heads * head_dim` and no score matrix or mask buffer exists.
+    ///
+    /// The reason this is not `online_attention`: that kernel's `live` test is
+    /// unconditional (`k_abs <= q_abs`), and the drafter's `full_attention`
+    /// layer must see the block rows *ahead* of each query.
+    pub fn dflash_block_attention(
+        &self,
+        request: DflashBlockRequest<'_>,
+    ) -> Result<Vec<u16>, KernelError> {
+        let DflashBlockRequest {
+            queries,
+            ctx_keys,
+            ctx_values,
+            block_keys,
+            block_values,
+            key_positions,
+            rows,
+            n_ctx,
+            q_heads,
+            kv_heads,
+            head_dim,
+            scale,
+            window,
+            bidirectional,
+        } = request;
+        if rows == 0 || q_heads == 0 || kv_heads == 0 || head_dim == 0 {
+            return Err(KernelError::InvalidInput(
+                "dflash block attention dimensions must be non-zero".to_string(),
+            ));
+        }
+        if !q_heads.is_multiple_of(kv_heads) {
+            return Err(KernelError::InvalidInput(
+                "dflash block attention needs q_heads to be a multiple of kv_heads".to_string(),
+            ));
+        }
+        if !head_dim.is_multiple_of(32) {
+            return Err(KernelError::InvalidInput(
+                "dflash block attention spreads head_dim over 32 lanes".to_string(),
+            ));
+        }
+        if !scale.is_finite() {
+            return Err(KernelError::InvalidInput(
+                "dflash block attention scale must be finite".to_string(),
+            ));
+        }
+        let row_elements = checked_product(rows, q_heads, KvAttentionError::ShapeOverflow)?
+            .checked_mul(head_dim)
+            .ok_or(KvAttentionError::ShapeOverflow)?;
+        if queries.len() != row_elements {
+            return Err(KernelError::InvalidInput(
+                "dflash block attention query buffer has the wrong length".to_string(),
+            ));
+        }
+        let groups = q_heads / kv_heads;
+        let key_elements = |count: usize, values: &[u16]| -> Result<(), KernelError> {
+            let expected = checked_product(count, kv_heads, KvAttentionError::ShapeOverflow)?
+                .checked_mul(head_dim)
+                .ok_or(KvAttentionError::ShapeOverflow)?;
+            if values.len() != expected {
+                return Err(KernelError::InvalidInput(
+                    "dflash block attention key/value buffer has the wrong length".to_string(),
+                ));
+            }
+            Ok(())
+        };
+        key_elements(n_ctx, ctx_keys)?;
+        key_elements(n_ctx, ctx_values)?;
+        key_elements(rows, block_keys)?;
+        key_elements(rows, block_values)?;
+        if key_positions.len() != n_ctx + rows {
+            return Err(KernelError::InvalidInput(
+                "dflash block attention needs one position per context and block row".to_string(),
+            ));
+        }
+        if groups > 32 {
+            return Err(KernelError::InvalidInput(
+                "dflash block attention caps q_heads/kv_heads at 32 simdgroups".to_string(),
+            ));
+        }
+        let query_buffer = self.make_u16_buffer(queries)?;
+        let ctx_key_buffer = self.make_u16_buffer(ctx_keys)?;
+        let ctx_value_buffer = self.make_u16_buffer(ctx_values)?;
+        let block_key_buffer = self.make_u16_buffer(block_keys)?;
+        let block_value_buffer = self.make_u16_buffer(block_values)?;
+        let position_buffer = self.make_u32_buffer(key_positions)?;
+        let output = self.device.new_buffer(
+            (row_elements * size_of::<u16>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let params = DflashBlockParams {
+            rows: to_u32(rows, "dflash block rows")?,
+            n_ctx: to_u32(n_ctx, "dflash context rows")?,
+            q_heads: to_u32(q_heads, "dflash query heads")?,
+            kv_heads: to_u32(kv_heads, "dflash kv heads")?,
+            head_dim: to_u32(head_dim, "dflash head dim")?,
+            scale,
+            window: to_u32(window, "dflash attention window")?,
+            bidirectional: u32::from(bidirectional),
+        };
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        encoder.set_compute_pipeline_state(&self.dflash_block_pipeline);
+        encoder.set_buffer(0, Some(&query_buffer), 0);
+        encoder.set_buffer(1, Some(&ctx_key_buffer), 0);
+        encoder.set_buffer(2, Some(&ctx_value_buffer), 0);
+        encoder.set_buffer(3, Some(&block_key_buffer), 0);
+        encoder.set_buffer(4, Some(&block_value_buffer), 0);
+        encoder.set_buffer(5, Some(&position_buffer), 0);
+        encoder.set_buffer(6, Some(&output), 0);
+        encoder.set_bytes(
+            7,
+            size_of::<DflashBlockParams>() as u64,
+            &params as *const DflashBlockParams as *const c_void,
+        );
+        let threads = (32 * groups) as u64;
+        encoder.dispatch_thread_groups(
+            MTLSize::new((rows * kv_heads) as u64, 1, 1),
+            MTLSize::new(threads, 1, 1),
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(KernelError::CommandFailed);
+        }
+        read_u16_buffer(&output)
     }
 
     fn make_u16_buffer(&self, values: &[u16]) -> Result<Buffer, KernelError> {

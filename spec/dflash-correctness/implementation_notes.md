@@ -282,3 +282,62 @@ cargo test -p kaplumba-engine --release --test dflash_load
 cargo test -p kaplumba-engine --release --test elements_metal
 cargo check -p kaplumba-engine --release
 ```
+
+## 2026-10-11 — T3 (part 1): `dflash_block_attn` Metal kernel
+
+`online_attention` **cannot** express the drafter's `full_attention` layer: its
+liveness test is unconditional (`k_abs <= q_abs`, `attention.metal:836`), so a
+bidirectional block is unreachable. z-lab's reference has that layer bidirectionally
+(`dflash/model.py:367`, `_attention_mask` with `is_causal=False` and
+`sliding_window=None` adds no branch), and the plan says implement z-lab. So a
+new kernel: `dflash_block_attn` in `crates/kernels/src/attention.metal`.
+
+Design (follows the repo's no-score-matrix rule, AGENTS.md §8): one
+threadgroup per (block row, kv head), `q_heads/kv_heads` simdgroups, one per
+query head in the group, 32 lanes each owning `head_dim/32` dimensions, online
+softmax in fp32. Threads per threadgroup = `32 * q_heads/kv_heads` = 256 for the
+real shapes (64/8). Capped at 32 simdgroups on the host side.
+
+`crates/kernels/src/attention.rs` gained `DflashBlockRequest` (queries,
+`ctx_keys`/`ctx_values`, `block_keys`/`block_values`, `key_positions` of length
+`n_ctx + rows`, `rows`, `n_ctx`, `q_heads`, `kv_heads`, `head_dim`, `scale`,
+`window`, `bidirectional`) and `AttentionKernels::dflash_block_attention`.
+
+### Two real kernel bugs, both found by the tests rather than by reading
+
+1. **`simd_shuffle_down` tree left only lane 0 holding the sum.** The original
+   code did `dot += simd_shuffle_down(dot, offset)` for 16,8,4,2,1 and then a
+   *no-op* `simd_broadcast(dot, 0) * 0.0f`. The online softmax merges `m`, `l`
+   and `acc` **across lanes**, so a lane holding a partial sum corrupts the
+   normaliser. Symptom: every output was exactly `0` (because `l` stayed 0 after
+   the second bug). Fixed with `dot = simd_sum(dot)`, a butterfly that leaves
+   all 32 lanes with the true total.
+2. **`m_new = simd_max(m)` omitted the current key.** On the first key
+   `m == -inf`, so `m_new == -inf` and the code hit an `if (m_new == -inf)
+   continue` — every first key was dropped and the row normalised against
+   nothing. Fixed to `m_new = max(m, score)`; since `score` is uniform across
+   the simdgroup this is a scalar max, no reduction.
+
+### Sabotage evidence (R8, `crates/engine/tests/dflash_block_attention.rs`)
+
+| sabotage | failing test | message |
+|---|---|---|
+| `bidirectional` flag ignored (always causal) | `dflash_block_attention_matches_host_in_every_mask_mode` | `full_attention (bidirectional)[0] expected 0.21587108 actual 0.2244873` |
+| `window` ignored (always open) | both the mask-mode test and `..._window_is_narrower_than_causal` | `window 1 barely differs from no window (0 of 16384 elements)` |
+
+Both reverted, green.
+
+### Agreement numbers (fp16, 128-dim dots)
+
+```
+full_attention (bidirectional): worst diff 0.000122   (vs scalar host reference)
+sliding_attention window 2048:   worst diff 0.000122
+sliding_attention window 4:      worst diff 0.000244
+window 1 (own-position only):    worst diff 0.000000
+dflash kernel vs online_attention (independent causal path): 0.000122
+```
+
+The cross-check against `online_attention` is the one worth keeping: two
+independent implementations of the same causal-plus-window mask agreeing to
+1.2e-4 is strong evidence the mask is right, and it is the only test that would
+catch a bug shared between the kernel and the host reference.
