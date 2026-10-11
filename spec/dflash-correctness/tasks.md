@@ -105,11 +105,18 @@ Update this file **immediately** after each task (AGENTS.md §3.3).
 
 ## Target-side feature export
 
-- [ ] **T7 — tap export.** `model.rs::forward_chunk` gains an optional tap
-      sink; `[1, 12, 23, 35, 46, 57]` blits out of `hidden_a`/`hidden_b`.
-      Tap buffers added to `ensure_scratch`. **Tested by**: R5's
-      `KAPLUMBA_GPU_PROFILE` A/B, and a tap-`[0]` comparison against
-      `hidden_states_all`.
+- [x] **T7 — tap export.** `TextModel::enable_taps` / `take_taps` / `tap_layers`
+      plus an opt-in `TapScratch` (66 MB for six taps, deliberately NOT in
+      `ForwardScratch` so the default path does not pay it). The blit sits inside
+      `forward_chunk`'s layer loop and **selects its ping-pong source per layer**
+      (`hidden_b` for even, `hidden_a` for odd) — the taps
+      `[1, 12, 23, 35, 46, 57]` are four odd and two even, so a hardcoded source is
+      wrong for two of six. **Tested by** `crates/engine/tests/dflash_taps.rs`
+      (ignored; needs `KAPLUMBA_TEST_MODEL`): shape+signal, bitwise-identical
+      logits with taps on/off, the parity check, and request order. **Passes:**
+      tap[1] vs tap[2] differ on 75180/75264 elements. **Sabotage:** hardcoding
+      the source to `hidden_a` makes them differ on **0/75264** and fails the
+      parity assertion. *(uncommitted)*
 - [ ] **T8 — chunked prefill streaming.** Stream each prefill chunk's taps into
       the drafter cache and release. **Tested by**: the chunk-vs-prompt-length
       invariance test.

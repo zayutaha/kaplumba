@@ -3161,6 +3161,24 @@ mod head_pick_tests {
 /// Sizes depend only on the configured chunk length, never on the context
 /// length, so steady-state decoding allocates nothing and the working set stays
 /// constant as the conversation grows.
+/// DFlash tap buffers (spec/dflash-correctness T7): the target's post-layer
+/// hidden states at the drafter's `target_layer_ids`.
+///
+/// One buffer per tap layer, each `max_tokens * hidden` F16, where `max_tokens`
+/// is at most [`PREFILL_CHUNK`] and never the prompt length — so the footprint is
+/// fixed and context-independent like every other buffer here (AGENTS.md §8).
+///
+/// Deliberately **not** part of [`ForwardScratch`]: 6 x 1024 x 5376 x 2 = 66 MB,
+/// and the default path must not pay for a feature it does not use. A caller opts
+/// in with [`Model::enable_taps`].
+pub struct TapScratch {
+    /// Layer indices captured, ascending as given.
+    pub layers: Vec<usize>,
+    /// `buffers[i]` holds `layers[i]`'s post-layer hidden state for the last
+    /// chunk forward.
+    pub buffers: Vec<Buffer>,
+}
+
 pub struct ForwardScratch {
     pub max_tokens: usize,
     pub hidden_a: Buffer,
@@ -3418,6 +3436,9 @@ pub struct TextModel {
     final_norm_buffer: Buffer,
     scratch: ForwardScratch,
     scratch_tokens: usize,
+    /// T7: target-hidden-state taps, captured in-loop by [`Self::forward_chunk`].
+    /// `None` unless [`Self::enable_taps`] was called.
+    taps: Option<TapScratch>,
     /// MEASUREMENT AID: destination for the injected `spin_burn` dispatch, and
     /// the thread count it is dispatched with. Allocated lazily, and only when
     /// `KAPLUMBA_DECODE_INJECT` asks for it, so a normal process does not carry
@@ -3566,6 +3587,7 @@ impl TextModel {
             final_norm_buffer,
             scratch,
             scratch_tokens: 1,
+            taps: None,
             spin_scratch: None,
             _residency_set: residency_set,
         })
@@ -4766,6 +4788,25 @@ impl TextModel {
                 &mut timer,
                 gpu,
             )?;
+            // T7: capture this layer's post-layer hidden state if it is a tap.
+            //
+            // `output` is where `forward_buffer` just wrote layer `index`'s
+            // result, and its identity alternates (hidden_b for even layers,
+            // hidden_a for odd) -- so the source must be selected, not assumed.
+            // The taps in the checkpoint are [1, 12, 23, 35, 46, 57], which is
+            // four odd and two even: hardcoding hidden_a is right for four of six
+            // and silently wrong for the other two.
+            //
+            // This cannot be done after the loop. `hidden_states_all` reads the
+            // *final* layer's state once the chunk is done; intermediate layers'
+            // states are overwritten by the ping-pong before then.
+            if let Some(taps) = self.taps.as_ref() {
+                if let Some(slot) = taps.layers.iter().position(|layer| *layer == index) {
+                    self.elements
+                        .encode_copy(encoder, output, &taps.buffers[slot], tokens * hidden)
+                        .map_err(ModelError::from)?;
+                }
+            }
             if profile {
                 // Per-layer host-flush cost. `phase` is read but not reset here:
                 // it is the start of this layer, and resetting per layer would
@@ -5190,6 +5231,86 @@ impl TextModel {
     /// surface for "did a long prompt sneak past the chunking".
     pub fn scratch_max_tokens(&self) -> usize {
         self.scratch.max_tokens
+    }
+
+    /// T7: start exporting the target's post-layer hidden states at `layers`.
+    ///
+    /// `layers` are 0-based `DecoderLayer` indices in the DFlash config's
+    /// `target_layer_ids` order — the order is load-bearing, because the
+    /// drafter's `fc` was trained on that exact concatenation. Capture happens
+    /// inside [`Self::forward_chunk`]'s layer loop, so it works for prefill
+    /// chunks and single decode steps alike.
+    ///
+    /// Allocates `layers.len()` buffers of `scratch_max_tokens() * hidden_size`
+    /// F16. That is 66 MB for the six DFlash taps, and it is why this is opt-in
+    /// rather than part of `ForwardScratch`: the default path must not carry it.
+    pub fn enable_taps(&mut self, layers: &[usize]) -> Result<(), ModelError> {
+        if layers.is_empty() {
+            self.taps = None;
+            return Ok(());
+        }
+        for layer in layers {
+            if *layer >= self.layers.len() {
+                return Err(ModelError::InvalidInput(format!(
+                    "tap layer {layer} is outside the model's {} layers",
+                    self.layers.len()
+                )));
+            }
+        }
+        let device = system_device()?;
+        let max_tokens = self.scratch.max_tokens;
+        let bytes = (max_tokens * self.hidden_size * std::mem::size_of::<u16>()) as u64;
+        let buffers = (0..layers.len())
+            .map(|_| device.new_buffer(bytes, metal::MTLResourceOptions::StorageModeShared))
+            .collect();
+        self.taps = Some(TapScratch {
+            layers: layers.to_vec(),
+            buffers,
+        });
+        Ok(())
+    }
+
+    /// The tap layers currently enabled, in capture order.
+    pub fn tap_layers(&self) -> &[usize] {
+        self.taps.as_ref().map_or(&[], |taps| taps.layers.as_slice())
+    }
+
+    /// Read back the `tokens`-row taps captured by the most recent
+    /// [`Self::forward_chunk`], one buffer per requested layer, in order.
+    ///
+    /// Returns `tokens * hidden_size` F16 per layer — the post-layer state
+    /// *before* the final norm, which is what the drafter's `fc` expects
+    /// (z-lab's `extract_context_feature` reads `hidden_states`, not the normed
+    /// stream).
+    pub fn take_taps(&self, tokens: usize) -> Result<Vec<Vec<u16>>, ModelError> {
+        let taps = self.taps.as_ref().ok_or_else(|| {
+            ModelError::InvalidConfig("taps were not enabled; call enable_taps first".to_string())
+        })?;
+        if tokens == 0 || tokens > self.scratch.max_tokens {
+            return Err(ModelError::InvalidInput(format!(
+                "cannot read {tokens} tap rows from a {}-row scratch",
+                self.scratch.max_tokens
+            )));
+        }
+        let width = tokens * self.hidden_size;
+        let mut out = Vec::with_capacity(taps.buffers.len());
+        for buffer in &taps.buffers {
+            if buffer.length() < (width * std::mem::size_of::<u16>()) as u64 {
+                return Err(ModelError::InvalidConfig(
+                    "tap buffer is smaller than the requested row count".to_string(),
+                ));
+            }
+            let mut rows = vec![0u16; width];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    buffer.contents() as *const u16,
+                    rows.as_mut_ptr(),
+                    width,
+                );
+            }
+            out.push(rows);
+        }
+        Ok(out)
     }
 
     pub fn gpu_next_position(&self) -> usize {

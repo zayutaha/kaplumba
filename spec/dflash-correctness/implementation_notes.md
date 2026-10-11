@@ -791,3 +791,246 @@ Notes that cost real time to establish and should not be re-derived:
 - `ensure_scratch` resolves its device handle inside its own body (via the
   `u16_elements`/`f32_elements` helpers). **I did not confirm that idiom** — read
   `model.rs:5165-5300` first; it is the only unknown left in T7.
+
+## 2026-10-11 — MEASURED: the M=16 verify floor is ~545 ms, so 40 tok/s is out of reach
+
+The one measurement everything hinged on. Prefill short prompts and read `ttft_ms`:
+
+| prompt tokens | ttft ms |
+|---|---|
+| 25 | **543.9** |
+| 28 | **548.1** |
+| 62 | 1351.9 |
+| 445 | 5189.2 |
+
+**25 and 28 tokens cost the same (543.9 vs 548.1 ms).** So `ttft` for a small prompt
+is a *fixed floor of ~545 ms*, not a per-token cost — the batch is padded or the
+chunk is padded, and an M=16 verify sits inside that floor. This is the number
+that supersedes the "~300-550 ms" estimate above; it is the pessimistic end.
+
+### Final round arithmetic
+
+| stage | cost | basis |
+|---|---|---|
+| 35 per-layer projections | 78.89 ms | measured (T12) |
+| `fc` | 8.72 ms | measured (T12) |
+| head, ~15 rows | ~37 ms | 1.05 GB at a prefill-like rate |
+| verify, M=16 | **~545 ms** | **measured floor** |
+
+Round = ~125 ms drafting + ~545 ms verify = **~670 ms for at most 15 tokens =
+~22 tok/s at 100% acceptance.** Against the measured 15.4 tok/s baseline that is
+**1.4x**.
+
+**40 tok/s needs 15 tokens per 375 ms, i.e. a verify at <= ~250 ms.** The measured
+floor is 545 ms, so 40 tok/s requires the M=16 prefill path to get ~2.2x faster
+than it currently is. It is not reachable by anything in this spec: the drafter is
+19% of a round and the verify floor alone is 15% more than the entire 375 ms
+budget. This is now a GEMM/prefill-efficiency question, not a DFlash question.
+
+### Caveats
+
+- `sysctl vm.swapusage`: 5275 MB in use, `sys_free_pct_min=18`. Still memory
+  pressure. But the two short-prompt runs agree with each other to 4 ms, so the
+  ~545 ms floor is robust to it in a way a single reading would not be.
+- All runs used `KAPLUMBA_FORCE_LOAD=1`.
+- The 62- and 445-token rows show cost *rising* with length past the floor, so
+  545 ms is a floor for M<=~28 and not a general prefill rate.
+
+### Bottom line for the spec
+
+DFlash as specified is worth ~1.4x (22 vs 15.4 tok/s), not the 10x its shape
+implies, and the ceiling is set by the target's M=16 prefill path. T7-T11 are
+still the only way to *confirm* the 1.4x, but they cannot exceed it. If 40 tok/s
+is the goal, the work is a faster M=16 tiled GEMM / prefill, and this spec should
+be paused rather than extended.
+
+## 2026-10-11 — HARD RESULT: 25 tok/s is impossible without speculation, and needs 100% acceptance with it
+
+### The bandwidth wall (measured weights, measured peak)
+
+```
+weights on disk:  8.498 + 7.529 GB = 16.03 GB   (the two safetensors shards)
+box peak:         273 GB/s
+```
+
+Every decode step must read all 16.03 GB of weights, so:
+
+```text
+theoretical max decode at 100% of peak = 16.03e9 / 273e9 = 58.7 ms/token = 17.0 tok/s
+measured decode                       = 15.4 tok/s  = 87% of that ceiling
+25 tok/s needs 401 GB/s  -> more than the hardware can do
+40 tok/s needs 641 GB/s  -> likewise
+```
+
+**25 tok/s is physically unreachable by single-token decode** — not "hard", not
+"needs a better kernel": it would require 1.47x the memory bandwidth this machine
+has, and the existing path is already at 87% of peak. The same is true of the
+earlier 40 tok/s request.
+
+So 25 tok/s **requires** emitting more than one token per weight read. That is
+what speculative decoding is for, and it is the only route.
+
+### But DFlash at block_size=16 cannot reach it either
+
+A round is `draft + verify` and yields at most 15 tokens (anchor dropped):
+
+```text
+draft                      ~125 ms   (measured: 78.89 projections + 8.72 fc + ~37 head)
+verify, M=16               ~545 ms   (measured floor)
+round                      ~670 ms
+tokens per second at 100% acceptance = 15 / 0.670 = 22.4 tok/s
+```
+
+**25 tok/s needs a round of <= 600 ms** (15 / 0.600 = 25.0). With the verify floor
+at 545 ms that leaves **<= 55 ms for drafting, against the measured 125 ms**, i.e.
+drafting must drop by **2.3x**, and acceptance must be **100%**.
+
+Both conditions are required and neither is sufficient alone. In practice
+acceptance will not be 100%, so:
+
+| acceptance | round needed for 25 tok/s | implication |
+|---|---|---|
+| 100% (15 tok) | 600 ms | drafting must be <= 55 ms |
+| 90% (13.5 tok avg) | 540 ms | drafting must be <= 0 (already impossible) |
+
+At 90% acceptance, 25 tok/s is out of reach **regardless of drafting cost**,
+because the verify floor alone exceeds the budget.
+
+### What would actually get there
+
+1. **Raise `block_size`.** This is the single highest-leverage change and it was
+   not in the spec. At M=32 the verify is a ~700-900 ms pass (bounded by the
+   measured 62-token pass at 1352 ms) for up to 31 tokens: `31 / (0.8 + 0.25) =
+   29.5 tok/s` at 100% acceptance, and still ~26 tok/s at 90%. That clears the
+   target with margin, from the *same drafter checkpoint semantics* the paper's
+   §5.5.4 says generalises down from b16. This is worth measuring before anything
+   else.
+2. **Cut the drafting cost.** The drafter's M=16 path runs at 9.9 GB/s where the
+   target's colmajor path reaches 28-46 GB/s — ~3-4x of real headroom in the same
+   kernel family (T12). This converts the 78.89 ms of projections into ~20-25 ms.
+3. **Accept that 25 tok/s is a speculation-only number.** Any plan that reaches it
+   by tuning the decode path is chasing 401 GB/s on a 273 GB/s machine.
+
+### Status of the spec against this target
+
+T7-T11 are still unimplemented, so no end-to-end DFlash tok/s exists. Even
+completed, at block_size=16 they top out at ~22 tok/s. **The measured evidence says
+the spec should be re-scoped around `block_size` before T7-T11 are built**, because
+block_size decides whether 25 tok/s is reachable at all and it is a config/verify-shape
+question rather than a drafter question.
+
+## 2026-10-11 — BREAKTHROUGH: the verify is PADDED TO A POWER OF TWO, so block_size=32 doubles throughput for ~free
+
+### The measurement
+
+Prefill cost vs prompt length (all `--max-new-tokens 1`, `Gxma-repacked`):
+
+| prompt tokens | ttft ms |
+|---|---|
+| 25 | 543.9 |
+| 28 | 548.1 |
+| **30** | **595.2** |
+| — boundary — | |
+| **36** | **1325.4** |
+| 37 | 1323.8 |
+| 39 | 1328.0 |
+| 43 | 1329.9 |
+| 62 | 1351.9 |
+| 445 | 5189.2 |
+
+**This is a step function, and the step is exactly at 32.** 25-30 tokens cost
+~545-595 ms; 36-62 tokens cost ~1324-1352 ms. The engine pads the prefill batch to
+a power of two, so **anything up to 32 rows costs the same as 16.**
+
+### Why that decides the target
+
+An M=16 verify (block_size=16 → 15 draft tokens) and an M=32 verify (→ **31** draft
+tokens) sit in the **same 545-600 ms bucket**. Doubling the block roughly doubles
+the tokens per round for ~50 ms of extra verify.
+
+Derived from the measured M=16 numbers (78.89 ms projections = 4.93 ms/row,
+~2.4 ms/row head), with verify from the table above:
+
+| block_size | verify ms | draft ms | round ms | 100% acc | 90% acc | 80% acc |
+|---|---|---|---|---|---|---|
+| 16 | 545 | 126 | 671 | 22.4 | 20.1 | 17.9 |
+| **32** | **~595** | **~242** | **~837** | **~37** | **~33** | **~29** |
+| 64 | 1325 | 478 | 1803 | 34.9 | 31.5 | 28.0 |
+
+**block_size=32 clears 25 tok/s even at 80% acceptance (~29 tok/s).**
+**block_size=16 cannot reach 25 tok/s even at 100% acceptance (22.4).**
+
+So the answer to "get it to 25 tok/s" is not a kernel optimisation and not the
+round loop: it is **block_size**. At 16 the target is arithmetically impossible; at
+32 it is reached with ~20% of headroom to spare. 64 is worse than 32 because it
+pays for the next padded bucket.
+
+### The risk, and the mitigation
+
+The checkpoint was trained at b16, and the paper's §5.5.4 only claims a b16-trained
+drafter **generalises down** to b8. Interpreting its geometry at b32 is not
+supported and may cost acceptance — which is why the 80% column matters, and 29
+tok/s there is still above target.
+
+A safer route to the same 31 tokens that stays on the trained b16 geometry: **run
+the drafter block twice per round** (15 drafts, then re-anchor on the 15th and draft
+15 more), concatenate both blocks' rows into one M=32 verify, and feed block 1's
+own K/V into the cache for block 2. `DflashBlock` already hands back
+`block_keys`/`block_values` for exactly this, so the plumbing exists; what does not
+is a caller that uses them.
+
+### Consequence for the spec
+
+T7-T11 should be re-scoped to **block_size=32** before being built. Building them
+at 16 would produce the best possible implementation of a configuration that
+cannot hit the target (22 tok/s ceiling), which is why this measurement had to come
+before the pipeline rather than after it.
+
+Caveats: the M=32 verify figure is read from the 30-token row (595.2 ms) and the
+drafter's M=32 cost is scaled linearly from its measured M=16 cost, not measured.
+Both should be confirmed with the drafter benchmark extended to M=32 before the
+round is built.
+
+## 2026-10-11 — T7 landed: target tap export
+
+`TextModel::enable_taps(&[usize])` / `take_taps(tokens) -> Vec<Vec<u16>>` /
+`tap_layers()`, plus `TapScratch`. The capture is a GPU->GPU `encode_copy`
+(`elements.rs:1776`) inside `forward_chunk`'s layer loop, after
+`forward_buffer` returns and before the profiling block.
+
+**The one non-obvious thing: the blit must select its ping-pong source per
+layer.** Layer `k` writes `hidden_b` when `k` is even and `hidden_a` when `k` is
+odd (`model.rs:4808`), so the offset written for layer `index` is `output`. The
+DFlash taps are `[1, 12, 23, 35, 46, 57]` — four odd, two even — so a hardcoded
+`hidden_a` is right for four of the six and silently wrong for the other two.
+
+It also **cannot** be done after the loop: `hidden_states_all` reads the *final*
+layer's state once a chunk completes, but intermediate layers are overwritten by
+the ping-pong before then. That is why this is in-loop and why T7 had no existing
+precedent to copy.
+
+`TapScratch` is deliberately **not** a field of `ForwardScratch`: six taps is
+6 x 1024 x 5376 x 2 = 66 MB, and the default path must not carry it (AGENTS.md §8,
+and the 12.96 GiB footprint budget is measured). `enable_taps(&[])` releases it.
+
+### Test and sabotage evidence (AGENTS.md §3.4)
+
+`crates/engine/tests/dflash_taps.rs`, `#[ignore]`d (needs `KAPLUMBA_TEST_MODEL`),
+one test with four assertions:
+
+| property | passing | sabotaged (source hardcoded to `hidden_a`) |
+|---|---|---|
+| shape + signal | 2 buffers, `rows * hidden` each, non-zero | — |
+| forward unperturbed | logits bitwise identical with taps on/off | **still passed** |
+| parity | tap[1] vs tap[2] differ on **75180/75264** | differ on **0/75264** -> FAILED |
+| request order | `[2,1]` returns the layers swapped | — |
+
+Note the second row: the perturbation check **still passed under the sabotage**,
+which is the point of having the parity assertion. Reading the wrong buffer does
+not corrupt the forward; it silently mislabels the data, and only a check on the
+*tap contents* can see it. Run command:
+
+```bash
+KAPLUMBA_TEST_MODEL=~/.kaplumba/models/Gxma-repacked \
+  cargo test -p kaplumba-engine --release --test dflash_taps -- --ignored --nocapture
+```
