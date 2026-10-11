@@ -443,6 +443,10 @@ pub struct LinearKernels {
     mrhs_exl3_m8: ComputePipelineState,
     mrhs_exl3_m16: ComputePipelineState,
     finalize_rows_pipeline: ComputePipelineState,
+    /// `linear_finalize_rows_f32`. Same pass as `finalize_rows_pipeline` but the
+    /// output stays f32. Used only by the DFlash drafter, whose residual stream
+    /// exceeds fp16's range; see `linear.metal:linear_finalize_rows_f32`.
+    finalize_rows_f32_pipeline: ComputePipelineState,
     zero_raw_pipeline: ComputePipelineState,
     gemv_reduce_sk2_pipeline: Option<ComputePipelineState>,
     gemv_reduce_sk4_pipeline: Option<ComputePipelineState>,
@@ -743,6 +747,8 @@ impl LinearKernels {
             pipeline_audit::build(&device, &library, "linear_gemv_mrhs_exl3_k3_mcg_m16")?;
         let finalize_rows_pipeline =
             pipeline_audit::build(&device, &library, "linear_finalize_rows")?;
+        let finalize_rows_f32_pipeline =
+            pipeline_audit::build(&device, &library, "linear_finalize_rows_f32")?;
         let zero_raw_pipeline = pipeline_audit::build(&device, &library, "linear_zero_raw")?;
         // `Option`, so a build without the standalone split-K reduce kernels
         // still starts. Nothing in the engine dispatches them -- the fused
@@ -803,6 +809,7 @@ impl LinearKernels {
             mrhs_exl3_m8,
             mrhs_exl3_m16,
             finalize_rows_pipeline,
+            finalize_rows_f32_pipeline,
             zero_raw_pipeline,
             gemv_reduce_sk2_pipeline,
             gemv_reduce_sk4_pipeline,
@@ -1154,6 +1161,117 @@ impl LinearKernels {
             return Err(KernelError::CommandFailed);
         }
         Ok((read_u16_buffer(&output)?, stats))
+    }
+
+    /// [`Self::gemm_chunk_buffer`] with an **f32** output.
+    ///
+    /// Byte-for-byte the same three dispatches (`input_rows`, the tiled GEMV into
+    /// the f32 `raw` accumulator, then the finalize) except that the finalize is
+    /// `linear_finalize_rows_f32`, so the result is never narrowed to half. The
+    /// `transform_vector` and output-sign steps are identical, so this agrees
+    /// bit-for-bit with the f16 path wherever the f16 path does not overflow.
+    ///
+    /// The DFlash drafter needs this: its residual stream reaches ~1.5e5, past
+    /// fp16's 65504, so storing `o_proj`/`down_proj` outputs as half drives the
+    /// block to `inf` and then `NaN`.
+    /// `reference/exllamav3/exllamav3/architecture/dflash.py:277,308` runs
+    /// exactly those two in fp32 for the same reason.
+    pub fn gemm_chunk_buffer_f32(
+        &self,
+        request: LinearBufferRequest<'_>,
+    ) -> Result<Vec<f32>, KernelError> {
+        let LinearBufferRequest {
+            packed,
+            packed_offset,
+            input,
+            input_signs,
+            output_signs,
+            in_features,
+            out_features,
+            rate,
+            codebook,
+        } = request;
+        let tokens = input.len() / in_features.max(1);
+        validate_buffer_shape(
+            packed.length().saturating_sub(packed_offset),
+            packed_offset,
+            input.len(),
+            input_signs.len(),
+            output_signs.len(),
+            in_features,
+            out_features,
+            rate,
+            codebook,
+        )?;
+        let input_buffer = self.make_buffer(input)?;
+        let input_sign_buffer = self.make_buffer(input_signs)?;
+        let output_sign_buffer = self.make_buffer(output_signs)?;
+        let input_elements = input.len();
+        let output_elements = checked_product(tokens, out_features, "buffer output")?;
+        let transformed = self.device.new_buffer(
+            size_of_val(input) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let raw = self.device.new_buffer(
+            (output_elements * size_of::<f32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        zero_f32_buffer(&raw, output_elements)?;
+        let output = self.device.new_buffer(
+            (output_elements * size_of::<f32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let row_params = PrefillRowParams {
+            in_features: to_u32(in_features, "input dimension")?,
+            out_features: to_u32(out_features, "output dimension")?,
+            queries: to_u32(tokens, "query count")?,
+            perm_mode: 0u32,
+        };
+        let linear_params = LinearParams {
+            in_features: to_u32(in_features, "input dimension")?,
+            out_features: to_u32(out_features, "output dimension")?,
+            tile_columns: to_u32(out_features / 16, "tile column count")?,
+            packed_words: to_u32(rate.packed_words(), "packed shape")?,
+            rate: rate.encoded(),
+            codebook: codebook.encoded(),
+            queries: to_u32(tokens, "query count")?,
+            perm_mode: 0u32,
+        };
+        let command_buffer = self.queue.new_command_buffer();
+        let encoder = command_buffer.new_compute_command_encoder();
+        self.encode(
+            encoder,
+            &self.input_rows_pipeline,
+            &[
+                Some(&input_buffer),
+                Some(&input_sign_buffer),
+                Some(&transformed),
+            ],
+            params_bytes(&row_params),
+            (input_elements / 128) as u64,
+        );
+        self.encode_groups(
+            encoder,
+            &self.gemv_tiled_pipeline,
+            &[Some(packed), Some(&transformed), Some(&raw)],
+            params_bytes(&linear_params),
+            (out_features / 16) as u64,
+            tokens.div_ceil(16) as u64,
+        );
+        self.encode(
+            encoder,
+            &self.finalize_rows_f32_pipeline,
+            &[Some(&raw), Some(&output_sign_buffer), Some(&output)],
+            params_bytes(&row_params),
+            (output_elements / 128) as u64,
+        );
+        encoder.end_encoding();
+        command_buffer.commit();
+        command_buffer.wait_until_completed();
+        if command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(KernelError::CommandFailed);
+        }
+        read_f32_buffer(&output)
     }
 
     pub fn gemm_chunk(&self, request: PrefillRequest<'_>) -> Result<Vec<u16>, KernelError> {
@@ -4192,4 +4310,16 @@ fn read_u16_buffer(buffer: &Buffer) -> Result<Vec<u16>, KernelError> {
         return Err(KernelError::CommandFailed);
     }
     Ok(unsafe { std::slice::from_raw_parts(pointer, length / size_of::<u16>()) }.to_vec())
+}
+
+fn read_f32_buffer(buffer: &Buffer) -> Result<Vec<f32>, KernelError> {
+    let length = buffer.length() as usize;
+    if !length.is_multiple_of(size_of::<f32>()) {
+        return Err(KernelError::CommandFailed);
+    }
+    let pointer = buffer.contents() as *const f32;
+    if pointer.is_null() {
+        return Err(KernelError::CommandFailed);
+    }
+    Ok(unsafe { std::slice::from_raw_parts(pointer, length / size_of::<f32>()) }.to_vec())
 }

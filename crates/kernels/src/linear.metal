@@ -11207,6 +11207,41 @@ kernel void linear_finalize_rows(
     }
 }
 
+// fp32-output twin of `linear_finalize_rows`. The tiled GEMV already
+// accumulates in f32 (the `raw` buffer); this keeps the result there instead of
+// narrowing to half.
+//
+// Needed by the DFlash drafter: its `o_proj` and `down_proj` outputs reach 2169
+// and 1.5e5, past fp16's 65504, and exllamav3 runs exactly those two in fp32
+// (`reference/exllamav3/exllamav3/architecture/dflash.py:277,308`). Note this is
+// the *only* dtype that changes vs the f16 path -- `transform_vector` and the
+// output signs are applied identically, so the two variants agree bit-for-bit
+// wherever the f16 one does not overflow.
+kernel void linear_finalize_rows_f32(
+    const device float *input [[buffer(0)]],
+    const device half *output_signs [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant PrefillRowParams &params [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    uint vectors_per_row = params.out_features / 128u;
+    uint total = params.queries * vectors_per_row;
+    if (gid >= total) {
+        return;
+    }
+    uint query = gid / vectors_per_row;
+    uint block = gid % vectors_per_row;
+    uint base = query * params.out_features + block * 128u;
+    uint sign_base = block * 128u;
+    float values[128];
+    for (uint i = 0; i < 128u; ++i) {
+        values[i] = input[base + i];
+    }
+    transform_vector(values);
+    for (uint i = 0; i < 128u; ++i) {
+        output[base + i] = values[i] * float(output_signs[sign_base + i]);
+    }
+}
+
 // Zeroes the f32 accumulator before a tiled prefill pass. The tiled kernel sums
 // across query tiles, so each dispatch must start from a clean buffer; doing it
 // on device keeps the whole prefill inside one command buffer.

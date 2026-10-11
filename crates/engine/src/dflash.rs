@@ -561,6 +561,29 @@ fn trace_stage(name: &str, values: &[u16]) {
     );
 }
 
+/// `trace_stage` for the f32 residual stream.
+///
+/// The drafter's residual stream is f32 precisely *because* it exceeds fp16's
+/// range, so it cannot be traced through the f16 helper: narrowing it to log it
+/// would print `inf` for the very stages under investigation.
+fn trace_stage_f32(name: &str, values: &[f32]) {
+    if std::env::var_os("KAPLUMBA_DFLASH_TRACE").is_none() {
+        return;
+    }
+    let mut bad = 0usize;
+    let mut magnitude = 0.0_f32;
+    for value in values {
+        if value.is_nan() || value.is_infinite() {
+            bad += 1;
+        }
+        magnitude = magnitude.max(value.abs());
+    }
+    eprintln!(
+        "[dflash] {name}: len={} bad={bad} max|v|={magnitude:.4}",
+        values.len()
+    );
+}
+
 /// The drafter's 5 transformer layers plus the `fc`/`hidden_norm` encoder.
 ///
 /// Mirrors z-lab's `DFlashDraftModel` (`dflash/model.py:550-607`) layer for
@@ -819,6 +842,84 @@ impl DflashModel {
         Ok(self.elements.residual_add(left, right)?)
     }
 
+    /// `gemm` with an **f32** output, for the two projections that join the
+    /// drafter's f32 residual stream.
+    ///
+    /// Only `o_proj` and `down_proj` need this. exllamav3 gives the attention
+    /// block and the GatedMLP `out_dtype = torch.float` while leaving their
+    /// inputs and the gated activation at half
+    /// (`reference/exllamav3/exllamav3/architecture/dflash.py:277,308`), and
+    /// that is exactly the split used here: everything upstream of those two
+    /// projections stays f16, so the cheap path is unchanged.
+    fn gemm_f32(&self, name: &str, input: &[u16]) -> Result<Vec<f32>, DflashError> {
+        let line = self
+            .weights
+            .line(name)
+            .map_err(|_| DflashError::Missing(name.to_string()))?;
+        if !input.len().is_multiple_of(line.in_features) {
+            return Err(DflashError::Shape(format!(
+                "{name} input has {} elements, not a multiple of {}",
+                input.len(),
+                line.in_features
+            )));
+        }
+        let metal_buffer = line.metal_buffer.as_ref().ok_or_else(|| {
+            DflashError::Kernels(format!("{name} has no GPU-resident packed buffer"))
+        })?;
+        Ok(self.linear.gemm_chunk_buffer_f32(LinearBufferRequest {
+            packed: metal_buffer,
+            packed_offset: line.metal_offset,
+            input,
+            input_signs: &line.input_signs,
+            output_signs: &line.output_signs,
+            in_features: line.in_features,
+            out_features: line.out_features,
+            rate: line.rate,
+            codebook: line.codebook,
+        })?)
+    }
+
+    /// `residual` in f32. Separate rather than generic because the point is that
+    /// this one does not narrow: by layer 0's MLP the stream is ~1.5e5, past
+    /// fp16's 65504.
+    fn residual_f32(&self, left: &[f32], right: &[f32]) -> Result<Vec<f32>, DflashError> {
+        if left.len() != right.len() {
+            return Err(DflashError::Shape(
+                "residual add needs equal lengths".to_string(),
+            ));
+        }
+        Ok(self.elements.residual_add_f32(left, right)?)
+    }
+
+    /// `rms_norm` reading the f32 residual stream and writing the f16 that the
+    /// EXL3 gemm consumes.
+    fn rms_norm_f32_in(
+        &self,
+        name: &str,
+        input: &[f32],
+        rows: usize,
+        width: usize,
+    ) -> Result<Vec<u16>, DflashError> {
+        let weight = self
+            .weights
+            .norm(name)
+            .map_err(|_| DflashError::Missing(name.to_string()))?;
+        if input.len() != rows * width {
+            return Err(DflashError::Shape(format!(
+                "{name} norm input has {} elements, expected {}",
+                input.len(),
+                rows * width
+            )));
+        }
+        Ok(self.elements.rms_norm_f32_in(
+            input,
+            weight,
+            rows,
+            width,
+            self.config.rms_norm_eps,
+        )?)
+    }
+
     /// R4/R7: fuse the target's tap rows into the drafter's hidden width.
     ///
     /// `taps` is `target_layer_ids.len()` rows-major buffers, each
@@ -907,7 +1008,10 @@ impl DflashModel {
         // takes it from the target's embedding table too
         // (`_raw_input_embeddings`, `dflash/model.py:135`) with NO sqrt(hidden)
         // scale, and the caller supplies the already-looked-up anchor row.
-        let mut hidden_state = vec![0_u16; rows * hidden];
+        // f32 from here on: the residual stream exceeds fp16's range within this
+        // block (see `gemm_f32`). The raw embedding rows are f16 weights, so they
+        // are widened once, on entry.
+        let mut hidden_state = vec![0.0_f32; rows * hidden];
         let mask_row = self.mask_embedding.as_slice();
         for row in 0..rows {
             let source = if row == 0 {
@@ -916,7 +1020,9 @@ impl DflashModel {
                 mask_row
             };
             let target = row * hidden;
-            hidden_state[target..target + hidden].copy_from_slice(source);
+            for (offset, bits) in source.iter().enumerate() {
+                hidden_state[target + offset] = half::f16::from_bits(*bits).to_f32();
+            }
         }
 
         // Positions, absolute. Context rows occupy `[position - n_ctx, position)`.
@@ -935,7 +1041,7 @@ impl DflashModel {
             let prefix = format!("layers.{layer}");
             let sliding = config.layer_is_sliding[layer];
 
-            let normed = self.rms_norm(
+            let normed = self.rms_norm_f32_in(
                 &format!("{prefix}.input_layernorm"),
                 &hidden_state,
                 rows,
@@ -1001,12 +1107,12 @@ impl DflashModel {
             })?;
 
             trace_stage(&format!("layer{layer}.attended"), &attended);
-            let projected = self.gemm(&format!("{prefix}.self_attn.o_proj"), &attended)?;
-            trace_stage(&format!("layer{layer}.attn_out"), &projected);
-            hidden_state = self.residual(&hidden_state, &projected)?;
-            trace_stage(&format!("layer{layer}.residual1"), &hidden_state);
+            let projected = self.gemm_f32(&format!("{prefix}.self_attn.o_proj"), &attended)?;
+            trace_stage_f32(&format!("layer{layer}.attn_out"), &projected);
+            hidden_state = self.residual_f32(&hidden_state, &projected)?;
+            trace_stage_f32(&format!("layer{layer}.residual1"), &hidden_state);
 
-            let mlp_normed = self.rms_norm(
+            let mlp_normed = self.rms_norm_f32_in(
                 &format!("{prefix}.post_attention_layernorm"),
                 &hidden_state,
                 rows,
@@ -1016,17 +1122,19 @@ impl DflashModel {
             let up = self.gemm(&format!("{prefix}.mlp.up_proj"), &mlp_normed)?;
             let activated = self.elements.gated_silu(&gate, &up)?;
             trace_stage(&format!("layer{layer}.activated"), &activated);
-            let down = self.gemm(&format!("{prefix}.mlp.down_proj"), &activated)?;
-            trace_stage(&format!("layer{layer}.mlp_out"), &down);
-            hidden_state = self.residual(&hidden_state, &down)?;
-            trace_stage(&format!("layer{layer}.residual2"), &hidden_state);
+            let down = self.gemm_f32(&format!("{prefix}.mlp.down_proj"), &activated)?;
+            trace_stage_f32(&format!("layer{layer}.mlp_out"), &down);
+            hidden_state = self.residual_f32(&hidden_state, &down)?;
+            trace_stage_f32(&format!("layer{layer}.residual2"), &hidden_state);
 
             block_keys.push(k_block);
             block_values.push(v_block);
         }
         let _ = q_width;
 
-        let normed = self.rms_norm("norm", &hidden_state, rows, hidden)?;
+        // Back to f16 for the caller: this is the drafter's final norm, and
+        // exllamav3 narrows at the same point (`.../dflash.py:316`).
+        let normed = self.rms_norm_f32_in("norm", &hidden_state, rows, hidden)?;
         Ok(DflashBlock {
             hidden: normed,
             block_keys,

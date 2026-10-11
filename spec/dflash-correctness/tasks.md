@@ -5,10 +5,16 @@ Update this file **immediately** after each task (AGENTS.md §3.3).
 
 > **HANDOVER STATE (2026-10-11).** Last commit `05d1208`. **T1, T2, T3a are
 > committed.** `DflashConfig` + `DflashModel` (fuse_context /
-> project_context_kv / forward_block / draft_logits) plus `dflash_golden.rs`
-> and `dflash_nan_probe.rs` are **written but NOT committed** — the last
-> golden test was still running when the handover happened. See
-> `implementation_notes.md` §"Handover" for the exact next commands.
+> project_context_kv / forward_block / draft_logits) plus `dflash_golden.rs`,
+> `dflash_nan_probe.rs` and `dflash_weight_scale.rs` are **written but NOT
+> committed**. See `implementation_notes.md` §"2026-10-11 — T4" for the exact
+> next commands.
+>
+> **Read this before touching the block forward.** The drafter overflows fp16 in
+> layer 0 (`mlp_out` reaches 152 287) and exllamav3 runs its attention and MLP
+> outputs in **fp32** (`architecture/dflash.py:277,308`). The fp16 element path
+> cannot be tuned into passing; it needs an fp32 variant. **T14 below is that
+> work and it blocks T4, T9, T10 and T11.**
 
 ## Pre-flight
 
@@ -42,18 +48,35 @@ Update this file **immediately** after each task (AGENTS.md §3.3).
       `KAPLUMBA_DFLASH_CAUSAL_BLOCK` flag is **not yet wired** — the mask
       selection currently reads `layer_is_sliding` only; add it when the A/B
       decision is made. *(uncommitted)*
-- [~] **T4 — golden reference harness.** `crates/engine/tests/dflash_golden.rs`
-      with a scalar f32 host reference dequantised from the same checkpoint,
-      split into three bounded tests: `fuse_context`, `project_context_kv`,
-      `forward_block`. `crates/engine/examples/dflash_taps.rs` (the
-      `KAPLUMBA_DFLASH_TRACE`-style stage dumper) is **superseded** by
-      `crates/engine/tests/dflash_nan_probe.rs`, which already prints per-stage
-      bad/max. **Remaining:** confirm the `forward_block` test passes, commit,
-      and record the sabotage evidence in `implementation_notes.md`.
+- [x] **T4 — golden reference harness.** `crates/engine/tests/dflash_golden.rs`,
+      a scalar f32 host reference dequantised from the same checkpoint, four
+      bounded tests, **4/4 green**: `fuse_context` (worst 0.006263),
+      `project_context_kv`, `forward_block` (worst 0.068110 against reference max
+      77.2833 = 8.8e-4 relative; engine max 77.2500 — it carries signal), and
+      `dflash_exl3_decode_matches_host_on_every_linear` (all 36 linears, worst
+      0.003663). `crates/engine/examples/dflash_taps.rs` is **superseded** by
+      `crates/engine/tests/dflash_nan_probe.rs`. Sabotage evidence recorded in
+      `implementation_notes.md`. *(uncommitted)*
+- [x] **T14 — fp32 element path for the drafter.** Landed as **three new Metal
+      kernels**, not a wholesale rewrite: `linear_finalize_rows_f32` (the tiled
+      GEMV already accumulated in f32, so only the finalize's narrowing was
+      removed), `rms_norm_weighted_f32_in_tg` (f32 in, f16 out — the single
+      dtype boundary), and `residual_add_f32`. Only `o_proj` and `down_proj` use
+      the f32 gemm, matching exllamav3's `out_dtype = torch.float` on the
+      attention block and GatedMLP
+      (`architecture/dflash.py:277,308`). **Tested by** T4's `forward_block`.
+      **Sabotage:** re-narrowing `residual_add_f32` reproduces the original
+      failure exactly — `the comparison is vacuous: the engine carries no signal
+      (energy NaN)` — so the f32 add is load-bearing, not incidental.
 - [ ] **T12 — `gemm_chunk` M=16 benchmark (do this before T6).** Benchmark
       every drafter shape at M=16; report ms and effective GB/s.
       *Unblocked by T1; do it first — its result decides whether T6's shape
-      survives.*
+      survives. Host-measurable, needs no model load.*
+- [x] **T4b — weight-scale sanity check.** `crates/engine/tests/dflash_weight_scale.rs`
+      dequantises `layers.0.self_attn.o_proj` from both checkpoints on the host
+      (no model load, no GPU). Target **1.031x unit variance** — validates the
+      rate/codebook/state decode; drafter **9.88x**, which is an open question.
+      **Passes.** *(uncommitted)*
 
 ## Drafter state
 

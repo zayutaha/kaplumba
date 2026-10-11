@@ -140,6 +140,47 @@ kernel void rms_norm_weighted_tg(
     }
 }
 
+// fp32-input twin of `rms_norm_weighted_tg`, for the DFlash drafter.
+//
+// The drafter's residual stream is f32 (it reaches ~1.5e5, past fp16's 65504),
+// so the norm has to *read* f32 -- but it still writes the f16 that the EXL3
+// gemm consumes. That split is exactly exllamav3's contract: its RMSNorm steps
+// the stream back down to half while the attention and MLP outputs stay float
+// (`reference/exllamav3/exllamav3/architecture/dflash.py:277,308`). The norm
+// output is magnitude ~1, so narrowing it here is safe.
+kernel void rms_norm_weighted_f32_in_tg(
+    const device float *input [[buffer(0)]],
+    const device half *weight [[buffer(1)]],
+    device half *output [[buffer(2)]],
+    constant NormParams &params [[buffer(3)]],
+    uint lid [[thread_position_in_threadgroup]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint tgdim [[threads_per_threadgroup]]) {
+    if (tgid >= params.rows) {
+        return;
+    }
+    threadgroup float partial[256];
+    const uint count = params.width;
+    const uint base = tgid * count;
+    float sum = 0.0f;
+    for (uint i = lid; i < count; i += tgdim) {
+        const float value = input[base + i];
+        sum += value * value;
+    }
+    partial[lid] = sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint stride = tgdim / 2u; stride > 0u; stride >>= 1u) {
+        if (lid < stride) {
+            partial[lid] += partial[lid + stride];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    const float inverse = rsqrt(partial[0] / float(count) + params.eps);
+    for (uint i = lid; i < count; i += tgdim) {
+        output[base + i] = half(input[base + i] * inverse * float(weight[i]));
+    }
+}
+
 kernel void rms_norm_residual_tg(
     const device half *input [[buffer(0)]],
     const device half *weight [[buffer(1)]],
@@ -298,6 +339,23 @@ kernel void residual_add(
         return;
     }
     output[gid] = half(float(left[gid]) + float(right[gid]));
+}
+
+// fp32 twin of `residual_add`, for the DFlash drafter's residual stream.
+//
+// The whole point of the drafter's fp32 path is that this add does not narrow:
+// by layer 0's MLP the stream is already ~1.5e5, and rounding that back to fp16
+// every layer would drive it to `inf` (fp16's ceiling is 65504).
+kernel void residual_add_f32(
+    const device float *left [[buffer(0)]],
+    const device float *right [[buffer(1)]],
+    device float *output [[buffer(2)]],
+    constant uint &count [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= count) {
+        return;
+    }
+    output[gid] = left[gid] + right[gid];
 }
 
 kernel void layer_scale(

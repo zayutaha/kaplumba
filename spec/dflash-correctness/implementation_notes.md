@@ -469,3 +469,77 @@ cargo test -p kaplumba-engine --release --test dflash_weight_scale -- --nocaptur
 unblocked, host-measurable, and it decides whether T6's shape survives;
 (2) the fp32 element path above, without which T4's third test cannot pass;
 (3) commit, then T6.
+
+## 2026-10-11 — T14 landed: the fp32 path, and T4 is green (4/4)
+
+**The blocker above is resolved, and it cost three small kernels rather than the
+element-path rewrite the first reading suggested.** The trick is in
+`linear.rs::gemm_chunk_buffer`: the M=16 prefill GEMM is not one kernel, it is
+three -- `input_rows` (f16 transform) -> the tiled GEMV into an **f32 `raw`
+accumulator** -> `linear_finalize_rows` (f32 -> f16, applying `transform_vector`
+and the output signs). The f32 result already exists in a buffer; only the last
+pass narrowed it. So the f32 GEMM output is a *new finalize kernel*, not a new
+GEMM.
+
+### What was added
+
+| file | addition | why |
+|---|---|---|
+| `crates/kernels/src/linear.metal` | `linear_finalize_rows_f32` | the f32 twin of `linear_finalize_rows`; identical apart from the output dtype |
+| `crates/kernels/src/linear.rs` | `finalize_rows_f32_pipeline`, `gemm_chunk_buffer_f32`, `read_f32_buffer` | the wrapper; same three dispatches as `gemm_chunk_buffer` |
+| `crates/kernels/src/elements.metal` | `rms_norm_weighted_f32_in_tg`, `residual_add_f32` | read the f32 stream; the norm still writes f16 |
+| `crates/kernels/src/elements.rs` | `rms_norm_f32_in`, `residual_add_f32`, `make_f32_buffer`, `read_f32_buffer` | wrappers |
+| `crates/engine/src/dflash.rs` | `gemm_f32`, `residual_f32`, `rms_norm_f32_in`, `trace_stage_f32`; `forward_block`'s `hidden_state` is now `Vec<f32>` | the drafter's residual stream never narrows |
+
+**Only `o_proj` and `down_proj` take the f32 gemm.** exllamav3 gives the attention
+block and the GatedMLP `out_dtype = torch.float` but leaves their inputs, and the
+gated activation, at half (`architecture/dflash.py:277,308`). Mirroring that split
+exactly means q/k/v/gate/up keep the fast f16 path. The single dtype boundary is
+the norm: **f32 in, f16 out** -- which is also what exllamav3 does (its norm
+writes half, and only the *final* norm steps the stream back down).
+
+`trace_stage_f32` exists because tracing the f32 stream through the f16 helper
+would narrow it to `inf` precisely for the stages under investigation.
+
+### Result
+
+```
+dflash_fuse_context_matches_host ................ ok   worst 0.006263
+dflash_context_kv_matches_host .................. ok
+dflash_forward_block_matches_host ............... ok   worst 0.068110  (ref max 77.2833 = 8.8e-4 rel)
+dflash_exl3_decode_matches_host_on_every_linear . ok   all 36 linears, worst 0.003663
+test result: ok. 4 passed; 0 failed
+```
+
+`forward_block`: engine max **77.2500** vs reference max **77.2833** — the engine
+now carries signal where it previously produced `NaN`. No regression:
+`dflash_load` 3/3, `dflash_block_attention` 3/3, `dflash_weight_scale` 1/1,
+`dflash_nan_probe` 1/1, `kaplumba-kernels` 33+5+4+4+2+1 green.
+
+### Sabotage evidence (AGENTS.md §3.4)
+
+`residual_add_f32` rewritten to narrow its result (`float(half(left + right))`) —
+i.e. undo the fix without touching anything else:
+
+```
+forward_block worst diff 0.000000 at 0 of 86016; engine max 0.0000 ... (energy NaN)
+thread 'dflash_forward_block_matches_host' panicked at dflash_golden.rs:700:5:
+the comparison is vacuous: the engine carries no signal (energy NaN)
+test result: FAILED
+```
+
+That is the *same* failure the fp32 path was introduced to fix, reproduced from
+the opposite direction, so the test can fail and the f32 add is load-bearing.
+Reverted; 4/4 green again.
+
+### Still open from this session
+
+- `crates/engine/tests/dflash_golden.rs` had **half-applied edits** from the
+  previous session (`let (in, out) = ...`, a stray `(line.0, line.1)`, an
+  unfixed `mut harness`). The first made the whole test *file* fail to compile,
+  which reads as "no tests ran" rather than "a test failed". Fixed. If a future
+  session sees a test file that will not build, check for that pattern first.
+- The 9.58x weight-RMS gap (below) is still unexplained and is not on the path to
+  T4 passing. Keep it in mind if acceptance floors.
+- `KAPLUMBA_DFLASH_CAUSAL_BLOCK` is still unwired (mask selection reads
+  `layer_is_sliding` only).

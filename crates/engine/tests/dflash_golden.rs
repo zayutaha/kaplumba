@@ -756,9 +756,8 @@ fn dflash_exl3_decode_matches_host_on_every_linear() {
         let (in_features, out_features) = if name == "fc" {
             (harness.config.tap_width(), hidden)
         } else {
-            let (in, out) = harness.model.gemv_shape(name);
-            (in, out)
-            (line.0, line.1)
+            let (in_features, out_features) = harness.model.gemv_shape(name);
+            (in_features, out_features)
         };
         let host = HostLinear::build(&harness.dir, name, in_features, out_features);
         // Smooth rows, small enough to stay inside fp16 for the wide projections.

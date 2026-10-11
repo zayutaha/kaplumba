@@ -200,6 +200,12 @@ pub struct ElementKernels {
     /// Threadgroup-per-row variants, used when `rows` is small. See the kernels
     /// for why the per-row variants collapse at `rows == 1`.
     rms_norm_weighted_tg_pipeline: ComputePipelineState,
+    /// `rms_norm_weighted_f32_in_tg`: reads an f32 stream, writes f16. For the
+    /// DFlash drafter, whose residual stream is f32 but whose EXL3 gemm input
+    /// must be f16.
+    rms_norm_weighted_f32_in_tg_pipeline: ComputePipelineState,
+    /// `residual_add_f32`: the drafter's residual stream must not narrow to f16.
+    residual_add_f32_pipeline: ComputePipelineState,
     rms_norm_unweighted_tg_pipeline: ComputePipelineState,
     rms_norm_residual_tg_pipeline: ComputePipelineState,
     rms_norm_residual_layer_scale_tg_pipeline: ComputePipelineState,
@@ -320,6 +326,9 @@ impl ElementKernels {
         let rms_norm_weighted_pipeline = pipeline(&device, &library, "rms_norm_weighted")?;
         let rms_norm_unweighted_pipeline = pipeline(&device, &library, "rms_norm_unweighted")?;
         let rms_norm_weighted_tg_pipeline = pipeline(&device, &library, "rms_norm_weighted_tg")?;
+        let rms_norm_weighted_f32_in_tg_pipeline =
+            pipeline(&device, &library, "rms_norm_weighted_f32_in_tg")?;
+        let residual_add_f32_pipeline = pipeline(&device, &library, "residual_add_f32")?;
         let rms_norm_unweighted_tg_pipeline =
             pipeline(&device, &library, "rms_norm_unweighted_tg")?;
         let rms_norm_residual_tg_pipeline = pipeline(&device, &library, "rms_norm_residual_tg")?;
@@ -356,6 +365,8 @@ impl ElementKernels {
             rms_norm_weighted_pipeline,
             rms_norm_unweighted_pipeline,
             rms_norm_weighted_tg_pipeline,
+            rms_norm_weighted_f32_in_tg_pipeline,
+            residual_add_f32_pipeline,
             rms_norm_unweighted_tg_pipeline,
             rms_norm_residual_tg_pipeline,
             rms_norm_residual_layer_scale_tg_pipeline,
@@ -561,6 +572,93 @@ impl ElementKernels {
             Self::NORM_GROUP_THREADS,
         )?;
         read_u16_buffer(&output)
+    }
+
+    /// `rms_norm_threadgroup` with an **f32** input and an f16 output.
+    ///
+    /// The DFlash drafter keeps its residual stream in f32 (it reaches ~1.5e5,
+    /// past fp16's 65504) but feeds f16 to the EXL3 gemm, so the norm is the one
+    /// place the two dtypes meet. Splitting exactly here is what exllamav3 does:
+    /// its norm writes half while the block's attention/MLP outputs stay float
+    /// (`reference/exllamav3/exllamav3/architecture/dflash.py:277,308`).
+    pub fn rms_norm_f32_in(
+        &self,
+        input: &[f32],
+        weight: &[u16],
+        rows: usize,
+        width: usize,
+        eps: f32,
+    ) -> Result<Vec<u16>, KernelError> {
+        if input.is_empty() || width == 0 || rows == 0 {
+            return Err(KernelError::InvalidInput(
+                "norm input must be non-empty".to_string(),
+            ));
+        }
+        if input.len() != rows * width {
+            return Err(KernelError::InvalidInput(format!(
+                "norm input is {} values, expected {}",
+                input.len(),
+                rows * width
+            )));
+        }
+        if weight.len() != width {
+            return Err(KernelError::InvalidInput(format!(
+                "norm weight is {} values, expected {width}",
+                weight.len()
+            )));
+        }
+        if !eps.is_finite() || eps <= 0.0 {
+            return Err(KernelError::InvalidInput(
+                "norm epsilon must be finite and positive".to_string(),
+            ));
+        }
+        let input_buffer = self.make_f32_buffer(input)?;
+        let weight_buffer = self.make_u16_buffer(weight)?;
+        let output = self.make_output(rows * width)?;
+        let params = NormParams {
+            rows: to_u32(rows, "row count")?,
+            width: to_u32(width, "norm width")?,
+            eps,
+        };
+        self.run_groups(
+            &self.rms_norm_weighted_f32_in_tg_pipeline,
+            &[Some(&input_buffer), Some(&weight_buffer), Some(&output)],
+            params_bytes(&params),
+            rows as u64,
+            Self::NORM_GROUP_THREADS,
+        )?;
+        read_u16_buffer(&output)
+    }
+
+    /// `residual_add` that neither reads nor writes f16.
+    pub fn residual_add_f32(
+        &self,
+        left: &[f32],
+        right: &[f32],
+    ) -> Result<Vec<f32>, KernelError> {
+        if left.is_empty() || left.len() != right.len() {
+            return Err(KernelError::InvalidInput(
+                "residual inputs must be non-empty and equal length".to_string(),
+            ));
+        }
+        let left_buffer = self.make_f32_buffer(left)?;
+        let right_buffer = self.make_f32_buffer(right)?;
+        let output = self.device.new_buffer(
+            (left.len() * size_of::<f32>()) as u64,
+            MTLResourceOptions::StorageModeShared,
+        );
+        let count = to_u32(left.len(), "residual length")?;
+        self.run(
+            &self.residual_add_f32_pipeline,
+            &[
+                Some(&left_buffer),
+                Some(&right_buffer),
+                Some(&output),
+            ],
+            params_bytes(&count),
+            left.len() as u64,
+        )?;
+        read_f32_buffer(&output)
     }
 
     pub fn rms_norm_unweighted(
@@ -1749,6 +1847,19 @@ impl ElementKernels {
         ))
     }
 
+    fn make_f32_buffer(&self, values: &[f32]) -> Result<Buffer, KernelError> {
+        if values.is_empty() {
+            return Err(KernelError::InvalidInput(
+                "f32 input cannot be empty".to_string(),
+            ));
+        }
+        Ok(self.device.new_buffer_with_data(
+            values.as_ptr() as *const c_void,
+            size_of_val(values) as u64,
+            MTLResourceOptions::StorageModeShared,
+        ))
+    }
+
     fn make_u16_buffer(&self, values: &[u16]) -> Result<Buffer, KernelError> {
         if values.is_empty() {
             return Err(KernelError::InvalidInput(
@@ -1863,6 +1974,18 @@ fn to_u32(value: usize, name: &str) -> Result<u32, KernelError> {
 
 fn params_bytes<T>(params: &T) -> &[u8] {
     unsafe { std::slice::from_raw_parts(params as *const T as *const u8, size_of::<T>()) }
+}
+
+fn read_f32_buffer(buffer: &Buffer) -> Result<Vec<f32>, KernelError> {
+    let length = buffer.length() as usize;
+    if !length.is_multiple_of(size_of::<f32>()) {
+        return Err(KernelError::CommandFailed);
+    }
+    let pointer = buffer.contents() as *const f32;
+    if pointer.is_null() {
+        return Err(KernelError::CommandFailed);
+    }
+    Ok(unsafe { std::slice::from_raw_parts(pointer, length / size_of::<f32>()) }.to_vec())
 }
 
 fn read_u16_buffer(buffer: &Buffer) -> Result<Vec<u16>, KernelError> {
