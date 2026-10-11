@@ -890,6 +890,91 @@ fn argmax_row(logits: &[u16], vocab: usize, row: usize) -> u32 {
     best as u32
 }
 
+/// The draft tokens for a block: one greedy token per **masked** row.
+///
+/// The block is `[anchor, mask x (block_size - 1)]` and `forward_block` puts
+/// `anchor_embedding` on row **0**. The anchor predicts a token the target has
+/// already emitted, so the drafts are rows `1..=draft_rows` and never row 0.
+///
+/// This was `0..draft_rows` -- the anchor included and the last masked row
+/// dropped -- while both `draft_tokens` and `draft_block`'s own comment said the
+/// anchor is dropped. z-lab takes exactly `1..`:
+/// `dflash/model.py:249` slices the drafter output with `[:, 1 - verify_size:, :]`
+/// (the last `verify_size - 1` rows) and `:268` fills `block_output_ids[:, 1:]`
+/// from the argmax of those. Extracted from `draft_block` so this range is
+/// testable without loading either checkpoint.
+fn select_draft_tokens(logits: &[u16], vocab: usize, draft_rows: usize) -> Vec<u32> {
+    (1..=draft_rows)
+        .map(|row| argmax_row(logits, vocab, row))
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::select_draft_tokens;
+
+    /// One row per block position, where row `r`'s argmax is the token id `r`
+    /// held in that row's last column. `vocab` is a small placeholder: the
+    /// function only indexes `row * vocab`, so the width is irrelevant to the
+    /// selection it exercises.
+    fn rows(block_rows: usize, vocab: usize, winner: &[u32]) -> Vec<u16> {
+        let mut logits = vec![0u16; block_rows * vocab];
+        for (row, token) in winner.iter().enumerate() {
+            let index = row * vocab + *token as usize;
+            logits[index] = half::f16::from_f32(1.0).to_bits();
+        }
+        logits
+    }
+
+    #[test]
+    fn draft_tokens_are_the_masked_rows_not_the_anchor() {
+        // block_size 16 -> 15 drafts; the anchor is row 0.
+        let block_rows = 16usize;
+        let vocab = 8usize;
+        let draft_rows = block_rows - 1;
+
+        // Give the anchor a distinctive winner (7) that no masked row shares,
+        // so including row 0 is observable rather than a coincidence.
+        let mut winner: Vec<u32> = (1..=draft_rows as u32).map(|t| t % vocab as u32).collect();
+        winner.insert(0, (vocab - 1) as u32);
+        let logits = rows(block_rows, vocab, &winner);
+
+        let selected = select_draft_tokens(&logits, vocab, draft_rows);
+
+        assert_eq!(selected.len(), draft_rows, "one draft per masked row");
+        assert_eq!(
+            selected,
+            winner[1..].to_vec(),
+            "the drafts must be rows 1..=draft_rows; taking rows 0..draft_rows would \
+             put the anchor's token first and drop the last masked row"
+        );
+        assert_ne!(
+            selected.first().copied(),
+            Some((vocab - 1) as u32),
+            "the anchor's own argmax must never appear as a draft"
+        );
+    }
+
+    #[test]
+    fn the_two_candidate_ranges_are_distinguishable() {
+        // Guards the assertion above against passing vacuously: if rows 0.. and
+        // 1.. happened to agree on every position, the previous test would
+        // prove nothing about which range is used.
+        let block_rows = 16usize;
+        let vocab = 8usize;
+        let draft_rows = block_rows - 1;
+        let mut winner: Vec<u32> = (1..=draft_rows as u32).map(|t| t % vocab as u32).collect();
+        winner.insert(0, (vocab - 1) as u32);
+        let logits = rows(block_rows, vocab, &winner);
+
+        let masked: Vec<u32> = select_draft_tokens(&logits, vocab, draft_rows);
+        let with_anchor: Vec<u32> = (0..draft_rows)
+            .map(|row| super::argmax_row(&logits, vocab, row))
+            .collect();
+        assert_ne!(masked, with_anchor, "the two ranges must differ on this input");
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum DflashError {
     #[error("kernels: {0}")]
@@ -1604,9 +1689,7 @@ impl DflashModel {
         // made the first draft the anchor's argmax -- a token the target had
         // already emitted -- and dropped the last masked row. No test covered
         // this; `dflash_golden` only exercises `forward_block`.
-        let tokens = (1..=draft_rows)
-            .map(|row| argmax_row(&logits, vocab, row))
-            .collect();
+        let tokens = select_draft_tokens(&logits, vocab, draft_rows);
         Ok(DflashDraft { tokens, block })
     }
 

@@ -1634,3 +1634,32 @@ since nothing ever called it, this plumbing has never been exercised. The
 assertion (tokens == argmax of rows `1..=draft_rows`, with an `assert_ne!` guard so
 it cannot pass vacuously when both ranges agree) is in place and will be the
 immediate check once the buffer view is fixed.
+
+### The fix is now covered, without either checkpoint
+
+The row selection was extracted from `draft_block` into a free function,
+`select_draft_tokens(logits, vocab, draft_rows)`, and unit-tested in
+`dflash.rs`'s own `#[cfg(test)] mod tests`. Two tests, both GPU-free and in the
+**default** suite (`cargo test -p kaplumba-engine --release --lib dflash::`):
+
+- `draft_tokens_are_the_masked_rows_not_the_anchor` -- the anchor's row is given a
+  winner no masked row shares, so including it is observable rather than
+  coincidental.
+- `the_two_candidate_ranges_are_distinguishable` -- guards the first against
+  passing vacuously, by asserting the two candidate ranges differ on this input.
+
+**Sabotage, run and observed (§3.4):** reverting the function to `(0..draft_rows)`
+fails both with
+
+    assertion `left == right` failed: the drafts must be rows 1..=draft_rows;
+      taking rows 0..draft_rows would put the anchor's token first and drop the
+      last masked row
+    assertion `left != right` failed: the two ranges must differ on this input
+
+exit 101. Reverted, re-run green, and the 16-test integration suite re-run green
+after the `dflash.rs` change (no regressions).
+
+`dflash_draft_rows.rs` (ignored) stays as the end-to-end version and still does
+not reach its assertion, for the head-buffer reason above. The unit tests are the
+ones that actually cover the fix; the integration test is the one that would cover
+the plumbing, and that plumbing is still first-touched-today.
