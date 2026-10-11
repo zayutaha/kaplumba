@@ -611,9 +611,20 @@ pub struct DflashModel {
 /// appended to the cache.
 pub struct BlockContext<'a> {
     pub anchor_embedding: &'a [u16],
+    /// Per layer: `[n_ctx_layer, kv_heads * head_dim]`, already RoPE'd and
+    /// k_norm'd.
+    ///
+    /// Layers may hold **different row counts**, which is why there is no single
+    /// `n_ctx` field: the drafter's last layer attends the whole context while
+    /// layers 0..`num_layers - 1` slide at `sliding_window`, so once the context
+    /// is longer than the window the two genuinely differ. Each layer's row
+    /// count is `ctx_keys[layer].len() / (kv_heads * head_dim)`.
     pub ctx_keys: &'a [Vec<u16>],
     pub ctx_values: &'a [Vec<u16>],
-    pub n_ctx: usize,
+    /// Per layer: absolute position of that layer's **first** retained context
+    /// row. A sliding layer's oldest rows are evicted, so this is not
+    /// `position - n_ctx` once the ring has wrapped.
+    pub ctx_first: &'a [usize],
     /// Absolute position of the first block row (== the target's
     /// `next_position`, i.e. one past the last context row).
     pub position: usize,
@@ -628,6 +639,233 @@ pub struct DflashBlock {
     /// wants to cache or discard them.
     pub block_keys: Vec<Vec<u16>>,
     pub block_values: Vec<Vec<u16>>,
+}
+
+/// One layer's retained context K/V.
+#[derive(Debug, Clone, Default)]
+struct KvLayer {
+    held: usize,
+    /// Rows retained, or `None` for the last layer, which attends everything.
+    capacity: Option<usize>,
+}
+
+/// The drafter's context K/V — the paper's "KV injection".
+///
+/// The drafter does not build context K/V from its own tokens. Each accepted
+/// target position contributes one fused tap feature, and every layer projects
+/// that feature with its own `k_proj`/`v_proj` (`project_context_kv`); this
+/// struct is where those land.
+///
+/// Layers 0..`num_layers - 1` slide: they never need more than
+/// `sliding_window` rows, so a longer context evicts the oldest. The **last**
+/// layer attends the whole context and never evicts, which is why
+/// [`Self::rows`] can differ per layer and [`BlockContext`] carries per-layer
+/// positions rather than one `n_ctx`.
+#[derive(Debug, Clone)]
+pub struct DflashKvCache {
+    /// One flat `held * kv_width` f16 vector per layer.
+    ///
+    /// Deliberately a `Vec<Vec<u16>>` and not a per-row or single-buffer layout:
+    /// this is already the shape [`BlockContext`] wants, so a block forward
+    /// borrows it instead of copying 5x2x[rows x kv_width] every round.
+    keys: Vec<Vec<u16>>,
+    values: Vec<Vec<u16>>,
+    layers: Vec<KvLayer>,
+    /// Context rows held, globally. Advanced once per appended chunk (after
+    /// every layer has been pushed) so it stays the context length rather than
+    /// a per-layer counter; [`Self::first_position`] subtracts each layer's own
+    /// retained count from it.
+    total: usize,
+    kv_width: usize,
+}
+
+impl DflashKvCache {
+    pub fn new(config: &DflashConfig) -> Self {
+        let last = config.num_layers.saturating_sub(1);
+        let layers = (0..config.num_layers)
+            .map(|layer| KvLayer {
+                capacity: if layer == last || config.sliding_window == 0 {
+                    None
+                } else {
+                    Some(config.sliding_window)
+                },
+                ..KvLayer::default()
+            })
+            .collect();
+        Self {
+            keys: vec![Vec::new(); config.num_layers],
+            values: vec![Vec::new(); config.num_layers],
+            layers,
+            total: 0,
+            kv_width: config.kv_heads * config.head_dim,
+        }
+    }
+
+    /// Elements of one row's key (or value) vector.
+    pub fn kv_width(&self) -> usize {
+        self.kv_width
+    }
+
+    pub fn num_layers(&self) -> usize {
+        self.layers.len()
+    }
+
+    /// Rows currently retained for `layer`. Not uniform across layers once the
+    /// context is longer than the sliding window.
+    pub fn rows(&self, layer: usize) -> usize {
+        self.layers[layer].held
+    }
+
+    /// Total context rows the cache represents, i.e. the absolute position one
+    /// past the last one. Equals the target's `next_position`.
+    pub fn total_rows(&self) -> usize {
+        self.total
+    }
+
+    /// Absolute position of `layer`'s oldest retained row.
+    ///
+    /// For a layer that has wrapped its ring this is *greater* than
+    /// `total - rows(layer)` would suggest naively, and it is exactly what the
+    /// attention needs: positions are absolute and the mask is on position
+    /// distance, so a ring must report where its surviving rows really are.
+    pub fn first_position(&self, layer: usize) -> usize {
+        self.total.saturating_sub(self.layers[layer].held)
+    }
+
+    pub fn keys(&self, layer: usize) -> &[u16] {
+        &self.keys[layer]
+    }
+
+    pub fn values(&self, layer: usize) -> &[u16] {
+        &self.values[layer]
+    }
+
+    /// Every layer's keys, in the form [`BlockContext`] takes. Borrowed, not
+    /// copied.
+    pub fn all_keys(&self) -> &[Vec<u16>] {
+        &self.keys
+    }
+
+    pub fn all_values(&self) -> &[Vec<u16>] {
+        &self.values
+    }
+
+    /// Per-layer first position, in the form [`BlockContext`] takes.
+    pub fn all_first_positions(&self) -> Vec<usize> {
+        (0..self.layers.len())
+            .map(|layer| self.first_position(layer))
+            .collect()
+    }
+
+    /// Append `rows` rows to one layer, evicting from the front if it slides.
+    ///
+    /// Layer-local: the global length advances in [`Self::commit`].
+    pub fn push(
+        &mut self,
+        layer: usize,
+        keys: &[u16],
+        values: &[u16],
+        rows: usize,
+    ) -> Result<(), DflashError> {
+        if layer >= self.layers.len() {
+            return Err(DflashError::Shape(format!(
+                "layer {layer} is outside the cache's {} layers",
+                self.layers.len()
+            )));
+        }
+        let expected = rows * self.kv_width;
+        if keys.len() != expected || values.len() != expected {
+            return Err(DflashError::Shape(format!(
+                "layer {layer} push has {}/{} elements for {rows} rows of width {}",
+                keys.len(),
+                values.len(),
+                self.kv_width
+            )));
+        }
+        if rows == 0 {
+            return Ok(());
+        }
+        let width = self.kv_width;
+        let capacity = self.layers[layer].capacity;
+        self.keys[layer].extend_from_slice(keys);
+        self.values[layer].extend_from_slice(values);
+        self.layers[layer].held += rows;
+        if let Some(capacity) = capacity {
+            let held = self.layers[layer].held;
+            if held > capacity {
+                let excess = (held - capacity) * width;
+                self.keys[layer].drain(..excess);
+                self.values[layer].drain(..excess);
+                self.layers[layer].held = capacity;
+            }
+        }
+        Ok(())
+    }
+
+    /// Advance the context length after every layer has been pushed.
+    pub fn commit(&mut self, rows: usize) {
+        self.total += rows;
+    }
+
+    /// Drop the last `rows` rows from every layer (a rejected speculative
+    /// tail).
+    ///
+    /// A layer that has already evicted cannot recover those rows, so it drops
+    /// only what it still holds. That is not data loss: a sliding layer only
+    /// ever needs its window, and any row it evicted is older than the window
+    /// the rewound context re-establishes.
+    pub fn rewind(&mut self, rows: usize) -> Result<(), DflashError> {
+        if rows == 0 {
+            return Ok(());
+        }
+        if rows > self.total {
+            return Err(DflashError::Shape(format!(
+                "cannot rewind {rows} rows from a {}-row context",
+                self.total
+            )));
+        }
+        for layer in 0..self.layers.len() {
+            let drop = rows.min(self.layers[layer].held);
+            if drop == 0 {
+                continue;
+            }
+            let elements = drop * self.kv_width;
+            let length = self.keys[layer].len() - elements;
+            self.keys[layer].truncate(length);
+            self.values[layer].truncate(length);
+            self.layers[layer].held -= drop;
+        }
+        self.total -= rows;
+        Ok(())
+    }
+
+}
+
+/// One drafting round's result.
+pub struct DflashDraft {
+    /// `draft_tokens()` tokens in order.
+    pub tokens: Vec<u32>,
+    /// The block that produced them, for a caller that wants the hidden rows or
+    /// the block's own K/V.
+    pub block: DflashBlock,
+}
+
+/// Greedy argmax of one row of softcapped logits.
+///
+/// Ties go to the lowest index, matching the engine's own greedy path so a
+/// draft and a verify cannot disagree about a tie.
+fn argmax_row(logits: &[u16], vocab: usize, row: usize) -> u32 {
+    let base = row * vocab;
+    let mut best = 0usize;
+    let mut best_value = half::f16::from_bits(logits[base]).to_f32();
+    for index in 1..vocab {
+        let value = half::f16::from_bits(logits[base + index]).to_f32();
+        if value > best_value {
+            best_value = value;
+            best = index;
+        }
+    }
+    best as u32
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -680,6 +918,23 @@ impl DflashModel {
             .line(name)
             .unwrap_or_else(|_| panic!("{name} is not a drafter linear"));
         (line.in_features, line.out_features)
+    }
+
+    /// Bytes of packed weights one linear's GEMM must read: the trellis plus
+    /// both sign vectors.
+    ///
+    /// T12 turns a timing into an effective bandwidth with this, and the
+    /// bandwidth is the number that answers R19's actual question: was the
+    /// weight read amortised across the block's 16 rows, or paid once per row?
+    /// A per-row read shows up as 1/16th of the streaming bandwidth, which
+    /// nothing else in the timing would reveal.
+    pub fn line_weight_bytes(&self, name: &str) -> Result<usize, DflashError> {
+        let line = self
+            .weights
+            .line(name)
+            .map_err(|_| DflashError::Missing(name.to_string()))?;
+        let trellis = line.packed_len.unwrap_or(line.packed.len());
+        Ok(trellis * 2 + (line.in_features + line.out_features) * 2)
     }
 
     fn validate_shapes(&self) -> Result<(), DflashError> {
@@ -984,18 +1239,38 @@ impl DflashModel {
                 context.ctx_values.len()
             )));
         }
+        if context.ctx_first.len() != config.num_layers {
+            return Err(DflashError::Shape(format!(
+                "ctx_first needs one position per layer ({})",
+                config.num_layers
+            )));
+        }
         let kv_width = config.kv_heads * head_dim;
+        // Row counts differ per layer (see `BlockContext`), so each layer is
+        // validated against its own width rather than a shared `n_ctx`.
+        let mut ctx_rows = Vec::with_capacity(config.num_layers);
         for layer in 0..config.num_layers {
-            if context.ctx_keys[layer].len() != context.n_ctx * kv_width
-                || context.ctx_values[layer].len() != context.n_ctx * kv_width
-            {
+            let keys = context.ctx_keys[layer].len();
+            let values = context.ctx_values[layer].len();
+            if keys % kv_width != 0 || values % kv_width != 0 || keys != values {
                 return Err(DflashError::Shape(format!(
-                    "layer {layer} context K/V has {}/{} elements, expected {}",
-                    context.ctx_keys[layer].len(),
-                    context.ctx_values[layer].len(),
-                    context.n_ctx * kv_width
+                    "layer {layer} context K/V has {keys}/{values} elements, not a \
+                     matching multiple of {kv_width}"
                 )));
             }
+            let rows_here = keys / kv_width;
+            // A sliding layer must not be handed more rows than its window.
+            if config.layer_is_sliding[layer]
+                && config.sliding_window > 0
+                && rows_here > config.sliding_window
+            {
+                return Err(DflashError::Shape(format!(
+                    "layer {layer} is sliding but was handed {rows_here} rows for a \
+                     window of {}",
+                    config.sliding_window
+                )));
+            }
+            ctx_rows.push(rows_here);
         }
 
         if self.mask_embedding.is_empty() {
@@ -1025,12 +1300,9 @@ impl DflashModel {
             }
         }
 
-        // Positions, absolute. Context rows occupy `[position - n_ctx, position)`.
-        let mut positions = Vec::with_capacity(context.n_ctx + rows);
-        let start = context.position.saturating_sub(context.n_ctx);
-        for index in start..context.position + rows {
-            positions.push(index as u32);
-        }
+        // Positions are built per layer inside the layer loop below: a sliding
+        // layer's first retained row is not `position - n_ctx` once its ring has
+        // wrapped, so the two layers genuinely differ.
 
         let q_width = config.q_heads * head_dim;
         let scale = 1.0 / (head_dim as f32).sqrt();
@@ -1040,6 +1312,14 @@ impl DflashModel {
         for layer in 0..config.num_layers {
             let prefix = format!("layers.{layer}");
             let sliding = config.layer_is_sliding[layer];
+            let n_ctx = ctx_rows[layer];
+            let mut positions = Vec::with_capacity(n_ctx + rows);
+            for index in 0..n_ctx {
+                positions.push((context.ctx_first[layer] + index) as u32);
+            }
+            for index in 0..rows {
+                positions.push((context.position + index) as u32);
+            }
 
             let normed = self.rms_norm_f32_in(
                 &format!("{prefix}.input_layernorm"),
@@ -1097,7 +1377,7 @@ impl DflashModel {
                 block_values: &v_block,
                 key_positions: &positions,
                 rows,
-                n_ctx: context.n_ctx,
+                n_ctx,
                 q_heads: config.q_heads,
                 kv_heads: config.kv_heads,
                 head_dim,
@@ -1203,6 +1483,99 @@ impl DflashModel {
         let v = self.gemm(&format!("{prefix}.self_attn.v_proj"), fused)?;
         let _ = (kv_width, context_position);
         Ok((k, v))
+    }
+
+    /// T6/R6: fuse one chunk of target taps and append the resulting K/V to
+    /// `cache`.
+    ///
+    /// `position` is the absolute position of the row **after** the chunk — the
+    /// position the next block will start at — so the chunk's own rows occupy
+    /// `[position - rows, position)`. That convention is what makes an
+    /// incremental chunked prefill and a single whole-prompt call produce
+    /// byte-identical caches, which is R6's invariant.
+    ///
+    /// `taps` is one `rows * hidden_size` F16 buffer per target tap, in
+    /// `target_layer_ids` order (the order `fc` was trained on).
+    pub fn append_context(
+        &self,
+        taps: &[&[u16]],
+        rows: usize,
+        position: usize,
+        cache: &mut DflashKvCache,
+    ) -> Result<(), DflashError> {
+        if rows == 0 {
+            return Ok(());
+        }
+        if position < rows {
+            return Err(DflashError::Shape(format!(
+                "a {rows}-row chunk at position {position} would start before 0"
+            )));
+        }
+        let fused = self.fuse_context(taps, rows)?;
+        let start = (position - rows) as u32;
+        let positions: Vec<u32> = (0..rows).map(|index| start + index as u32).collect();
+        for layer in 0..self.config.num_layers {
+            let (k, v) = self.project_context_kv(layer, &fused, rows, &positions, position)?;
+            cache.push(layer, &k, &v, rows)?;
+        }
+        cache.commit(rows);
+        Ok(())
+    }
+
+    /// R13: drop the last `rows` context rows after a rejected speculative
+    /// tail, so the next round drafts from the verified prefix.
+    pub fn rewind_context(
+        &self,
+        rows: usize,
+        cache: &mut DflashKvCache,
+    ) -> Result<(), DflashError> {
+        cache.rewind(rows)
+    }
+
+    /// R7/T9: draft one block from the cache.
+    ///
+    /// `anchor_embedding` is the *raw* target embedding row for the token at
+    /// `position - 1` (no `sqrt(hidden)`; R7, and Q1 may flip this). The block is
+    /// `[anchor, mask x (block_size - 1)]` and its rows are dropped: the anchor
+    /// predicts a token the target has already emitted.
+    ///
+    /// `head` is the **target's** tied output head — the drafter has none
+    /// (`tie_word_embeddings` is true and the vocabularies match), which is why
+    /// this takes it as an argument rather than owning it. That is a deviation
+    /// from `plan.md`'s signature, which omitted it; the plan also assumed a
+    /// single `n_ctx`, which the sliding cache makes impossible.
+    pub fn draft_block(
+        &self,
+        anchor_embedding: &[u16],
+        position: usize,
+        cache: &DflashKvCache,
+        head: &crate::model::QuantizedLinear,
+    ) -> Result<DflashDraft, DflashError> {
+        let config = &self.config;
+        let rows = config.block_size;
+        let vocab = head.out_features;
+        let first = cache.all_first_positions();
+        let block = self.forward_block(&BlockContext {
+            anchor_embedding,
+            ctx_keys: cache.all_keys(),
+            ctx_values: cache.all_values(),
+            ctx_first: &first,
+            position,
+        })?;
+        // Only the `block_size - 1` masked rows are new tokens; the anchor's own
+        // logits predict a token the target has already produced.
+        let logits = self.draft_logits(&block.hidden, head, config.final_logit_softcapping, rows)?;
+        let draft_rows = config.draft_tokens();
+        if logits.len() < draft_rows * vocab {
+            return Err(DflashError::Shape(format!(
+                "the head returned {} logits for {rows} rows of {vocab}",
+                logits.len()
+            )));
+        }
+        let tokens = (0..draft_rows)
+            .map(|row| argmax_row(&logits, vocab, row))
+            .collect();
+        Ok(DflashDraft { tokens, block })
     }
 
     /// R11: apply the *target's* tied head and the drafter's softcap, exactly as

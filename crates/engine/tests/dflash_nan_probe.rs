@@ -123,11 +123,12 @@ fn dflash_stage_probe_localises_nan() {
     let anchor = pseudo(0x5EED_A11C, hidden, INPUT_SCALE);
     let mask = pseudo(0x0A5C0FFE, hidden, INPUT_SCALE);
     model.set_mask_embedding(&mask).expect("mask");
+    let ctx_first = vec![position.saturating_sub(n_ctx); config.num_layers];
     let block = match model.forward_block(&kaplumba_engine::dflash::BlockContext {
         anchor_embedding: &anchor,
         ctx_keys: &ctx_keys,
         ctx_values: &ctx_values,
-        n_ctx,
+        ctx_first: &ctx_first,
         position,
     }) {
         Ok(block) => block,

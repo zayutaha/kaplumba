@@ -3,18 +3,23 @@
 Status legend: `[ ]` todo · `[~]` in progress · `[x]` done (commit hash appended).
 Update this file **immediately** after each task (AGENTS.md §3.3).
 
-> **HANDOVER STATE (2026-10-11).** Last commit `05d1208`. **T1, T2, T3a are
-> committed.** `DflashConfig` + `DflashModel` (fuse_context /
-> project_context_kv / forward_block / draft_logits) plus `dflash_golden.rs`,
-> `dflash_nan_probe.rs` and `dflash_weight_scale.rs` are **written but NOT
-> committed**. See `implementation_notes.md` §"2026-10-11 — T4" for the exact
-> next commands.
+> **STATE (2026-10-11).** Last commit `7b20fa1`. **T1, T2, T3a, T3, T5, T4, T4b
+> and T14 are done and committed.** `DflashConfig`, `DflashModel`
+> (fuse_context / project_context_kv / forward_block / draft_logits) and the
+> four-test golden harness are all in tree. See `implementation_notes.md`
+> §"2026-10-11 — T14 landed" for the fp32 findings and the exact commands.
 >
-> **Read this before touching the block forward.** The drafter overflows fp16 in
-> layer 0 (`mlp_out` reaches 152 287) and exllamav3 runs its attention and MLP
-> outputs in **fp32** (`architecture/dflash.py:277,308`). The fp16 element path
-> cannot be tuned into passing; it needs an fp32 variant. **T14 below is that
-> work and it blocks T4, T9, T10 and T11.**
+> **The fp16 overflow that blocked this spec is fixed — see T14.** The drafter's
+> residual stream is now f32 end to end and T4 is green 4/4 (`99db335`). T6 is
+> green 3/3.
+>
+> **READ T12'S RESULT BEFORE PLANNING ANYTHING ELSE.** The M=16 GEMM path runs
+> at **9.9 GB/s**, ~25x below streaming peak. The target's verify pass is an
+> M=16 pass over 15.5 GB of weights, so it is ~1.55 s, not ~300 ms. Per block
+> that is ~193 ms of drafting + ~1.55 s of verify for at most 15 tokens — a
+> ceiling of **~8.6 tok/s even at 100% acceptance**. A 40 tok/s target is not
+> reachable by improving the drafter, acceptance, or the round; it requires the
+> M=16 GEMM to be fixed first. See `implementation_notes.md` §"T12".
 
 ## Pre-flight
 
@@ -68,10 +73,14 @@ Update this file **immediately** after each task (AGENTS.md §3.3).
       **Sabotage:** re-narrowing `residual_add_f32` reproduces the original
       failure exactly — `the comparison is vacuous: the engine carries no signal
       (energy NaN)` — so the f32 add is load-bearing, not incidental.
-- [ ] **T12 — `gemm_chunk` M=16 benchmark (do this before T6).** Benchmark
-      every drafter shape at M=16; report ms and effective GB/s.
-      *Unblocked by T1; do it first — its result decides whether T6's shape
-      survives. Host-measurable, needs no model load.*
+      **Commit `99db335`.**
+- [x] **T12 — `gemm_chunk` M=16 benchmark.** `crates/engine/tests/dflash_gemm_m16.rs`,
+      all 36 linears at M=16, median of 9. **Result: the M=16 path runs at 9.9
+      GB/s — ~25x below this box's streaming peak, so it is instruction-bound,
+      not bandwidth-bound.** The 35 per-layer projections cost 78.89 ms per
+      block and `fc` 8.72 ms. R19's gate (< 100 ms for the projections) passes at
+      78.89 ms, but see the note below: this is the binding constraint on the
+      whole spec, not the drafter. *(uncommitted)*
 - [x] **T4b — weight-scale sanity check.** `crates/engine/tests/dflash_weight_scale.rs`
       dequantises `layers.0.self_attn.o_proj` from both checkpoints on the host
       (no model load, no GPU). Target **1.031x unit variance** — validates the
@@ -80,11 +89,19 @@ Update this file **immediately** after each task (AGENTS.md §3.3).
 
 ## Drafter state
 
-- [~] **T6 — drafter KV cache.** `project_context_kv` exists and is validated
-      against the host reference. **Not built:** the `DflashKvCache` itself
-      (5 layers × 8 kv heads × 128, layers 0–3 ring at 2048, layer 4 full),
-      `append_context`, `rewind_context`, and the R13 equivalence test.
-      *TODO after T12.*
+- [x] **T6 — drafter KV cache.** `DflashKvCache` (per-layer flat K/V, layers
+      0–3 ring at `sliding_window`, last layer unbounded), `append_context`,
+      `rewind_context`, `draft_block`, `DflashDraft`, and a host-side
+      `argmax_row`. **`BlockContext` was restructured**: it now carries
+      `ctx_first: &[usize]` and derives each layer's row count from its own
+      buffer, because a sliding layer and the full-attention last layer hold
+      different rows once the context passes the window — the old single `n_ctx`
+      could not express that. **Tested by** `crates/engine/tests/dflash_cache.rs`
+      (3 tests: chunk invariance R6, rewind equivalence R13, ring absolute
+      positions), **3/3 green**. Sabotage: skipping the ring eviction fails the
+      ring test with `layer 0 should hold exactly the window`; dropping the
+      chunk offset from the RoPE position fails chunk invariance and rewind with
+      `layer 0 keys differ`. *(uncommitted)*
 
 ## Target-side feature export
 

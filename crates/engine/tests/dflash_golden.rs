@@ -517,6 +517,9 @@ fn dflash_forward_block_matches_host() {
     let mask = pseudo(0x0A5C0FFE, hidden, INPUT_SCALE);
     let empty: Vec<u16> = Vec::new();
     let empties = vec![empty.clone(); harness.config.num_layers];
+    // No context in this test, so every layer's first retained row is where its
+    // (empty) context would have started.
+    let ctx_first = vec![position.saturating_sub(n_ctx); harness.config.num_layers];
 
     harness
         .model
@@ -528,7 +531,7 @@ fn dflash_forward_block_matches_host() {
             anchor_embedding: &anchor,
             ctx_keys: &empties,
             ctx_values: &empties,
-            n_ctx,
+            ctx_first: &ctx_first,
             position,
         })
         .expect("block");

@@ -543,3 +543,103 @@ Reverted; 4/4 green again.
   T4 passing. Keep it in mind if acceptance floors.
 - `KAPLUMBA_DFLASH_CAUSAL_BLOCK` is still unwired (mask selection reads
   `layer_is_sliding` only).
+
+## 2026-10-11 — T12: the M=16 GEMM is the binding constraint, not the drafter
+
+`crates/engine/tests/dflash_gemm_m16.rs`, all 36 drafter linears at M=16, median
+of 9 with 3 warmups. Full table is printed by the test; the shape of it:
+
+```
+fc                          32256x5376    86.78 MB    8.722 ms    9.9 GB/s
+layers.N.self_attn.q_proj    5376x8192    22.05 MB    ~2.50 ms    8.8 GB/s
+layers.N.self_attn.k_proj    5376x1024     2.77 MB    ~0.69 ms    4.1 GB/s
+layers.N.mlp.gate_proj       5376x10752   28.93 MB    ~3.08 ms    9.4 GB/s
+layers.N.mlp.down_proj      10752x5376   28.93 MB    ~3.13 ms    9.0 GB/s
+one block, 35 per-layer projections: 78.89 ms      slowest single: fc, 8.722 ms
+```
+
+**9.9 GB/s on a box with 273 GB/s and a measured ~51 GB/s on the M=1 decode
+path.** The M=16 tiled GEMM is therefore *instruction-bound*, not bandwidth-bound,
+and it is ~25x off streaming peak. That is a much larger finding than the one T12
+was commissioned to make, and it changes what is worth doing next.
+
+### The arithmetic this pins down
+
+| stage | cost | source |
+|---|---|---|
+| 35 per-layer projections | 78.89 ms | measured |
+| `fc`, once per block | 8.72 ms | measured |
+| the output head | **~105 ms** | extrapolated: the drafter has no head, so the round uses the target's `lm_head` (5376x262144 at 6 bpw ~= 1.05 GB) at the measured 9.9 GB/s |
+| target verify, M=16 | **~1.55 s** | extrapolated: one M=16 pass over the target's 15.5 GB at 9.9 GB/s |
+
+So one round costs ~193 ms of drafting **plus ~1.55 s of verify** and can yield at
+most 15 tokens: **a ceiling of ~8.6 tok/s at 100% acceptance and zero rejection.**
+The current non-speculative decode is 3.3-6.4 tok/s. DFlash as specified is
+therefore worth perhaps 1.5-2.5x, not the 10x the paper's shape suggests.
+
+**A 40 tok/s target is not reachable by work on the drafter, the acceptance
+rate, or the round loop.** It requires the M=16 GEMM to reach a normal fraction
+of bandwidth first. The head at ~105 ms and the verify at ~1.55 s are both the
+same bottleneck: `gemv_tiled` at M=16.
+
+### Caveats on the extrapolations
+
+- The head and verify rows are **extrapolated from the measured per-byte rate**,
+  not measured. Measuring them needs the 13 GB target loaded (`scripts/gpuq`), and
+  the head row in particular assumes the target's 6 bpw `lm_head` behaves like the
+  drafter's 4 bpw linears, which the per-shape table suggests but does not prove.
+  **Both should be measured before any decision is made on them.**
+- The 51 GB/s figure for the M=1 path is taken from the decode rate already in
+  the repo (15.5 GB at ~3.3 tok/s), not re-measured here.
+- `k_proj`/`v_proj` are the efficient outliers at 4.1 GB/s because 2.77 MB per
+  dispatch is too little work to amortise the dispatch; they would want fusing,
+  not a new kernel.
+
+### What is NOT the problem
+
+The drafter's own forward is fine: T4 agrees with the f32 reference to 8.8e-4 and
+T6's cache invariants hold. Optimising the drafter further buys ~1.4x of the
+mispredicted 10x.
+
+## 2026-10-11 — T6 landed: the drafter context cache
+
+`DflashKvCache` + `DflashModel::append_context` / `rewind_context` / `draft_block`.
+Three tests in `crates/engine/tests/dflash_cache.rs`, 3/3 green.
+
+### The design change the plan did not predict
+
+`plan.md` assumed one `n_ctx` for all five layers. **That cannot work with the
+sliding window**: layers 0-3 cap at `sliding_window` (2048) while the last layer
+attends the whole context, so past 2048 rows the layers genuinely hold different
+row counts and start at different absolute positions. `BlockContext` now carries
+`ctx_first: &[usize]` and derives each layer's count from its own buffer; the mask
+is on position *distance*, so a ring that renumbered its surviving rows from zero
+would silently attend the wrong keys.
+
+Cache storage is `keys: Vec<Vec<u16>>` / `values: Vec<Vec<u16>>` — one flat vector
+per layer, which is *exactly* `BlockContext`'s shape, so a block forward borrows it
+instead of copying 5x2x[rows x kv_width] per round.
+
+`push` is layer-local and `commit(rows)` advances the global context length once
+per chunk; that is what keeps `first_position(layer) = total - held(layer)` correct
+for both a ring that has wrapped and one that has not.
+
+### Deviations from `plan.md`
+
+- `draft_block` takes the target's head (`&QuantizedLinear`) as an argument and
+  returns a `DflashDraft { tokens, block }`. The plan's signature had no head,
+  but the drafter has none of its own (`tie_word_embeddings`) and the round needs
+  the target's, so it cannot be implicit.
+- `rewind_context` returns `Result` rather than `()`: rewinding further than the
+  context is a caller bug and should not be silent.
+
+### Sabotage evidence (AGENTS.md §3.4)
+
+| sabotage | failing test | message |
+|---|---|---|
+| ring eviction skipped (`if false && held > capacity`) | `ring_keeps_absolute_positions` | `assertion failed: layer 0 should hold exactly the window` |
+| RoPE offset uses `position` instead of `position - rows` | `is_chunk_invariant` **and** `rewind_equals_never_having_appended` | `assertion failed: layer 0 keys differ between a whole and a chunked append` / `layer 0 keys differ after rewind` |
+
+Both reverted, 3/3 green. Note the second sabotage attributes to two tests, which
+is expected: the same offset error corrupts any two-schedule comparison, and it is
+why chunk invariance and rewind equivalence are not redundant tests.
