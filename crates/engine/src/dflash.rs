@@ -1594,7 +1594,17 @@ impl DflashModel {
                 logits.len()
             )));
         }
-        let tokens = (0..draft_rows)
+        // Rows `1..=draft_rows`, NOT `0..draft_rows`. The block is
+        // `[anchor, mask x (block_size - 1)]` (see `forward_block`, which puts
+        // `anchor_embedding` on row 0), so row 0 is the anchor and only rows 1..
+        // are masked predictions. z-lab takes exactly this range:
+        // `dflash/model.py:249` slices the drafter's output with
+        // `[:, 1 - verify_size :, :]` (the last `verify_size - 1` rows) and
+        // `:268` fills `block_output_ids[:, 1:]` from it. Selecting `0..` instead
+        // made the first draft the anchor's argmax -- a token the target had
+        // already emitted -- and dropped the last masked row. No test covered
+        // this; `dflash_golden` only exercises `forward_block`.
+        let tokens = (1..=draft_rows)
             .map(|row| argmax_row(&logits, vocab, row))
             .collect();
         Ok(DflashDraft { tokens, block })
