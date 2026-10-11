@@ -217,3 +217,68 @@ amortise the book across 16 tokens).
 - [ ] Q1 — acceptance under raw vs `sqrt(hidden)`-scaled block embedding.
 - [ ] Q2 — acceptance under the ±1 tap-index variants if the gate misses.
 - [ ] z-lab mask vs `KAPLUMBA_DFLASH_CAUSAL_BLOCK=1` acceptance.
+
+## 2026-10-11 — T1/T2 landed: loader + Gemma norm offset
+
+**T1 — `crates/engine/src/dflash.rs` (new, ~250 lines).** Single-shard loader
+for `~/.kaplumba/models/Drafter`. Builds `QuantizedLinear`s from the EXL3 mcg
+packing directly (`.trellis` i16 `[in/16, out/16, 64]`, `.suh`/`.svh` fp16,
+`.mcg` i32), so the existing EXL3 gemv/gemm kernels apply unchanged — no new
+quantised-matmul path. BF16 `.weight` tensors become the RMSNorm scales.
+
+Design decisions not in the plan:
+- **`unknown_tensors` is surfaced, not ignored.** The loader collects every
+  header name it does not recognise into a `Vec<String>` and the test asserts
+  it is empty. exllamav3's `DFlashConfig`
+  (`architecture/dflash.py:83-98`) probes for `attention_sink_bias`,
+  `mask_embedding` and per-tap `hidden_norms.*`; our checkpoint has none, and
+  if a future one does, this makes the loader refuse rather than half-load.
+- **`QuantizedLinear::validate` already enforces `in_features` and
+  `out_features` multiples of 128** (`model.rs:429`). Warned in the plan:
+  `fc` is 32256 (ok, 252 × 128) and `hidden_norm` is 5376 (ok, 42 × 128), so
+  every drafter line passes without an explicit check here.
+- **`.su`/`.sv` packed-scale suffixes are accepted but unused** — this
+  checkpoint stores `.suh`/`.svh` outright.
+
+**T2 — the Gemma `+1.0` offset, and the trap that proves it matters.** First
+working version had a real bug: it widened BF16 via
+`bf16→f16 bits`, then reused *those* bits as the top half of an f32, which
+converts the value a second time. `hidden_norm[0]` came out 1.0137 instead of
+2.0937 and the test caught it immediately. Final form: BF16 widens exactly as
+`f32::from_bits(bits << 16)`, add 1.0 in f32, narrow once to f16.
+
+**Sabotage evidence (AGENTS.md §3.4), `dflash_norm_weights_carry_the_gemma_offset`:**
+removing the `+1.0` fails with
+`hidden_norm[0]: stored 1.09375, file 1.09375 + 1.0 = 2.09375`.
+Reverted, re-run green.
+
+**Tests, `crates/engine/tests/dflash_load.rs` (new, 3 tests):**
+- `dflash_load_has_every_tensor_and_the_right_shapes` — `unknown_tensors`
+  empty; one linear per trellis stem; `fc` = 32256→5376; per-layer q/k/o/gate/
+  down shapes; `mcg` = `MCG_MULTIPLIER` for three sampled tensors.
+- `dflash_norm_weights_carry_the_gemma_offset` — all 22 norm tensors compared
+  element-by-element against the file, plus the hand-measured
+  `layers.0.input_layernorm[0] == 1.7539`.
+- `dflash_load_rejects_a_mismatched_codebook` — copies the shard, flips one
+  byte of `fc.mcg`, and asserts the error names both the tensor and the
+  codebook and stays a `DflashLoadError::Tensor`.
+
+**Also needed and landed with it: a `silu` / `gated_silu` Metal kernel**
+(`crates/kernels/src/elements.metal`, `elements.rs`). The DFlash drafter is
+Gemma-family, so its MLP is SwiGLU (`hidden_act: "silu"` in `config.json`);
+the engine only had `gated_gelu` for the MTP drafter. Using GeLU where SiLU
+belongs is a *silent* quality error — nothing crashes — so it got its own
+discriminator test: `gated_silu_is_not_gated_gelu` scans −8..8 in 0.25 steps
+and asserts the two activations disagree by more than 0.1 somewhere, which is
+50× the fp16 tolerance `assert_close` uses. Sabotage: rewiring `gated_silu`
+to `gelu_tanh_value` fails **both** `element_gated_silu_matches_cpu`
+(`gated silu[0] expected 0.15650958 actual 0.17114258`) and the
+discriminator. Reverted, green.
+
+### Commands
+
+```bash
+cargo test -p kaplumba-engine --release --test dflash_load
+cargo test -p kaplumba-engine --release --test elements_metal
+cargo check -p kaplumba-engine --release
+```

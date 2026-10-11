@@ -210,6 +210,8 @@ pub struct ElementKernels {
     layer_scale_pipeline: ComputePipelineState,
     gelu_pipeline: ComputePipelineState,
     gated_gelu_pipeline: ComputePipelineState,
+    silu_pipeline: ComputePipelineState,
+    gated_silu_pipeline: ComputePipelineState,
     rope_pipeline: ComputePipelineState,
     /// Q/K norm+RoPE and V norm in one dispatch, replacing the five-dispatch
     /// sequence. Decode only: it assumes one token, so `offset` is the position.
@@ -329,6 +331,8 @@ impl ElementKernels {
         let layer_scale_pipeline = pipeline(&device, &library, "layer_scale")?;
         let gelu_pipeline = pipeline(&device, &library, "gelu_tanh")?;
         let gated_gelu_pipeline = pipeline(&device, &library, "gated_gelu")?;
+        let silu_pipeline = pipeline(&device, &library, "silu")?;
+        let gated_silu_pipeline = pipeline(&device, &library, "gated_silu")?;
         let rope_pipeline = pipeline(&device, &library, "rope")?;
         let norm_rope_qkv_pipeline = pipeline(&device, &library, "norm_rope_qkv")?;
         let norm_rope_qkv_cache_pipeline = pipeline(&device, &library, "norm_rope_qkv_cache")?;
@@ -361,6 +365,8 @@ impl ElementKernels {
             layer_scale_pipeline,
             gelu_pipeline,
             gated_gelu_pipeline,
+            silu_pipeline,
+            gated_silu_pipeline,
             rope_pipeline,
             norm_rope_qkv_pipeline,
             norm_rope_qkv_cache_pipeline,
@@ -651,6 +657,51 @@ impl ElementKernels {
         let count = to_u32(gate.len(), "gated GELU length")?;
         self.run(
             &self.gated_gelu_pipeline,
+            &[Some(&gate_buffer), Some(&up_buffer), Some(&output)],
+            &count.to_le_bytes(),
+            gate.len() as u64,
+        )?;
+        read_u16_buffer(&output)
+    }
+
+    /// spec/dflash-correctness R10: the DFlash drafter's MLP is SwiGLU, so the
+    /// activation is `silu(gate) * up`. GELU-tanh is the MTP drafter's, and
+    /// using it here would be a silent quality error rather than a crash.
+    ///
+    /// The reference value is `x / (1 + e^-x)` evaluated in fp32, which is what
+    /// `silu` means in PyTorch/MLX; the kernel matches it exactly at fp32 and
+    /// then narrows to fp16. `dflash_forward`'s golden test compares against
+    /// arrays dumped from the reference, so this is the definition.
+    pub fn silu(&self, input: &[u16]) -> Result<Vec<u16>, KernelError> {
+        if input.is_empty() {
+            return Err(KernelError::InvalidInput(
+                "SiLU input must be non-empty".to_string(),
+            ));
+        }
+        let input_buffer = self.make_u16_buffer(input)?;
+        let output = self.make_output(input.len())?;
+        let count = to_u32(input.len(), "SiLU length")?;
+        self.run(
+            &self.silu_pipeline,
+            &[Some(&input_buffer), Some(&output)],
+            &count.to_le_bytes(),
+            input.len() as u64,
+        )?;
+        read_u16_buffer(&output)
+    }
+
+    pub fn gated_silu(&self, gate: &[u16], up: &[u16]) -> Result<Vec<u16>, KernelError> {
+        if gate.is_empty() || gate.len() != up.len() {
+            return Err(KernelError::InvalidInput(
+                "gated SiLU inputs must be non-empty and equal length".to_string(),
+            ));
+        }
+        let gate_buffer = self.make_u16_buffer(gate)?;
+        let up_buffer = self.make_u16_buffer(up)?;
+        let output = self.make_output(gate.len())?;
+        let count = to_u32(gate.len(), "gated SiLU length")?;
+        self.run(
+            &self.gated_silu_pipeline,
             &[Some(&gate_buffer), Some(&up_buffer), Some(&output)],
             &count.to_le_bytes(),
             gate.len() as u64,

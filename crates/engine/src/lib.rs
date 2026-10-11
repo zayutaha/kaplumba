@@ -1,6 +1,7 @@
 pub mod bench;
 pub mod chat;
 pub mod config;
+pub mod dflash;
 pub mod decode_profile;
 pub mod drafter;
 pub mod drafter_model;

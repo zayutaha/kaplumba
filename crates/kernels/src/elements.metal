@@ -334,6 +334,39 @@ kernel void gated_gelu(
     output[gid] = half(gelu_tanh_value(float(gate[gid])) * float(up[gid]));
 }
 
+// spec/dflash-correctness R10. The DFlash drafter is a Gemma-family model, so
+// its MLP is SwiGLU: silu(gate) * up, not the GELU-tanh of the MTP drafter.
+// Sigmoid is computed in fp32 from the fp16 gate; the 1/(1+e^-x) form (rather
+// than tanh) matches `silu` in every reference implementation bit-for-bit at
+// fp32, which matters because the golden reference in T4 compares against
+// values computed this way.
+static float silu_value(float value) {
+    return value / (1.0f + metal::exp(-value));
+}
+
+kernel void silu(
+    const device half *input [[buffer(0)]],
+    device half *output [[buffer(1)]],
+    constant uint &count [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= count) {
+        return;
+    }
+    output[gid] = half(silu_value(float(input[gid])));
+}
+
+kernel void gated_silu(
+    const device half *gate [[buffer(0)]],
+    const device half *up [[buffer(1)]],
+    device half *output [[buffer(2)]],
+    constant uint &count [[buffer(3)]],
+    uint gid [[thread_position_in_grid]]) {
+    if (gid >= count) {
+        return;
+    }
+    output[gid] = half(silu_value(float(gate[gid])) * float(up[gid]));
+}
+
 // One thread per (token, head, rotation PAIR), not per column.
 //
 // The kernel is called IN PLACE on q and k (`encode_rope(&scratch.q,

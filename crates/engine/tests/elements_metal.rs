@@ -179,6 +179,37 @@ fn element_residual_activation_and_softcap_match_cpu() {
 }
 
 #[test]
+fn element_gated_silu_matches_cpu() {
+    let kernels = ElementKernels::new().expect("Metal element kernels should compile");
+    let left = values(97, 0.6);
+    let right = values(97, 1.9);
+
+    // Reference is x / (1 + e^-x), i.e. PyTorch's `silu`, evaluated in fp32 and
+    // narrowed to fp16 on both sides so the comparison is like-for-like.
+    let expected_gated = left
+        .iter()
+        .zip(right.iter())
+        .map(|(gate, up)| {
+            let value = f16::from_bits(*gate).to_f32();
+            f16::from_f32(value / (1.0 + (-value).exp())).to_f32()
+                * f16::from_bits(*up).to_f32()
+        })
+        .collect::<Vec<_>>();
+    let actual_gated = kernels.gated_silu(&left, &right).unwrap();
+    assert_close(&actual_gated, &expected_gated, 2e-3, "gated silu");
+
+    let expected_silu = left
+        .iter()
+        .map(|value| {
+            let value = f16::from_bits(*value).to_f32();
+            f16::from_f32(value / (1.0 + (-value).exp())).to_f32()
+        })
+        .collect::<Vec<_>>();
+    let actual_silu = kernels.silu(&left).unwrap();
+    assert_close(&actual_silu, &expected_silu, 2e-3, "silu");
+}
+
+#[test]
 fn element_rope_matches_default_and_proportional_paths() {
     let kernels = ElementKernels::new().expect("Metal element kernels should compile");
     let default_input = values(3 * 2 * 256, 0.4);
@@ -313,4 +344,39 @@ fn threadgroup_norm_matches_per_row_norm() {
             println!("norm width={width:>5} rows={rows:>4} worst_rel={worst:.2e}");
         }
     }
+}
+
+#[test]
+fn gated_silu_is_not_gated_gelu() {
+    // spec/dflash-correctness T4 sabotage evidence. The drafter's `hidden_act`
+    // is `silu`; the engine already had a `gated_gelu` for the MTP drafter.
+    // Feeding GeLU where SiLU belongs is a *silent* quality error -- nothing
+    // crashes, the draft just gets worse. So pin the two apart by the number
+    // that actually matters: the largest disagreement over the range a real
+    // activation row covers, which must dwarf the 2e-3 fp16 tolerance
+    // `assert_close` uses.
+    let kernels = ElementKernels::new().expect("Metal element kernels should compile");
+    let one = vec![f16::from_f32(1.0).to_bits(); 64];
+    let gate = (-32..32)
+        .map(|value| f16::from_f32(value as f32 * 0.25).to_bits())
+        .collect::<Vec<_>>();
+    let silu = kernels.gated_silu(&gate, &one).unwrap();
+    let gelu = kernels.gated_gelu(&gate, &one).unwrap();
+    let worst = (0..gate.len())
+        .map(|index| {
+            let a = f16::from_bits(silu[index]).to_f32();
+            let b = f16::from_bits(gelu[index]).to_f32();
+            let input = f16::from_bits(gate[index]).to_f32();
+            (input, (a - b).abs())
+        })
+        .fold((0.0_f32, 0.0_f32), |(at, worst), (input, diff)| {
+            if diff > worst { (input, diff) } else { (at, worst) }
+        });
+    assert!(
+        worst.1 > 0.1,
+        "silu and gelu-tanh only differ by {} at input {}, so swapping them \
+         would not be caught by any test in this file",
+        worst.1,
+        worst.0
+    );
 }
