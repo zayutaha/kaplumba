@@ -117,9 +117,21 @@ Update this file **immediately** after each task (AGENTS.md §3.3).
       tap[1] vs tap[2] differ on 75180/75264 elements. **Sabotage:** hardcoding
       the source to `hidden_a` makes them differ on **0/75264** and fails the
       parity assertion. *(uncommitted)*
-- [ ] **T8 — chunked prefill streaming.** Stream each prefill chunk's taps into
-      the drafter cache and release. **Tested by**: the chunk-vs-prompt-length
-      invariance test.
+- [x] **T8 — chunked prefill streaming.** `append_context` streams one chunk's
+      taps (`fc` + `hidden_norm` + per-layer `k_proj`/`v_proj` + `k_norm` + RoPE)
+      straight into the cache; nothing is retained beyond the chunk. **Tested
+      by** `crates/engine/tests/dflash_streaming.rs` (ignored; needs the target
+      **and** the drafter): a 32-token prefill fed as one chunk vs two 16-row
+      chunks, with **real target taps** through T7's capture path, must be
+      byte-identical — **0 of 32768 elements differ on all 5 layers**.
+      **Sabotage:** taking the RoPE base from the chunk offset instead of the
+      absolute position makes **~13130/32768 keys differ and 0 values**, which
+      is the correct signature because R9 rotates K and never V. *(uncommitted)*
+      **This test also caught a real bug in T7**: `enable_taps` sized its buffers
+      from the then-current `scratch.max_tokens`, but the first forward *grows*
+      the scratch, so the blit could write past the end of a one-row buffer.
+      Fixed by re-sizing the tap buffers in `ensure_scratch`'s growth path
+      (`rebuild_tap_buffers`).
 - [ ] **T9 — the round.** `generate.rs` DFlash loop; rewind on rejection.
       **Tested by**: the 0/5/15 stub-forced acceptance cases and the R13
       two-round test.

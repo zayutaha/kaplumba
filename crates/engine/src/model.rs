@@ -5168,6 +5168,39 @@ impl TextModel {
             attn_pass_state,
         )?;
         self.scratch_tokens = tokens;
+        // T7: the tap buffers are sized from `scratch.max_tokens`, which just
+        // changed. Re-sizing them here rather than in `enable_taps` is what keeps
+        // the blit in bounds: `enable_taps` is typically called before the first
+        // forward, when the scratch is still at its initial size, and the first
+        // forward is what grows it. Miss this and the blit writes past the end of
+        // a buffer sized for one row.
+        self.rebuild_tap_buffers()?;
+        Ok(())
+    }
+
+    /// (Re)allocate the T7 tap buffers from the current `scratch.max_tokens`.
+    ///
+    /// A no-op when taps are disabled. Cheap when the row count has not changed,
+    /// which is the common case, so `ensure_scratch` can call it unconditionally.
+    fn rebuild_tap_buffers(&mut self) -> Result<(), ModelError> {
+        let Some(taps) = self.taps.as_ref() else {
+            return Ok(());
+        };
+        let rows = self.scratch.max_tokens;
+        let bytes = (rows * self.hidden_size * std::mem::size_of::<u16>()) as u64;
+        if taps
+            .buffers
+            .first()
+            .is_some_and(|buffer| buffer.length() == bytes)
+        {
+            return Ok(());
+        }
+        let layers = taps.layers.clone();
+        let device = system_device()?;
+        let buffers = (0..layers.len())
+            .map(|_| device.new_buffer(bytes, metal::MTLResourceOptions::StorageModeShared))
+            .collect();
+        self.taps = Some(TapScratch { layers, buffers });
         Ok(())
     }
 

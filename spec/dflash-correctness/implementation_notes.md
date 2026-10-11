@@ -1034,3 +1034,45 @@ not corrupt the forward; it silently mislabels the data, and only a check on the
 KAPLUMBA_TEST_MODEL=~/.kaplumba/models/Gxma-repacked \
   cargo test -p kaplumba-engine --release --test dflash_taps -- --ignored --nocapture
 ```
+
+## 2026-10-11 — T8 landed: chunked prefill streaming, plus a real T7 bug it caught
+
+`crates/engine/tests/dflash_streaming.rs` (ignored; needs the 16 GB target *and*
+the drafter). It feeds the same 32 tokens two ways — one 32-row chunk, and two
+16-row chunks streamed through `append_context` — with **real target taps** from
+T7, and requires the drafter's cache to be byte-identical.
+
+Result: **0 of 32768 elements differ on all 5 layers.** R6 holds end to end.
+
+This is strictly stronger than `dflash_cache`'s synthetic-tap invariance test: it
+covers tap capture, `fc`/`hidden_norm` fusion, `k_proj`/`v_proj` + `k_norm` +
+RoPE, and the cache, across a real chunking.
+
+### It caught a genuine out-of-bounds bug I had just introduced in T7
+
+`enable_taps` sized the tap buffers from `self.scratch.max_tokens` **at the time
+it was called** — which is before the first forward, when the scratch is still at
+its initial size. The first forward calls `ensure_scratch(tokens)`, which *grows*
+the scratch. The tap buffers did not grow with it, so the in-loop blit was writing
+`tokens * hidden` elements into a buffer sized for one row.
+
+Symptom: `take taps: InvalidConfig("tap buffer is smaller than the requested row
+count")` — the read-back failing was the *lucky* part; had `take_taps` not
+re-checked the length, this would have been a silent device out-of-bounds write.
+
+Fixed with `rebuild_tap_buffers`, called from `ensure_scratch` after the scratch is
+rebuilt, which re-allocates when the row count changed and is a no-op otherwise.
+`dflash_taps` passed *before* this fix only because its 14-token prompt happened to
+fit the scratch's initial size — a reminder that a test with a too-small input can
+pass while the code is wrong.
+
+### Sabotage evidence (AGENTS.md §3.4)
+
+| sabotage | result |
+|---|---|
+| RoPE base from the chunk offset (`start = 0`) instead of `position - rows` | **~13130/32768 keys differ, 0 values**, on every layer -> FAILED |
+
+That split is the correct signature and worth keeping as a diagnostic: R9 rotates
+q and k and **never** v, so a position/RoPE error must move keys and leave values
+untouched. A failure that moved both would mean a different bug (e.g. the fusion or
+the projection), not a position error.
