@@ -2051,8 +2051,22 @@ impl AttentionKernels {
             ));
         }
         let query_buffer = self.make_u16_buffer(queries)?;
-        let ctx_key_buffer = self.make_u16_buffer(ctx_keys)?;
-        let ctx_value_buffer = self.make_u16_buffer(ctx_values)?;
+        // The ctx K/V are legitimately empty when the drafter's block is the
+        // whole sequence so far (n_ctx == 0, the first block after an empty
+        // prefill). `make_u16_buffer` refuses an empty slice because for every
+        // *other* caller that means a sizing bug, so stand in a one-element
+        // dummy: the Metal body only indexes ctx K/V when `k < n_ctx`, which is
+        // never, so the dummy is never read. `queries` must stay non-empty.
+        let ctx_key_buffer = if ctx_keys.is_empty() {
+            self.device.new_buffer(2, MTLResourceOptions::StorageModeShared)
+        } else {
+            self.make_u16_buffer(ctx_keys)?
+        };
+        let ctx_value_buffer = if ctx_values.is_empty() {
+            self.device.new_buffer(2, MTLResourceOptions::StorageModeShared)
+        } else {
+            self.make_u16_buffer(ctx_values)?
+        };
         let block_key_buffer = self.make_u16_buffer(block_keys)?;
         let block_value_buffer = self.make_u16_buffer(block_values)?;
         let position_buffer = self.make_u32_buffer(key_positions)?;

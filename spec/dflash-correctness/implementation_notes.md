@@ -341,3 +341,131 @@ The cross-check against `online_attention` is the one worth keeping: two
 independent implementations of the same causal-plus-window mask agreeing to
 1.2e-4 is strong evidence the mask is right, and it is the only test that would
 catch a bug shared between the kernel and the host reference.
+
+## 2026-10-11 — T4: the golden harness, and the blocker that stops T5/T9
+
+State: **T1/T2 committed (`5c8b9fe`); T3a committed (`05d1208`).** `DflashConfig`
++ `DflashModel::fuse_context / project_context_kv / forward_block / draft_logits`
+and the three test files below are **written but NOT committed**.
+
+### What T4 is now
+
+`crates/engine/tests/dflash_golden.rs` — three bounded tests, each with its own
+scalar f32 host reference dequantised from the same checkpoint:
+
+| test | covers | result |
+|---|---|---|
+| `dflash_fuse_context_matches_host` | `fc` + mask/anchor fusion | **pass**, worst 0.006263 |
+| `dflash_context_kv_matches_host` | `project_context_kv` (k/v proj + k_norm + RoPE) | **pass** |
+| `dflash_forward_block_matches_host` | the 5-layer block | **FAIL — see blocker** |
+
+`crates/engine/tests/dflash_nan_probe.rs` supersedes the proposed
+`examples/dflash_taps.rs`: it prints per-stage `bad/max` (16 stages) and is how
+the NaN below was localised.
+
+### Two engine bugs found on the way (both fixed)
+
+1. **Empty ctx K/V rejected.** `crates/kernels/src/attention.rs`:
+   `dflash_block_attention` went through `make_u16_buffer`, which rejects empty
+   inputs. With `n_ctx == 0` the context K/V are empty, so the block forwarded an
+   `Err(InvalidInput)` where a self-attention-only block is perfectly legal. Fix:
+   allocate a 2-element dummy buffer when the slice is empty. It is never
+   dereferenced — the Metal loop only indexes `ctx_keys` when `k < n_ctx`, which
+   is never true at `n_ctx == 0`. *(uncommitted)*
+2. **Absolute tolerance too tight.** `v_ctx` reaches magnitude ~45, where fp16
+   rounding is ~0.09. An absolute 0.05 threshold failed a correct implementation
+   (`0.075` disagreement, 0.17% relative). Threshold is now relative to the
+   reference's max.
+
+### THE BLOCKER: the drafter overflows fp16, and exllamav3 runs it in fp32
+
+With synthetic context, the **f32 host reference** — not the engine — produces:
+
+```
+v_block max  45.83      o_proj out max   2169.47
+mlp activated max 5811.90   mlp_out max 152287.50
+```
+
+`152287` is past fp16's `65504`, so the engine's fp16 element path goes `inf` in
+layer 0 and every later layer is `NaN`. `dflash_forward_block_matches_host`
+therefore trips its own vacuity guard (`engine carries no signal (energy NaN)`).
+
+**This is not an engine bug.** exllamav3 deliberately runs the drafter with fp32
+activations — verified in `reference/exllamav3/exllamav3/architecture/dflash.py`:
+
+- `:277` the attention block computes with `out_dtype = torch.float`
+- `:308` `GatedMLP(..., interm_dtype=torch.half, out_dtype=torch.float)`
+- `:316` only the *final* RMSNorm steps back down to `torch.half`
+- `modules/arch_specific/dflash.py:26` `DFlashInputLayer(out_dtype = torch.float)`
+
+So the residual stream is **fp32 throughout the drafter**, and that is a
+requirement, not an optimisation. Consequence: T3/T5's fp16 block forward cannot
+be made to pass by scaling or re-tuning; the element path needs an fp32 variant
+for the drafter (norms, residuals, `silu`, softcap, and the gemm input/output the
+EXL3 kernels consume). **This is the largest piece of remaining work in the spec
+and it is not in `plan.md`.**
+
+### The 9.58x gap (measured, unexplained — recorded, not resolved)
+
+`crates/engine/tests/dflash_weight_scale.rs` dequantises `layers.0.self_attn.o_proj`
+(8192→5376 in both checkpoints) on the host and compares RMS against the
+known-good target:
+
+```
+target  (3 bpw, colmajor): rms 0.011386 = 1.031x unit variance  (1/sqrt(8192))
+drafter (4 bpw, rowmajor): rms 0.109117 = 9.88x unit variance    (9.58x target)
+```
+
+The target landing at **1.031x unit variance** validates the rate/codebook/state
+decode: a residual-preserving projection has RMS `1/sqrt(in_features)` by
+construction, and a misread one does not. The drafter's ~10x is **not**
+explained by 4 bpw vs 3 bpw. It is consistent with the overflow above (larger
+weights → larger activations), so it is probably real — but "probably" is why
+this is written down as an open question rather than a fact. First thing to check
+if acceptance floors: whether the drafter's weights are genuinely 10x, or
+whether 4 bpw 0.0.32 needs a different decode than the target's 3 bpw 0.0.37.
+
+**Sabotage evidence (AGENTS.md §3.4), all three attempted:**
+
+| sabotage | caught? | result |
+|---|---|---|
+| target rate `Integer(3)` → `Integer(4)` | yes, but coarsely | `TrellisLength` error, not the assertion — the width check fires first |
+| `packed[0] ^= 0x1` (one corrupt trellis word) | **no** | test still green |
+| global `0.01` scale on the decoded matrix | yes | `decodes to 0.01x unit variance; a correct read of a residual-preserving projection sits near 1.0` |
+
+The middle row is the honest scope limit and it is now stated in the test's own
+doc comment: **RMS is invariant under permutation**, so this test can never see a
+row-major/column-major misread or a single bad tile. It is a magnitude check
+only. The real guard on tile order is `repacked_golden`, not this.
+
+### Checkpoint-format gotcha (cost an hour; do not re-derive)
+
+The two checkpoints store the trellis with **different grid orders**, so a shape
+cannot be used to derive in/out features:
+
+```
+drafter layers.0.self_attn.o_proj.trellis  [512, 336, 64]   tiles_k, tiles_n (stock EXL3)
+target  ...layers.0.self_attn.o_proj.trellis [336, 512, 48] tiles_n, tiles_k (repacker, colmajor)
+```
+
+Both have `suh [8192]` / `svh [5376]`, so **use the sign-vector lengths** for
+in/out — they are unambiguous. The target's on-disk tiles are already transposed;
+the tile-grid transpose is its own inverse, so applying `reorder_tensor_to_colmajor`
+to what is on disk converts it back to the row-major order `reconstruct_matrix`
+reads.
+
+### Exact next commands
+
+```bash
+# The three golden tests, with per-stage diagnostics on failure
+cargo test -p kaplumba-engine --release --test dflash_golden -- --nocapture
+# Stage-by-stage NaN/max probe (no model load, no GPU)
+cargo test -p kaplumba-engine --release --test dflash_nan_probe -- --nocapture
+# Host-only weight-scale check (no GPU, no gpuq)
+cargo test -p kaplumba-engine --release --test dflash_weight_scale -- --nocapture
+```
+
+**Order for the next session:** (1) T12's M=16 `gemm_chunk` bench — it is
+unblocked, host-measurable, and it decides whether T6's shape survives;
+(2) the fp32 element path above, without which T4's third test cannot pass;
+(3) commit, then T6.

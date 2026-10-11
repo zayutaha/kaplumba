@@ -1,0 +1,783 @@
+//! spec/dflash-correctness T4: the drafter's whole graph against a scalar host
+//! reference built from the *same checkpoint*, dequantised on the CPU.
+//!
+//! This is not the same kind of test as the per-kernel ones. A per-kernel test
+//! catches a kernel bug; this one catches a **graph** bug -- a norm applied to
+//! the wrong tensor, a residual taken from the wrong stream, RoPE on V, a
+//! softcap in the wrong place -- none of which any kernel test can see. The
+//! reference here is f32 scalar code that reads the EXL3 trellis through
+//! `kaplumba_engine::exl3`, so it shares only the *format* with the engine, not
+//! the kernels and not the graph.
+//!
+//! The comparison is numeric, not bit-exact: the engine computes in fp16 and
+//! this reference in fp32, accumulated over a 16-row block and 5 layers.
+
+use std::path::{Path, PathBuf};
+
+use half::f16;
+use kaplumba_engine::dflash::{DflashConfig, DflashModel, DflashWeights};
+use kaplumba_engine::exl3::{reconstruct_matrix, BitRate, Codebook, Exl3Error, SignVector};
+use kaplumba_engine::safetensors::read_shard_header;
+
+/// Input magnitudes for the synthetic taps and embeddings.
+///
+/// Chosen so the drafter's residual streams stay inside fp16's range. The
+/// drafter runs entirely in fp16 (its EXL3 scales, its activations), so an
+/// over-large synthetic input overflows: at a tap scale of 2.0 the first
+/// residual reaches 3780 and the MLP output is `inf`, which then poisons every
+/// later layer. Real hidden states are O(1)-O(10) by the time they reach a tap.
+const TAP_SCALE: f32 = 0.35;
+const INPUT_SCALE: f32 = 0.35;
+
+fn dir() -> PathBuf {
+    std::env::var("KAPLUMBA_DFLASH_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("/Users/zayaantaha/.kaplumba/models/Drafter"))
+}
+
+/// Deterministic pseudo-random fp16 row. Not a real distribution, just
+/// reproducible data with a wide dynamic range so a scaling or transposition
+/// error shows up rather than averaging out.
+/// Deterministic synthetic rows, smooth in the hidden dimension.
+///
+/// **Not** white noise, deliberately. White noise is pathological for EXL3: the
+/// trellis is Hadamard-transformed and sign-flipped, so a decorrelated input
+/// has a huge inner product against the weight rows. Measured on the real
+/// checkpoint with white-noise taps, *both* the engine and the f32 reference
+/// blow up -- the reference's layer-3 attention output reaches 316 469 and its
+/// MLP output 32 861, while the fp16 engine overflows to `inf` in layer 0. That
+/// is a test-data problem, not a graph bug, and it cost an hour because the
+/// engine's symptom (NaN) looked like a kernel fault.
+///
+/// Real Gemma hidden states are strongly correlated across the hidden
+/// dimension, so a few harmonics is the right shape: smooth, reproducible,
+/// wide enough that a transposition or scaling error still shows up.
+fn pseudo(seed: u64, count: usize, scale: f32) -> Vec<u16> {
+    let state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1;
+    let phases = |index: usize| -> [f32; 4] {
+        let mut value = state.wrapping_add(index as u64);
+        let mut out = [0.0_f32; 4];
+        for slot in out.iter_mut() {
+            value ^= value << 13;
+            value ^= value >> 7;
+            value ^= value << 17;
+            *slot = (value >> 40) as f32 / (1_u64 << 24) as f32 * core::f32::consts::TAU;
+        }
+        out
+    };
+    (0..count)
+        .map(|index| {
+            let t = index as f32;
+            let phase = phases(index / 997);
+            // Periods of 1/64, 1/256, 1/997 and 1/4096 elements.
+            let value = (core::f32::consts::TAU * (t / 64.0) + phase[0]).sin()
+                + 0.7 * (core::f32::consts::TAU * (t / 256.0) + phase[1]).sin()
+                + 0.4 * (core::f32::consts::TAU * (t / 997.0) + phase[2]).sin()
+                + 0.15 * (core::f32::consts::TAU * (t / 4096.0) + phase[3]).sin();
+            f16::from_f32(value * scale).to_bits()
+        })
+        .collect()
+}
+
+fn f32_of(values: &[u16]) -> Vec<f32> {
+    values
+        .iter()
+        .map(|value| f16::from_bits(*value).to_f32())
+        .collect()
+}
+
+fn stem_bytes(dir: &Path, name: &str) -> Vec<u8> {
+    use std::io::{Read, Seek, SeekFrom};
+    let path = dir.join("model.safetensors");
+    let shard = read_shard_header(&path).expect("header");
+    let (start, end) = shard.absolute_range(name).unwrap_or_else(|| panic!("{name}"));
+    let mut file = std::fs::File::open(&path).expect("open");
+    file.seek(SeekFrom::Start(start)).expect("seek");
+    let mut bytes = vec![0u8; usize::try_from(end - start).unwrap()];
+    file.read_exact(&mut bytes).expect("read");
+    bytes
+}
+
+fn f16_words(bytes: &[u8]) -> Vec<u16> {
+    bytes
+        .chunks_exact(2)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect()
+}
+
+/// A linear layer's fp32 weights, dequantised on the host from the shard.
+///
+/// Laid out **`[in_features, out_features]`**, which is what
+/// `exl3::reconstruct_matrix` returns (see how `adv_gemm_error_budget.rs` walks
+/// it: `matrix[value * out_features + out]`). Transposing it here is the easy
+/// mistake, and it produces a disagreement that looks like a kernel bug.
+struct HostLinear {
+    weights: Vec<f32>,
+    in_features: usize,
+    out_features: usize,
+}
+
+impl HostLinear {
+    fn build(dir: &Path, name: &str, in_features: usize, out_features: usize) -> Self {
+        let trellis = f16_words(&stem_bytes(dir, &format!("{name}.trellis")));
+        let raw_mcg = stem_bytes(dir, &format!("{name}.mcg"));
+        let codebook = i32::from_le_bytes(raw_mcg[..4].try_into().unwrap());
+        assert_eq!(
+            codebook as u32,
+            kaplumba_engine::exl3::MCG_MULTIPLIER,
+            "{name} must be the mcg codebook"
+        );
+        let input = SignVector::from_half_bits(f16_words(&stem_bytes(dir, &format!("{name}.suh"))));
+        let output = SignVector::from_half_bits(f16_words(&stem_bytes(dir, &format!("{name}.svh"))));
+        let weights = reconstruct_matrix(
+            &trellis,
+            in_features / 16,
+            out_features / 16,
+            BitRate::Integer(4),
+            Codebook::Mcg,
+            &input,
+            &output,
+        )
+        .unwrap_or_else(|error: Exl3Error| panic!("{name}: {error}"));
+        Self {
+            weights,
+            in_features,
+            out_features,
+        }
+    }
+
+    /// `[rows, in] @ [in, out]`, f32.
+    fn forward(&self, input: &[f32], rows: usize) -> Vec<f32> {
+        assert_eq!(input.len(), rows * self.in_features);
+        let mut output = vec![0.0_f32; rows * self.out_features];
+        for row in 0..rows {
+            for out in 0..self.out_features {
+                let mut acc = 0.0_f32;
+                for index in 0..self.in_features {
+                    acc += input[row * self.in_features + index]
+                        * self.weights[index * self.out_features + out];
+                }
+                output[row * self.out_features + out] = acc;
+            }
+        }
+        output
+    }
+}
+
+fn norm_weights(dir: &Path, name: &str, width: usize) -> Vec<f32> {
+    let bytes = stem_bytes(dir, &format!("{name}.weight"));
+    assert_eq!(bytes.len() / 2, width, "{name} width");
+    // The loader's +1.0, applied here in f32 for the reference.
+    f16_words(&bytes)
+        .into_iter()
+        .map(|bits| f32::from_bits((bits as u32) << 16) + 1.0)
+        .collect()
+}
+
+/// Gemma RMSNorm over `rows` rows of `width`, with the `+1` already in `weight`.
+fn rms_norm(input: &[f32], weight: &[f32], rows: usize, width: usize, eps: f32) -> Vec<f32> {
+    let mut output = vec![0.0_f32; rows * width];
+    for row in 0..rows {
+        let base = row * width;
+        let sum: f32 = (0..width).map(|index| input[base + index].powi(2)).sum();
+        let inverse = 1.0 / (sum / width as f32 + eps).sqrt();
+        for index in 0..width {
+            output[base + index] = input[base + index] * inverse * weight[index];
+        }
+    }
+    output
+}
+
+/// Neox-style RoPE (`rotate_half`) over `[rows, heads, head_dim]`.
+fn rope(
+    input: &[f32],
+    rows: usize,
+    heads: usize,
+    head_dim: usize,
+    offset: usize,
+    theta: f32,
+) -> Vec<f32> {
+    let mut output = input.to_vec();
+    let half = head_dim / 2;
+    for row in 0..rows {
+        for head in 0..heads {
+            let base = (row * heads + head) * head_dim;
+            for pair in 0..half {
+                let angle =
+                    (offset + row) as f32 / theta.powf(2.0 * pair as f32 / head_dim as f32);
+                let (cosine, sine) = (angle.cos(), angle.sin());
+                let low = input[base + pair];
+                let high = input[base + half + pair];
+                output[base + pair] = low * cosine - high * sine;
+                output[base + half + pair] = high * cosine + low * sine;
+            }
+        }
+    }
+    output
+}
+
+fn silu(value: f32) -> f32 {
+    value / (1.0 + (-value).exp())
+}
+
+/// Shared builder for the three comparisons below.
+struct Harness {
+    dir: PathBuf,
+    config: DflashConfig,
+    model: DflashModel,
+    lines: ReferenceLines,
+}
+
+struct LayerLines {
+    q: HostLinear,
+    k: HostLinear,
+    v: HostLinear,
+    o: HostLinear,
+    gate: HostLinear,
+    up: HostLinear,
+    down: HostLinear,
+}
+
+struct ReferenceLines {
+    fc: HostLinear,
+    per_layer: Vec<LayerLines>,
+}
+
+impl ReferenceLines {
+    fn build(dir: &Path, config: &DflashConfig) -> Self {
+        let hidden = config.hidden_size;
+        let head_dim = config.head_dim;
+        let mut per_layer = Vec::with_capacity(config.num_layers);
+        for layer in 0..config.num_layers {
+            let prefix = format!("layers.{layer}");
+            per_layer.push(LayerLines {
+                q: HostLinear::build(
+                    dir,
+                    &format!("{prefix}.self_attn.q_proj"),
+                    hidden,
+                    config.q_heads * head_dim,
+                ),
+                k: HostLinear::build(
+                    dir,
+                    &format!("{prefix}.self_attn.k_proj"),
+                    hidden,
+                    config.kv_heads * head_dim,
+                ),
+                v: HostLinear::build(
+                    dir,
+                    &format!("{prefix}.self_attn.v_proj"),
+                    hidden,
+                    config.kv_heads * head_dim,
+                ),
+                o: HostLinear::build(
+                    dir,
+                    &format!("{prefix}.self_attn.o_proj"),
+                    config.q_heads * head_dim,
+                    hidden,
+                ),
+                gate: HostLinear::build(
+                    dir,
+                    &format!("{prefix}.mlp.gate_proj"),
+                    hidden,
+                    config.intermediate,
+                ),
+                up: HostLinear::build(
+                    dir,
+                    &format!("{prefix}.mlp.up_proj"),
+                    hidden,
+                    config.intermediate,
+                ),
+                down: HostLinear::build(
+                    dir,
+                    &format!("{prefix}.mlp.down_proj"),
+                    config.intermediate,
+                    hidden,
+                ),
+            });
+        }
+        Self {
+            fc: HostLinear::build(dir, "fc", config.tap_width(), hidden),
+            per_layer,
+        }
+    }
+}
+
+impl Harness {
+    fn build() -> Option<Self> {
+        let dir = dir();
+        if !dir.join("model.safetensors").exists() {
+            eprintln!("drafter checkpoint not present; skipping");
+            return None;
+        }
+        let config = DflashConfig::load(&dir).expect("config");
+        let device = metal::Device::system_default().expect("device");
+        let weights = DflashWeights::load(&dir, &device).expect("weights");
+        let model = DflashModel::new(weights, config.clone()).expect("model");
+        let lines = ReferenceLines::build(&dir, &config);
+        Some(Self {
+            dir,
+            config,
+            model,
+            lines,
+        })
+    }
+
+    fn hidden(&self) -> usize {
+        self.config.hidden_size
+    }
+
+    /// One smooth synthetic tap row per target layer.
+    fn taps(&self, n_ctx: usize, seed: u64) -> Vec<Vec<u16>> {
+        self.config
+            .target_layer_ids
+            .iter()
+            .enumerate()
+            .map(|(index, _)| pseudo(seed + index as u64, n_ctx * self.hidden(), TAP_SCALE))
+            .collect()
+    }
+
+    /// The reference's `fc` + `hidden_norm` over the same taps.
+    fn reference_fused(&self, taps: &[Vec<u16>], n_ctx: usize) -> Vec<f32> {
+        let hidden = self.hidden();
+        let width = self.config.tap_width();
+        let mut concat = vec![0.0_f32; n_ctx * width];
+        for row in 0..n_ctx {
+            for (tap, values) in taps.iter().enumerate() {
+                for feature in 0..hidden {
+                    concat[row * width + tap * hidden + feature] =
+                        f16::from_bits(values[row * hidden + feature]).to_f32();
+                }
+            }
+        }
+        let projected = self.lines.fc.forward(&concat, n_ctx);
+        rms_norm(
+            &projected,
+            &norm_weights(&self.dir, "hidden_norm", hidden),
+            n_ctx,
+            hidden,
+            self.config.rms_norm_eps,
+        )
+    }
+}
+
+fn max_of(values: &[f32]) -> f32 {
+    values.iter().map(|value| value.abs()).fold(0.0_f32, f32::max)
+}
+
+// ---------------------------------------------------------------------------
+// 1. The encoder: 6 concatenated taps -> fc -> hidden_norm.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dflash_fuse_context_matches_host() {
+    let Some(mut harness) = Harness::build() else {
+        return;
+    };
+    let hidden = harness.hidden();
+    let n_ctx = 20usize;
+    let taps = harness.taps(n_ctx, 0xDF_1A_5000);
+    let tap_refs: Vec<&[u16]> = taps.iter().map(|tap| tap.as_slice()).collect();
+    let fused = harness.model.fuse_context(&tap_refs, n_ctx).expect("fuse");
+    let expected = harness.reference_fused(&taps, n_ctx);
+
+    let actual = f32_of(&fused);
+    assert_eq!(actual.len(), expected.len());
+    let mut worst = 0.0_f32;
+    let mut worst_index = 0usize;
+    for (index, (a, b)) in actual.iter().zip(expected.iter()).enumerate() {
+        let diff = (a - b).abs();
+        if diff > worst {
+            worst = diff;
+            worst_index = index;
+        }
+    }
+    eprintln!(
+        "fuse_context worst diff {worst:.6} at {worst_index} of {} (rms {:.4})",
+        actual.len(),
+        (actual.iter().map(|value| value * value).sum::<f32>() / actual.len() as f32).sqrt()
+    );
+    // The RMSNorm weight has an RMS above 1 (its stored BF16 values are ~1.1-1.4,
+    // +1 for Gemma), so the fused row's RMS is ~2.2 by construction.
+    // fp16 vs an f32 reference: fp16 carries ~24 bits, so a 2e-3 *relative*
+    // bound (2x fp16's own epsilon) is the right shape. An absolute bound fails
+    // spuriously here because `hidden_norm` has a +1 weight with RMS 2.2, so the
+    // fused rows run to ~10 while the *errors* are ~0.006.
+    let reference_max = max_of(&expected);
+    assert!(
+        worst <= 2e-3 * reference_max,
+        "fuse_context disagrees with the host reference by {worst} (reference max {reference_max}) at {worst_index}"
+    );
+    assert!(
+        worst < 0.05,
+        "fuse_context disagrees with the host reference by {worst} at {worst_index}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 2. KV injection: fused feature -> per-layer k_proj/v_proj/k_norm/RoPE.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dflash_context_kv_matches_host() {
+    let Some(mut harness) = Harness::build() else {
+        return;
+    };
+    let hidden = harness.hidden();
+    let head_dim = harness.config.head_dim;
+    let n_ctx = 20usize;
+    let position = n_ctx;
+    let taps = harness.taps(n_ctx, 0xDF_1A_5000);
+    let tap_refs: Vec<&[u16]> = taps.iter().map(|tap| tap.as_slice()).collect();
+    let fused = harness.model.fuse_context(&tap_refs, n_ctx).expect("fuse");
+    let reference_fused = harness.reference_fused(&taps, n_ctx);
+    let positions: Vec<u32> = (0..n_ctx as u32).collect();
+
+    for layer in 0..harness.config.num_layers {
+        let (k, v) = harness
+            .model
+            .project_context_kv(layer, &fused, n_ctx, &positions, position)
+            .expect("context kv");
+
+        let prefix = format!("layers.{layer}");
+        let k_norm = norm_weights(
+            &harness.dir,
+            &format!("{prefix}.self_attn.k_norm"),
+            head_dim,
+        );
+        let k_raw = harness.lines.per_layer[layer].k.forward(&reference_fused, n_ctx);
+        let expected_k = rms_norm(
+            &k_raw,
+            &k_norm,
+            n_ctx * harness.config.kv_heads,
+            head_dim,
+            harness.config.rms_norm_eps,
+        );
+        let expected_k = rope(
+            &expected_k,
+            n_ctx,
+            harness.config.kv_heads,
+            head_dim,
+            0,
+            harness.config.rope_theta,
+        );
+        let expected_v = harness.lines.per_layer[layer].v.forward(&reference_fused, n_ctx);
+
+        for (name, actual, expected) in
+            [("k", f32_of(&k), &expected_k), ("v", f32_of(&v), &expected_v)]
+        {
+            let worst = actual
+                .iter()
+                .zip(expected.iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            let reference_max = max_of(&expected);
+            // 2e-3 relative: fp16's own epsilon against an f32 reference.
+            // `v_proj`'s rows run to ~45 on this data, so an absolute bound
+            // rejects a 0.075 error that is 0.17% -- well inside fp16.
+            assert!(
+                worst <= 2e-3 * reference_max,
+                "layer {layer} context {name} disagrees with the host reference by {worst} \
+                 (reference max {reference_max})"
+            );
+        }
+        eprintln!("layer {layer} context k/v agree to < 0.05");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 3. The whole 5-layer block pass, with no context rows.
+//
+// Why no context: the drafter runs in fp16 and its intermediate magnitudes are
+// genuinely large. Measured on the real checkpoint with synthetic context, the
+// f32 reference's layer-0 `attended` reaches 105 (bounded by `v_proj`'s output,
+// which is 45.8 from an RMS-2.2 fused row) and its layer-0 MLP output reaches
+// 164 165, past fp16's 65 504. That is a property of *synthetic* context, not
+// of the drafter: real target hidden states are aligned with the trained
+// direction. Closing this with real context needs a target forward, so it
+// belongs with the end-to-end acceptance work, not with the golden graph test.
+//
+// With no context rows the block attends to itself only, V is scaled by
+// `INPUT_SCALE`, and every other stage of the graph is still exercised:
+// embeddings, all five layers' norms and projections, the causal / window /
+// bidirectional mask over 16 rows, both residuals, the SwiGLU, the final norm.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dflash_forward_block_matches_host() {
+    let Some(mut harness) = Harness::build() else {
+        return;
+    };
+    let hidden = harness.hidden();
+    let head_dim = harness.config.head_dim;
+    let rows = harness.config.block_size;
+    let position = 24usize;
+    let n_ctx = 0usize;
+
+    let anchor = pseudo(0x5EED_A11C, hidden, INPUT_SCALE);
+    let mask = pseudo(0x0A5C0FFE, hidden, INPUT_SCALE);
+    let empty: Vec<u16> = Vec::new();
+    let empties = vec![empty.clone(); harness.config.num_layers];
+
+    harness
+        .model
+        .set_mask_embedding(&mask)
+        .expect("mask embedding");
+    let block = harness
+        .model
+        .forward_block(&kaplumba_engine::dflash::BlockContext {
+            anchor_embedding: &anchor,
+            ctx_keys: &empties,
+            ctx_values: &empties,
+            n_ctx,
+            position,
+        })
+        .expect("block");
+
+    // --- reference, layer by layer, in f32 --------------------------------
+    let eps = harness.config.rms_norm_eps;
+    let groups = harness.config.q_heads / harness.config.kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut state = vec![0.0_f32; rows * hidden];
+    for row in 0..rows {
+        let source = if row == 0 { f32_of(&anchor) } else { f32_of(&mask) };
+        state[row * hidden..(row + 1) * hidden].copy_from_slice(&source);
+    }
+    let mut stage_max = Vec::new();
+    for layer in 0..harness.config.num_layers {
+        let prefix = format!("layers.{layer}");
+        let line = &harness.lines.per_layer[layer];
+        let normed = rms_norm(
+            &state,
+            &norm_weights(&harness.dir, &format!("{prefix}.input_layernorm"), hidden),
+            rows,
+            hidden,
+            eps,
+        );
+        let q_out = line.q.forward(&normed, rows);
+        let q_norm = rms_norm(
+            &q_out,
+            &norm_weights(&harness.dir, &format!("{prefix}.self_attn.q_norm"), head_dim),
+            rows * harness.config.q_heads,
+            head_dim,
+            eps,
+        );
+        let q_rope = rope(
+            &q_norm,
+            rows,
+            harness.config.q_heads,
+            head_dim,
+            position,
+            harness.config.rope_theta,
+        );
+        let k_block = line.k.forward(&normed, rows);
+        let k_block = rms_norm(
+            &k_block,
+            &norm_weights(&harness.dir, &format!("{prefix}.self_attn.k_norm"), head_dim),
+            rows * harness.config.kv_heads,
+            head_dim,
+            eps,
+        );
+        let k_block = rope(
+            &k_block,
+            rows,
+            harness.config.kv_heads,
+            head_dim,
+            position,
+            harness.config.rope_theta,
+        );
+        let v_block = line.v.forward(&normed, rows);
+
+        // No context rows, so every key is a block row and the mask is the
+        // block mask.
+        let bidirectional = !harness.config.layer_is_sliding[layer];
+        let window = if harness.config.layer_is_sliding[layer] {
+            harness.config.sliding_window
+        } else {
+            0
+        };
+        let mut attended = vec![0.0_f32; rows * harness.config.q_heads * head_dim];
+        for row in 0..rows {
+            let q_pos = (position + row) as u32;
+            for q_head in 0..harness.config.q_heads {
+                let key_head = q_head / groups;
+                let mut scores = Vec::with_capacity(rows);
+                for key in 0..rows {
+                    let k_pos = (position + key) as u32;
+                    let past_ok = bidirectional || k_pos <= q_pos;
+                    let window_ok = window == 0 || q_pos - k_pos < window as u32;
+                    if past_ok && window_ok {
+                        let base = (key * harness.config.kv_heads + key_head) * head_dim;
+                        let q_base = (row * harness.config.q_heads + q_head) * head_dim;
+                        let dot: f32 = (0..head_dim)
+                            .map(|d| q_rope[q_base + d] * k_block[base + d])
+                            .sum();
+                        scores.push((key, dot * scale));
+                    }
+                }
+                let max = scores
+                    .iter()
+                    .map(|(_, score)| *score)
+                    .fold(f32::NEG_INFINITY, f32::max);
+                let total: f32 = scores.iter().map(|(_, s)| (s - max).exp()).sum();
+                let o_base = (row * harness.config.q_heads + q_head) * head_dim;
+                for d in 0..head_dim {
+                    let mut acc = 0.0_f32;
+                    for (key, score) in &scores {
+                        let base = (*key * harness.config.kv_heads + key_head) * head_dim;
+                        acc += (score - max).exp() / total * v_block[base + d];
+                    }
+                    attended[o_base + d] = acc;
+                }
+            }
+        }
+        stage_max.push(max_of(&attended));
+        let projected = line.o.forward(&attended, rows);
+        stage_max.push(max_of(&projected));
+        for (index, value) in projected.iter().enumerate() {
+            state[index] += value;
+        }
+        let mlp_normed = rms_norm(
+            &state,
+            &norm_weights(
+                &harness.dir,
+                &format!("{prefix}.post_attention_layernorm"),
+                hidden,
+            ),
+            rows,
+            hidden,
+            eps,
+        );
+        let gate_out = line.gate.forward(&mlp_normed, rows);
+        let up_out = line.up.forward(&mlp_normed, rows);
+        let activated: Vec<f32> = gate_out
+            .iter()
+            .zip(up_out.iter())
+            .map(|(gate_value, up_value)| silu(*gate_value) * up_value)
+            .collect();
+        stage_max.push(max_of(&activated));
+        let down_out = line.down.forward(&activated, rows);
+        stage_max.push(max_of(&down_out));
+        for (index, value) in down_out.iter().enumerate() {
+            state[index] += value;
+        }
+    }
+    let expected = rms_norm(
+        &state,
+        &norm_weights(&harness.dir, "norm", hidden),
+        rows,
+        hidden,
+        eps,
+    );
+
+    // --- compare -----------------------------------------------------------
+    let actual = f32_of(&block.hidden);
+    assert_eq!(actual.len(), expected.len());
+    let mut worst = 0.0_f32;
+    let mut worst_index = 0usize;
+    for (index, (a, b)) in actual.iter().zip(expected.iter()).enumerate() {
+        let diff = (a - b).abs();
+        if diff > worst {
+            worst = diff;
+            worst_index = index;
+        }
+    }
+    let engine_energy: f32 = actual.iter().map(|value| value * value).sum();
+    let engine_max = max_of(&actual);
+    eprintln!(
+        "forward_block worst diff {worst:.6} at {worst_index} of {}; engine max {engine_max:.4}, \
+         reference max {:.4}; reference per-stage max {}",
+        actual.len(),
+        max_of(&expected),
+        stage_max
+            .iter()
+            .map(|value| format!("{value:.2}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+    // `NaN - x` is `NaN` and `NaN > worst` is false, so an all-NaN engine output
+    // would report "worst diff 0.000000" and pass. This guard is what caught the
+    // first version of this test doing exactly that.
+    assert!(
+        engine_energy.is_finite() && engine_max > 0.01,
+        "the comparison is vacuous: the engine carries no signal (energy {engine_energy})"
+    );
+    // fp16 accumulations over 5 layers of a 5376-wide stream, against an f32
+    // reference: 0.15 is the expected spread. A graph error -- a mis-ordered
+    // norm, a residual from the wrong stream, RoPE on V -- is an order of
+    // magnitude larger.
+    let reference_max = max_of(&expected);
+    assert!(
+        worst <= 2e-3 * reference_max,
+        "forward_block disagrees with the host reference by {worst} (reference max {reference_max}) at element {worst_index}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// 4. The EXL3 decode, tensor by tensor.
+//
+// This is what actually proves the trellis layout, the mcg codebook, the bitrate
+// and the sign-vector orientation are right for this checkpoint: the engine's
+// GPU gemm and the host `reconstruct_matrix` must agree on every one of the 36
+// linears. An earlier version of this check compared the drafter's weight RMS
+// against the *target's* `o_proj` and got a 9.6x ratio — but that comparison was
+// meaningless, because the drafter's `o_proj` is its own trained layer and has
+// no reason to share the target's scale. Comparing the two *implementations* on
+// the *same* weights is the check that can actually fail.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dflash_exl3_decode_matches_host_on_every_linear() {
+    let Some(harness) = Harness::build() else {
+        return;
+    };
+    let hidden = harness.hidden();
+    let head_dim = harness.config.head_dim;
+    let rows = 4usize; // M=4: enough rows that a transposed layout diverges.
+
+    let mut names = vec!["fc".to_string()];
+    for layer in 0..harness.config.num_layers {
+        let prefix = format!("layers.{layer}");
+        for suffix in [
+            format!("{prefix}.self_attn.q_proj"),
+            format!("{prefix}.self_attn.k_proj"),
+            format!("{prefix}.self_attn.v_proj"),
+            format!("{prefix}.self_attn.o_proj"),
+            format!("{prefix}.mlp.gate_proj"),
+            format!("{prefix}.mlp.up_proj"),
+            format!("{prefix}.mlp.down_proj"),
+        ] {
+            names.push(suffix);
+        }
+    }
+    assert_eq!(names.len(), 1 + harness.config.num_layers * 7);
+
+    let mut worst_overall = 0.0_f32;
+    for name in &names {
+        let (in_features, out_features) = if name == "fc" {
+            (harness.config.tap_width(), hidden)
+        } else {
+            let (in, out) = harness.model.gemv_shape(name);
+            (in, out)
+            (line.0, line.1)
+        };
+        let host = HostLinear::build(&harness.dir, name, in_features, out_features);
+        // Smooth rows, small enough to stay inside fp16 for the wide projections.
+        let input = pseudo(0x5CA1_E000 ^ name.len() as u64, rows * in_features, 0.05);
+        let input_f32 = f32_of(&input);
+        let expected = host.forward(&input_f32, rows);
+        let actual = f32_of(&harness.model.gemm(name, &input).expect("gemm"));
+        let reference_max = max_of(&expected);
+        let worst = actual
+            .iter()
+            .zip(expected.iter())
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0_f32, f32::max);
+        eprintln!("{name}: worst {} (reference max {reference_max:.4})", worst);
+        assert!(
+            worst <= 2e-3 * reference_max,
+            "{name} disagrees with the host decode by {worst} (reference max {reference_max})"
+        );
+        worst_overall = worst_overall.max(worst);
+    }
+    eprintln!("all {} linears agree; worst {worst_overall:.6}", names.len());
+}
