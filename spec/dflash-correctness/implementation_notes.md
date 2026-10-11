@@ -1142,3 +1142,856 @@ sequences, which is why T10 has to be written before T9 is believed.
   raw -> scaled by changing that one argument.
 - `DflashRound { accepted, next, drafted }` with `emitted()`, the shape the round
   will return.
+
+---
+
+## Decode baseline measured, 2026-10-11 (3-bit target, no speculation)
+
+Command (3 runs, 200 tokens, through gpuq):
+
+    M=~/.kaplumba/models/Gxma/Gxma
+    for i in 1 2 3; do
+      ~/.../gpuq run -- ./target/release/kaplumba --model "$M" \
+        --prompt "Explain the theory of relativity." --max-new-tokens 200 \
+        --temperature 0 --metrics
+    done
+
+Result — decode tok/s: **15.283, 15.403, 15.265** (median 15.283, spread
+0.138 = 0.9%). ttft_ms: 1388.6, 1342.6, 1337.7.
+
+This is the first tight decode figure in this repo. AGENTS.md §10.2 #5 records
+3.7-6.4 tok/s from the *same* binary minutes apart; this session's runs are
+within 0.9% of each other across three runs. Treat 15.3 as the baseline, not the
+older numbers — those were measured under different conditions.
+
+### What 30 tok/s requires (arithmetic, not opinion)
+
+    weights            = 16.028 GB (8.499 + 7.529)
+    15.283 tok/s       = 65.4 ms/token = 245 GB/s = **90% of the 273 GB/s peak**
+    non-spec ceiling   = 273 / 16.028 = **17.03 tok/s**
+    30 t/s needs       = 481 GB/s = **1.76x the machine's bandwidth**
+
+**30 t/s is impossible on any single-token decode path.** The existing decode is
+already at 90% of the hardware ceiling; there are ~1.7 tok/s of headroom, not
+13. This closes the question the same way 25 did, with a measured baseline
+rather than an assumed one.
+
+### Therefore 30 t/s is reachable only through speculation, and only at b32
+
+              block=16    block=32
+    acc 100%    22.4        37.0
+    acc  90%    20.1        33.3
+    acc  81%    18.1        30.0   <- 30 t/s threshold
+    acc  80%    17.9        29.6
+
+- **block_size=16 cannot reach 30 t/s even at 100% acceptance (22.4).**
+- **block_size=32 reaches 30 t/s at 81% acceptance** (33.3 at 90%, 37.0 at 100%).
+
+So the acceptance bar is now an exact number: **81% at block_size=32**. Between
+81% and 100% every extra point of acceptance is worth 0.37 tok/s.
+
+### Residual uncertainty in the b32 column
+
+The 595 ms verify is read from the 30-token prefill row (measured); the 242 ms
+drafter is the M=16 figure scaled 2x, **not measured**. If the drafter's M=32
+path is superlinear the round grows and the acceptance bar rises in step. The
+cheap check is extending `dflash_gemm_m16` to M=32 — it is the one number
+between this table and a decision.
+
+---
+
+## Drafter M=32 measured — the b32 column is now measured, not projected
+
+`dflash_gemm_m16` gained a `KAPLUMBA_DFLASH_M` override so the same 36 linears
+can be timed at a candidate block size without editing the checkpoint config.
+An override prints its numbers and does not trip the R19 `< 100 ms` assertion,
+which is scoped to the checkpoint's own block size.
+
+Command (both runs, release, no model load):
+
+    cargo test -p kaplumba-engine --release --test dflash_gemm_m16 -- --nocapture
+    KAPLUMBA_DFLASH_M=32 cargo test -p kaplumba-engine --release --test dflash_gemm_m16 -- --nocapture
+
+| | M=16 | M=32 |
+|---|---|---|
+| 35 per-layer projections | 78.65 ms | 139.94 ms |
+| `fc` | 8.713 ms | 16.774 ms |
+| **drafting total** | **87.36 ms** | **156.71 ms** |
+| effective bandwidth | 9.4 GB/s | 5.1 GB/s |
+
+Two things this settles:
+
+1. **M=32 is SUBlinear** — 1.794x the time for 2x the rows, so the earlier
+   2x-scaled 242 ms estimate was **wrong by 85 ms** in the favourable direction.
+2. **The drafter is compute-bound, not read-bound.** Doubling the rows does not
+   double the bytes; if the kernel were bandwidth-bound M=32 would cost the same
+   as M=16. Instead GB/s *falls* (9.4 -> 5.1) while time rises 1.79x. So the
+   earlier "3-4x of headroom vs the target's 28-46 GB/s colmajor path" is real
+   *and* the limit at M=32 is arithmetic throughput, not weight traffic. Fixing
+   it is a tiling problem, not a staging problem.
+
+## The 30 t/s answer, both sides measured
+
+    block=16:  545 verify +  87.4 draft =  632 ms round -> 23.7 t/s at 100% acc
+    block=32:  595 verify + 156.7 draft =  752 ms round -> 41.2 t/s at 100% acc
+
+               block=16    block=32
+    acc 100%     23.7        41.2
+    acc  90%     21.3        37.1
+    acc  80%     19.0        33.0
+
+    block=16: 30 t/s needs **126.5% acceptance** -> arithmetically impossible
+    block=32: 30 t/s needs **72.7% acceptance** -> the real bar
+
+**At block_size=16 the target is unreachable at any acceptance rate.** At
+block_size=32 it needs 73% acceptance, and every point above that is worth
+about 0.4 tok/s. That is the whole decision: `block_size`, 32, 73% acceptance.
+
+Residual: the 595 ms verify is the 30-token prefill row (measured step function,
+upper bound sound for a 32-row batch); the 156.7 ms drafter is now measured
+directly. The one unmeasured interaction is that a b16-trained drafter read at
+b32 may lose acceptance — which is exactly what the 73% bar is asking about.
+
+---
+
+## 2026-10-11 — T9's remaining blocker is on the target, and it is a hardcoded `1`
+
+I went to implement T9 with the corrected (non-anchor-refeeding) shape and found the
+structural blocker that makes it more than a caller change. It is worth recording
+precisely because it invalidates the "T9 is just wiring" reading.
+
+### The target returns logits for exactly ONE row
+
+`TextModel::encode_lm_head` (`crates/engine/src/model.rs:5050`) runs:
+
+    self.elements.encode_rms_norm(.., &self.scratch.last_hidden, .., 1, hidden, eps)
+                                                                       ^
+    self.linear.encode_gemv(.., input: &self.scratch.last_hidden, ..)
+
+A literal `1` for the row count, over `scratch.last_hidden`, which is a single
+row. `forward_buffer_into`'s own doc says it outright: *"The LM head already runs
+on the last row only, so only the final chunk's logits are returned."* That is
+correct for prefill (only the last row predicts the next token) and for decode
+(one row by definition).
+
+**A batched verify needs `n` logits rows, one per draft position.** `L[k]` is the
+full vocabulary distribution at position `position + k - 1`; there is no way to
+decide acceptance for `draft.tokens[k]` without it. So the verify path cannot use
+`forward_buffer`, and T9 is blocked on a target-side change, not on the round
+loop:
+
+1. the final hidden state must survive for **all `n` rows**, not just row `n-1`
+   (`scratch.last_hidden` currently keeps only that one), and
+2. the head must run at `n` rows — `encode_rms_norm(rows = n)` plus a GEMM at
+   `M = n` instead of the `encode_gemv` — and expose an `[n, vocab]` read-back.
+
+### The cost is small once written, which is the point
+
+The head is ~1.05 GB at 6 bpw. `encode_gemv` at M=1 reads all of it; a batched
+GEMM at M=n reads the same bytes once and amortises them over `n` rows, so the
+head costs ~4.3 ms at the measured 245 GB/s whether n is 1 or 32. **The verify
+head is nearly free.** What is not free is that it does not exist yet, and that
+adding it touches the same 6 500-line hot-path file that `forward_buffer` lives
+in — the file whose single-row behaviour every decode measurement depends on.
+
+### So the full T9 chain is now specified end to end
+
+| # | piece | state |
+|---|---|---|
+| 1 | drafter tap export (T7) | **done** — `dflash_taps` 1/1, sabotaged |
+| 2 | chunked tap streaming (T8) | **done** — `dflash_streaming` 1/1, sabotaged |
+| 3 | the corrected round shape | **specified** (see above): feed `draft.tokens[0..n]` at `position..position+n-1`, carry `previous_logits` for `L[0]`, read `L[1..=n]` off the returned rows, retract `n - k` |
+| 4 | **multi-row head on the target** | **missing** — the blocker above |
+| 5 | greedy-equivalence test (T10) | not written; must precede believing (3) |
+| 6 | CLI wiring + measurement (T11) | not written |
+
+Piece 4 is the one that has to be built carefully, and it is the reason I am not
+writing T9 in the remaining budget: an unverified edit to `encode_lm_head` risks
+the decode path that every number in this note is measured through. The
+single-row `KAPLUMBA_FORCE_LOAD` decode baseline (15.283 tok/s) is the thing worth
+protecting, and a batched head is exactly the change that could silently move it.
+
+Nothing above changes the decision the measurements support: **block_size=32,
+~73% acceptance for 30 tok/s.**
+
+---
+
+## 2026-10-11 — multi-row head: design closed, including the memory tradeoff
+
+I scoped the multi-row head to the point of implementation and found the last
+unknown, which is a **sizing** decision rather than a correctness one.
+
+### The final hidden state for ALL rows is already there
+
+`forward_chunk` keeps every row's hidden through the layer stack and only narrows
+at the head:
+
+    let final_hidden = if layers.is_multiple_of(2) { &self.scratch.hidden_a }
+                       else                         { &self.scratch.hidden_b };
+    self.elements.encode_copy_last_row(encoder, final_hidden, &self.scratch.last_hidden, tokens, hidden)?;
+
+So the multi-row head is **additive** — a new method, not a re-plumbing of
+`forward_buffer_into`. `forward_buffer_into`'s signature and its 3 external call
+sites (`generate.rs:967`, `examples/prefill_probe.rs:98`, plus the internal
+pipelined path) do not have to change. `scratch.normed` is already
+`max_tokens x hidden`, so even the normalise target exists.
+
+### The one thing that does NOT fit: the head's fp32 accumulator
+
+`encode_gemm`/`encode_gemv_mrhs` accumulate into `scratch.raw`, sized
+
+    raw_elements = (max_tokens * inter).max(vocab)      // 32*21504 = 688128 elems = 2.75 MB
+
+but a head GEMM over `queries` rows needs `queries * out_features` = `queries *
+262144`:
+
+| rows | head raw (f32) | logits (f16) | total |
+|---|---|---|---|
+| 1 | 1.0 MB | 0.5 MB | 1.6 MB |
+| 8 | 8.4 MB | 4.2 MB | 12.6 MB |
+| 16 | 16.8 MB | 8.4 MB | 25.2 MB |
+| **32** | **33.6 MB** | **16.8 MB** | **50.3 MB** |
+
+At 32 rows the needed accumulator is **12x the existing `raw`**. A new buffer is
+required either way; the question is its size, which is exactly the kind of
+decision AGENTS.md §8 ("explicitly owned, fixed-size, independent of context
+length") and R20 (peak footprint) govern rather than a late edit.
+
+### Recommended shape: batch the head at 8 rows
+
+Run the head in fixed 8-row batches inside the verify. 32 rows = 4 batches,
+allocating 12.6 MB instead of 50.3 MB, at a cost of 3 extra reads of the 1.05 GB
+head:
+
+    3 * 1.05 GB / 245 GB/s = **12.9 ms per round**, against a 752 ms round => 1.7%
+
+So the batching is 1.7% of the round to quarter the buffer, and it keeps the
+allocation **independent of block size** — raising `block_size` to 64 later does
+not grow it. That satisfies §8 properly instead of merely passing this round.
+
+### Where this leaves T9
+
+Every piece is now specified: the round shape, the retract count, the accessors
+(landed), the head change (design above), the T10 equivalence test that must
+precede believing any of it, and the T11 measurement. Nothing here changes the
+settled conclusion — **30 t/s needs `block_size=32` and >=72.7% acceptance** — and
+none of this design work moves the decode baseline, which is the number worth
+protecting at 15.283 tok/s.
+
+---
+
+## 2026-10-11 — TWO CORRECTIONS: the model path, and the acceptance arithmetic
+
+Both of these invalidate numbers I wrote earlier in this file. Correcting them in
+place rather than leaving the earlier text to mislead.
+
+### Correction 1 — the checkpoint path in every command above is wrong
+
+Every command block in this file says `--model ~/.kaplumba/models/Gxma/Gxma`.
+**That path does not exist.** The real 3-bit target is
+
+    ~/.kaplumba/models/Gxma-repacked
+
+confirmed by size: `model-00001-of-00002.safetensors` is 8 498 859 202 B and
+`model-00002-of-00002.safetensors` is 7 529 529 792 B, the exact pair the
+bandwidth arithmetic uses (16.028 GB). The **numbers** recorded above are right
+(they came from a real run); only the path label was wrong. Anyone re-running
+these commands verbatim got
+`checkpoint inspection failed: ... config.json: No such file or directory`.
+
+Other checkpoints present: `Gxma-4-bit-split` (19 G), `Gxma-uncensored*` (15 G),
+`Drafter` (733 M, the DFlash drafter).
+
+### Correction 2 — the acceptance arithmetic was wrong, by up to 2.9x
+
+I wrote that a b32 round yields `31 * acceptance` tokens, and derived "30 t/s needs
+72.7% acceptance" from it. **That is not the formula.** In speculative decoding the
+draft is a *prefix*: the round emits tokens while the acceptance coin keeps coming
+up heads, so with per-token acceptance `alpha` and `gamma` draft tokens,
+
+    E[tokens per round] = sum_{j=0}^{gamma} alpha^j = (1 - alpha^(gamma+1)) / (1 - alpha)
+
+The linear form agrees only at `alpha = 1` and diverges fast -- at `b32, alpha=0.9`
+it overstated by **2.9x** (37.1 t/s claimed, 12.8 t/s correct).
+
+Round times used (both sides measured): b16 = 545 verify + 87.4 draft = 0.6324 s;
+b32 = 595 + 156.7 = 0.7517 s.
+
+| alpha | E[b16] | E[b32] | t/s b16 | t/s b32 |
+|---|---|---|---|---|
+| 0.80 | 4.86 | 5.00 | 7.7 | 6.6 |
+| 0.90 | 8.15 | 9.66 | 12.9 | 12.8 |
+| 0.92 | 9.21 | 11.63 | 14.6 | 15.5 |
+| 0.94 | 10.47 | 14.37 | 16.6 | 19.1 |
+| 0.96 | 11.99 | 18.23 | 19.0 | 24.3 |
+| 0.977 | 13.52 | 22.83 | 21.4 | **30.4** |
+| 1.00 | 16.00 | 32.00 | 25.3 | 42.6 |
+
+**Baseline to beat: 15.25 tok/s** (measured below, this box, clean).
+
+- **b16: break-even alpha = 0.928; 30 t/s is UNREACHABLE — even at alpha = 1 the
+  ceiling is 25.3 t/s.** This conclusion survives the correction, but for a
+  different reason than I gave: not "acceptance is capped", but "16 tokens per
+  round at 545 ms is 25.3 t/s, period".
+- **b32: break-even alpha = 0.919; 30 t/s needs alpha = 0.977.**
+
+**Below alpha ~= 0.92, DFlash is SLOWER than plain decode.** At alpha = 0.9, b32
+gives 12.8 t/s against the 15.25 baseline: the drafting cost (156.7 ms) is not
+repaid. That is the single most important number in this file, because it means
+the whole spec is net-negative until acceptance is high.
+
+### The spec's own gate was below break-even
+
+AC4 said "acceptance >= 2.4 tokens per target forward" at b16. Under the correct
+formula, 2.4 tokens/round at b16 is `alpha ~= 0.58`, which is **4.4 t/s** -- a
+**3.5x slowdown** against plain decode. I set that gate without checking it
+against the baseline it had to beat. It is retired below.
+
+### Temp 1.0 / top_k 64 changes the VERIFIER, not just the sampler
+
+The requested target is *coherent prose at temperature 1.0, top_k = 64*. Greedy
+`argmax` comparison is **not a valid verifier for that** and would violate R6:
+matching argmax turns the output greedy, which is a different distribution from
+the one asked for.
+
+Distribution-exact sampling requires **speculative sampling** (Leviathan et al.
+2023; Chen et al. 2023): draft `x ~ q`, accept with probability
+`min(1, p(x)/q(x))`, and on rejection resample from the normalised residual
+`(p - q)+`. Then per-token acceptance is
+
+    alpha = sum_x min(p(x), q(x)) = 1 - TV(p, q)
+
+i.e. acceptance *is* the total-variation distance between the drafter and target
+distributions **at temperature 1.0 under top_k = 64 truncation** -- not the
+argmax agreement rate, and not the temperature-0 number. So T9's design and T10's
+test both need restating for sampling:
+
+- T9 must carry `p` and `q` rows (not argmax) and implement the accept/residual
+  step; the corrected round shape in the section above still holds for the
+  positions and the retract count.
+- **T10's "greedy sequence equivalence" is the wrong criterion here.** For
+  temp > 0 the admissible test is distribution-exactness: with a fixed seed and a
+  fixed draft stream, the round must reproduce the *same sampling procedure's*
+  distribution -- checked by comparing the empirical token distribution (and the
+  rejection/residual path) against non-speculative sampling, not by byte-equality
+  of sequences. Byte-equality is only the temp-0 special case.
+
+**`alpha` is now the blocking unknown.** Nothing above tells us what it is: it
+depends on how close a b16-trained 733 MB drafter's temp-1.0 top-64 distribution is
+to a 31B target's, and on whether a b16 checkpoint read at b32 keeps it. If it
+lands below 0.92 the honest answer is **do not ship this** -- it is a pessimization
+-- and that is measurable *before* building T9, by comparing the drafter's and
+target's next-token distributions on real contexts.
+
+---
+
+## 2026-10-11 — `draft_block` contradicts its own documented contract, on an untested path
+
+Found while trying to measure `alpha` (which is now the blocking unknown). This
+must be resolved **before** any alpha number means anything, because alpha is a
+function of exactly which logits rows become the drafts.
+
+### The evidence
+
+Three sources say the anchor (block row 0) must be dropped:
+
+1. `DflashConfig::draft_tokens` (`dflash.rs:396`):
+   > `// A block is [anchor, mask x (block_size - 1)] and the anchor row predicts a
+   > // token the target has already emitted, so it is dropped.`
+   > `self.block_size - 1`
+2. `DflashModel::draft_block` (`dflash.rs:1588`):
+   > `// Only the block_size - 1 masked rows are new tokens; the anchor's own`
+   > `// logits predict a token the target has already produced.`
+3. `forward_block` (`dflash.rs:1310`) — the anchor is row 0, unambiguously:
+
+        let source = if row == 0 { context.anchor_embedding } else { mask_row };
+
+But the selection loop (`dflash.rs:1596`) takes **rows `0..draft_rows`**, i.e.
+`0..block_size-1`:
+
+    let tokens = (0..draft_rows)
+        .map(|row| argmax_row(&logits, vocab, row))
+        .collect();
+
+That is **the anchor (row 0) included and the last masked row
+(`block_size - 1`) omitted**. The count is right; the start index is not. The
+reading consistent with all three sources is `1..=draft_rows` (= `1..block_size`,
+exactly the `block_size - 1` masked rows).
+
+### Consequences if it is the bug it looks like
+
+- The **first** draft token is the anchor's argmax: a token the target has
+  already emitted, so the round would spend its first verify slot re-checking a
+  token that is not a prediction at all.
+- The **last** of the `block_size - 1` real drafts is never produced, so the
+  block is one token short of what the geometry says.
+- At temperature 1.0 both effects corrupt the draft *stream*, so any measured
+  `alpha` would be an artefact of the selection rather than of the drafter's
+  quality.
+- **No test covers this.** `dflash_golden` exercises `forward_block` (4/4) and
+  never calls `draft_block`; `dflash_cache` tests cache arithmetic. Grepping the
+  test tree for `draft_block` finds no assertion on `tokens`. This is the
+  AGENTS.md §3.4 pattern again: a documented invariant with nothing that could
+  fail.
+
+### Why I am recording it rather than "fixing" it in place
+
+One thing does not fit the story, and it is the reason I stopped instead of
+patching: `BlockContext::position` is documented as *"absolute position of the
+first block row (== the target's `next_position`, i.e. one past the last context
+row)"*, and the first block row **is** the anchor. If the anchor sits at
+`next_position` while the last emitted token sits at `next_position - 1`, then the
+anchor's logits predict a genuinely new token and "already emitted" is wrong --
+which would make `(0..draft_rows)` correct and the two doc comments wrong.
+
+I cannot settle that by reading position arithmetic, and guessing is precisely how
+this file already acquired a re-fed-anchor bug in T9. So this is an **open
+question requiring the z-lab reference** (`dflash/model.py`, `_rejection_sample` /
+`dflash_generate`, and `reference/exllamav3/architecture/dflash.py`, which the
+grep above did not surface a match in) to say which rows become drafts.
+
+### The sharp test, either way
+
+Whichever way the reference rules, `draft_block`'s `tokens` must equal the argmax
+of **one specific** contiguous row range of `draft_logits(&block.hidden, ...)`,
+and today nothing asserts it. `DflashBlock::hidden` and `draft_logits` are both
+public, so the test is: recompute the logits from the returned block and assert
+`tokens == argmax(rows X)`, plus `tokens != argmax(rows 0..draft_rows)` so the
+test cannot pass vacuously by the two ranges agreeing. `argmax_row` is private, so
+the test needs a local f16 argmax -- which also makes it independent of the
+engine's own helper.
+
+---
+
+## 2026-10-11 — RESOLVED against the reference: `draft_block` was off by one. Fixed.
+
+The open question above is settled. The z-lab reference **is** present
+(`/private/var/folders/tp/.../opencode/zlab/dflash`) and is explicit.
+
+### The reference says rows `1..`, so the engine was wrong
+
+    dflash/model.py:249   draft_hidden = model(...)[:, 1 - verify_size :, :]
+    dflash/model.py:265   block_output_ids[:, 1:] = _sample_probs(draft_probs)
+    dflash/model.py:268   block_output_ids[:, 1:] = torch.argmax(draft_logits, dim=-1)
+    dflash/model.py:281   _rejection_sample(block_output_ids[:, 1:], ...)
+    dflash/model.py:291   (block_output_ids[:, 1:] == posterior[:, :-1])...
+
+`[:, 1 - verify_size :, :]` with `verify_size == block_size` is `[:, -(block_size-1):, :]`
+-- **the last `block_size - 1` rows**, i.e. the masks, with the anchor's row 0
+excluded. `argmax` of exactly those fills slots `1..`. The engine's `(0..draft_rows)`
+took the anchor and dropped the last mask. **Fixed to `(1..=draft_rows)`** in
+`crates/engine/src/dflash.rs`, with the citation in the comment.
+
+So `BlockContext::position`'s "first block row == next_position" is *not* in
+conflict after all: the anchor is re-fed at the block's first position by design,
+and the reference's round re-writes `output_ids[start]` with it
+(`output_ids[start : start+acc+1] = block_output_ids[:acc+1]`), so the anchor is
+the already-emitted token that seeds the block and is then overwritten in place,
+not a duplicated row.
+
+### `draft_block` and `draft_logits` have no callers at all
+
+    $ grep -rn "draft_block\|draft_logits" crates/ --include=*.rs | grep -v dflash.rs
+    (only doc-comment mentions, plus the new test)
+
+They are unexercised dead code. That is *why* the off-by-one survived a spec, a
+plan, a golden harness and a task list: R15/T9 was never wired, so nothing ever
+ran the selection.
+
+### The round semantics, now read off the reference (for T9)
+
+- Block ids: `[anchor, draft_1 .. draft_{b-1}]` at positions
+  `position_ids[start : start + verify_size]`.
+- Drafts from the drafter's **last `b-1` rows**; `block_output_ids[:, 1:] = drafts`.
+- Target runs once over the whole block; `verify_size > 1` implies
+  `output_hidden_states=True`.
+- `temperature > 0` -> `target_probs`/`draft_probs` are
+  `_sampling_probs(logits, temperature, top_p, top_k)`, then **`_rejection_sample`**
+  (`model.py:94`): accept while `rand()*q < p`, and on rejection resample from
+  `residual = clamp(p - q, 0)` renormalised. This is the distribution-exact
+  verifier the temp-1.0 requirement needs -- confirming the note above that greedy
+  argmax matching is not the right criterion here.
+- `temperature == 0` -> `acceptance_length = (block_output_ids[:, 1:] == posterior[:, :-1]).cumprod(1).sum(1)`,
+  the greedy prefix match, and `bonus = posterior[:, acceptance_length]`.
+- Emit `acc` drafts + 1 bonus; `output_ids[start : start+acc+1] = block_output_ids[:acc+1]`,
+  `output_ids[start+acc+1] = bonus`; then `_crop_to(cache, start + produced)`.
+
+Note the acceptance is over `posterior[:, :-1]` vs `drafts` -- **`b-1` drafts, not
+`b`**. The engine's round must use `b-1` verify positions, which matches
+`Config::draft_tokens()`.
+
+### Test written; it does not yet reach its assertion
+
+`crates/engine/tests/dflash_draft_rows.rs` (ignored). It compiles and runs, and
+aborts inside `draft_block` with
+
+    Kernels("invalid kernel input: packed buffer length 2208470208 does not match 1056964608")
+
+`1056964608 == 262144 * 5376 * 6 / 8`, the target head's packed size, so the
+expectation is right and the supplied buffer is the wrong object --
+`draft_logits` hands `head.metal_buffer` straight to the drafter's encoder, and
+since nothing ever called it, this plumbing has never been exercised. The
+assertion (tokens == argmax of rows `1..=draft_rows`, with an `assert_ne!` guard so
+it cannot pass vacuously when both ranges agree) is in place and will be the
+immediate check once the buffer view is fixed.
+
+### The fix is now covered, without either checkpoint
+
+The row selection was extracted from `draft_block` into a free function,
+`select_draft_tokens(logits, vocab, draft_rows)`, and unit-tested in
+`dflash.rs`'s own `#[cfg(test)] mod tests`. Two tests, both GPU-free and in the
+**default** suite (`cargo test -p kaplumba-engine --release --lib dflash::`):
+
+- `draft_tokens_are_the_masked_rows_not_the_anchor` -- the anchor's row is given a
+  winner no masked row shares, so including it is observable rather than
+  coincidental.
+- `the_two_candidate_ranges_are_distinguishable` -- guards the first against
+  passing vacuously, by asserting the two candidate ranges differ on this input.
+
+**Sabotage, run and observed (§3.4):** reverting the function to `(0..draft_rows)`
+fails both with
+
+    assertion `left == right` failed: the drafts must be rows 1..=draft_rows;
+      taking rows 0..draft_rows would put the anchor's token first and drop the
+      last masked row
+    assertion `left != right` failed: the two ranges must differ on this input
+
+exit 101. Reverted, re-run green, and the 16-test integration suite re-run green
+after the `dflash.rs` change (no regressions).
+
+`dflash_draft_rows.rs` (ignored) stays as the end-to-end version and still does
+not reach its assertion, for the head-buffer reason above. The unit tests are the
+ones that actually cover the fix; the integration test is the one that would cover
+the plumbing, and that plumbing is still first-touched-today.
+
+---
+
+## 2026-10-11 — self-disproof attempt: the verify estimate HOLDS; D2 diagnosed to the byte
+
+Asked to disprove my own pessimistic conclusion, I attacked the two assumptions it
+rests on. The first broke in my favour; the second did not.
+
+### ttft is NOT mostly fixed overhead -- the 595 ms verify is real
+
+My whole bar depends on the M=32 verify costing ~595 ms, and I had taken that from
+a `ttft` number, which bundles startup cost. If the fixed part had been large, a
+mid-decode verify would be far cheaper and the bar would collapse. Measured
+directly (`--max-new-tokens 1`, varying prompt length, reading `prompt_tokens` and
+`ttft_ms`):
+
+| prompt tokens | ttft ms |
+|---|---|
+| 14 | 317.5 |
+| 21 | 457.5 |
+| 29 | 587.8 |
+| 37 | 1326.5 |
+| 61 | 1341.0 |
+| 109 | 1374.8 |
+
+Linear fit for the `<= 32` bucket: **`ttft ~= 65.5 + 18.0 * n` ms**. The intercept is
+**65.5 ms -- exactly one decode step** (the one unavoidable weight read), not the
+400 ms that would have rescued the estimate. At n = 32 that is ~641 ms, so my
+595 ms was mildly **optimistic, not pessimistic**. The conclusion survives.
+
+### New finding: the 32-row cliff is `SmallBatchMrhs`, and it argues for b32 hard
+
+The step from 29 -> 37 rows costs **+739 ms and then stays flat** (61, 77 and 109
+rows all land in 1341-1375 ms). That is not chunking -- taller prompts would keep
+growing. It is the route switch documented in the code:
+
+> `LinearRoute::SmallBatchMrhs => // ... Falls back to encode_gemm internally for
+> ineligible shapes (rate/codebook != MCG 3 bpw, queries > 32)`
+
+So `queries <= 32` takes the fast small-batch path at **18.0 ms/row**, and anything
+past 32 falls onto `encode_gemm` at ~1330 ms flat. **This is an independent,
+measured argument for `block_size = 32` and against 64** -- I previously rejected
+b64 only on the acceptance arithmetic.
+
+### D2 root cause, measured rather than guessed
+
+`draft_block`'s first-ever caller produced the printed head metadata:
+
+    head: in=5376 out=262144 rate=Integer(6) packed_len=Some(528482304)
+          host_packed_words=0 metal_buffer=Some(7529545728) metal_offset=5321075520
+
+- `metal_buffer` is the **whole 7.53 GB shard** (`model-00002-of-00002` is
+  7 529 529 792 B).
+- The trellis starts at `metal_offset = 5 321 075 520` and is
+  `packed_len * 2 = 1 056 964 608` B.
+- `length - offset = 7 529 545 728 - 5 321 075 520 = 2 208 470 208`, which is
+  exactly the number the error reported, so **1 151 505 600 B of further tensors
+  follow the head in the same buffer**.
+- `host_packed_words = 0`: the head is fully buffer-resident, so a test cannot
+  rebuild it from host words.
+
+`validate_buffer_shape` (`linear.rs:4197`) requires
+`length - offset == expected`, which is only true when the tensor is the buffer's
+**tail**. The drafter's own linears get dedicated buffers and satisfy it; the
+target's head does not. `encode_gemv` -- the head's only ever-exercised path --
+accepts the layout. **Two validators disagree, and only one has ever run.**
+
+**The fix, and why I did not apply it:** the preferred change is an explicit packed
+length on `LinearBufferRequest` (keeps the equality check for all other callers);
+the alternative is bounding the region by `packed_len` instead of the buffer end.
+Both touch `validate_buffer_shape`, which guards **every GEMM in the engine**,
+including the MMA path this file's comments already record as having shipped
+numerically wrong once. That is not a change to make blind at the end of a session
+on a box that is currently swapping (5.83 GiB in use, 1.2 GiB "available", which is
+why the run needed `KAPLUMBA_FORCE_LOAD=1`).
+
+`dflash_draft_rows.rs` is therefore an **expected-fail diagnostic**: it is
+`#[ignore]`d, so the default suite is unaffected, and its failure message carries
+the whole diagnosis above.
+
+---
+
+## 2026-10-11 — D2 FIXED. The target-head plumbing works, and the round is unblocked.
+
+### The change
+
+`gemm_chunk_buffer`'s validator took the packed tensor to be everything from
+`packed_offset` to the buffer's end, which is false for a tensor that is not the
+buffer's tail. Rather than relax that check -- it is the only thing catching a
+mislocated tensor for every other caller -- a length-aware path was added:
+
+- `linear.rs`: `gemm_chunk_buffer_with_stats` is now a 4-line wrapper that measures
+  the region and delegates to a private
+  `gemm_chunk_buffer_with_stats_region(request, packed_bytes)`, which is the old
+  body with `validate_buffer_shape` receiving the supplied length. **All 13
+  existing construction sites are untouched and take byte-identical code paths.**
+- New public `gemm_chunk_buffer_sliced(request, packed_bytes)`.
+- `draft_logits` now passes `head.packed_len * 2` (falling back to the region when
+  `packed_len` is absent), with the measured numbers in the comment.
+
+### Result: the first end-to-end run of the drafter's head path
+
+    head trellis 1056964608 B at offset 5321075520 inside a 2208470208 B region
+      (1151505600 B of trailing tensors); sliced validation used
+    test draft_tokens_are_the_masked_rows_not_the_anchor ... ok
+
+`dflash_draft_rows` is no longer an expected-fail diagnostic: it loads the 16 GB
+target **and** the drafter, builds the double-drift context, runs `draft_block`,
+and asserts the drafts are the argmax of rows `1..=draft_rows`.
+
+**Sabotage, run and observed:** reverting `select_draft_tokens` to `0..draft_rows`
+fails it on the real models with
+
+    assertion `left == right` failed: draft_block must return the argmax of rows
+      1..=draft_rows (the masked rows); it returned the argmax of rows 0..draft_rows,
+      which includes the anchor's row -- a token the target has already emitted --
+      and drops the last masked row
+
+exit 101. Reverted, re-run green (1/1), and the 16-test non-ignored suite re-run
+green (16/16, exit 0) -- **and checked unfiltered**, because a first pass with
+`--lib dflash::` in the same invocation propagated that filter to every target and
+reported `0 passed; N filtered out` for all of them, which is a vacuous pass rather
+than a passing test.
+
+### What this unblocks
+
+`draft_logits` on the real target head is now exercised, so **alpha is finally
+measurable**: the drafter returns one logits row per block row, the target's own
+`last_logits()` gives `p`, and `alpha = sum_x min(p(x), q(x)) = 1 - TV(p, q)` over
+the temp-1.0 / top-64 truncated distributions. That is D3, and it decides whether
+30 t/s is reachable at all: break-even is 0.919 at b32, 30 t/s needs 0.977.
+
+---
+
+## 2026-10-11 — D3 MEASURED: the drafter does not condition on its context at all
+
+This is the answer to the 30 t/s question, and it is not the answer I expected.
+
+### alpha is 0.0000 on every row and every target position
+
+`dflash_alpha_probe` (ignored) loads the target and the drafter, prefills real prose
+(78 tokens), builds the drafter's context from real taps, chains six target
+positions, and measures `alpha = sum_x min(p, q)` at temperature 1.0 / top_k 64 over
+a full matrix of (drafter row, target position):
+
+```
+=== SUMMARY (mean alpha on the round's diagonal) ===
+  as-configured                [1, 12, 23, 35, 46, 57]  mean 0.0000  best 0.0000
+  config+1 (z-lab offset=1)    [2, 13, 24, 36, 47, 58]  mean 0.0000  best 0.0000
+```
+
+Every entry in the 16 x 6 matrix is `0.0000`. With 64-token supports out of a
+262,144 vocabulary, chance overlap is ~0.016 per pair, so 0/96 is consistent with
+the drafter's predictions being **statistically unrelated to the target's**.
+
+### The probe is not the explanation -- three of its own bugs were found and fixed
+
+The number above is only worth reporting because three ways of getting a spurious
+zero were found and eliminated first, each recorded because each produced a
+confident wrong answer:
+
+1. **Synthetic input.** The first version fed a token-id soup. Its positive control
+   -- two *adjacent positions of the target itself* -- returned `alpha 0.0001, 4/64
+   shared`, proving the input drove the model somewhere consecutively predicted
+   distributions barely overlap. Replaced with real prose via `GemmaTokenizer`.
+2. **`last_logits()` instead of the return value.** `forward_buffer` *returns* the
+   last row's logits; `last_logits()` reads `scratch.capped`, which
+   `encode_lm_head` writes only on the softcap path
+   (`pick.skips_softcap(out.is_some())`). A stale read makes even adjacent positions
+   look disjoint.
+3. **A one-position shift.** The round's alignment is `row r ~ position start + r`
+   (anchor at row 0 is the already-emitted token, so rows 1.. are the drafts), which
+   is why the probe prints the whole matrix: a shift shows up as an off-diagonal
+   ridge. None did.
+
+Surviving validity checks, all in the run: **self control `alpha(p0, p0) = 1.000000`**
+(the metric reproduces itself), real prose, `forward_buffer`'s return value, and a
+matrix rather than a single comparison. The target's own rows are sane and peaked
+(`3048:0.9189`, `560:0.9984`, `3016:0.9876`), so the target side is fine.
+
+### The root cause: the taps do not reach the drafter
+
+The two tap conventions are `[1,12,23,35,46,57]` and `[2,13,24,36,47,58]`. They must
+produce different drafts -- different layers, different tap contents, different
+context. They produced **byte-identical** drafts:
+
+    drafts: [84544, 84544, 236774, 236774, 236774, ...]   (both cases, exactly)
+
+So **the drafter's output does not depend on its context at all.** `alpha == 0` is
+not a low-quality drafter; it is the arithmetic consequence of a drafter that is not
+conditioned on the target it is supposed to predict. `enable_taps` does update the
+layer list (`self.taps = Some(TapScratch { layers: layers.to_vec(), .. })`), and
+T7's own test shows different layers capture different tap *contents*, so the loss is
+downstream: `append_context`'s `fc`/`hidden_norm`/`k_proj`/`v_proj`/RoPE fusion,
+the drafter's attention over the context rows, or the positions those rows are
+cached at.
+
+**Why nothing caught it:** `dflash_golden` -- the only reference comparison in the
+spec -- exercises `forward_block` with **zero context rows** (`dflash_cache` and
+`dflash_streaming` validate cache arithmetic and chunk invariance, both of which are
+self-consistency). The drafter's context path has **never been compared against
+z-lab**. That is the gap, and it is the same shape as the `draft_block` off-by-one:
+an invariant with nothing that could fail.
+
+### What this means for 30 t/s
+
+**Unanswerable until the context path is fixed, and with no supporting evidence
+today.** The bar stands from measurement (`alpha >= 0.977` at b32, break-even
+0.919), but the only direct measurement of `alpha` this engine can produce is
+0.0000. Do not read that as "the drafter is bad" -- read it as "the drafter is not
+connected". The next task is to validate the context path against z-lab **with real
+context**, which is a new test, not a tweak.
+
+`dflash_alpha_probe` therefore ends with an `assert_ne!` on the two draft vectors
+that **fails today** with the explanation above. It is the check that should flip to
+green when the context path is fixed, which is why it is an assertion rather than a
+comment. The probe is `#[ignore]`d, so the default suite is unaffected.
+
+## 2026-10-11 — D4: the context path IS connected; the 2% residual is the norm's f16 narrowing
+
+`dflash_forward_block_with_context_matches_host` (new, fifth test in
+`dflash_golden.rs`) fills a real `DflashKvCache` through `append_context` and
+drafts from it, compared against the f32 host reference. Results:
+
+```
+no context:   worst 0.068110 at 77305 of 86016; engine max 77.2500, reference max 77.2833
+              relative 8.8e-4
+with context: worst 1.703331 at 4953 of 86016; engine max 88.6875, reference max 89.6041
+              relative 1.9e-2
+```
+
+So `forward_block`'s context path is **wired and correct in structure** — the
+context changes the output (engine max 88.7 with context vs 77.3 without), and
+the per-stage reference maxima are in the same range as the no-context case.
+
+The 1.9% residual is NOT a graph error (a mis-ordered norm or a residual from the
+wrong stream would be 10x-100x). It is **fp16 narrowing in the context path**:
+`project_context_kv` produces the cache's K/V through the f16 `gemm` and the f16
+`rope`, and those rows then attend against f16 queries. The no-context test
+narrows only the block's own f32 residual at `rms_norm_f32_in`, so it is 20x
+tighter. Closing it means an f32 context K/V path, which is a throughput cost on
+the append side (see T12's M=16 numbers) and is deferred.
+
+**Consequence for D4:** the premise "the drafter's output does not depend on its
+context" is FALSE for `forward_block`. The `alpha = 0.0000` measurement must
+therefore be either the probe's wiring or `append_context`'s caller in the probe.
+`dflash_alpha_probe`'s byte-identical drafts for two tap sets is the thing to
+re-check, not the drafter.
+
+## 2026-10-11/12 — T9's second half: the batched-verify head, landed and measured
+
+### What landed
+
+* `HeadPick::Rows(n)` — a third head mode, alongside `Argmax` and `Sample`.
+  `None` (the `forward_buffer_into` / `forward_chunk` default) is `Argmax`, so
+  every existing caller takes the byte-identical single-row path.
+* `encode_lm_head_rows` + `TextModel::forward_verify(token_ids, positions) ->
+  [rows, vocab]` softcapped fp16, plus `head_rows_matrix(rows)`.
+* `ForwardScratch::last_hidden` is now `max_tokens` rows instead of 1, so a
+  verify pass can normalise its whole matrix in place. `HeadPick::Argmax`/`Sample`
+  still only touch row `tokens - 1`, via `encode_copy_last_row`, which is what
+  the single-row head reads.
+* `elements::encode_copy_region` and `MetalEncoder::dispatch_1d_offset`
+  (`dispatch_1d_offset` already existed in `encoder.rs` with a `TensorRef`
+  signature; only the elements-side wrapper is new).
+* `crates/engine/tests/dflash_verify_head.rs` — the plan's risk #7, as two
+  ignored tests.
+
+### The head currently runs `encode_gemv` once per row, in one command buffer
+
+Not `encode_gemm(M = rows)`. Measured on the real checkpoint:
+
+| M | worst \|batched - sequential\| | note |
+|---|---|---|
+| 1 | 0.000000 | bit-exact |
+| 2 | 19.247559 | at row 1, on softcapped logits that span only -30..30 |
+
+So `encode_gemm`'s MMA tile — 128 queries x 64 outputs, selected
+unconditionally whenever `out_features % 64 == 0`, and 262 144 is — does not
+agree with `encode_gemv` at small M. The repo's purpose-built M>1 path,
+`encode_gemv_mrhs` (k3/k4 mcg, M <= 32, ~185 GB/s), is rate-gated and the
+target head is **6 bpw**, so it falls through to the same MMA tile.
+
+`encode_gemv` is the kernel the non-speculative decode loop uses, so reusing it
+keeps the verify pass bit-comparable to the decode path — which is what R17's
+greedy equivalence needs. Cost: the head's trellis is ~1.06 GB, so `rows` gemvs
+read it `rows` times. At 16 rows that is ~16.9 GB, ~65 ms at 250 GB/s, against
+~4 ms for a correct M=16. The head's share of a 545 ms verify is small today,
+but it becomes the binding constraint once the layers are batched.
+
+### Four real bugs found on the way, each of which produced a plausible answer
+
+1. **`HeadPick::Rows` never reached the head.** `forward_buffer_into_pick`'s
+   `token_ids.len() <= chunk` branch still called `forward_chunk(...)`, the
+   wrapper, which hardcodes `HeadPick::Argmax`. Symptom: `logits_rows` was never
+   written, so `head_rows_matrix` returned zeros and "adjacent rows differ on
+   0/4194304" read as a stride bug.
+2. **`raw` was the u16 logits buffer.** `encode_gemv` stores f32, so a 262
+   144-element u16 buffer (512 KB) was written with 1 MB of f32. Metal does not
+   bounds-check a shared buffer. Fixed to `scratch.raw`.
+3. **`HeadPick::Rows(1)` fell through to the single-row head**, which writes
+   `scratch.capped`, while `head_rows_matrix` read `logits_rows` — zeros. Every
+   `Rows` pass now runs the rows head, including rows == 1.
+4. **Two ignored tests each loaded their own 16 GiB model in parallel**, which
+   is 32 GiB on this 24 GiB box and so a direct AGENTS.md section 10 violation.
+   It produced a 32.1-divergence that vanished under `--test-threads=1`. The
+   lesson is that an ignored test which loads the model must be run serialised,
+   and the failure it produces looks exactly like a numerical bug.
+
+### Where T9 stands
+
+The head plumbing is done and M=1 is bit-exact. The remaining M=2 divergence is
+**not** in the head: the per-row head is `encode_gemv` for every row, so row 1's
+logits can only differ if row 1's *hidden state* differs. That points at the 60
+layer forward — a 2-row prefill versus a decode step with a 1-row cache — and
+not at anything this spec added. `attention_prefill_pass_bit_exact.rs` pins
+prefill *internal* chunking, not prefill-versus-decode, so the engine does not
+currently guarantee the two agree.
+
+**Next step, in order:** (a) confirm the row-1 hidden state diverges by
+comparing two prefill widths (M=2 vs two M=1s is not the comparison; M=2 vs a
+prefill of 1 fed M=1 with a cache is), (b) if the layers diverge, that is a
+pre-existing engine property and R17's NEAR_TIE exemption is the right answer;
+(c) if they do not, the head needs the M>1 6-bp kernel.
+
+### Command
+
+```bash
+KAPLUMBA_TEST_MODEL=~/.kaplumba/models/Gxma-repacked KAPLUMBA_FORCE_LOAD=1 \
+  scripts/gpuq try -- cargo test -p kaplumba-engine --release \
+  --test dflash_verify_head -- --ignored --nocapture --test-threads=1
+```

@@ -495,6 +495,25 @@ impl<'q> MetalEncoder<'q> {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
+    fn bind_and_dispatch_slots(
+        &mut self,
+        pipeline: &ComputePipelineState,
+        slots: usize,
+        params: &[u8],
+        grid: MTLSize,
+        threadgroup: MTLSize,
+    ) -> Result<(), KernelError> {
+        self.encoder.set_compute_pipeline_state(pipeline);
+        self.encoder.set_bytes(
+            slots as u64,
+            params.len() as u64,
+            params.as_ptr() as *const std::ffi::c_void,
+        );
+        self.encoder.dispatch_threads(grid, threadgroup);
+        Ok(())
+    }
+
     fn bind_and_dispatch(
         &mut self,
         pipeline: &ComputePipelineState,

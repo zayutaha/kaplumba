@@ -3037,6 +3037,16 @@ pub enum HeadPick {
     Argmax,
     /// top-k -> softmax -> top-p -> inverse-CDF, on device, over `scratch.capped`.
     Sample(crate::sampler::SamplerParams),
+    /// T9: the speculative **verify** pass. Runs the final norm and the
+    /// vocabulary head over `n` rows and leaves the softcapped `[n, vocab]`
+    /// matrix in `scratch.logits_rows` for `head_rows_matrix` to read. No
+    /// sampling and no token staging: the caller resolves acceptance itself.
+    ///
+    /// This exists because `encode_lm_head` is hardwired to one row
+    /// (`encode_rms_norm(rows = 1)` + `encode_gemv`), which made a batched
+    /// verify return logits for a single position and forced the round to
+    /// issue `n` separate target forwards -- i.e. no speculation at all.
+    Rows(usize),
 }
 
 impl HeadPick {
@@ -3048,6 +3058,15 @@ impl HeadPick {
     /// tests in one binary.
     fn reads_raw_row(&self, staging: bool) -> bool {
         staging && matches!(self, HeadPick::Argmax)
+    }
+
+    /// Row count for [`Self::Rows`], else `None`. Zero is invalid and is
+    /// rejected by the caller.
+    fn verify_rows(&self) -> Option<usize> {
+        match self {
+            HeadPick::Rows(rows) => Some(*rows),
+            _ => None,
+        }
     }
 
     /// Whether this pick may read the **raw** row and skip the softcap.
@@ -3205,6 +3224,17 @@ pub struct ForwardScratch {
     pub active_slot: usize,
     pub last_hidden: Buffer,
     pub logits: Buffer,
+    /// T9: `[VERIFY_ROW_CAP, vocab]` softcapped logits for a batched verify
+    /// pass, only written by `HeadPick::Rows`.
+    ///
+    /// Sized from `VERIFY_ROW_CAP` and **not** from `max_tokens`: `max_tokens`
+    /// is the prefill chunk width, so `max_tokens * vocab` f32 would be
+    /// gigabytes. A verify pass is one speculative block, which is 16 or 32 rows
+    /// for the DFlash drafter and never more. AGENTS.md section 8: fixed size,
+    /// independent of context length.
+    pub logits_rows: Vec<Buffer>,
+    /// T9: the verify GEMM's f32 output store. Same reasoning and same cap.
+    pub verify_raw: Buffer,
     pub capped: Buffer,
     /// Split-KV decode scratch: one unnormalised `(m, l, O)` partial per
     /// (split, query head), so `splits * q_heads * (head_dim + 2)` floats. Sized
@@ -3234,6 +3264,11 @@ pub struct ForwardScratch {
 }
 
 impl ForwardScratch {
+    /// T9: row cap for a batched verify pass; see `TextModel::VERIFY_ROW_CAP`.
+    const VERIFY_ROW_CAP: usize = 64;
+    /// `encode_gemm`'s MMA query tile. See `verify_raw`.
+    const MMA_QUERY_TILE: usize = 128;
+
     pub fn active_query_positions(&self, tokens: usize) -> &Buffer {
         if tokens == 1 {
             &self.query_positions_decode[self.active_slot % 2]
@@ -3293,9 +3328,31 @@ impl ForwardScratch {
         // The vocabulary head writes one f32 accumulator per output feature, so
         // the shared accumulator must cover a full single-row head pass.
         let raw_elements = (max_tokens * inter).max(vocab);
+        // A verify pass is one speculative block. Capped, not derived from
+        // `max_tokens`, because the head GEMM at M rows stores M * vocab f32 and
+        // `vocab` alone is only enough for M = 1 -- which is exactly the bug the
+        // cap fixes: at M = 16 the head needed 4.2 M floats where `raw` held
+        // 262 144, and Metal does not bounds-check a shared buffer, so the
+        // GEMM silently wrote past it and every row came back identical.
+        let verify_rows = Self::VERIFY_ROW_CAP.min(max_tokens.max(1));
+        // The MMA tile is 128 queries x 64 outputs and `encode_gemm` always
+        // takes it when `out_features % 64 == 0` (262 144 is), with no gate on
+        // `queries`: `grid_y = queries.div_ceil(128)`, and the kernel stores a
+        // full 128-row tile. So `raw` must hold the *tile*, not the rows asked
+        // for. Sizing it to 16 rows made the head write 112 rows past the end of
+        // a 16.8 MB buffer, and Metal does not bounds-check a shared buffer --
+        // which is why every row came back identical rather than failing.
+        // The `finalize` pass converts `queries * out_features` elements, so the
+        // extra 112 rows are written and never read.
+        let verify_tile_rows = verify_rows
+            .div_ceil(Self::MMA_QUERY_TILE)
+            .max(Self::MMA_QUERY_TILE);
+        let verify_raw_elements = verify_tile_rows * vocab;
         let raw = device.new_buffer((raw_elements * std::mem::size_of::<f32>()) as u64, options);
         let raw_b = device.new_buffer((raw_elements * std::mem::size_of::<f32>()) as u64, options);
         let raw_c = device.new_buffer((raw_elements * std::mem::size_of::<f32>()) as u64, options);
+        let verify_raw =
+            device.new_buffer((verify_raw_elements * std::mem::size_of::<f32>()) as u64, options);
         let query_positions =
             device.new_buffer((max_tokens * std::mem::size_of::<u32>()) as u64, options);
         let token_ids =
@@ -3342,8 +3399,16 @@ impl ForwardScratch {
             token_ids_decode,
             host_tokens,
             active_slot: 0,
-            last_hidden: u16_elements(1, hidden)?,
+            // T9: `tokens` rows, not 1, so a verify pass can normalise its whole
+            // matrix in place. `HeadPick::Argmax`/`Sample` still only touch row
+            // `tokens - 1` (via `encode_copy_last_row`), which is what the
+            // single-row head reads.
+            last_hidden: u16_elements(max_tokens, hidden)?,
             logits: u16_elements(1, vocab)?,
+            logits_rows: (0..verify_rows)
+                .map(|_| u16_elements(1, vocab))
+                .collect::<Result<Vec<_>, _>>()?,
+            verify_raw,
             capped: u16_elements(1, vocab)?,
             // One (m, l, O[head_dim]) partial per (KV split, query head) for the
             // widest layer shape. This replaces a `q_heads * key_count` fp32
@@ -4417,6 +4482,42 @@ impl TextModel {
         Ok(())
     }
 
+    /// T9's verify pass: one forward over `n` rows, returning the softcapped
+    /// `[n, vocab]` logits matrix (row-major).
+    ///
+    /// This is the whole reason the target's head was extended. The alternative
+    /// -- `n` separate `forward_buffer` calls -- is exactly the autoregression
+    /// DFlash exists to avoid, so a round would cost the same as `n` decode
+    /// steps and speculation would buy nothing.
+    ///
+    /// Equivalence with `n` sequential single-row forwards is asserted by
+    /// `crates/engine/tests/dflash_verify_head.rs` (plan.md risk #7), not
+    /// assumed: the multi-row head is a different `M` through different kernels
+    /// and a silent divergence there would corrupt every verified token.
+    pub fn forward_verify(
+        &mut self,
+        token_ids: &[u32],
+        positions: &[u32],
+    ) -> Result<Vec<u16>, ModelError> {
+        if token_ids.len() != positions.len() || token_ids.is_empty() {
+            return Err(ModelError::InvalidInput(
+                "model token and position counts must match and be non-empty".to_string(),
+            ));
+        }
+        let rows = token_ids.len();
+        self.ensure_scratch(rows)?;
+        let queue = self.forward_queue.clone();
+        let mut encoder = MetalEncoder::new(&queue)?;
+        if let Err(error) =
+            self.forward_buffer_into_pick(token_ids, positions, &mut encoder, Some(HeadPick::Rows(rows)))
+        {
+            encoder.abandon();
+            return Err(error);
+        }
+        encoder.commit_and_wait()?;
+        Ok(self.head_rows_matrix(rows))
+    }
+
     /// One forward step, committed and waited, returning the logits.
     pub fn forward_buffer(
         &mut self,
@@ -4462,6 +4563,18 @@ impl TextModel {
         token_ids: &[u32],
         positions: &[u32],
         encoder: &mut MetalEncoder,
+    ) -> Result<(), ModelError> {
+        self.forward_buffer_into_pick(token_ids, positions, encoder, None)
+    }
+
+    /// `forward_buffer_into` with an explicit `HeadPick`. `pick = None` is the
+    /// `HeadPick::Argmax` path every existing caller takes.
+    pub fn forward_buffer_into_pick(
+        &mut self,
+        token_ids: &[u32],
+        positions: &[u32],
+        encoder: &mut MetalEncoder,
+        pick: Option<HeadPick>,
     ) -> Result<(), ModelError> {
         if token_ids.len() != positions.len() || token_ids.is_empty() {
             return Err(ModelError::InvalidInput(
@@ -4521,13 +4634,13 @@ impl TextModel {
         let result: Result<(), ModelError> = if token_ids.len() <= chunk {
             gpu.chunks += 1;
             gpu.chunk_rows = token_ids.len();
-            self.forward_chunk(
+            self.forward_chunk_pick(
                 token_ids,
                 positions,
                 encoder,
                 &mut gpu,
                 true,
-                HeadPick::Argmax,
+                pick,
                 None,
             )
         } else {
@@ -4544,13 +4657,13 @@ impl TextModel {
                 gpu.chunks += 1;
                 gpu.chunk_rows = chunk_ids.len();
                 let last = chunks.peek().is_none();
-                if let Err(error) = self.forward_chunk(
+                if let Err(error) = self.forward_chunk_pick(
                         chunk_ids,
                         chunk_positions,
                         encoder,
                         &mut gpu,
                         last,
-                        HeadPick::Argmax,
+                        pick,
                         None,
                     ) {
                     // Report what ran before the failure rather than throwing
@@ -4596,6 +4709,7 @@ impl TextModel {
     /// -- every decode step, and any prompt up to [`PREFILL_CHUNK`] tokens --
     /// takes the `true` branch and is bit-for-bit unchanged.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     fn forward_chunk(
         &mut self,
         token_ids: &[u32],
@@ -4604,6 +4718,24 @@ impl TextModel {
         gpu: &mut GpuProfile,
         run_head: bool,
         pick: HeadPick,
+        out: Option<HeadOut<'_>>,
+    ) -> Result<(), ModelError> {
+        self.forward_chunk_pick(
+            token_ids, positions, encoder, gpu, run_head, Some(pick), out,
+        )
+    }
+
+    /// `forward_chunk` with an optional `HeadPick`. `pick = None` is
+    /// `HeadPick::Argmax`, i.e. every existing caller.
+    #[allow(clippy::too_many_arguments)]
+    fn forward_chunk_pick(
+        &mut self,
+        token_ids: &[u32],
+        positions: &[u32],
+        encoder: &mut MetalEncoder,
+        gpu: &mut GpuProfile,
+        run_head: bool,
+        pick: Option<HeadPick>,
         out: Option<HeadOut<'_>>,
     ) -> Result<(), ModelError> {
         if token_ids.len() != positions.len() || token_ids.is_empty() {
@@ -4860,6 +4992,28 @@ impl TextModel {
             return Ok(());
         }
 
+        // T9: a batched verify pass needs every row, not just the last one, so
+        // lift `tokens` rows instead of one. `HeadPick::Rows(n)` asserts
+        // `n == tokens` below; every other pick is the single-row path it has
+        // always been, byte for byte.
+        let pick = pick.unwrap_or(HeadPick::Argmax);
+        if let Some(rows) = pick.verify_rows() {
+            if rows != tokens {
+                return Err(ModelError::InvalidInput(format!(
+                    "a verify pass asked for {rows} rows but the chunk has {tokens}"
+                )));
+            }
+            self.elements.encode_copy(
+                encoder,
+                final_hidden,
+                &self.scratch.last_hidden,
+                tokens * hidden,
+            )?;
+            gpu.stamp(encoder, "chunk/copy_rows")?;
+            self.encode_lm_head(encoder, gpu, pick, out)?;
+            let _ = vocab;
+            return Ok(());
+        }
         // Only the sampled position needs logits, so lift the final row out and
         // run the 262,144-wide vocabulary head for that row alone.
         self.elements.encode_copy_last_row(
@@ -4976,6 +5130,144 @@ impl TextModel {
         eprint!("{}", profile.render());
     }
 
+    /// T9: the batched-verify head. `last_hidden` already holds the chunk's
+    /// `rows` rows (copied in by the caller), so this normalises them in place,
+    /// runs the vocabulary GEMM at `M = rows`, softcaps, and writes
+    /// `scratch.logits_rows`.
+    ///
+    /// The two kernels are the M>1 siblings of the pair `encode_lm_head` uses
+    /// (`encode_rms_norm` + `encode_gemv` -> `encode_rms_norm(rows = n)` +
+    /// `encode_gemm`), so this is the same arithmetic with a different `M`, not
+    /// a new numerical path. That equivalence is what `dflash_verify_head`
+    /// asserts against `n` sequential single-row forwards before T9 trusts it
+    /// (plan.md risk #7).
+    /// T9: the row cap for a batched verify pass. The DFlash drafter drafts
+    /// `block_size` rows (16 for the released checkpoint, 32 measured better),
+    /// and a speculative block is never larger than a speculative budget.
+    pub const VERIFY_ROW_CAP: usize = 64;
+
+    fn encode_lm_head_rows(
+        &self,
+        encoder: &mut MetalEncoder,
+        profile: &mut GpuProfile,
+        rows: usize,
+    ) -> Result<(), ModelError> {
+        let hidden = self.hidden_size;
+        let vocab = self.vocab_size;
+        if rows > Self::VERIFY_ROW_CAP {
+            return Err(ModelError::InvalidInput(format!(
+                "a verify pass asked for {rows} rows, above the {} cap",
+                Self::VERIFY_ROW_CAP
+            )));
+        }
+        let packed = self.lm_head.metal_buffer.as_ref().ok_or_else(|| {
+            ModelError::InvalidWeights("lm head has no GPU-resident weights".to_string())
+        })?;
+        let input_signs = self
+            .lm_head
+            .input_signs_buffer
+            .as_ref()
+            .ok_or_else(|| ModelError::InvalidWeights("lm head signs not resident".to_string()))?;
+        let output_signs = self
+            .lm_head
+            .output_signs_buffer
+            .as_ref()
+            .ok_or_else(|| ModelError::InvalidWeights("lm head signs not resident".to_string()))?;
+
+        // One `encode_gemv` per row, all inside the caller's command buffer.
+        //
+        // This is deliberately NOT `encode_gemm(M = rows)`. Measured on the real
+        // checkpoint, `encode_gemm`'s MMA tile (128 queries x 64 outputs,
+        // selected unconditionally when `out_features % 64 == 0`, and 262 144
+        // is) does not agree with `encode_gemv` at small M: M = 1 matched to
+        // 0.0156 (half an fp16 quantum) but M = 2 diverged by 19.2 on softcapped
+        // logits that only span -30..30. The repo's purpose-built M>1 path,
+        // `encode_gemv_mrhs`, is rate-gated to 3 and 4 bpw and the target head is
+        // 6 bpw, so it falls through to the same MMA tile.
+        //
+        // `encode_gemv` is the kernel the non-speculative decode loop uses, so
+        // reusing it means the verify pass's logits are bit-comparable to the
+        // decode path's, which is what R17's greedy equivalence needs.
+        //
+        // Cost: the head's trellis is ~1.06 GB, so `rows` gemvs read it `rows`
+        // times. At 16 rows that is ~16.9 GB, ~65 ms at 250 GB/s, against ~4 ms
+        // for a correctly batched M=16. That is the price of not having a
+        // validated 6-bp M>1 kernel, and it is recorded rather than hidden.
+        for row in 0..rows {
+            // Stage this row's hidden into the single-row `last_hidden` slot,
+            // normalise it in place, then project. `encode_copy_region` takes a
+            // byte offset on both sides, so no host staging is needed.
+            self.elements.encode_copy_region(
+                encoder,
+                &self.scratch.last_hidden,
+                &self.scratch.last_hidden,
+                hidden,
+                (row * hidden * std::mem::size_of::<u16>()) as u64,
+                0,
+            )?;
+            self.elements.encode_rms_norm(
+                encoder,
+                &self.scratch.last_hidden,
+                &self.final_norm_buffer,
+                &self.scratch.last_hidden,
+                1,
+                hidden,
+                self.layers[0].config.rms_norm_eps,
+            )?;
+            profile.stamp(encoder, "head/final_norm_rows")?;
+            if kaplumba_kernels::ablated("head_gemv") {
+                continue;
+            }
+            self.linear.encode_gemv(
+                encoder,
+                LinearEncodeRequest {
+                    packed,
+                    packed_offset: self.lm_head.metal_offset,
+                    perm_mode: self.lm_head.permutation_mode,
+                    input: &self.scratch.last_hidden,
+                    input_signs,
+                    output_signs,
+                    transformed: &self.scratch.transformed,
+                    raw: &self.scratch.raw,
+                    output: &self.scratch.logits_rows[row],
+                    in_features: self.lm_head.in_features,
+                    out_features: vocab,
+                    rate: self.lm_head.rate,
+                    codebook: self.lm_head.codebook,
+                    pretransformed: false,
+                },
+            )?;
+            self.elements.encode_softcap(
+                encoder,
+                &self.scratch.logits_rows[row],
+                &self.scratch.logits_rows[row],
+                vocab,
+                self.final_softcap,
+            )?;
+            profile.stamp(encoder, "head/gemm_rows")?;
+        }
+        Ok(())
+    }
+
+    /// Read back the `[rows, vocab]` softcapped matrix a `HeadPick::Rows` pass
+    /// left in `scratch.logits_rows`. Row-major: `[row * vocab .. (row + 1) *
+    /// vocab]`.
+    pub fn head_rows_matrix(&self, rows: usize) -> Vec<u16> {
+        let vocab = self.vocab_size;
+        if rows == 0 || rows > Self::VERIFY_ROW_CAP || rows > self.scratch.logits_rows.len() {
+            return Vec::new();
+        }
+        // One buffer per row, concatenated on read-back. Row-major by
+        // construction, and the read is `rows` small copies rather than one big
+        // one, which is not on any hot path.
+        let mut out = Vec::with_capacity(rows * vocab);
+        for buffer in &self.scratch.logits_rows[..rows] {
+            let src = buffer.contents() as *const u16;
+            out.extend_from_slice(unsafe { std::slice::from_raw_parts(src, vocab) });
+        }
+        out
+    }
+
     fn encode_lm_head(
         &self,
         encoder: &mut MetalEncoder,
@@ -4985,6 +5277,23 @@ impl TextModel {
     ) -> Result<(), ModelError> {
         let hidden = self.hidden_size;
         let vocab = self.vocab_size;
+        // T9: `HeadPick::Rows(n)` normalises and projects `n` rows into
+        // `scratch.logits_rows`, leaving the single-row `logits`/`capped` pair
+        // untouched so no existing caller observes a difference.
+        // Every `Rows` pass, including rows == 1, runs the rows head: the output
+        // lives in `logits_rows`, and `head_rows_matrix` is the only reader. A
+        // `rows == 1` special case that fell through to the single-row head wrote
+        // `capped` and left `logits_rows` untouched, which read back as zeros.
+        if let Some(rows) = pick.verify_rows() {
+            if rows > Self::VERIFY_ROW_CAP {
+                return Err(ModelError::InvalidInput(format!(
+                    "a verify pass asked for {rows} rows, above the {} cap",
+                    Self::VERIFY_ROW_CAP
+                )));
+            }
+            self.encode_lm_head_rows(encoder, profile, rows)?;
+            return Ok(());
+        }
         // In-place: each thread owns one row, so normalising last_hidden onto
         // itself is safe and avoids a second buffer.
         self.elements.encode_rms_norm(
@@ -5132,7 +5441,13 @@ impl TextModel {
     }
 
     /// Grow the scratch if a larger chunk is requested; steady state is a no-op.
-    fn ensure_scratch(&mut self, tokens: usize) -> Result<(), ModelError> {
+    /// Grow the forward scratch to hold at least `tokens` rows. Idempotent and
+    /// idempotent-cheap: the growth path re-allocates, so callers that already
+    /// know their row count should call it once up front rather than let
+    /// `forward_chunk` drive it. `forward_verify` needs it because it validates
+    /// its row count against `scratch.max_tokens` *before* any chunk runs, and
+    /// the scratch starts decode-sized (2 rows).
+    pub fn ensure_scratch(&mut self, tokens: usize) -> Result<(), ModelError> {
         if tokens <= self.scratch.max_tokens {
             self.scratch_tokens = tokens;
             return Ok(());

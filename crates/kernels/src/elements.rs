@@ -1794,6 +1794,50 @@ impl ElementKernels {
         )
     }
 
+    /// A region copy: `count` fp16 elements from `src[src_offset..]` into
+    /// `dst[dst_offset..]`.
+    ///
+    /// Exists for the T9 verify head, which needs one row of the multi-row hidden
+    /// matrix at a time. `encode_copy` starts at offset 0 in both buffers, and a
+    /// host-side staging buffer would put a read-back on the verify pass's hot
+    /// path for no reason.
+    pub fn encode_copy_region(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        src: &Buffer,
+        dst: &Buffer,
+        count: usize,
+        src_offset: u64,
+        dst_offset: u64,
+    ) -> Result<(), KernelError> {
+        if count == 0 {
+            return Err(KernelError::InvalidInput(
+                "copy count must be non-zero".to_string(),
+            ));
+        }
+        // Bounds: the source region is `src[src_offset .. src_offset + count]`
+        // and the destination region is `dst[dst_offset .. dst_offset + count]`.
+        // Both are in fp16, so bytes are `count * 2`. Metal does not bounds-check
+        // a shared buffer, and the whole reason this method exists is a head that
+        // was writing past its store.
+        let bytes = count as u64 * std::mem::size_of::<u16>() as u64;
+        if src.length() < src_offset + bytes || dst.length() < dst_offset + bytes {
+            return Err(KernelError::InvalidInput(
+                "copy region runs past the end of a buffer".to_string(),
+            ));
+        }
+        encoder.dispatch_1d_offset(
+            &self.copy_buffer_pipeline,
+            &[
+                crate::encoder::TensorRef::new(src, src_offset),
+                crate::encoder::TensorRef::new(dst, dst_offset),
+            ],
+            &to_u32(count, "copy count")?.to_le_bytes(),
+            count as u64,
+            64,
+        )
+    }
+
     /// Encode `dispatches` copies of a deliberately slow kernel, so a timing
     /// instrument can be shown to resolve a cost injected into the region it
     /// claims to measure.
