@@ -643,3 +643,151 @@ for both a ring that has wrapped and one that has not.
 Both reverted, 3/3 green. Note the second sabotage attributes to two tests, which
 is expected: the same offset error corrupts any two-schedule comparison, and it is
 why chunk invariance and rewind equivalence are not redundant tests.
+
+## 2026-10-11 — CORRECTION: the T12 extrapolation above is WRONG for the target
+
+I extrapolated the target's M=16 verify cost from the *drafter's* measured 9.9 GB/s.
+That was a mistake — the two are not comparable — and it has now been measured
+directly. **The table in §"T12" under "the arithmetic this pins down" must not be
+used.** Corrected numbers below.
+
+### What was measured (this branch, `Gxma-repacked`, 3 bpw)
+
+```text
+prompt 28 tok, 1 new:   ttft 546.7 ms   prefill 51.26 tok/s   (28.4 GB/s over ~15.5 GB)
+prompt 62 tok, 24 new:  ttft 1351.9 ms  prefill 45.87 tok/s   decode 15.39 tok/s
+```
+
+Two things fall out, and both matter more than the T12 result did:
+
+1. **The target prefills at 28-46 GB/s, not 9.9.** The drafter's 9.9 GB/s figure
+   is specific to a 4 bpw **row-major** (`perm_mode = 0`) trellis. The target is
+   3 bpw **colmajor**, and the repo's colmajor path is the faster one
+   (`spec/decode-19tok-repacked-250gb`). So an M=16 verify over the target is
+   ~550 ms, not ~1.55 s, and the head is ~37 ms, not ~105 ms.
+2. **The baseline decode on this branch is 15.4 tok/s, not the 3.7-6.4 tok/s that
+   `AGENTS.md` §10.2 #5 records.** That figure is stale for `stepwise-clean-3724c01`,
+   which carries the colmajor/19-tok work. This changes the value proposition
+   completely: DFlash is being asked to beat 15.4 tok/s, not 3.3.
+
+### Corrected round arithmetic
+
+| stage | corrected cost | basis |
+|---|---|---|
+| 35 per-layer projections | 78.89 ms | measured (T12) |
+| `fc` | 8.72 ms | measured (T12) |
+| head, ~15 rows | ~37 ms | 1.05 GB at the target's measured ~28 GB/s |
+| verify, M=16 | ~550 ms | 15.5 GB at ~28 GB/s |
+
+Per block: ~125 ms drafting + ~550 ms verify = **~675 ms for at most 15 tokens =
+~22 tok/s at 100% acceptance.** Against a 15.4 tok/s baseline that is ~1.4x.
+
+**40 tok/s** needs 15 tokens per 375 ms, i.e. verify + draft <= 375 ms, i.e. the
+M=16 verify at >= ~62 GB/s. Whether that is reachable is exactly the open question
+(see below). It is *not* reachable by drafter-side work: the drafter is already
+only 19% of the block.
+
+### Hard caveats on these numbers
+
+- `sysctl vm.swapusage` after the second run: **5994.75 M swap in use**, and the
+  engine printed `sys_free_pct_min=15`, `sys_wired_peak_gb=20.36`. The box was
+  under real memory pressure. Per `AGENTS.md` §10 these numbers should be treated
+  as indicative only and re-measured on a quiet box before any decision.
+- The 62-token run needed `KAPLUMBA_FORCE_LOAD=1`; admission control refused it
+  (demand 16.28 GiB vs 15.95 GiB available). A forced load is a benchmark-validity
+  risk, which is the second reason to re-measure.
+- The M=16 verify cost is still **inferred**, now from a prefill-rate measurement
+  rather than a drafter number. It has not been measured at M=16 specifically.
+- I did not determine **why** decode is 15.4 tok/s when `AGENTS.md` says 3.7-6.4.
+  If the engine is already running a speculative (MTP) path, then DFlash's
+  marginal value is much smaller again, and the 15.4 tok/s is not the baseline
+  DFlash has to beat. **This should be established before implementing T7-T9.**
+
+### T12's real conclusion
+
+The drafter is not the bottleneck; the M=16 GEMM is, and the target's own M=16
+path is the number that decides whether any of this pays. T12's 9.9 GB/s remains a
+valid measurement **of the drafter's row-major 4 bpw path only** and should not be
+generalised.
+
+## 2026-10-11 — RESEARCH: why decode is 15.4 tok/s, and the exact T7 edit sites
+
+### It is NOT speculative decoding — verified
+
+`grep -rn "speculative|mtp|Mtp|draft_model|drafter"` across the run path returns
+exactly one real hit: `generate.rs:1068`, whose comment says "the GPU never
+executes this speculative step". That is the **pipelined encoder commit** (encode
+the next step, commit only once the token is known not to be EOS) — not
+speculative decoding. There is no MTP head and no draft model in `Model::load` or
+the CLI. The 15.4 tok/s is the genuine non-speculative decode rate.
+
+### Why it is that fast: decode is at the bandwidth ceiling
+
+`Gxma-repacked` is **15 G on disk** (`du -sh`). One decode step reads all of it:
+
+```text
+15.5 GB / 64.9 ms = 239 GB/s    (vs 273 GB/s peak, and the ~227-238 GB/s ceiling
+                                 already recorded in spec/decode-19tok-repacked-250gb)
+```
+
+64.9 ms/token is exactly 15.4 tok/s. **Decode is bandwidth-saturated at ~88% of
+peak — there is essentially nothing left to win there**, which is precisely the
+regime where speculative decoding is supposed to pay.
+
+### Why prefill looked slow: it is compute-bound, and it amortises
+
+Measured, three prompt lengths, `--max-new-tokens 1`:
+
+| prompt tokens | ttft ms | prefill tok/s | marginal ms/token |
+|---|---|---|---|
+| 28 | 546.7 | 51.26 | — |
+| 62 | 1351.9 | 45.87 | 23.7 (28->62) |
+| 445 | 5189.2 | 85.77 | 10.0 (62->445) |
+
+The marginal cost **falls** with batch size, so prefill amortises the weight read
+across the batch (and is then compute-bound), while decode at M=1 cannot amortise
+anything. This fixes the mistake in §"CORRECTION": a verify is **one pass**, not
+per-token. Extrapolating the measured M=28 pass (546 ms total) to M=16 gives
+**~300-550 ms**, not 1.55 s. So a round is ~125 ms drafting + ~300-550 ms verify
+for up to 15 tokens:
+
+- at 550 ms: ~22 tok/s (1.4x over the 15.4 baseline)
+- at 300 ms: ~35 tok/s (2.3x)
+
+**The M=16 verify cost is the single number that decides whether this spec pays,
+and it is still not directly measured.** Measuring it is cheap: prefill exactly 16
+tokens and read `ttft_ms`. That should be the first action of the next session,
+before any more implementation.
+
+### T7 edit sites (researched, not yet implemented)
+
+Everything needed is known; I ran out of budget before writing it and chose not to
+leave unverified edits in a 5800-line hot-path file.
+
+| what | where |
+|---|---|
+| `ForwardScratch` struct | `model.rs:3163` |
+| `scratch: ForwardScratch` field | `model.rs:3419` |
+| Model construction literal (`scratch,`) | `model.rs:3591` |
+| layer loop | `model.rs:4807` — `for index in 0..layers` |
+| ping-pong select | `model.rs:4808` — `let (input, output) = if index % 2 == 0 { (hidden_a, hidden_b) } else { (hidden_b, hidden_a) }` |
+| layer call, after which `output` holds layer `index`'s post-layer state | `model.rs:4836` (`this[0].forward_buffer(...)`) |
+| GPU->GPU copy primitive | `ElementKernels::encode_copy(encoder, input, output, count)` — `elements.rs:1776` |
+| read-back precedent | `hidden_states_all` — `model.rs:5474` |
+| `ensure_scratch` | `model.rs:5165` |
+
+Notes that cost real time to establish and should not be re-derived:
+
+- **Tap layers `[1, 12, 23, 35, 46, 57]` have mixed parity**, so the blit must
+  pick its source per layer: odd -> `hidden_a`, even -> `hidden_b`. A hardcoded
+  `hidden_a` happens to be right for four of the six.
+- The blit **must be inside the layer loop**. `hidden_states_all` captures only the
+  *final* layer's pre-final-norm state after the whole chunk, so intermediate
+  taps cannot be recovered post-hoc. This is the one part of T7 that has no
+  existing precedent in the tree.
+- Add the tap buffers as an **opt-in struct**, not an unconditional
+  `ensure_scratch` allocation: 6 x 1024 x 5376 x 2 = 66 MB, and the default path
+  must not pay it (AGENTS.md §8; the footprint budget is 12.96 GiB measured).
+- `ensure_scratch` resolves its device handle inside its own body (via the
+  `u16_elements`/`f32_elements` helpers). **I did not confirm that idiom** — read
+  `model.rs:5165-5300` first; it is the only unknown left in T7.
