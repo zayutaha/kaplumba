@@ -1794,3 +1794,120 @@ measurable**: the drafter returns one logits row per block row, the target's own
 `last_logits()` gives `p`, and `alpha = sum_x min(p(x), q(x)) = 1 - TV(p, q)` over
 the temp-1.0 / top-64 truncated distributions. That is D3, and it decides whether
 30 t/s is reachable at all: break-even is 0.919 at b32, 30 t/s needs 0.977.
+
+---
+
+## 2026-10-11 — D3 MEASURED: the drafter does not condition on its context at all
+
+This is the answer to the 30 t/s question, and it is not the answer I expected.
+
+### alpha is 0.0000 on every row and every target position
+
+`dflash_alpha_probe` (ignored) loads the target and the drafter, prefills real prose
+(78 tokens), builds the drafter's context from real taps, chains six target
+positions, and measures `alpha = sum_x min(p, q)` at temperature 1.0 / top_k 64 over
+a full matrix of (drafter row, target position):
+
+```
+=== SUMMARY (mean alpha on the round's diagonal) ===
+  as-configured                [1, 12, 23, 35, 46, 57]  mean 0.0000  best 0.0000
+  config+1 (z-lab offset=1)    [2, 13, 24, 36, 47, 58]  mean 0.0000  best 0.0000
+```
+
+Every entry in the 16 x 6 matrix is `0.0000`. With 64-token supports out of a
+262,144 vocabulary, chance overlap is ~0.016 per pair, so 0/96 is consistent with
+the drafter's predictions being **statistically unrelated to the target's**.
+
+### The probe is not the explanation -- three of its own bugs were found and fixed
+
+The number above is only worth reporting because three ways of getting a spurious
+zero were found and eliminated first, each recorded because each produced a
+confident wrong answer:
+
+1. **Synthetic input.** The first version fed a token-id soup. Its positive control
+   -- two *adjacent positions of the target itself* -- returned `alpha 0.0001, 4/64
+   shared`, proving the input drove the model somewhere consecutively predicted
+   distributions barely overlap. Replaced with real prose via `GemmaTokenizer`.
+2. **`last_logits()` instead of the return value.** `forward_buffer` *returns* the
+   last row's logits; `last_logits()` reads `scratch.capped`, which
+   `encode_lm_head` writes only on the softcap path
+   (`pick.skips_softcap(out.is_some())`). A stale read makes even adjacent positions
+   look disjoint.
+3. **A one-position shift.** The round's alignment is `row r ~ position start + r`
+   (anchor at row 0 is the already-emitted token, so rows 1.. are the drafts), which
+   is why the probe prints the whole matrix: a shift shows up as an off-diagonal
+   ridge. None did.
+
+Surviving validity checks, all in the run: **self control `alpha(p0, p0) = 1.000000`**
+(the metric reproduces itself), real prose, `forward_buffer`'s return value, and a
+matrix rather than a single comparison. The target's own rows are sane and peaked
+(`3048:0.9189`, `560:0.9984`, `3016:0.9876`), so the target side is fine.
+
+### The root cause: the taps do not reach the drafter
+
+The two tap conventions are `[1,12,23,35,46,57]` and `[2,13,24,36,47,58]`. They must
+produce different drafts -- different layers, different tap contents, different
+context. They produced **byte-identical** drafts:
+
+    drafts: [84544, 84544, 236774, 236774, 236774, ...]   (both cases, exactly)
+
+So **the drafter's output does not depend on its context at all.** `alpha == 0` is
+not a low-quality drafter; it is the arithmetic consequence of a drafter that is not
+conditioned on the target it is supposed to predict. `enable_taps` does update the
+layer list (`self.taps = Some(TapScratch { layers: layers.to_vec(), .. })`), and
+T7's own test shows different layers capture different tap *contents*, so the loss is
+downstream: `append_context`'s `fc`/`hidden_norm`/`k_proj`/`v_proj`/RoPE fusion,
+the drafter's attention over the context rows, or the positions those rows are
+cached at.
+
+**Why nothing caught it:** `dflash_golden` -- the only reference comparison in the
+spec -- exercises `forward_block` with **zero context rows** (`dflash_cache` and
+`dflash_streaming` validate cache arithmetic and chunk invariance, both of which are
+self-consistency). The drafter's context path has **never been compared against
+z-lab**. That is the gap, and it is the same shape as the `draft_block` off-by-one:
+an invariant with nothing that could fail.
+
+### What this means for 30 t/s
+
+**Unanswerable until the context path is fixed, and with no supporting evidence
+today.** The bar stands from measurement (`alpha >= 0.977` at b32, break-even
+0.919), but the only direct measurement of `alpha` this engine can produce is
+0.0000. Do not read that as "the drafter is bad" -- read it as "the drafter is not
+connected". The next task is to validate the context path against z-lab **with real
+context**, which is a new test, not a tweak.
+
+`dflash_alpha_probe` therefore ends with an `assert_ne!` on the two draft vectors
+that **fails today** with the explanation above. It is the check that should flip to
+green when the context path is fixed, which is why it is an assertion rather than a
+comment. The probe is `#[ignore]`d, so the default suite is unaffected.
+
+## 2026-10-11 — D4: the context path IS connected; the 2% residual is the norm's f16 narrowing
+
+`dflash_forward_block_with_context_matches_host` (new, fifth test in
+`dflash_golden.rs`) fills a real `DflashKvCache` through `append_context` and
+drafts from it, compared against the f32 host reference. Results:
+
+```
+no context:   worst 0.068110 at 77305 of 86016; engine max 77.2500, reference max 77.2833
+              relative 8.8e-4
+with context: worst 1.703331 at 4953 of 86016; engine max 88.6875, reference max 89.6041
+              relative 1.9e-2
+```
+
+So `forward_block`'s context path is **wired and correct in structure** — the
+context changes the output (engine max 88.7 with context vs 77.3 without), and
+the per-stage reference maxima are in the same range as the no-context case.
+
+The 1.9% residual is NOT a graph error (a mis-ordered norm or a residual from the
+wrong stream would be 10x-100x). It is **fp16 narrowing in the context path**:
+`project_context_kv` produces the cache's K/V through the f16 `gemm` and the f16
+`rope`, and those rows then attend against f16 queries. The no-context test
+narrows only the block's own f32 residual at `rms_norm_f32_in`, so it is 20x
+tighter. Closing it means an f32 context K/V path, which is a throughput cost on
+the append side (see T12's M=16 numbers) and is deferred.
+
+**Consequence for D4:** the premise "the drafter's output does not depend on its
+context" is FALSE for `forward_block`. The `alpha = 0.0000` measurement must
+therefore be either the probe's wiring or `append_context`'s caller in the probe.
+`dflash_alpha_probe`'s byte-identical drafts for two tap sets is the thing to
+re-check, not the drafter.

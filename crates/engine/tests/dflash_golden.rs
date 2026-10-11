@@ -783,3 +783,299 @@ fn dflash_exl3_decode_matches_host_on_every_linear() {
     }
     eprintln!("all {} linears agree; worst {worst_overall:.6}", names.len());
 }
+
+/// The drafter's block attention, in f32, over context rows followed by block
+/// rows. `ctx_offset` is the absolute position of the first context row and
+/// `block_start` of the first block row; `ctx_len` of `usize::MAX` means "no
+/// context".
+#[allow(clippy::too_many_arguments)]
+fn attended_of(
+    q: &[f32],
+    k_ctx: &[f32],
+    v_ctx: &[f32],
+    k_block: &[f32],
+    v_block: &[f32],
+    ctx_len: usize,
+    rows: usize,
+    q_heads: usize,
+    kv_heads: usize,
+    head_dim: usize,
+    groups: usize,
+    scale: f32,
+    ctx_offset: usize,
+    block_start: usize,
+    bidirectional: bool,
+    window: usize,
+) -> Vec<f32> {
+    let mut attended = vec![0.0_f32; rows * q_heads * head_dim];
+    for row in 0..rows {
+        let q_pos = (block_start + row) as u32;
+        for q_head in 0..q_heads {
+            let key_head = q_head / groups;
+            let mut scores = Vec::new();
+            for key in 0..ctx_len + rows {
+                let k_pos = if key < ctx_len {
+                    (ctx_offset + key) as u32
+                } else {
+                    (block_start + key - ctx_len) as u32
+                };
+                let past_ok = bidirectional || k_pos <= q_pos;
+                let window_ok = window == 0 || q_pos - k_pos < window as u32;
+                if !(past_ok && window_ok) {
+                    continue;
+                }
+                let (keys, base) = if key < ctx_len {
+                    (k_ctx, (key * kv_heads + key_head) * head_dim)
+                } else {
+                    (
+                        k_block,
+                        ((key - ctx_len) * kv_heads + key_head) * head_dim,
+                    )
+                };
+                let q_base = (row * q_heads + q_head) * head_dim;
+                let dot: f32 = (0..head_dim)
+                    .map(|d| q[q_base + d] * keys[base + d])
+                    .sum();
+                scores.push((key, dot * scale));
+            }
+            let max = scores
+                .iter()
+                .map(|(_, score)| *score)
+                .fold(f32::NEG_INFINITY, f32::max);
+            let total: f32 = scores.iter().map(|(_, s)| (s - max).exp()).sum();
+            let o_base = (row * q_heads + q_head) * head_dim;
+            for d in 0..head_dim {
+                let mut acc = 0.0_f32;
+                for (key, score) in &scores {
+                    let (values, base) = if *key < ctx_len {
+                        (v_ctx, (*key * kv_heads + key_head) * head_dim)
+                    } else {
+                        (
+                            v_block,
+                            ((key - ctx_len) * kv_heads + key_head) * head_dim,
+                        )
+                    };
+                    acc += (score - max).exp() / total * values[base + d];
+                }
+                attended[o_base + d] = acc;
+            }
+        }
+    }
+    attended
+}
+
+// ---------------------------------------------------------------------------
+// 5. The whole 5-layer block pass WITH real context rows.
+//
+// This is the test the spec was missing, and the reason D4 existed:
+// `dflash_forward_block_matches_host` above runs with **zero** context rows, and
+// `dflash_cache`/`dflash_streaming` only check cache arithmetic against itself.
+// Nothing had ever compared the context path -- `fc`/`hidden_norm` fusion, the
+// per-layer `k_proj`/`v_proj`/`k_norm`/RoPE, the drafter's attention over the
+// context rows, and the window those rows are cached at -- against z-lab. The
+// measured symptom was alpha = 0.0000 with byte-identical drafts for two
+// different tap sets, i.e. a drafter whose output does not depend on its
+// context at all.
+//
+// With T14's f32 residual stream the magnitudes that used to overflow fp16
+// (layer-0 attention output 45.8, `o_proj` 2169, MLP output 152 288) now fit, so
+// this comparison is possible.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn dflash_forward_block_with_context_matches_host() {
+    let Some(mut harness) = Harness::build() else {
+        return;
+    };
+    let hidden = harness.hidden();
+    let head_dim = harness.config.head_dim;
+    let rows = harness.config.block_size;
+    let eps = harness.config.rms_norm_eps;
+    let n_ctx = 20usize;
+    let position = n_ctx + rows;
+
+    let anchor = pseudo(0x5EED_A11C, hidden, INPUT_SCALE);
+    let mask = pseudo(0x0A5C0FFE, hidden, INPUT_SCALE);
+    let taps = harness.taps(n_ctx, 0xDF_1A_5000);
+    let tap_refs: Vec<&[u16]> = taps.iter().map(|tap| tap.as_slice()).collect();
+
+    // Fill the drafter's cache through the real entry point, as the round loop
+    // would, then draft from it.
+    let mut cache = kaplumba_engine::dflash::DflashKvCache::new(&harness.config);
+    let ctx_first_all = cache.all_first_positions();
+    harness
+        .model
+        .append_context(&tap_refs, n_ctx, n_ctx, &mut cache)
+        .expect("append context");
+    harness
+        .model
+        .set_mask_embedding(&mask)
+        .expect("mask embedding");
+    let block = harness
+        .model
+        .forward_block(&kaplumba_engine::dflash::BlockContext {
+            anchor_embedding: &anchor,
+            ctx_keys: cache.all_keys(),
+            ctx_values: cache.all_values(),
+            ctx_first: &ctx_first_all,
+            position,
+        })
+        .expect("block");
+
+    // --- host reference, with the same context ----------------------------
+    let reference_fused = harness.reference_fused(&taps, n_ctx);
+    let groups = harness.config.q_heads / harness.config.kv_heads;
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let mut state = vec![0.0_f32; rows * hidden];
+    for row in 0..rows {
+        let source = if row == 0 { f32_of(&anchor) } else { f32_of(&mask) };
+        state[row * hidden..(row + 1) * hidden].copy_from_slice(&source);
+    }
+    let mut stage_max = Vec::new();
+    for layer in 0..harness.config.num_layers {
+        let prefix = format!("layers.{layer}");
+        let line = &harness.lines.per_layer[layer];
+        let k_norm = norm_weights(
+            &harness.dir,
+            &format!("{prefix}.self_attn.k_norm"),
+            head_dim,
+        );
+        let normed = rms_norm(
+            &state,
+            &norm_weights(&harness.dir, &format!("{prefix}.input_layernorm"), hidden),
+            rows,
+            hidden,
+            eps,
+        );
+        let q_out = line.q.forward(&normed, rows);
+        let q_norm = rms_norm(
+            &q_out,
+            &norm_weights(&harness.dir, &format!("{prefix}.self_attn.q_norm"), head_dim),
+            rows * harness.config.q_heads,
+            head_dim,
+            eps,
+        );
+        let q_rope = rope(
+            &q_norm,
+            rows,
+            harness.config.q_heads,
+            head_dim,
+            position,
+            harness.config.rope_theta,
+        );
+        let k_block = line.k.forward(&normed, rows);
+        let k_block = rms_norm(
+            &k_block,
+            &k_norm,
+            rows * harness.config.kv_heads,
+            head_dim,
+            eps,
+        );
+        let k_block = rope(
+            &k_block,
+            rows,
+            harness.config.kv_heads,
+            head_dim,
+            position,
+            harness.config.rope_theta,
+        );
+        let v_block = line.v.forward(&normed, rows);
+        let k_ctx = line.k.forward(&reference_fused, n_ctx);
+        let k_ctx = rms_norm(
+            &k_ctx,
+            &k_norm,
+            n_ctx * harness.config.kv_heads,
+            head_dim,
+            eps,
+        );
+        let k_ctx = rope(
+            &k_ctx,
+            n_ctx,
+            harness.config.kv_heads,
+            head_dim,
+            0,
+            harness.config.rope_theta,
+        );
+        let v_ctx = line.v.forward(&reference_fused, n_ctx);
+        let attended = attended_of(
+            &q_rope,
+            &k_ctx,
+            &v_ctx,
+            &k_block,
+            &v_block,
+            n_ctx,
+            rows,
+            harness.config.q_heads,
+            harness.config.kv_heads,
+            head_dim,
+            groups,
+            scale,
+            0,
+            position,
+            !harness.config.layer_is_sliding[layer],
+            harness.config.sliding_window,
+        );
+        stage_max.push(max_of(&attended));
+        let projected = line.o.forward(&attended, rows);
+        stage_max.push(max_of(&projected));
+        for (index, value) in projected.iter().enumerate() {
+            state[index] += value;
+        }
+        let mlp_normed = rms_norm(
+            &state,
+            &norm_weights(
+                &harness.dir,
+                &format!("{prefix}.post_attention_layernorm"),
+                hidden,
+            ),
+            rows,
+            hidden,
+            eps,
+        );
+        let gate_out = line.gate.forward(&mlp_normed, rows);
+        let up_out = line.up.forward(&mlp_normed, rows);
+        let activated: Vec<f32> = gate_out
+            .iter()
+            .zip(up_out.iter())
+            .map(|(gate_value, up_value)| silu(*gate_value) * up_value)
+            .collect();
+        stage_max.push(max_of(&activated));
+        let down_out = line.down.forward(&activated, rows);
+        stage_max.push(max_of(&down_out));
+        for (index, value) in down_out.iter().enumerate() {
+            state[index] += value;
+        }
+    }
+    let expected = rms_norm(
+        &state,
+        &norm_weights(&harness.dir, "norm", hidden),
+        rows,
+        hidden,
+        eps,
+    );
+
+    let actual = f32_of(&block.hidden);
+    assert_eq!(actual.len(), expected.len());
+    let mut worst = 0.0_f32;
+    let mut worst_index = 0usize;
+    for (index, (a, b)) in actual.iter().zip(expected.iter()).enumerate() {
+        let diff = (a - b).abs();
+        if diff > worst {
+            worst = diff;
+            worst_index = index;
+        }
+    }
+    let engine_max = max_of(&actual);
+    let reference_max = max_of(&expected);
+    eprintln!(
+        "forward_block WITH CONTEXT worst diff {worst:.6} at {worst_index} of {}; \
+         engine max {engine_max:.4}, reference max {reference_max:.4}, \
+         reference per-stage max {}",
+        actual.len(),
+        stage_max
+            .iter()
+            .map(|value| format!("{value:.2}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    );
+}
