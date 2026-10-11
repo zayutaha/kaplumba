@@ -132,7 +132,14 @@ Update this file **immediately** after each task (AGENTS.md §3.3).
       the scratch, so the blit could write past the end of a one-row buffer.
       Fixed by re-sizing the tap buffers in `ensure_scratch`'s growth path
       (`rebuild_tap_buffers`).
-- [ ] **T9 — the round.** `generate.rs` DFlash loop; rewind on rejection.
+- [ ] **T9 — the round.** **Blocked on a design finding, see
+      `implementation_notes.md` §"T9 blocked on a real alignment subtlety".**
+      The obvious implementation (feed `[last_token] ++ drafts` to the target)
+      **re-feeds the anchor**, duplicating a K/V row and corrupting the logits it
+      verifies against. The correct shape feeds only the drafts and carries the
+      previous step's logits as `previous_logits`, with an adjusted retract count.
+      `TextModel::head()` and `raw_embedding()` have landed; `draft_and_verify`
+      was written, found wrong, and removed rather than committed.
       **Tested by**: the 0/5/15 stub-forced acceptance cases and the R13
       two-round test.
 

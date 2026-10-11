@@ -5439,6 +5439,55 @@ impl TextModel {
         }
     }
 
+    /// The target's tied output head.
+    ///
+    /// The DFlash drafter has no head of its own (`tie_word_embeddings` is true
+    /// and the vocabularies match), so the round applies this one to both the
+    /// drafter's block and the target's verify rows. Leaked as a borrow rather
+    /// than a clone because it is 1.05 GB.
+    pub fn head(&self) -> &QuantizedLinear {
+        &self.lm_head
+    }
+
+    /// RAW embedding rows: `embed_tokens[token]`, with **no** `sqrt(hidden)`.
+    ///
+    /// [`Self::embedding`] applies the scale the target's own embed step uses.
+    /// The DFlash drafter's anchor needs the raw row — z-lab's
+    /// `_raw_input_embeddings` (`dflash/model.py:135`) takes it straight from the
+    /// table, and the drafter's `fc` was trained against that. Spec R7; Q1 is the
+    /// open question that would flip it, and this is the flag to flip.
+    ///
+    /// Goes through the same kernel path as [`Self::embedding`] so it handles a
+    /// page-aligned, possibly-BF16, offloaded table — the host-mirror version of
+    /// this once returned garbage for exactly that case.
+    pub fn raw_embedding(&self, token_ids: &[u32]) -> Vec<u16> {
+        if let Some(buffer) = &self.embedding_buffer {
+            return self
+                .elements
+                .embedding_scaled_view(
+                    token_ids,
+                    buffer,
+                    self.embedding_offset,
+                    self.embedding_is_bf16,
+                    self.hidden_size,
+                    self.vocab_size,
+                    1.0,
+                )
+                .unwrap_or_default();
+        }
+        let mut output = vec![0_u16; token_ids.len() * self.hidden_size];
+        for (row, token) in token_ids.iter().enumerate() {
+            let token = *token as usize;
+            if token >= self.vocab_size {
+                continue;
+            }
+            output[row * self.hidden_size..(row + 1) * self.hidden_size].copy_from_slice(
+                &self.embedding[token * self.hidden_size..(token + 1) * self.hidden_size],
+            );
+        }
+        output
+    }
+
     pub fn vocab_size(&self) -> usize {
         self.vocab_size
     }

@@ -1076,3 +1076,69 @@ That split is the correct signature and worth keeping as a diagnostic: R9 rotate
 q and k and **never** v, so a position/RoPE error must move keys and leave values
 untouched. A failure that moved both would mean a different bug (e.g. the fusion or
 the projection), not a position error.
+
+## 2026-10-11 — T9 blocked on a real alignment subtlety (found, not yet solved)
+
+I wrote `draft_and_verify`, then removed it before committing. It compiled, but it
+is **wrong**, and this is the finding that matters.
+
+### The bug
+
+The block is `[anchor, mask x 15]` at positions `position .. position + block - 1`,
+where `anchor` is the last already-generated token. Verifying row `r` requires the
+target's logits *at that row*. The obvious implementation feeds
+`[last_token] ++ drafts` to the target at `position .. position + block - 1` — which
+is what I wrote.
+
+**That re-feeds the last token.** After any prefill the target's cache already
+holds the row for `last_token`; feeding it again at the same position appends a
+second, identical K/V row there. With a causal mask the block's rows then attend
+to that key twice, which does not cancel — it changes the softmax and therefore
+the logits. So the "target" being verified against would be a subtly different
+model, and acceptance would be measured against corrupted logits.
+
+### The correct shape
+
+Do not re-feed the anchor. Carry the previous step's logits instead:
+
+```rust
+pub fn draft_and_verify(
+    &self, target, cache,
+    last_token: u32,
+    position: usize,             // position of the FIRST token to predict
+    previous_logits: &[u16],     // target logits at row position - 1, vocab-wide
+) -> Result<DflashRound, DflashError>
+```
+
+- Feed only `draft.tokens[0 .. n-1]` at `position .. position + n - 2`.
+- Let `L[k]` be the target logits row that predicts `draft.tokens[k]`: `L[0]` is
+  `previous_logits`, and `L[k]` for `k >= 1` is the row produced by feeding
+  `draft.tokens[k-1]`.
+- First `k` with `argmax(L[k]) != draft.tokens[k]` decides: accept
+  `draft.tokens[..k]`, emit `argmax(L[k])` as `next`.
+- The cache advanced by `n - 1` rows but only `k + 1` are correct, so retract
+  `(n - 1) - (k + 1)`.
+
+The consequence for the caller is that the round must **own the logits** from the
+previous forward — the prefill's returned last-row logits, then each round's
+`L[k]`. `forward_buffer` already returns exactly that for a single row, so the
+plumbing exists; it just is not free, and the round's signature has to carry it.
+
+### Why this is worth writing down rather than coding through
+
+Every wrong variant here still *runs* and still produces a number. Re-feeding the
+anchor inflates or deflates acceptance silently; verifying `draft.tokens[1..]`
+against `L[0..]` (off by one) accepts tokens the target would not have emitted,
+which breaks R6's "no quality loss" without failing anything obvious. A T10
+equivalence test catches those — but only if the test compares full greedy
+sequences, which is why T10 has to be written before T9 is believed.
+
+### What did land
+
+- `TextModel::head()` and `TextModel::raw_embedding(&[u32])` — the latter is
+  `embedding_scaled_view` with `scale = 1.0`, so it reuses the proven kernel path
+  rather than a host mirror (the host mirror is what once made `mtp_acceptance`
+  read `-inf`/`NaN` and report 0 acceptance). This is the R7/Q1 flag: Q1 flips
+  raw -> scaled by changing that one argument.
+- `DflashRound { accepted, next, drafted }` with `emitted()`, the shape the round
+  will return.

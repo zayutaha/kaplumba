@@ -841,6 +841,28 @@ impl DflashKvCache {
 
 }
 
+/// One draft-and-verify round's outcome (T9/R15).
+pub struct DflashRound {
+    /// The drafted tokens the target confirmed, in order.
+    pub accepted: Vec<u32>,
+    /// The target's own greedy token at the first position the drafter got
+    /// wrong (or the position past the last row if it got them all right). This
+    /// is the token that ends the round and seeds the next one, and it is why a
+    /// round always emits at least one token.
+    pub next: u32,
+    /// How many tokens were drafted (the block's `draft_tokens()`), so a caller
+    /// can report acceptance as `accepted.len() as f32 / drafted as f32`.
+    pub drafted: usize,
+}
+
+impl DflashRound {
+    /// Tokens this round emitted: the accepted prefix plus the target's own
+    /// correction token.
+    pub fn emitted(&self) -> usize {
+        self.accepted.len() + 1
+    }
+}
+
 /// One drafting round's result.
 pub struct DflashDraft {
     /// `draft_tokens()` tokens in order.
