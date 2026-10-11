@@ -1663,3 +1663,134 @@ after the `dflash.rs` change (no regressions).
 not reach its assertion, for the head-buffer reason above. The unit tests are the
 ones that actually cover the fix; the integration test is the one that would cover
 the plumbing, and that plumbing is still first-touched-today.
+
+---
+
+## 2026-10-11 — self-disproof attempt: the verify estimate HOLDS; D2 diagnosed to the byte
+
+Asked to disprove my own pessimistic conclusion, I attacked the two assumptions it
+rests on. The first broke in my favour; the second did not.
+
+### ttft is NOT mostly fixed overhead -- the 595 ms verify is real
+
+My whole bar depends on the M=32 verify costing ~595 ms, and I had taken that from
+a `ttft` number, which bundles startup cost. If the fixed part had been large, a
+mid-decode verify would be far cheaper and the bar would collapse. Measured
+directly (`--max-new-tokens 1`, varying prompt length, reading `prompt_tokens` and
+`ttft_ms`):
+
+| prompt tokens | ttft ms |
+|---|---|
+| 14 | 317.5 |
+| 21 | 457.5 |
+| 29 | 587.8 |
+| 37 | 1326.5 |
+| 61 | 1341.0 |
+| 109 | 1374.8 |
+
+Linear fit for the `<= 32` bucket: **`ttft ~= 65.5 + 18.0 * n` ms**. The intercept is
+**65.5 ms -- exactly one decode step** (the one unavoidable weight read), not the
+400 ms that would have rescued the estimate. At n = 32 that is ~641 ms, so my
+595 ms was mildly **optimistic, not pessimistic**. The conclusion survives.
+
+### New finding: the 32-row cliff is `SmallBatchMrhs`, and it argues for b32 hard
+
+The step from 29 -> 37 rows costs **+739 ms and then stays flat** (61, 77 and 109
+rows all land in 1341-1375 ms). That is not chunking -- taller prompts would keep
+growing. It is the route switch documented in the code:
+
+> `LinearRoute::SmallBatchMrhs => // ... Falls back to encode_gemm internally for
+> ineligible shapes (rate/codebook != MCG 3 bpw, queries > 32)`
+
+So `queries <= 32` takes the fast small-batch path at **18.0 ms/row**, and anything
+past 32 falls onto `encode_gemm` at ~1330 ms flat. **This is an independent,
+measured argument for `block_size = 32` and against 64** -- I previously rejected
+b64 only on the acceptance arithmetic.
+
+### D2 root cause, measured rather than guessed
+
+`draft_block`'s first-ever caller produced the printed head metadata:
+
+    head: in=5376 out=262144 rate=Integer(6) packed_len=Some(528482304)
+          host_packed_words=0 metal_buffer=Some(7529545728) metal_offset=5321075520
+
+- `metal_buffer` is the **whole 7.53 GB shard** (`model-00002-of-00002` is
+  7 529 529 792 B).
+- The trellis starts at `metal_offset = 5 321 075 520` and is
+  `packed_len * 2 = 1 056 964 608` B.
+- `length - offset = 7 529 545 728 - 5 321 075 520 = 2 208 470 208`, which is
+  exactly the number the error reported, so **1 151 505 600 B of further tensors
+  follow the head in the same buffer**.
+- `host_packed_words = 0`: the head is fully buffer-resident, so a test cannot
+  rebuild it from host words.
+
+`validate_buffer_shape` (`linear.rs:4197`) requires
+`length - offset == expected`, which is only true when the tensor is the buffer's
+**tail**. The drafter's own linears get dedicated buffers and satisfy it; the
+target's head does not. `encode_gemv` -- the head's only ever-exercised path --
+accepts the layout. **Two validators disagree, and only one has ever run.**
+
+**The fix, and why I did not apply it:** the preferred change is an explicit packed
+length on `LinearBufferRequest` (keeps the equality check for all other callers);
+the alternative is bounding the region by `packed_len` instead of the buffer end.
+Both touch `validate_buffer_shape`, which guards **every GEMM in the engine**,
+including the MMA path this file's comments already record as having shipped
+numerically wrong once. That is not a change to make blind at the end of a session
+on a box that is currently swapping (5.83 GiB in use, 1.2 GiB "available", which is
+why the run needed `KAPLUMBA_FORCE_LOAD=1`).
+
+`dflash_draft_rows.rs` is therefore an **expected-fail diagnostic**: it is
+`#[ignore]`d, so the default suite is unaffected, and its failure message carries
+the whole diagnosis above.
+
+---
+
+## 2026-10-11 — D2 FIXED. The target-head plumbing works, and the round is unblocked.
+
+### The change
+
+`gemm_chunk_buffer`'s validator took the packed tensor to be everything from
+`packed_offset` to the buffer's end, which is false for a tensor that is not the
+buffer's tail. Rather than relax that check -- it is the only thing catching a
+mislocated tensor for every other caller -- a length-aware path was added:
+
+- `linear.rs`: `gemm_chunk_buffer_with_stats` is now a 4-line wrapper that measures
+  the region and delegates to a private
+  `gemm_chunk_buffer_with_stats_region(request, packed_bytes)`, which is the old
+  body with `validate_buffer_shape` receiving the supplied length. **All 13
+  existing construction sites are untouched and take byte-identical code paths.**
+- New public `gemm_chunk_buffer_sliced(request, packed_bytes)`.
+- `draft_logits` now passes `head.packed_len * 2` (falling back to the region when
+  `packed_len` is absent), with the measured numbers in the comment.
+
+### Result: the first end-to-end run of the drafter's head path
+
+    head trellis 1056964608 B at offset 5321075520 inside a 2208470208 B region
+      (1151505600 B of trailing tensors); sliced validation used
+    test draft_tokens_are_the_masked_rows_not_the_anchor ... ok
+
+`dflash_draft_rows` is no longer an expected-fail diagnostic: it loads the 16 GB
+target **and** the drafter, builds the double-drift context, runs `draft_block`,
+and asserts the drafts are the argmax of rows `1..=draft_rows`.
+
+**Sabotage, run and observed:** reverting `select_draft_tokens` to `0..draft_rows`
+fails it on the real models with
+
+    assertion `left == right` failed: draft_block must return the argmax of rows
+      1..=draft_rows (the masked rows); it returned the argmax of rows 0..draft_rows,
+      which includes the anchor's row -- a token the target has already emitted --
+      and drops the last masked row
+
+exit 101. Reverted, re-run green (1/1), and the 16-test non-ignored suite re-run
+green (16/16, exit 0) -- **and checked unfiltered**, because a first pass with
+`--lib dflash::` in the same invocation propagated that filter to every target and
+reported `0 passed; N filtered out` for all of them, which is a vacuous pass rather
+than a passing test.
+
+### What this unblocks
+
+`draft_logits` on the real target head is now exercised, so **alpha is finally
+measurable**: the drafter returns one logits row per block row, the target's own
+`last_logits()` gives `p`, and `alpha = sum_x min(p(x), q(x)) = 1 - TV(p, q)` over
+the temp-1.0 / top-64 truncated distributions. That is D3, and it decides whether
+30 t/s is reachable at all: break-even is 0.919 at b32, 30 t/s needs 0.977.

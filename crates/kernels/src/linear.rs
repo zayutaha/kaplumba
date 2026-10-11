@@ -1064,9 +1064,50 @@ impl LinearKernels {
             .map(|(output, _)| output)
     }
 
+    /// [`Self::gemm_chunk_buffer`] with the packed tensor's byte length supplied
+    /// explicitly.
+    ///
+    /// `packed` may hold several tensors. The target's `lm_head` lives inside the
+    /// whole second shard (`model-00002-of-00002`), so
+    /// `packed.length() - packed_offset` is 2 208 470 208 B while its trellis is
+    /// only 1 056 964 608 B -- 1 151 505 600 B of further tensors follow it. The
+    /// equality check in `validate_buffer_shape` therefore rejects a buffer that
+    /// is entirely valid to read, which is why `TextModel::head` could be used by
+    /// `encode_gemv` (the head's only exercised path, which does not go through
+    /// this validator's packed_bytes arm) and refused by this one.
+    ///
+    /// Callers that know the length -- `QuantizedLinear::packed_len` -- pass it
+    /// here. Every other caller keeps the buffer-end behaviour and so keeps
+    /// **exactly** the check it had before.
+    pub fn gemm_chunk_buffer_sliced(
+        &self,
+        request: LinearBufferRequest<'_>,
+        packed_bytes: u64,
+    ) -> Result<Vec<u16>, KernelError> {
+        self.gemm_chunk_buffer_with_stats_region(request, packed_bytes)
+            .map(|(output, _)| output)
+    }
+
     pub fn gemm_chunk_buffer_with_stats(
         &self,
         request: LinearBufferRequest<'_>,
+    ) -> Result<(Vec<u16>, LinearPrefillStats), KernelError> {
+        // Unchanged behaviour: the packed tensor is assumed to run from
+        // `packed_offset` to the end of the buffer. See
+        // `gemm_chunk_buffer_sliced` for the case where it does not.
+        let region = request
+            .packed
+            .length()
+            .saturating_sub(request.packed_offset);
+        self.gemm_chunk_buffer_with_stats_region(request, region)
+    }
+
+    /// The body of [`Self::gemm_chunk_buffer_with_stats`], with `packed_bytes`
+    /// supplied by the caller instead of measured from the buffer's end.
+    fn gemm_chunk_buffer_with_stats_region(
+        &self,
+        request: LinearBufferRequest<'_>,
+        packed_bytes: u64,
     ) -> Result<(Vec<u16>, LinearPrefillStats), KernelError> {
         let LinearBufferRequest {
             packed,
@@ -1081,7 +1122,7 @@ impl LinearKernels {
         } = request;
         let tokens = input.len() / in_features.max(1);
         validate_buffer_shape(
-            packed.length().saturating_sub(packed_offset),
+            packed_bytes,
             packed_offset,
             input.len(),
             input_signs.len(),

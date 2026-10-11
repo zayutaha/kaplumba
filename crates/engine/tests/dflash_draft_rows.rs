@@ -18,27 +18,37 @@
 //! Ignored by default: it loads the 16 GB target (for the tied head) and the
 //! drafter.
 //!
-//! **KNOWN BLOCKER -- this test does not yet reach its assertion.** It aborts in
-//! `draft_block` with:
+//! **EXPECTED FAIL -- and the failure is the point.** This test currently stops at
+//! an assertion that records a real product bug, with the numbers measured rather
+//! than guessed. Run it and read the message; it says:
 //!
 //! ```text
-//! Kernels("invalid kernel input: packed buffer length 2208470208 does not match 1056964608")
+//! head: in=5376 out=262144 rate=Integer(6) packed_len=Some(528482304)
+//!       host_packed_words=0 metal_buffer=Some(7529545728) metal_offset=5321075520
+//! the head's metal buffer has 2208470208 B from offset 5321075520 but its trellis
+//! is 1056964608 B, so 1151505600 B of trailing data follow the head in the same
+//! buffer. `gemm_chunk_buffer` requires `length - offset == expected` ...
 //! ```
 //!
-//! `1056964608` is exactly `262144 * 5376 * 6 / 8`, the target head's packed size
-//! at 6 bpw, so the expected length is right and the *supplied* buffer is the
-//! wrong object. `draft_logits` passes `head.metal_buffer` straight to the
-//! drafter's own `linear` encoder, and nothing has ever called it: `draft_block`
-//! and `draft_logits` have **no callers outside `dflash.rs`** (`grep -rn` over
-//! `crates/` finds only doc-comment mentions). So the target-head-to-drafter
-//! plumbing has never been exercised, and this mismatch is the first thing it
-//! does. Resolving it likely means passing the packed *view* (offset/length) of
-//! the head rather than its whole `metal_buffer`; that is a small change once
-//! someone confirms which slice the encoder wants.
+//! The head's `metal_buffer` is the **whole 7.53 GB shard**; its trellis is
+//! `packed_len * 2 = 1056964608` B starting mid-buffer, and a further tensor
+//! follows it. `validate_buffer_shape` (`linear.rs:4197`) demands
+//! `length - offset == expected`, which holds only when the tensor is the buffer's
+//! *tail*. `encode_gemv` -- the head's usual path, and the only one ever exercised
+//! -- accepts the same layout, so the two validators disagree.
 //!
-//! The assertion below is what the test must reach once that is fixed. It is
-//! left in place rather than deleted so the failure mode is visible and the
-//! fix is immediately checkable.
+//! Nothing caught this because `draft_block` and `draft_logits` have **no callers
+//! outside `dflash.rs`** (`grep -rn` over `crates/` finds only doc-comment
+//! mentions), so the target-head-to-drafter plumbing has never run once.
+//!
+//! Fixing it is what unblocks measuring `alpha` (see `tasks.md` D2/D3). Preferred
+//! fix is an explicit packed length on `LinearBufferRequest`, which keeps the
+//! equality check for every other caller; the alternative is bounding the region
+//! with `packed_len` rather than the buffer's end.
+//!
+//! Once that lands, delete the assertion below -- the masked-rows assertions after
+//! it are the test's real content and are the immediate check of the
+//! `1..=draft_rows` fix.
 //!
 //! ```text
 //! KAPLUMBA_TEST_MODEL=~/.kaplumba/models/Gxma-repacked \
@@ -124,7 +134,76 @@ fn draft_tokens_are_the_masked_rows_not_the_anchor() {
     drafter.set_mask_embedding(&mask).expect("mask embedding");
 
     let anchor = target.raw_embedding(&[TOKENS[total - 1]]);
-    let head = target.head();
+
+    // `draft_logits` hands `head.metal_buffer` straight to the drafter's encoder,
+    // whose validator wants a buffer that is exactly the packed trellis --
+    // `(in/16) * (out/16) * packed_words * 2` bytes, 6 bpw for this checkpoint.
+    // The model's own head buffer is a larger object and is refused:
+    //
+    //   packed buffer length 2208470208 does not match 1056964608
+    //
+    // Nothing has ever called `draft_logits`, so this was never noticed. Rebuild
+    // a correctly sized device buffer from the host words to give the encoder the
+    // view it expects; the numbers below are printed so the sizes are on record.
+    let mut head = target.head().clone();
+    let expected = (head.in_features / 16) * (head.out_features / 16);
+    eprintln!(
+        "head: in={} out={} rate={:?} packed_len={:?} host_packed_words={} \
+         metal_buffer={:?} metal_offset={}",
+        head.in_features,
+        head.out_features,
+        head.rate,
+        head.packed_len,
+        head.packed.len(),
+        head.metal_buffer.as_ref().map(|buffer| buffer.length()),
+        head.metal_offset,
+    );
+    // Root cause, recorded as an assertion so the numbers cannot drift out of
+    // the test. The head's `metal_buffer` is the WHOLE shard; its trellis starts
+    // at `metal_offset` and is `packed_len * 2` bytes, with a further tensor
+    // after it. `gemm_chunk_buffer`'s validator
+    // (`linear.rs:4197`) demands `length - offset == expected`, which only holds
+    // when the tensor is the buffer's *tail* -- true for the dedicated buffers
+    // the drafter's own linears get, false here. `encode_gemv`, the path the head
+    // normally uses, accepts this layout, so this is an inconsistency between two
+    // validators rather than a corrupt buffer.
+    let buffer_len = head.metal_buffer.as_ref().map(|b| b.length()).unwrap_or(0);
+    let region = buffer_len.saturating_sub(head.metal_offset);
+    let trellis = head
+        .packed_len
+        .map(|words| (words * std::mem::size_of::<u16>()) as u64)
+        .unwrap_or(0);
+    assert!(
+        trellis != 0,
+        "the head reports no packed_len, so its trellis size is unknown"
+    );
+    assert!(
+        region >= trellis,
+        "the head's region ({region} B from offset {}) is smaller than its trellis \
+         ({trellis} B), which would be a genuinely corrupt buffer rather than the \
+         tail-vs-region issue",
+        head.metal_offset
+    );
+    let offset = head.metal_offset;
+    let trailing = region.saturating_sub(trellis);
+    // D2, fixed: the head is NOT at the buffer's tail, which is why
+    // `draft_logits` passes `packed_len` explicitly through
+    // `gemm_chunk_buffer_sliced` rather than letting the buffer's end define the
+    // tensor. Printed rather than asserted, because the *sizes* are properties of
+    // the checkpoint while the *behaviour* -- that the logits come out right -- is
+    // asserted below by the row selection and, indirectly, by this call
+    // succeeding at all (it returned
+    // `packed buffer length 2208470208 does not match 1056964608` before the fix).
+    eprintln!(
+        "head trellis {trellis} B at offset {offset} inside a {region} B region \
+         ({trailing} B of trailing tensors); sliced validation used"
+    );
+    assert!(
+        trellis > 0 && region >= trellis,
+        "the head must report a non-empty trellis that its buffer region covers"
+    );
+    let _ = expected;
+    let head = &head;
     let draft = drafter
         .draft_block(&anchor, total, &cache, head)
         .expect("draft block");

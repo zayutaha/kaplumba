@@ -1718,17 +1718,33 @@ impl DflashModel {
         let metal_buffer = head.metal_buffer.as_ref().ok_or_else(|| {
             DflashError::Kernels("the target head has no GPU-resident packed buffer".to_string())
         })?;
-        let logits = self.linear.gemm_chunk_buffer(LinearBufferRequest {
-            packed: metal_buffer,
-            packed_offset: head.metal_offset,
-            input: hidden,
-            input_signs: &head.input_signs,
-            output_signs: &head.output_signs,
-            in_features: head.in_features,
-            out_features: head.out_features,
-            rate: head.rate,
-            codebook: head.codebook,
-        })?;
+        // The target's head is offloaded into the whole second shard, so tensors
+        // follow its trellis: `packed.length() - packed_offset` is 2 208 470 208 B
+        // for a 1 056 964 608 B trellis, and `gemm_chunk_buffer`'s equality check
+        // refuses that. `packed_len` is the real word count, so use the
+        // length-aware entry point. Measured on the real checkpoint:
+        //
+        //   in=5376 out=262144 rate=Integer(6) packed_len=Some(528482304)
+        //   metal_buffer=Some(7529545728) metal_offset=5321075520
+        //   528482304 * 2 = 1056964608 == (5376/16) * (262144/16) * 96 * 2
+        let packed_bytes = match head.packed_len {
+            Some(words) => (words as u64) * std::mem::size_of::<u16>() as u64,
+            None => metal_buffer.length().saturating_sub(head.metal_offset),
+        };
+        let logits = self.linear.gemm_chunk_buffer_sliced(
+            LinearBufferRequest {
+                packed: metal_buffer,
+                packed_offset: head.metal_offset,
+                input: hidden,
+                input_signs: &head.input_signs,
+                output_signs: &head.output_signs,
+                in_features: head.in_features,
+                out_features: head.out_features,
+                rate: head.rate,
+                codebook: head.codebook,
+            },
+            packed_bytes,
+        )?;
         Ok(self.elements.softcap(&logits, softcap)?)
     }
 }
