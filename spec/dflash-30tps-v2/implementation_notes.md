@@ -441,3 +441,165 @@ loader that treated them as +-1 would be off by 65x -- and both the GPU path and
 the host path multiply by the f16 values, which is what
 `dflash_exl3_decode_matches_host_on_every_linear` verifies at 3e-4 relative on all
 36 of the drafter's linears.
+
+## 2026-10-12 (later still) — the round had two position conventions; fixed (T13 correction)
+
+`draft_and_verify` was marked done (T13) but passed its `position` argument to
+**two** callees that read it differently:
+
+* `DflashWeights::draft_block` / `forward_block` take **the anchor's own
+  position** — the block is `[anchor, mask x 15]`, so block row 0 (the anchor's
+  embedding) sits at the anchor's position and the mask rows at +1..+15;
+* the round's own `verify_positions` fed `draft.tokens[k]` at
+  `position + k`.
+
+`draft.tokens[k]` is block **row `k + 1`** (`select_draft_tokens` takes rows
+`1..=draft_rows`), and a block row's hidden state is the model's prediction for
+the token **at that row's own position** — that is the convention z-lab's mask
+block is trained and verified with (`dflash/model.py:249` slices
+`[:, 1 - verify_size:, :]`; `:268` writes those argmaxes into
+`block_output_ids[:, 1:]`, whose slots are `anchor_position + 1 ..`). So the
+drafts belong at `anchor_position + 1 + k`, not `anchor_position + k`.
+
+The code therefore placed the block at the *first draft's* position while the
+verify assumed the drafts started there: **every draft was verified against the
+target's row for the position before the one it proposes.**
+
+Failure mode is the nasty kind — silent and total:
+
+* every draft is rejected, so `alpha` is exactly `0.0000` on every round;
+* the emitted text stays **correct** (the round still emits the target's own
+  token), so no equivalence test, no golden test and no crash reports anything.
+
+Fix: one convention, named. `draft_and_verify` now takes `anchor_position` (the
+same number `draft_block` is handed, and the same number a caller passes to
+`append_context`, whose chunk ends at `position - 1`), and the `+ 1` between the
+anchor's slot and the first draft's lives in a new named function
+`draft_verify_positions(anchor_position, n)` (`dflash.rs`, next to
+`select_draft_tokens`). Nothing decrements a position, so an anchor at position 0
+(empty context) cannot underflow.
+
+**Sabotage (AGENTS.md §3.4), recorded:** dropping the `+ 1` from
+`draft_verify_positions` makes
+`dflash::tests::drafts_are_fed_one_position_after_the_anchor` fail with
+`the first draft is block row 1, so it belongs one past the anchor at 8, not at
+the anchor's own slot 7 (which the target's cache already holds: re-feeding it
+appends a second key row beneath the anchor)`. Reverted; the suite is 9/9.
+
+`cargo test -p kaplumba-engine --lib -- dflash` → 9 passed, 0 failed.
+
+### What this does NOT fix
+
+`dflash_alpha_probe`'s `alpha = 0.0000` was measured through the *probe*, which
+calls `draft_block(&anchor, total, ...)` directly with `total` = the anchor's
+position — i.e. already the correct convention — so this fix does not explain it
+and does not repair it. The probe's own byte-identical-drafts result
+(`[84544, 84544, 236774, 236774, ...]` for both `[1,12,23,35,46,57]` and
+`[2,13,24,36,47,58]`) is still the open question, and T12 — "compare at the
+`draft_logits` level, assert the drafter conditions on its context" — is still the
+task that settles it. Two candidate explanations survive, and T12 discriminates
+between them without needing a new oracle:
+
+1. **Saturation.** The drafter's raw logits peak at 113 against the target's 27.3
+   and `final_logit_softcapping` is 30, so entries above the cap collapse to
+   exactly `30.0` in f16; `argmax_row` breaks ties to the lowest index, which is
+   context-independent — that alone would give byte-identical drafts and the flat
+   `1/64`-per-token distributions the probe printed. D7's scale sweep argues
+   against it (logits at 0.125 of the hidden, max ~14, are not saturated, and the
+   drafts still did not move), but D7 reports "still 1 distinct token", i.e. the
+   sweep may not have touched the path that produces the drafts.
+2. **The probe's context is not the context the block sees.** `forward_block`'s
+   own visibility test (`dflash_context_rows_are_visible_in_the_block_output`)
+   shows the context moves the block output by 8x its own RMS in engine *and*
+   host, which contradicts "the context does not reach the block" as a blanket
+   statement.
+
+Comparison at the logits level separates them: saturation means the *logits*
+differ while the *argmaxes* agree; a dead context means the logits are
+byte-identical.
+
+## 2026-10-12 (T12) — MEASURED: the context DOES reach the block. The "dead context" conclusion is refuted
+
+`dflash_alpha_probe`, real checkpoints (`Gxma-repacked` + `Drafter`), 25.7 s,
+`KAPLUMBA_FORCE_LOAD=1` (admission control refuses 16.28 GiB against 15.27 GiB
+available; the load is fine with swap, as documented):
+
+```
+[ t12 ] two different tap-layer sets, compared at the LOGITS level:
+  bit-pattern sums: 145459805532 vs 145508050646 (equal: false)
+  4172920 of 4194304 logits differ; worst |delta| 16.28125
+  drafts identical: true
+  [d5] block hidden (norm out)    rms 3.202003
+  [d5] draft logits (softcapped)  max|v| 30.00000 rms 12.594
+  [d6] top4 capped->raw [29.9844->123.79, 29.9844->123.79, 29.9844->123.79, 29.9531->107.31]
+  [d6] 500 of 4194304 raw logits exceed 60
+  [d5] 68 of 4194304 within 0.1 of the softcap 30, 6 within 0.05 of the row max
+  [d13] row 2: target wants 560 (p_target 0.9984); drafter ranks it 198213 of 262144
+  [d4] row 1 q top3: 236774:0.0299 84544:0.0268 108003:0.0256
+  [d11] M=1 vs M=16 head: per-row worst diff 0.0000 in all 16 rows
+```
+
+**99.5% of the block's logits (4 172 920 of 4 194 304) change when the tap layers
+change, by up to 16.3 logits on a scale where the softcap is 30.** The context is
+not ignored, not dropped by the mask, and not lost in `append_context`: the
+drafter's output is massively context-dependent. `alpha = 0.0000` is therefore
+**not** "the drafter does not condition on its context" (the previous section's
+conclusion, and the probe's own `assert_ne!` on the drafts), and AC3/AC4/AC5 are
+not gated on a broken context path.
+
+The probe's assertion was measuring the wrong quantity. It compared *drafts* --
+argmaxes -- and argmaxes collapse when the logits pile up at the cap:
+`argmax_row` breaks ties to the lowest index, which is context-independent, so a
+context change that moves 99.5% of the logits can leave all 15 argmaxes
+identical. The assertion is now made on the logits (it passes) and the draft
+comparison is printed as the saturation signature instead.
+
+### What the numbers now say the illness is
+
+* The distribution is **near-uniform at the top**: row 1 is
+  `236774:0.0299 84544:0.0268 108003:0.0256` -- top-3 within 25% of each other --
+  while the *target* for the same slot is `3048:0.9189`.
+* The drafter's logits are **12.59 rms against the target's 6.278** (exactly 2x),
+  and its block hidden is `3.202` rms against the target's final-norm row of
+  `1.6` -- also 2x. The two are consistent through one shared head (6.278/1.6 =
+  3.9 = 12.59/3.202), so the drafter's *scale* is the trained checkpoint's, not a
+  decode error. D7's hidden-scale sweep (0.125 -> logit max 14.3, well inside the
+  cap) still gives `alpha 0.0000`, so the scale is not the illness either.
+* `[d13]`: the target's token, which it is 0.998 confident about, sits at rank
+  198 213 of 262 144 in the drafter's row. **The ranking is wrong, and only the
+  ranking** -- magnitude, support and context sensitivity are all present.
+
+So the remaining suspects, in the order the evidence supports them:
+
+1. **The drafter's weight decode.** `alpha` is 2x-scaled but wrong-ranked and
+   logits move a lot with context. Every engine-vs-host test shares the reader,
+   so a transposed/differently-ordered non-square tile read is invisible to all
+   of them, and the drafter is the *only* model that has never been scored with a
+   predictability probe. Its `quantization_config.json` has no `layout` key, so
+   it takes the row-major default -- and `Gxma-repacked` (`"layout": "colmajor"`,
+   which `model.rs:4025` turns into `permutation_mode = 1` for every layer
+   linear) shows the project has already had to *score* a permutation for the
+   target. **T12's mode sweep could not test this**: `LinearBufferRequest`
+   (`kernels/linear.rs:438`) has no `perm_mode` field and
+   `gemm_chunk_buffer_with_stats_region` hardcodes `perm_mode: 0`, so setting the
+   field to `1` leaves the block bit-identical (measured: same drafts, same 68/16
+   pin counts). The buffer path has to learn `perm_mode` before the drafter's
+   permutation can be scored at all.
+2. **The drafter's `norm`/`hidden_norm` weights and the head application.**
+   `DflashModel::draft_logits` applies the *target's* head through the *drafter's*
+   GEMM entry point, and `[d10]`'s head replay is unusable as an oracle because
+   `forward_with_hidden` returns a **zero** final hidden (`max|v| 0.00000`), the
+   dead end already recorded above. D11 only proves the drafter's head is
+   self-consistent (M=1 == M=16, 0.0000 in all 16 rows), which a systematic error
+   in that entry point would also satisfy.
+
+### Reproduce
+
+```bash
+M=~/.kaplumba/models/Gxma-repacked
+KAPLUMBA_TEST_MODEL=$M KAPLUMBA_FORCE_LOAD=1 scripts/gpuq try -- \
+  cargo test -p kaplumba-engine --release --test dflash_alpha_probe -- --ignored --nocapture
+```
+
+`Gxma-4-bit-split` cannot be used for this probe: it demands 20.02 GiB against
+15.27 GiB available, and the drafter plus the 4-bit target is what pushes it over.

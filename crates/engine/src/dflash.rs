@@ -332,6 +332,33 @@ impl DflashWeights {
             .ok_or_else(|| DflashLoadError::Missing(name.to_string()))
     }
 
+    /// Select the EXL3 tile permutation for every drafter projection.
+    ///
+    /// Mirrors [`crate::model::TextModel::set_permutation_mode`]. The drafter's
+    /// checkpoint carries **no `layout` key** in its `quantization_config.json`
+    /// (`Gxma-repacked` writes `"layout": "colmajor"`; the Drafter does not), so
+    /// the loader leaves every linear at the row-major default of `0` -- and,
+    /// unlike the target, no test has ever scored a drafter mode with a
+    /// predictability probe. `real_model_permutation_sweep`
+    /// (`tests/real_forward_buffer.rs`) does exactly that for the *target*: the
+    /// correct permutation is "the one that makes the model know things". A
+    /// row-major label on colmajor bytes -- or a mode-0 kernel read that is
+    /// transposed for non-square tiles -- decodes every weight to a
+    /// plausible-magnitude, wrong-direction matrix, which is invisible to every
+    /// engine-vs-host comparison because both sides share the reader.
+    ///
+    /// The justification for having this setter at all is that asymmetry: the
+    /// target's permutation was *scored* and the drafter's was not. It carries the
+    /// same caveat as [`DflashModel::set_permutation_mode`] -- the block's
+    /// projections run through the buffer-backed path, which is row-major by
+    /// construction, so setting `1` is measured to change nothing until that path
+    /// learns `perm_mode`.
+    pub fn set_permutation_mode(&mut self, mode: u32) {
+        for linear in self.lines.values_mut() {
+            linear.permutation_mode = mode;
+        }
+    }
+
     pub fn norm(&self, name: &str) -> Result<&[u16], DflashLoadError> {
         self.norms
             .get(name)
@@ -1301,6 +1328,23 @@ impl DflashModel {
             .line(name)
             .unwrap_or_else(|_| panic!("{name} is not a drafter linear"));
         (line.in_features, line.out_features)
+    }
+
+    /// Select the EXL3 tile permutation for the drafter's projections.
+    ///
+    /// **This does not reach the block's projections.** The drafter runs every
+    /// linear through `LinearKernels::gemm_chunk_buffer*`, whose request type
+    /// (`LinearBufferRequest`) has no `perm_mode` field and whose body hardcodes
+    /// `PrefillRowParams { perm_mode: 0 }` (`kernels/linear.rs`), so the mode is
+    /// row-major there by construction. Measured: setting `1` leaves the block's
+    /// logits, its drafts and its softcap pin counts bit-identical, i.e. the
+    /// setter is a no-op for this model. It is kept because the *field* is what
+    /// the layer path (`model.rs`) uses to choose kernels, so a future caller
+    /// that moves the drafter onto that path needs it -- and because the negative
+    /// result is worth not re-measuring. To score a permutation for the drafter,
+    /// the buffer path has to learn `perm_mode` first.
+    pub fn set_permutation_mode(&mut self, mode: u32) {
+        self.weights.set_permutation_mode(mode);
     }
 
     /// Bytes of packed weights one linear's GEMM must read: the trellis plus

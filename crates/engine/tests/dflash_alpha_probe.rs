@@ -206,6 +206,9 @@ struct Case {
     best_t: usize,
     drafts: Vec<u32>,
     top_target: String,
+    /// The drafter's *capped* block logits, every row, kept so two cases can be
+    /// compared at the logits level and not only at their argmaxes (T12).
+    block_logits: Vec<u16>,
 }
 
 /// Prefill, build the drafter's context from `layers`, chain a few target steps, draft
@@ -845,6 +848,7 @@ fn measure_case(
         best_t: best.1,
         drafts: draft.tokens.clone(),
         top_target: top3(&targets[0]),
+        block_logits,
     }
 }
 
@@ -890,15 +894,51 @@ fn alpha_at_temperature_1_top_k_64() {
     );
 
     let mut summary = Vec::new();
-    for (label, layers) in [
-        ("as-configured", base_layers.clone()),
-        ("config+1 (z-lab offset=1)", shifted_layers.clone()),
+    // The third case is the drafter's own version of
+    // `real_model_permutation_sweep`: its checkpoint has no `layout` key, so the
+    // loader leaves every linear at the row-major default and nothing has ever
+    // scored that choice. A row-major label (or a mode-0 read transposed for
+    // non-square tiles) decodes to plausible-magnitude, wrong-direction weights,
+    // which every engine-vs-host test is blind to because both sides share the
+    // reader. Acceptance is the score: the right permutation is the one that
+    // makes the drafter predict the target.
+    for (label, layers, permutation) in [
+        ("as-configured", base_layers.clone(), 0u32),
+        ("config+1 (z-lab offset=1)", shifted_layers.clone(), 0u32),
+        ("as-configured, colmajor", base_layers.clone(), 1u32),
     ] {
+        drafter.set_permutation_mode(permutation);
         let case = measure_case(&mut target, &mut drafter, &tokens, &layers, &config);
         println!();
-        println!("=== tap layers {label}: {layers:?} ===");
+        println!("=== tap layers {label}: {layers:?}, permutation_mode {permutation} ===");
         println!("  target p0 top3: {}", case.top_target);
         println!("  drafts: {:?}", case.drafts);
+        // T12: the softcap's flat region, per row. `draft_logits` caps at
+        // `final_logit_softcapping` = 30, and `argmax_row` breaks ties to the
+        // lowest index, which is context-independent. If whole rows sit inside
+        // the cap, every row's argmax is decided by tie order and no amount of
+        // context can move it -- which looks exactly like a dead context path.
+        let pinned = case
+            .block_logits
+            .iter()
+            .filter(|bits| half::f16::from_bits(**bits).to_f32().abs() > 29.9)
+            .count();
+        // Row width from the buffer itself: the vocab is 262144 here, but a
+        // literal would silently mis-slice every row if the checkpoint changed.
+        let vocab = case.block_logits.len() / config.block_size;
+        let rows_pinned = (0..config.block_size)
+            .filter(|row| {
+                case.block_logits[row * vocab..(row + 1) * vocab]
+                    .iter()
+                    .any(|bits| half::f16::from_bits(*bits).to_f32() > 29.9)
+            })
+            .count();
+        println!(
+            "  [t12] {pinned} of {} capped logits sit at the softcap (> 29.9), in {rows_pinned} of \
+             {} rows",
+            case.block_logits.len(),
+            config.block_size
+        );
         println!(
             "  mean alpha on the round's diagonal: {:.4}; best {:.4} at row {} vs t={}",
             case.mean_diagonal, case.best_alpha, case.best_row, case.best_t
@@ -914,6 +954,45 @@ fn alpha_at_temperature_1_top_k_64() {
             case.mean_diagonal, case.best_alpha
         );
     }
+
+    // T12's measurement, and the one that separates the two illnesses that both
+    // print `alpha = 0.0000`: compare the drafter's block *logits* across the two
+    // contexts, not just their argmaxes.
+    //
+    //   * logits differ (and differ by a lot) -> the context DOES reach the block
+    //     and the argmaxes coincide because the rows are saturated or degenerate
+    //     at the cap. The bug is downstream of the context: the logit scale or
+    //     the head, not the taps.
+    //   * logits byte-identical -> the block's output does not depend on its
+    //     context at all, so the loss is in `append_context`'s fusion/projection,
+    //     the cached rows, or the attention.
+    {
+        let a = &summary[0].2.block_logits;
+        let b = &summary[1].2.block_logits;
+        if a.len() == b.len() {
+            let differing = a.iter().zip(b).filter(|(x, y)| x != y).count();
+            let worst = a
+                .iter()
+                .zip(b)
+                .map(|(x, y)| {
+                    (half::f16::from_bits(*x).to_f32() - half::f16::from_bits(*y).to_f32()).abs()
+                })
+                .fold(0.0_f32, f32::max);
+            let left = a.iter().map(|bits| *bits as u64).sum::<u64>();
+            let right = b.iter().map(|bits| *bits as u64).sum::<u64>();
+            println!();
+            println!("=== [t12] do two different contexts change the block LOGITS? ===");
+            println!("  bit-pattern sums: {} vs {} (equal: {})", left, right, left == right);
+            println!(
+                "  {differing} of {} logits differ; worst |delta| {worst:.5}",
+                a.len()
+            );
+            println!(
+                "  drafts identical: {}",
+                summary[0].2.drafts == summary[1].2.drafts
+            );
+        }
+    }
     println!();
     println!("DECISION RULE (measured round times, 15.25 tok/s baseline):");
     println!("  alpha < 0.919 -> slower than plain decode, DO NOT SHIP");
@@ -921,26 +1000,37 @@ fn alpha_at_temperature_1_top_k_64() {
     println!("  alpha >= 0.977 -> 30 t/s at b32 is reachable");
 
     // The two cases tap different layers, so the taps differ, so the drafter's
-    // context differs, so its drafts must differ. They are byte-identical, and that
-    // is the root cause of `alpha == 0.0000` rather than a symptom of it: the
-    // drafter's output does not depend on its context at all, so it cannot be
-    // correlated with the target it was supposed to predict. `enable_taps` does
-    // update the layer list (it sets `TapScratch { layers: layers.to_vec(), .. }`),
-    // and T7's own test shows different layers produce different tap *contents*, so
-    // the loss is downstream -- in `append_context`'s fusion/projection, the
-    // context attention, or the positions the context rows are cached at.
+    // context differs. **The block logits must therefore differ**: the drafter is
+    // supposed to condition on the target's hidden states, and this is the one
+    // property that separates "the context is not reaching the block" from "the
+    // context reaches the block but the argmaxes coincide" -- two failures that
+    // both print `alpha = 0.0000` and need opposite fixes.
     //
-    // This assertion fails today. It is the check that should flip to green when the
-    // context path is fixed, which is why it is here rather than in a comment.
+    // Asserted on the logits, not on the drafts, because the drafts are argmaxes:
+    // `draft_logits` caps at the softcap 30 (`final_logit_softcapping` = 30) and
+    // `argmax_row` breaks ties to the lowest index, so a context change that
+    // moves every logit by 10 can still leave the argmaxes identical. An
+    // assertion on the drafts alone would accuse the wrong component.
     assert_ne!(
-        summary[0].2.drafts, summary[1].2.drafts,
-        "the drafter returned identical drafts from two different tap layer sets \
-         ({:?} vs {:?}), so its context does not affect its predictions. alpha = \
-         0.0000 on every row and every target position follows from that. This is a \
-         broken context path, not a low-quality drafter, and it makes the 30 t/s \
-         question unanswerable until it is fixed. Note that `dflash_golden` only \
-         ever exercised `forward_block` with ZERO context rows, so this path has \
-         never been validated against the reference.",
+        summary[0].2.block_logits, summary[1].2.block_logits,
+        "the drafter's block logits are byte-identical from two different tap layer \
+         sets ({:?} vs {:?}), so its context does not reach its output at all. \
+         alpha = 0.0000 on every row follows from that, and no amount of context \
+         quality can fix it: the loss is in `append_context`'s fusion/projection, the \
+         cached rows, or the attention. `enable_taps` does update the layer list and \
+         T7's test shows different layers produce different tap contents, so the loss \
+         is downstream of the taps.",
         summary[0].1, summary[1].1
     );
+
+    // And the drafts are recorded separately, because "logits differ but drafts do \
+    // not" is the saturation signature and is the next thing to chase.
+    if summary[0].2.drafts == summary[1].2.drafts {
+        println!();
+        println!(
+            "NOTE: the logits differ but the drafts do not. That is the softcap \
+             tie-break, not a dead context: the argmax is decided by index order among \
+             logits pinned at the cap. Chase the logit scale, not the taps."
+        );
+    }
 }
