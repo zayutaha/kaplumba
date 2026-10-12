@@ -1,0 +1,383 @@
+# spec/dflash-30tps-v2 — implementation notes
+
+Running handover log. Append as work proceeds.
+
+## 2026-10-12 — opened. What `spec/dflash-30tps` measured, and why this spec is
+## the opposite design.
+
+Read `plan.md` first. The short version: the previous spec bet on *removing the
+FMA bottleneck and the 4× weight re-stream* (fp16 scalar, then MMA). Both were
+built, both measured, and both **lost to the shipped fp32 path**:
+
+```
+arm                           M        v1 fp32      A fp16/n8          B mma
+target 3bpw colmajor          8     0.983 ms     1.976 ms     1.593 ms
+target 3bpw colmajor         16     1.621 ms     1.359 ms     1.692 ms
+target 3bpw colmajor         32     2.621 ms     3.305 ms     2.507 ms
+drafter 4bpw rowmajor        32     1.622 ms     2.572 ms     1.355 ms
+```
+
+`spec/dflash-30tps/implementation_notes.md` names the cause: Path A's win was
+eaten by register pressure and by 128 activation loads per lane per k-tile at
+M_CAP=32, and Path B's `bstage` + per-chunk barrier + scattered threadgroup
+stores made its dequant schedule 3.9× worse than v1's register-only path.
+
+What survived from that analysis, and is this spec's starting point:
+
+* v1's *schedule* (K split across 8 simdgroups, register-only dequant, one
+  `red[8][16]` reduction) is the fast one. Do not change it.
+* The only remaining lever is **instructions retired per MAC**, and the one
+  instruction that retires two MACs on this hardware is a packed `half2` FMA.
+  Scalar `half` retires one, which is why Path A's "fp16" measured as fp32.
+* The pairing is free: the ring's 8 decoded values are the 4 k-positions
+  `r0, r0+1, r0+8, r0+9` for column `n` then the same four for `n+8`, and
+  `mrhs_load_tile_x` already loads exactly the matching `half2` pairs.
+
+### Measured premises carried in
+
+| fact | value | source |
+|---|---|---|
+| target | `~/.kaplumba/models/Gxma-repacked`, 16.028 GB, 3 bpw, **colmajor**, 60 layers, inter 21504 | `spec/dflash-30tps/implementation_notes.md` |
+| drafter | `~/.kaplumba/models/Drafter`, 769 MB, 4 bpw, rowmajor, **block_size 16** | same |
+| non-speculative decode | 15.28-16.05 tok/s (65 ms/token, 245 GB/s ≈ 90% of the 273 GB/s wire) | `perf_probe_simd_alu_roofline.rs` |
+| M=32 verify, 60 layers | 606 ms (v1 default route) | `spec/dflash-30tps` |
+| prefill bucket | ≤32 rows ≈ 545-600 ms; 36-62 rows ≈ 1325-1352 ms | `dflash-correctness` notes |
+| copy ceiling | 250.5 GB/s measured | `spec/decode-19tok-repacked-250gb` |
+| M=1 dequant is 82% of ALU | at M=1 only — **not** at M=32 | `perf_probe_simd_alu_roofline.rs` |
+
+### Environment
+
+* GPU lock: `scripts/gpuq status` / `scripts/gpuq try --`. Exit 75 = busy.
+* `env_flag` (`crates/kernels/src/linear.rs`) memoises on first read; a test
+  cannot flip a kernel-selection flag mid-process. `force_mrhs_path` is the
+  atomic hook.
+* Box: 24 GiB unified, currently ~23 GB used by browsers/editor before any
+  model load. Watch `top -l 1 -n 0 | grep PhysMem` (AGENTS.md §10.3).
+
+## 2026-10-12 — K1/K3 MEASURED (AC1, AC2): the packed-half2 family is correct,
+## and its win does not survive the noise
+
+Shipped: `extract_v_mcg_32_h2` + `linear_gemv_mrhs_ishizuki_k3_colmajor_h2_impl`
+(`linear_repacked.metal`), `exl3_decode8_mcg_h2` + `linear_gemv_mrhs_exl3_h2_impl`
+(`linear.metal`), 10 new kernels, `MrhsPath::H2` + `KAPLUMBA_MRHS_PATH=h2`, the
+parity/sabotage suite, and the `C h2` arms in `mrhs_v2_bench`.
+
+`mrhs_v2_bench`, same binary, four runs, median of 9 per cell:
+
+```
+arm                           M        v1 fp32      A fp16/n8          B mma       C h2/n16
+------------------------------------------------------------------------------------------------
+target 3bpw colmajor          8     0.983 ms     1.976 ms     1.593 ms     1.035 ms
+target 3bpw colmajor          8     1.351 ms     1.499 ms     1.828 ms     0.941 ms
+target 3bpw colmajor          8     1.464 ms     1.088 ms     1.216 ms     1.713 ms
+target 3bpw colmajor         16     1.341 ms     1.454 ms     2.354 ms     1.832 ms
+target 3bpw colmajor         16     1.366 ms     2.526 ms     1.725 ms     2.270 ms
+target 3bpw colmajor         32     2.441 ms     3.312 ms     2.518 ms     3.010 ms   (4x m8 blocks)
+target 3bpw colmajor         32     2.426 ms     3.318 ms     2.510 ms     7.479 ms   (single-pass m32)
+```
+
+### Verdict — AC2 is NOT met
+
+AC2 asked for ≥ 1.8x v1 at M=32 on the 3 bpw colmajor target. The single-pass
+m32 body is **3.06x slower** (7.479 vs 2.426 ms) and the 4x-m8-block route is
+**0.81x** (3.010 vs 2.441). At M=8 the packed body measured 1.41x, 1.44x and
+**0.86x** on three runs of the same binary — a 1.7x spread, which is the box's
+noise floor (`AGENTS.md` §10.2 #5), not a result. **No configuration in this
+family is reliably faster than v1**, so `auto` is unchanged (v1 ≤ 8 rows, MMA
+above) and nothing in the engine routes to `H2` unless `KAPLUMBA_MRHS_PATH=h2`
+says so.
+
+### Why the packed body does not pay: the kernel is already at the issue limit
+
+This is the finding that supersedes `spec/dflash-30tps`'s "it is FMA-bound" and
+this spec's own "fewer instructions per MAC will fix it". Fit the measured v1
+times against lane-ops:
+
+```
+per m8 pass, one 5376x21504 3 bpw projection = 451,584 tiles x 32 lane-tiles
+lane-ops per lane-tile = 56 dequant + 64 FMA + 18 loads = 138
+                                    1.445e7 x 138 = 1.99e9 lane-ops
+measured per pass (2.426 ms / 4)              = 0.607 ms
+                                    1.99e9 / 0.607e-3 = 3.29e12 lane-ops/s
+```
+
+3.29e12 lane-ops/s is **this GPU's SIMD lane rate** (20 cores x 128 lanes x
+1.37 GHz = 3.5e12). v1 is at ~94% of it. That also explains the two results the
+previous spec could not:
+
+* a *single pass* over 32 rows is not faster than four 8-row passes, because the
+  pass cost is FMAs, not weight traffic — Path B's 2.510 ms against v1's 2.426;
+* the dequant is 40% of the instruction stream at M≤8 and 13% at M=32, which is
+  why shrinking the FMA count buys so little: at M=32 the floor is
+  `0.25 loads + 0.5 packed FMA + 6.75/M dequant` = 0.96 lane-ops/MAC, against
+  v1's 2.15. That is a 2.2x *ceiling* for a body that actually reaches issue
+  rate — and none of the wide single-pass bodies does.
+
+### The wide single-pass bodies stall, and it is `M_CAP`
+
+h2 at M=32 is 7.479 ms = 4.7e11 lane-ops/s = **13% of issue**, i.e. stalled, not
+busy. It degrades superlinearly in `M_CAP` (40% of issue at m8, 27% at m16, 13%
+at m32) while the *work* per row is constant, which is the signature of the
+compiler losing the accumulator registers: 2 `half2` per row is 64 registers at
+`M_CAP=32`, plus 4 float2 per row (128) for the fp32 widen. Removing the widen
+entirely (`_h2w_`, never widen) measures the same 7.43 ms, so the widen arrays
+are not it — the 64 accumulator registers are. The fp32 m32 bucket fell off the
+same cliff in `spec/small-batch-prefill-mrhs`; this is the third independent
+confirmation that a 32-row single pass does not fit this register budget.
+
+### Two lines of attack that remain, neither of which this spec lands
+
+1. **MLA / MMA without the `bstage` round trip.** Path B has the right op count
+   (`~70` lane-ops per 256 MACs, 0.27/MAC) and still measures 2.510 ms, i.e. it
+   is stalled too. Its staging cost is the whole difference. Nothing here
+   changes Path B's schedule.
+2. **`M_CAP` = 16 with a *paired* accumulator** (one `half2` per row-pair rather
+   than two per row) halves the accumulator registers to 32 at M=32, at the cost
+   of two strided activations loads and one pack per row-pair. Unmeasured.
+
+### Test coverage that was found by sabotage, not by design
+
+`mrhs_h2_matches_v1_*` runs `in_features` ∈ {256, 1024}, and the second is
+load-bearing. `tiles_k = in_features / 16` and the 4-tile unroll advances by
+`8 simdgroups x 4 = 32` tiles, so at `in_features = 256` (16 tiles) **the
+unrolled body never executes** — every k-tile is served by the 8-tile remainder
+loop. A sabotage planted in the unrolled body therefore passed the first version
+of the test. With 1024 (64 tiles) the same sabotage fails with
+`worst 42.73 on a peak magnitude 77.75`. Recorded because the same blind spot
+applies to the existing Path A/B suites, which are all `in_features = 256`.
+
+Sabotage evidence (AGENTS.md §3.4), all reverted after observing the failure:
+
+| sabotage | failing test | message |
+|---|---|---|
+| colmajor h2: swap `x01`/`x23` in the **unrolled** tk+0 tile | `mrhs_h2_matches_v1_column_major` | `K=1024 diverges from v1 at M=1: worst 42.734375 on a peak magnitude 77.75` |
+| colmajor h2: swap `x01`/`x23` in the **remainder** loop | same test | `K=256 ... worst 33.984375 on a peak magnitude 42.40625` |
+| row-major h2: `H.xz + H.yw` → `H.xz + H.xz` | `mrhs_h2_matches_v1_row_major` | `3 bpw row-major K=256 diverges from v1 at M=1: worst 36.726563 on a peak magnitude 51.15625` |
+
+The legitimate worst diff is 1-2 fp16 ULP of the peak (0.03125 at peak 44.09 for
+K=256; 0.0625 at peak 79.7 for K=1024) — the packed body is numerically as good
+as the fp32 one, which is the one thing this work does establish outright.
+
+## 2026-10-12 — the blocker is NOT the kernel: the drafter does not condition on
+## its context, so alpha is 0.0000 and AC3/AC4/AC5 are unreachable
+
+`dflash_alpha_probe` run against the real checkpoints (17.5 s, model loaded
+cleanly — `vm.swapusage` 4704 MB in / 4704 MB out, no thrash):
+
+```
+  [d4] tap checksum 71960269904                  (taps are non-zero)
+  [d4] 2 distinct draft tokens of 15
+=== tap layers as-configured: [1, 12, 23, 35, 46, 57] ===
+  drafts: [84544, 84544, 236774, 236774, ... x13]
+  mean alpha on the round's diagonal: 0.0000; best 0.0000 at row 7 vs t=2
+=== tap layers config+1 (z-lab offset=1): [2, 13, 24, 36, 47, 58] ===
+  drafts: [84544, 84544, 236774, 236774, ... x13]      <-- byte-identical
+  mean alpha on the round's diagonal: 0.0000
+```
+
+The probe's own assertion fires, and it is the right assertion:
+
+> the drafter returned identical drafts from two different tap layer sets, so its
+> context does not affect its predictions. alpha = 0.0000 on every row and every
+> target position follows from that.
+
+The drafter's own rows are also near-degenerate — `row 0 q top3:
+2584:0.0158 9525:0.0158 13855:0.0158` is a nearly flat distribution, and 15
+draft rows collapse to 2 distinct tokens — which is what a drafter whose
+residual stream is dominated by an uninformative context would look like.
+
+### Why this ends the 30 t/s question for now, and what it does not say
+
+With alpha = 0 the round emits **one** token per 606 ms verify plus a 157 ms
+draft: **~1.3 tok/s**, i.e. 12x *slower* than the 15.28 tok/s plain decode.
+No kernel speedup fixes that: the verify cost only matters once the round emits
+`sum alpha^j` tokens, and at alpha = 0 that sum is 1. **Every number in
+`spec.md` AC3-AC5 is gated on this, not on the MRHS family.**
+
+What the kernel work above therefore is, honestly stated: the m8 packed-half2
+body is correct to 1-2 fp16 ULP and *sometimes* 1.4x faster, the wide single-pass
+bodies lose their registers, and the verify's 606 ms cannot come down without
+the ~2.2x headroom that the lane-op arithmetic allows (0.96 lane-ops/MAC
+reachable vs 2.15 achieved). All of that is real. None of it is on the critical
+path until the context path works.
+
+### Two suspected causes eliminated by reading, not by guessing
+
+Both were the obvious first candidates, and both are wrong — recorded so the
+next session does not spend the same time on them:
+
+1. **NOT the cache length.** `DflashKvCache` tracks `KvLayer.held` explicitly and
+   `keys[layer]` is a flat vector of exactly `held * kv_width` f16s appended by
+   `push`, so `rows_here = keys / kv_width` in `forward_block` really is the row
+   count. The probe's `[d4] cache rows per layer [0, 0, 0, 0, 0]` is
+   `first_position` (= `total - held`), not a row count, and is 0 *because* the
+   cache is correctly full. There are no phantom zero-capacity rows.
+2. **NOT `window: 0` on the full-attention layer.** `dflash_block_attn`
+   (`attention.metal:2105-2108`) reads
+   `window_ok = (params.window == 0u) || (gap < params.window)`,
+   so `0` means "no window". And the sliding layers' ctx rows (positions 0..31)
+   against block rows at 32..47 satisfy both `key_positions[k] <= q_pos` and
+   `gap < 2048`, i.e. **the context is visible to all five layers**. The mask is
+   not what drops it.
+
+### What is left
+
+The tap features themselves, or the fusion/projection of them:
+
+* **The T7 tap parity trap is the leading suspect.** `target_layer_ids` =
+  [1, 12, 23, 35, 46, 57] has mixed parity, and the in-loop blit must take odd
+  layers from `hidden_a` and even from `hidden_b`. A hardcoded source is right
+  for four of six. It would leave a *non-zero* tap checksum (the probe's is
+  7.2e10, which is not a useful test — summing raw f16 bit patterns is not a
+  checksum, and its magnitude implies ~40 prompt rows of large negative values),
+  so nothing in the probe output rules this out.
+* **`fuse_context` / `project_context_kv` on real taps**, where T4c's only
+  positive evidence (`forward_block` differs with 20 *synthetic* context rows)
+  does not transfer. `dflash_forward_block_matches_host` — the one test with an
+  independent host reference — has only ever been run with **zero** context
+  rows.
+
+### The one test that separates them
+
+Extend `dflash_golden`'s host-reference test to `forward_block` with a
+**non-zero** context: build 20 context rows from a known f32 pattern, dequantise
+and project them on the host, and compare. That test existing at all is the gap
+— the whole context path has never been validated against the reference, which
+is exactly why the probe's `alpha = 0` sat unexplained across two specs.
+Cheaper first pass: call `forward_block` twice with contexts of different row
+counts (32 vs 64) under the same anchor and assert the outputs differ; that
+localises the failure to "context ignored" vs "context wrong".
+
+### Build / test commands
+
+```bash
+cargo build --release
+cargo test -p kaplumba-kernels --release                        # all kernel suites
+cargo test -p kaplumba-kernels --release --test linear_mrhs_h2  # the new parity
+cargo test -p kaplumba-engine  --release --test mrhs_v2_bench -- --nocapture
+cargo test -p kaplumba-engine  --release --test probe_kernsel_census -- --nocapture
+```
+
+## 2026-10-12 (later) — TWO REAL BUGS FOUND AND FIXED; alpha is still 0.0000
+
+Session started from the previous section's "the one test that separates them". It
+found two bugs on the way, both of which are fixed and committed. Neither restores
+acceptance, and the notes below say exactly what is now ruled out and with what
+number, because most of the work in this session was eliminating hypotheses.
+
+### BUG 1 (fixed): Gemma's `+1.0` RMSNorm offset was applied to a **Qwen3** drafter
+
+`DflashWeights::load` added 1.0 to every drafter RMSNorm weight, justified by a
+comment about "Gemma's RMSNorm is `(1 + weight)`". The *target* is Gemma. The
+drafter is not: `config.json` says `model_type: "qwen3"`, and z-lab's drafter uses
+`Qwen3RMSNorm` (`dflash/model.py:550-607`), whose forward is `weight * x/rms(x)`
+with no offset. exllamav3 -- the format's definition -- says the same thing
+explicitly:
+
+* `architecture/gemma3.py:267-310` passes `constant_bias = 1.0` to every RMSNorm;
+* `architecture/dflash.py:267,272,287,293,316` and
+  `modules/arch_specific/dflash.py:52` pass nothing, taking the `0.0` default
+  (`modules/rmsnorm.py:20`, applied at `:86`:
+  `x * w if self.constant_bias == 0.0 else x * (w + self.constant_bias)`).
+
+The stored bytes agree. Read straight out of the shard as bf16:
+
+| tensor | mean | min | max |
+|---|---|---|---|
+| `layers.0.input_layernorm.weight` | +0.765 | +0.023 | +3.44 |
+| `layers.0.post_attention_layernorm.weight` | +0.311 | -0.006 | +0.617 |
+| `layers.0.self_attn.q_norm.weight` | +1.525 | +0.758 | +2.25 |
+| `hidden_norm.weight` | +1.208 | +0.002 | +1.69 |
+| `norm.weight` | +3.080 | +1.477 | +7.06 |
+
+Ordinary trained weights, all but a handful positive. Gemma's delta-coded table in
+the same models directory looks nothing like that: its
+`layers.0.input_layernorm.weight` spans **-5.78 .. +444** with mean +4.88, i.e. it
+*is* `w - 1` and the offset is real -- for Gemma.
+
+Cost of the error: `post_attention_layernorm` 0.311 -> 1.311 (**4.2x**),
+`input_layernorm` 0.765 -> 1.765 (2.3x), `q_norm`/`k_norm` 1.5 -> 2.5, compounding
+through five layers and the MLP. Measured in `dflash_golden` (synthetic inputs,
+same test both times): layer-0 MLP peak **152 287 -> 10 422**, and the real
+drafter's block output RMS **4.139 -> 3.183** with its fused context RMS
+**1.958 -> 1.006** and layer-0 ctx V RMS **20.28 -> 10.73**.
+
+Why no test caught it: `dflash_golden`'s host reference applied the same `+1.0`
+(`norm_weights`, "The loader's +1.0, applied here in f32 for the reference"), and
+`dflash_load` *asserted* the offset existed. Both now assert verbatim storage, with
+the two measured anchors named (0.7539; post-attention mean 0.311) so a regression
+is read off the failure message.
+
+### BUG 2 (fixed): the golden host reference turned the one non-causal layer causal
+
+`host_block` passed `config.sliding_window` to `attended_of` **unconditionally**,
+including for the last layer, which is `full_attention` and `bidirectional`. z-lab
+does not: `self.sliding_window = config.sliding_window if layer_type ==
+"sliding_attention" else None` (`dflash/model.py:366`), and the engine passes
+`window: if sliding { .. } else { 0 }`. With a window and `bidirectional` true,
+`q_pos - k_pos` is negative for the block rows ahead of the query and the u32
+subtraction wraps to ~4e9, so `gap < window` was false and every future key was
+dropped.
+
+Invisible until the norms were fixed, because with the inflated weights the
+drafter's own path dominated. After the fix it appeared as a **7% disagreement at
+layer 4's `attn_out`** while layers 0-3 matched to 1e-4 -- and layer 4 is the only
+non-sliding layer, which is what localized it. Fixed: the same test's worst diff is
+**4.973 (11.5%) -> 0.0232 (0.06%)**, and layer 4's stages now agree
+(engine 2456.85 / 735.00 / 2454.35 vs host 2457.65 / 734.53 / 2455.96).
+
+This survived because the with-context test **only printed** its result -- no
+assertion, so no failure. It now asserts 3e-2 of the reference maximum and names the
+worst row and feature.
+
+### New test: the context is *visible*, not merely agreed upon
+
+`dflash_golden::dflash_context_rows_are_visible_in_the_block_output` -- three
+passes over the same anchor and positions: two contexts that differ in value, and no
+context at all. Measured today (host RMS 4.1122):
+
+```
+different context values: engine 33.6172 (8.1751 of host RMS), host 33.8357
+context rows vs none:     engine 33.1875 (8.0706 of host RMS), host 33.1591
+```
+
+So `forward_block` + `append_context` are right on the context path: the output
+moves by 8x its own RMS when the context moves, in the engine and in the reference
+alike. A test that only checks agreement could not say this (two implementations
+that both ignore the context agree perfectly). On the real checkpoints the same
+measurement is `context reordered: block hidden moves 58.14 (18.26 of its own RMS)`.
+
+`host_block` / `block_case` were extracted so engine and reference run over exactly
+the same rows, with the worst difference's row and feature reported.
+
+### Probe instrumentation added (D5-D12) and what each ruled out
+
+All measured on the real checkpoints (`Gxma-repacked` + `Drafter`), `alpha = 0.0000`
+throughout. A negative result here is worth more than the positive ones:
+
+| # | measurement | result | conclusion |
+|---|---|---|---|
+| D5 | real magnitudes | anchor RMS 0.0153, mask 0.0161, fused ctx 1.006, taps 0.84-4.94, ctx V 10.73, block hidden RMS 3.183 max 93.7 | nothing degenerate, nothing inf/NaN |
+| D6 | drafter logits vs target's | drafter raw top values **103-113**, capped max 30.0, RMS 12.41; **target's own logits max 27.31, RMS 6.28** | the drafter's pre-softcap logits are ~4x the target's, so `tanh(x/30)*30` flattens its whole top band to 29.94-30.00 |
+| D8 | block row structure | row RMS 3.13-3.22; cosine to row 0 = 1.0, 0.739, 0.726, 0.691, 0.679, 0.669 | the rows are *not* degenerate -- they differ |
+| D9 | the anchor token | the probe fed `tokens[total-1]` (the prompt's last token, 101) where the block's row 0 sits at position `total`; the correct anchor is the target's own argmax there (3048) | a real off-by-one in the probe, fixed (z-lab takes `output_ids[start]`, `dflash/model.py:249,264`). Correcting it changed nothing |
+| D10 | head replay vs oracle | `forward_with_hidden`'s `last_hidden` is **all zeros** (max 0.0) and is pre-final-norm anyway (`encode_lm_head` does the norm internally), so this is not a usable oracle | dead end, recorded so nobody repeats it |
+| D11 | head at M=1 vs M=16 | per-row worst diff **0.0000 for all 16 rows** | `draft_logits`' batched GEMM is not the `encode_lm_head_rows` MMA hazard |
+| D12 | noise embedding x sqrt(hidden) = 73.32 | mean alpha 0.0000, still 1 distinct token | **immaterial**: the block's own rows go through `input_layernorm`, so only their direction survives and the scale cancels. `_raw_input_embeddings(..., scale)` in z-lab is 1.0 for this checkpoint anyway |
+| D7 | scale sweep on the block hidden, 1.0 -> 0.125 | alpha 0.0000 at every factor | a pure scale **cannot** change the argmax or the top-64 support, so this only confirms the support is wrong; it was never able to show anything else and is kept as a negative |
+| D-as-configured vs +1 | probe ran both tap conventions | identical drafts | the as-configured taps are the right ones (`hidden_states[layer_id + 1]` = the output of layer `layer_id`; exllamav3's `tap_shift = 1`, `architecture/dflash.py:22-27`), and the +1 case is the wrong one |
+
+### Where it stands
+
+`alpha` is **0.0000** on every row and every target position, and all fifteen draft
+rows return the **same** token (236774) with a near-flat top-3 (`236774:0.0321
+108705:0.0246 84544:0.0235`) while the target's is sharp (`3048:0.9189`). The
+drafter's top-64 never intersects the target's top-64 at *any* of the 16x6 row and
+position alignments. Established: it is not the norm convention (fixed), not the
+mask (fixed), not the head path, not the anchor, not the noise scale, not the
+magnitude, and not a lack of context sensitivity -- the context moves the block
+output by 18x its RMS. What is left is that the *content* the drafter conditions on
+reaches it in a form it cannot use, or that the drafter's weights are not what the
+engine decodes; the taps are now the only input that has never been validated
+against anything external, and `dflash_golden`'s block reference validates the
+graph *given* the fused context, not the fused context itself.

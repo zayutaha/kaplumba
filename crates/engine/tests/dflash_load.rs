@@ -1,6 +1,11 @@
 //! spec/dflash-correctness T1/T2: the DFlash drafter's shard loads with every
 //! tensor accounted for, the EXL3 packing agrees with the header, and the
-//! Gemma `+1.0` RMSNorm offset is applied.
+//! RMSNorm weights are stored **verbatim**.
+//!
+//! That last claim used to be its opposite -- this file asserted a Gemma-style
+//! `+1.0` offset, and the loader applied one. The drafter is Qwen3, whose
+//! RMSNorm has no offset, so both were wrong together and this test passed. See
+//! `DflashWeights::load` for the measurement and the exllamav3 citation.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
@@ -115,7 +120,7 @@ fn dflash_load_has_every_tensor_and_the_right_shapes() {
 }
 
 #[test]
-fn dflash_norm_weights_carry_the_gemma_offset() {
+fn dflash_norm_weights_are_stored_verbatim() {
     let d = dir();
     if !d.join("model.safetensors").exists() {
         eprintln!("drafter checkpoint not present; skipping");
@@ -143,35 +148,43 @@ fn dflash_norm_weights_carry_the_gemma_offset() {
         assert_eq!(file.len() % 2, 0, "{name} is not BF16 pairs");
         assert_eq!(stored.len(), file.len() / 2, "{name} element count");
 
-        // The offset must be present AND the conversion must be exact, or the
-        // drafter's residual streams are all scaled wrong. Spot-check every
-        // element of the two norms the notes measured by hand.
+        // Bit-exact: BF16 widens to f32 exactly and f16 holds it (the values
+        // are all in [0.002, 7.1), well inside f16's exact-BF16 range for these
+        // magnitudes only insofar as the rows are bf16-rounded; the point is
+        // that no arithmetic happens between the file and the runtime).
         for (index, pair) in file.chunks_exact(2).enumerate() {
             let bits = u16::from_le_bytes([pair[0], pair[1]]);
-            let raw_value = half::f16::from_f32(f32::from_bits((bits as u32) << 16)).to_f32();
+            let raw_value = f32::from_bits((bits as u32) << 16);
             let stored_value = half::f16::from_bits(stored[index]).to_f32();
-            let expected = half::f16::from_f32(raw_value + 1.0).to_f32();
+            let expected = half::f16::from_f32(raw_value).to_f32();
             assert_eq!(
                 stored_value, expected,
-                "{name}[{index}]: stored {stored_value}, file {raw_value} + 1.0 = {expected}"
-            );
-            assert!(
-                (stored_value - 1.0 - raw_value).abs() <= half::f16::from_f32(raw_value + 1.0)
-                    .to_f32()
-                    .abs()
-                    * 1e-3
-                    + 1e-3,
-                "{name}[{index}]: {stored_value} does not look like {raw_value} + 1.0"
+                "{name}[{index}]: stored {stored_value}, file {raw_value}"
             );
         }
     }
 
-    // The measured values from the notes, so a regression in the offset is
-    // visible without reading the whole row.
+    // The measured values, so a regression in the convention is visible without
+    // reading the whole row. `layers.0.input_layernorm[0]` is 0.7539 in the file;
+    // a loader that adds Gemma's 1.0 gives 1.7539. `post_attention_layernorm`'s
+    // mean is the sharpest tell: 0.311 verbatim against 1.311 offset, a 4.2x
+    // error that compounded to a saturated softcap and acceptance 0.0000.
     let first = half::f16::from_bits(weights.norm("layers.0.input_layernorm").unwrap()[0]).to_f32();
     assert!(
-        (first - 1.7539).abs() < 1e-3,
-        "layers.0.input_layernorm[0] = {first}, expected 0.7539 + 1.0"
+        (first - 0.7539).abs() < 2e-3,
+        "layers.0.input_layernorm[0] = {first}, expected the file's 0.7539 (0.7539 + 1.0 \
+         would mean the Gemma offset is back)"
+    );
+    let post = weights.norm("layers.0.post_attention_layernorm").unwrap();
+    let mean: f32 = post
+        .iter()
+        .map(|bits| half::f16::from_bits(*bits).to_f32())
+        .sum::<f32>()
+        / post.len() as f32;
+    assert!(
+        (mean - 0.311).abs() < 5e-3,
+        "layers.0.post_attention_layernorm mean {mean}, expected 0.311 verbatim (1.311 means the \
+         Gemma +1.0 offset is back, which flattens every draft to acceptance 0.0000)"
     );
 }
 

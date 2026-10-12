@@ -146,6 +146,59 @@ fn top3(dist: &[(u32, f64)]) -> String {
         .join(" ")
 }
 
+fn widen(values: &[u16]) -> Vec<f32> {
+    values
+        .iter()
+        .map(|bits| f16::from_bits(*bits).to_f32())
+        .collect()
+}
+
+/// D5: `max|v|`, RMS and a non-finite count. Printed, not asserted.
+///
+/// The whole point of the 30 t/s question turned out to be scale: a block whose
+/// residual stream vanishes gives a uniform distribution, one that saturates
+/// `final_logit_softcapping` gives a flat one, and both look identical from the
+/// outside (two distinct tokens in fifteen rows).
+fn stats(label: &str, values: &[f32]) -> f32 {
+    let mut max = 0.0_f32;
+    let mut sum = 0.0_f64;
+    let mut bad = 0usize;
+    for value in values {
+        if !value.is_finite() {
+            bad += 1;
+        }
+        max = max.max(value.abs());
+        sum += (*value as f64) * (*value as f64);
+    }
+    let rms = if values.is_empty() {
+        0.0
+    } else {
+        (sum / values.len() as f64).sqrt() as f32
+    };
+    println!(
+        "  [d5] {label:<26} len {:>7} max|v| {:>12.5} rms {:>11.6} nonfinite {bad}",
+        values.len(),
+        max,
+        rms
+    );
+    rms
+}
+
+/// The largest element of a batch of f16 logits, widened.
+fn widened_max(values: &[u16]) -> f32 {
+    values
+        .iter()
+        .map(|bits| f16::from_bits(*bits).to_f32())
+        .fold(f32::MIN, f32::max)
+}
+
+fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0_f32, f32::max)
+}
+
 struct Case {
     mean_diagonal: f64,
     best_alpha: f64,
@@ -159,12 +212,36 @@ struct Case {
 /// one block, and return the acceptance numbers for the round's diagonal.
 fn measure_case(
     target: &mut TextModel,
-    drafter: &DflashModel,
+    drafter: &mut DflashModel,
     tokens: &[u32],
     layers: &[usize],
     config: &DflashConfig,
 ) -> Case {
     let total = tokens.len();
+
+    // DIAGNOSTIC (D10), part 1. The oracle for the *head* path.
+    //
+    // `draft_logits` applies the target's head through the drafter's own GEMM
+    // entry point (`gemm_chunk_buffer_sliced`: the packed-buffer path with the
+    // head's 6-bit rate, its metal offset and its scale vectors). The target's
+    // own logits go through `encode_lm_head`. If those two disagree on the same
+    // input, the drafter's head is applied wrongly and nothing about the
+    // drafter's hidden state can matter. This captures the target's final normed
+    // row and the logits its own head made from it.
+    //
+    // Taken on a cold cache and wiped afterwards: a forward appends to the
+    // target's KV cache, and re-feeding a position duplicates its key row, which
+    // silently changes every later logit (`draft_and_verify` documents the same
+    // trap). The real prefill below therefore starts from empty.
+    let oracle_positions: Vec<u32> = (0..total as u32).collect();
+    target.reset_gpu_caches();
+    let head_oracle = match target.forward_with_hidden(&tokens, &oracle_positions) {
+        Ok((hidden_rows, logits)) => Some((hidden_rows, logits)),
+        Err(error) => {
+            println!("  [d10] oracle forward failed: {error}");
+            None
+        }
+    };
     target.reset_gpu_caches();
     target.enable_taps(layers).expect("enable taps");
     let positions: Vec<u32> = (0..total as u32).collect();
@@ -187,6 +264,26 @@ fn measure_case(
         .append_context(&borrowed, total, total, &mut cache)
         .expect("append context");
 
+    // D6: the target's own pre-softcap logits, the yardstick the drafter's have
+    // to be measured against. Both models feed the *same* head, so a drafter
+    // whose logits are 10x the target's saturates `final_logit_softcapping` and
+    // its distribution flattens to a coin flip.
+    stats("target p0 logits", &widen(&logits));
+
+    // The anchor is the token at position `total` -- the one the target has just
+    // predicted there -- NOT the prompt's last token at `total - 1`.
+    //
+    // The block places row 0 at position `total` (`draft_block(anchor, total, ..)`),
+    // and z-lab's round is identical: `block_output_ids[0]` is
+    // `output_ids[start]`, which was filled by sampling the prefill's logits
+    // (`dflash/model.py:249`, `:264`). Feeding `tokens[total - 1]` instead tells
+    // the drafter the sequence has the prompt's last token *twice* -- the most
+    // recent token is the one a next-token model leans on hardest, so this is not
+    // a rounding detail: it puts a wrong token in the position the drafter has to
+    // extend, and the prediction that follows is not the continuation of the
+    // prompt at all.
+    let anchor_token = argmax(&logits);
+
     // `targets[t]` is the target's distribution for position `total + t`.
     let mut targets = vec![top_k_distribution(&logits, TOP_K)];
     for step in 0..COLLECT - 1 {
@@ -200,10 +297,183 @@ fn measure_case(
     let head = target.head();
     let block_size = config.block_size;
     let draft_rows = config.draft_tokens();
-    let anchor = target.raw_embedding(&[tokens[total - 1]]);
+    let anchor = target.raw_embedding(&[anchor_token]);
+    let mask = target.raw_embedding(&[config.mask_token_id]);
+    println!(
+        "  [d9] anchor token {anchor_token} (the target's own argmax at position {total}); \
+         prompt's last token was {}",
+        tokens[total - 1]
+    );
     let draft = drafter
         .draft_block(&anchor, total, &cache, head)
         .expect("draft block");
+
+    // DIAGNOSTIC (D5): the real magnitudes, on the real checkpoints.
+    //
+    // The block collapses to two distinct tokens, which is either a flat
+    // distribution (saturated softcap) or a uniform one (vanishing residual).
+    // Both are visible here as numbers, and neither is visible from the drafts.
+    // DIAGNOSTIC (D8): the block rows must differ.
+    //
+    // Rows 1..15 are the *same* input (the mask embedding) at 15 different
+    // positions, so every difference between them is RoPE and the attention it
+    // induces. A drafter that gives all fifteen the same argmax is not
+    // predicting fifteen different tokens; it is predicting one and repeating
+    // it. The cosine against row 0 says whether the rows are distinguishable at
+    // all, which separates "the block lost its positions" from "the head
+    // flattens a correct block".
+    {
+        let hidden = draft.block.hidden.as_slice();
+        let width = config.hidden_size;
+        let rows_here = hidden.len() / width;
+        let row_rms = |row: usize| -> f32 {
+            let slice = &hidden[row * width..(row + 1) * width];
+            (slice
+                .iter()
+                .map(|bits| {
+                    let value = f16::from_bits(*bits).to_f32();
+                    (value as f64) * (value as f64)
+                })
+                .sum::<f64>()
+                / width as f64)
+            .sqrt() as f32
+        };
+        let base = &hidden[0..width];
+        let base_norm: f64 = base
+            .iter()
+            .map(|bits| {
+                let value = f16::from_bits(*bits).to_f32() as f64;
+                value * value
+            })
+            .sum::<f64>()
+            .sqrt();
+        let mut cosine = Vec::with_capacity(rows_here);
+        for row in 0..rows_here {
+            let slice = &hidden[row * width..(row + 1) * width];
+            let dot: f64 = slice
+                .iter()
+                .zip(base.iter())
+                .map(|(a, b)| {
+                    f16::from_bits(*a).to_f32() as f64 * f16::from_bits(*b).to_f32() as f64
+                })
+                .sum();
+            let norm: f64 = slice
+                .iter()
+                .map(|bits| {
+                    let value = f16::from_bits(*bits).to_f32() as f64;
+                    value * value
+                })
+                .sum::<f64>()
+                .sqrt();
+            cosine.push(dot / (norm * base_norm).max(1e-12));
+        }
+        println!(
+            "  [d8] row RMS {:?}",
+            (0..rows_here)
+                .map(|row| format!("{:.2}", row_rms(row)))
+                .collect::<Vec<_>>()
+        );
+        println!(
+            "  [d8] cosine to row 0 {:?}",
+            cosine
+                .iter()
+                .take(6)
+                .map(|value| format!("{value:.4}"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // DIAGNOSTIC (D10): the head path, against an oracle.
+    //
+    // `draft_logits` applies the *target's* head through the drafter's own GEMM
+    // entry point (`gemm_chunk_buffer_sliced`, the packed-buffer path with the
+    // head's 6-bit rate, metal offset and scale vectors). The target's own
+    // logits go through `encode_lm_head` instead. If the two disagree on the
+    // *same* input, then the drafter's head is being applied wrongly and no
+    // amount of work on the drafter's hidden state matters. `forward_with_hidden`
+    // supplies exactly that oracle: the target's final normed row and the logits
+    // its own head produced from it.
+    if let Some((hidden_rows, target_logits)) = head_oracle.as_ref() {
+        {
+            let last = total - 1;
+            let row = &hidden_rows[last * config.hidden_size..];
+            stats("target final-norm row", &widen(row));
+            stats("target own logits (oracle)", &widen(&target_logits));
+            match drafter.draft_logits(row, head, config.final_logit_softcapping, 1) {
+                Ok(replayed) => {
+                    let replayed_f32 = widen(&replayed);
+                    let oracle = widen(target_logits);
+                    let diff = max_abs_diff(&replayed_f32, &oracle);
+                    let max = oracle.iter().cloned().fold(f32::MIN, f32::max);
+                    let same_argmax = argmax(&replayed) == argmax(&target_logits);
+                    println!(
+                        "  [d10] head replay: worst diff {diff:.4} on oracle max {max:.4} \
+                         ({:.6} relative), argmax {} ({}/{})",
+                        diff / max.abs().max(1e-9),
+                        if same_argmax { "matches" } else { "DIFFERS" },
+                        argmax(&replayed),
+                        argmax(&target_logits)
+                    );
+                }
+                Err(error) => println!("  [d10] head replay failed: {error}"),
+            }
+        }
+    }
+
+    println!("  [d5] --- real magnitudes ---");
+    let anchor_rms = stats("anchor (raw embed row)", &widen(&anchor));
+    let mask_rms = stats("mask (raw embed row)", &widen(&mask));
+    for (slot, tap) in borrowed.iter().enumerate() {
+        stats(&format!("tap {slot} (layer {})", config.target_layer_ids[slot]), &widen(tap));
+    }
+    if let Ok(fused) = drafter.fuse_context(&borrowed, total) {
+        let fused_rms = stats("fused ctx (fc+hidden_norm)", &widen(&fused));
+        println!(
+            "  [d5] fused/anchor RMS ratio {:.4}, fused/mask RMS ratio {:.4}",
+            fused_rms / anchor_rms.max(1e-9),
+            fused_rms / mask_rms.max(1e-9)
+        );
+        let positions: Vec<u32> = (0..total as u32).collect();
+        if let Ok((k, v)) = drafter.project_context_kv(0, &fused, total, &positions, total) {
+            stats("layer0 ctx K", &widen(&k));
+            stats("layer0 ctx V", &widen(&v));
+        }
+    }
+    let block_hidden_rms = stats("block hidden (norm out)", &widen(&draft.block.hidden));
+    stats("layer0 block K (gemm out)", &widen(&draft.block.block_keys[0]));
+    stats("layer0 block V (gemm out)", &widen(&draft.block.block_values[0]));
+
+    // The real-path version of `dflash_context_rows_are_visible_in_the_block_output`:
+    // same anchor, same positions, a context built from the same taps in a
+    // different order. If the block output does not move, the context is not
+    // reaching the predictions, and no kernel change can fix that.
+    {
+        let mut reversed: Vec<Vec<u16>> = taps.clone();
+        reversed.reverse();
+        let reversed_refs: Vec<&[u16]> = reversed.iter().map(|tap| tap.as_slice()).collect();
+        let mut other = DflashKvCache::new(config);
+        if drafter
+            .append_context(&reversed_refs, total, total, &mut other)
+            .is_ok()
+        {
+            let first = other.all_first_positions();
+            if let Ok(block) = drafter.forward_block(&kaplumba_engine::dflash::BlockContext {
+                anchor_embedding: &anchor,
+                ctx_keys: other.all_keys(),
+                ctx_values: other.all_values(),
+                ctx_first: &first,
+                position: total,
+            }) {
+                let moved = max_abs_diff(&widen(&draft.block.hidden), &widen(&block.hidden));
+                println!(
+                    "  [d5] context reordered: block hidden moves {moved:.5} ({:.4} of its own RMS \
+                     {block_hidden_rms:.5})",
+                    moved / block_hidden_rms.max(1e-9)
+                );
+            }
+        }
+    }
+
     let block_logits = drafter
         .draft_logits(
             &draft.block.hidden,
@@ -213,6 +483,48 @@ fn measure_case(
         )
         .expect("draft logits");
     let vocab = head.out_features;
+    let logits_f32 = widen(&block_logits);
+    let logit_rms = stats("draft logits (softcapped)", &logits_f32);
+    // The softcap is monotone, so the pre-cap logit is recoverable:
+    // `x = 30 * atanh(capped / 30)`. This is the number that matters --
+    // `tanh(x/30)*30` is ~linear below |x| = 10 and flat above |x| = 60, so two
+    // raw logits of 114 and 200 both arrive at 29.97 and the softmax cannot tell
+    // them apart.
+    {
+        let mut order: Vec<&f32> = logits_f32.iter().collect();
+        order.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        let cap = config.final_logit_softcapping;
+        let raw = |capped: f32| cap * (capped / cap).clamp(-0.999_999, 0.999_999).atanh();
+        let top: Vec<String> = order
+            .iter()
+            .take(4)
+            .map(|value| format!("{value:.4}->{:.2}", raw(**value)))
+            .collect();
+        let flattened = logits_f32
+            .iter()
+            .filter(|value| raw(**value) > 60.0)
+            .count();
+        println!(
+            "  [d6] top4 capped->raw [{}], {flattened} of {} raw logits exceed 60 (the softcap's \
+             flat region)",
+            top.join(", "),
+            logits_f32.len()
+        );
+    }
+    let logit_max = logits_f32.iter().cloned().fold(f32::MIN, f32::max);
+    let saturated = logits_f32.iter().filter(|value| value.abs() > 29.9).count();
+    let near_flat = logits_f32
+        .iter()
+        .filter(|value| logit_max - **value < 0.05)
+        .count();
+    println!(
+        "  [d5] logits max {logit_max:.5}, rms {logit_rms:.5}, {saturated} of {} within 0.1 of the \
+         softcap 30, {near_flat} within 0.05 of the row max",
+        logits_f32.len()
+    );
+    println!(
+        "  [d5] block hidden vs real anchor/mask: anchor RMS {anchor_rms:.5}, mask RMS {mask_rms:.5}"
+    );
 
     let dists: Vec<Vec<(u32, f64)>> = (0..block_size)
         .map(|row| top_k_distribution(&block_logits[row * vocab..(row + 1) * vocab], TOP_K))
@@ -227,11 +539,252 @@ fn measure_case(
             }
         }
     }
-    // The round's alignment: row r is compared against the distribution for
-    // position start + r, i.e. targets[r - 1].
+
+    // DIAGNOSTIC (D11): the head at M=16 vs M=1.
+    //
+    // `Model::encode_lm_head_rows` refuses to run this 6-bpw head through
+    // `encode_gemm`'s M>1 MMA tile, and says why: measured on this same
+    // checkpoint, M=1 matched `encode_gemv` to half an fp16 quantum while M=2
+    // "diverged by 19.2 on softcapped logits that only span -30..30".
+    // `DflashModel::draft_logits` goes through `gemm_chunk_buffer_sliced` with
+    // all 16 rows at once. If that is the broken path, the drafter's logits are
+    // not a wrong model -- they are a wrong kernel, and every row of them is
+    // noise.
+    {
+        let width = config.hidden_size;
+        let mut per_row = Vec::with_capacity(block_size * vocab);
+        let mut ok = true;
+        for row in 0..block_size {
+            let slice = &draft.block.hidden[row * width..(row + 1) * width];
+            match drafter.draft_logits(slice, head, config.final_logit_softcapping, 1) {
+                Ok(logits) => per_row.extend(logits),
+                Err(error) => {
+                    println!("  [d11] per-row head failed at row {row}: {error}");
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        if ok && per_row.len() == block_size * vocab {
+            let batched = widen(&block_logits);
+            let per_row_f32 = widen(&per_row);
+            let mut row_diffs = Vec::new();
+            for row in 0..block_size {
+                row_diffs.push(max_abs_diff(
+                    &per_row_f32[row * vocab..(row + 1) * vocab],
+                    &batched[row * vocab..(row + 1) * vocab],
+                ));
+            }
+            let per_row_dists: Vec<Vec<(u32, f64)>> = (0..block_size)
+                .map(|row| top_k_distribution(&per_row[row * vocab..(row + 1) * vocab], TOP_K))
+                .collect();
+            let per_row_diagonal: Vec<f64> = (1..=draft_rows)
+                .filter(|row| *row < targets.len())
+                .map(|row| acceptance(&targets[row], &per_row_dists[row]))
+                .collect();
+            let per_row_mean = if per_row_diagonal.is_empty() {
+                0.0
+            } else {
+                per_row_diagonal.iter().sum::<f64>() / per_row_diagonal.len() as f64
+            };
+            let per_row_best = per_row_dists
+                .iter()
+                .enumerate()
+                .flat_map(|(row, dist)| {
+                    targets.iter().enumerate().map(move |(t, target_dist)| {
+                        (row, t, acceptance(target_dist, dist))
+                    })
+                })
+                .fold((0usize, 0usize, 0.0_f64), |best, item| {
+                    if item.2 > best.2 {
+                        item
+                    } else {
+                        best
+                    }
+                });
+            let mut distinct = per_row[..]
+                .chunks_exact(vocab)
+                .map(argmax)
+                .collect::<Vec<u32>>();
+            distinct.sort_unstable();
+            distinct.dedup();
+            println!(
+                "  [d11] M=1 vs M=16 head: per-row worst diff {:?}",
+                row_diffs
+                    .iter()
+                    .map(|value| format!("{value:.4}"))
+                    .collect::<Vec<_>>()
+            );
+            println!(
+                "  [d11] M=1 head: mean alpha {per_row_mean:.4}, best {:.4} (row {} t {}), \
+                 {} distinct tokens of {}",
+                per_row_best.2, per_row_best.0, per_row_best.1, distinct.len(), block_size
+            );
+        }
+    }
+
+    // DIAGNOSTIC (D12): the noise embedding's scale.
+    //
+    // The anchor and mask rows are the target's **raw** table rows, RMS 0.015,
+    // while the fused context is RMS 1.006 -- a ratio of 65x. Under that ratio
+    // the block's sixteen rows all collapse onto the context: their own identity
+    // (a real token versus `<mask>`) is 1.5% of the input to layer 0, so the only
+    // thing left distinguishing one row from the next is the RoPE phase of its
+    // attention. Measured, the rows do differ (cosine 0.7) but every one of them
+    // returns the same argmax.
+    //
+    // The target is Gemma, and Gemma does not use its embedding table raw: its
+    // own forward multiplies every row by `sqrt(hidden_size)` = 73.3. A drafter
+    // trained to continue the target's stream has to be fed the rows the way the
+    // target sees them -- and z-lab plumbs exactly that scale as a config knob
+    // (`input_embedding_scale`, `arch_specific/dflash.py:126`), defaulting to 1.0
+    // only because the DFlash2 export leaves it unset. If that is the missing
+    // factor, the block's rows get their identity back and the draft stops being
+    // one token repeated sixteen times.
+    {
+        let scale = (config.hidden_size as f32).sqrt();
+        let rescale = |row: &[u16]| -> Vec<u16> {
+            row.iter()
+                .map(|bits| {
+                    f16::from_f32(f16::from_bits(*bits).to_f32() * scale).to_bits()
+                })
+                .collect()
+        };
+        let scaled_anchor = rescale(&anchor);
+        let scaled_mask = rescale(&mask);
+        if drafter.set_mask_embedding(&scaled_mask).is_ok() {
+            if let Ok(scaled) = drafter.draft_block(&scaled_anchor, total, &cache, head) {
+                stats("block hidden (x sqrt(h))", &widen(&scaled.block.hidden));
+                if let Ok(scaled_logits) = drafter.draft_logits(
+                    &scaled.block.hidden,
+                    head,
+                    config.final_logit_softcapping,
+                    block_size,
+                ) {
+                    let scaled_dists: Vec<Vec<(u32, f64)>> = (0..block_size)
+                        .map(|row| {
+                            top_k_distribution(&scaled_logits[row * vocab..(row + 1) * vocab], TOP_K)
+                        })
+                        .collect();
+                    let scaled_diagonal: Vec<f64> = (1..=draft_rows)
+                        .filter(|row| *row < targets.len())
+                        .map(|row| acceptance(&targets[row], &scaled_dists[row]))
+                        .collect();
+                    let scaled_mean = if scaled_diagonal.is_empty() {
+                        0.0
+                    } else {
+                        scaled_diagonal.iter().sum::<f64>() / scaled_diagonal.len() as f64
+                    };
+                    let scaled_best = scaled_dists
+                        .iter()
+                        .enumerate()
+                        .flat_map(|(row, dist)| {
+                            targets.iter().enumerate().map(move |(t, target_dist)| {
+                                (row, t, acceptance(target_dist, dist))
+                            })
+                        })
+                        .fold((0usize, 0usize, 0.0_f64), |best, item| {
+                            if item.2 > best.2 {
+                                item
+                            } else {
+                                best
+                            }
+                        });
+                    let mut distinct = scaled.tokens.clone();
+                    distinct.sort_unstable();
+                    distinct.dedup();
+                    println!(
+                        "  [d12] noise x sqrt(hidden) = {scale:.2}: mean alpha {scaled_mean:.4}, best \
+                         {:.4} (row {} t {}), {} distinct tokens of {}",
+                        scaled_best.2,
+                        scaled_best.0,
+                        scaled_best.1,
+                        distinct.len(),
+                        scaled.tokens.len()
+                    );
+                    println!("  [d12] drafts: {:?}", scaled.tokens);
+                }
+            }
+        }
+        // Restore, so nothing downstream sees the scaled mask.
+        let _ = drafter.set_mask_embedding(&mask);
+    }
+
+    // DIAGNOSTIC (D7): is the failure *only* a scale?
+    //
+    // The drafter's raw logits reach 113 while the target's peak at 27, so
+    // `tanh(x/30)*30` flattens the drafter's whole top band to 29.97-30.00 and
+    // every row's argmax becomes a coin toss among near-ties. Sweeping a scale
+    // on the block's hidden state separates that from a deeper error: if some
+    // factor restores alpha, the drafter computes the right thing at the wrong
+    // magnitude (and the factor names the bug); if none does, the magnitude is
+    // a symptom and the search must continue elsewhere.
+    println!("  [d7] --- scale sweep on the drafter's block output ---");
+    for factor in [1.0_f32, 0.75, 0.5, 0.35, 0.25, 0.125] {
+        let scaled: Vec<u16> = draft
+            .block
+            .hidden
+            .iter()
+            .map(|bits| {
+                half::f16::from_f32(half::f16::from_bits(*bits).to_f32() * factor).to_bits()
+            })
+            .collect();
+        let Ok(scaled_logits) = drafter.draft_logits(
+            &scaled,
+            head,
+            config.final_logit_softcapping,
+            block_size,
+        ) else {
+            continue;
+        };
+        let scaled_dists: Vec<Vec<(u32, f64)>> = (0..block_size)
+            .map(|row| {
+                top_k_distribution(
+                    &scaled_logits[row * vocab..(row + 1) * vocab],
+                    TOP_K,
+                )
+            })
+            .collect();
+        let scaled_diagonal: Vec<f64> = (1..=draft_rows)
+            .filter(|row| *row <= targets.len())
+            .map(|row| acceptance(&targets[row - 1], &scaled_dists[row]))
+            .collect();
+        let scaled_mean = if scaled_diagonal.is_empty() {
+            0.0
+        } else {
+            scaled_diagonal.iter().sum::<f64>() / scaled_diagonal.len() as f64
+        };
+        let scaled_best = scaled_dists
+            .iter()
+            .enumerate()
+            .flat_map(|(row, dist)| {
+                targets
+                    .iter()
+                    .enumerate()
+                    .map(move |(t, target_dist)| (row, t, acceptance(target_dist, dist)))
+            })
+            .fold((0usize, 0usize, 0.0_f64), |best, item| {
+                if item.2 > best.2 {
+                    item
+                } else {
+                    best
+                }
+            });
+        let raw_max = widened_max(&scaled_logits);
+        println!(
+            "  [d7] scale {factor:<6} mean alpha {scaled_mean:.4}  best {:.4} (row {} t {}), \
+             softcapped logit max {raw_max:.4}",
+            scaled_best.2, scaled_best.0, scaled_best.1
+        );
+    }
+    // The round's alignment: block row `r` sits at position `total + r` and
+    // predicts the token at `total + r`, which is exactly what `targets[r]`
+    // holds. (Row `r - 1` would be right if row 0 were the *previous* position;
+    // it is not -- row 0 is the anchor at `total` itself.) The best-over-all-pairs
+    // search above is alignment-free, so this is a display convention only.
     let diagonal: Vec<f64> = (1..=draft_rows)
-        .filter(|row| *row <= targets.len())
-        .map(|row| acceptance(&targets[row - 1], &dists[row]))
+        .filter(|row| *row < targets.len())
+        .map(|row| acceptance(&targets[row], &dists[row]))
         .collect();
     let mean_diagonal = if diagonal.is_empty() {
         0.0
@@ -308,7 +861,7 @@ fn alpha_at_temperature_1_top_k_64() {
         ("as-configured", base_layers.clone()),
         ("config+1 (z-lab offset=1)", shifted_layers.clone()),
     ] {
-        let case = measure_case(&mut target, &drafter, &tokens, &layers, &config);
+        let case = measure_case(&mut target, &mut drafter, &tokens, &layers, &config);
         println!();
         println!("=== tap layers {label}: {layers:?} ===");
         println!("  target p0 top3: {}", case.top_target);

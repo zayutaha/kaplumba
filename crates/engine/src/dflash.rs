@@ -33,14 +33,16 @@ use kaplumba_kernels::attention::DflashBlockRequest;
 use kaplumba_kernels::elements::RopeRequest;
 use kaplumba_kernels::linear::LinearBufferRequest;
 
-/// A drafter RMSNorm: `hidden_size` fp16 values, already offset-corrected.
+/// A drafter RMSNorm: `hidden_size` fp16 values, taken verbatim from the
+/// checkpoint's BF16 row (`RMSNorm` with `constant_bias = 0`; the drafter is
+/// Qwen3, so there is no Gemma-style `+1.0`).
 pub type NormWeights = Vec<u16>;
 
 pub struct DflashWeights {
     /// EXL3 linears, keyed by the checkpoint's own tensor stem
     /// (`fc`, `layers.0.self_attn.q_proj`, ...).
     pub lines: BTreeMap<String, QuantizedLinear>,
-    /// RMSNorm scales, already `+1.0`-offset. Keyed the same way
+    /// RMSNorm scales, verbatim from the checkpoint. Keyed the same way
     /// (`hidden_norm`, `norm`, `layers.0.input_layernorm`, ...).
     pub norms: BTreeMap<String, NormWeights>,
     /// Raw EXL3 scale vectors for the linears, kept so tests and the
@@ -269,22 +271,48 @@ impl DflashWeights {
             lines.insert(stem, linear);
         }
 
-        // T2. Gemma's RMSNorm is `(1 + weight) * x / rms(x)`. The engine's
-        // `rms_norm_weighted` (elements.metal:110) multiplies by `weight` alone
-        // and the *target* checkpoints are repacked with the offset folded in,
-        // so this checkpoint's raw values (0.30-0.82 on the input norms) have
-        // to be shifted here or every residual stream is scaled wrong.
+        // T2. The drafter's norm weights are stored **verbatim**: no offset.
         //
-        // BF16 is the top 16 bits of an f32, so widening is exact; add 1.0 in
-        // f32 (matching what the trainer's BF16 `(1 + w)` did before it was
-        // stored) and narrow once, to f16, at the very end.
+        // This used to add 1.0 to every RMSNorm weight, on the reasoning that
+        // Gemma's RMSNorm is `(1 + weight) * x / rms(x)` and the *target* is
+        // Gemma. The drafter is not Gemma -- it is **Qwen3**
+        // (`model_type: "qwen3"` in the checkpoint's own `config.json`,
+        // `Qwen3RMSNorm` in z-lab's `dflash/model.py:550-607`) -- and Qwen3's
+        // RMSNorm multiplies by `weight` alone. The stored values confirm it:
+        // means of +0.31 to +3.08 over `[0, 0.62]`..`[1.48, 7.06]`, all but a
+        // handful positive, i.e. ordinary trained weights. Gemma's delta-coded
+        // table looks nothing like that (its `input_layernorm` here spans
+        // -5.78..+444).
+        //
+        // exllamav3 is the format's definition and says the same thing
+        // explicitly: `architecture/gemma3.py:267-310` passes
+        // `constant_bias = 1.0` to every RMSNorm, while
+        // `architecture/dflash.py:267-316` and `modules/arch_specific/dflash.py:52`
+        // pass nothing, taking the `constant_bias = 0.0` default
+        // (`modules/rmsnorm.py:20`, applied at `:86`:
+        // `x * w if self.constant_bias == 0.0 else x * (w + self.constant_bias)`).
+        // The offset is per-architecture, not per-format.
+        //
+        // The cost of adding it anyway was not subtle and not visible to any
+        // test: `post_attention_layernorm` went from 0.311 to 1.311 (4.2x),
+        // `input_layernorm` from 0.765 to 1.765 (2.3x), compounded through five
+        // layers and the MLP to a residual stream whose MLP output peaks at
+        // 152 288 instead of ~1e3. The drafter's logits then saturate
+        // `final_logit_softcapping = 30` (measured `max|v| = 30.00000`,
+        // 1424 entries pinned there), the draft distribution flattens to
+        // `1/64` per token, and acceptance is exactly 0.0000. Every
+        // engine-vs-host test passed throughout, because `dflash_golden`'s
+        // reference applied the same offset.
+        //
+        // BF16 is the top 16 bits of an f32, so widening is exact; narrow once,
+        // to f16, at the very end.
         let mut norms = BTreeMap::new();
         for (stem, bytes) in bf16_norms {
             let mut values = Vec::with_capacity(bytes.len() / 2);
             for pair in bytes.chunks_exact(2) {
                 let bits = u16::from_le_bytes([pair[0], pair[1]]);
                 let widened = f32::from_bits((bits as u32) << 16);
-                values.push(half::f16::from_f32(widened + 1.0).to_bits());
+                values.push(half::f16::from_f32(widened).to_bits());
             }
             norms.insert(stem, values);
         }

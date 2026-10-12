@@ -167,10 +167,15 @@ impl HostLinear {
 fn norm_weights(dir: &Path, name: &str, width: usize) -> Vec<f32> {
     let bytes = stem_bytes(dir, &format!("{name}.weight"));
     assert_eq!(bytes.len() / 2, width, "{name} width");
-    // The loader's +1.0, applied here in f32 for the reference.
+    // Verbatim, matching the loader. This used to add 1.0 (Gemma's
+    // `(1 + weight)` convention) and the loader did the same, so the two agreed
+    // while both were wrong: the drafter is Qwen3, whose RMSNorm has no offset
+    // (exllamav3 `architecture/dflash.py:267` vs `architecture/gemma3.py:267`).
+    // That single shared assumption hid a 4.2x error on
+    // `post_attention_layernorm` and made acceptance exactly 0.0000.
     f16_words(&bytes)
         .into_iter()
-        .map(|bits| f32::from_bits((bits as u32) << 16) + 1.0)
+        .map(|bits| f32::from_bits((bits as u32) << 16))
         .collect()
 }
 
@@ -593,6 +598,8 @@ fn dflash_forward_block_matches_host() {
         // No context rows, so every key is a block row and the mask is the
         // block mask.
         let bidirectional = !harness.config.layer_is_sliding[layer];
+        // Window on sliding layers only, and the gap in i64 for the
+        // bidirectional case: see `host_block`.
         let window = if harness.config.layer_is_sliding[layer] {
             harness.config.sliding_window
         } else {
@@ -607,7 +614,8 @@ fn dflash_forward_block_matches_host() {
                 for key in 0..rows {
                     let k_pos = (position + key) as u32;
                     let past_ok = bidirectional || k_pos <= q_pos;
-                    let window_ok = window == 0 || q_pos - k_pos < window as u32;
+                    let window_ok =
+                        window == 0 || (q_pos as i64 - k_pos as i64) < window as i64;
                     if past_ok && window_ok {
                         let base = (key * harness.config.kv_heads + key_head) * head_dim;
                         let q_base = (row * harness.config.q_heads + q_head) * head_dim;
@@ -820,7 +828,10 @@ fn attended_of(
                     (block_start + key - ctx_len) as u32
                 };
                 let past_ok = bidirectional || k_pos <= q_pos;
-                let window_ok = window == 0 || q_pos - k_pos < window as u32;
+                // In i64: a bidirectional layer legitimately has keys after the
+                // query, and the u32 subtraction of two positions wraps to ~4e9
+                // there rather than going negative.
+                let window_ok = window == 0 || (q_pos as i64 - k_pos as i64) < window as i64;
                 if !(past_ok && window_ok) {
                     continue;
                 }
@@ -880,50 +891,39 @@ fn attended_of(
 // With T14's f32 residual stream the magnitudes that used to overflow fp16
 // (layer-0 attention output 45.8, `o_proj` 2169, MLP output 152 288) now fit, so
 // this comparison is possible.
+//
+// Two tests, because agreement and context sensitivity are different claims and
+// the first version of this file made only the weaker one:
+//
+// * `dflash_forward_block_with_context_matches_host` -- the engine agrees with
+//   the reference over 20 context rows.
+// * `dflash_context_rows_are_visible_in_the_block_output` -- the context is
+//   what the output depends on. Agreement alone does not prove that: a
+//   reference and an engine that both ignore the context agree perfectly.
 // ---------------------------------------------------------------------------
 
-#[test]
-fn dflash_forward_block_with_context_matches_host() {
-    let Some(mut harness) = Harness::build() else {
-        return;
-    };
+/// The drafter's block pass in f32 scalar code: `n_ctx` context rows at
+/// positions `0..n_ctx`, then `block_size` block rows at `position..`.
+///
+/// Returns the final `norm` output and the per-stage max magnitude. The stage
+/// maxima matter: a stage reaching 1.5e5 makes a 1.7 absolute difference
+/// meaningless until you can see that the magnitude is 1.5e5, and they are what
+/// separates a real graph disagreement from fp16 range.
+fn host_block(
+    harness: &Harness,
+    anchor: &[u16],
+    mask: &[u16],
+    taps: &[Vec<u16>],
+    n_ctx: usize,
+    position: usize,
+) -> (Vec<f32>, Vec<f32>) {
     let hidden = harness.hidden();
     let head_dim = harness.config.head_dim;
     let rows = harness.config.block_size;
     let eps = harness.config.rms_norm_eps;
-    let n_ctx = 20usize;
-    let position = n_ctx + rows;
-
-    let anchor = pseudo(0x5EED_A11C, hidden, INPUT_SCALE);
-    let mask = pseudo(0x0A5C0FFE, hidden, INPUT_SCALE);
-    let taps = harness.taps(n_ctx, 0xDF_1A_5000);
-    let tap_refs: Vec<&[u16]> = taps.iter().map(|tap| tap.as_slice()).collect();
-
-    // Fill the drafter's cache through the real entry point, as the round loop
-    // would, then draft from it.
-    let mut cache = kaplumba_engine::dflash::DflashKvCache::new(&harness.config);
-    let ctx_first_all = cache.all_first_positions();
-    harness
-        .model
-        .append_context(&tap_refs, n_ctx, n_ctx, &mut cache)
-        .expect("append context");
-    harness
-        .model
-        .set_mask_embedding(&mask)
-        .expect("mask embedding");
-    let block = harness
-        .model
-        .forward_block(&kaplumba_engine::dflash::BlockContext {
-            anchor_embedding: &anchor,
-            ctx_keys: cache.all_keys(),
-            ctx_values: cache.all_values(),
-            ctx_first: &ctx_first_all,
-            position,
-        })
-        .expect("block");
 
     // --- host reference, with the same context ----------------------------
-    let reference_fused = harness.reference_fused(&taps, n_ctx);
+    let reference_fused = harness.reference_fused(taps, n_ctx);
     let groups = harness.config.q_heads / harness.config.kv_heads;
     let scale = 1.0 / (head_dim as f32).sqrt();
     let mut state = vec![0.0_f32; rows * hidden];
@@ -997,6 +997,7 @@ fn dflash_forward_block_with_context_matches_host() {
             harness.config.rope_theta,
         );
         let v_ctx = line.v.forward(&reference_fused, n_ctx);
+        let sliding = harness.config.layer_is_sliding[layer];
         let attended = attended_of(
             &q_rope,
             &k_ctx,
@@ -1012,8 +1013,23 @@ fn dflash_forward_block_with_context_matches_host() {
             scale,
             0,
             position,
-            !harness.config.layer_is_sliding[layer],
-            harness.config.sliding_window,
+            !sliding,
+            // NOT `config.sliding_window` unconditionally: the window applies to
+            // sliding layers only. z-lab sets `self.sliding_window =
+            // config.sliding_window if layer_type == "sliding_attention" else None`
+            // (`dflash/model.py:366`), and the engine passes the same
+            // (`forward_block`: `window: if sliding { .. } else { 0 }`). Handing
+            // the full layer a 2048 window is not a no-op here: with
+            // `bidirectional` true its `q_pos - k_pos` is negative for the block
+            // rows ahead of the query, so the u32 subtraction wraps and every
+            // future key is dropped -- the reference quietly became causal on the
+            // one layer that is not, which is a 7% error on `attn_out` and was
+            // invisible while this test only printed its result.
+            if sliding {
+                harness.config.sliding_window
+            } else {
+                0
+            },
         );
         stage_max.push(max_of(&attended));
         let projected = line.o.forward(&attended, rows);
@@ -1053,29 +1069,219 @@ fn dflash_forward_block_with_context_matches_host() {
         hidden,
         eps,
     );
+    (expected, stage_max)
+}
 
-    let actual = f32_of(&block.hidden);
-    assert_eq!(actual.len(), expected.len());
+/// One block pass through both implementations, over the same context rows.
+struct BlockCase {
+    engine: Vec<f32>,
+    host: Vec<f32>,
+    stage_max: Vec<f32>,
+    /// `max |engine - host|` -- the number the agreement test asserts on.
+    worst: f32,
+    /// Where that difference is, so a failure names a row and a feature rather
+    /// than only a magnitude. `worst / hidden` is the block row.
+    worst_index: usize,
+    /// The largest element of `host`, the scale that difference is relative to.
+    host_max: f32,
+}
+
+/// Build the drafter's cache through the real entry point (`append_context`, as
+/// the round loop does), run `forward_block` over it, and pair the result with
+/// [`host_block`] on the same rows.
+fn block_case(
+    harness: &mut Harness,
+    anchor: &[u16],
+    mask: &[u16],
+    taps: &[Vec<u16>],
+    n_ctx: usize,
+    position: usize,
+) -> BlockCase {
+    let mut cache = kaplumba_engine::dflash::DflashKvCache::new(&harness.config);
+    if n_ctx > 0 {
+        let tap_refs: Vec<&[u16]> = taps.iter().map(|tap| tap.as_slice()).collect();
+        harness
+            .model
+            .append_context(&tap_refs, n_ctx, n_ctx, &mut cache)
+            .expect("append context");
+    }
+    harness
+        .model
+        .set_mask_embedding(mask)
+        .expect("mask embedding");
+    let first = cache.all_first_positions();
+    let block = harness
+        .model
+        .forward_block(&kaplumba_engine::dflash::BlockContext {
+            anchor_embedding: anchor,
+            ctx_keys: cache.all_keys(),
+            ctx_values: cache.all_values(),
+            ctx_first: &first,
+            position,
+        })
+        .expect("block");
+    let engine = f32_of(&block.hidden);
+    let (host, stage_max) = host_block(harness, anchor, mask, taps, n_ctx, position);
+    assert_eq!(engine.len(), host.len());
     let mut worst = 0.0_f32;
     let mut worst_index = 0usize;
-    for (index, (a, b)) in actual.iter().zip(expected.iter()).enumerate() {
+    for (index, (a, b)) in engine.iter().zip(host.iter()).enumerate() {
         let diff = (a - b).abs();
         if diff > worst {
             worst = diff;
             worst_index = index;
         }
     }
-    let engine_max = max_of(&actual);
-    let reference_max = max_of(&expected);
+    let host_max = max_of(&host);
+    BlockCase {
+        engine,
+        host,
+        stage_max,
+        worst,
+        worst_index,
+        host_max,
+    }
+}
+
+fn rms_of(values: &[f32]) -> f32 {
+    (values.iter().map(|value| value * value).sum::<f32>() / values.len() as f32).sqrt()
+}
+
+fn max_diff(a: &[f32], b: &[f32]) -> f32 {
+    a.iter()
+        .zip(b.iter())
+        .map(|(x, y)| (x - y).abs())
+        .fold(0.0_f32, f32::max)
+}
+
+/// Tolerance for the context path, as a fraction of the reference's largest
+/// element.
+///
+/// Measured: 1.703331 on a reference max of 89.6041, i.e. 1.90e-2, against
+/// 8.8e-4 (0.068110 / 77.2833) for the same comparison with **zero** context
+/// rows. The block's residual stream is f32 and its stages reach 1.5e5, so 1.7
+/// absolute is 1e-5 of a stage magnitude; the number is set by fp16 in the
+/// context's `k_proj`/`v_proj` and by the f16 context K/V themselves, and it
+/// does not grow with the context length at a fixed position (see the notes).
+const CONTEXT_TOLERANCE: f32 = 3e-2;
+
+#[test]
+fn dflash_forward_block_with_context_matches_host() {
+    let Some(mut harness) = Harness::build() else {
+        return;
+    };
+    let hidden = harness.hidden();
+    let rows = harness.config.block_size;
+    let n_ctx = 20usize;
+    let position = n_ctx + rows;
+
+    let anchor = pseudo(0x5EED_A11C, hidden, INPUT_SCALE);
+    let mask = pseudo(0x0A5C0FFE, hidden, INPUT_SCALE);
+    let taps = harness.taps(n_ctx, 0xDF_1A_5000);
+    let case = block_case(&mut harness, &anchor, &mask, &taps, n_ctx, position);
+
+    let hidden = harness.hidden();
     eprintln!(
-        "forward_block WITH CONTEXT worst diff {worst:.6} at {worst_index} of {}; \
-         engine max {engine_max:.4}, reference max {reference_max:.4}, \
-         reference per-stage max {}",
-        actual.len(),
-        stage_max
+        "forward_block WITH CONTEXT worst diff {:.6} at {:.4} of {}; row {} feature {}, \
+         engine max {:.4}, reference max {:.4}, engine RMS {:.4}, reference per-stage max {}",
+        case.worst,
+        case.worst / case.host_max,
+        case.engine.len(),
+        case.worst_index / hidden,
+        case.worst_index % hidden,
+        max_of(&case.engine),
+        case.host_max,
+        rms_of(&case.engine),
+        case.stage_max
             .iter()
             .map(|value| format!("{value:.2}"))
             .collect::<Vec<_>>()
             .join(" ")
+    );
+    // `NaN - x` is `NaN` and `NaN > worst` is false, so an all-NaN engine output
+    // reports "worst diff 0.000000" and passes. Same guard as the zero-context
+    // test above, for the same reason.
+    let energy: f32 = case.engine.iter().map(|value| value * value).sum();
+    let engine_max = max_of(&case.engine);
+    assert!(
+        energy.is_finite() && engine_max > 0.01,
+        "the comparison is vacuous: the engine carries no signal (energy {energy})"
+    );
+    assert!(
+        case.worst <= CONTEXT_TOLERANCE * case.host_max,
+        "forward_block with {n_ctx} context rows disagrees with the host reference by {} \
+         ({} relative on a reference max of {}) -- a graph error, not fp16 spread",
+        case.worst,
+        case.worst / case.host_max,
+        case.host_max
+    );
+}
+
+/// The context must be what the block's output *depends on*.
+///
+/// `dflash_forward_block_with_context_matches_host` proves the engine and the
+/// reference agree; it does not prove that either of them reads the context. A
+/// pair of implementations that both ignore it agree perfectly, and that is not
+/// a hypothetical: the real checkpoints draft byte-identical tokens from two
+/// different tap-layer sets (`dflash_alpha_probe`, alpha = 0.0000), which is
+/// only possible if the context never reaches the predictions.
+///
+/// Three cases, same anchor, same mask, same positions:
+///
+/// * `a`, `b` -- 20 context rows that differ in *value*.
+/// * `none`  -- no context rows at all.
+///
+/// Both differences are measured on the engine **and** on the reference, so a
+/// failure says which of the two is context-blind. Meaningless magnitudes are
+/// guarded: nothing is asserted unless the reference itself is sensitive to the
+/// context by more than 1% of its own RMS.
+#[test]
+fn dflash_context_rows_are_visible_in_the_block_output() {
+    let Some(mut harness) = Harness::build() else {
+        return;
+    };
+    let hidden = harness.hidden();
+    let rows = harness.config.block_size;
+    let n_ctx = 20usize;
+    let position = n_ctx + rows;
+
+    let anchor = pseudo(0x5EED_A11C, hidden, INPUT_SCALE);
+    let mask = pseudo(0x0A5C0FFE, hidden, INPUT_SCALE);
+    let taps_a = harness.taps(n_ctx, 0xDF_1A_5000);
+    let taps_b = harness.taps(n_ctx, 0x11_C0_FFEE);
+    let a = block_case(&mut harness, &anchor, &mask, &taps_a, n_ctx, position);
+    let b = block_case(&mut harness, &anchor, &mask, &taps_b, n_ctx, position);
+    let none = block_case(&mut harness, &anchor, &mask, &[], 0, position);
+
+    let scale = rms_of(&a.host);
+    let engine_values = max_diff(&a.engine, &b.engine);
+    let engine_rows = max_diff(&a.engine, &none.engine);
+    let host_values = max_diff(&a.host, &b.host);
+    let host_rows = max_diff(&a.host, &none.host);
+    eprintln!(
+        "context visibility (host RMS {scale:.4}):\n  \
+         different context values: engine {engine_values:.4} ({:.4} of host RMS), \
+         host {host_values:.4}\n  \
+         context rows vs none:     engine {engine_rows:.4} ({:.4} of host RMS), \
+         host {host_rows:.4}",
+        engine_values / scale,
+        engine_rows / scale,
+    );
+
+    // Guard: if the reference is not context sensitive, the numbers below are
+    // not evidence about the engine at all.
+    assert!(
+        host_values > 0.01 * scale && host_rows > 0.01 * scale,
+        "the host reference itself is context-blind (values {host_values}, rows {host_rows} \
+         on RMS {scale}), so this test cannot say anything about the engine"
+    );
+    assert!(
+        engine_rows > 0.01 * scale,
+        "`forward_block` ignored every context row: with 20 rows and with none it differs by \
+         {engine_rows} ({} of the block's RMS {scale}) while the reference moves by {host_rows} \
+         ({}). This is the alpha = 0.0000 signature -- the drafter's predictions do not depend \
+         on the history they are supposed to continue.",
+        engine_rows / scale,
+        host_rows / scale
     );
 }
