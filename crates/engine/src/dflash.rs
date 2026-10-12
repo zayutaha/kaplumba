@@ -969,6 +969,41 @@ fn select_draft_tokens(logits: &[u16], vocab: usize, draft_rows: usize) -> Vec<u
         .collect()
 }
 
+/// The absolute positions a round feeds its drafts to, derived from the one
+/// position everything in a round is anchored on.
+///
+/// `anchor_position` is the position of `anchor_token` itself. That single
+/// number fixes the whole round, because the block is `[anchor, mask x 15]` and
+/// a block row's hidden state is the model's prediction for the token **at that
+/// row's own position** -- the convention z-lab's mask block is trained and
+/// verified with. So:
+///
+///   * the block's rows sit at `anchor_position .. anchor_position + block_size`
+///     (this is what `draft_block`/`forward_block` take -- they are handed
+///     `anchor_position`, not the first draft's position),
+///   * `draft.tokens[k]` is row `k + 1` (see [`select_draft_tokens`]), i.e. the
+///     prediction for the token at `anchor_position + 1 + k`,
+///   * and z-lab writes those argmaxes into `block_output_ids[:, 1:]`, whose
+///     slots are exactly those positions (`dflash/model.py:268`).
+///
+/// Hence the drafts start **one past the anchor**, and the anchor's own slot is
+/// never fed: a draft re-fed at the anchor's position would append a second key
+/// row beneath it, and the target would be verifying against a subtly different
+/// model.
+///
+/// Getting this wrong is silent, which is why it is a named function instead of
+/// an inline `+ 1`: feeding the drafts at `anchor_position + k` instead of
+/// `anchor_position + 1 + k` compares every draft against the target's row for
+/// the position *before* the one it proposes. That rejects every draft and every
+/// round -- `alpha` reads exactly 0.0000 -- while the emitted text stays correct,
+/// because the round still emits the target's own token. Nothing else fails, so
+/// nothing else can tell you.
+fn draft_verify_positions(anchor_position: usize, n: usize) -> Vec<u32> {
+    (0..n)
+        .map(|index| (anchor_position + 1 + index) as u32)
+        .collect()
+}
+
 // ============================================================================
 // `spec/dflash-30tps` L2: the round's distribution machinery
 // ============================================================================
@@ -1214,7 +1249,58 @@ mod sampler_tests {
 }
 #[cfg(test)]
 mod tests {
-    use super::select_draft_tokens;
+    use super::{draft_verify_positions, select_draft_tokens};
+
+    /// The drafts start one past the anchor, and the anchor's own slot is never
+    /// fed. Both halves matter and both are silent when broken: dropping the
+    /// `+ 1` compares every draft against the target's row for the position
+    /// before the one it proposes, which rejects the whole round while still
+    /// emitting correct text (`alpha` = 0.0000 and nothing else fails).
+    #[test]
+    fn drafts_are_fed_one_position_after_the_anchor() {
+        let anchor_position = 7usize;
+        let drafts = 15usize;
+        let positions = draft_verify_positions(anchor_position, drafts);
+
+        assert_eq!(positions.len(), drafts, "one position per draft");
+        assert_eq!(
+            positions[0], 8,
+            "the first draft is block row 1, so it belongs one past the anchor at \
+             8, not at the anchor's own slot 7 (which the target's cache already \
+             holds: re-feeding it appends a second key row beneath the anchor)"
+        );
+        assert_eq!(
+            positions[drafts - 1],
+            22,
+            "the last draft is block row 15, i.e. 7 + 1 + 14"
+        );
+        assert!(
+            !positions.contains(&(anchor_position as u32)),
+            "a draft was fed at the anchor's own position {anchor_position}, so \
+             this round would verify drafts against the wrong row"
+        );
+        assert_eq!(
+            positions,
+            (8u32..=22).collect::<Vec<u32>>(),
+            "the drafts occupy a contiguous run one past the anchor"
+        );
+
+        // The convention this must NOT drift back to: a round that treats its
+        // argument as the first draft's position anyway is one slot early, and
+        // `positions[0]` is exactly where the difference shows.
+        let shifted = (0..drafts)
+            .map(|index| (anchor_position + index) as u32)
+            .collect::<Vec<u32>>();
+        assert_ne!(
+            positions, shifted,
+            "draft positions have drifted back to the anchor's own slot"
+        );
+
+        // An anchor at position 0 is legal (an empty context), and must not
+        // underflow: the base is never decremented, the first draft is derived
+        // by adding one.
+        assert_eq!(draft_verify_positions(0, 2), vec![1, 2]);
+    }
 
     /// One row per block position, where row `r`'s argmax is the token id `r`
     /// held in that row's last column. `vocab` is a small placeholder: the
@@ -1975,14 +2061,25 @@ impl DflashModel {
     ///
     /// So the anchor is never re-fed. Instead:
     ///
-    ///   * `draft.tokens[0..n]` are fed at `position .. position + n - 1`,
-    ///   * `L[0]` is `previous_logits` — the target's own row for the position
-    ///     *before* this round's first draft, which the caller owns because each
-    ///     round consumes the logits its predecessor produced,
+    ///   * the block sits at `anchor_position .. anchor_position + block_size`
+    ///     and the drafts are its rows `1..=n` (see
+    ///     [`draft_verify_positions`]), so `draft.tokens[0..n]` are fed at
+    ///     `anchor_position + 1 .. anchor_position + n`,
+    ///   * `L[0]` is `previous_logits` — the target's own row for
+    ///     `anchor_position`, i.e. the row the caller got by feeding
+    ///     `anchor_token`, which predicts exactly `draft.tokens[0]`,
     ///   * `L[k]` for `k >= 1` is the batched verify's row `k - 1`.
     ///
     /// `L[k]` is the target's prediction for the position `draft.tokens[k]`
     /// lands at, so it is the row that decides whether that draft is accepted.
+    ///
+    /// **`anchor_position` is the anchor's own position, not the first
+    /// draft's.** That is the same number `draft_block` is handed, and the same
+    /// number a caller passes as `position` to [`Self::append_context`] (whose
+    /// chunk ends at `position - 1`, i.e. at the anchor's predecessor). One
+    /// round therefore has exactly one position convention; a second one cannot
+    /// be introduced without breaking the invariant that `[block, context,
+    /// verify]` agree, which is silent when it fails.
     ///
     /// # Verification: speculative sampling, not argmax
     ///
@@ -2022,7 +2119,7 @@ impl DflashModel {
         drafter_cache: &mut DflashKvCache,
         anchor_token: u32,
         previous_logits: &[u16],
-        position: usize,
+        anchor_position: usize,
         greedy: bool,
         top_k: usize,
         mut sample: impl FnMut() -> f32,
@@ -2036,7 +2133,7 @@ impl DflashModel {
         }
         let head = target.head();
         let anchor_embedding = target.raw_embedding(&[anchor_token]);
-        let draft = self.draft_block(&anchor_embedding, position, drafter_cache, head)?;
+        let draft = self.draft_block(&anchor_embedding, anchor_position, drafter_cache, head)?;
         let n = draft.tokens.len();
         if n == 0 {
             return Err(DflashError::Shape("the drafter drafted no tokens".to_string()));
@@ -2045,9 +2142,10 @@ impl DflashModel {
         // The target's row for each draft position. `L[0]` is the caller's
         // previous row and is NOT re-derived (see the header); `L[k>=1]` comes
         // off the batched verify, whose row `k-1` is the target's prediction at
-        // the position `draft.tokens[k]` was fed to.
-        let verify_positions: Vec<u32> =
-            (0..n as u32).map(|index| position as u32 + index).collect();
+        // the position `draft.tokens[k]` was fed to. The positions themselves
+        // come from `draft_verify_positions`, which owns the `+ 1` between the
+        // anchor's slot and the first draft's.
+        let verify_positions = draft_verify_positions(anchor_position, n);
         let verify_rows = target
             .forward_verify(&draft.tokens, &verify_positions)
             .map_err(|error| DflashError::Kernels(error.to_string()))?;
