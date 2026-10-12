@@ -381,3 +381,63 @@ reaches it in a form it cannot use, or that the drafter's weights are not what t
 engine decodes; the taps are now the only input that has never been validated
 against anything external, and `dflash_golden`'s block reference validates the
 graph *given* the fused context, not the fused context itself.
+
+### T18 dead end: the taps cannot be validated without a single-layer GPU entry point
+
+The plan for T18 was to compare a captured tap against the layer's own output,
+computed one layer at a time: `forward_layer(0, embedding)` then
+`forward_layer(1, ..)`. Written and run, it panics inside the engine:
+
+```
+panicked at crates/engine/src/model.rs:5804:55:
+called `Result::unwrap()` on an `Err` value: Kernel(InvalidInput(
+  "packed buffer length 5671862592 does not match 16515072"))
+```
+
+`DecoderLayer::forward` is the **host** path and hands the kernel the whole
+offloaded packed region (5 671 862 592 B = the entire second shard) where the
+layer's own trellis is 16 515 072 B. It has no `metal_offset`/`packed_len`
+slicing, unlike `Model::gemm_chunk_buffer_sliced`, which is why the verify and
+drafter paths use the latter. So the only public single-layer entry point cannot
+run on a repacked checkpoint, and there is no intermediate-layer oracle in the
+API at all: `hidden_states_all` returns the **final** layer's pre-norm state only.
+
+The test was removed rather than committed in a state that always panics. T18
+stays open, and the honest statement of it is narrower than before: the taps are
+still the only input of the drafter never validated against an independent
+computation, and validating them now requires either teaching
+`DecoderLayer::forward` to slice an offloaded trellis (a real, separate defect in
+a diagnostic path) or exporting one intermediate layer's rows through the GPU
+path.
+
+### D13: the drafter does not rank the target's token at all
+
+This is the measurement that ended the magnitude theory for good. For each draft
+row, the rank the drafter gives the token the target actually wants (softcapped
+logits, so the softcap's order preservation is not in question):
+
+```
+row 1: target wants 236858 (p_target 0.3324); drafter ranks it 250604 of 262144 with p 5.8e-26
+row 2: target wants 560    (p_target 0.9984); drafter ranks it 198213 of 262144 with p 1.5e-20
+row 3: target wants 3016   (p_target 0.9876); drafter ranks it 115807 of 262144 with p 5.7e-15
+row 4: target wants 3847   (p_target 0.4052); drafter ranks it  46891 of 262144 with p 5.8e-10
+```
+
+`alpha = 0` has two possible causes and they need opposite fixes: a *flattened*
+distribution whose ranking is right (a temperature or softcap problem -- fixable)
+or a *wrong* ranking (nothing about the magnitude helps). Row 2 settles it: the
+target is 99.84% certain of token 560 and the drafter puts it 198 213rd, below
+three quarters of the vocabulary. The softcap, the hidden scale, the head path and
+the logit magnitudes are all irrelevant to that; the drafter's hidden state simply
+does not point where the target's head needs it to.
+
+Also eliminated this session, by reading rather than running:
+`permutation_mode` is `0` on both sides (`QuantizedLinear::from_metal_buffer` sets
+it, `model.rs:404`, and the drafter's `quantization_config.json` has no `layout`
+key, which is what leaves it at 0), so it matches exllamav3's row-major native
+layout and the host's `reconstruct_matrix`; and the `suh`/`svh` vectors really are
+*scales*, not signs -- `fc.suh` spans 0.0167..1.09 across its 32 256 entries, so a
+loader that treated them as +-1 would be off by 65x -- and both the GPU path and
+the host path multiply by the f16 values, which is what
+`dflash_exl3_decode_matches_host_on_every_linear` verifies at 3e-4 relative on all
+36 of the drafter's linears.

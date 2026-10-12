@@ -540,6 +540,39 @@ fn measure_case(
         }
     }
 
+    // DIAGNOSTIC (D13): where the drafter *ranks* the token the target wants.
+    //
+    // alpha = sum min(p, q) is zero for two very different illnesses. Either the
+    // drafter gives the target's token a sane probability in a flattened
+    // distribution (fixable: the ranking is right and only the sharpness is
+    // lost), or it ranks that token so far down that it is not in the top 64 at
+    // all (the ranking itself is wrong and no temperature fixes it). The rank
+    // below is the difference, and it is the one number that says which of the
+    // two this is.
+    println!("  [d13] --- rank of the target's top token in the drafter's row ---");
+    for row in 1..draft_rows.min(5) {
+        let Some((token, _)) = targets.get(row).and_then(|dist| dist.first()) else {
+            continue;
+        };
+        let logits_row = &block_logits[row * vocab..(row + 1) * vocab];
+        let widened_row = widen(logits_row);
+        let mine = widened_row[*token as usize];
+        let rank = widened_row.iter().filter(|value| **value > mine).count();
+        let max = widened_row.iter().cloned().fold(f32::MIN, f32::max);
+        let sum: f64 = widened_row
+            .iter()
+            .map(|value| ((*value - max) as f64).exp())
+            .sum();
+        let p = ((mine - max) as f64).exp() / sum;
+        let own = draft.tokens.get(row).copied().unwrap_or(u32::MAX);
+        println!(
+            "  [d13] row {row}: target wants {token} (p_target {:.4}); drafter ranks it {rank} of \
+             {vocab} with p {p:.3e}; logit {mine:.4} against the row's max {max:.4} (softcapped). \
+             The drafter's own pick is {own}",
+            targets[row].first().map_or(0.0, |(_, prob)| *prob)
+        );
+    }
+
     // DIAGNOSTIC (D11): the head at M=16 vs M=1.
     //
     // `Model::encode_lm_head_rows` refuses to run this 6-bpw head through
