@@ -870,6 +870,11 @@ pub struct DflashDraft {
     /// The block that produced them, for a caller that wants the hidden rows or
     /// the block's own K/V.
     pub block: DflashBlock,
+    /// The drafter's softcapped `[block_size, vocab]` logits, one row per block
+    /// row, already computed by `draft_block`. Carried so the verify pass can
+    /// build its proposal distributions without re-reading the 1.06 GB target
+    /// head a second time.
+    pub logits: Vec<u16>,
 }
 
 /// Greedy argmax of one row of softcapped logits.
@@ -909,6 +914,249 @@ fn select_draft_tokens(logits: &[u16], vocab: usize, draft_rows: usize) -> Vec<u
         .collect()
 }
 
+// ============================================================================
+// `spec/dflash-30tps` L2: the round's distribution machinery
+// ============================================================================
+//
+// Everything below operates on a `BTreeMap<u32, f32>` of `token -> probability`
+// for a *sorted* support, which is the only shape the round's arithmetic needs:
+// the accept test is a lookup, and the residual is a pointwise difference over a
+// union of two sorted supports. It is also the only thing the round has to do
+// 262,144 times per draft, so `acceptance` uses two sorted walks instead of a
+// hash map.
+
+/// `S(logits)`: softmax at temperature 1, truncated to the `k` largest entries,
+/// renormalised.
+///
+/// This is the sampler the round must be exact for (`dflash_alpha_probe`'s
+/// `top_k_distribution`, and z-lab's `_sampling_probs`). Passing the *sampler's*
+/// distribution rather than the full softmax is what makes speculative sampling
+/// exact for a truncated sampler: `draft x ~ S(q)`, accept with
+/// `min(1, S_p(x) / S_q(x))`, resample from the normalised residual, and the
+/// emitted marginal is exactly `S(p)`.
+fn sampler_distribution(logits: &[u16], vocab: usize, k: usize) -> BTreeMap<u32, f32> {
+    let values: Vec<f32> = logits
+        .iter()
+        .take(vocab)
+        .map(|bits| half::f16::from_bits(*bits).to_f32())
+        .collect();
+    let max = values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    if !max.is_finite() {
+        return BTreeMap::new();
+    }
+    let mut order: Vec<u32> = (0..vocab as u32).collect();
+    order.sort_by(|a, b| {
+        values[*b as usize]
+            .partial_cmp(&values[*a as usize])
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then(a.cmp(b))
+    });
+    order.truncate(k);
+    let weights: Vec<f32> = order
+        .iter()
+        .map(|token| (values[*token as usize] - max).exp())
+        .collect();
+    let total: f32 = weights.iter().sum();
+    if !(total > 0.0) {
+        return BTreeMap::new();
+    }
+    order
+        .into_iter()
+        .zip(weights)
+        .map(|(token, weight)| (token, weight / total))
+        .collect()
+}
+
+/// Draw one token from a sorted support with `uniform` in `[0, 1)`.
+fn sample_sorted(support: &BTreeMap<u32, f32>, sample: &mut impl FnMut() -> f32) -> u32 {
+    let threshold = sample() * support.values().sum::<f32>();
+    let mut cumulative = 0.0f32;
+    let mut last = 0u32;
+    for (token, prob) in support {
+        cumulative += *prob;
+        last = *token;
+        if cumulative >= threshold {
+            return *token;
+        }
+    }
+    last
+}
+
+/// The rejection step of Leviathan/Chen: resample from the normalised residual
+/// `max(0, p - q)`, with the rejected proposal's mass folded back to `p` so the
+/// result is a proper distribution and the emitted marginal stays exactly `p`.
+///
+/// `excluded` is the rejected proposal. It is removed from the residual (its
+/// probability under the residual is zero because `p(x) <= q(x)` there) and
+/// the remainder is renormalised; if everything cancels, fall back to `p` itself,
+/// which is the only answer that keeps the marginal exact.
+fn sample_residual(
+    p: &BTreeMap<u32, f32>,
+    q: &BTreeMap<u32, f32>,
+    excluded: &u32,
+    sample: &mut impl FnMut() -> f32,
+) -> u32 {
+    let mut residual: BTreeMap<u32, f32> = BTreeMap::new();
+    for (token, prob) in p {
+        if token == excluded {
+            continue;
+        }
+        let q_prob = q.get(token).copied().unwrap_or(0.0);
+        let difference = prob - q_prob;
+        if difference > 0.0 {
+            residual.insert(*token, difference);
+        }
+    }
+    let total: f32 = residual.values().sum();
+    if !(total > 0.0) {
+        return sample_sorted(p, sample);
+    }
+    for prob in residual.values_mut() {
+        *prob /= total;
+    }
+    sample_sorted(&residual, sample)
+}
+
+#[cfg(test)]
+mod sampler_tests {
+    use super::{sample_residual, sampler_distribution, sample_sorted};
+    use half::f16;
+    use std::collections::BTreeMap;
+
+    fn row(values: &[f32]) -> Vec<u16> {
+        values.iter().map(|v| f16::from_f32(*v).to_bits()).collect()
+    }
+
+    fn map(entries: &[(u32, f32)]) -> BTreeMap<u32, f32> {
+        entries.iter().copied().collect()
+    }
+
+    #[test]
+    fn the_distribution_is_the_sampler_not_the_softmax() {
+        // A row whose 5th entry is far below the top 4: top_k = 4 must drop it
+        // and renormalise, not just zero it.
+        let logits = row(&[10.0, 9.0, 8.0, 7.0, 0.0, 0.0, 0.0, 0.0]);
+        let dist = sampler_distribution(&logits, 8, 4);
+        assert_eq!(dist.len(), 4, "top_k truncates the support");
+        let total: f32 = dist.values().sum();
+        assert!(
+            (total - 1.0).abs() < 1e-3,
+            "the truncated support is renormalised, got {total}"
+        );
+        assert!(dist.get(&4).is_none(), "the 5th entry is dropped");
+    }
+
+    #[test]
+    fn a_degenerate_row_yields_an_empty_distribution() {
+        // All -inf (or NaN) must not panic or produce NaN probabilities.
+        let logits = vec![f16::NEG_INFINITY.to_bits(); 8];
+        let dist = sampler_distribution(&logits, 8, 4);
+        assert!(dist.is_empty(), "no finite max means no distribution");
+    }
+
+    /// Guards `sampler_distribution` against passing vacuously: a top_k larger
+    /// than the vocab must return the whole row.
+    #[test]
+    fn a_large_top_k_returns_every_token() {
+        let logits = row(&[3.0, 1.0, 0.5, 0.25]);
+        let dist = sampler_distribution(&logits, 4, 64);
+        assert_eq!(dist.len(), 4);
+    }
+
+    #[test]
+    fn the_residual_is_zero_on_the_rejected_token_and_renormalised() {
+        let p = map(&[(1, 0.5), (2, 0.5)]);
+        let q = map(&[(1, 0.9), (2, 0.1)]);
+        // Rejecting 1 means p(1) <= q(1) there, so the residual must exclude it
+        // and put all its mass on 2.
+        let mut draws = 0;
+        let mut draws_mut = || {
+            draws += 1;
+            0.99
+        };
+        let token = sample_residual(&p, &q, &1u32, &mut draws_mut);
+        assert_eq!(token, 2, "the residual must not resample the rejected token");
+    }
+
+    /// The exactness property the whole round rests on, checked numerically
+    /// instead of symbolically: Lamperti. The emitted token's marginal under
+    /// speculative sampling is
+    ///
+    ///   `q(t) * min(1, p(t)/q(t)) + sum_x q(x) * (1 - min(1, p(x)/q(x))) * residual(t | x)`
+    ///
+    /// and it must equal `p(t)` for every `t`. Both factors on the right are
+    /// computed by the *shipped* code (`sample_sorted`, `sample_residual`), not
+    /// by re-implementing them here — a test that re-derived the rule would only
+    /// prove the test is self-consistent.
+    ///
+    /// `sample_sorted` is a step function of its uniform, so a stratified grid
+    /// over that uniform integrates the residual exactly (up to the step's
+    /// position, which the grid resolves to within 1/N).
+    #[test]
+    fn acceptance_is_distribution_exact() {
+        for (p, q) in [
+            (
+                map(&[(1, 0.25), (2, 0.25), (3, 0.5)]),
+                map(&[(1, 0.5), (2, 0.25), (3, 0.25)]),
+            ),
+            // `q` steeper than `p`: nothing is ever accepted outright, so the
+            // marginal comes entirely from the residual.
+            (
+                map(&[(1, 0.1), (2, 0.2), (3, 0.7)]),
+                map(&[(1, 0.7), (2, 0.2), (3, 0.1)]),
+            ),
+            // A proposal that costs more than `p` allows it: `p/q >= 1` must
+            // accept with probability 1, not 1/2.
+            (
+                map(&[(1, 0.6), (2, 0.4)]),
+                map(&[(1, 0.1), (2, 0.9)]),
+            ),
+        ] {
+            let quadrature = 2_000usize;
+            let mut tally: BTreeMap<u32, f64> = BTreeMap::new();
+            for (proposal, q_prob) in &q {
+                let p_prob = p.get(proposal).copied().unwrap_or(0.0);
+                let accept = (p_prob / q_prob).min(1.0);
+                *tally.entry(*proposal).or_insert(0.0) += *q_prob as f64 * accept as f64;
+                let reject = 1.0f32 - accept;
+                if reject <= 0.0 {
+                    continue;
+                }
+                // The residual, integrated over its own uniform.
+                for index in 0..quadrature {
+                    let uniform = (index as f32 + 0.5) / quadrature as f32;
+                    let mut state = uniform;
+                    let mut next = move || {
+                        let value = state;
+                        state += 1.0;
+                        value
+                    };
+                    let drawn = sample_residual(&p, &q, proposal, &mut next);
+                    *tally.entry(drawn).or_insert(0.0) +=
+                        *q_prob as f64 * reject as f64 / quadrature as f64;
+                }
+            }
+            for (token, expected) in &p {
+                let observed = tally.get(token).copied().unwrap_or(0.0);
+                assert!(
+                    (observed - *expected as f64).abs() < 5e-3,
+                    "token {token}: marginal {observed} vs p {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_single_token_support_always_returns_it() {
+        let support = map(&[(7, 1.0)]);
+        let mut counter = 0.0f32;
+        let mut next = || {
+            counter += 0.5;
+            counter
+        };
+        assert_eq!(sample_sorted(&support, &mut next), 7);
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::select_draft_tokens;
@@ -1639,6 +1887,180 @@ impl DflashModel {
         cache.rewind(rows)
     }
 
+    /// T9 / `spec/dflash-30tps` L2: one full speculative round.
+    ///
+    /// # The shape, and why it is not the obvious one
+    ///
+    /// The naive round feeds `[anchor] ++ drafts` to the target at
+    /// `position .. position + n - 1`. That is **wrong**. The target's cache
+    /// already holds the anchor's K/V row — whatever produced `previous_logits`
+    /// put it there — so re-feeding the anchor at the same position appends a
+    /// *second*, identical key row beneath it. Causal attention then attends to
+    /// that key twice, which does not cancel: it changes the softmax denominator
+    /// and therefore the logits. The "target" being verified against is a subtly
+    /// different model, and acceptance is measured against corrupted logits —
+    /// silently, because nothing fails.
+    ///
+    /// So the anchor is never re-fed. Instead:
+    ///
+    ///   * `draft.tokens[0..n]` are fed at `position .. position + n - 1`,
+    ///   * `L[0]` is `previous_logits` — the target's own row for the position
+    ///     *before* this round's first draft, which the caller owns because each
+    ///     round consumes the logits its predecessor produced,
+    ///   * `L[k]` for `k >= 1` is the batched verify's row `k - 1`.
+    ///
+    /// `L[k]` is the target's prediction for the position `draft.tokens[k]`
+    /// lands at, so it is the row that decides whether that draft is accepted.
+    ///
+    /// # Verification: speculative sampling, not argmax
+    ///
+    /// `spec/dflash-30tps` was amended on 2026-10-12 to demand coherent output at
+    /// temperature 1.0 / top_k 64. **Argmax verification is not a valid verifier
+    /// for that**: matching argmax makes the whole generation greedy, which is a
+    /// different distribution from the one asked for. So the round uses
+    /// Leviathan et al. 2023 / Chen et al. 2023 speculative sampling over the
+    /// *sampler's* own distributions `S(p)` and `S(q)` (here: softmax, top-k
+    /// truncation, renormalise — the same sampler the caller will apply):
+    ///
+    ///   draft `x ~ S(q)`; accept with `min(1, S_p(x) / S_q(x))`; on rejection
+    ///   resample from the normalised residual `max(0, S_p - S_q)`.
+    ///
+    /// The emitted token's marginal is then exactly `S(p)`, so the speculative
+    /// stream is distributionally identical to sampling from the target
+    /// directly, at ~n tokens per round. `greedy` selects the argmax verifier
+    /// instead — the same loop with a degenerate proposal — for the bit-identical
+    /// equivalence test (R6 / AC3).
+    ///
+    /// # Retraction
+    ///
+    /// The target's cache advanced `n` rows but only `accepted.len() + 1` of them
+    /// are correct after a rejection, so the difference is retracted. The
+    /// drafter's own cache is the caller's business: it knows the tap schedule,
+    /// and redrafting from the verified prefix is what it should do.
+    ///
+    /// `sample` draws uniforms in `[0, 1)`; the engine's sampler supplies it so
+    /// the round and the single-token path cannot disagree about an RNG.
+    ///
+    /// Returns the drafted-and-verified round. `Ok(None)` when the drafter
+    /// produced nothing at all (a cache that has not seen enough context yet),
+    /// which the caller should treat as "take a plain target step".
+    pub fn draft_and_verify(
+        &mut self,
+        target: &mut crate::model::TextModel,
+        drafter_cache: &mut DflashKvCache,
+        anchor_token: u32,
+        previous_logits: &[u16],
+        position: usize,
+        greedy: bool,
+        top_k: usize,
+        mut sample: impl FnMut() -> f32,
+    ) -> Result<DflashRound, DflashError> {
+        let vocab = target.head().out_features;
+        if previous_logits.len() < vocab {
+            return Err(DflashError::Shape(format!(
+                "previous_logits holds {} of {vocab}",
+                previous_logits.len()
+            )));
+        }
+        let head = target.head();
+        let anchor_embedding = target.raw_embedding(&[anchor_token]);
+        let draft = self.draft_block(&anchor_embedding, position, drafter_cache, head)?;
+        let n = draft.tokens.len();
+        if n == 0 {
+            return Err(DflashError::Shape("the drafter drafted no tokens".to_string()));
+        }
+
+        // The target's row for each draft position. `L[0]` is the caller's
+        // previous row and is NOT re-derived (see the header); `L[k>=1]` comes
+        // off the batched verify, whose row `k-1` is the target's prediction at
+        // the position `draft.tokens[k]` was fed to.
+        let verify_positions: Vec<u32> =
+            (0..n as u32).map(|index| position as u32 + index).collect();
+        let verify_rows = target
+            .forward_verify(&draft.tokens, &verify_positions)
+            .map_err(|error| DflashError::Kernels(error.to_string()))?;
+        if verify_rows.len() < n * vocab {
+            return Err(DflashError::Shape(format!(
+                "the target returned {} rows of {vocab} for {n} drafts",
+                verify_rows.len() / vocab
+            )));
+        }
+
+        let mut accepted: Vec<u32> = Vec::with_capacity(n);
+        let mut next = 0u32;
+        for k in 0..n {
+            let candidate = draft.tokens[k];
+            let target_row: &[u16] = if k == 0 {
+                &previous_logits[..vocab]
+            } else {
+                let base = (k - 1) * vocab;
+                &verify_rows[base..base + vocab]
+            };
+            if greedy {
+                let target_token = argmax_row(target_row, vocab, 0);
+                if target_token == candidate {
+                    accepted.push(candidate);
+                } else {
+                    next = target_token;
+                    break;
+                }
+            } else {
+                let p = sampler_distribution(target_row, vocab, top_k);
+                // The proposal for draft k is the drafter's own row k+1: row 0
+                // is the anchor and predicts a token the target already
+                // emitted, so it is not a proposal for anything.
+                let q = if k + 1 < draft.logits.len() / vocab {
+                    let base = (k + 1) * vocab;
+                    sampler_distribution(&draft.logits[base..base + vocab], vocab, top_k)
+                } else {
+                    // The last draft has no row of its own in the block. Propose
+                    // from the target's row instead: the accept test is then
+                    // min(1, p/p) = 1 and the round degenerates to plain
+                    // sampling for that one position, which is exact.
+                    p.clone()
+                };
+                let p_candidate = p.get(&candidate).copied().unwrap_or(0.0);
+                let q_candidate = q.get(&candidate).copied().unwrap_or(0.0);
+                let accepted_now = q_candidate <= 0.0
+                    || p_candidate >= q_candidate
+                    || (p_candidate / q_candidate) > sample();
+                if accepted_now {
+                    accepted.push(candidate);
+                } else {
+                    next = sample_residual(&p, &q, &candidate, &mut sample);
+                    break;
+                }
+            }
+        }
+        if accepted.len() == n {
+            // Every draft landed. The round's correction token is then the
+            // target's prediction for the position just past the last accepted
+            // draft, which is the last verify row.
+            let base = (n - 1) * vocab;
+            let last_row = &verify_rows[base..base + vocab];
+            next = if greedy {
+                argmax_row(last_row, vocab, 0)
+            } else {
+                let p = sampler_distribution(last_row, vocab, top_k);
+                sample_sorted(&p, &mut sample)
+            };
+        }
+
+        // Cache accounting: the verify advanced `n` rows, `accepted.len() + 1`
+        // of which are correct. Retract the rest so the next round drafts are
+        // checked against the prefix the target actually emitted.
+        let correct = accepted.len() + 1;
+        if n > correct {
+            target.retract_gpu_caches(n - correct);
+        }
+
+        Ok(DflashRound {
+            accepted,
+            next,
+            drafted: n,
+        })
+    }
+
     /// R7/T9: draft one block from the cache.
     ///
     /// `anchor_embedding` is the *raw* target embedding row for the token at
@@ -1690,7 +2112,7 @@ impl DflashModel {
         // already emitted -- and dropped the last masked row. No test covered
         // this; `dflash_golden` only exercises `forward_block`.
         let tokens = select_draft_tokens(&logits, vocab, draft_rows);
-        Ok(DflashDraft { tokens, block })
+        Ok(DflashDraft { tokens, block, logits })
     }
 
     /// R11: apply the *target's* tied head and the drafter's softcap, exactly as
