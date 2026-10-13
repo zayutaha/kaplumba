@@ -169,7 +169,7 @@ branches selected from those results, not mandatory simultaneous implementations
   explains the rejected trajectory but does not validate the unprocessed-anchor
   contract for general prompts. Reverted the experiment. T16 stays open pending
   an exact row-zero method. Original experiment commit: `7cebcd5`; follow-up:
-  `ad37199`.
+  `ad37199`; spec correction: `4eef4f4`.
 - [x] **T5 — validate existing permutation propagation.**
   Plumbing landed in `9a4cf60`; this task adds direct setter coverage to
   `dflash_golden`: mode 0 must match the independent host reference at `fc`,
@@ -493,7 +493,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | T1b.2b | done | six repeated full rejections across position 1024; live layer-0 K/V/positions exact to sequential; preflight failure atomic; retract sabotage fails; `b8e6781` |
 | T19h / T19i | override rejected / follow-up complete | forced proposal reached a sensitive altered trajectory; natural M=3 rows and repeated rollback match; position sabotage fails; `ad37199` |
 | T12a | done | 3 × 200 greedy tokens match exactly; DFlash 3.85–4.34 tok/s vs plain 12.30; `20be6d7` |
-| T16a | experiment rejected | altered acceptance path flips at token 77 from accumulated batch-cache drift; exact row-zero contract remains open; `7cebcd5`, `ad37199` |
+| T16a | experiment rejected | altered acceptance path flips at token 77 from accumulated batch-cache drift; exact row-zero contract remains open; `7cebcd5`, `ad37199`, `4eef4f4` |
 | T19 | conditional design, held | GPU stage ownership/wait overhead needs measurement after correctness |
 | T1b.1 | done | 2048-slot sliding ring; boundary greedy identity, max logit delta 0.136719, 13.59 GiB phys_footprint, no swap; sabotage fails; `6e69bf7` |
 | T20.1 | done | exact fp16/fp32 mapped slices; host and full-context tests plus sabotage; `880b7e4` |
