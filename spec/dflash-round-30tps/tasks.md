@@ -276,7 +276,7 @@ branches selected from those results, not mandatory simultaneous implementations
   context append, and total generation on the same 3 × 200 greedy prompts.
   Keep instrumentation opt-in/test-only. Compare sums against elapsed wall time;
   this localizes T19 before GPU-resident changes. Test output remains identical.
-  Completed: 3 × 200 greedy tokens exact; commit `PENDING`.
+  Completed: 3 × 200 greedy tokens exact; commit `389dd88`.
 - [x] **T20 — load DFlash packed weights through base mmap + mlock path.**
   Files: `crates/engine/src/dflash.rs`, `crates/engine/tests/dflash_load.rs`,
   this spec's plan/tasks/notes. Replace the DFlash loader's per-tensor file reads
