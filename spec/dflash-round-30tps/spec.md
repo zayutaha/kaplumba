@@ -351,6 +351,12 @@ probe's overlaps are not substitute measurements for this engine.
   unchanged so the existing mmap/no-copy path remains usable. The existing
   drafter remains default unless exactness, stable gain, and memory acceptance
   all pass.
+* **AC13:** Any additional same-target EXL3 candidate is isolated from the
+  default model. Validate its file hash, config/taps, inferred trellis rate,
+  all-linears host comparison, and exact 3 × 200-token greedy streams before
+  comparing complete B=4/8/16 throughput with the current drafter. Use repeated
+  same-prompt A/B/A/B timings and report footprint, mlock, and swap. Candidate
+  evaluation alone cannot satisfy AC5 or change the default.
 
 ## Open questions / scheduled evidence
 
@@ -367,6 +373,9 @@ exact EAGLE-3 resident footprint and reduced-vocabulary mapping. A same-target
 community 6-bpw EXL3 DFlash candidate has a compatible tensor/config layout but
 exposed a hardcoded 4-bpw loader assumption. F1d resolves rate loading and
 evaluates it without changing the default. The separate Red Hat BF16 artifact
-remains incompatible with the current EXL3 loader.
+remains incompatible with the current EXL3 loader. The official ExLlama 5.00-bpw
+same-target EXL3 quant has matching architecture and tap configuration and is
+small enough to evaluate under F1e; its local acceptance, speed, and residency
+are not yet known.
 No default fallback, tolerance or checkpoint substitution is silently chosen by
 this draft.

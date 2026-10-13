@@ -552,6 +552,20 @@ branches selected from those results, not mandatory simultaneous implementations
   gate remain open. Candidate B16/B4 stream evidence is in implementation notes;
   results recorded in `implementation_notes.md` at `2601faf`.
 
+- [ ] **F1e — evaluate the official same-target 5-bpw EXL3 DFlash quant.**
+  Files: `crates/engine/tests/dflash_golden.rs`, this spec's
+  implementation notes and acceptance status. Candidate:
+  `turboderp/gemma4-31b-it-DFlash-exl3`, branch `5.00bpw`, shard size
+  961,045,318 bytes, expected LFS SHA-256
+  `5ae9ffe6f4c6250d7f08f0265b1aaff17bca6645b0879097e24aa447bd2f95ca`.
+  Keep it under `~/.kaplumba/models/Drafter-turboderp-5bpw`; do not change the
+  default. Check downloaded hash and config/taps/rates, mmap alignment, and
+  mlock profile; run all 36 host linears; run exact 3 × 200 greedy streams at
+  B=4/8/16 with `--test-threads=1`; compare B=4/8/16 to the existing drafter
+  with repeated same-prompt A/B/A/B; record `phys_footprint` and swap. Drop it
+  without promotion if exactness, stable gain or memory acceptance fail. This
+  evaluation cannot satisfy the 30 tok/s gate without a measured ≥30 result.
+
 ## Status
 
 | item | state | evidence |
@@ -588,6 +602,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | F1a / F1b | conditional, held | alternative evaluation requires shared verifier evidence and design decisions |
 | F1c | done, candidate rejected | public same-target model uses dense BF16 linears and incompatible config; header-only review, no weights downloaded |
 | F1d | evaluated; not promoted | 3×200 exact, B4 prompt-0 A/B/A/B +4.3%, but only 6.31 tok/s median and drafter mlock fails with target resident; see notes |
+| F1e | open | official 5-bpw candidate is downloading outside the repository; no local model results yet |
 | T11 | done | all-row greedy identity, offset sabotage, and short-context B-A-B timing; `aaa010c` |
 | T16b | experiment rejected | unprocessed anchor B=4 and B=16 both diverge at output 77 (99382 vs 84750); removed; `cb9de00` |
 

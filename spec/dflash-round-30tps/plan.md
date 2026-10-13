@@ -161,9 +161,24 @@ missing directory/config/shard must fail with the configured path in the
 diagnostic. Validate this by running with a deliberately nonexistent explicit
 path and observing test failure, then rerun on the actual candidate and observe
 that it loads and reaches a named tensor comparison.
+
 | `crates/engine/src/generate.rs` | plain generation only | experimental loop after round correctness |
 | `crates/cli/src/{args,main,chat}.rs` | no drafter selection | explicit flags, loading, errors and metrics; supported chat policy |
 | `crates/engine/tests/dflash_equivalence.rs` and a future verifier timing harness | existing evidence does not establish the full round | sequential-vs-batched control, ideal-proposal ceiling and round equivalence; final filenames chosen during implementation |
+
+### F1e — official 5-bpw EXL3 candidate
+
+Use `turboderp/gemma4-31b-it-DFlash-exl3`, branch `5.00bpw`, in an isolated
+directory under `~/.kaplumba/models`. The remote shard is 961,045,318 bytes;
+its config has the existing five-layer DFlash geometry, block size 16, taps
+`[1, 12, 23, 35, 46, 57]`, 8 KV heads × 128, and declares 5 bpw. Do not wire
+the candidate into the default path. First validate its complete file hash,
+header names/rates, mmap alignment and model-load profile; then run the existing
+36-line host oracle and exact 200-token greedy streams at B=4/8/16 across the
+three standard prompts. Interleave the candidate and existing 4-bpw drafter on
+the same prompt/block for A/B/A/B timings. Capture `/usr/bin/time -l`, mlock
+warnings, and swap; no result from the candidate counts toward AC5 unless the
+end-to-end 30 tok/s gate itself passes.
 
 ### P1 follow-up — keep DFlash block intermediates on Metal
 
@@ -390,3 +405,4 @@ same interleaved plain baseline. Existing kernel-family restrictions apply.
 | AC10 | F1a, F1b, T13, T14 |
 | AC11 | T20, T20.1 |
 | AC12 | T20.2, F1d |
+| AC13 | F1e |
