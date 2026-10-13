@@ -533,7 +533,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | F1a / F1b | conditional, held | alternative evaluation requires shared verifier evidence and design decisions |
 | F1c | done, candidate rejected | public same-target model uses dense BF16 linears and incompatible config; header-only review, no weights downloaded |
 | T11 | done | all-row greedy identity, offset sabotage, and short-context B-A-B timing; `aaa010c` |
-| T16b | experiment rejected | unprocessed anchor B=4 and B=16 both diverge at output 77 (99382 vs 84750); removed |
+| T16b | experiment rejected | unprocessed anchor B=4 and B=16 both diverge at output 77 (99382 vs 84750); removed; `cb9de00` |
 
 Historical 2026-10-13 follow-up (before latest authorization): user had limited
 work to drafting and exllamav3 diagnostics.
