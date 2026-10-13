@@ -197,6 +197,129 @@ fn batched_m3_matches_sequential_at_dflash_prompt_token_77() {
 
 #[test]
 #[ignore = "requires KAPLUMBA_TEST_MODEL; loads the 16 GB target"]
+fn repeated_rejections_preserve_live_cache_and_preflight_errors_are_atomic() {
+    let path = model_path();
+    let mut model = TextModel::load_from_dir(Path::new(&path)).expect("target model");
+    let vocab = model.vocab_size();
+    let prefix_len = 1022usize;
+    let prefix: Vec<u32> = (0..prefix_len as u32)
+        .map(|index| 1 + (index * 7919 + 17) % 4096)
+        .collect();
+    let prefix_positions: Vec<u32> = (0..prefix_len as u32).collect();
+    let corrections = [2048u32, 2051, 2063, 2077, 2099, 2111];
+
+    model.reset_gpu_caches();
+    model
+        .forward_buffer(&prefix, &prefix_positions)
+        .expect("prefill repeated-rejection prefix");
+    let before_bad_verify = model.layer_kv_to_host(0).expect("cache before error");
+    let bad_positions: Vec<u32> = (0..4).map(|row| (prefix_len + row + 1) as u32).collect();
+    let error = model
+        .forward_verify(&[137, 941, 211, 1501], &bad_positions)
+        .expect_err("non-contiguous verify must fail before writing cache");
+    assert!(
+        error
+            .to_string()
+            .contains("positions must begin at the current cache position"),
+        "unexpected preflight error: {error}"
+    );
+    assert_eq!(model.gpu_next_position(), prefix_len);
+    assert_eq!(
+        model.layer_kv_to_host(0).expect("cache after error"),
+        before_bad_verify,
+        "preflight failure mutated the target KV cache"
+    );
+
+    let mut actual_logits = Vec::with_capacity(corrections.len());
+    for (round, correction) in corrections.iter().copied().enumerate() {
+        let position = prefix_len + round;
+        let draft = [
+            137 + round as u32,
+            941 + round as u32,
+            211 + round as u32,
+            1501 + round as u32,
+        ];
+        let positions: Vec<u32> = (0..draft.len())
+            .map(|row| (position + row) as u32)
+            .collect();
+        model
+            .forward_verify(&draft, &positions)
+            .expect("verify repeated rejected rows");
+        model.retract_gpu_caches(draft.len());
+        assert_eq!(model.gpu_next_position(), position);
+        let logits = model
+            .forward_buffer(&[correction], &[position as u32])
+            .expect("feed correction after full rejection");
+        actual_logits.push(logits);
+        assert_eq!(model.gpu_next_position(), position + 1);
+    }
+    let actual_cache = model.layer_kv_to_host(0).expect("repeated-rejection cache");
+
+    model.reset_gpu_caches();
+    model
+        .forward_buffer(&prefix, &prefix_positions)
+        .expect("sequential reference prefill");
+    for (round, correction) in corrections.iter().copied().enumerate() {
+        let position = prefix_len + round;
+        let expected = model
+            .forward_buffer(&[correction], &[position as u32])
+            .expect("sequential reference correction");
+        assert_eq!(
+            argmax_row(&actual_logits[round], 0, vocab),
+            argmax_row(&expected, 0, vocab),
+            "repeated rejection changed greedy output at correction {round}"
+        );
+        let mut max_delta = 0.0f32;
+        for (actual, expected) in actual_logits[round].iter().zip(expected) {
+            max_delta = max_delta.max(
+                (half::f16::from_bits(*actual).to_f32() - half::f16::from_bits(expected).to_f32())
+                    .abs(),
+            );
+        }
+        assert!(
+            max_delta < 2.0,
+            "repeated rejection correction {round} max logit delta {max_delta:.6}"
+        );
+    }
+    let expected_cache = model
+        .layer_kv_to_host(0)
+        .expect("sequential reference cache");
+    let (actual_keys, actual_values, actual_positions, actual_slots, heads, dim) = &actual_cache;
+    let (
+        expected_keys,
+        expected_values,
+        expected_positions,
+        expected_slots,
+        expected_heads,
+        expected_dim,
+    ) = &expected_cache;
+    assert_eq!((*heads, *dim), (*expected_heads, *expected_dim));
+    let cursor = prefix_len + corrections.len();
+    let first_live = cursor.saturating_sub(1024);
+    let width = heads * dim;
+    for position in first_live..cursor {
+        let actual_slot = actual_slots[position];
+        let expected_slot = expected_slots[position];
+        assert_eq!(actual_slot, expected_slot);
+        assert_eq!(actual_positions[actual_slot], position as u32);
+        assert_eq!(expected_positions[expected_slot], position as u32);
+        let start_actual = actual_slot * width;
+        let start_expected = expected_slot * width;
+        assert_eq!(
+            &actual_keys[start_actual..start_actual + width],
+            &expected_keys[start_expected..start_expected + width],
+            "retained key differs at logical position {position}"
+        );
+        assert_eq!(
+            &actual_values[start_actual..start_actual + width],
+            &expected_values[start_expected..start_expected + width],
+            "retained value differs at logical position {position}"
+        );
+    }
+}
+
+#[test]
+#[ignore = "requires KAPLUMBA_TEST_MODEL; loads the 16 GB target"]
 fn batched_verify_head_matches_sequential_single_row() {
     let path = model_path();
     let dir = Path::new(&path);

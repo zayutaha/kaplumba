@@ -969,3 +969,25 @@ were compared. Restoring exact positions made the focused test pass in 33.98 s.
 The test also logged output-77's close margin. No model change was justified.
 Failed forced-override run: `/tmp/dflash-t19h-sabotage.log`; cache-drift replay
 numbers came from the temporary accepted-pattern diagnostic, which was removed.
+
+## 2026-10-14 — repeated rejection around the sliding-window boundary
+
+Added ignored GPU test `repeated_rejections_preserve_live_cache_and_preflight_errors_are_atomic`
+in `crates/engine/tests/dflash_verify_head.rs`. It prefills 1022 tokens, confirms
+a non-contiguous verify-position error is rejected before any layer-0 cache
+bytes or position slots change, then runs six four-row full rejections followed
+by one target correction each. The sequence crosses position 1024. Correction
+argmaxes matched an independently replayed sequential stream and max logit
+delta stayed below 2.0. On layer 0, every live logical position (4 through 1027
+at the final exclusive cursor 1028) had identical slot mapping, absolute position, K and V to the
+sequential reference. This covers repeated stale-tail writes that T1b.2a's
+single rollback cases did not.
+
+Sabotaged `TextModel::retract_gpu_caches` to retract `tokens - 1`; the new test
+failed with cursor 1023 vs expected 1022 immediately after the first rejection.
+Restored the implementation and reran clean: 1 passed in 32.88 s. Build command:
+`cargo test --release -p kaplumba-engine --test dflash_verify_head --no-run`.
+GPU command:
+`scripts/gpuq try -- env KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacked" cargo test --release -p kaplumba-engine --test dflash_verify_head repeated_rejections_preserve_live_cache_and_preflight_errors_are_atomic -- --ignored --exact --nocapture`.
+Preflight failure is atomic; a post-dispatch device error is still not injected,
+so parent task T1b.2 remains open. No model code changed.
