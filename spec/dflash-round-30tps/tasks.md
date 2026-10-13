@@ -181,7 +181,7 @@ branches selected from those results, not mandatory simultaneous implementations
   offset. The corrected host oracle confirms the loader's mode-0 default for all
   36 linears; mode 1 fails both the host reference and setter canary. This is
   the justified row-major layout for this checkpoint. Do not choose layouts
-  from overlap.
+  from overlap. Commit: `c71a335`.
 - [x] **T7 — head diagnosis after T0c.**
   Files: `crates/engine/tests/dflash_alpha_probe.rs` and notes; production
   change only if proven. Reconstruct selected 128-column head bands directly
@@ -479,7 +479,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | T0c | done | 3 nonzero rows; full-vocab max error ≤0.0156; zero-row and ×2 scale sabotage fail; `00ae90b` |
 | T7 | done | 45 host/target/DFlash bands; worst error 0.0088; tile-index and ×2 scale sabotage fail; `8863b83` |
 | T5 | done | setter mode 1 diverges from host; mode 0 restores bit-exact; no-op setter sabotage fails; `f934c0d` |
-| T6 | done | all 36 actual buffer linears match independent mode-0 host decode; wrong-mode controls fail; see notes |
+| T6 | done | all 36 actual buffer linears match independent mode-0 host decode; wrong-mode controls fail; `c71a335` |
 | T1a | done | code/tests `2f35201`; argmax sabotage failure in implementation notes |
 | V0a | done | 3 prompts × M=1/2/4/8/16 greedy identity; tap/KV and ring boundary parity; row and query-position sabotage both fail; see implementation notes |
 | V0b | done | 3 prefixes × 4 contexts × M=2/4/8/16 × 3 repeats; greedy identity; `00f8c38` |
