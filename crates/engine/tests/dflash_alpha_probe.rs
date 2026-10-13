@@ -51,6 +51,7 @@ use std::path::{Path, PathBuf};
 
 use half::f16;
 use kaplumba_engine::dflash::{DflashConfig, DflashKvCache, DflashModel, DflashWeights};
+use kaplumba_engine::exl3::{apply_hadamard_matrix, decode_tile, BitRate, Codebook, SignVector};
 use kaplumba_engine::model::TextModel;
 use kaplumba_engine::tokenizer::GemmaTokenizer;
 
@@ -197,6 +198,103 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         .zip(b.iter())
         .map(|(x, y)| (x - y).abs())
         .fold(0.0_f32, f32::max)
+}
+
+/// Reconstruct one 128-column LM-head band on the host. Reconstructing the
+/// full 5376×262144 fp32 matrix would need 5.6 GB, so this follows the EXL3
+/// row-major tile order and its 128×128 Hadamard transforms for one band.
+fn host_head_band(
+    head: &kaplumba_engine::model::QuantizedLinear,
+    input: &[u16],
+    column_start: usize,
+    softcap: f32,
+) -> Vec<f32> {
+    const BAND: usize = 128;
+    assert_eq!(input.len(), head.in_features);
+    assert_eq!(column_start % BAND, 0, "host bands align to Hadamard tiles");
+    assert!(column_start + BAND <= head.out_features);
+    let rate = match head.rate {
+        kaplumba_kernels::exl3::Exl3Rate::Integer(bits) => BitRate::Integer(bits),
+        other => panic!("unsupported target head rate {other:?}"),
+    };
+    assert_eq!(head.codebook, kaplumba_kernels::exl3::Exl3Codebook::Mcg);
+    let rows = head.in_features;
+    let tiles_n = head.out_features / 16;
+    let tile_rows = rows / 16;
+    let first_tile_n = column_start / 16;
+    let tiles_in_band = BAND / 16;
+    let words_per_tile = rate.packed_words();
+    let expected_words = tile_rows * tiles_n * words_per_tile;
+    assert_eq!(
+        head.packed_len.unwrap_or(head.packed.len()),
+        expected_words,
+        "head packed length must cover the complete EXL3 matrix"
+    );
+    let packed_buffer = head
+        .metal_buffer
+        .as_ref()
+        .expect("mapped target head buffer");
+    let packed_bytes = expected_words * std::mem::size_of::<u16>();
+    assert!(
+        head.metal_offset + packed_bytes as u64 <= packed_buffer.length(),
+        "head trellis region must fit in its mapped shard buffer"
+    );
+    let packed_base = unsafe {
+        (packed_buffer.contents() as *const u8)
+            .add(head.metal_offset as usize)
+            .cast::<u16>()
+    };
+
+    let mut weights = vec![0.0_f32; rows * BAND];
+    for tile_row in 0..tile_rows {
+        for local_tile_n in 0..tiles_in_band {
+            let tile_n = first_tile_n + local_tile_n;
+            let packed_offset = (tile_row * tiles_n + tile_n) * words_per_tile;
+            let tile = if head.packed.is_empty() {
+                let packed_tile = unsafe {
+                    std::slice::from_raw_parts(packed_base.add(packed_offset), words_per_tile)
+                };
+                decode_tile(packed_tile, rate, Codebook::Mcg)
+            } else {
+                decode_tile(
+                    &head.packed[packed_offset..packed_offset + words_per_tile],
+                    rate,
+                    Codebook::Mcg,
+                )
+            }
+            .expect("decode target head EXL3 tile");
+            for row in 0..16 {
+                for column in 0..16 {
+                    let matrix_row = tile_row * 16 + row;
+                    let matrix_column = local_tile_n * 16 + column;
+                    weights[matrix_row * BAND + matrix_column] = tile[row * 16 + column];
+                }
+            }
+        }
+    }
+    apply_hadamard_matrix(&mut weights, rows, BAND).expect("host head Hadamard");
+    let input_signs = SignVector::from_half_bits(head.input_signs.clone())
+        .decode(rows)
+        .expect("decode target head input scales");
+    let all_output_signs = SignVector::from_half_bits(head.output_signs.clone())
+        .decode(head.out_features)
+        .expect("decode target head output scales");
+    let start = column_start;
+    for row in 0..rows {
+        for column in 0..BAND {
+            weights[row * BAND + column] *= input_signs[row] * all_output_signs[start + column];
+        }
+    }
+
+    let mut logits = vec![0.0_f32; BAND];
+    for column in 0..BAND {
+        let mut sum = 0.0_f32;
+        for row in 0..rows {
+            sum += f16::from_bits(input[row]).to_f32() * weights[row * BAND + column];
+        }
+        logits[column] = softcap * (sum / softcap).tanh();
+    }
+    logits
 }
 
 struct Case {
@@ -418,7 +516,8 @@ fn measure_case(
         let replayed = drafter
             .draft_logits(row, head, config.final_logit_softcapping, 1)
             .expect("D10 replay target head through DFlash GEMM");
-        let diff = max_abs_diff(&widen(&replayed), &target_f32);
+        let replayed_f32 = widen(&replayed);
+        let diff = max_abs_diff(&replayed_f32, &target_f32);
         assert!(
             diff <= 1.0,
             "D10 row {index}: target-head replay max logit error {diff:.4} exceeds 1.0"
@@ -428,6 +527,25 @@ fn measure_case(
             argmax(target_logits),
             "D10 row {index}: target-head replay changed greedy token"
         );
+
+        let head = target.head();
+        for column_start in [0, 128, 65_536, 131_072, head.out_features - 128] {
+            let host = host_head_band(head, row, column_start, config.final_logit_softcapping);
+            let end = column_start + host.len();
+            let target_error = max_abs_diff(&host, &target_f32[column_start..end]);
+            let dflash_error = max_abs_diff(&host, &replayed_f32[column_start..end]);
+            assert!(
+                target_error <= 0.05,
+                "T7 row {index}, columns {column_start}..{end}: host vs target GEMV error {target_error:.4} exceeds 0.05"
+            );
+            assert!(
+                dflash_error <= 0.05,
+                "T7 row {index}, columns {column_start}..{end}: host vs DFlash GEMM error {dflash_error:.4} exceeds 0.05"
+            );
+            println!(
+                "  [t7] row {index}, columns {column_start}..{end}: host-target {target_error:.4}, host-DFlash {dflash_error:.4}"
+            );
+        }
         println!(
             "  [d10] row {index}: full-vocabulary head replay max diff {diff:.4}; greedy token {} matches",
             argmax(target_logits)

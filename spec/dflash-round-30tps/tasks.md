@@ -147,10 +147,14 @@ branches selected from those results, not mandatory simultaneous implementations
   Files: drafter loader/tests and implementation notes if a mismatch is proven.
   Test: checkpoint reconstruction and distinct target-head/drafter modes; log
   actual default and justified layout. Do not choose layout solely by overlap.
-- [ ] **T7 — head diagnosis after T0c.**
-  Files: repaired head-oracle test and notes; production change only if proven.
-  Test: independent host vs target head vs drafter head on identical inputs,
-  declared tolerances, representative rows/slices, and path-specific sabotage.
+- [x] **T7 — head diagnosis after T0c.**
+  Files: `crates/engine/tests/dflash_alpha_probe.rs` and notes; production
+  change only if proven. Reconstruct selected 128-column head bands directly
+  from EXL3 tiles and sign vectors to avoid allocating the full 5.6 GB matrix.
+  Test: independent host vs target head vs DFlash head on identical nonzero
+  rows, slices at the vocabulary start/interior/end, declared 0.05 tolerance,
+  and path-specific indexing/scale sabotage. Results and commit hash recorded
+  in notes and Status.
 - [ ] **T8 — aligned checkpoint semantics.**
   Files: `dflash_alpha_probe.rs`, diagnostic tests, and notes; fix a proven
   semantic mismatch as a separately committed task if necessary.
@@ -278,7 +282,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | A3 | review/tests complete | `exllama_review.md` and text evidence; `59a6f4b` |
 | T0a / T0b | historical observations recorded | earlier rerun notes; not repeated during this audit |
 | T0c | done | 3 nonzero rows; full-vocab max error ≤0.0156; zero-row and ×2 scale sabotage fail; `00ae90b` |
-| T7 | open | use corrected oracle to continue drafter-stage diagnosis |
+| T7 | done | 45 host/target/DFlash bands; worst error 0.0088; tile-index and ×2 scale sabotage fail; hash pending |
 | T5 plumbing | implemented | `9a4cf60`; independent correctness/coverage gate open |
 | T6 sweep | prior work recorded | `6622031`; reference/default gate open |
 | T1a | done | code/tests `2f35201`; argmax sabotage failure in implementation notes |

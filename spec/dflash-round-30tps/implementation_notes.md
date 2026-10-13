@@ -257,8 +257,44 @@ Validation used `scripts/gpuq try` with `Gxma-repacked` and the `Drafter`:
   tap+1 measured 0.2439; colmajor measured 0.0000. This supersedes the old
   0.1663/mode-1 claim: the target head path is correct, and permutation mode 1
   is not a useful layout for this checkpoint. Low acceptance is still a
-  drafter path/quality problem, not proof of low model quality until T7/T8
-  isolate its stages.
+  drafter path/quality problem, not proof of low model quality until T8 isolates
+  its remaining stages.
+
+## 2026-10-13 — T7: independent target-head reconstruction
+
+Extended D10 with a CPU reference for five 128-column bands of the 6-bpw
+target head: vocabulary columns 0–128, 128–256, 65536–65664, 131072–131200,
+and 262016–262144, across three nonzero final-norm rows. The helper decodes
+only those EXL3 tiles from the mmap-backed Metal shard buffer, applies the
+checkpoint sign vectors and 128×128 Hadamard transforms, then computes the
+softcapped dot product in f32. It never allocates the full 5.6 GB fp32 matrix.
+Host, target `encode_gemv`, and DFlash `gemm_chunk_buffer_sliced` all receive
+the same final-norm row and head. The 0.05 maximum-logit bound was set before
+the comparison; full target-vs-DFlash output also retains the T0c 1.0 bound
+and exact-argmax assertion.
+
+Validation command: `scripts/gpuq try -- env KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacked" KAPLUMBA_DFLASH_DIR="$HOME/.kaplumba/models/Drafter" cargo test --release -p kaplumba-engine --test dflash_alpha_probe -- --ignored --exact --nocapture`.
+It passed 1/1 in 35.52 s. Across all three probe layouts (row-major configured,
+tap+1, and colmajor), 45 band comparisons passed; worst host-vs-target and
+host-vs-DFlash error was 0.0088. Full-vocabulary target-vs-DFlash maximum
+errors remained 0.0078 / 0.0078 / 0.0156 for the three rows, with identical
+greedy tokens.
+
+Coverage sabotage results, restored afterward:
+
+- Shift the host band by one 128-column tile: failed with `T7 row 0, columns
+  0..128: host vs target GEMV error 38.9325 exceeds 0.05` (exit 101).
+- Double the host input scale: failed with `T7 row 0, columns 0..128: host vs
+  target GEMV error 8.9751 exceeds 0.05` (exit 101).
+- A first attempt to use `head.packed` found it empty under the mmap loader.
+  The test reads only selected tile words from `metal_buffer` contents at
+  `metal_offset`; the zero-copy loader and mlock path are unchanged.
+
+Conclusion: target-head packing, mapped offset, sign/scaling, vocabulary slice
+indexing, and target-vs-DFlash head kernels agree. The head is not the source
+of the measured 0.2604 mean diagonal overlap. Continue with T8's model-stage,
+tap, and row alignment checks; do not re-enable colmajor from the stale alpha
+claim.
 
 ## 2026-10-13 — V0b ideal-proposal verifier ceiling
 

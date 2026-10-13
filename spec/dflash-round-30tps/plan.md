@@ -118,6 +118,7 @@ before asserting practical headroom.
 | path | observed behavior | planned work |
 |---|---|---|
 | `crates/engine/tests/dflash_alpha_probe.rs` | D10 passes a prompt-length batch to the single-token `forward_with_hidden` API, then reads an unwritten last row; no numerical assertion | use sequential final-token decode rows, compare all vocabulary logits to target GEMV output, assert numeric/argmax bounds |
+| D10 host control in `dflash_alpha_probe.rs` | target GEMV and DFlash sliced GEMM only cross-check two GPU paths | reconstruct bounded 128-column EXL3 head bands on CPU, apply documented Hadamard/sign transforms, and compare host/target/DFlash outputs on identical rows |
 | `crates/engine/tests/dflash_alpha_probe.rs` | overlap matrix on greedy target continuation; hardcoded speed decision | label overlap as diagnostic; align rows; replace speed threshold with measured round statistics |
 | `crates/kernels/src/linear.rs` | `perm_mode` present; fp16/fp32 buffer GEMM validates offset but binds packed bytes at zero | honor packed offset/length via offset-aware binding; then independently validate layout |
 | `crates/engine/src/dflash.rs` | T1a samples from retained q; temperature 1/top-k policy; existing processed-anchor method | complete sampler policy, unprocessed-anchor API, independent stage diagnosis and verified context ownership |
