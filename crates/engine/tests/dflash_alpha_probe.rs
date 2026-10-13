@@ -93,6 +93,24 @@ fn dflash_mask_rows_align_with_same_position_target_logits() {
     }
 }
 
+#[test]
+fn proposal_temperature_changes_q_without_changing_target_p() {
+    let logits = [0.0_f32, -0.5, -1.0, -2.0]
+        .iter()
+        .map(|value| f16::from_f32(*value).to_bits())
+        .collect::<Vec<_>>();
+    let cool = top_k_distribution_at_temperature(&logits, 3, 0.5);
+    let hot = top_k_distribution_at_temperature(&logits, 3, 2.0);
+    let target_p = top_k_distribution(&logits, 3);
+
+    assert_eq!(cool.len(), 3);
+    assert_eq!(hot.len(), 3);
+    assert!((cool.iter().map(|(_, p)| p).sum::<f64>() - 1.0).abs() < 1e-12);
+    assert!((hot.iter().map(|(_, p)| p).sum::<f64>() - 1.0).abs() < 1e-12);
+    assert!(cool[0].1 > hot[0].1, "cool q should be sharper than hot q");
+    assert_eq!(target_p, top_k_distribution_at_temperature(&logits, 3, 1.0));
+}
+
 fn model_path() -> String {
     std::env::var("KAPLUMBA_TEST_MODEL").expect("KAPLUMBA_TEST_MODEL is required")
 }
@@ -106,12 +124,24 @@ fn drafter_dir() -> PathBuf {
 /// Softmax at temperature 1, truncated to the `k` largest entries and renormalised
 /// -- what `_sampling_probs` does in `dflash/model.py`.
 fn top_k_distribution(logits: &[u16], k: usize) -> Vec<(u32, f64)> {
+    top_k_distribution_at_temperature(logits, k, 1.0)
+}
+
+fn top_k_distribution_at_temperature(
+    logits: &[u16],
+    k: usize,
+    temperature: f64,
+) -> Vec<(u32, f64)> {
+    assert!(temperature.is_finite() && temperature > 0.0);
     let values: Vec<f64> = logits
         .iter()
         .map(|bits| f16::from_bits(*bits).to_f32() as f64)
         .collect();
     let max = values.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-    let mut probs: Vec<f64> = values.iter().map(|v| (v - max).exp()).collect();
+    let mut probs: Vec<f64> = values
+        .iter()
+        .map(|v| ((v - max) / temperature).exp())
+        .collect();
     let total: f64 = probs.iter().sum();
     if !(total > 0.0) {
         return Vec::new();
@@ -331,6 +361,9 @@ struct Case {
     /// The drafter's *capped* block logits, every row, kept so two cases can be
     /// compared at the logits level and not only at their argmaxes (T12).
     block_logits: Vec<u16>,
+    /// Target p distributions remain fixed at temperature 1 / top-k 64; T10
+    /// evaluates proposal-only temperature candidates against these rows.
+    target_distributions: Vec<Vec<(u32, f64)>>,
 }
 
 /// Prefill, build the drafter's context from `layers`, chain a few target steps, draft
@@ -1033,6 +1066,7 @@ fn measure_case(
         drafts: draft.tokens.clone(),
         top_target: top3(&targets[0]),
         block_logits,
+        target_distributions: targets,
     }
 }
 
@@ -1129,6 +1163,32 @@ fn alpha_at_temperature_1_top_k_64() {
                     .map(|(index, alpha)| (index + 1, *alpha))
                     .collect::<Vec<_>>()
             );
+            if label == "as-configured" {
+                let vocab = case.block_logits.len() / config.block_size;
+                println!(
+                    "  [t10] target p fixed at temp=1/top_k={TOP_K}; proposal q temp sweep, top_k={TOP_K}"
+                );
+                for proposal_temperature in [0.5, 0.75, 1.0, 1.25, 1.5, 2.0] {
+                    let row_alphas: Vec<f64> = (1..config.block_size)
+                        .map(|row| {
+                            let target_row = target_row_for_mask_row(row);
+                            let row_logits = &case.block_logits[row * vocab..(row + 1) * vocab];
+                            let q = top_k_distribution_at_temperature(
+                                row_logits,
+                                TOP_K,
+                                proposal_temperature,
+                            );
+                            acceptance(&case.target_distributions[target_row], &q)
+                        })
+                        .collect();
+                    let early = row_alphas[..4].iter().sum::<f64>() / 4.0;
+                    let late = row_alphas[4..].iter().sum::<f64>() / (row_alphas.len() - 4) as f64;
+                    let mean = row_alphas.iter().sum::<f64>() / row_alphas.len() as f64;
+                    println!(
+                        "    q_temp {proposal_temperature:.2}: mean {mean:.4}, depths1-4 {early:.4}, depths5-15 {late:.4}, per-depth {row_alphas:?}"
+                    );
+                }
+            }
             summary.push((label, layers, case));
         }
 

@@ -394,3 +394,41 @@ the drafter signal/quality path and implement a measured complete round; target
 - Row-selection sabotage: changed `head_rows_matrix` to repeat the first row. The row-signal test failed with `adjacent verify rows are nearly identical (0/4194304)`; restored and retested successfully.
 - Position sabotage: shifted staged batched query positions by +1. The sequential comparison failed at M=2 row 0: batched greedy `3824`, sequential `236777`; restored and reran the 3-prompt matrix successfully.
 - V0a now closes. These results establish greedy target-logit/cache parity for the tested shapes and position boundary. Sampled distribution equivalence and round rollback remain in T1b.2/T12; V0b ideal-proposal timing is recorded above.
+
+## 2026-10-13 — T10a proposal-temperature diagnostic
+
+Extended `dflash_alpha_probe.rs` to compare proposal q at temperatures
+0.5/0.75/1.0/1.25/1.5/2.0 while holding target p at temperature 1.0/top-k 64.
+The sweep uses the same three real prompts and all 15 draft positions. It is
+diagnostic only: no production sampler behavior changed. Mean overlap by
+temperature, averaged equally over the three prompts, was 0.2071/0.1971/0.1805/
+0.1610/0.1428/0.1125. Per-prompt bests differed: 0.75 for the relativity prompt
+(0.1033 vs 0.0992 at 1.0), 0.5 for coastal temperatures (0.3445 vs 0.2572),
+and 1.0 for garden planning (0.1852; 0.1851 at 0.75). The gain is neither
+large nor stable enough to select a product temperature, and mean late-depth
+overlap remains poor. Changing q temperature also requires T1c to retain the
+exact proposal distribution used for each draw before any production trial.
+
+Validation: release `proposal_temperature_changes_q_without_changing_target_p`
+passed. Sabotage replacing the temperature divisor with `1.0` failed the named
+`cool q should be sharper than hot q` assertion (exit 101); restored and reran
+successfully. The full forced-load diagnostic passed 1/1 in 92.63 s through
+`scripts/gpuq try`; all 3 prompts completed the 6 temperatures × 15 positions.
+Command:
+
+```bash
+scripts/gpuq try -- env KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacked" \
+  KAPLUMBA_DFLASH_DIR="$HOME/.kaplumba/models/Drafter" \
+  cargo test --release -p kaplumba-engine --test dflash_alpha_probe \
+  alpha_at_temperature_1_top_k_64 -- --ignored --exact --nocapture
+```
+
+The model process emitted one `mlock` warning for an 86,720,512-byte range
+(`Resource temporarily unavailable`, after 0 bytes in that range tracker). The
+test completed; this diagnostic does not establish whether target or drafter
+weight pages remained pinned, and it is not a throughput result. Investigate
+before using this run to make any residency claim.
+
+`git diff --check` and rustfmt check passed. T10 remains open for actual
+acceptance and complete round cost; temperature tuning alone is not the path to
+30 tok/s.

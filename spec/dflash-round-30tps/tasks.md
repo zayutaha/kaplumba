@@ -201,12 +201,21 @@ branches selected from those results, not mandatory simultaneous implementations
   distinct from target-feature context. Test positions, q conditioning, anchor
   deduplication and rollback before claiming a 31-proposal path.
 - [ ] **T10 — measure trained B16 and shorter proposal prefixes.**
-  Files: benchmark harness and notes. Same prompts/settings with each variant's
-  actual acceptance; complete disjoint timings, including full-block draft cost
-  if prefixes are truncated. B32/two-block experiments depend on T9's semantic
-  design and evidence; do not assume native B32 training.
-  Test: interleaved repeated runs,
-  totals, prefix survival and spread. No requirement for identical alpha.
+  Files: benchmark harness and notes. With the proposal-temperature diagnostic
+  in T10a complete, measure trained B16 and shorter prefixes with actual
+  acceptance and complete disjoint timings,
+  including full-block draft cost when truncating outputs. B32/two-block tests
+  depend on T9's semantic design; do not assume native B32 training.
+  Test interleaved repeated runs, totals, prefix survival and spread. No
+  requirement for identical alpha.
+- [x] **T10a — measure proposal-temperature sensitivity.**
+  Files: `dflash_alpha_probe.rs`, plan and implementation notes. Sweep proposal
+  q temperature at 0.5/0.75/1/1.25/1.5/2 against fixed target p at 1.0/top-k
+  64 for all 15 positions on the three existing real prompts. Diagnostic only;
+  no product sampler changes. The fast fixture proves q changes with temperature
+  while target p remains fixed. Sabotage the temperature divisor and observe
+  the named assertion fail. Result: no stable cross-prompt temperature winner;
+  see implementation notes. Commit: pending.
 - [ ] **T15 — choose length from complete cost and prefix survival.**
   Files: proposal/generation selection policy and notes. Select measured useful
   lengths; use plain continuation when speculation has no measured gain.
