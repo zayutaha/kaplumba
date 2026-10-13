@@ -339,7 +339,7 @@ branches selected from those results, not mandatory simultaneous implementations
   context (V relative error 0.584% vs the 0.5% bound). Fixed scratch is now
   5,980,160 bytes (5.70 MiB), including the third f32 residual buffer. Commit
   commit `529f1af`.
-- [ ] **T19g.3 — route draft generation through the encoded block and measure.**
+- [x] **T19g.3 — route draft generation through the encoded block and measure.**
   Files: `crates/engine/src/dflash.rs`, `dflash_equivalence.rs`, notes. Preserve
   the slice path as a test oracle; compare draft logits/argmax and exact target
   generation, then run 3 × 200 and interleaved A/B plus footprint/swap. Adopt
@@ -351,10 +351,14 @@ branches selected from those results, not mandatory simultaneous implementations
   Updated three-prompt runs: B=4 encoded 7.08/7.01/7.16 tok/s (median 7.08),
   slice 6.92/6.89/7.05 (median 6.92); exact on all 600 tokens. `time -l`
   measured 14.35 GiB footprint and zero swapouts for the encoded run. These
-  grouped A/B runs are not yet repeated/interleaved enough to call a stable
-  2.3% gain. B=16 encoded now passed all three prompts at 4.16/4.06/4.58
+  grouped A/B runs alone were not enough to call a stable 2.3% gain. B=16
+  encoded now passed all three prompts at 4.16/4.06/4.58
   tok/s (median 4.16; rounds 78/80/71; accepted 127/123/128), exact on all
-  600 tokens. Interleaved repeats remain before closing this task.
+  600 tokens. Prompt-0 interleaved A/B/A/B/A/B measured encoded
+  7.07/7.05/7.08 and slice 6.96/6.94/6.95 tok/s; all six runs were exact.
+  Encoded median gain is ~1.7%, within practical noise and not enough to change
+  the default. Full B=4 footprint was 13.37 GiB with zero swapouts. The encoded
+  route remains opt-in; commits `5b7981e`, `50c393e`.
 - [x] **T19g.4 — test two chained blocks and reject if slower.**
   Files: `crates/engine/src/dflash.rs`, this spec's plan/tasks/notes.
   One prompt, B=4: exact greedy output, 74 rounds, 129 accepted, 5.43 tok/s
@@ -373,7 +377,8 @@ branches selected from those results, not mandatory simultaneous implementations
   One prompt, B=4, exact output: encoded block + encoded head 6.69 tok/s;
   encoded head with slice block 6.54 tok/s; single encoded block 7.05 tok/s;
   slice block 6.92 tok/s. Removed the head path; separate command submission,
-  staging, and synchronization outweigh its compute savings.
+  staging, and synchronization outweigh its compute savings. Cleanup commit
+  `5b7981e`.
 - [x] **T19g.7 — attribute the current B=4 encoded round by synchronized phase.**
   Files: `crates/engine/src/dflash.rs`, this spec's plan/tasks/notes.
   Temporarily measure encoded block body, tied head, target `forward_verify`,
@@ -382,6 +387,20 @@ branches selected from those results, not mandatory simultaneous implementations
   round timing. Removed the runtime hook after measurement. The 3 × 200 test
   stayed exact; phase medians and footprint are in implementation notes.
   Commit `50c393e`.
+- [x] **T19h — test reusing the known greedy target token as the first proposal; reject.**
+  Files: `crates/engine/src/dflash.rs`, `crates/engine/tests/dflash_equivalence.rs`,
+  this spec's plan/tasks/notes. Coverage assertion failed under sabotage at
+  prompt 0, round 7. With the override enabled, exact greedy output failed at
+  prompt 0, token 77 (emitted 99382 vs target 84750). Removed the override; do
+  not retain it until the verifier discrepancy is fixed.
+- [ ] **T19i — isolate batched-verifier drift at the newly reached prefix.**
+  Files: `crates/engine/tests/dflash_equivalence.rs`, target verify tests,
+  `crates/engine/src/model.rs` only if needed, this spec's notes. Reproduce
+  prompt 0 through the first divergence; save the exact token prefix and compare
+  batched target rows against sequential rows, including top-two gaps, target
+  caches and captured taps. Explain why the batch chose 99382 while sequential
+  chose 84750. Add a test that fails under row/position/cache sabotage. Do not
+  optimize the proposal path until exact output holds through this prefix.
 - [x] **T20 — load DFlash packed weights through base mmap + mlock path.**
   Files: `crates/engine/src/dflash.rs`, `crates/engine/tests/dflash_load.rs`,
   this spec's plan/tasks/notes. Replace the DFlash loader's per-tensor file reads

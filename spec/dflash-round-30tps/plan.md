@@ -186,14 +186,30 @@ block and 6.69 tok/s with the encoded block, both below the corresponding
 single encoded-block run (7.05 tok/s). Both branches were removed.
 
 Keep the single encoded block behind `KAPLUMBA_DFLASH_GPU_BLOCK=1` as a
-measurement option. It remains unadopted by default until interleaved 3 × 200
-measurements establish a gain. Further work should attribute full-round time
-to block body, tied head, target verify, and cache update before choosing a
-fused path. The next diagnostic records these synchronized stage durations for
-the current B=4 route on the same exact 3 × 200 stream. It is measurement-only;
-remove runtime timing hooks after collecting the data. Do not build a longer
-chained proposal tree: current measurements show its per-token drafter cost
-dominates the saved target work.
+measurement option. Three-prompt and interleaved prompt-0 results show a small
+~1.7% B=4 gain (encoded median 7.07, slice median 6.95 tok/s), not enough to
+change the default. B=16 is slower at 4.16 tok/s. Phase timing shows the
+remaining B=4 work is roughly 60 ms block body, 38 ms tied head, 138 ms target
+verify, plus the caller's 81 ms anchor forward. Do not build a longer chained
+proposal tree: current measurements show its per-token drafter cost dominates
+the saved target work.
+
+### P3 result — known-token proposal exposed batched verifier drift
+
+An experiment replaced DFlash proposal zero with the greedy target argmax
+already present in `previous_logits`. Coverage sabotage correctly failed the
+new first-accept assertion at prompt 0, round 7. With the override restored,
+the three-prompt exact-output test failed at prompt 0, token 77: the speculative
+stream emitted 99382 while sequential target decode emitted 84750. The prior
+stream had rejected before reaching the affected batch row, so its exact-output
+pass did not exercise that row. The override has been removed.
+
+This is a target-verifier correctness blocker, not evidence that the known
+token is wrong. The next task must reproduce the failure and retain batch and
+sequential logits at the first divergent row, including its top-two gap and
+cache/tap positions. Do not add more accepted-prefix shortcuts until the
+batched verifier's numerical behavior is understood and exact greedy output
+holds for the longer prefix.
 
 Measurement validity note: `gpuq status` previously showed 0 MiB swap because
 the parser read the first positional amount (`total`) and assumed it was

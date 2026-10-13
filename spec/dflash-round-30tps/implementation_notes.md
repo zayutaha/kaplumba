@@ -919,3 +919,37 @@ scripts/gpuq try -- env KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacke
   dflash_greedy_stream_matches_target_for_200_tokens_on_three_prompts \
   -- --ignored --exact --nocapture
 ```
+
+## 2026-10-14 — interleaved B=4 A/B and known-token override rejection
+
+Completed three prompt-0 A/B pairs in the order encoded/slice/encoded/slice/
+encoded/slice. Encoded B=4 tok/s: 7.07, 7.05, 7.08 (median 7.07); slice:
+6.96, 6.94, 6.95 (median 6.95). Pairwise differences were 0.11, 0.11,
+0.13 tok/s; all six 200-token outputs were greedy-exact and acceptance stayed
+85 rounds/115 drafts each. This confirms a small repeatable local improvement,
+but both routes remain far below plain decode (~12.3 tok/s); the encoded route
+stays opt-in. `gpuq status` was checked before every arm. Global allocated swap
+varied from 3.24 to 3.42 GiB during the sweep; this is not process swapout
+count. The earlier encoded `/usr/bin/time -l` run recorded 13.37 GiB peak
+footprint and zero swapouts.
+
+Tested a greedy proposal-zero override using `argmax(previous_logits)`, which
+is the already-computed exact target token. A test assertion required the first
+accepted candidate to equal that token. Coverage sabotage replaced the override
+with a no-op; it failed at prompt 0, round 7 because no candidate was accepted.
+With the override enabled, the 3-prompt exact test then failed at prompt 0,
+output token 77: DFlash emitted 99382 while the sequential target emitted
+84750. Earlier tokens matched. The old speculative sequence had rejected
+before reaching this affected verifier row; forcing the first token advanced
+the accepted prefix into the drift. Removed the override and its test assertion.
+
+This failure means the batched verifier is not proven greedy-identical for all
+rows it can reach, even though the existing verifier tests preserve argmax on
+their chosen prefixes and the old DFlash stream passed. The current branch has
+no change to generation behavior from this experiment. Next isolate the target
+row at output token 77: preserve the exact prompt/prefix and positions, compare
+all batched `forward_verify` rows with sequential target logits, record the
+argmax gap and max per-logit delta, and check cache/tap contents after the
+accepted prefix. Do not use a longer forced accepted prefix for speed until this
+is resolved. Failed experiment output: `/tmp/dflash-t19h-sabotage.log` and the
+clean divergent run was captured in the active command output.
