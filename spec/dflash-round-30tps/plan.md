@@ -119,8 +119,8 @@ before asserting practical headroom.
 | `crates/engine/tests/dflash_alpha_probe.rs` | overlap matrix on greedy target continuation; hardcoded speed decision | label overlap as diagnostic; align rows; replace speed threshold with measured round statistics |
 | `crates/kernels/src/linear.rs` | `perm_mode` present; fp16/fp32 buffer GEMM validates offset but binds packed bytes at zero | honor packed offset/length via offset-aware binding; then independently validate layout |
 | `crates/engine/src/dflash.rs` | T1a samples from retained q; temperature 1/top-k policy; existing processed-anchor method | complete sampler policy, unprocessed-anchor API, independent stage diagnosis and verified context ownership |
-| `crates/engine/src/gpu_cache.rs` | `retract` only lowers cursor; sliding cache capacity equals window | reserve bounded chunk history in sliding rings; mask future rejected positions and validate cursor rollback |
-| `crates/engine/src/model.rs` | M=2 verify previously differed from sequential; projection-sign and cross-layer faults are repaired | keep attention window semantic unchanged, size physical sliding capacity for safe batched appends, prove boundary behavior |
+| `crates/engine/src/gpu_cache.rs` | `retract` only lowers cursor; physical sliding ring must retain rows overwritten by a chunk | mask future rejected positions and validate cursor rollback; physical append headroom is handled at cache construction |
+| `crates/engine/src/model.rs` | projection-sign and cross-layer faults are repaired; physical sliding capacity was only the window | keep attention window semantic unchanged, size physical sliding capacity to window plus maximum append chunk, prove boundary behavior |
 | `crates/engine/src/dflash.rs` + `crates/engine/src/weights.rs` | DFlash loader uses `File::read_exact` into per-tensor vectors and copies packed bytes into new Metal buffers | build a single-shard selection and pass it through existing `TextWeights::load_dedicated`; use zero-copy trellis views and retain `TextWeights` so its mmap and `mlock` lifetime covers every drafter buffer |
 
 ### T20 follow-up — exact packed slices over shard-sized Metal buffers
@@ -255,6 +255,6 @@ same interleaved plain baseline. Existing kernel-family restrictions apply.
 | AC5 | T10, T11, T13, T14 |
 | AC6, AC7 | T14 |
 | AC8 | V0a, V0b |
-| AC9 | T1b, T3, T16, T12 |
+| AC9 | T1b.1, T1b.2, T3, T16, T12 |
 | AC10 | F1a, F1b, T13, T14 |
 | AC11 | T20, T20.1 |

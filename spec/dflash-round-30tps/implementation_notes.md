@@ -199,3 +199,31 @@ Validation on the Drafter checkpoint:
 - Coverage sabotage: temporarily replaced both sliced APIs with whole-buffer GEMM. The named linear test failed at the first projection with `packed buffer length 768973144 does not match 86704128`; restored exact slices and reran successfully.
 - `git diff --check` passed. Tests used `scripts/gpuq try`; each model test was run serially. Target loading and `sampler.rs` were not changed.
 - This repairs DFlash mapped projection execution. It does not connect DFlash to generation or establish any throughput gain. The contemporaneous plain decode observation remains about `12.6 tok/s`; the 30 tok/s acceptance gate is open.
+
+## 2026-10-13 — T1b.1 sliding-ring append headroom
+
+The existing target cache allocated exactly the 1024-token attention window.
+`forward_verify` appends all K/V rows before attention, so a two-row verify at
+positions 1023/1024 wrote position 1024 into slot 0 before the earlier query
+could attend to key 0. The existing boundary test caught this: `batched row at
+position 1024 evicted key position 0 before row 0 attended`.
+
+Sliding GPU caches now allocate `sliding_window + prefill_chunk()` physical
+positions (2048 for the current 1024 window/chunk). `key_count` sees the full
+capacity as needed, while attention still receives `config.sliding_window` and
+applies the unchanged semantic mask. At Gemma's 50 sliding layers this adds
+839,065,600 bytes (0.78 GiB), from the spec's 3,524,730,880-byte reserve to
+4,363,796,480 bytes.
+
+Validation on `Gxma-repacked`:
+
+- `scripts/gpuq try -- /usr/bin/time -l env KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacked" cargo test --release -p kaplumba-engine --test dflash_verify_head batched_verify_preserves_keys_at_sliding_window_boundary -- --ignored --exact --nocapture` — passed. The M=2 batched verify retained key position 0; both rows matched sequential greedy output; max logit delta `0.136719`.
+- Direct process footprint measurement (the cargo wrapper reports only its own `phys_footprint`; execute the already-built test binary directly): `scripts/gpuq try -- /usr/bin/time -l env KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacked" target/release/deps/dflash_verify_head-56a416db91f6d528 batched_verify_preserves_keys_at_sliding_window_boundary --ignored --exact --nocapture` — peak `phys_footprint` 14,591,895,680 bytes (13.59 GiB), zero swaps and zero block input operations.
+- Coverage sabotage: temporarily restored capacity to `config.sliding_window`; the same named assertion failed with `batched row at position 1024 evicted key position 0 before row 0 attended`. Restored `window + prefill_chunk` and reran the test successfully.
+- The tests use synthetic valid token IDs rather than tokenizer-produced text. They compare exactly the target paths at the cache boundary; a user-facing prompt-level round test remains part of T12.
+
+The old V0a task row reporting `19.247559` was stale after T18. A fresh run on
+2026-10-13 across three prompts and M=1/2/4/8/16 passed per-row greedy identity,
+with worst logit delta `0.4375`. Taps/KV M=2 comparison also passed (hidden
+0.375, K 0.0022583, V 0.048828125). V0a still needs its row-selection and
+position-accounting sabotage coverage; this does not close V0a or V0b.

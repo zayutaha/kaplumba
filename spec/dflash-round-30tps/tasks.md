@@ -98,7 +98,7 @@ branches selected from those results, not mandatory simultaneous implementations
 - [ ] **T1b — transaction and ring rollback.**
   Files: `crates/engine/src/model.rs`, `gpu_cache.rs`, `dflash.rs`, and
   cache/round tests.
-- [ ] **T1b.1 — preserve the attention window during chunk writes.**
+- [x] **T1b.1 — preserve the attention window during chunk writes.**
   Sliding physical capacity is `window + prefill_chunk()`; attention still masks
   to the configured window. This preserves keys needed by the earliest query
   during any bounded chunk append, including verify. Gxma's default reserve
@@ -106,8 +106,10 @@ branches selected from those results, not mandatory simultaneous implementations
   4,363,796,480 bytes. Measure the actual process footprint with
   `/usr/bin/time -l`. Test the 1024 boundary against sequential decode and
   assert key position 0 remains present after the batched write. Sabotage the
-  physical capacity and confirm that named assertion fails.
-  Completed in `COMMIT_HASH_PENDING`.
+  physical capacity and confirm that named assertion fails. Baseline and
+  deliberate capacity sabotage both failed with key position 0 evicted; restored
+  capacity passed the sequential boundary comparison. Implementation commit
+  recorded in Status.
 - [ ] **T1b.2 — transactional rollback after rejection or error.**
   Rejected future rows must be excluded by absolute positions after cursor
   rollback; verify stale rows cannot leak into later outputs. Test zero/partial/
@@ -274,10 +276,11 @@ branches selected from those results, not mandatory simultaneous implementations
 | T6 sweep | prior work recorded | `6622031`; reference/default gate open |
 | T1a | done | code/tests `2f35201`; argmax sabotage failure in implementation notes |
 | V0a / V0b | drafted, held | verifier equivalence and ceiling gate before selecting a drafter |
-| V0a current test | failing evidence | M=2 max logit error 19.247559; full gate remains incomplete |
+| V0a current test | partial pass | rerun 2026-10-13: 3 prompts × M=1/2/4/8/16 greedy identity; worst logit delta 0.4375; ring/cache comparison passes separately; row/position sabotage and complete gate remain open |
 | T17 | done | offset binding, fp32 sliced API, multirow 4/6-bpw tests; `fda508d` |
 | T18 | complete | projection-sign routing repaired; cross-layer path disabled by default; greedy M=2/4/8/16 pass on 3 prompts; see implementation notes/commit |
 | T19 | conditional design, held | GPU stage ownership/wait overhead needs measurement after correctness |
+| T1b.1 | done | 2048-slot sliding ring; boundary greedy identity, max logit delta 0.136719, 13.59 GiB phys_footprint, no swap; sabotage fails; implementation commit recorded below |
 | T20.1 | done | exact fp16/fp32 mapped slices; host and full-context tests plus sabotage; `880b7e4` |
 | T1c / T15 / T16 | drafted, held | sampling policy, measured length selection, new anchor contract |
 | T1b / T3 / T8 / T12 | open | correctness work before product wiring |

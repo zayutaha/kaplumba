@@ -1192,9 +1192,20 @@ impl DecoderLayer {
                 config.head_dim,
             )?
         } else {
+            // Chunked verification writes every query's K/V before attention
+            // runs. Keep one configured window plus one maximum append chunk so
+            // early queries can still see the oldest live key after later rows
+            // are written. Attention itself continues to mask to
+            // `config.sliding_window` below.
+            let sliding_capacity = config
+                .sliding_window
+                .checked_add(prefill_chunk())
+                .ok_or_else(|| {
+                    ModelError::InvalidConfig("sliding KV capacity overflows".to_string())
+                })?;
             GpuKvCache::new(
                 &device,
-                config.sliding_window,
+                sliding_capacity,
                 config.kv_heads,
                 config.head_dim,
             )?
