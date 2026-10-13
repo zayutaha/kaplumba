@@ -3292,7 +3292,7 @@ pub struct ForwardScratch {
     /// gigabytes. A verify pass is one speculative block, which is 16 or 32 rows
     /// for the DFlash drafter and never more. AGENTS.md section 8: fixed size,
     /// independent of context length.
-    pub logits_rows: Vec<Buffer>,
+    pub logits_rows: Buffer,
     /// T9: the verify GEMM's f32 output store. Same reasoning and same cap.
     pub verify_raw: Buffer,
     pub capped: Buffer,
@@ -3465,9 +3465,7 @@ impl ForwardScratch {
             // single-row head reads.
             last_hidden: u16_elements(max_tokens, hidden)?,
             logits: u16_elements(1, vocab)?,
-            logits_rows: (0..verify_rows)
-                .map(|_| u16_elements(1, vocab))
-                .collect::<Result<Vec<_>, _>>()?,
+            logits_rows: u16_elements(verify_rows, vocab)?,
             verify_raw,
             capped: u16_elements(1, vocab)?,
             // One (m, l, O[head_dim]) partial per (KV split, query head) for the
@@ -5190,17 +5188,13 @@ impl TextModel {
         eprint!("{}", profile.render());
     }
 
-    /// T9: the batched-verify head. `last_hidden` already holds the chunk's
+    /// T11: the batched-verify head. `last_hidden` already holds the chunk's
     /// `rows` rows (copied in by the caller), so this normalises them in place,
-    /// runs the vocabulary GEMM at `M = rows`, softcaps, and writes
-    /// `scratch.logits_rows`.
+    /// runs the vocabulary GEMM at `M = rows`, softcaps, and writes the
+    /// contiguous `scratch.logits_rows` matrix.
     ///
-    /// The two kernels are the M>1 siblings of the pair `encode_lm_head` uses
-    /// (`encode_rms_norm` + `encode_gemv` -> `encode_rms_norm(rows = n)` +
-    /// `encode_gemm`), so this is the same arithmetic with a different `M`, not
-    /// a new numerical path. That equivalence is what `dflash_verify_head`
-    /// asserts against `n` sequential single-row forwards before T9 trusts it
-    /// (plan.md risk #7).
+    /// `dflash_verify_head` checks this path against sequential single-row
+    /// forwards, including greedy picks, before speculative generation uses it.
     /// T9: the row cap for a batched verify pass. The DFlash drafter drafts
     /// `block_size` rows (16 for the released checkpoint, 32 measured better),
     /// and a speculative block is never larger than a speculative budget.
@@ -5234,78 +5228,46 @@ impl TextModel {
             .as_ref()
             .ok_or_else(|| ModelError::InvalidWeights("lm head signs not resident".to_string()))?;
 
-        // One `encode_gemv` per row, all inside the caller's command buffer.
-        //
-        // This is deliberately NOT `encode_gemm(M = rows)`. Measured on the real
-        // checkpoint, `encode_gemm`'s MMA tile (128 queries x 64 outputs,
-        // selected unconditionally when `out_features % 64 == 0`, and 262 144
-        // is) does not agree with `encode_gemv` at small M: M = 1 matched to
-        // 0.0156 (half an fp16 quantum) but M = 2 diverged by 19.2 on softcapped
-        // logits that only span -30..30. The repo's purpose-built M>1 path,
-        // `encode_gemv_mrhs`, is rate-gated to 3 and 4 bpw and the target head is
-        // 6 bpw, so it falls through to the same MMA tile.
-        //
-        // `encode_gemv` is the kernel the non-speculative decode loop uses, so
-        // reusing it means the verify pass's logits are bit-comparable to the
-        // decode path's, which is what R17's greedy equivalence needs.
-        //
-        // Cost: the head's trellis is ~1.06 GB, so `rows` gemvs read it `rows`
-        // times. At 16 rows that is ~16.9 GB, ~65 ms at 250 GB/s, against ~4 ms
-        // for a correctly batched M=16. That is the price of not having a
-        // validated 6-bp M>1 kernel, and it is recorded rather than hidden.
-        for row in 0..rows {
-            // Stage this row's hidden into the single-row `last_hidden` slot,
-            // normalise it in place, then project. `encode_copy_region` takes a
-            // byte offset on both sides, so no host staging is needed.
-            self.elements.encode_copy_region(
-                encoder,
-                &self.scratch.last_hidden,
-                &self.scratch.last_hidden,
-                hidden,
-                (row * hidden * std::mem::size_of::<u16>()) as u64,
-                0,
-            )?;
-            self.elements.encode_rms_norm(
-                encoder,
-                &self.scratch.last_hidden,
-                &self.final_norm_buffer,
-                &self.scratch.last_hidden,
-                1,
-                hidden,
-                self.layers[0].config.rms_norm_eps,
-            )?;
-            profile.stamp(encoder, "head/final_norm_rows")?;
-            if kaplumba_kernels::ablated("head_gemv") {
-                continue;
-            }
-            self.linear.encode_gemv(
-                encoder,
-                LinearEncodeRequest {
-                    packed,
-                    packed_offset: self.lm_head.metal_offset,
-                    perm_mode: self.lm_head.permutation_mode,
-                    input: &self.scratch.last_hidden,
-                    input_signs,
-                    output_signs,
-                    transformed: &self.scratch.transformed,
-                    raw: &self.scratch.raw,
-                    output: &self.scratch.logits_rows[row],
-                    in_features: self.lm_head.in_features,
-                    out_features: vocab,
-                    rate: self.lm_head.rate,
-                    codebook: self.lm_head.codebook,
-                    pretransformed: false,
-                },
-            )?;
-            self.elements.encode_softcap(
-                encoder,
-                &self.scratch.logits_rows[row],
-                &self.scratch.logits_rows[row],
-                vocab,
-                self.final_softcap,
-            )?;
-            profile.stamp(encoder, "head/gemm_rows")?;
+        self.elements.encode_rms_norm(
+            encoder,
+            &self.scratch.last_hidden,
+            &self.final_norm_buffer,
+            &self.scratch.last_hidden,
+            rows,
+            hidden,
+            self.layers[0].config.rms_norm_eps,
+        )?;
+        profile.stamp(encoder, "head/final_norm_rows")?;
+        if kaplumba_kernels::ablated("head_gemv") {
+            return Ok(());
         }
+        self.linear.encode_gemm(
+            encoder,
+            PrefillEncodeRequest {
+                packed,
+                packed_offset: self.lm_head.metal_offset,
+                perm_mode: self.lm_head.permutation_mode,
+                input: &self.scratch.last_hidden,
+                input_signs,
+                output_signs,
+                transformed: &self.scratch.transformed,
+                raw: &self.scratch.verify_raw,
+                output: &self.scratch.logits_rows,
+                queries: rows,
+                in_features: self.lm_head.in_features,
+                out_features: vocab,
+                rate: self.lm_head.rate,
+                codebook: self.lm_head.codebook,
+            },
+        )?;
+        self.elements.encode_softcap(
+            encoder,
+            &self.scratch.logits_rows,
+            &self.scratch.logits_rows,
+            rows * vocab,
+            self.final_softcap,
+        )?;
+        profile.stamp(encoder, "head/gemm_rows")?;
         Ok(())
     }
 
@@ -5314,18 +5276,12 @@ impl TextModel {
     /// vocab]`.
     pub fn head_rows_matrix(&self, rows: usize) -> Vec<u16> {
         let vocab = self.vocab_size;
-        if rows == 0 || rows > Self::VERIFY_ROW_CAP || rows > self.scratch.logits_rows.len() {
+        let row_capacity = self.scratch.logits_rows.length() as usize / (vocab * 2);
+        if rows == 0 || rows > Self::VERIFY_ROW_CAP || rows > row_capacity {
             return Vec::new();
         }
-        // One buffer per row, concatenated on read-back. Row-major by
-        // construction, and the read is `rows` small copies rather than one big
-        // one, which is not on any hot path.
-        let mut out = Vec::with_capacity(rows * vocab);
-        for buffer in &self.scratch.logits_rows[..rows] {
-            let src = buffer.contents() as *const u16;
-            out.extend_from_slice(unsafe { std::slice::from_raw_parts(src, vocab) });
-        }
-        out
+        let src = self.scratch.logits_rows.contents() as *const u16;
+        unsafe { std::slice::from_raw_parts(src, rows * vocab) }.to_vec()
     }
 
     fn encode_lm_head(

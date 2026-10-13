@@ -325,7 +325,7 @@ same interleaved plain baseline. Existing kernel-family restrictions apply.
 | same-target DFlash alternative is incompatible with EXL3 loader | record tensor/config mismatch; only reopen with a concrete format and memory plan |
 | ring wrap destroys retained K/V | bounded transaction storage or another proven restore strategy before shipping |
 | B32 or two-block acceptance is lower | measure each variant independently; choose by complete throughput |
-| existing head GEMM remains numerically wrong | keep sequential head; performance task remains open |
+| 6-bpw target head GEMM differs from per-row GEMV | retain the checked per-row route unless exact greedy and numeric gates pass; current packed-offset-correct batched route passes, but keep it only for the measured ~2.3% M=16 verifier gain |
 | speculative path is slower | retain opt-in diagnostics and plain default; record unmet performance target |
 | 30 tok/s remains unmet | report cost and acceptance gap; do not infer hardware impossibility |
 

@@ -266,13 +266,20 @@ branches selected from those results, not mandatory simultaneous implementations
   lengths; use plain continuation when speculation has no measured gain.
   Test zero/low/high acceptance, short tails and workload changes. Bound state
   and measure selection overhead; no added scheduling layer on the hot path.
-- [ ] **T11 — guarded batched head.**
-  Files: `model.rs`, existing kernel path if repair is justified, head tests.
-  After T17/T18 resolve offset and whole-target discrepancies, compare the head
-  independently; do not replace GEMV blindly with GEMM.
-  Test identical-input numerical and greedy equality, correct
-  6-bpw dispatch, sabotage, then interleaved speed. No new kernel family without
-  scope amendment; keep sequential head if validation fails.
+- [x] **T11 — guarded batched head.**
+  Files: `crates/engine/src/model.rs`, `crates/engine/tests/dflash_head_ab.rs`,
+  `crates/engine/tests/dflash_verify_head.rs`, and these notes. After T17 fixed
+  packed offsets, route all-row verify through the existing `encode_gemm` path
+  with contiguous fixed-size logits scratch. The M=1/2/4/8/16 test across three
+  prompts matched each sequential greedy token; maximum logit difference was
+  0.4375. A zero-offset sabotage failed at M=1, row 0 (greedy 14697 vs 236777),
+  then the restored route passed. The every-row signal check passed. A short
+  B-A-B M=16 timing run (three prompts × three repeats) measured medians
+  368.240 / 376.376 / 367.591 ms for batched / rowwise / batched, a repeatable
+  ~8.5 ms (~2.3%) verifier reduction. The complete V0b matrix also passed all
+  144 rows and reduced the 8k M=16 median from historical 461.548 to 452.821 ms;
+  do not treat this separate-run difference as the paired timing result. No new
+  kernel family was added. 30 tok/s remains unmet. Commit recorded in Status.
 - [ ] **T13 — acceptance and throughput.**
   Files: bounded acceptance harness and notes. ≥200 rounds per mode across ≥3
   prompts, accepted-prefix survival, total tokens/time, median run rates and
@@ -516,6 +523,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | T9–T11 / T13 / T14 | open | measurements and performance acceptance outstanding |
 | F1a / F1b | conditional, held | alternative evaluation requires shared verifier evidence and design decisions |
 | F1c | done, candidate rejected | public same-target model uses dense BF16 linears and incompatible config; header-only review, no weights downloaded |
+| T11 | done | all-row greedy identity, offset sabotage, and short-context B-A-B timing; see notes/commit |
 
 Historical 2026-10-13 follow-up (before latest authorization): user had limited
 work to drafting and exllamav3 diagnostics.

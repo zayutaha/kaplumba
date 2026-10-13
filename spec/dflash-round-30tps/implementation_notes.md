@@ -1074,3 +1074,73 @@ Sources: <https://huggingface.co/RedHatAI/gemma-4-31B-it-speculator.dflash>
 and its `config.json` / `model.safetensors` headers; local checks against
 `crates/engine/src/dflash.rs` (`SUFFIX_RULES`, `DflashWeights::load`,
 `DflashConfig::load`).
+
+## 2026-10-14 — T11 validated batched 6-bpw verify head
+
+T17's packed-offset fix made the existing `encode_gemm` route usable for the
+target's 6-bpw tied head. `encode_lm_head_rows` now final-normalizes all hidden
+rows together, calls the existing GEMM with `lm_head.metal_offset`, writes a
+contiguous fixed-capacity logits buffer, then softcaps it. No kernel family was
+added. `head_rows_matrix` returns only rows that fit the allocated buffer.
+
+Correctness and sabotage:
+
+- `batched_verify_head_matches_sequential_single_row` passed for M=1/2/4/8/16
+  on three real prefixes. Greedy IDs matched every row; largest logit difference
+  was 0.4375 (at M=16), within the existing diagnostic bound.
+- `batched_verify_head_carries_signal_on_every_row` passed; adjacent rows differ
+  in 4,190,784 of 4,194,304 logits.
+- Temporarily forced `packed_offset: 0` in the batched head. The named greedy
+  comparison failed at M=1 row 0 (14697 vs 236777). Restoring
+  `self.lm_head.metal_offset` and rerunning passed.
+- `cargo check -p kaplumba-engine` and release integration test compilation
+  passed. The `dflash_head_ab` harness was formatted with `rustfmt`.
+
+Paired B-A-B timing used the same target, prompt seeds, and one M=16 verify per
+repeat. A was the previous committed rowwise head in a detached worktree with a
+separate `CARGO_TARGET_DIR`; B was the new batched head in the main tree. Three
+prompts × three repeats per run, short 32-token prefix; every row matched the
+saved sequential greedy continuation:
+
+```text
+B1 batched median 368.240 ms (samples 366.708–368.567)
+A  rowwise median 376.376 ms (samples 375.445–377.996)
+B2 batched median 367.591 ms (samples 366.945–368.961)
+```
+
+The two batched medians are both about 8.5 ms (~2.3%) faster than A; B-A-B
+guards against a single warm/cold timing. The gain is real but small and does
+not close the DFlash throughput gap.
+
+The full V0b test was rerun after the change with 3 prefixes × 4 contexts ×
+M=2/4/8/16 × 3 interleaved repeats. All 144 verify rows matched the saved
+target-greedy continuation. M=16 medians across the three prompt medians:
+
+```text
+context     old rowwise V0b   new batched median   ideal unprocessed ceiling
+32          377.699 ms        369.422 ms           43.31 tok/s
+1024        410.785 ms        402.254 ms           39.78 tok/s
+2048        421.480 ms        413.015 ms           38.74 tok/s
+8192        461.548 ms        452.821 ms           35.34 tok/s
+```
+
+The cross-run full-matrix deltas are descriptive; only the short-context
+B-A-B above is the paired speed claim. The 8k run completed in 964.68 s. Swap
+used was 3,051 MiB before and 3,704 MiB after the run; available memory returned
+to 18.0 GiB after the process exited. This is an ideal-proposal ceiling, not
+DFlash throughput: at 8k, 16 rows still consume 452.8 ms and leave only 80.5 ms
+to emit 17 tokens at 30 tok/s (the historical unprocessed-anchor budget is
+59.8 ms for 16 tokens). The existing DFlash draft/update work remains over the
+budget, and 30 tok/s is not achieved.
+
+Repro commands:
+
+```bash
+scripts/gpuq try -- env KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacked" \
+  cargo test --release -p kaplumba-engine --test dflash_head_ab \
+  m16_verify_head_is_greedy_exact_and_timed -- --ignored --exact --nocapture
+
+scripts/gpuq try -- env KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacked" \
+  cargo test --release -p kaplumba-engine --test dflash_verify_ceiling \
+  ideal_target_continuations_bound_verify_throughput -- --ignored --exact --nocapture
+```
