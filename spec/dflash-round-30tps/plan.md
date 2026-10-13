@@ -117,7 +117,7 @@ before asserting practical headroom.
 
 | path | observed behavior | planned work |
 |---|---|---|
-| `crates/engine/tests/dflash_head_oracle.rs` | full output chunked at 512 rather than vocab; inconsistent host scaling; no numerical assertion; control reuses buffer GEMM | repair diagnostic indexing/conventions and add independent target-head control |
+| `crates/engine/tests/dflash_alpha_probe.rs` | D10 passes a prompt-length batch to the single-token `forward_with_hidden` API, then reads an unwritten last row; no numerical assertion | use sequential final-token decode rows, compare all vocabulary logits to target GEMV output, assert numeric/argmax bounds |
 | `crates/engine/tests/dflash_alpha_probe.rs` | overlap matrix on greedy target continuation; hardcoded speed decision | label overlap as diagnostic; align rows; replace speed threshold with measured round statistics |
 | `crates/kernels/src/linear.rs` | `perm_mode` present; fp16/fp32 buffer GEMM validates offset but binds packed bytes at zero | honor packed offset/length via offset-aware binding; then independently validate layout |
 | `crates/engine/src/dflash.rs` | T1a samples from retained q; temperature 1/top-k policy; existing processed-anchor method | complete sampler policy, unprocessed-anchor API, independent stage diagnosis and verified context ownership |
@@ -151,12 +151,14 @@ mapping lifetime. Read `.mcg`, scale vectors, and BF16 norm tensors from the
 loader's arena. If `KAPLUMBA_RESIDENT_WEIGHTS` selects the arena path, bind the
 resident tensor buffer instead. Do not change target weight loading.
 
-Index full head output with row stride `head.out_features`, then select columns.
-Compare the same inputs, packing, signs, permutation, transform normalization,
-and pre-/post-softcap stage. Determine the correct scaling from the reference
-and actual kernel conventions, not by selecting the factor that fits a result.
-Use multiple nonzero inputs and slices across vocabulary tile boundaries.
-Specify numerical tolerances before interpretation and assert them.
+Capture multiple nonzero target final-norm rows using the single-token
+`forward_with_hidden` contract. Compare the complete vocabulary vector from
+each target GEMV against DFlash's sliced-GEMM replay, with the same head,
+permutation, input convention and softcap. Assert a declared max-logit error
+bound and exact greedy-token equality. The 2026-10-13 harness run passed at
+0.0078–0.0156 max error; zero-row and ×2-scale sabotage both failed the bound.
+The earlier zero-row reading came from asking the one-token API to process a
+prompt-length batch, not from a production forward bug.
 
 The current “plain” control calls `gemm_chunk_buffer_sliced`, also called by
 `draft_logits`; agreement there cannot independently certify `encode_gemv`.

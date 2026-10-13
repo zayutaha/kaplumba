@@ -77,13 +77,17 @@ branches selected from those results, not mandatory simultaneous implementations
 
 ## Correctness before product wiring
 
-- [ ] **T0c — repair the head-oracle control.**
-  Files: `crates/engine/tests/dflash_head_oracle.rs` and, only if needed for a
-  trustworthy identical-input control, a target diagnostic interface.
-  Fix vocabulary row stride, establish transform/scaling/softcap conventions,
-  compare the actual target head, and assert justified numerical tolerances.
-  Test: multiple nonzero rows and column slices; deliberately corrupt indexing
-  and scaling and observe named numerical failures. Shape-only success is invalid.
+- [x] **T0c — repair the head-oracle control.**
+  Files: `crates/engine/tests/dflash_alpha_probe.rs` (the historical
+  `dflash_head_oracle.rs` file does not exist). `forward_with_hidden` accepts
+  one-token decode rows; prefill all but the final three prompt tokens, capture
+  those three nonzero hidden rows and target logits with sequential one-token
+  calls, then compare full vocabulary output against `draft_logits` using the
+  same target head and softcap. Assert a predeclared max-logit tolerance and
+  argmax equality. Sabotage the selected hidden row and a logit scale and
+  observe named numerical failures. This is a diagnostic harness fix; do not
+  change production head behavior unless this comparison proves it wrong. See
+  2026-10-13 notes; commit hash recorded in Status.
 - [x] **T1a — sampled proposal correctness.**
   Files: `crates/engine/src/dflash.rs` and its unit tests.
   Draw candidates from q in sampled mode, retain exact q for verification,
@@ -273,7 +277,8 @@ branches selected from those results, not mandatory simultaneous implementations
 | A2 | documentation complete | verifier-first draft, new anchor contract and conditional fallbacks; `697dcc2` |
 | A3 | review/tests complete | `exllama_review.md` and text evidence; `59a6f4b` |
 | T0a / T0b | historical observations recorded | earlier rerun notes; not repeated during this audit |
-| T0c / T7 | open | oracle indexing/scaling/control/assertion flaws identified |
+| T0c | done | 3 nonzero rows; full-vocab max error ≤0.0156; zero-row and ×2 scale sabotage fail; hash pending |
+| T7 | open | use corrected oracle to continue drafter-stage diagnosis |
 | T5 plumbing | implemented | `9a4cf60`; independent correctness/coverage gate open |
 | T6 sweep | prior work recorded | `6622031`; reference/default gate open |
 | T1a | done | code/tests `2f35201`; argmax sabotage failure in implementation notes |

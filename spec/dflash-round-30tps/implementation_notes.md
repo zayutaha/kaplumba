@@ -76,8 +76,10 @@ and the head oracle raise α and there is appetite for it, it is the next spec.
   `DflashModel::set_permutation_mode` is dead on the buffer path: setting it to
   1 leaves the block bit-identical (measured). This is the plumbing bug T5
   fixes; it is why the drafter's tile permutation has never been scored.
-* `forward_with_hidden` returns a **zero** final hidden — `max|v| 0.00000`. There
-  is currently no oracle for `draft_logits`'s head application.
+* `forward_with_hidden` returns one final-norm row for a one-token decode.
+  Passing a prompt-length chunk and reading its last row was invalid because
+  only one row is populated. D10 now captures sequential one-token rows and
+  checks the full-vocabulary target-head replay; see T0c below.
 * `DflashBlock.block_keys` / `block_values` (dflash.rs:695-696) — returned by
   `forward_block` and never consumed by anything. That is what T9 uses.
 
@@ -227,6 +229,36 @@ The old V0a task row reporting `19.247559` was stale after T18. A fresh run on
 with worst logit delta `0.4375`. Taps/KV M=2 comparison also passed (hidden
 0.375, K 0.0022583, V 0.048828125). The sabotage coverage and final V0a
 evidence are recorded below.
+
+## 2026-10-13 — T0c repair: valid target-head oracle
+
+The old D10 diagnostic passed a 78-token prompt to `forward_with_hidden`, whose
+contract is a single-token decode, then indexed row 77 from a buffer with only
+one written row. The resulting all-zero input made its 27.3125 logit error
+misleading. Updated `dflash_alpha_probe.rs` to prefill all but the final three
+prompt tokens and capture those three final-norm rows and target logits using
+sequential one-token calls. For each row it compares the entire 262,144-token
+vocabulary output against `DflashModel::draft_logits`, asserts RMS > 0.01,
+max-logit error ≤ 1.0 and exact argmax equality. The 1.0 bound was declared
+before the corrected run (1/30 of the model's softcap).
+
+Validation used `scripts/gpuq try` with `Gxma-repacked` and the `Drafter`:
+
+- Release integration test compiled and `dflash_alpha_probe` passed 1/1 in
+  35.19 s. The three oracle rows had RMS 3.4851 / 3.0591 / 6.4171; full-vocab
+  maximum logit errors were 0.0078 / 0.0078 / 0.0156; greedy tokens were
+  107 / 101 / 3048 in both target and DFlash head paths.
+- Zero-row sabotage failed as intended: `D10 row 0: target-head replay max
+  logit error 27.1875 exceeds 1.0` (exit 101). Restored and retested.
+- ×2 input-scale sabotage failed as intended: `D10 row 0: target-head replay
+  max logit error 9.0156 exceeds 1.0` (exit 101). Restored and retested.
+- After restoration, the full probe passed. The configured row-major overlap
+  remained mean diagonal alpha 0.2604 (best 0.5740 at row 2 vs target t=2);
+  tap+1 measured 0.2439; colmajor measured 0.0000. This supersedes the old
+  0.1663/mode-1 claim: the target head path is correct, and permutation mode 1
+  is not a useful layout for this checkpoint. Low acceptance is still a
+  drafter path/quality problem, not proof of low model quality until T7/T8
+  isolate its stages.
 
 ## 2026-10-13 — V0b ideal-proposal verifier ceiling
 

@@ -232,19 +232,31 @@ fn measure_case(
     // drafter's hidden state can matter. This captures the target's final normed
     // row and the logits its own head made from it.
     //
-    // Taken on a cold cache and wiped afterwards: a forward appends to the
-    // target's KV cache, and re-feeding a position duplicates its key row, which
-    // silently changes every later logit (`draft_and_verify` documents the same
-    // trap). The real prefill below therefore starts from empty.
-    let oracle_positions: Vec<u32> = (0..total as u32).collect();
+    // `forward_with_hidden` is a one-token decode API. It writes one final
+    // hidden row; passing a prompt-length batch only writes the first row, so
+    // reading the final row returned zeros. Prefill everything before the last
+    // three prompt tokens, then capture three real decode rows and target
+    // logits. Wipe the cache before the tap prefill below.
     target.reset_gpu_caches();
-    let head_oracle = match target.forward_with_hidden(&tokens, &oracle_positions) {
-        Ok((hidden_rows, logits)) => Some((hidden_rows, logits)),
-        Err(error) => {
-            println!("  [d10] oracle forward failed: {error}");
-            None
-        }
-    };
+    let oracle_start = total.saturating_sub(3);
+    if oracle_start > 0 {
+        let prefill_positions: Vec<u32> = (0..oracle_start as u32).collect();
+        target
+            .forward_buffer(&tokens[..oracle_start], &prefill_positions)
+            .expect("head-oracle prefix prefill");
+    }
+    let mut head_oracle = Vec::with_capacity(total - oracle_start);
+    for position in oracle_start..total {
+        let (hidden, logits) = target
+            .forward_with_hidden(&tokens[position..position + 1], &[position as u32])
+            .unwrap_or_else(|error| panic!("[d10] oracle failed at position {position}: {error}"));
+        assert_eq!(
+            hidden.len(),
+            config.hidden_size,
+            "D10 expects one hidden row"
+        );
+        head_oracle.push((hidden, logits));
+    }
     target.reset_gpu_caches();
     target.enable_taps(layers).expect("enable taps");
     let positions: Vec<u32> = (0..total as u32).collect();
@@ -339,7 +351,7 @@ fn measure_case(
                 })
                 .sum::<f64>()
                 / width as f64)
-            .sqrt() as f32
+                .sqrt() as f32
         };
         let base = &hidden[0..width];
         let base_norm: f64 = base
@@ -393,41 +405,43 @@ fn measure_case(
     // head's 6-bit rate, metal offset and scale vectors). The target's own
     // logits go through `encode_lm_head` instead. If the two disagree on the
     // *same* input, then the drafter's head is being applied wrongly and no
-    // amount of work on the drafter's hidden state matters. `forward_with_hidden`
-    // supplies exactly that oracle: the target's final normed row and the logits
-    // its own head produced from it.
-    if let Some((hidden_rows, target_logits)) = head_oracle.as_ref() {
-        {
-            let last = total - 1;
-            let row = &hidden_rows[last * config.hidden_size..];
-            stats("target final-norm row", &widen(row));
-            stats("target own logits (oracle)", &widen(&target_logits));
-            match drafter.draft_logits(row, head, config.final_logit_softcapping, 1) {
-                Ok(replayed) => {
-                    let replayed_f32 = widen(&replayed);
-                    let oracle = widen(target_logits);
-                    let diff = max_abs_diff(&replayed_f32, &oracle);
-                    let max = oracle.iter().cloned().fold(f32::MIN, f32::max);
-                    let same_argmax = argmax(&replayed) == argmax(&target_logits);
-                    println!(
-                        "  [d10] head replay: worst diff {diff:.4} on oracle max {max:.4} \
-                         ({:.6} relative), argmax {} ({}/{})",
-                        diff / max.abs().max(1e-9),
-                        if same_argmax { "matches" } else { "DIFFERS" },
-                        argmax(&replayed),
-                        argmax(&target_logits)
-                    );
-                }
-                Err(error) => println!("  [d10] head replay failed: {error}"),
-            }
-        }
+    // Compare every vocabulary entry, not selected columns or a head-only
+    // self-control. Both routes use the same head and softcap, leaving target
+    // GEMV versus DFlash sliced-GEMM arithmetic as the difference. A 1.0
+    // max-logit bound is 1/30 of the configured softcap; greedy output must
+    // match exactly.
+    for (index, (row, target_logits)) in head_oracle.iter().enumerate() {
+        let rms = stats(&format!("target final-norm row {index}"), &widen(row));
+        assert!(rms > 0.01, "D10 oracle row {index} is unexpectedly zero");
+        let target_f32 = widen(target_logits);
+        stats(&format!("target logits oracle {index}"), &target_f32);
+        let replayed = drafter
+            .draft_logits(row, head, config.final_logit_softcapping, 1)
+            .expect("D10 replay target head through DFlash GEMM");
+        let diff = max_abs_diff(&widen(&replayed), &target_f32);
+        assert!(
+            diff <= 1.0,
+            "D10 row {index}: target-head replay max logit error {diff:.4} exceeds 1.0"
+        );
+        assert_eq!(
+            argmax(&replayed),
+            argmax(target_logits),
+            "D10 row {index}: target-head replay changed greedy token"
+        );
+        println!(
+            "  [d10] row {index}: full-vocabulary head replay max diff {diff:.4}; greedy token {} matches",
+            argmax(target_logits)
+        );
     }
 
     println!("  [d5] --- real magnitudes ---");
     let anchor_rms = stats("anchor (raw embed row)", &widen(&anchor));
     let mask_rms = stats("mask (raw embed row)", &widen(&mask));
     for (slot, tap) in borrowed.iter().enumerate() {
-        stats(&format!("tap {slot} (layer {})", config.target_layer_ids[slot]), &widen(tap));
+        stats(
+            &format!("tap {slot} (layer {})", config.target_layer_ids[slot]),
+            &widen(tap),
+        );
     }
     if let Ok(fused) = drafter.fuse_context(&borrowed, total) {
         let fused_rms = stats("fused ctx (fc+hidden_norm)", &widen(&fused));
@@ -443,8 +457,14 @@ fn measure_case(
         }
     }
     let block_hidden_rms = stats("block hidden (norm out)", &widen(&draft.block.hidden));
-    stats("layer0 block K (gemm out)", &widen(&draft.block.block_keys[0]));
-    stats("layer0 block V (gemm out)", &widen(&draft.block.block_values[0]));
+    stats(
+        "layer0 block K (gemm out)",
+        &widen(&draft.block.block_keys[0]),
+    );
+    stats(
+        "layer0 block V (gemm out)",
+        &widen(&draft.block.block_values[0]),
+    );
 
     // The real-path version of `dflash_context_rows_are_visible_in_the_block_output`:
     // same anchor, same positions, a context built from the same taps in a
@@ -627,9 +647,10 @@ fn measure_case(
                 .iter()
                 .enumerate()
                 .flat_map(|(row, dist)| {
-                    targets.iter().enumerate().map(move |(t, target_dist)| {
-                        (row, t, acceptance(target_dist, dist))
-                    })
+                    targets
+                        .iter()
+                        .enumerate()
+                        .map(move |(t, target_dist)| (row, t, acceptance(target_dist, dist)))
                 })
                 .fold((0usize, 0usize, 0.0_f64), |best, item| {
                     if item.2 > best.2 {
@@ -654,7 +675,11 @@ fn measure_case(
             println!(
                 "  [d11] M=1 head: mean alpha {per_row_mean:.4}, best {:.4} (row {} t {}), \
                  {} distinct tokens of {}",
-                per_row_best.2, per_row_best.0, per_row_best.1, distinct.len(), block_size
+                per_row_best.2,
+                per_row_best.0,
+                per_row_best.1,
+                distinct.len(),
+                block_size
             );
         }
     }
@@ -681,9 +706,7 @@ fn measure_case(
         let scale = (config.hidden_size as f32).sqrt();
         let rescale = |row: &[u16]| -> Vec<u16> {
             row.iter()
-                .map(|bits| {
-                    f16::from_f32(f16::from_bits(*bits).to_f32() * scale).to_bits()
-                })
+                .map(|bits| f16::from_f32(f16::from_bits(*bits).to_f32() * scale).to_bits())
                 .collect()
         };
         let scaled_anchor = rescale(&anchor);
@@ -699,7 +722,10 @@ fn measure_case(
                 ) {
                     let scaled_dists: Vec<Vec<(u32, f64)>> = (0..block_size)
                         .map(|row| {
-                            top_k_distribution(&scaled_logits[row * vocab..(row + 1) * vocab], TOP_K)
+                            top_k_distribution(
+                                &scaled_logits[row * vocab..(row + 1) * vocab],
+                                TOP_K,
+                            )
                         })
                         .collect();
                     let scaled_diagonal: Vec<f64> = (1..=draft_rows)
@@ -765,21 +791,13 @@ fn measure_case(
                 half::f16::from_f32(half::f16::from_bits(*bits).to_f32() * factor).to_bits()
             })
             .collect();
-        let Ok(scaled_logits) = drafter.draft_logits(
-            &scaled,
-            head,
-            config.final_logit_softcapping,
-            block_size,
-        ) else {
+        let Ok(scaled_logits) =
+            drafter.draft_logits(&scaled, head, config.final_logit_softcapping, block_size)
+        else {
             continue;
         };
         let scaled_dists: Vec<Vec<(u32, f64)>> = (0..block_size)
-            .map(|row| {
-                top_k_distribution(
-                    &scaled_logits[row * vocab..(row + 1) * vocab],
-                    TOP_K,
-                )
-            })
+            .map(|row| top_k_distribution(&scaled_logits[row * vocab..(row + 1) * vocab], TOP_K))
             .collect();
         let scaled_diagonal: Vec<f64> = (1..=draft_rows)
             .filter(|row| *row <= targets.len())
@@ -832,7 +850,11 @@ fn measure_case(
     let mut distinct = draft.tokens.clone();
     distinct.sort_unstable();
     distinct.dedup();
-    println!("  [d4] {} distinct draft tokens of {}", distinct.len(), draft.tokens.len());
+    println!(
+        "  [d4] {} distinct draft tokens of {}",
+        distinct.len(),
+        draft.tokens.len()
+    );
     for row in [0usize, 1, 2, 3, 15] {
         if row >= dists.len() {
             continue;
@@ -882,16 +904,13 @@ fn alpha_at_temperature_1_top_k_64() {
         config.block_size,
         config.draft_tokens()
     );
-    println!(
-        "  self control (p0 vs itself) must be 1.0: {:.6}",
-        {
-            let positions: Vec<u32> = (0..tokens.len() as u32).collect();
-            target.reset_gpu_caches();
-            let logits = target.forward_buffer(&tokens, &positions).expect("control");
-            let p = top_k_distribution(&logits, TOP_K);
-            acceptance(&p, &p)
-        }
-    );
+    println!("  self control (p0 vs itself) must be 1.0: {:.6}", {
+        let positions: Vec<u32> = (0..tokens.len() as u32).collect();
+        target.reset_gpu_caches();
+        let logits = target.forward_buffer(&tokens, &positions).expect("control");
+        let p = top_k_distribution(&logits, TOP_K);
+        acceptance(&p, &p)
+    });
 
     let mut summary = Vec::new();
     // The third case is the drafter's own version of
@@ -982,7 +1001,12 @@ fn alpha_at_temperature_1_top_k_64() {
             let right = b.iter().map(|bits| *bits as u64).sum::<u64>();
             println!();
             println!("=== [t12] do two different contexts change the block LOGITS? ===");
-            println!("  bit-pattern sums: {} vs {} (equal: {})", left, right, left == right);
+            println!(
+                "  bit-pattern sums: {} vs {} (equal: {})",
+                left,
+                right,
+                left == right
+            );
             println!(
                 "  {differing} of {} logits differ; worst |delta| {worst:.5}",
                 a.len()
