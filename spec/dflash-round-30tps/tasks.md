@@ -277,6 +277,14 @@ branches selected from those results, not mandatory simultaneous implementations
   Keep instrumentation opt-in/test-only. Compare sums against elapsed wall time;
   this localizes T19 before GPU-resident changes. Test output remains identical.
   Completed: 3 × 200 greedy tokens exact; commit `389dd88`.
+- [ ] **T19b — separate DFlash proposal, target verify, and acceptance time.**
+  Files: `crates/engine/src/dflash.rs`, `crates/engine/tests/dflash_equivalence.rs`,
+  implementation notes. Add temporary opt-in diagnostic timings around
+  `draft_block`, proposal selection, `forward_verify`, and verify acceptance;
+  report the aggregate across the same exact 3 × 200 run. Remove diagnostic
+  production hooks after measurement unless T19 explicitly adopts a stable
+  profiler interface. Test: all output IDs remain greedy-identical and the
+  phase sum agrees with the existing draft-and-verify bucket within timer noise.
 - [x] **T20 — load DFlash packed weights through base mmap + mlock path.**
   Files: `crates/engine/src/dflash.rs`, `crates/engine/tests/dflash_load.rs`,
   this spec's plan/tasks/notes. Replace the DFlash loader's per-tensor file reads
