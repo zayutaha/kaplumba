@@ -296,12 +296,13 @@ branches selected from those results, not mandatory simultaneous implementations
   Completed: B=4 verified on 3 × 200 tokens; B=2 repeated three times; B=4
   repeated three times; B=8 and B=16 compared. Result in notes; no runtime
   default changed. Implementation commit: `0d9c1a6`.
-- [ ] **T19d — add encoder APIs for existing f32 residual operations.**
+- [x] **T19d — add encoder APIs for existing f32 residual operations.**
   Files: `crates/kernels/src/elements.rs`, `crates/kernels/tests/` focused
   element tests. Add encoder-only `rms_norm_f32_in` and `residual_add_f32`
   wrappers using the current pipelines, with validation matching slice APIs.
   Compare encoder results to slice outputs at 1 and multiple rows, including
-  large residual values above fp16 range. No new Metal shader.
+  large residual values above fp16 range. No new Metal shader. Passed focused
+  encoder test and binding sabotage; implementation hash recorded below.
 - [ ] **T19e — add encoder APIs for gated SiLU and f32 GEMM output.**
   Files: `crates/kernels/src/elements.rs`, `crates/kernels/src/linear.rs`,
   focused kernel tests. Encode current gated-SiLU and fp32-output linear

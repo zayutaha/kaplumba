@@ -103,7 +103,6 @@ struct NormRopeQkvCacheParams {
 }
 
 #[repr(C)]
-
 #[derive(Clone, Copy)]
 struct ScalarParams {
     count: u32,
@@ -631,11 +630,7 @@ impl ElementKernels {
     }
 
     /// `residual_add` that neither reads nor writes f16.
-    pub fn residual_add_f32(
-        &self,
-        left: &[f32],
-        right: &[f32],
-    ) -> Result<Vec<f32>, KernelError> {
+    pub fn residual_add_f32(&self, left: &[f32], right: &[f32]) -> Result<Vec<f32>, KernelError> {
         if left.is_empty() || left.len() != right.len() {
             return Err(KernelError::InvalidInput(
                 "residual inputs must be non-empty and equal length".to_string(),
@@ -650,11 +645,7 @@ impl ElementKernels {
         let count = to_u32(left.len(), "residual length")?;
         self.run(
             &self.residual_add_f32_pipeline,
-            &[
-                Some(&left_buffer),
-                Some(&right_buffer),
-                Some(&output),
-            ],
+            &[Some(&left_buffer), Some(&right_buffer), Some(&output)],
             params_bytes(&count),
             left.len() as u64,
         )?;
@@ -937,6 +928,48 @@ impl ElementKernels {
             params_bytes(&params),
             rows as u64,
             64,
+        )
+    }
+
+    /// Encode weighted RMSNorm with an f32 residual input and f16 output.
+    /// This is the DFlash boundary between its wide residual stream and the
+    /// f16 projection inputs. Buffers remain owned by the caller.
+    #[allow(clippy::too_many_arguments)]
+    pub fn encode_rms_norm_f32_in(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        input: &Buffer,
+        weight: &Buffer,
+        output: &Buffer,
+        rows: usize,
+        width: usize,
+        eps: f32,
+    ) -> Result<(), KernelError> {
+        if rows == 0 || width == 0 || !eps.is_finite() || eps <= 0.0 {
+            return Err(KernelError::InvalidInput(
+                "RMSNorm dimensions must be non-zero and eps finite and positive".to_string(),
+            ));
+        }
+        let elements = checked_product(rows, width, "RMSNorm dimensions")?;
+        if input.length() < (elements * size_of::<f32>()) as u64
+            || weight.length() < (width * size_of::<u16>()) as u64
+            || output.length() < (elements * size_of::<u16>()) as u64
+        {
+            return Err(KernelError::InvalidInput(
+                "RMSNorm buffer is smaller than its declared dimensions".to_string(),
+            ));
+        }
+        let params = NormParams {
+            rows: to_u32(rows, "row count")?,
+            width: to_u32(width, "norm width")?,
+            eps,
+        };
+        encoder.dispatch_groups(
+            &self.rms_norm_weighted_f32_in_tg_pipeline,
+            &[Some(input), Some(weight), Some(output)],
+            params_bytes(&params),
+            rows as u64,
+            Self::NORM_GROUP_THREADS,
         )
     }
 
@@ -1351,6 +1384,37 @@ impl ElementKernels {
         let params = to_u32(count, "residual length")?;
         encoder.dispatch_1d(
             &self.residual_pipeline,
+            &[Some(left), Some(right), Some(output)],
+            &params.to_le_bytes(),
+            count as u64,
+            64,
+        )
+    }
+
+    /// Encode the f32 residual addition used by DFlash without narrowing either
+    /// input. Inputs and output are caller-owned shared Metal buffers.
+    pub fn encode_residual_add_f32(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        left: &Buffer,
+        right: &Buffer,
+        output: &Buffer,
+        count: usize,
+    ) -> Result<(), KernelError> {
+        if count == 0 {
+            return Err(KernelError::InvalidInput(
+                "residual count must be non-zero".to_string(),
+            ));
+        }
+        let bytes = (count * size_of::<f32>()) as u64;
+        if left.length() < bytes || right.length() < bytes || output.length() < bytes {
+            return Err(KernelError::InvalidInput(
+                "f32 residual buffer is smaller than its declared count".to_string(),
+            ));
+        }
+        let params = to_u32(count, "residual length")?;
+        encoder.dispatch_1d(
+            &self.residual_add_f32_pipeline,
             &[Some(left), Some(right), Some(output)],
             &params.to_le_bytes(),
             count as u64,

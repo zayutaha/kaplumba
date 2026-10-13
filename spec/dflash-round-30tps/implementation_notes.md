@@ -675,3 +675,23 @@ scripts/gpuq try -- env KAPLUMBA_TEST_DFLASH_BLOCK_SIZE=4 \
   dflash_greedy_stream_matches_target_for_200_tokens_on_three_prompts \
   -- --ignored --exact --nocapture
 ```
+
+## 2026-10-14 — T19d encoder-facing f32 element operations
+
+Added `ElementKernels::encode_rms_norm_f32_in` and
+`encode_residual_add_f32`, which enqueue the existing weighted f32-input norm
+and f32 residual pipelines on a caller-owned `MetalEncoder`. The encode APIs
+validate dimensions and caller buffer lengths before dispatch. No Metal shader
+or slice-path behavior changed.
+
+Added `crates/kernels/tests/dflash_encode.rs`. Its 4 × 32 f32 norm input
+contains values around 150k (above fp16 range), and encoded output matched the
+existing slice API exactly. A 67-element f32 residual case also matched exactly
+and confirmed the result remains above 65,504. Zero count, zero epsilon, and
+undersized output/input buffers are rejected. `scripts/gpuq try -- cargo test
+--release -p kaplumba-kernels --test dflash_encode` passed 1/1.
+
+Coverage sabotage replaced the encoded residual's right operand with the left
+operand. The test failed at the output parity assertion (line 93; GPU output
+contained `left + left`, expected `left + right`; exit 101). The binding was
+restored and the test passed. This confirms the residual binding is exercised.
