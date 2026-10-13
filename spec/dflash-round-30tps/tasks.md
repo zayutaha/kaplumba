@@ -307,8 +307,7 @@ branches selected from those results, not mandatory simultaneous implementations
   Files: `crates/kernels/src/elements.rs`, `crates/kernels/tests/dflash_encode.rs`.
   Encode the current gated-SiLU pipeline into caller-owned buffers; test mixed
   positive/negative inputs, parity against the slice method, and invalid count
-  and buffer sizes. Passed parity and wrong-binding sabotage; commit recorded
-  in the implementation notes.
+  and buffer sizes. Passed parity and wrong-binding sabotage; commit `1715925`.
 - [ ] **T19e.1 — add an offset-aware encoder API for f32-output GEMM.**
   Files: `crates/kernels/src/encoder.rs`, `crates/kernels/src/linear.rs`,
   focused linear tests. Encode the existing fp32-output pipeline into a caller
