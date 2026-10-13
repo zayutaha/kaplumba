@@ -155,12 +155,17 @@ branches selected from those results, not mandatory simultaneous implementations
   rows, slices at the vocabulary start/interior/end, declared 0.05 tolerance,
   and path-specific indexing/scale sabotage. Results and commit hash recorded
   in notes and Status.
-- [ ] **T8 — aligned checkpoint semantics.**
-  Files: `dflash_alpha_probe.rs`, diagnostic tests, and notes; fix a proven
-  semantic mismatch as a separately committed task if necessary.
-  Test: z-lab stage contracts for raw embeddings, taps/fc/norm, K/V, RoPE,
-  masks and row selection. Log per-depth ranks/overlap on ≥3 prompts. Replace
-  hardcoded .919 ship language with diagnostic-only reporting.
+- [x] **T8 — aligned checkpoint semantics.**
+  Files: `crates/engine/tests/dflash_alpha_probe.rs` and notes; fix any proven
+  semantic mismatch as its own separately specified task. Capture all 15 masked
+  draft positions, report per-depth target-top-token rank and top-k overlap on
+  three distinct tokenized prompts, and retain the z-lab checkpoint's actual
+  tap offset/layout candidates as diagnostics. Replace the hardcoded alpha ship
+  thresholds with an explicit note that overlap is diagnostic and full-round
+  throughput is not measured by this test. Test all prompt lengths and output
+  row counts; sabotage the one-position target-row mapping and observe its
+  named alignment fixture fail. No semantic patch was demonstrated. Evidence
+  and commit hash recorded in notes and Status.
 - [ ] **T12 — round equivalence gate.**
   Files: `crates/engine/tests/dflash_equivalence.rs` and relevant round tests.
   Test: actual round path greedy equality on ≥3 prompts × ≥200 tokens where
@@ -294,7 +299,8 @@ branches selected from those results, not mandatory simultaneous implementations
 | T1b.1 | done | 2048-slot sliding ring; boundary greedy identity, max logit delta 0.136719, 13.59 GiB phys_footprint, no swap; sabotage fails; `6e69bf7` |
 | T20.1 | done | exact fp16/fp32 mapped slices; host and full-context tests plus sabotage; `880b7e4` |
 | T1c / T15 / T16 | drafted, held | sampling policy, measured length selection, new anchor contract |
-| T1b / T3 / T8 / T12 | open | correctness work before product wiring |
+| T8 | done | 3 prompts × 15 depths; row mapping fixture and shift sabotage; overlap is diagnostic only; hash pending |
+| T1b / T3 / T12 | open | correctness work before product wiring |
 | T1 / T2 / T4 | open | experimental product loop absent |
 | T9–T11 / T13 / T14 | open | measurements and performance acceptance outstanding |
 | F1a / F1b | conditional, held | alternative evaluation requires shared verifier evidence and design decisions |

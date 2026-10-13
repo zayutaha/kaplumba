@@ -23,6 +23,9 @@
 //! drafts, so **row `r` predicts position `start + r`**. Comparing row `r` against
 //! the target's distribution for `start + r` is the diagonal.
 //!
+//! This probe reports model quality diagnostics only. Full-round throughput is
+//! measured separately; overlap thresholds cannot establish a speed claim.
+//!
 //! Three earlier versions of this probe were wrong in ways only the numbers show,
 //! and each is worth recording:
 //!
@@ -67,8 +70,28 @@ but as the curvature of spacetime produced by mass and energy.";
 /// The requested sampler: temperature 1.0, top_k 64.
 const TOP_K: usize = 64;
 
-/// Target positions collected, and therefore how many drafter rows can be compared.
-const COLLECT: usize = 6;
+/// One anchor distribution plus all 15 masked output positions.
+const COLLECT: usize = 16;
+
+const PROMPTS: [&str; 3] = [
+    PROMPT,
+    "Explain why coastal regions often have milder temperatures than inland areas, and give two examples.",
+    "Describe a practical way to plan a small garden, from choosing plants to watering them through the first week.",
+];
+
+/// z-lab's masked output row is aligned to the same absolute position: mask
+/// row r predicts the target token/distribution at position start+r.
+fn target_row_for_mask_row(mask_row: usize) -> usize {
+    assert!(mask_row > 0, "row zero is the already-emitted anchor");
+    mask_row
+}
+
+#[test]
+fn dflash_mask_rows_align_with_same_position_target_logits() {
+    for row in 1..16 {
+        assert_eq!(target_row_for_mask_row(row), row);
+    }
+}
 
 fn model_path() -> String {
     std::env::var("KAPLUMBA_TEST_MODEL").expect("KAPLUMBA_TEST_MODEL is required")
@@ -299,6 +322,7 @@ fn host_head_band(
 
 struct Case {
     mean_diagonal: f64,
+    row_alphas: Vec<f64>,
     best_alpha: f64,
     best_row: usize,
     best_t: usize,
@@ -670,6 +694,12 @@ fn measure_case(
     let dists: Vec<Vec<(u32, f64)>> = (0..block_size)
         .map(|row| top_k_distribution(&block_logits[row * vocab..(row + 1) * vocab], TOP_K))
         .collect();
+    assert_eq!(dists.len(), block_size, "T8 needs every block output row");
+    assert_eq!(
+        draft.tokens.len(),
+        draft_rows,
+        "T8 needs every masked draft token"
+    );
 
     let mut best = (0usize, 0usize, -1.0_f64);
     for row in 0..block_size {
@@ -691,8 +721,9 @@ fn measure_case(
     // below is the difference, and it is the one number that says which of the
     // two this is.
     println!("  [d13] --- rank of the target's top token in the drafter's row ---");
-    for row in 1..draft_rows.min(5) {
-        let Some((token, _)) = targets.get(row).and_then(|dist| dist.first()) else {
+    for row in 1..=draft_rows {
+        let target_row = target_row_for_mask_row(row);
+        let Some((token, _)) = targets.get(target_row).and_then(|dist| dist.first()) else {
             continue;
         };
         let logits_row = &block_logits[row * vocab..(row + 1) * vocab];
@@ -705,7 +736,7 @@ fn measure_case(
             .map(|value| ((*value - max) as f64).exp())
             .sum();
         let p = ((mine - max) as f64).exp() / sum;
-        let own = draft.tokens.get(row).copied().unwrap_or(u32::MAX);
+        let own = draft.tokens.get(row - 1).copied().unwrap_or(u32::MAX);
         println!(
             "  [d13] row {row}: target wants {token} (p_target {:.4}); drafter ranks it {rank} of \
              {vocab} with p {p:.3e}; logit {mine:.4} against the row's max {max:.4} (softcapped). \
@@ -954,10 +985,22 @@ fn measure_case(
     // holds. (Row `r - 1` would be right if row 0 were the *previous* position;
     // it is not -- row 0 is the anchor at `total` itself.) The best-over-all-pairs
     // search above is alignment-free, so this is a display convention only.
+    assert_eq!(
+        targets.len(),
+        block_size,
+        "T8 needs one target distribution for every anchor/mask position"
+    );
     let diagonal: Vec<f64> = (1..=draft_rows)
-        .filter(|row| *row < targets.len())
-        .map(|row| acceptance(&targets[row], &dists[row]))
+        .map(|row| {
+            let target_row = target_row_for_mask_row(row);
+            acceptance(&targets[target_row], &dists[row])
+        })
         .collect();
+    assert_eq!(
+        diagonal.len(),
+        draft_rows,
+        "T8 needs overlap at every draft depth"
+    );
     let mean_diagonal = if diagonal.is_empty() {
         0.0
     } else {
@@ -983,6 +1026,7 @@ fn measure_case(
     println!("  [d4] cache rows per layer {:?}", ctx_first);
     Case {
         mean_diagonal,
+        row_alphas: diagonal,
         best_alpha: best.2,
         best_row: best.0,
         best_t: best.1,
@@ -1007,172 +1051,175 @@ fn alpha_at_temperature_1_top_k_64() {
     let mut drafter = DflashModel::new(weights, config.clone()).expect("drafter model");
 
     let tokenizer = GemmaTokenizer::from_model_dir(Path::new(&model_path())).expect("tokenizer");
-    let tokens = tokenizer.encode_prompt(PROMPT).expect("encode prompt");
     let mask = target.raw_embedding(&[config.mask_token_id]);
     drafter.set_mask_embedding(&mask).expect("mask embedding");
 
     let base_layers: Vec<usize> = config.target_layer_ids.clone();
     let shifted_layers: Vec<usize> = base_layers.iter().map(|layer| layer + 1).collect();
 
-    println!();
-    println!(
-        "alpha probe: temperature 1.0, top_k {TOP_K}, prompt {} tokens, block_size {}, \
-         draft_rows {}",
-        tokens.len(),
-        config.block_size,
-        config.draft_tokens()
-    );
-    println!("  self control (p0 vs itself) must be 1.0: {:.6}", {
-        let positions: Vec<u32> = (0..tokens.len() as u32).collect();
-        target.reset_gpu_caches();
-        let logits = target.forward_buffer(&tokens, &positions).expect("control");
-        let p = top_k_distribution(&logits, TOP_K);
-        acceptance(&p, &p)
-    });
-
-    let mut summary = Vec::new();
-    // The third case is the drafter's own version of
-    // `real_model_permutation_sweep`: its checkpoint has no `layout` key, so the
-    // loader leaves every linear at the row-major default and nothing has ever
-    // scored that choice. A row-major label (or a mode-0 read transposed for
-    // non-square tiles) decodes to plausible-magnitude, wrong-direction weights,
-    // which every engine-vs-host test is blind to because both sides share the
-    // reader. Acceptance is the score: the right permutation is the one that
-    // makes the drafter predict the target.
-    for (label, layers, permutation) in [
-        ("as-configured", base_layers.clone(), 0u32),
-        ("config+1 (z-lab offset=1)", shifted_layers.clone(), 0u32),
-        ("as-configured, colmajor", base_layers.clone(), 1u32),
-    ] {
-        drafter.set_permutation_mode(permutation);
-        let case = measure_case(&mut target, &mut drafter, &tokens, &layers, &config);
+    for (prompt_index, prompt_text) in PROMPTS.iter().enumerate() {
+        let tokens = tokenizer.encode_prompt(prompt_text).expect("encode prompt");
         println!();
-        println!("=== tap layers {label}: {layers:?}, permutation_mode {permutation} ===");
-        println!("  target p0 top3: {}", case.top_target);
-        println!("  drafts: {:?}", case.drafts);
-        // T12: the softcap's flat region, per row. `draft_logits` caps at
-        // `final_logit_softcapping` = 30, and `argmax_row` breaks ties to the
-        // lowest index, which is context-independent. If whole rows sit inside
-        // the cap, every row's argmax is decided by tie order and no amount of
-        // context can move it -- which looks exactly like a dead context path.
-        let pinned = case
-            .block_logits
-            .iter()
-            .filter(|bits| half::f16::from_bits(**bits).to_f32().abs() > 29.9)
-            .count();
-        // Row width from the buffer itself: the vocab is 262144 here, but a
-        // literal would silently mis-slice every row if the checkpoint changed.
-        let vocab = case.block_logits.len() / config.block_size;
-        let rows_pinned = (0..config.block_size)
-            .filter(|row| {
-                case.block_logits[row * vocab..(row + 1) * vocab]
-                    .iter()
-                    .any(|bits| half::f16::from_bits(*bits).to_f32() > 29.9)
-            })
-            .count();
         println!(
+            "alpha probe {}/{}: temperature 1.0, top_k {TOP_K}, prompt {} tokens, block_size {}, draft_rows {}",
+            prompt_index + 1,
+            PROMPTS.len(),
+            tokens.len(),
+            config.block_size,
+            config.draft_tokens()
+        );
+        println!("  self control (p0 vs itself) must be 1.0: {:.6}", {
+            let positions: Vec<u32> = (0..tokens.len() as u32).collect();
+            target.reset_gpu_caches();
+            let logits = target.forward_buffer(&tokens, &positions).expect("control");
+            let p = top_k_distribution(&logits, TOP_K);
+            acceptance(&p, &p)
+        });
+
+        let mut summary = Vec::new();
+        // These layouts are diagnostic candidates only. The checkpoint has no
+        // explicit layout field; host/head controls and source conventions must
+        // agree before any layout change is considered.
+        for (label, layers, permutation) in [
+            ("as-configured", base_layers.clone(), 0u32),
+            ("config+1 (z-lab offset=1)", shifted_layers.clone(), 0u32),
+            ("as-configured, colmajor", base_layers.clone(), 1u32),
+        ] {
+            drafter.set_permutation_mode(permutation);
+            let case = measure_case(&mut target, &mut drafter, &tokens, &layers, &config);
+            println!();
+            println!("=== tap layers {label}: {layers:?}, permutation_mode {permutation} ===");
+            println!("  target p0 top3: {}", case.top_target);
+            println!("  drafts: {:?}", case.drafts);
+            // T12: the softcap's flat region, per row. `draft_logits` caps at
+            // `final_logit_softcapping` = 30, and `argmax_row` breaks ties to the
+            // lowest index, which is context-independent. If whole rows sit inside
+            // the cap, every row's argmax is decided by tie order and no amount of
+            // context can move it -- which looks exactly like a dead context path.
+            let pinned = case
+                .block_logits
+                .iter()
+                .filter(|bits| half::f16::from_bits(**bits).to_f32().abs() > 29.9)
+                .count();
+            // Row width from the buffer itself: the vocab is 262144 here, but a
+            // literal would silently mis-slice every row if the checkpoint changed.
+            let vocab = case.block_logits.len() / config.block_size;
+            let rows_pinned = (0..config.block_size)
+                .filter(|row| {
+                    case.block_logits[row * vocab..(row + 1) * vocab]
+                        .iter()
+                        .any(|bits| half::f16::from_bits(*bits).to_f32() > 29.9)
+                })
+                .count();
+            println!(
             "  [t12] {pinned} of {} capped logits sit at the softcap (> 29.9), in {rows_pinned} of \
              {} rows",
             case.block_logits.len(),
             config.block_size
         );
-        println!(
-            "  mean alpha on the round's diagonal: {:.4}; best {:.4} at row {} vs t={}",
-            case.mean_diagonal, case.best_alpha, case.best_row, case.best_t
-        );
-        summary.push((label, layers, case));
-    }
-
-    println!();
-    println!("=== SUMMARY (mean alpha on the round's diagonal) ===");
-    for (label, layers, case) in &summary {
-        println!(
-            "  {label:<28} {layers:?}  mean {:.4}  best {:.4}",
-            case.mean_diagonal, case.best_alpha
-        );
-    }
-
-    // T12's measurement, and the one that separates the two illnesses that both
-    // print `alpha = 0.0000`: compare the drafter's block *logits* across the two
-    // contexts, not just their argmaxes.
-    //
-    //   * logits differ (and differ by a lot) -> the context DOES reach the block
-    //     and the argmaxes coincide because the rows are saturated or degenerate
-    //     at the cap. The bug is downstream of the context: the logit scale or
-    //     the head, not the taps.
-    //   * logits byte-identical -> the block's output does not depend on its
-    //     context at all, so the loss is in `append_context`'s fusion/projection,
-    //     the cached rows, or the attention.
-    {
-        let a = &summary[0].2.block_logits;
-        let b = &summary[1].2.block_logits;
-        if a.len() == b.len() {
-            let differing = a.iter().zip(b).filter(|(x, y)| x != y).count();
-            let worst = a
-                .iter()
-                .zip(b)
-                .map(|(x, y)| {
-                    (half::f16::from_bits(*x).to_f32() - half::f16::from_bits(*y).to_f32()).abs()
-                })
-                .fold(0.0_f32, f32::max);
-            let left = a.iter().map(|bits| *bits as u64).sum::<u64>();
-            let right = b.iter().map(|bits| *bits as u64).sum::<u64>();
-            println!();
-            println!("=== [t12] do two different contexts change the block LOGITS? ===");
             println!(
-                "  bit-pattern sums: {} vs {} (equal: {})",
-                left,
-                right,
-                left == right
+                "  mean alpha on the round's diagonal: {:.4}; best {:.4} at row {} vs t={}",
+                case.mean_diagonal, case.best_alpha, case.best_row, case.best_t
             );
             println!(
-                "  {differing} of {} logits differ; worst |delta| {worst:.5}",
-                a.len()
+                "  per-depth alpha (draft row: target top-k overlap): {:?}",
+                case.row_alphas
+                    .iter()
+                    .enumerate()
+                    .map(|(index, alpha)| (index + 1, *alpha))
+                    .collect::<Vec<_>>()
             );
+            summary.push((label, layers, case));
+        }
+
+        println!();
+        println!("=== SUMMARY (mean alpha on the round's diagonal) ===");
+        for (label, layers, case) in &summary {
             println!(
-                "  drafts identical: {}",
-                summary[0].2.drafts == summary[1].2.drafts
+                "  {label:<28} {layers:?}  mean {:.4}  best {:.4}",
+                case.mean_diagonal, case.best_alpha
             );
         }
-    }
-    println!();
-    println!("DECISION RULE (measured round times, 15.25 tok/s baseline):");
-    println!("  alpha < 0.919 -> slower than plain decode, DO NOT SHIP");
-    println!("  alpha 0.919-0.977 -> a real speedup, but under 30 t/s at b32");
-    println!("  alpha >= 0.977 -> 30 t/s at b32 is reachable");
 
-    // The two cases tap different layers, so the taps differ, so the drafter's
-    // context differs. **The block logits must therefore differ**: the drafter is
-    // supposed to condition on the target's hidden states, and this is the one
-    // property that separates "the context is not reaching the block" from "the
-    // context reaches the block but the argmaxes coincide" -- two failures that
-    // both print `alpha = 0.0000` and need opposite fixes.
-    //
-    // Asserted on the logits, not on the drafts, because the drafts are argmaxes:
-    // `draft_logits` caps at the softcap 30 (`final_logit_softcapping` = 30) and
-    // `argmax_row` breaks ties to the lowest index, so a context change that
-    // moves every logit by 10 can still leave the argmaxes identical. An
-    // assertion on the drafts alone would accuse the wrong component.
-    assert_ne!(
-        summary[0].2.block_logits, summary[1].2.block_logits,
-        "the drafter's block logits are byte-identical from two different tap layer \
+        // T12's measurement, and the one that separates the two illnesses that both
+        // print `alpha = 0.0000`: compare the drafter's block *logits* across the two
+        // contexts, not just their argmaxes.
+        //
+        //   * logits differ (and differ by a lot) -> the context DOES reach the block
+        //     and the argmaxes coincide because the rows are saturated or degenerate
+        //     at the cap. The bug is downstream of the context: the logit scale or
+        //     the head, not the taps.
+        //   * logits byte-identical -> the block's output does not depend on its
+        //     context at all, so the loss is in `append_context`'s fusion/projection,
+        //     the cached rows, or the attention.
+        {
+            let a = &summary[0].2.block_logits;
+            let b = &summary[1].2.block_logits;
+            if a.len() == b.len() {
+                let differing = a.iter().zip(b).filter(|(x, y)| x != y).count();
+                let worst = a
+                    .iter()
+                    .zip(b)
+                    .map(|(x, y)| {
+                        (half::f16::from_bits(*x).to_f32() - half::f16::from_bits(*y).to_f32())
+                            .abs()
+                    })
+                    .fold(0.0_f32, f32::max);
+                let left = a.iter().map(|bits| *bits as u64).sum::<u64>();
+                let right = b.iter().map(|bits| *bits as u64).sum::<u64>();
+                println!();
+                println!("=== [t12] do two different contexts change the block LOGITS? ===");
+                println!(
+                    "  bit-pattern sums: {} vs {} (equal: {})",
+                    left,
+                    right,
+                    left == right
+                );
+                println!(
+                    "  {differing} of {} logits differ; worst |delta| {worst:.5}",
+                    a.len()
+                );
+                println!(
+                    "  drafts identical: {}",
+                    summary[0].2.drafts == summary[1].2.drafts
+                );
+            }
+        }
+        println!("  overlap is diagnostic only; it does not measure full-round tok/s");
+
+        // The two cases tap different layers, so the taps differ, so the drafter's
+        // context differs. **The block logits must therefore differ**: the drafter is
+        // supposed to condition on the target's hidden states, and this is the one
+        // property that separates "the context is not reaching the block" from "the
+        // context reaches the block but the argmaxes coincide" -- two failures that
+        // both print `alpha = 0.0000` and need opposite fixes.
+        //
+        // Asserted on the logits, not on the drafts, because the drafts are argmaxes:
+        // `draft_logits` caps at the softcap 30 (`final_logit_softcapping` = 30) and
+        // `argmax_row` breaks ties to the lowest index, so a context change that
+        // moves every logit by 10 can still leave the argmaxes identical. An
+        // assertion on the drafts alone would accuse the wrong component.
+        assert_ne!(
+            summary[0].2.block_logits, summary[1].2.block_logits,
+            "the drafter's block logits are byte-identical from two different tap layer \
          sets ({:?} vs {:?}), so its context does not reach its output at all. \
          alpha = 0.0000 on every row follows from that, and no amount of context \
          quality can fix it: the loss is in `append_context`'s fusion/projection, the \
          cached rows, or the attention. `enable_taps` does update the layer list and \
          T7's test shows different layers produce different tap contents, so the loss \
          is downstream of the taps.",
-        summary[0].1, summary[1].1
-    );
+            summary[0].1, summary[1].1
+        );
 
-    // And the drafts are recorded separately, because "logits differ but drafts do \
-    // not" is the saturation signature and is the next thing to chase.
-    if summary[0].2.drafts == summary[1].2.drafts {
-        println!();
-        println!(
-            "NOTE: the logits differ but the drafts do not. That is the softcap \
+        // And the drafts are recorded separately, because "logits differ but drafts do \
+        // not" is the saturation signature and is the next thing to chase.
+        if summary[0].2.drafts == summary[1].2.drafts {
+            println!();
+            println!(
+                "NOTE: the logits differ but the drafts do not. That is the softcap \
              tie-break, not a dead context: the argmax is decided by index order among \
              logits pinned at the cap. Chase the logit scale, not the taps."
-        );
+            );
+        }
     }
 }

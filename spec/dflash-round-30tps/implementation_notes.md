@@ -296,6 +296,49 @@ of the measured 0.2604 mean diagonal overlap. Continue with T8's model-stage,
 tap, and row alignment checks; do not re-enable colmajor from the stale alpha
 claim.
 
+## 2026-10-13 — T8: full-depth DFlash alignment and overlap
+
+The alpha probe now obtains target-greedy continuations for all 15 masked rows,
+asserts 16 target distributions / 16 block-logit rows / 15 draft tokens, and
+prints every row's target-top-token rank and same-position top-64 overlap. It
+runs three distinct tokenized prompts (78, 30, and 34 tokens) under the
+checkpoint tap indices, the `+1` offset candidate, and the diagnostic colmajor
+mode. The old fixed `.919/.977` ship thresholds are removed; the output labels
+overlap as diagnostic and explicitly says it is not full-round throughput.
+
+The prompt × layout mean diagonal overlaps were:
+
+| Prompt tokens | configured row-major | tap +1 | colmajor candidate |
+|---:|---:|---:|---:|
+| 78 | 0.0992 | 0.0920 | 0.0000 |
+| 30 | 0.2572 | 0.1768 | 0.0000 |
+| 34 | 0.1852 | 0.2097 | 0.0001 |
+
+Configured row-major averaged 0.1805 across these prompts. Its mean overlap
+across depths 1–4 was 0.5341, while depths 5–15 averaged 0.0520. The signal is
+prompt-dependent at early depths, then collapses for most later rows. No
+one-position target-row mismatch was observed; config+1 did not consistently
+improve overlap, and colmajor remains unsupported by both the source convention
+and these measurements. This identifies a short useful prefix but does not
+prove a production acceptance rate or diagnose the checkpoint's training data.
+
+Validation:
+
+- `cargo test --release -p kaplumba-engine --test dflash_alpha_probe dflash_mask_rows_align_with_same_position_target_logits -- --exact` — passed.
+- Row-shift sabotage (`target_row_for_mask_row(r) = r - 1`) failed the fixture:
+  `assertion left == right`, `left: 0`, `right: 1` (exit 101); restored and
+  reran successfully.
+- `scripts/gpuq try -- env KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacked" KAPLUMBA_DFLASH_DIR="$HOME/.kaplumba/models/Drafter" cargo test --release -p kaplumba-engine --test dflash_alpha_probe alpha_at_temperature_1_top_k_64 -- --ignored --exact --nocapture` — passed 1/1 in 88.12 s. All three prompts completed all 15 draft depths and each of the three layout/tap diagnostics.
+- `rustfmt --edition 2021 --check crates/engine/tests/dflash_alpha_probe.rs` and `git diff --check` passed.
+
+The V0b long-context ceiling constrains any shorter prefix: at context 8192,
+M=4 has a processed-anchor ideal ceiling of 25.63 tok/s even before draft cost;
+M=8 reaches 33.89 tok/s only with 34.45 ms left for all proposal and round
+work. Since the first eight rows already lose most acceptance probability after
+the first few depths, shorter-prefix selection alone cannot establish 30 tok/s.
+No production behavior changed. Next evaluate proposal-distribution tuning or
+a two-block design against the full target cost and exact rejection contract.
+
 ## 2026-10-13 — V0b ideal-proposal verifier ceiling
 
 Added ignored integration test `crates/engine/tests/dflash_verify_ceiling.rs`.
