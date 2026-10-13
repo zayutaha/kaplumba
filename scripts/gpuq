@@ -40,6 +40,10 @@
 
 set -uo pipefail
 
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/gpuq_mem.sh
+. "$SCRIPT_DIR/gpuq_mem.sh"
+
 LOCK="${KAPLUMBA_GPU_LOCK_FILE:-$HOME/.kaplumba/gpu.lock}"
 QUEUE="${LOCK}.queue"
 
@@ -96,8 +100,7 @@ anon_gib() {
 }
 
 swap_used_mb() {
-  sysctl -n vm.swapusage 2>/dev/null |
-    awk -F'[= ]+' '/used/ { printf "%.0f", $2 / 1048576; exit }' || echo "?"
+  sysctl -n vm.swapusage 2>/dev/null | gpuq_swap_used_mib_from_stdin
 }
 
 # Read the holder out of the lock file. ADVISORY ONLY and possibly stale: the

@@ -170,6 +170,28 @@ gpuq_mem_healthy() {
   awk -v a="$avail" -v m="$min" 'BEGIN { exit !(a + 0 >= m + 0) }'
 }
 
+# Parse `sysctl -n vm.swapusage`, reporting the `used` field in MiB. Read the
+# system field by name: positional parsing here once reported `total` as swap
+# usage because the three values have the same unit suffix.
+gpuq_swap_used_mib_from_stdin() {
+  awk '
+    {
+      for (i = 1; i <= NF; i++) {
+        if ($i != "used") continue
+        value = $(i + 2)
+        unit = substr(value, length(value), 1)
+        sub(/[KMG]$/, "", value)
+        multiplier = unit == "G" ? 1024 : unit == "K" ? (1 / 1024) : unit == "M" ? 1 : 0
+        if (multiplier == 0 || value !~ /^[0-9]+([.][0-9]+)?$/) break
+        printf "%.0f", value * multiplier
+        found = 1
+        exit
+      }
+    }
+    END { if (!found) print "?" }
+  '
+}
+
 # Convenience: run `gpuq status` ourselves and report health.  $1 = min GiB.
 box_healthy() { scripts/gpuq status 2>/dev/null | gpuq_mem_healthy "${1:-4}"; }
 

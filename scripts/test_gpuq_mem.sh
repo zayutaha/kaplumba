@@ -45,6 +45,38 @@ check "unhealthy 1.47 GiB"    0 "memory: 1.47 GiB available (reclaimable), 0 GiB
 # The OQ5 stall signature, already normalised by gpuq.
 check "OQ5 stall 0.12"       0 "memory: 0.12 GiB available (reclaimable), 23 GiB in use by processes, 0 MiB swap"
 
+echo "== swap usage uses the named 'used' field from sysctl =="
+SWAP=$(printf '%s\n' 'total = 4096.00M used = 3296.25M free = 799.75M' | gpuq_swap_used_mib_from_stdin)
+if [ "$SWAP" = "3296" ]; then
+  printf '  ok   %-26s %s MiB\n' "swap used field" "$SWAP"
+else
+  printf '  FAIL %-26s expected 3296 MiB got %s\n' "swap used field" "$SWAP"; fail=1
+fi
+SWAP_G=$(printf '%s\n' 'total = 4.00G used = 1.50G free = 2.50G' | gpuq_swap_used_mib_from_stdin)
+if [ "$SWAP_G" = "1536" ]; then
+  printf '  ok   %-26s %s MiB\n' "swap G unit" "$SWAP_G"
+else
+  printf '  FAIL %-26s expected 1536 MiB got %s\n' "swap G unit" "$SWAP_G"; fail=1
+fi
+SWAP_K=$(printf '%s\n' 'total = 4096K used = 1024K free = 3072K' | gpuq_swap_used_mib_from_stdin)
+if [ "$SWAP_K" = "1" ]; then
+  printf '  ok   %-26s %s MiB\n' "swap K unit" "$SWAP_K"
+else
+  printf '  FAIL %-26s expected 1 MiB got %s\n' "swap K unit" "$SWAP_K"; fail=1
+fi
+SWAP_BAD=$(printf '%s\n' 'total = 4096.00M free = 4096.00M' | gpuq_swap_used_mib_from_stdin)
+if [ "$SWAP_BAD" = "?" ]; then
+  printf '  ok   %-26s malformed fails closed\n' "swap missing used"
+else
+  printf '  FAIL %-26s expected ? got %s\n' "swap missing used" "$SWAP_BAD"; fail=1
+fi
+SWAP_UNIT=$(printf '%s\n' 'total = 4096.00M used = 1.00T free = 4095.00M' | gpuq_swap_used_mib_from_stdin)
+if [ "$SWAP_UNIT" = "?" ]; then
+  printf '  ok   %-26s unknown unit fails closed\n' "swap unknown unit"
+else
+  printf '  FAIL %-26s expected ? got %s\n' "swap unknown unit" "$SWAP_UNIT"; fail=1
+fi
+
 echo "== must be treated as UNHEALTHY (fail closed, never invent a number) =="
 check "no memory line"       0 "queue: 0 waiting"
 check "wrong shape (17G)"    0 "memory: 17G available (reclaimable), 1G in use, 0 MiB swap"

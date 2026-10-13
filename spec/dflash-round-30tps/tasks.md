@@ -352,14 +352,16 @@ branches selected from those results, not mandatory simultaneous implementations
   Files: `crates/engine/src/dflash.rs`, this spec's plan/tasks/notes.
   One prompt, B=4: exact greedy output, 74 rounds, 129 accepted, 5.43 tok/s
   versus 7.05 tok/s for one encoded block. Removed the second-block branch;
+  cleanup committed as `5b7981e`.
   speculative K/V chaining adds enough draft work to erase the verify savings.
 - [x] **T19g.5 — repair GPUQ swap telemetry.**
   Files: `scripts/gpuq`, `scripts/gpuq_mem.sh`, `scripts/test_gpuq_mem.sh`,
   this spec's notes. Parse the named `used` value and convert K/M/G units.
   Before the fix, `sysctl -n vm.swapusage` showed about 3.2 GiB used while
   `gpuq status` incorrectly showed 0 MiB. Parser tests pass for M/G and missing
-  fields fail closed. Coverage sabotage and clean rerun are required before
-  committing this telemetry correction.
+  fields fail closed. Coverage sabotage read `total` and failed all five swap
+  assertions; the restored parser passed the full script. Commit hash is
+  recorded in the following task-status update.
 - [x] **T19g.6 — measure GPU tied-head encoding and reject if slower.**
   Files: `crates/engine/src/dflash.rs`, this spec's plan/tasks/notes.
   One prompt, B=4, exact output: encoded block + encoded head 6.69 tok/s;
