@@ -338,7 +338,7 @@ branches selected from those results, not mandatory simultaneous implementations
   All three contexts passed; the context-V binding sabotage failed on normal
   context (V relative error 0.584% vs the 0.5% bound). Fixed scratch is now
   5,980,160 bytes (5.70 MiB), including the third f32 residual buffer. Commit
-  hash to be recorded immediately after commit.
+  commit `529f1af`.
 - [ ] **T19g.3 — route draft generation through the encoded block and measure.**
   Files: `crates/engine/src/dflash.rs`, `dflash_equivalence.rs`, notes. Preserve
   the slice path as a test oracle; compare draft logits/argmax and exact target
