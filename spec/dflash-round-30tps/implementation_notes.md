@@ -360,6 +360,46 @@ scripts/gpuq try -- env KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacke
   ideal_target_continuations_bound_verify_throughput -- --ignored --exact --nocapture
 ```
 
+## 2026-10-14 — T20.2/F1d candidate review and loader gap
+
+Found `eepos/gemma-4-31B-it-DFlash-exl3-6.0bpw` while searching for a same-
+target DFlash candidate the current EXL3 loader could consume. Its config matches
+the local Qwen3 DFlash architecture, `block_size=16`, hidden/intermediate sizes,
+attention geometry, sliding/full layer layout, and target taps
+`[1,12,23,35,46,57]`. Remote Safetensors header inspection only downloaded the
+first 128 KiB; it declares 166 tensors and the same key set as local. All 36
+`.trellis/.mcg/.suh/.svh` linears and 22 BF16 `.weight` norms are recognized by
+the current suffix rules. Norms, input/output scales and MCG codebook metadata
+use the expected dtypes. Every candidate trellis has 96 words per tile (6 bpw),
+where local uses 64 words (4 bpw).
+
+The compatibility probe caught a source-level blocker before any model run:
+`DflashWeights::load` checks against `BitRate::Integer(4).packed_words()` and
+constructs every `QuantizedLinear` with `Exl3Rate::Integer(4)` at
+`crates/engine/src/dflash.rs`. Thus the candidate is not loadable correctly even
+though its config and tensor names match. T20.2 adds per-line integer-rate
+inference from the packed tile shape and 4/6-bpw coverage; fractional MCG layouts
+remain rejected. No kernel family is needed because line execution already
+accepts a per-line `Exl3Rate`.
+
+Candidate repo metadata: `Apache-2.0`, revision
+`48be48d8035ec6c94d6b9b3f867c7dae1e4dc627`, 1,153,033,071-byte
+`model.safetensors` (SHA-256 from HF file metadata:
+`b86bc095d00b30f73f22f3338981061e2218046a675c51c2871a9b51abeff0cb`). Local
+drafter shard is 769,057,588 bytes, so candidate adds 383,975,483 bytes (~366
+MiB), not a multi-gigabyte memory increase. HF model card author warns this was
+their first EXL3 conversion and only briefly tested; treat all local results as
+required. Source: [candidate model card](https://huggingface.co/eepos/gemma-4-31B-it-DFlash-exl3-6.0bpw)
+and its `config.json`, `quantization_config.json`, and Safetensors header.
+
+Per the user's existing constraint, weight download started only after config,
+tensor-header compatibility, and storage/footprint delta were established. It
+is downloading to `~/.kaplumba/models/Drafter-eepos-exl3-6bpw`; neither the local
+drafter nor project code has been changed yet. The target-model equivalence test
+binary compiled with `cargo test --release -p kaplumba-engine --test
+dflash_equivalence --no-run`. Continue after the segmented transfer, verify its
+SHA-256, add config files, and run T20.2 before any forced-load generation.
+
 ## 2026-10-14 — T12/T10 reruns and T16b unprocessed-anchor rejection
 
 After T11, the processed-anchor DFlash stream was rerun at trained B=16 for

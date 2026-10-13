@@ -468,6 +468,15 @@ branches selected from those results, not mandatory simultaneous implementations
   length 768973144 does not match 86704128`. Implementation commit recorded in
   the Status table.
 
+- [ ] **T20.2 — infer integer EXL3 rate from DFlash trellis shape.**
+  Files: `crates/engine/src/dflash.rs`, `crates/engine/tests/dflash_load.rs`,
+  notes. Replace the hardcoded 4-bpw/64-word assumption with shape-based integer
+  rate inference for supported EXL3 integer rates; retain exact byte-count,
+  codebook and mapping checks. Generalize the real-shard checks for 4/6 bpw and
+  add rate-table plus malformed/fractional rejection coverage. Sabotage the
+  inferred rate back to 4 bpw and require the 6-bpw fixture/candidate loader to
+  fail diagnostically. Keep the local drafter and runtime defaults unchanged.
+
 ## Conditional alternatives after the shared verifier gate
 
 - [ ] **F1a — lookup evaluation design and optional experiment.**
@@ -498,6 +507,19 @@ branches selected from those results, not mandatory simultaneous implementations
   design and memory estimate. Public acceptance (3.98–6.62 tokens on listed
   subsets) is external and does not show 30 tok/s here.
 
+- [ ] **F1d — evaluate a compatible same-target 6-bpw EXL3 DFlash candidate.**
+  Files: this spec's notes and acceptance status. Candidate:
+  `eepos/gemma-4-31B-it-DFlash-exl3-6.0bpw`, repo commit
+  `48be48d8035ec6c94d6b9b3f867c7dae1e4dc627`, 1,153,033,071-byte Safetensors,
+  Apache-2.0 metadata. Header-only review found 166 recognized names, identical
+  key sets and architecture/tap config; the third trellis dimension is 96
+  (=6 bpw) instead of the local checkpoint's 64 (=4 bpw). The owner says the
+  conversion was only briefly tested, so treat it as experimental. After T20.2,
+  load it from an isolated model directory, verify all 36 lines and exact greedy
+  output on the existing three 200-token prompts, then compare repeated
+  same-prompt timings, footprint and swap to the current drafter. No default
+  change from a single run or without exactness and stable measured gain.
+
 ## Status
 
 | item | state | evidence |
@@ -525,6 +547,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | T19 | conditional design, held | GPU stage ownership/wait overhead needs measurement after correctness |
 | T1b.1 | done | 2048-slot sliding ring; boundary greedy identity, max logit delta 0.136719, 13.59 GiB phys_footprint, no swap; sabotage fails; `6e69bf7` |
 | T20.1 | done | exact fp16/fp32 mapped slices; host and full-context tests plus sabotage; `880b7e4` |
+| T20.2 | open | loader hardcodes 4 bpw; compatible candidate uses 6 bpw / 96 words per tile |
 | T1c / T15 / T16 | drafted, held | sampling policy, measured length selection, new anchor contract |
 | T8 | done | 3 prompts × 15 depths; row mapping fixture and shift sabotage; overlap is diagnostic only; `c2e63c9` |
 | T1b / T3 / T12 | open | correctness work before product wiring |
@@ -532,6 +555,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | T9–T11 / T13 / T14 | open | measurements and performance acceptance outstanding |
 | F1a / F1b | conditional, held | alternative evaluation requires shared verifier evidence and design decisions |
 | F1c | done, candidate rejected | public same-target model uses dense BF16 linears and incompatible config; header-only review, no weights downloaded |
+| F1d | open | compatible 6-bpw EXL3 candidate; needs rate-aware loader, exact stream and repeated throughput/memory gate |
 | T11 | done | all-row greedy identity, offset sabotage, and short-context B-A-B timing; `aaa010c` |
 | T16b | experiment rejected | unprocessed anchor B=4 and B=16 both diverge at output 77 (99382 vs 84750); removed; `cb9de00` |
 

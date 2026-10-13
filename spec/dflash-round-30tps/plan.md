@@ -124,6 +124,8 @@ before asserting practical headroom.
 | T10 proposal shape | fixed temperature and a single 15-row average hide whether proposals are over/under-confident at depth | measure q-temperature overlap against fixed target p for each depth; any product policy change first amends T1c and stores exact q |
 | `crates/kernels/src/linear.rs` | `perm_mode` present; fp16/fp32 buffer GEMM validates offset but binds packed bytes at zero | honor packed offset/length via offset-aware binding; then independently validate layout |
 | `crates/engine/src/dflash.rs` | T1a samples from retained q; temperature 1/top-k policy; existing processed-anchor method | complete sampler policy, unprocessed-anchor API, independent stage diagnosis and verified context ownership |
+| `crates/engine/src/dflash.rs` | DFlash packed line construction hardcodes `Integer(4)` and expects 64 words per tile | infer and validate integer bpw from each trellis shape; preserve exact mapped slice, MCG and per-line rate |
+| `crates/engine/tests/dflash_load.rs` | real-shard assertions assume the local 4-bpw checkpoint | parameterize rate/shape assertions; cover 4 and 6 bpw and malformed-rate rejection |
 | DFlash `forward_block` / slice-based `Elements` and `LinearKernels` | individual operations materialize GPU buffers, dispatch, wait, and read results back into host `Vec`s | T19a measures whole round buckets; T19b separates drafter proposal, target verify, and accept/sample costs before designing GPU-resident scratch around existing encode paths |
 | DFlash checkpoint trained with block size 16 | T8 shows overlap falls sharply after early rows, while every round computes/verifies all 15 proposals | T19c sweeps verified prefixes B=2/4/8/16 with exact output checks and records generation speed plus accepted-prefix counts; no runtime default changes without a repeatable gain |
 | `crates/engine/src/gpu_cache.rs` | `retract` only lowers cursor; physical sliding ring must retain rows overwritten by a chunk | mask future rejected positions and validate cursor rollback; physical append headroom is handled at cache construction |
@@ -312,6 +314,14 @@ automatically selected implementation:
   loader. Treat it as incompatible until a separately scoped loader/format plan
   proves compatibility and footprint; do not download weights as a benchmark
   shortcut. Its public acceptance is not local throughput evidence.
+- **Compatible EXL3 candidate:** `eepos/gemma-4-31B-it-DFlash-exl3-6.0bpw`
+  has the same Qwen3 DFlash architecture, block size 16, tap IDs and tensor
+  names/shapes apart from expected EXL3 tile depth. Its 1,153,033,071-byte
+  Safetensors file is about 384 MB larger than the current local file. The
+  loader currently hardcodes 4 bpw, so first infer rate from tile depth and
+  verify the MCG payload; then load only from an isolated directory. Its author
+  describes the conversion as briefly tested, so exact-stream and performance
+  measurements decide whether it is useful.
 
 For either candidate, compare complete cost and accepted-prefix survival to the
 same interleaved plain baseline. Existing kernel-family restrictions apply.
@@ -328,6 +338,7 @@ same interleaved plain baseline. Existing kernel-family restrictions apply.
 | 6-bpw target head GEMM differs from per-row GEMV | retain the checked per-row route unless exact greedy and numeric gates pass; current packed-offset-correct batched route passes, but keep it only for the measured ~2.3% M=16 verifier gain |
 | speculative path is slower | retain opt-in diagnostics and plain default; record unmet performance target |
 | 30 tok/s remains unmet | report cost and acceptance gap; do not infer hardware impossibility |
+| candidate rate metadata is ignored | infer rate per trellis and require candidate exact-stream plus rate/shape assertions before timing |
 
 ## Requirement → task mapping
 
@@ -355,3 +366,4 @@ same interleaved plain baseline. Existing kernel-family restrictions apply.
 | AC9 | T1b.1, T1b.2, T3, T16, T12 |
 | AC10 | F1a, F1b, T13, T14 |
 | AC11 | T20, T20.1 |
+| AC12 | T20.2, F1d |

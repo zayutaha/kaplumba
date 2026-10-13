@@ -195,6 +195,12 @@ probe's overlaps are not substitute measurements for this engine.
     Metal view. Do not add a second `File::read_exact` plus per-tensor packed
     copy loader for the drafter. Small scale and norm tensors may use the base
     loader's resident arena.
+12. An alternate EXL3 DFlash candidate must load from an isolated model
+    directory. It must not replace `~/.kaplumba/models/Drafter` or become the
+    runtime default without exact target-output parity, repeated complete-speed
+    wins, and footprint/swap evidence. Derive each line's integer bpw from its
+    trellis tile shape and reject unsupported/fractional MCG layouts; never
+    treat 6-bpw data as 4-bpw.
 
 ## Requirements
 
@@ -231,6 +237,13 @@ probe's overlaps are not substitute measurements for this engine.
   views, and `mlock` policy as target weights. Retain the `TextWeights` owner
   inside `DflashWeights`; keep scales and norms in its arena. Preserve the
   target model's base loader unchanged.
+* **L2 — EXL3 rate compatibility.** Infer the integer EXL3 rate from each
+  trellis tensor's third dimension (`16 * bpw` words per 16×16 tile), validate
+  the shape and exact byte count, and store the inferred rate on that line.
+  Cover the current 4-bpw drafter, the compatible 6-bpw candidate, supported
+  integer-rate parsing, and explicit rejection of unsupported or fractional
+  MCG shapes. Compare all candidate line shapes and exercise its exact full
+  draft/verify stream before timing.
 * **S1 — valid proposals.** For sampled mode draw every candidate from the exact
   q used by verification; greedy mode uses deterministic proposals. Match the
   supported temperature/top-k/top-p policy on p and q. The planned CLI path
@@ -326,6 +339,13 @@ probe's overlaps are not substitute measurements for this engine.
   drafter's lifetime. Tests confirm aligned no-copy views use the tensor's
   actual packed offset and length, and misaligned views take the base loader's
   required alignment-copy path without changing bytes.
+* **AC12:** The loader assigns each DFlash line the rate declared by its trellis
+  tile shape. Synthetic 4-bpw and 6-bpw checkpoints load with the expected
+  `QuantizedLinear.rate`; malformed/fractional shapes fail with a named error.
+  The candidate's 166 tensors are all recognized, its exact greedy stream
+  matches the target, and any throughput claim uses repeated same-prompt runs
+  plus measured footprint/swap. The existing drafter remains default unless
+  exactness, stable gain, and memory acceptance all pass.
 
 ## Open questions / scheduled evidence
 
@@ -338,8 +358,10 @@ correct existing batched 6-bpw head; attainable acceptance and throughput.
 Unresolved decisions: which verifier shapes have adequate cost headroom;
 whether DFlash's first divergence is implementation, conversion, target-feature
 mismatch or checkpoint quality; whether lookup or EAGLE-3 merits implementation;
-exact EAGLE-3 resident footprint and reduced-vocabulary mapping. The reviewed
-same-target Red Hat DFlash artifact is not loadable by the current EXL3-only
-drafter path; a BF16 format or quantization design would be a separate scope.
+exact EAGLE-3 resident footprint and reduced-vocabulary mapping. A same-target
+community 6-bpw EXL3 DFlash candidate has a compatible tensor/config layout but
+exposed a hardcoded 4-bpw loader assumption. F1d resolves rate loading and
+evaluates it without changing the default. The separate Red Hat BF16 artifact
+remains incompatible with the current EXL3 loader.
 No default fallback, tolerance or checkpoint substitution is silently chosen by
 this draft.
