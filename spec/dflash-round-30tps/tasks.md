@@ -407,6 +407,7 @@ branches selected from those results, not mandatory simultaneous implementations
   greedy-exact on its measured prompts. Captured taps were not causal to this
   investigation; no target-model change was justified. Do not retain T19h's
   override or the diagnostic assertion that expects the altered path to drift.
+  Implementation/test commit: `ad37199`.
 - [x] **T20 — load DFlash packed weights through base mmap + mlock path.**
   Files: `crates/engine/src/dflash.rs`, `crates/engine/tests/dflash_load.rs`,
   this spec's plan/tasks/notes. Replace the DFlash loader's per-tensor file reads
