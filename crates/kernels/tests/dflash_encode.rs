@@ -1,6 +1,7 @@
 use std::ffi::c_void;
 use std::mem::size_of_val;
 
+use kaplumba_kernels::attention::{AttentionKernels, DflashBlockBufferRequest, DflashBlockRequest};
 use kaplumba_kernels::elements::ElementKernels;
 use kaplumba_kernels::encoder::MetalEncoder;
 use metal::{Buffer, Device, MTLResourceOptions};
@@ -176,4 +177,113 @@ fn dflash_f32_encode_operations_match_slice_paths_and_validate_buffers() {
             )
             .is_err()
     );
+}
+
+#[test]
+fn dflash_block_attention_encoder_matches_slice_path() {
+    let device = Device::system_default().expect("Metal device");
+    let queue = device.new_command_queue();
+    let attention = AttentionKernels::new().expect("attention kernels");
+    let rows = 4;
+    let q_heads = 4;
+    let kv_heads = 2;
+    let head_dim = 32;
+    let q_count = rows * q_heads * head_dim;
+    let kv_width = kv_heads * head_dim;
+    let queries: Vec<u16> = (0..q_count)
+        .map(|i| half::f16::from_f32((i as f32 % 37.0 - 18.0) * 0.01).to_bits())
+        .collect();
+    let block_keys: Vec<u16> = (0..rows * kv_width)
+        .map(|i| half::f16::from_f32((i as f32 % 29.0 - 14.0) * 0.02).to_bits())
+        .collect();
+    let block_values: Vec<u16> = (0..rows * kv_width)
+        .map(|i| half::f16::from_f32((i as f32 % 31.0 - 15.0) * 0.015).to_bits())
+        .collect();
+
+    for (n_ctx, window, bidirectional, first_position) in [
+        (3, 0, true, 10_u32),
+        (3, 3, false, 10_u32),
+        (0, 0, true, 0_u32),
+    ] {
+        let ctx_keys: Vec<u16> = (0..n_ctx * kv_width)
+            .map(|i| half::f16::from_f32((i as f32 % 23.0 - 11.0) * 0.013).to_bits())
+            .collect();
+        let ctx_values: Vec<u16> = (0..n_ctx * kv_width)
+            .map(|i| half::f16::from_f32((i as f32 % 19.0 - 9.0) * 0.017).to_bits())
+            .collect();
+        let key_positions: Vec<u32> = (0..n_ctx + rows)
+            .map(|i| first_position + i as u32)
+            .collect();
+        let expected = attention
+            .dflash_block_attention(DflashBlockRequest {
+                queries: &queries,
+                ctx_keys: &ctx_keys,
+                ctx_values: &ctx_values,
+                block_keys: &block_keys,
+                block_values: &block_values,
+                key_positions: &key_positions,
+                rows,
+                n_ctx,
+                q_heads,
+                kv_heads,
+                head_dim,
+                scale: 1.0 / (head_dim as f32).sqrt(),
+                window,
+                bidirectional,
+            })
+            .expect("slice DFlash attention");
+
+        let query_buffer = buffer_with(&device, &queries);
+        let ctx_key_buffer = if ctx_keys.is_empty() {
+            buffer_with(&device, &[0_u16])
+        } else {
+            buffer_with(&device, &ctx_keys)
+        };
+        let ctx_value_buffer = if ctx_values.is_empty() {
+            buffer_with(&device, &[0_u16])
+        } else {
+            buffer_with(&device, &ctx_values)
+        };
+        let block_key_buffer = buffer_with(&device, &block_keys);
+        let block_value_buffer = buffer_with(&device, &block_values);
+        let position_buffer = buffer_with(&device, &key_positions);
+        let output_buffer = zero_buffer(&device, q_count * size_of::<u16>());
+        let request = DflashBlockBufferRequest {
+            queries: &query_buffer,
+            ctx_keys: &ctx_key_buffer,
+            ctx_values: &ctx_value_buffer,
+            block_keys: &block_key_buffer,
+            block_values: &block_value_buffer,
+            key_positions: &position_buffer,
+            output: &output_buffer,
+            rows,
+            n_ctx,
+            q_heads,
+            kv_heads,
+            head_dim,
+            scale: 1.0 / (head_dim as f32).sqrt(),
+            window,
+            bidirectional,
+        };
+        let mut encoder = MetalEncoder::new(&queue).expect("encoder");
+        attention
+            .encode_dflash_block_attention(&mut encoder, request)
+            .expect("encode DFlash attention");
+        encoder.commit_and_wait().expect("attention completion");
+        assert_eq!(read_u16(&output_buffer, q_count), expected);
+
+        let short_output = zero_buffer(&device, q_count * size_of::<u16>() - 1);
+        let mut invalid_encoder = MetalEncoder::new(&queue).expect("encoder");
+        assert!(
+            attention
+                .encode_dflash_block_attention(
+                    &mut invalid_encoder,
+                    DflashBlockBufferRequest {
+                        output: &short_output,
+                        ..request
+                    },
+                )
+                .is_err()
+        );
+    }
 }

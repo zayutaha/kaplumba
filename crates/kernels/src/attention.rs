@@ -748,6 +748,28 @@ pub struct DflashBlockRequest<'a> {
     pub bidirectional: bool,
 }
 
+/// Caller-owned Metal buffers for encoding DFlash block attention without a
+/// host round trip. Empty context uses a one-element dummy K/V buffer; the
+/// kernel will not read it when `n_ctx == 0`.
+#[derive(Clone, Copy)]
+pub struct DflashBlockBufferRequest<'a> {
+    pub queries: &'a Buffer,
+    pub ctx_keys: &'a Buffer,
+    pub ctx_values: &'a Buffer,
+    pub block_keys: &'a Buffer,
+    pub block_values: &'a Buffer,
+    pub key_positions: &'a Buffer,
+    pub output: &'a Buffer,
+    pub rows: usize,
+    pub n_ctx: usize,
+    pub q_heads: usize,
+    pub kv_heads: usize,
+    pub head_dim: usize,
+    pub scale: f32,
+    pub window: usize,
+    pub bidirectional: bool,
+}
+
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct DflashBlockParams {
@@ -1976,6 +1998,122 @@ impl AttentionKernels {
     /// The reason this is not `online_attention`: that kernel's `live` test is
     /// unconditional (`k_abs <= q_abs`), and the drafter's `full_attention`
     /// layer must see the block rows *ahead* of each query.
+    /// Encode the existing DFlash block-attention kernel into caller-owned
+    /// buffers; the caller controls command submission and readback.
+    pub fn encode_dflash_block_attention(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        request: DflashBlockBufferRequest<'_>,
+    ) -> Result<(), KernelError> {
+        let DflashBlockBufferRequest {
+            queries,
+            ctx_keys,
+            ctx_values,
+            block_keys,
+            block_values,
+            key_positions,
+            output,
+            rows,
+            n_ctx,
+            q_heads,
+            kv_heads,
+            head_dim,
+            scale,
+            window,
+            bidirectional,
+        } = request;
+        if rows == 0 || q_heads == 0 || kv_heads == 0 || head_dim == 0 {
+            return Err(KernelError::InvalidInput(
+                "dflash block attention dimensions must be non-zero".to_string(),
+            ));
+        }
+        if !q_heads.is_multiple_of(kv_heads) {
+            return Err(KernelError::InvalidInput(
+                "dflash block attention needs q_heads to be a multiple of kv_heads".to_string(),
+            ));
+        }
+        if !head_dim.is_multiple_of(32) {
+            return Err(KernelError::InvalidInput(
+                "dflash block attention spreads head_dim over 32 lanes".to_string(),
+            ));
+        }
+        if !scale.is_finite() {
+            return Err(KernelError::InvalidInput(
+                "dflash block attention scale must be finite".to_string(),
+            ));
+        }
+        let groups = q_heads / kv_heads;
+        if groups > 32 {
+            return Err(KernelError::InvalidInput(
+                "dflash block attention caps q_heads/kv_heads at 32 simdgroups".to_string(),
+            ));
+        }
+        let q_elements = checked_product(
+            checked_product(rows, q_heads, KvAttentionError::ShapeOverflow)?,
+            head_dim,
+            KvAttentionError::ShapeOverflow,
+        )?;
+        let kv_width = checked_product(kv_heads, head_dim, KvAttentionError::ShapeOverflow)?;
+        let context_elements = checked_product(n_ctx, kv_width, KvAttentionError::ShapeOverflow)?;
+        let block_elements = checked_product(rows, kv_width, KvAttentionError::ShapeOverflow)?;
+        let position_count = n_ctx
+            .checked_add(rows)
+            .ok_or(KvAttentionError::ShapeOverflow)?;
+        let u16_bytes = |elements: usize, empty_dummy: bool| -> Result<u64, KernelError> {
+            if empty_dummy && elements == 0 {
+                return Ok(size_of::<u16>() as u64);
+            }
+            Ok(checked_product(
+                elements,
+                size_of::<u16>(),
+                KvAttentionError::ShapeOverflow,
+            )? as u64)
+        };
+        let position_bytes = checked_product(
+            position_count,
+            size_of::<u32>(),
+            KvAttentionError::ShapeOverflow,
+        )? as u64;
+        if queries.length() < u16_bytes(q_elements, false)?
+            || ctx_keys.length() < u16_bytes(context_elements, true)?
+            || ctx_values.length() < u16_bytes(context_elements, true)?
+            || block_keys.length() < u16_bytes(block_elements, false)?
+            || block_values.length() < u16_bytes(block_elements, false)?
+            || key_positions.length() < position_bytes
+            || output.length() < u16_bytes(q_elements, false)?
+        {
+            return Err(KernelError::InvalidInput(
+                "dflash attention buffer is smaller than its declared shape".to_string(),
+            ));
+        }
+        let params = DflashBlockParams {
+            rows: to_u32(rows, "dflash block rows")?,
+            n_ctx: to_u32(n_ctx, "dflash context rows")?,
+            q_heads: to_u32(q_heads, "dflash query heads")?,
+            kv_heads: to_u32(kv_heads, "dflash kv heads")?,
+            head_dim: to_u32(head_dim, "dflash head dim")?,
+            scale,
+            window: to_u32(window, "dflash attention window")?,
+            bidirectional: u32::from(bidirectional),
+        };
+        let groups_x = checked_product(rows, kv_heads, KvAttentionError::ShapeOverflow)?;
+        encoder.dispatch_groups(
+            &self.dflash_block_pipeline,
+            &[
+                Some(queries),
+                Some(ctx_keys),
+                Some(ctx_values),
+                Some(block_keys),
+                Some(block_values),
+                Some(key_positions),
+                Some(output),
+            ],
+            params_bytes(&params),
+            groups_x as u64,
+            (32 * groups) as u64,
+        )
+    }
+
     pub fn dflash_block_attention(
         &self,
         request: DflashBlockRequest<'_>,

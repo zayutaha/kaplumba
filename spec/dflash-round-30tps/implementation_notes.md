@@ -730,3 +730,19 @@ zero. The test failed at the output parity assertion (line 582; nonzero output
 was read from the `0xA55A` prefix; exit 101). Restored the offset and reran; it
 passed 1/1. The existing sampler edit in `crates/engine/src/sampler.rs` was not
 staged.
+
+## 2026-10-14 — T19f encoder-facing DFlash block attention
+
+Added `DflashBlockBufferRequest` and `AttentionKernels::encode_dflash_block_attention`
+to dispatch the existing `dflash_block_attention` pipeline into the caller's
+`MetalEncoder`. Shape/window/mask params are validated; empty context requires
+the same one-u16 dummy buffer as the slice path. No shader changed.
+
+`dflash_encode` now checks exact output parity for four block rows, 4 Q heads,
+2 KV heads and head dimension 32 under bidirectional full attention, a sliding
+window, and empty context. It rejects a one-byte-short output. The full focused
+suite passed 2/2.
+
+Coverage sabotage bound context K as context V. The attention parity assertion
+failed with differing fp16 outputs (exit 101). Restored the correct V binding;
+the suite passed 2/2. This confirms context V is consumed by the tested path.

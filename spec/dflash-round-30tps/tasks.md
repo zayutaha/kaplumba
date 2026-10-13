@@ -314,11 +314,13 @@ branches selected from those results, not mandatory simultaneous implementations
   encoder while binding exact packed offset/length; test nonzero offsets, 4/6
   bpw, row counts 1 and 4, slice parity, and invalid sizing. Passed parity and
   offset-binding sabotage; commit `5a68534`.
-- [ ] **T19f — encode DFlash block attention into a caller encoder.**
+- [x] **T19f — encode DFlash block attention into a caller encoder.**
   Files: `crates/kernels/src/attention.rs`, focused kernel tests. Preserve the
   current DFlash attention shader and mask/window semantics; add a buffer-based
   request and encode method. Compare against `dflash_block_attention` for
   bidirectional and sliding modes, empty context, and block/context boundaries.
+  Exact parity and wrong-context-value-binding sabotage passed; commit recorded
+  in implementation notes.
 - [ ] **T19g — port DFlash `forward_block` to bounded GPU scratch.**
   Files: `crates/engine/src/dflash.rs`, DFlash correctness tests, kernel buffer
   helpers as needed. Keep residual/projection precision unchanged, reuse scratch
