@@ -348,6 +348,11 @@ branches selected from those results, not mandatory simultaneous implementations
   slice; B=16 exact at 4.17 tok/s encoded. Full 3 × 200 and footprint/swap
   measurements remain. Do not make a speedup claim until swap pressure is
   rechecked: `gpuq status` had been reporting 0 MiB due to a parser bug.
+  Updated three-prompt runs: B=4 encoded 7.08/7.01/7.16 tok/s (median 7.08),
+  slice 6.92/6.89/7.05 (median 6.92); exact on all 600 tokens. `time -l`
+  measured 14.35 GiB footprint and zero swapouts for the encoded run. These
+  grouped A/B runs are not yet repeated/interleaved enough to call a stable
+  2.3% gain. B=16 still needs a three-prompt run.
 - [x] **T19g.4 — test two chained blocks and reject if slower.**
   Files: `crates/engine/src/dflash.rs`, this spec's plan/tasks/notes.
   One prompt, B=4: exact greedy output, 74 rounds, 129 accepted, 5.43 tok/s
@@ -367,6 +372,13 @@ branches selected from those results, not mandatory simultaneous implementations
   encoded head with slice block 6.54 tok/s; single encoded block 7.05 tok/s;
   slice block 6.92 tok/s. Removed the head path; separate command submission,
   staging, and synchronization outweigh its compute savings.
+- [x] **T19g.7 — attribute the current B=4 encoded round by synchronized phase.**
+  Files: `crates/engine/src/dflash.rs`, this spec's plan/tasks/notes.
+  Temporarily measure encoded block body, tied head, target `forward_verify`,
+  and acceptance/retraction separately under an opt-in diagnostic. Run exact
+  greedy 3 × 200 prompts and compare aggregate phase totals to the existing
+  round timing. Removed the runtime hook after measurement. The 3 × 200 test
+  stayed exact; phase medians and footprint are in implementation notes.
 - [x] **T20 — load DFlash packed weights through base mmap + mlock path.**
   Files: `crates/engine/src/dflash.rs`, `crates/engine/tests/dflash_load.rs`,
   this spec's plan/tasks/notes. Replace the DFlash loader's per-tensor file reads

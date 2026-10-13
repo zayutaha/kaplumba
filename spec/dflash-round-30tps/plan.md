@@ -188,9 +188,12 @@ single encoded-block run (7.05 tok/s). Both branches were removed.
 Keep the single encoded block behind `KAPLUMBA_DFLASH_GPU_BLOCK=1` as a
 measurement option. It remains unadopted by default until interleaved 3 × 200
 measurements establish a gain. Further work should attribute full-round time
-to drafter block stages, tied head, target verify, and cache update before
-choosing a fused path. Do not build a longer chained proposal tree: current
-measurements show its per-token drafter cost dominates the saved target work.
+to block body, tied head, target verify, and cache update before choosing a
+fused path. The next diagnostic records these synchronized stage durations for
+the current B=4 route on the same exact 3 × 200 stream. It is measurement-only;
+remove runtime timing hooks after collecting the data. Do not build a longer
+chained proposal tree: current measurements show its per-token drafter cost
+dominates the saved target work.
 
 Measurement validity note: `gpuq status` previously showed 0 MiB swap because
 the parser read the first positional amount (`total`) and assumed it was

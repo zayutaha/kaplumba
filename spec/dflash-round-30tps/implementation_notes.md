@@ -851,3 +851,47 @@ Validation after removing failed branches: `cargo check -p kaplumba-engine
 The build emitted existing unused/deprecated-cfg warnings. The separate
 GPUQ parser correction is recorded as T19g.5; it changes benchmark telemetry,
 not engine behavior.
+
+## 2026-10-14 — B=4 encoded route A/B and phase attribution
+
+Ran the same exact 3 × 200 greedy prompts through the encoded B=4 route and
+slice control. Encoded speeds were 7.08/7.01/7.16 tok/s (median 7.08); slice
+speeds were 6.92/6.89/7.05 (median 6.92). Same-process plain decode was
+12.32–12.35 tok/s. All 600 DFlash token IDs matched the sequential target.
+These were grouped runs (encoded then slice), not a repeated A/B/A/B sweep, so
+the 2.3% median difference is exploratory and is not enough to adopt the path.
+`gpuq status` showed 17 GiB reclaimable before the profiled encoded run. The
+run's `/usr/bin/time -l` peak footprint was 14,353,076,224 bytes (13.37 GiB)
+and reported zero swapouts. It still logged the 86,720,512-byte mlock failure;
+these measurements do not prove all drafter pages are pinned. Global swap
+allocation was ~3.2 GiB before and after; `sysctl vm.swapusage used` is not the
+same measurement as process swapouts.
+
+Temporarily added `KAPLUMBA_DFLASH_PHASE_TIMING=1` around encoded block body,
+tied head, `forward_verify`, and acceptance/retraction, then removed the hook.
+Across 255 rounds the medians/means were: block body 60.038/60.082 ms; tied
+head 37.970/37.998 ms; target verify 137.735/137.637 ms; acceptance/retraction
+0.528/0.606 ms. The test remained exact for all 600 output tokens, with
+7.01–7.16 tok/s across prompts. Combined draft+verify phase medians are about
+236 ms, consistent with the outer test's ~237 ms bucket; the caller separately
+spends ~81 ms in the anchor target forward and ~13.7 ms appending context.
+Acceptance and tap read are negligible. This identifies verification, the
+separate anchor forward, and proposal quality as the largest remaining costs.
+
+The target-call lower bound rules out B=4 for the 30 tok/s gate: even emitting
+all four positions from one B=4 block would require about 221 ms of anchor plus
+verify time per round at these measured costs, a ceiling of ~18 tok/s before
+any draft work. Larger trained blocks and stronger accepted prefixes are
+required. The B=4 route's small relative gain does not establish a path to 30.
+Exact profile command (log at `/tmp/dflash-t19g7-profile.log`):
+
+```bash
+scripts/gpuq try -- /usr/bin/time -l env \
+  KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacked" \
+  KAPLUMBA_DFLASH_DIR="$HOME/.kaplumba/models/Drafter" \
+  KAPLUMBA_TEST_DFLASH_BLOCK_SIZE=4 KAPLUMBA_DFLASH_GPU_BLOCK=1 \
+  KAPLUMBA_DFLASH_PHASE_TIMING=1 \
+  target/release/deps/dflash_equivalence-2b02cd992899a095 \
+  dflash_greedy_stream_matches_target_for_200_tokens_on_three_prompts \
+  --ignored --exact --nocapture
+```
