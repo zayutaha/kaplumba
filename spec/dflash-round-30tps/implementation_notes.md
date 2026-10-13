@@ -96,7 +96,13 @@ KAPLUMBA_TEST_MODEL=$M KAPLUMBA_FORCE_LOAD=1 scripts/gpuq try -- \
 15.27 GiB available. `KAPLUMBA_FORCE_LOAD=1` on the 3-bit checkpoint is the
 documented override.
 
-## 2026-10-13 — D1 LANDED, and `perm_mode = 1` is the drafter's real layout
+## Historical 2026-10-13 — initial `perm_mode = 1` claim (superseded by T6)
+
+The overlap interpretation below predates the corrected target-head oracle. Its
+claim that mode 1 is the drafter's real layout was invalidated by T7/T8 and the
+T5/T6 host-reference validation recorded at the end of this file. Keep these
+measurements as historical evidence only; the current checkpoint layout is
+mode 0.
 
 `crates/engine/tests/buffer_perm_mode.rs` (3 tests, model-free, sabotage-verified:
 re-hardcoding the two params sites fails both with the named diagnosis).
@@ -1016,3 +1022,19 @@ still matched the host at 0.001942 error. Restored the setter and reran clean;
 all 36 passed in 30.72 s. This closes T5. The independent default-layout
 interpretation is recorded separately under T6. This test does not explain the
 measured low accepted-prefix count or improve the 7.07 tok/s result.
+
+## 2026-10-14 — T6 checkpoint layout/default
+
+`Drafter/quantization_config.json` has no layout key; `QuantizedLinear::from_metal_buffer`
+therefore supplies the mode-0 default. The host oracle's 36 independent EXL3
+reconstructions all match actual mode-0 buffer GEMMs (worst error 0.003663).
+Mode 1 on `fc` fails the same reference by more than the 0.013644 acceptance
+bound; a separate temporary loader override to mode 1 failed at `fc` with
+10.495664 max error. This selects mode 0 as the checkpoint's actual row-major
+layout. The earlier mode-1/colmajor alpha result came from the invalid target
+head oracle and is superseded. No DFlash weight or layout default changed.
+
+T5/T6 result: the old colmajor claim was wrong; correcting it does not raise
+acceptance. DFlash remains at 7.07 tok/s in the best measured B=4 route, so the
+30 tok/s objective still requires a materially stronger drafter and/or a much
+faster target verifier.

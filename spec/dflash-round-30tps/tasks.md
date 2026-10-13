@@ -175,13 +175,13 @@ branches selected from those results, not mandatory simultaneous implementations
   output. The existing all-linears host test remains the default-layout oracle.
   Setter no-op sabotage must fail by name. T6 separately chooses the checkpoint
   default from this evidence. Commit: `f934c0d`.
-- [ ] **T6 — layout/default evidence.**
+- [x] **T6 — layout/default evidence.**
   Sweep work recorded in `6622031`; complete its default/reference validation.
   Its overlap-based colmajor conclusion is invalidated by the ignored head
-  offset. Corrected-head control favors original row-major on the measured prompt.
-  Files: drafter loader/tests and implementation notes if a mismatch is proven.
-  Test: checkpoint reconstruction and distinct target-head/drafter modes; log
-  actual default and justified layout. Do not choose layout solely by overlap.
+  offset. The corrected host oracle confirms the loader's mode-0 default for all
+  36 linears; mode 1 fails both the host reference and setter canary. This is
+  the justified row-major layout for this checkpoint. Do not choose layouts
+  from overlap.
 - [x] **T7 — head diagnosis after T0c.**
   Files: `crates/engine/tests/dflash_alpha_probe.rs` and notes; production
   change only if proven. Reconstruct selected 128-column head bands directly
@@ -479,7 +479,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | T0c | done | 3 nonzero rows; full-vocab max error ≤0.0156; zero-row and ×2 scale sabotage fail; `00ae90b` |
 | T7 | done | 45 host/target/DFlash bands; worst error 0.0088; tile-index and ×2 scale sabotage fail; `8863b83` |
 | T5 | done | setter mode 1 diverges from host; mode 0 restores bit-exact; no-op setter sabotage fails; `f934c0d` |
-| T6 sweep | prior work recorded | `6622031`; reference/default gate open |
+| T6 | done | all 36 actual buffer linears match independent mode-0 host decode; wrong-mode controls fail; see notes |
 | T1a | done | code/tests `2f35201`; argmax sabotage failure in implementation notes |
 | V0a | done | 3 prompts × M=1/2/4/8/16 greedy identity; tap/KV and ring boundary parity; row and query-position sabotage both fail; see implementation notes |
 | V0b | done | 3 prefixes × 4 contexts × M=2/4/8/16 × 3 repeats; greedy identity; `00f8c38` |

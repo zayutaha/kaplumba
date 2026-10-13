@@ -409,25 +409,12 @@ impl DflashWeights {
 
     /// Select the EXL3 tile permutation for every drafter projection.
     ///
-    /// Mirrors [`crate::model::TextModel::set_permutation_mode`]. The drafter's
-    /// checkpoint carries **no `layout` key** in its `quantization_config.json`
-    /// (`Gxma-repacked` writes `"layout": "colmajor"`; the Drafter does not), so
-    /// the loader leaves every linear at the row-major default of `0` -- and,
-    /// unlike the target, no test has ever scored a drafter mode with a
-    /// predictability probe. `real_model_permutation_sweep`
-    /// (`tests/real_forward_buffer.rs`) does exactly that for the *target*: the
-    /// correct permutation is "the one that makes the model know things". A
-    /// row-major label on colmajor bytes -- or a mode-0 kernel read that is
-    /// transposed for non-square tiles -- decodes every weight to a
-    /// plausible-magnitude, wrong-direction matrix, which is invisible to every
-    /// engine-vs-host comparison because both sides share the reader.
-    ///
-    /// The justification for having this setter at all is that asymmetry: the
-    /// target's permutation was *scored* and the drafter's was not. It carries the
-    /// same caveat as [`DflashModel::set_permutation_mode`] -- the block's
-    /// projections run through the buffer-backed path, which is row-major by
-    /// construction, so setting `1` is measured to change nothing until that path
-    /// learns `perm_mode`.
+    /// Mirrors [`crate::model::TextModel::set_permutation_mode`]. The Drafter
+    /// checkpoint has no explicit layout key, so its linears load with mode 0.
+    /// `dflash_golden::dflash_exl3_decode_matches_host_on_every_linear` compares
+    /// the actual buffer calls against independent host reconstruction and
+    /// confirms that default for all 36 linears. Mode 1 fails the host reference;
+    /// do not infer the checkpoint layout from overlap alone.
     pub fn set_permutation_mode(&mut self, mode: u32) {
         for linear in self.lines.values_mut() {
             linear.permutation_mode = mode;
