@@ -365,6 +365,46 @@ impl Harness {
     }
 }
 
+#[test]
+#[ignore = "loads the DFlash checkpoint to inspect fixed Metal scratch ownership"]
+fn dflash_gpu_scratch_is_block_sized_and_caches_norm_sign_buffers() {
+    let Some(harness) = Harness::build() else {
+        return;
+    };
+    let rows = harness.config.block_size as u64;
+    let hidden = harness.config.hidden_size as u64;
+    let intermediate = harness.config.intermediate as u64;
+    let q_width = (harness.config.q_heads * harness.config.head_dim) as u64;
+    let kv_width = (harness.config.kv_heads * harness.config.head_dim) as u64;
+    let h = rows * hidden;
+    let q = rows * q_width;
+    let kv = rows * kv_width;
+    let inter = rows * intermediate;
+    let max_linear = h.max(q).max(kv).max(inter);
+    let expected = 2 * h * 4
+        + h * 2
+        + 3 * q * 2
+        + 3 * kv * 2
+        + kv * 2
+        + q * 2
+        + 3 * inter * 2
+        + 2 * max_linear * 2
+        + max_linear * 4
+        + max_linear * 2
+        + h * 4
+        + h * 2
+        + harness.config.num_layers as u64 * 2 * kv * 2;
+    eprintln!(
+        "DFlash fixed scratch={} bytes, cached signs/norms={} bytes",
+        harness.model.gpu_scratch_bytes(),
+        harness.model.gpu_cached_weight_bytes()
+    );
+    assert_eq!(harness.model.gpu_scratch_bytes(), expected);
+    assert!(harness.model.gpu_cached_weight_bytes() > 0);
+    assert!(harness.model.gpu_scratch_bytes() < 32 * 1024 * 1024);
+    assert!(harness.model.gpu_cached_weight_bytes() < 16 * 1024 * 1024);
+}
+
 fn max_of(values: &[f32]) -> f32 {
     values.iter().map(|value| value.abs()).fold(0.0_f32, f32::max)
 }

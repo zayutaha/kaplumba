@@ -21,6 +21,8 @@
 //!    bf16→f16 scale conversion and no packed `.su`/`.sv` path.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::ffi::c_void;
+use std::mem::{size_of, size_of_val};
 use std::path::Path;
 
 use crate::exl3::{BitRate, MCG_MULTIPLIER};
@@ -28,9 +30,10 @@ use crate::metal::{MetalContext, resident_limit_bytes};
 use crate::model::QuantizedLinear;
 use crate::safetensors::{DType, SafeTensorsIndex, read_shard_header};
 use crate::weights::TextWeights;
-use kaplumba_kernels::attention::DflashBlockRequest;
+use kaplumba_kernels::attention::{DflashBlockBufferRequest, DflashBlockRequest};
 use kaplumba_kernels::elements::RopeRequest;
 use kaplumba_kernels::linear::LinearBufferRequest;
+use metal::{Buffer, CommandQueue, Device, MTLResourceOptions};
 
 /// A drafter RMSNorm: `hidden_size` fp16 values, taken verbatim from the
 /// checkpoint's BF16 row (`RMSNorm` with `constant_bias = 0`; the drafter is
@@ -726,6 +729,33 @@ pub struct DflashModel {
     linear: &'static kaplumba_kernels::linear::LinearKernels,
     attention: kaplumba_kernels::attention::AttentionKernels,
     elements: &'static kaplumba_kernels::elements::ElementKernels,
+    gpu_device: Device,
+    gpu_queue: CommandQueue,
+    gpu_scratch: DflashGpuScratch,
+    gpu_norms: BTreeMap<String, Buffer>,
+    gpu_signs: BTreeMap<String, (Buffer, Buffer)>,
+}
+
+/// Fixed-size intermediate storage for one DFlash block. Context K/V is input
+/// data and is staged separately; none of these scratch sizes depend on it.
+struct DflashGpuScratch {
+    hidden: [Buffer; 2],
+    normed: Buffer,
+    q: [Buffer; 3],
+    k: [Buffer; 3],
+    v: Buffer,
+    attended: Buffer,
+    gate: Buffer,
+    up: Buffer,
+    activated: Buffer,
+    linear_input: Buffer,
+    linear_transformed: Buffer,
+    linear_raw: Buffer,
+    linear_output: Buffer,
+    linear_f32_output: Buffer,
+    final_norm: Buffer,
+    block_keys: Vec<Buffer>,
+    block_values: Vec<Buffer>,
 }
 
 /// What the drafter needs about the current block before it can attend.
@@ -1890,8 +1920,199 @@ impl From<kaplumba_kernels::exl3::KernelError> for DflashError {
     }
 }
 
+fn scratch_bytes(elements: usize, element_size: usize) -> Result<u64, DflashError> {
+    let bytes = elements
+        .checked_mul(element_size)
+        .ok_or_else(|| DflashError::Shape("DFlash scratch size overflows".to_string()))?;
+    u64::try_from(bytes)
+        .map_err(|_| DflashError::Shape("DFlash scratch size exceeds Metal limits".to_string()))
+}
+
+fn new_scratch_buffer(
+    device: &Device,
+    elements: usize,
+    element_size: usize,
+) -> Result<Buffer, DflashError> {
+    let bytes = scratch_bytes(elements, element_size)?;
+    if bytes == 0 {
+        return Err(DflashError::Shape(
+            "DFlash scratch buffer cannot be empty".to_string(),
+        ));
+    }
+    Ok(device.new_buffer(bytes, MTLResourceOptions::StorageModeShared))
+}
+
+fn new_weight_buffer(device: &Device, values: &[u16]) -> Result<Buffer, DflashError> {
+    if values.is_empty() {
+        return Err(DflashError::Shape(
+            "DFlash GPU weight buffer cannot be empty".to_string(),
+        ));
+    }
+    Ok(device.new_buffer_with_data(
+        values.as_ptr() as *const c_void,
+        size_of_val(values) as u64,
+        MTLResourceOptions::StorageModeShared,
+    ))
+}
+
+fn write_f32_buffer(buffer: &Buffer, values: &[f32]) -> Result<(), DflashError> {
+    let bytes = scratch_bytes(values.len(), size_of::<f32>())?;
+    if buffer.length() < bytes || buffer.contents().is_null() {
+        return Err(DflashError::Shape(
+            "DFlash f32 input does not fit its owned scratch buffer".to_string(),
+        ));
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            values.as_ptr(),
+            buffer.contents() as *mut f32,
+            values.len(),
+        );
+    }
+    Ok(())
+}
+
+fn read_u16_buffer(buffer: &Buffer, elements: usize) -> Result<Vec<u16>, DflashError> {
+    let bytes = scratch_bytes(elements, size_of::<u16>())?;
+    if buffer.length() < bytes || buffer.contents().is_null() {
+        return Err(DflashError::Shape(
+            "DFlash output does not fit its owned scratch buffer".to_string(),
+        ));
+    }
+    let mut values = vec![0u16; elements];
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            buffer.contents() as *const u16,
+            values.as_mut_ptr(),
+            elements,
+        );
+    }
+    Ok(values)
+}
+
+impl DflashGpuScratch {
+    fn new(device: &Device, config: &DflashConfig) -> Result<Self, DflashError> {
+        if config.block_size < 2
+            || config.hidden_size == 0
+            || config.intermediate == 0
+            || config.q_heads == 0
+            || config.kv_heads == 0
+            || config.head_dim == 0
+            || config.num_layers == 0
+        {
+            return Err(DflashError::Shape(
+                "invalid DFlash dimensions for fixed GPU scratch".to_string(),
+            ));
+        }
+        let rows = config.block_size;
+        let hidden = rows
+            .checked_mul(config.hidden_size)
+            .ok_or_else(|| DflashError::Shape("DFlash hidden scratch overflows".to_string()))?;
+        let q_width = config
+            .q_heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| DflashError::Shape("DFlash Q width overflows".to_string()))?;
+        let kv_width = config
+            .kv_heads
+            .checked_mul(config.head_dim)
+            .ok_or_else(|| DflashError::Shape("DFlash KV width overflows".to_string()))?;
+        let q_rows = rows
+            .checked_mul(q_width)
+            .ok_or_else(|| DflashError::Shape("DFlash Q scratch overflows".to_string()))?;
+        let kv_rows = rows
+            .checked_mul(kv_width)
+            .ok_or_else(|| DflashError::Shape("DFlash KV scratch overflows".to_string()))?;
+        let intermediate = rows
+            .checked_mul(config.intermediate)
+            .ok_or_else(|| DflashError::Shape("DFlash MLP scratch overflows".to_string()))?;
+        let max_linear = hidden.max(intermediate).max(q_rows).max(kv_rows);
+
+        Ok(Self {
+            hidden: [
+                new_scratch_buffer(device, hidden, size_of::<f32>())?,
+                new_scratch_buffer(device, hidden, size_of::<f32>())?,
+            ],
+            normed: new_scratch_buffer(device, hidden, size_of::<u16>())?,
+            q: [
+                new_scratch_buffer(device, q_rows, size_of::<u16>())?,
+                new_scratch_buffer(device, q_rows, size_of::<u16>())?,
+                new_scratch_buffer(device, q_rows, size_of::<u16>())?,
+            ],
+            k: [
+                new_scratch_buffer(device, kv_rows, size_of::<u16>())?,
+                new_scratch_buffer(device, kv_rows, size_of::<u16>())?,
+                new_scratch_buffer(device, kv_rows, size_of::<u16>())?,
+            ],
+            v: new_scratch_buffer(device, kv_rows, size_of::<u16>())?,
+            attended: new_scratch_buffer(device, q_rows, size_of::<u16>())?,
+            gate: new_scratch_buffer(device, intermediate, size_of::<u16>())?,
+            up: new_scratch_buffer(device, intermediate, size_of::<u16>())?,
+            activated: new_scratch_buffer(device, intermediate, size_of::<u16>())?,
+            linear_input: new_scratch_buffer(device, max_linear, size_of::<u16>())?,
+            linear_transformed: new_scratch_buffer(device, max_linear, size_of::<u16>())?,
+            linear_raw: new_scratch_buffer(device, max_linear, size_of::<f32>())?,
+            linear_output: new_scratch_buffer(device, max_linear, size_of::<u16>())?,
+            linear_f32_output: new_scratch_buffer(device, hidden, size_of::<f32>())?,
+            final_norm: new_scratch_buffer(device, hidden, size_of::<u16>())?,
+            block_keys: (0..config.num_layers)
+                .map(|_| new_scratch_buffer(device, kv_rows, size_of::<u16>()))
+                .collect::<Result<Vec<_>, _>>()?,
+            block_values: (0..config.num_layers)
+                .map(|_| new_scratch_buffer(device, kv_rows, size_of::<u16>()))
+                .collect::<Result<Vec<_>, _>>()?,
+        })
+    }
+
+    fn bytes(&self) -> u64 {
+        self.hidden.iter().map(|buffer| buffer.length()).sum::<u64>()
+            + [
+                &self.normed,
+                &self.v,
+                &self.attended,
+                &self.gate,
+                &self.up,
+                &self.activated,
+                &self.linear_input,
+                &self.linear_transformed,
+                &self.linear_raw,
+                &self.linear_output,
+                &self.linear_f32_output,
+                &self.final_norm,
+            ]
+            .iter()
+            .map(|buffer| buffer.length())
+            .sum::<u64>()
+            + self.q.iter().map(|buffer| buffer.length()).sum::<u64>()
+            + self.k.iter().map(|buffer| buffer.length()).sum::<u64>()
+            + self.block_keys.iter().map(|buffer| buffer.length()).sum::<u64>()
+            + self.block_values.iter().map(|buffer| buffer.length()).sum::<u64>()
+    }
+}
+
 impl DflashModel {
     pub fn new(weights: DflashWeights, config: DflashConfig) -> Result<Self, DflashError> {
+        let device = Device::system_default()
+            .ok_or_else(|| DflashError::Kernels("Metal device is unavailable".to_string()))?;
+        let gpu_queue = device.new_command_queue();
+        let gpu_scratch = DflashGpuScratch::new(&device, &config)?;
+        let gpu_norms = weights
+            .norms
+            .iter()
+            .map(|(name, values)| Ok((name.clone(), new_weight_buffer(&device, values)?)))
+            .collect::<Result<BTreeMap<_, _>, DflashError>>()?;
+        let gpu_signs = weights
+            .lines
+            .iter()
+            .map(|(name, line)| {
+                Ok((
+                    name.clone(),
+                    (
+                        new_weight_buffer(&device, &line.input_signs)?,
+                        new_weight_buffer(&device, &line.output_signs)?,
+                    ),
+                ))
+            })
+            .collect::<Result<BTreeMap<_, _>, DflashError>>()?;
         let model = Self {
             weights,
             config,
@@ -1902,6 +2123,11 @@ impl DflashModel {
                 .map_err(|e| DflashError::Kernels(e.to_string()))?,
             elements: kaplumba_kernels::elements::ElementKernels::shared()
                 .map_err(|e| DflashError::Kernels(e.to_string()))?,
+            gpu_device: device,
+            gpu_queue,
+            gpu_scratch,
+            gpu_norms,
+            gpu_signs,
         };
         model.validate_shapes()?;
         Ok(model)
@@ -1909,6 +2135,24 @@ impl DflashModel {
 
     pub fn config(&self) -> &DflashConfig {
         &self.config
+    }
+
+    /// Bytes in the drafter's fixed block scratch; independent of context
+    /// length. Reported separately from its cached sign/norm weight views.
+    pub fn gpu_scratch_bytes(&self) -> u64 {
+        self.gpu_scratch.bytes()
+    }
+
+    pub fn gpu_cached_weight_bytes(&self) -> u64 {
+        self.gpu_norms
+            .values()
+            .map(|buffer| buffer.length())
+            .sum::<u64>()
+            + self
+                .gpu_signs
+                .values()
+                .map(|(input, output)| input.length() + output.length())
+                .sum::<u64>()
     }
 
     /// `(in_features, out_features)` of one of this drafter's linears, for a

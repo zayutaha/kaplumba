@@ -746,3 +746,21 @@ suite passed 2/2.
 Coverage sabotage bound context K as context V. The attention parity assertion
 failed with differing fp16 outputs (exit 101). Restored the correct V binding;
 the suite passed 2/2. This confirms context V is consumed by the tested path.
+
+## 2026-10-14 — T19g.1 owned DFlash GPU scratch and weight views
+
+`DflashModel::new` now creates a Metal command queue, reusable block-shaped
+ping-pong/linear/attention/MLP buffers, and cached Metal buffers for all
+drafter norm and EXL3 sign vectors. The scratch allocator accepts only model
+and trained block dimensions; context length is not an input. Context K/V
+buffers remain separate data staging for T19g.2. The existing `TextWeights`
+owner and zero-copy packed views are unchanged.
+
+On the actual Drafter checkpoint (`B=16`, hidden 5376, intermediate 10752,
+Q width 8192, KV width 1024, five layers), the sizing test measured 5,636,096
+bytes (5.37 MiB) fixed scratch and 1,090,048 bytes (1.04 MiB) cached norm/sign
+buffers. Both are below the 32 MiB / 16 MiB task bounds. The forced-load
+`dflash_gpu_scratch_is_block_sized_and_caches_norm_sign_buffers` test passed
+1/1 in 8.22 s. Sabotaging `gpu_scratch_bytes()` to omit hidden buffers failed
+with 4,947,968 vs 5,636,096; restored implementation passed again. No target
+model or decode run was involved in this allocation check.

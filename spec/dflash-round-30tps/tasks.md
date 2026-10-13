@@ -321,12 +321,13 @@ branches selected from those results, not mandatory simultaneous implementations
   bidirectional and sliding modes, empty context, and block/context boundaries.
   Exact parity and wrong-context-value-binding sabotage passed; commit
   `f1fd6e0`.
-- [ ] **T19g.1 — add owned fixed-shape DFlash GPU buffers and cached weight views.**
+- [x] **T19g.1 — add owned fixed-shape DFlash GPU buffers and cached weight views.**
   Files: `crates/engine/src/dflash.rs`. Allocate reusable ping-pong activation,
   projection, attention, MLP and linear scratch from block dimensions; cache
   norm/sign Metal buffers beside the drafter. Test sizing/shape validation and
   ensure no scratch size depends on context length. Keep existing loading and
-  mmap/mlock ownership unchanged.
+  mmap/mlock ownership unchanged. Real checkpoint allocated 5.37 MiB scratch
+  and 1.04 MiB cached signs/norms; sizing sabotage failed as expected.
 - [ ] **T19g.2 — encode `forward_block` on one bounded encoder.**
   Files: `crates/engine/src/dflash.rs`, DFlash correctness tests. Encode all five
   layers using the T19d–T19f APIs and existing f16 linear/RoPE paths. Preserve
