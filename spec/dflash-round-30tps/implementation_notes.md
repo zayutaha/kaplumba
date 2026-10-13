@@ -895,3 +895,27 @@ scripts/gpuq try -- /usr/bin/time -l env \
   dflash_greedy_stream_matches_target_for_200_tokens_on_three_prompts \
   --ignored --exact --nocapture
 ```
+
+## 2026-10-14 — encoded B=16 three-prompt result
+
+Ran the trained B=16 block through `forward_block_gpu` on all three exact
+200-token prompts. Speeds were 4.16/4.06/4.58 tok/s (median 4.16); plain
+same-process decode was 12.32/12.33/12.32 tok/s. Rounds were 78/80/71 with
+127/123/128 accepted drafts. Every output matched sequential greedy decode.
+Per-round draft+verify was 520.97/520.15/519.68 ms; the separately processed
+anchor was ~81 ms and context append ~14 ms. `gpuq status` reported 16 GiB
+reclaimable before the run and ~3.28 GiB global swap allocation; the loader
+again reported the 86.7 MB mlock failure. `/usr/bin/time -l` was not wrapped
+around this run, so no footprint number is claimed. This confirms B=16 is
+slower than B=4 with the encoded path and remains far below the target.
+
+Exact command:
+
+```bash
+scripts/gpuq try -- env KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacked" \
+  KAPLUMBA_DFLASH_DIR="$HOME/.kaplumba/models/Drafter" \
+  KAPLUMBA_DFLASH_GPU_BLOCK=1 cargo test --release -p kaplumba-engine \
+  --test dflash_equivalence \
+  dflash_greedy_stream_matches_target_for_200_tokens_on_three_prompts \
+  -- --ignored --exact --nocapture
+```

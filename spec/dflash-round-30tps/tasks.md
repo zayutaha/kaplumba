@@ -352,7 +352,9 @@ branches selected from those results, not mandatory simultaneous implementations
   slice 6.92/6.89/7.05 (median 6.92); exact on all 600 tokens. `time -l`
   measured 14.35 GiB footprint and zero swapouts for the encoded run. These
   grouped A/B runs are not yet repeated/interleaved enough to call a stable
-  2.3% gain. B=16 still needs a three-prompt run.
+  2.3% gain. B=16 encoded now passed all three prompts at 4.16/4.06/4.58
+  tok/s (median 4.16; rounds 78/80/71; accepted 127/123/128), exact on all
+  600 tokens. Interleaved repeats remain before closing this task.
 - [x] **T19g.4 — test two chained blocks and reject if slower.**
   Files: `crates/engine/src/dflash.rs`, this spec's plan/tasks/notes.
   One prompt, B=4: exact greedy output, 74 rounds, 129 accepted, 5.43 tok/s
