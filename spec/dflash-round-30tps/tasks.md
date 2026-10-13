@@ -520,7 +520,7 @@ branches selected from those results, not mandatory simultaneous implementations
   design and memory estimate. Public acceptance (3.98–6.62 tokens on listed
   subsets) is external and does not show 30 tok/s here.
 
-- [ ] **F1d — evaluate a compatible same-target 6-bpw EXL3 DFlash candidate.**
+- [x] **F1d — evaluate a compatible same-target 6-bpw EXL3 DFlash candidate.**
   Files: `crates/engine/tests/dflash_golden.rs`, this spec's notes and
   acceptance status. Candidate:
   `eepos/gemma-4-31B-it-DFlash-exl3-6.0bpw`, repo commit
@@ -536,19 +536,21 @@ branches selected from those results, not mandatory simultaneous implementations
   lines and exact greedy output on the existing three 200-token prompts, then
   compare repeated same-prompt timings, footprint and swap to the current
   drafter. Candidate mapped load, block implementation, and all-36-linears host
-  checks now pass under T20.2. A two-repeat B-A-B isolated block comparison was
-  70.41/70.08 ms at 6 bpw vs 69.71 ms at 4 bpw; this is a small slowdown, not
-  end-to-end evidence. The ignored target-vs-DFlash 3×200-token test remains
-  pending; current `gpuq status` reports 9.5 GiB available and 2.58 GiB swap,
-  below the 14 GiB model-run guard. No default change from isolated block timing
-  or without exactness and stable measured gain. Before more candidate tests,
-  make the golden-test harness fail when an explicitly configured checkpoint
-  path is absent; the current “checkpoint not present; skipping” returns green
-  and previously hid a path typo. Prove the negative path fails, then prove the
-  candidate path reaches its all-linears assertions. Implemented: a nonexistent
-  explicit path now fails with the path in the panic; the actual candidate then
-  passed all 36 host comparisons through the same harness; `eb3771c`. The
-  target-stream exactness and end-to-end performance/memory gates remain open.
+  checks pass under T20.2. Three 200-token B16 streams were greedy-exact at
+  3.72–4.04 tok/s (median 3.92); B4 slice was exact at 5.86–6.21 (median 6.05),
+  and B4 encoded was exact at 6.09–6.49 (median 6.31). B2 and B8 prompt-0
+  controls were exact at 5.27 and 5.63 tok/s. Prompt-0 B4 encoded A/B/A/B
+  measured 4-bpw 6.23/6.24 vs 6-bpw 6.50/6.51 tok/s, a repeatable 4.3% gain
+  on that prompt, while remaining far below 30. Peak `phys_footprint` was
+  14.44–14.53 GB on these short prompts; process swapouts were zero. With the
+  target loaded, the target pinned 11.22 GiB, then DFlash mlock failed on its
+  first 86.7 MB (4-bpw) or 130.1 MB (6-bpw) range; no drafter pinned-byte
+  profile was reported. Do not promote the larger candidate from this modest,
+  prompt-local gain. The false-green missing-path harness was fixed and tested;
+  nonexistent explicit path failed and actual candidate reached all 36 checks;
+  `eb3771c`. F1d evaluation is complete; DFlash mlock budgeting and the 30 tok/s
+  gate remain open. Candidate B16/B4 stream evidence is in implementation notes;
+  results recorded in `implementation_notes.md` at `2601faf`.
 
 ## Status
 
@@ -585,7 +587,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | T9–T11 / T13 / T14 | open | measurements and performance acceptance outstanding |
 | F1a / F1b | conditional, held | alternative evaluation requires shared verifier evidence and design decisions |
 | F1c | done, candidate rejected | public same-target model uses dense BF16 linears and incompatible config; header-only review, no weights downloaded |
-| F1d | open | compatible 6-bpw EXL3 candidate; needs rate-aware loader, exact stream and repeated throughput/memory gate |
+| F1d | evaluated; not promoted | 3×200 exact, B4 prompt-0 A/B/A/B +4.3%, but only 6.31 tok/s median and drafter mlock fails with target resident; see notes |
 | T11 | done | all-row greedy identity, offset sabotage, and short-context B-A-B timing; `aaa010c` |
 | T16b | experiment rejected | unprocessed anchor B=4 and B=16 both diverge at output 77 (99382 vs 84750); removed; `cb9de00` |
 
