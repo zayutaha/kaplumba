@@ -707,3 +707,26 @@ T19d/T19e focused test passed 1/1.
 Coverage sabotage bound `gate` in place of `up`. The test failed at the gated
 SiLU parity assertion (line 116; exit 101). Restored the binding; clean rerun
 passed 1/1. No shader was added.
+
+## 2026-10-14 — T19e.1 encoder-facing f32-output GEMM
+
+Added `LinearF32EncodeRequest` and `LinearKernels::encode_gemm_f32`. It encodes
+the existing f16 input transform, f32 accumulator zero, tiled EXL3 GEMM, and
+f32 output-sign finalize into the caller's `MetalEncoder`. `packed_bytes` and
+`packed_offset` are both validated, and packed offset is passed through
+`TensorRef`; all activation/scratch buffers remain caller-owned. No linear or
+Metal shader was added.
+
+Added `encoded_f32_buffer_gemm_matches_sliced_path_with_offsets` to
+`crates/engine/tests/linear_metal.rs`. For 4/6 bpw and 1/4 rows, the encoded
+outputs matched `gemm_chunk_buffer_f32_sliced` exactly with a 128-byte prefix
+and suffix canary. A packed region one word too short and an output buffer one
+byte too small were rejected. `cargo test --release -p kaplumba-engine --test
+linear_metal encoded_f32_buffer_gemm_matches_sliced_path_with_offsets --
+--exact` passed 1/1.
+
+Coverage sabotage changed the encoded packed binding from `packed_offset` to
+zero. The test failed at the output parity assertion (line 582; nonzero output
+was read from the `0xA55A` prefix; exit 101). Restored the offset and reran; it
+passed 1/1. The existing sampler edit in `crates/engine/src/sampler.rs` was not
+staged.

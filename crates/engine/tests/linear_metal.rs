@@ -9,7 +9,8 @@ use kaplumba_engine::exl3::{
 use kaplumba_kernels::encoder::MetalEncoder;
 use kaplumba_kernels::exl3::{Exl3Codebook, Exl3Rate};
 use kaplumba_kernels::linear::{
-    LinearBufferRequest, LinearKernels, LinearRequest, PrefillEncodeRequest, PrefillRequest,
+    LinearBufferRequest, LinearF32EncodeRequest, LinearKernels, LinearRequest,
+    PrefillEncodeRequest, PrefillRequest,
 };
 use metal::{Device, MTLResourceOptions};
 
@@ -484,6 +485,124 @@ fn buffer_gemm_honors_packed_offset_for_fp16_and_fp32() {
             out_of_range.is_err(),
             "fp16 sliced GEMM accepted a rate-{bits} tensor range past the end of its Metal buffer"
         );
+    }
+}
+
+#[test]
+fn encoded_f32_buffer_gemm_matches_sliced_path_with_offsets() {
+    let kernels = LinearKernels::new().expect("Metal linear kernels should compile");
+    let device = Device::system_default().expect("Metal device");
+    let queue = device.new_command_queue();
+    let (row, input_signs, output_signs) = vectors();
+    const PREFIX_WORDS: usize = 64;
+    const PREFIX_BYTES: u64 = (PREFIX_WORDS * size_of::<u16>()) as u64;
+
+    let as_buffer = |words: &[u16]| {
+        device.new_buffer_with_data(
+            words.as_ptr() as *const c_void,
+            size_of_val(words) as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    };
+    let scratch = |bytes: usize| {
+        device.new_buffer(bytes as u64, MTLResourceOptions::StorageModeShared)
+    };
+
+    for bits in [4, 6] {
+        let packed = matrix_packed_integer_shape(bits, 0xD3A0 + u32::from(bits), 8, 8);
+        let packed_bytes = size_of_val(packed.as_slice()) as u64;
+        let mut embedded = vec![0xA55A; PREFIX_WORDS];
+        embedded.extend_from_slice(&packed);
+        embedded.extend(std::iter::repeat_n(0x5AA5, 32));
+        let packed_buffer = as_buffer(&embedded);
+
+        for queries in [1, 4] {
+            let input: Vec<u16> = (0..queries)
+                .flat_map(|row_index| {
+                    let scale = [1.0_f32, -0.5, 0.25, 0.75][row_index];
+                    row.iter().map(move |value| {
+                        f16::from_f32(f16::from_bits(*value).to_f32() * scale).to_bits()
+                    })
+                })
+                .collect();
+            let expected = kernels
+                .gemm_chunk_buffer_f32_sliced(
+                    LinearBufferRequest {
+                        packed: &packed_buffer,
+                        packed_offset: PREFIX_BYTES,
+                        input: &input,
+                        input_signs: &input_signs,
+                        output_signs: &output_signs,
+                        in_features: 128,
+                        out_features: 128,
+                        rate: Exl3Rate::Integer(bits),
+                        codebook: Exl3Codebook::Mcg,
+                        perm_mode: 0,
+                    },
+                    packed_bytes,
+                )
+                .expect("sliced f32 GEMM reference");
+
+            let input_buffer = as_buffer(&input);
+            let input_sign_buffer = as_buffer(&input_signs);
+            let output_sign_buffer = as_buffer(&output_signs);
+            let transformed = scratch(queries * 128 * size_of::<u16>());
+            let raw = scratch(queries * 128 * size_of::<f32>());
+            let output = scratch(queries * 128 * size_of::<f32>());
+            let request = LinearF32EncodeRequest {
+                packed: &packed_buffer,
+                packed_offset: PREFIX_BYTES,
+                packed_bytes,
+                perm_mode: 0,
+                input: &input_buffer,
+                input_signs: &input_sign_buffer,
+                output_signs: &output_sign_buffer,
+                transformed: &transformed,
+                raw: &raw,
+                output: &output,
+                queries,
+                in_features: 128,
+                out_features: 128,
+                rate: Exl3Rate::Integer(bits),
+                codebook: Exl3Codebook::Mcg,
+            };
+            let mut encoder = MetalEncoder::new(&queue).expect("Metal encoder");
+            kernels
+                .encode_gemm_f32(&mut encoder, request)
+                .expect("encode f32 GEMM");
+            encoder.commit_and_wait().expect("encoded GEMM completion");
+            let mut actual = vec![0.0_f32; queries * 128];
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    output.contents() as *const f32,
+                    actual.as_mut_ptr(),
+                    actual.len(),
+                );
+            }
+            assert_eq!(actual, expected, "bits={bits}, queries={queries}");
+            if queries == 1 {
+                let mut invalid_encoder = MetalEncoder::new(&queue).expect("Metal encoder");
+                assert!(kernels
+                    .encode_gemm_f32(
+                        &mut invalid_encoder,
+                        LinearF32EncodeRequest {
+                            packed_bytes: packed_bytes - 2,
+                            ..request
+                        },
+                    )
+                    .is_err());
+                let short_output = scratch(128 * size_of::<f32>() - 1);
+                assert!(kernels
+                    .encode_gemm_f32(
+                        &mut invalid_encoder,
+                        LinearF32EncodeRequest {
+                            output: &short_output,
+                            ..request
+                        },
+                    )
+                    .is_err());
+            }
+        }
     }
 }
 

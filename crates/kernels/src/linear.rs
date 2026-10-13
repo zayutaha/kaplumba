@@ -346,6 +346,27 @@ pub struct PrefillEncodeRequest<'a> {
     pub codebook: Exl3Codebook,
 }
 
+/// GPU-resident fp32-output EXL3 GEMM. Scratch buffers are caller-owned so
+/// projections can be encoded without intermediate host waits.
+#[derive(Clone, Copy)]
+pub struct LinearF32EncodeRequest<'a> {
+    pub packed: &'a Buffer,
+    pub packed_offset: u64,
+    pub packed_bytes: u64,
+    pub perm_mode: u32,
+    pub input: &'a Buffer,
+    pub input_signs: &'a Buffer,
+    pub output_signs: &'a Buffer,
+    pub transformed: &'a Buffer,
+    pub raw: &'a Buffer,
+    pub output: &'a Buffer,
+    pub queries: usize,
+    pub in_features: usize,
+    pub out_features: usize,
+    pub rate: Exl3Rate,
+    pub codebook: Exl3Codebook,
+}
+
 /// Every `linear_gemv_ishizuki_*` function in the library, sorted.
 ///
 /// Sorted so the pipeline build order — and therefore any error a missing kernel
@@ -3788,6 +3809,117 @@ impl LinearKernels {
         )?;
         encoder.dispatch_1d(
             &self.finalize_rows_pipeline,
+            &[Some(raw), Some(output_signs), Some(output)],
+            params_bytes(&row_params),
+            (output_elements / 128) as u64,
+            64,
+        )
+    }
+
+    /// Encode the existing fp32-output EXL3 GEMM into a caller-owned encoder.
+    /// The raw accumulator is cleared on-GPU so reuse does not race earlier
+    /// encoded projections with a host write.
+    pub fn encode_gemm_f32(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        request: LinearF32EncodeRequest<'_>,
+    ) -> Result<(), KernelError> {
+        use crate::encoder::TensorRef;
+
+        let LinearF32EncodeRequest {
+            packed,
+            packed_offset,
+            packed_bytes,
+            perm_mode,
+            input,
+            input_signs,
+            output_signs,
+            transformed,
+            raw,
+            output,
+            queries,
+            in_features,
+            out_features,
+            rate,
+            codebook,
+        } = request;
+        if queries == 0 {
+            return Err(KernelError::InvalidInput(
+                "f32 GEMM query count must be non-zero".to_string(),
+            ));
+        }
+        let input_elements = checked_product(queries, in_features, "f32 GEMM input")?;
+        let output_elements = checked_product(queries, out_features, "f32 GEMM output")?;
+        validate_buffer_shape(
+            packed.length(),
+            packed_bytes,
+            packed_offset,
+            input_elements,
+            (input_signs.length() / size_of::<u16>() as u64) as usize,
+            (output_signs.length() / size_of::<u16>() as u64) as usize,
+            in_features,
+            out_features,
+            rate,
+            codebook,
+        )?;
+        let input_bytes = (input_elements * size_of::<u16>()) as u64;
+        let output_bytes = (output_elements * size_of::<f32>()) as u64;
+        if input.length() < input_bytes
+            || transformed.length() < input_bytes
+            || raw.length() < output_bytes
+            || output.length() < output_bytes
+        {
+            return Err(KernelError::InvalidInput(
+                "f32 GEMM scratch buffer is smaller than its declared shape".to_string(),
+            ));
+        }
+
+        let row_params = PrefillRowParams {
+            in_features: to_u32(in_features, "input dimension")?,
+            out_features: to_u32(out_features, "output dimension")?,
+            queries: to_u32(queries, "query count")?,
+            perm_mode,
+        };
+        let linear_params = LinearParams {
+            in_features: to_u32(in_features, "input dimension")?,
+            out_features: to_u32(out_features, "output dimension")?,
+            tile_columns: to_u32(out_features / 16, "tile column count")?,
+            packed_words: to_u32(rate.packed_words(), "packed shape")?,
+            rate: rate.encoded(),
+            codebook: codebook.encoded(),
+            queries: to_u32(queries, "query count")?,
+            perm_mode,
+        };
+        encoder.dispatch_1d(
+            &self.input_rows_pipeline,
+            &[Some(input), Some(input_signs), Some(transformed)],
+            params_bytes(&row_params),
+            (input_elements / 128) as u64,
+            64,
+        )?;
+        let zero_count = to_u32(output_elements, "f32 GEMM accumulator length")?;
+        encoder.dispatch_1d(
+            &self.zero_raw_pipeline,
+            &[Some(raw)],
+            &zero_count.to_le_bytes(),
+            output_elements as u64,
+            64,
+        )?;
+        encoder.dispatch_2d(
+            &self.gemv_tiled_pipeline,
+            &[
+                TensorRef::new(packed, packed_offset),
+                TensorRef::new(transformed, 0),
+                TensorRef::new(raw, 0),
+            ],
+            params_bytes(&linear_params),
+            (out_features / 16) as u64,
+            queries.div_ceil(16) as u64,
+            16,
+            16,
+        )?;
+        encoder.dispatch_1d(
+            &self.finalize_rows_f32_pipeline,
             &[Some(raw), Some(output_signs), Some(output)],
             params_bytes(&row_params),
             (output_elements / 128) as u64,

@@ -308,11 +308,12 @@ branches selected from those results, not mandatory simultaneous implementations
   Encode the current gated-SiLU pipeline into caller-owned buffers; test mixed
   positive/negative inputs, parity against the slice method, and invalid count
   and buffer sizes. Passed parity and wrong-binding sabotage; commit `1715925`.
-- [ ] **T19e.1 — add an offset-aware encoder API for f32-output GEMM.**
+- [x] **T19e.1 — add an offset-aware encoder API for f32-output GEMM.**
   Files: `crates/kernels/src/encoder.rs`, `crates/kernels/src/linear.rs`,
   focused linear tests. Encode the existing fp32-output pipeline into a caller
   encoder while binding exact packed offset/length; test nonzero offsets, 4/6
-  bpw, row counts 1 and 4, slice parity, and invalid sizing.
+  bpw, row counts 1 and 4, slice parity, and invalid sizing. Passed parity and
+  offset-binding sabotage; commit hash recorded in notes.
 - [ ] **T19f — encode DFlash block attention into a caller encoder.**
   Files: `crates/kernels/src/attention.rs`, focused kernel tests. Preserve the
   current DFlash attention shader and mask/window semantics; add a buffer-based
