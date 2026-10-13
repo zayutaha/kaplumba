@@ -321,14 +321,23 @@ branches selected from those results, not mandatory simultaneous implementations
   bidirectional and sliding modes, empty context, and block/context boundaries.
   Exact parity and wrong-context-value-binding sabotage passed; commit
   `f1fd6e0`.
-- [ ] **T19g — port DFlash `forward_block` to bounded GPU scratch.**
-  Files: `crates/engine/src/dflash.rs`, DFlash correctness tests, kernel buffer
-  helpers as needed. Keep residual/projection precision unchanged, reuse scratch
-  sized only by block dimensions, batch encoder work, and read back only values
-  required by draft selection. Compare every block tensor and draft argmax to
-  the slice reference, sabotage one encoded binding and observe failure, then
-  run exact 3 × 200 generation and interleaved A/B. Keep the slice path until
-  parity, speed and footprint gates pass.
+- [ ] **T19g.1 — add owned fixed-shape DFlash GPU buffers and cached weight views.**
+  Files: `crates/engine/src/dflash.rs`. Allocate reusable ping-pong activation,
+  projection, attention, MLP and linear scratch from block dimensions; cache
+  norm/sign Metal buffers beside the drafter. Test sizing/shape validation and
+  ensure no scratch size depends on context length. Keep existing loading and
+  mmap/mlock ownership unchanged.
+- [ ] **T19g.2 — encode `forward_block` on one bounded encoder.**
+  Files: `crates/engine/src/dflash.rs`, DFlash correctness tests. Encode all five
+  layers using the T19d–T19f APIs and existing f16 linear/RoPE paths. Preserve
+  f32 residuals and exact block masks/positions. Compare hidden/K/V block output
+  against the slice implementation on empty, normal, and sliding contexts;
+  sabotage one buffer binding and require failure.
+- [ ] **T19g.3 — route draft generation through the encoded block and measure.**
+  Files: `crates/engine/src/dflash.rs`, `dflash_equivalence.rs`, notes. Preserve
+  the slice path as a test oracle; compare draft logits/argmax and exact target
+  generation, then run 3 × 200 and interleaved A/B plus footprint/swap. Adopt
+  the encoded path only if exactness, memory, and complete-round speed all pass.
 - [x] **T20 — load DFlash packed weights through base mmap + mlock path.**
   Files: `crates/engine/src/dflash.rs`, `crates/engine/tests/dflash_load.rs`,
   this spec's plan/tasks/notes. Replace the DFlash loader's per-tensor file reads
