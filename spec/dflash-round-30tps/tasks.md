@@ -277,7 +277,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | A2 | documentation complete | verifier-first draft, new anchor contract and conditional fallbacks; `697dcc2` |
 | A3 | review/tests complete | `exllama_review.md` and text evidence; `59a6f4b` |
 | T0a / T0b | historical observations recorded | earlier rerun notes; not repeated during this audit |
-| T0c | done | 3 nonzero rows; full-vocab max error ≤0.0156; zero-row and ×2 scale sabotage fail; hash pending |
+| T0c | done | 3 nonzero rows; full-vocab max error ≤0.0156; zero-row and ×2 scale sabotage fail; `00ae90b` |
 | T7 | open | use corrected oracle to continue drafter-stage diagnosis |
 | T5 plumbing | implemented | `9a4cf60`; independent correctness/coverage gate open |
 | T6 sweep | prior work recorded | `6622031`; reference/default gate open |
