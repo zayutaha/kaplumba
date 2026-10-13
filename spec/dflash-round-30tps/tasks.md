@@ -547,8 +547,8 @@ branches selected from those results, not mandatory simultaneous implementations
   and previously hid a path typo. Prove the negative path fails, then prove the
   candidate path reaches its all-linears assertions. Implemented: a nonexistent
   explicit path now fails with the path in the panic; the actual candidate then
-  passed all 36 host comparisons through the same harness. The target-stream
-  exactness and end-to-end performance/memory gates remain open.
+  passed all 36 host comparisons through the same harness; `eb3771c`. The
+  target-stream exactness and end-to-end performance/memory gates remain open.
 
 ## Status
 
