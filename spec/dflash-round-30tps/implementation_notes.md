@@ -225,5 +225,15 @@ Validation on `Gxma-repacked`:
 The old V0a task row reporting `19.247559` was stale after T18. A fresh run on
 2026-10-13 across three prompts and M=1/2/4/8/16 passed per-row greedy identity,
 with worst logit delta `0.4375`. Taps/KV M=2 comparison also passed (hidden
-0.375, K 0.0022583, V 0.048828125). V0a still needs its row-selection and
-position-accounting sabotage coverage; this does not close V0a or V0b.
+0.375, K 0.0022583, V 0.048828125). The sabotage coverage and final V0a
+evidence are recorded below.
+
+### V0a completion — row and position sabotage
+
+- `scripts/gpuq try -- env KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacked" cargo test --release -p kaplumba-engine --test dflash_verify_head batched_verify_head_matches_sequential_single_row -- --ignored --exact --nocapture` — passed on three deterministic token prefixes at M=1/2/4/8/16. Every row kept greedy identity; worst absolute logit delta was `0.4375`.
+- `... cargo test ... batched_and_sequential_layer_states_match ...` — passed at M=2; hidden `0.375` at L42, K `0.0022583` at L25, V `0.048828125` at L45.
+- `... cargo test ... batched_verify_head_carries_signal_on_every_row ...` — passed; adjacent rows differed on `4,190,782 / 4,194,304` vocab entries.
+- Sliding boundary test (T1b.1 above) checks `gpu_next_position == 1025`, retained key position 0, per-row greedy equality and max logit delta `0.136719` after position 1024.
+- Row-selection sabotage: changed `head_rows_matrix` to repeat the first row. The row-signal test failed with `adjacent verify rows are nearly identical (0/4194304)`; restored and retested successfully.
+- Position sabotage: shifted staged batched query positions by +1. The sequential comparison failed at M=2 row 0: batched greedy `3824`, sequential `236777`; restored and reran the 3-prompt matrix successfully.
+- V0a now closes. These results establish greedy target-logit/cache parity for the tested shapes and position boundary. Sampled distribution equivalence and round rollback remain in T1b.2/T12; V0b ideal-proposal timing is still open.

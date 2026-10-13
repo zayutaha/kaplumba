@@ -38,7 +38,7 @@ branches selected from those results, not mandatory simultaneous implementations
 
 ## First gate: correct verifier and optimistic ceiling
 
-- [ ] **V0a — sequential versus batched target verification.**
+- [x] **V0a — sequential versus batched target verification.**
   Files: `crates/engine/tests/dflash_verify_head.rs` and `model.rs` only if a
   diagnostic interface is required. Compare identical prefixes, token IDs and
   positions at M=2/4/8/16. Reset/isolate state for each arm. Test per-row greedy
@@ -275,8 +275,8 @@ branches selected from those results, not mandatory simultaneous implementations
 | T5 plumbing | implemented | `9a4cf60`; independent correctness/coverage gate open |
 | T6 sweep | prior work recorded | `6622031`; reference/default gate open |
 | T1a | done | code/tests `2f35201`; argmax sabotage failure in implementation notes |
-| V0a / V0b | drafted, held | verifier equivalence and ceiling gate before selecting a drafter |
-| V0a current test | partial pass | rerun 2026-10-13: 3 prompts × M=1/2/4/8/16 greedy identity; worst logit delta 0.4375; ring/cache comparison passes separately; row/position sabotage and complete gate remain open |
+| V0a | done | 3 prompts × M=1/2/4/8/16 greedy identity; tap/KV and ring boundary parity; row and query-position sabotage both fail; see implementation notes |
+| V0b | open | ideal-proposal ceiling harness and interleaved timings remain |
 | T17 | done | offset binding, fp32 sliced API, multirow 4/6-bpw tests; `fda508d` |
 | T18 | complete | projection-sign routing repaired; cross-layer path disabled by default; greedy M=2/4/8/16 pass on 3 prompts; see implementation notes/commit |
 | T19 | conditional design, held | GPU stage ownership/wait overhead needs measurement after correctness |
