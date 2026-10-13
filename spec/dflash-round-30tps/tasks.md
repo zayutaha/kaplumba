@@ -295,7 +295,7 @@ branches selected from those results, not mandatory simultaneous implementations
   sequential target. Select no runtime default from a single noisy reading.
   Completed: B=4 verified on 3 × 200 tokens; B=2 repeated three times; B=4
   repeated three times; B=8 and B=16 compared. Result in notes; no runtime
-  default changed.
+  default changed. Implementation commit: `0d9c1a6`.
 - [x] **T20 — load DFlash packed weights through base mmap + mlock path.**
   Files: `crates/engine/src/dflash.rs`, `crates/engine/tests/dflash_load.rs`,
   this spec's plan/tasks/notes. Replace the DFlash loader's per-tensor file reads
