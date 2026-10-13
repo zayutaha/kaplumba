@@ -69,7 +69,21 @@ fn dflash_greedy_stream_matches_target_for_200_tokens_on_three_prompts() {
     let mut target = TextModel::load_from_dir(Path::new(&model_dir)).expect("target model");
     let device = metal::Device::system_default().expect("Metal device");
     let weights = DflashWeights::load(Path::new(&drafter_dir), &device).expect("DFlash weights");
-    let config = DflashConfig::load(Path::new(&drafter_dir)).expect("DFlash config");
+    let mut config = DflashConfig::load(Path::new(&drafter_dir)).expect("DFlash config");
+    let trained_block_size = config.block_size;
+    if let Ok(value) = std::env::var("KAPLUMBA_TEST_DFLASH_BLOCK_SIZE") {
+        let block_size = value.parse::<usize>().expect("valid DFlash block size");
+        assert!(
+            (2..=trained_block_size).contains(&block_size),
+            "test block size must be in 2..={trained_block_size}"
+        );
+        config.block_size = block_size;
+    }
+    let prompt_count = std::env::var("KAPLUMBA_TEST_PROMPT_COUNT")
+        .ok()
+        .map(|value| value.parse::<usize>().expect("valid prompt count"))
+        .unwrap_or(PROMPTS.len());
+    assert!((1..=PROMPTS.len()).contains(&prompt_count));
     let mut drafter = DflashModel::new(weights, config.clone()).expect("DFlash model");
     let mask = target.raw_embedding(&[config.mask_token_id]);
     drafter.set_mask_embedding(&mask).expect("mask embedding");
@@ -79,7 +93,11 @@ fn dflash_greedy_stream_matches_target_for_200_tokens_on_three_prompts() {
         ..DflashSamplingConfig::default()
     };
 
-    for (prompt_index, prompt) in PROMPTS.iter().enumerate() {
+    eprintln!(
+        "DFlash test block size B={}, prompts={prompt_count}",
+        config.block_size
+    );
+    for (prompt_index, prompt) in PROMPTS.iter().take(prompt_count).enumerate() {
         let prompt_tokens = tokenizer.encode_prompt(prompt).expect("encode prompt");
         assert!(
             prompt_tokens.len() + OUTPUT_TOKENS < 8192,

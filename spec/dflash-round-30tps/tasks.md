@@ -287,12 +287,15 @@ branches selected from those results, not mandatory simultaneous implementations
   phase sum agrees with the existing draft-and-verify bucket within timer noise.
   Completed: 229 rounds averaged 170 ms draft + 374 ms verify; all 600 output
   tokens exact. Temporary timing hook removed; commit `845fb32`.
-- [ ] **T19c — measure shorter verified proposal blocks.**
+- [x] **T19c — measure shorter verified proposal blocks.**
   Files: `crates/engine/tests/dflash_equivalence.rs`, implementation notes.
   Add test-only block-size and prompt-count controls, then run exact 200-token
   greedy generation at B=2/4/8/16 on the same prompt(s). Record accepted tokens,
   total DFlash and plain time, and ensure every generated token matches the
   sequential target. Select no runtime default from a single noisy reading.
+  Completed: B=4 verified on 3 × 200 tokens; B=2 repeated three times; B=4
+  repeated three times; B=8 and B=16 compared. Result in notes; no runtime
+  default changed.
 - [x] **T20 — load DFlash packed weights through base mmap + mlock path.**
   Files: `crates/engine/src/dflash.rs`, `crates/engine/tests/dflash_load.rs`,
   this spec's plan/tasks/notes. Replace the DFlash loader's per-tensor file reads

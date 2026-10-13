@@ -635,3 +635,43 @@ run, and 18 GiB available with no swap afterward. After removing the timing
 hook, `cargo test --release -p kaplumba-engine --test dflash_equivalence
 --no-run` compiled successfully. No persistent product behavior change was
 made by the profiler.
+
+## 2026-10-14 — T19c verified-prefix sweep
+
+Added test-only `KAPLUMBA_TEST_DFLASH_BLOCK_SIZE` and
+`KAPLUMBA_TEST_PROMPT_COUNT` controls to `dflash_equivalence`. The block override
+is constrained to `[2, trained_block_size]`; runtime configuration and
+production defaults are untouched. Each measured candidate generated 200
+tokens and compared every token ID against the sequential target. B=4 was then
+confirmed across all three prompts.
+
+| Proposal block B | Prompt runs | DFlash tok/s | DFlash rounds / accepted drafts | Plain tok/s |
+|---:|---|---:|---|---:|
+| 2 | prompt 0 ×3 | 6.34, 6.34, 6.37 | 116 / 84 each | 12.32–12.33 |
+| 4 | prompt 0 ×3 | 6.95, 6.97, 6.97 | 85 / 115 each | 12.31–12.33 |
+| 4 | prompts 0/1/2 | 6.97, 6.90, 7.05 | 85/115, 86/116, 84/115 | 12.32–12.33 |
+| 8 | prompt 0 ×1 | 5.99 | 77 / 127 | 12.35 |
+| 16 | prompts 0/1/2, T19a baseline | 3.94, 3.85, 4.33 | 78/127, 80/123, 71/128 | 12.35–12.36 |
+
+B=4 is consistently faster than B=2 and full B=16 on these prompts. B=8
+accepts more than B=4 but pays for weaker late rows. This is an interim result
+only: B=4 reaches about 7 tok/s, far from 30 tok/s, and was not wired into a
+runtime entry point. The confirmed gain justifies reducing avoidable work, but
+the primary draft and verify synchronization costs remain. Do not describe
+shorter B as a 30 tok/s fix.
+
+Build validation: `cargo test --release -p kaplumba-engine --test
+dflash_equivalence --no-run` passed. Forced-load runs used `scripts/gpuq try`;
+all passed exact greedy comparison. The three-prompt B=4 run passed 1/1 in
+150.58 s. One 86,720,512-byte range failed `mlock` in each process; GPUQ showed
+no swap. Exact command for the three-prompt B=4 confirmation:
+
+```bash
+scripts/gpuq try -- env KAPLUMBA_TEST_DFLASH_BLOCK_SIZE=4 \
+  KAPLUMBA_TEST_PROMPT_COUNT=3 \
+  KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacked" \
+  KAPLUMBA_DFLASH_DIR="$HOME/.kaplumba/models/Drafter" \
+  cargo test --release -p kaplumba-engine --test dflash_equivalence \
+  dflash_greedy_stream_matches_target_for_200_tokens_on_three_prompts \
+  -- --ignored --exact --nocapture
+```
