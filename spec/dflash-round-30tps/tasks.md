@@ -168,11 +168,13 @@ branches selected from those results, not mandatory simultaneous implementations
   drift; this run did not isolate logits, so that cause is unconfirmed. Reverted
   the experiment. T16 stays open pending an exact row-zero method. Commit:
   `7cebcd5`.
-- [ ] **T5 — validate existing permutation propagation.**
-  Plumbing already landed in `9a4cf60`; do not implement it again.
-  Files: existing kernel/drafter permutation tests and implementation notes.
-  Test: independent expected values through actual buffer calls, not merely
-  “mode changes output”; hardcode the wrong mode and observe failure.
+- [x] **T5 — validate existing permutation propagation.**
+  Plumbing landed in `9a4cf60`; this task adds direct setter coverage to
+  `dflash_golden`: mode 0 must match the independent host reference at `fc`,
+  mode 1 must diverge from it, and restoring mode 0 must reproduce the original
+  output. The existing all-linears host test remains the default-layout oracle.
+  Setter no-op sabotage must fail by name. T6 separately chooses the checkpoint
+  default from this evidence.
 - [ ] **T6 — layout/default evidence.**
   Sweep work recorded in `6622031`; complete its default/reference validation.
   Its overlap-based colmajor conclusion is invalidated by the ignored head
@@ -476,7 +478,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | T0a / T0b | historical observations recorded | earlier rerun notes; not repeated during this audit |
 | T0c | done | 3 nonzero rows; full-vocab max error ≤0.0156; zero-row and ×2 scale sabotage fail; `00ae90b` |
 | T7 | done | 45 host/target/DFlash bands; worst error 0.0088; tile-index and ×2 scale sabotage fail; `8863b83` |
-| T5 plumbing | implemented | `9a4cf60`; independent correctness/coverage gate open |
+| T5 | done | setter mode 1 diverges from host; mode 0 restores bit-exact; no-op setter sabotage fails; see notes |
 | T6 sweep | prior work recorded | `6622031`; reference/default gate open |
 | T1a | done | code/tests `2f35201`; argmax sabotage failure in implementation notes |
 | V0a | done | 3 prompts × M=1/2/4/8/16 greedy identity; tap/KV and ring boundary parity; row and query-position sabotage both fail; see implementation notes |

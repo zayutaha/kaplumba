@@ -913,7 +913,7 @@ fn dflash_forward_block_matches_host() {
 
 #[test]
 fn dflash_exl3_decode_matches_host_on_every_linear() {
-    let Some(harness) = Harness::build() else {
+    let Some(mut harness) = Harness::build() else {
         return;
     };
     let hidden = harness.hidden();
@@ -950,7 +950,8 @@ fn dflash_exl3_decode_matches_host_on_every_linear() {
         let input = pseudo(0x5CA1_E000 ^ name.len() as u64, rows * in_features, 0.05);
         let input_f32 = f32_of(&input);
         let expected = host.forward(&input_f32, rows);
-        let actual = f32_of(&harness.model.gemm(name, &input).expect("gemm"));
+        let actual_words = harness.model.gemm(name, &input).expect("gemm");
+        let actual = f32_of(&actual_words);
         let reference_max = max_of(&expected);
         let worst = actual
             .iter()
@@ -962,6 +963,31 @@ fn dflash_exl3_decode_matches_host_on_every_linear() {
             worst <= 2e-3 * reference_max,
             "{name} disagrees with the host decode by {worst} (reference max {reference_max})"
         );
+        if name == "fc" {
+            harness.model.set_permutation_mode(1);
+            let mode_one_words = harness.model.gemm(name, &input).expect("mode-1 fc gemm");
+            let mode_one = f32_of(&mode_one_words);
+            let mode_one_error = mode_one
+                .iter()
+                .zip(&expected)
+                .map(|(actual, expected)| (actual - expected).abs())
+                .fold(0.0_f32, f32::max);
+            assert!(
+                mode_one_error > 2e-3 * reference_max,
+                "mode-1 fc still matches the host decode (error {mode_one_error}); \
+                 `DflashModel::set_permutation_mode` may not reach the buffer GEMM"
+            );
+            assert!(
+                mode_one_words.iter().zip(&actual_words).any(|(left, right)| left != right),
+                "mode-1 fc output is identical; permutation mode did not reach the buffer GEMM"
+            );
+            harness.model.set_permutation_mode(0);
+            let restored = harness.model.gemm(name, &input).expect("restored mode-0 fc");
+            assert_eq!(
+                restored, actual_words,
+                "restoring mode 0 did not reproduce the default fc output"
+            );
+        }
         worst_overall = worst_overall.max(worst);
     }
     eprintln!("all {} linears agree; worst {worst_overall:.6}", names.len());

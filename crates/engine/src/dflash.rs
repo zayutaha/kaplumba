@@ -2209,17 +2209,10 @@ impl DflashModel {
 
     /// Select the EXL3 tile permutation for the drafter's projections.
     ///
-    /// **This does not reach the block's projections.** The drafter runs every
-    /// linear through `LinearKernels::gemm_chunk_buffer*`, whose request type
-    /// (`LinearBufferRequest`) has no `perm_mode` field and whose body hardcodes
-    /// `PrefillRowParams { perm_mode: 0 }` (`kernels/linear.rs`), so the mode is
-    /// row-major there by construction. Measured: setting `1` leaves the block's
-    /// logits, its drafts and its softcap pin counts bit-identical, i.e. the
-    /// setter is a no-op for this model. It is kept because the *field* is what
-    /// the layer path (`model.rs`) uses to choose kernels, so a future caller
-    /// that moves the drafter onto that path needs it -- and because the negative
-    /// result is worth not re-measuring. To score a permutation for the drafter,
-    /// the buffer path has to learn `perm_mode` first.
+    /// The selected mode is included in each buffer-backed GEMM request,
+    /// including the sliced tied-head call. `buffer_perm_mode` verifies that
+    /// those entry points respond to the field; `dflash_golden` independently
+    /// verifies the checkpoint's default mode against host reconstruction.
     pub fn set_permutation_mode(&mut self, mode: u32) {
         self.weights.set_permutation_mode(mode);
     }

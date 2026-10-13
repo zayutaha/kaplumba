@@ -991,3 +991,28 @@ GPU command:
 `scripts/gpuq try -- env KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacked" cargo test --release -p kaplumba-engine --test dflash_verify_head repeated_rejections_preserve_live_cache_and_preflight_errors_are_atomic -- --ignored --exact --nocapture`.
 Preflight failure is atomic; a post-dispatch device error is still not injected,
 so parent task T1b.2 remains open. No model code changed.
+
+## 2026-10-14 — T5 drafter permutation propagation
+
+The DFlash buffer GEMM requests carry `QuantizedLinear::permutation_mode` at
+all projection and sliced-head call sites. `buffer_perm_mode` checks that both
+buffer entry points respond to that field; its earlier parameter-site sabotage
+fails. Extended the real-checkpoint host oracle to toggle
+`DflashModel::set_permutation_mode` on `fc`: default mode 0 matches independent
+host `reconstruct_matrix`, mode 1 must differ and fail that same host bound,
+and restoring mode 0 must reproduce the original output bit for bit.
+
+```bash
+scripts/gpuq try -- env KAPLUMBA_DFLASH_DIR="$HOME/.kaplumba/models/Drafter" \
+  cargo test --release -p kaplumba-engine --test dflash_golden \
+  dflash_exl3_decode_matches_host_on_every_linear -- --exact --nocapture
+```
+
+All 36 actual buffer linears matched host reconstruction at the loaded default;
+worst absolute error was 0.003663 (layer 0 `o_proj`). The mode-1 `fc` result
+failed the host bound. Setter sabotage hardcoded mode 0 inside
+`DflashModel::set_permutation_mode`; the test failed by name because mode 1
+still matched the host at 0.001942 error. Restored the setter and reran clean;
+all 36 passed in 30.72 s. This closes T5. The independent default-layout
+interpretation is recorded separately under T6. This test does not explain the
+measured low accepted-prefix count or improve the 7.07 tok/s result.
