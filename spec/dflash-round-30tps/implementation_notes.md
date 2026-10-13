@@ -811,3 +811,43 @@ initial version of the forced test used `Harness::build()`, which also
 dequantized every checkpoint linear into host reference matrices and took
 285 s; switching this test to a drafter-only load reduced its full run to under
 7 s. No target model or decode run was involved.
+
+## 2026-10-14 — T19g.3–T19g.6 route experiments and measurement correction
+
+Kept an opt-in route from `draft_block_with_context` through the one-encoder
+`forward_block_gpu`, selected by `KAPLUMBA_DFLASH_GPU_BLOCK=1`. The default
+remains the slice path. On prompt 0, B=4 greedy output matched exactly: the
+encoded route measured 7.05 tok/s (85 rounds, 115 accepted), versus 6.92 for
+the slice route. B=16 encoded measured 4.17 tok/s. This is a small exploratory
+gain, not a stable result; full 3 × 200 interleaved A/B and clean footprint
+measurements remain required. The runs printed the existing 86,720,512-byte
+mlock warning; do not claim full drafter residency from those runs.
+
+Rejected two chained blocks: one prompt, B=4, exact greedy output, 74 rounds,
+129 accepted, 5.43 tok/s. The second block's added drafter work outweighed
+saved target verification. Removed `KAPLUMBA_DFLASH_BLOCK_COUNT` branch.
+Rejected separately encoded target-head path: slice-block + encoded-head was
+6.54 tok/s; encoded-block + encoded-head was 6.69 tok/s, below the 6.92 and
+7.05 tok/s respective single-block routes. Removed the head scratch and
+`KAPLUMBA_DFLASH_GPU_HEAD` branch; the extra command submission/readback
+erased any head compute savings. These one-prompt measurements also occurred
+while the global swap state was elevated, so they are directional only.
+
+Found `scripts/gpuq`'s swap status parser was selecting the first positional
+value (`total`) instead of the field named `used`. It therefore printed 0 MiB
+while `sysctl -n vm.swapusage` showed about 3.2 GiB used. Fixed the parser in
+`scripts/gpuq_mem.sh` to find `used` and convert K/M/G values; missing/malformed
+fields return `?`. `bash scripts/test_gpuq_mem.sh` passes. Coverage sabotage
+changed the parser to read `total`; the tests failed with `expected 3296 MiB
+got 4096`, `expected 1536 MiB got 4096`, and `expected ? got 4096`. Restoring
+the real parser made the full script pass. This demonstrates the old metric
+was wrong but does not identify when swap accumulated or attribute it to any
+specific DFlash run. Repeat performance A/B only after recording stable
+pre-run and post-run swap values.
+
+Validation after removing failed branches: `cargo check -p kaplumba-engine
+--lib`; `cargo test --release -p kaplumba-engine --test dflash_equivalence
+--no-run`; `git diff --check`; and `bash scripts/test_gpuq_mem.sh` all passed.
+The build emitted existing unused/deprecated-cfg warnings. The separate
+GPUQ parser correction is recorded as T19g.5; it changes benchmark telemetry,
+not engine behavior.

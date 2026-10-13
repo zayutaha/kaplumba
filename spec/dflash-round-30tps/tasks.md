@@ -344,6 +344,28 @@ branches selected from those results, not mandatory simultaneous implementations
   the slice path as a test oracle; compare draft logits/argmax and exact target
   generation, then run 3 × 200 and interleaved A/B plus footprint/swap. Adopt
   the encoded path only if exactness, memory, and complete-round speed all pass.
+  Early prompt-0 measurements: B=4 exact at 7.05 tok/s encoded vs 6.92 tok/s
+  slice; B=16 exact at 4.17 tok/s encoded. Full 3 × 200 and footprint/swap
+  measurements remain. Do not make a speedup claim until swap pressure is
+  rechecked: `gpuq status` had been reporting 0 MiB due to a parser bug.
+- [x] **T19g.4 — test two chained blocks and reject if slower.**
+  Files: `crates/engine/src/dflash.rs`, this spec's plan/tasks/notes.
+  One prompt, B=4: exact greedy output, 74 rounds, 129 accepted, 5.43 tok/s
+  versus 7.05 tok/s for one encoded block. Removed the second-block branch;
+  speculative K/V chaining adds enough draft work to erase the verify savings.
+- [x] **T19g.5 — repair GPUQ swap telemetry.**
+  Files: `scripts/gpuq`, `scripts/gpuq_mem.sh`, `scripts/test_gpuq_mem.sh`,
+  this spec's notes. Parse the named `used` value and convert K/M/G units.
+  Before the fix, `sysctl -n vm.swapusage` showed about 3.2 GiB used while
+  `gpuq status` incorrectly showed 0 MiB. Parser tests pass for M/G and missing
+  fields fail closed. Coverage sabotage and clean rerun are required before
+  committing this telemetry correction.
+- [x] **T19g.6 — measure GPU tied-head encoding and reject if slower.**
+  Files: `crates/engine/src/dflash.rs`, this spec's plan/tasks/notes.
+  One prompt, B=4, exact output: encoded block + encoded head 6.69 tok/s;
+  encoded head with slice block 6.54 tok/s; single encoded block 7.05 tok/s;
+  slice block 6.92 tok/s. Removed the head path; separate command submission,
+  staging, and synchronization outweigh its compute savings.
 - [x] **T20 — load DFlash packed weights through base mmap + mlock path.**
   Files: `crates/engine/src/dflash.rs`, `crates/engine/tests/dflash_load.rs`,
   this spec's plan/tasks/notes. Replace the DFlash loader's per-tensor file reads

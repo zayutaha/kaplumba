@@ -712,6 +712,14 @@ fn trace_stage_f32(name: &str, values: &[f32]) {
     );
 }
 
+fn use_gpu_dflash_block() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("KAPLUMBA_DFLASH_GPU_BLOCK")
+            .is_some_and(|value| value == "1" || value == "true")
+    })
+}
+
 /// The drafter's 5 transformer layers plus the `fc`/`hidden_norm` encoder.
 ///
 /// Mirrors z-lab's `DFlashDraftModel` (`dflash/model.py:550-607`) layer for
@@ -3467,17 +3475,30 @@ impl DflashModel {
         cache: &DflashKvCache,
         head: &crate::model::QuantizedLinear,
     ) -> Result<DflashDraft, DflashError> {
-        let config = &self.config;
-        let rows = config.block_size;
-        let vocab = head.out_features;
         let first = cache.all_first_positions();
-        let block = self.forward_block(&BlockContext {
+        let context = BlockContext {
             anchor_embedding,
             ctx_keys: cache.all_keys(),
             ctx_values: cache.all_values(),
             ctx_first: &first,
             position,
-        })?;
+        };
+        self.draft_block_with_context(&context, head)
+    }
+
+    fn draft_block_with_context(
+        &self,
+        context: &BlockContext<'_>,
+        head: &crate::model::QuantizedLinear,
+    ) -> Result<DflashDraft, DflashError> {
+        let config = &self.config;
+        let rows = config.block_size;
+        let vocab = head.out_features;
+        let block = if use_gpu_dflash_block() {
+            self.forward_block_gpu(context)?
+        } else {
+            self.forward_block(context)?
+        };
         // Only the `block_size - 1` masked rows are new tokens; the anchor's own
         // logits predict a token the target has already produced.
         let logits =
@@ -3528,7 +3549,14 @@ impl DflashModel {
                 "the drafter's final_logit_softcapping must be positive".to_string(),
             ));
         }
-        let _ = rows;
+        if hidden.len() != rows * self.config.hidden_size {
+            return Err(DflashError::Shape(format!(
+                "draft head has {} hidden values, expected {} rows x {}",
+                hidden.len(),
+                rows,
+                self.config.hidden_size
+            )));
+        }
         let metal_buffer = head.metal_buffer.as_ref().ok_or_else(|| {
             DflashError::Kernels("the target head has no GPU-resident packed buffer".to_string())
         })?;

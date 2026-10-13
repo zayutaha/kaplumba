@@ -519,6 +519,24 @@ fn dflash_gpu_encoded_block_matches_slice_block() {
             hidden_diff / hidden_scale.max(f32::MIN_POSITIVE) < 5e-3,
             "{case_name} hidden relative mismatch {hidden_diff}/{hidden_scale}"
         );
+        if case_name == "normal" {
+            let mut slice_times = Vec::with_capacity(5);
+            let mut encoded_times = Vec::with_capacity(5);
+            for _ in 0..5 {
+                let start = std::time::Instant::now();
+                std::hint::black_box(model.forward_block(&context).expect("slice timing"));
+                slice_times.push(start.elapsed().as_secs_f64() * 1000.0);
+                let start = std::time::Instant::now();
+                std::hint::black_box(model.forward_block_gpu(&context).expect("encoded timing"));
+                encoded_times.push(start.elapsed().as_secs_f64() * 1000.0);
+            }
+            slice_times.sort_by(f64::total_cmp);
+            encoded_times.sort_by(f64::total_cmp);
+            eprintln!(
+                "normal block median: slice={:.2}ms encoded={:.2}ms",
+                slice_times[2], encoded_times[2]
+            );
+        }
     }
 }
 

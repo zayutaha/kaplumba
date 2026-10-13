@@ -174,6 +174,31 @@ Implementation sequence:
 No new kernel family is needed or authorized by P1. The existing slice path
 remains the correctness oracle and fallback until all gates pass.
 
+### P2 measurement outcome — reject chained blocks and separate head encoding
+
+T19g.2 reduced the measured B=4 drafter block median from 93.65 ms to 70.51
+ms, but a matched prompt-0 200-token run moved only from 6.92 to 7.05 tok/s.
+At B=16 the encoded route measured 4.17 tok/s. Two chained B=4 blocks retained
+exact greedy output but fell to 5.43 tok/s (74 rounds, 129 accepted); the
+second block's approximate context and extra drafter/head work erased verify
+savings. A separately encoded tied head measured 6.54 tok/s with the slice
+block and 6.69 tok/s with the encoded block, both below the corresponding
+single encoded-block run (7.05 tok/s). Both branches were removed.
+
+Keep the single encoded block behind `KAPLUMBA_DFLASH_GPU_BLOCK=1` as a
+measurement option. It remains unadopted by default until interleaved 3 × 200
+measurements establish a gain. Further work should attribute full-round time
+to drafter block stages, tied head, target verify, and cache update before
+choosing a fused path. Do not build a longer chained proposal tree: current
+measurements show its per-token drafter cost dominates the saved target work.
+
+Measurement validity note: `gpuq status` previously showed 0 MiB swap because
+the parser read the first positional amount (`total`) and assumed it was
+`used`. A direct `sysctl -n vm.swapusage` showed about 3.2 GiB used. The parser
+now reads the named `used` field and converts K/M/G to MiB. Treat prior DFlash
+speed samples as exploratory, not as clean-memory benchmark evidence; repeat
+interleaved A/B only after swap pressure is understood and stable.
+
 ## Diagnostic controls
 
 ### L1 — drafter weight residency
