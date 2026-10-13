@@ -282,7 +282,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | A3 | review/tests complete | `exllama_review.md` and text evidence; `59a6f4b` |
 | T0a / T0b | historical observations recorded | earlier rerun notes; not repeated during this audit |
 | T0c | done | 3 nonzero rows; full-vocab max error ≤0.0156; zero-row and ×2 scale sabotage fail; `00ae90b` |
-| T7 | done | 45 host/target/DFlash bands; worst error 0.0088; tile-index and ×2 scale sabotage fail; hash pending |
+| T7 | done | 45 host/target/DFlash bands; worst error 0.0088; tile-index and ×2 scale sabotage fail; `8863b83` |
 | T5 plumbing | implemented | `9a4cf60`; independent correctness/coverage gate open |
 | T6 sweep | prior work recorded | `6622031`; reference/default gate open |
 | T1a | done | code/tests `2f35201`; argmax sabotage failure in implementation notes |
