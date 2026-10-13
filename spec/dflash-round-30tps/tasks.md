@@ -327,7 +327,8 @@ branches selected from those results, not mandatory simultaneous implementations
   norm/sign Metal buffers beside the drafter. Test sizing/shape validation and
   ensure no scratch size depends on context length. Keep existing loading and
   mmap/mlock ownership unchanged. Real checkpoint allocated 5.37 MiB scratch
-  and 1.04 MiB cached signs/norms; sizing sabotage failed as expected.
+  and 1.04 MiB cached signs/norms; sizing sabotage failed as expected; commit
+  `84c126c`.
 - [ ] **T19g.2 — encode `forward_block` on one bounded encoder.**
   Files: `crates/engine/src/dflash.rs`, DFlash correctness tests. Encode all five
   layers using the T19d–T19f APIs and existing f16 linear/RoPE paths. Preserve
