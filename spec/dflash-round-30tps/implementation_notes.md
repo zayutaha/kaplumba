@@ -1038,3 +1038,39 @@ T5/T6 result: the old colmajor claim was wrong; correcting it does not raise
 acceptance. DFlash remains at 7.07 tok/s in the best measured B=4 route, so the
 30 tok/s objective still requires a materially stronger drafter and/or a much
 faster target verifier.
+
+## 2026-10-14 — F1c same-target DFlash checkpoint compatibility
+
+Reviewed `RedHatAI/gemma-4-31B-it-speculator.dflash` from its official Hugging
+Face model card and fetched only `config.json` plus the first 128 KiB of the
+Safetensors file to inspect its header. No checkpoint weights were downloaded.
+The model card reports average accepted lengths from 3.9846 (summarization) to
+6.6225 (math reasoning), block size 8 with 7 proposed tokens, taps
+`[1, 17, 29, 47, 59]`, BF16, and 3B parameters. These are published external
+results, not local benchmark evidence. The Safetensors model file is 5.08 GB;
+the repository's 10.2 GB total includes a similarly sized optimizer state.
+
+The artifact is not usable by the current path: its tensor header contains
+dense BF16 `.weight` tensors (including `fc.weight [5376, 26880]`) and no EXL3
+`.trellis`, `.mcg`, `.suh`, or `.svh` tensors. `DflashWeights::load` only builds
+projections from `.trellis` plus MCG and input/output scales. Its config schema
+uses `aux_hidden_state_layer_ids`, top-level `mask_token_id`, and nested
+`transformer_layer_config`; `DflashConfig::load` currently expects top-level
+`layer_types`, `num_hidden_layers`, and `dflash_config.target_layer_ids`.
+Therefore config normalization alone cannot make the artifact load; a dense
+BF16 DFlash projection path or an offline compatible quantization pipeline is
+needed. The public config also selects a different draft attention geometry
+(32 Q / 16 KV heads × 256 vs local 64 / 8 × 128), which must be validated against
+the kernels if a future format path is designed.
+
+Decision: reject this candidate for the current DFlash experiment; do not
+download 5.08 GB or replace the existing 733 MB EXL3 drafter. Reopen only with
+a concrete format/kernel or quantization plan and a measured footprint estimate.
+No GPU test was appropriate because the existing loader cannot consume the
+artifact. F1c is recorded complete as a read-only compatibility review; 30 tok/s
+remains unmet.
+
+Sources: <https://huggingface.co/RedHatAI/gemma-4-31B-it-speculator.dflash>
+and its `config.json` / `model.safetensors` headers; local checks against
+`crates/engine/src/dflash.rs` (`SUFFIX_RULES`, `DflashWeights::load`,
+`DflashConfig::load`).

@@ -146,10 +146,11 @@ and position contract and prove equivalence first.
    token needs no separate forward. Select proposal lengths by measured cost
    and accepted-prefix survival, with a plain-step fallback.
 5. **Evaluate alternatives only after the shared verifier gate.** Prompt/history
-   lookup and a Gemma-specific EAGLE-3 checkpoint are conditional experiments,
-   with separate sampling, memory and correctness gates. Selection is unresolved;
-   this draft authorizes neither an automatic checkpoint replacement nor a new
-   engine subsystem.
+   lookup, a Gemma-specific EAGLE-3 checkpoint, and other same-target DFlash
+   checkpoints are conditional experiments with separate sampling, memory and
+   correctness gates. A public checkpoint review may rule out a candidate on
+   format or footprint grounds without downloading it. No automatic checkpoint
+   replacement or new engine subsystem is authorized by a performance target.
 
 The corresponding total wall-time budgets are:
 
@@ -183,7 +184,9 @@ probe's overlaps are not substitute measurements for this engine.
    Shape checks, printed metrics, and helper tests do not prove the round path.
 9. Implementation and testing are authorized. Preserve the staged correctness
    gates, one-task commits, sabotage evidence, and measured acceptance requirements.
-   No checkpoint replacement/download is selected by this review.
+   A new checkpoint may be evaluated only as an isolated candidate; keep the
+   existing drafter intact, and establish loader compatibility and memory fit
+   before downloading its weights.
 10. Preserve the target checkpoint and tokenizer. Alternative drafters must use
     the same target verifier; reduced draft vocabularies must not truncate p.
     Kernel-family and model-quality restrictions still apply to fallbacks.
@@ -335,5 +338,8 @@ correct existing batched 6-bpw head; attainable acceptance and throughput.
 Unresolved decisions: which verifier shapes have adequate cost headroom;
 whether DFlash's first divergence is implementation, conversion, target-feature
 mismatch or checkpoint quality; whether lookup or EAGLE-3 merits implementation;
-exact EAGLE-3 resident footprint and reduced-vocabulary mapping. No default
-fallback, tolerance or checkpoint substitution is silently chosen by this draft.
+exact EAGLE-3 resident footprint and reduced-vocabulary mapping. The reviewed
+same-target Red Hat DFlash artifact is not loadable by the current EXL3-only
+drafter path; a BF16 format or quantization design would be a separate scope.
+No default fallback, tolerance or checkpoint substitution is silently chosen by
+this draft.

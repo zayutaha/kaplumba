@@ -469,6 +469,18 @@ branches selected from those results, not mandatory simultaneous implementations
   Test/design gate: no target p truncation, exact verifier contract, compatible
   target/tokenizer and <20 GiB at 2k. A loader implementation needs an amended
   concrete file/task plan; this item does not authorize downloading or coding.
+- [x] **F1c — review same-target DFlash checkpoint compatibility.**
+  Files: this spec's spec/plan/tasks/notes. Compare the public RedHatAI
+  Gemma-4-31B DFlash config and tensor header with the existing loader without
+  downloading checkpoint weights. Record expected acceptance, file size, tensor
+  dtype/layout, config-schema and attention-shape compatibility. Result:
+  rejected for the current engine path: the public 5.08 GB checkpoint is dense
+  BF16, while `DflashWeights::load` requires EXL3 `.trellis`/`.mcg`/scale tensors;
+  its `aux_hidden_state_layer_ids` and nested transformer config also do not
+  satisfy `DflashConfig::load`. Do not spend 5 GB on an artifact the loader
+  cannot consume. Reopen only with a separately scoped BF16/quantized format
+  design and memory estimate. Public acceptance (3.98–6.62 tokens on listed
+  subsets) is external and does not show 30 tok/s here.
 
 ## Status
 
@@ -503,6 +515,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | T1 / T2 / T4 | open | experimental product loop absent |
 | T9–T11 / T13 / T14 | open | measurements and performance acceptance outstanding |
 | F1a / F1b | conditional, held | alternative evaluation requires shared verifier evidence and design decisions |
+| F1c | done, candidate rejected | public same-target model uses dense BF16 linears and incompatible config; header-only review, no weights downloaded |
 
 Historical 2026-10-13 follow-up (before latest authorization): user had limited
 work to drafting and exllamav3 diagnostics.

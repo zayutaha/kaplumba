@@ -306,6 +306,12 @@ automatically selected implementation:
   [2,30,57]. Full target p still spans 262144 entries. Verify mapping, embeddings,
   trained target compatibility and sampled q; public acceptance is external
   evidence, not an M4 throughput prediction. Model weights stay outside the repo.
+- **Alternate DFlash checkpoint:** the public Red Hat Gemma-4 DFlash card reports
+  stronger acceptance on its evaluation sets, but its published artifact uses
+  BF16 dense linears and a different config schema from this engine's EXL3 DFlash
+  loader. Treat it as incompatible until a separately scoped loader/format plan
+  proves compatibility and footprint; do not download weights as a benchmark
+  shortcut. Its public acceptance is not local throughput evidence.
 
 For either candidate, compare complete cost and accepted-prefix survival to the
 same interleaved plain baseline. Existing kernel-family restrictions apply.
@@ -316,6 +322,7 @@ same interleaved plain baseline. Existing kernel-family restrictions apply.
 | target batch/decode discrepancy persists | inspect layer-0 projections, transforms, attention and residuals; no speculation until equivalence passes |
 | every measured ideal ceiling misses 30 | repair an existing verifier bottleneck before changing proposal source |
 | stage reference differs from quantized checkpoint | separate implementation/conversion errors from quantization and target-feature mismatch |
+| same-target DFlash alternative is incompatible with EXL3 loader | record tensor/config mismatch; only reopen with a concrete format and memory plan |
 | ring wrap destroys retained K/V | bounded transaction storage or another proven restore strategy before shipping |
 | B32 or two-block acceptance is lower | measure each variant independently; choose by complete throughput |
 | existing head GEMM remains numerically wrong | keep sequential head; performance task remains open |
