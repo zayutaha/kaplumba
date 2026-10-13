@@ -433,6 +433,53 @@ before using this run to make any residency claim.
 acceptance and complete round cost; temperature tuning alone is not the path to
 30 tok/s.
 
+## 2026-10-14 — T12a real greedy stream
+
+Added ignored `crates/engine/tests/dflash_equivalence.rs` to exercise the whole
+current round and context handoff. It initializes DFlash context from real target
+taps, feeds the target-selected anchor, calls `draft_and_verify`, saves verify
+taps before the next target forward, appends exactly the anchor plus accepted
+verify taps, and proceeds from the correction token. For each of three real
+prompts, 200 emitted greedy tokens matched the target's sequential argmax stream
+exactly. The test also times generation after prompt prefill and runs a plain
+200-token reference in the same process.
+
+Forced-load run (DFlash and target both resident, no swap) completed 1/1 in
+213.40 s. DFlash/plain results:
+
+| prompt | rounds | accepted draft tokens | DFlash tok/s | plain tok/s |
+|---|---:|---:|---:|---:|
+| relativity | 78 | 127 | 3.94 | 12.30 |
+| coastal climate | 80 | 123 | 3.85 | 12.30 |
+| garden | 71 | 128 | 4.34 | 12.30 |
+
+Median DFlash is 3.94 tok/s, only 32% of this same-process plain baseline; mean
+accepted drafts are 1.65 per round. It is therefore not merely below 30 tok/s:
+this DFlash loop is about 3.1× slower than plain target decode on these prompts.
+Even if the 16-token verify/draft round accepted every proposal, it has a narrow
+cost ceiling; the present checkpoint's acceptance length makes this path
+uncompetitive. This evidence points to both round cost and draft quality. It
+does not justify an end-to-end speed claim for sampled mode.
+
+The run emitted one `mlock` warning for 86,720,512 bytes while both model sets
+were loaded. It completed with no swap, but the warning means those pages were
+not guaranteed pinned. The plain and DFlash timings share this same residency
+state. Re-run throughput after resolving this pinned-byte gap before treating
+these rates as final. Exact command:
+
+```bash
+scripts/gpuq try -- env KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacked" \
+  KAPLUMBA_DFLASH_DIR="$HOME/.kaplumba/models/Drafter" \
+  cargo test --release -p kaplumba-engine --test dflash_equivalence \
+  dflash_greedy_stream_matches_target_for_200_tokens_on_three_prompts \
+  -- --ignored --exact --nocapture
+```
+
+T12a is complete; T12 still needs sampled equivalence and independent branch
+sabotage. T13/T14 are not met. Next performance work must first reduce proposal
+round cost and address the late-depth horizon collapse; sampler tuning alone
+cannot plausibly close the measured gap.
+
 ## 2026-10-13 — T1c exact sampler policy
 
 Added public `DflashSamplingConfig` in `crates/engine/src/dflash.rs` with CLI

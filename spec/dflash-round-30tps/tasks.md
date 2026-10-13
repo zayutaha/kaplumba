@@ -184,6 +184,14 @@ branches selected from those results, not mandatory simultaneous implementations
   controlled distributions and end-to-end evidence. Different seed consumption
   need not give identical sampled streams. Sabotage each production branch
   claimed covered; record failures before reporting coverage.
+- [x] **T12a — forced-load greedy streaming and contemporaneous baseline.**
+  Files: `crates/engine/tests/dflash_equivalence.rs` and implementation notes.
+  Run 200 generated tokens on each of three real prompts, carrying anchor and
+  accepted target taps into the DFlash context between rounds; compare every
+  output token to sequential target greedy decode. All matched exactly. DFlash
+  measured 3.85–4.34 tok/s versus 12.30 tok/s plain in the same process. This
+  isolates a correctness-proved but severe performance regression; T12 remains
+  open for sampled equivalence and branch sabotage. Commit: pending.
 
 ## Experimental wiring after correctness gates
 
@@ -318,6 +326,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | T10a | done | six q temperatures × 15 rows × 3 prompts; no stable winner; temperature sabotage fails; `70f9578` |
 | T1c | done | Shared temp/top-k/top-p policy for p/q; 11 sampler tests and top-p sabotage; `f95b040` |
 | T1b.2a | done | 9 cache rollback cases across ring boundary; off-by-one sabotage fails; no stale-row decode divergence; `e5a9be8` |
+| T12a | done | 3 × 200 greedy tokens match exactly; DFlash 3.85–4.34 tok/s vs plain 12.30; task commit pending |
 | T19 | conditional design, held | GPU stage ownership/wait overhead needs measurement after correctness |
 | T1b.1 | done | 2048-slot sliding ring; boundary greedy identity, max logit delta 0.136719, 13.59 GiB phys_footprint, no swap; sabotage fails; `6e69bf7` |
 | T20.1 | done | exact fp16/fp32 mapped slices; host and full-context tests plus sabotage; `880b7e4` |
