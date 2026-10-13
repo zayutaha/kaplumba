@@ -234,6 +234,7 @@ impl Fixture {
             out_features: self.out_features,
             rate: Exl3Rate::Integer(self.bits),
             codebook,
+            perm_mode: 0,
         }
     }
 

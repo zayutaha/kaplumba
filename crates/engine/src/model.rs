@@ -2943,6 +2943,7 @@ let use_sk4 = env_flag("KAPLUMBA_O_SK4")
                 out_features: linear.out_features,
                 rate: linear.rate,
                 codebook: linear.codebook,
+                perm_mode: linear.permutation_mode,
             };
             return if tokens == 1 {
                 Ok(self.linear.gemv_buffer(request)?)
@@ -5923,6 +5924,7 @@ impl TextModel {
                 out_features: self.lm_head.out_features,
                 rate: self.lm_head.rate,
                 codebook: self.lm_head.codebook,
+                perm_mode: self.lm_head.permutation_mode,
             };
             if tokens == 1 {
                 self.linear.gemv_buffer(request)?
@@ -6071,6 +6073,7 @@ impl TextModel {
                     out_features: self.lm_head.out_features,
                     rate: self.lm_head.rate,
                     codebook: self.lm_head.codebook,
+                    perm_mode: self.lm_head.permutation_mode,
                 };
                 if tokens == 1 {
                     self.linear.gemv_buffer(request)?

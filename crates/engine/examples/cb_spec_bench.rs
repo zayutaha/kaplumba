@@ -154,6 +154,7 @@ fn one_pass(
                 out_features: out_f,
                 rate: Exl3Rate::Integer(bits),
                 codebook: Exl3Codebook::Mcg,
+                perm_mode: 0,
             },
         )
         .expect("gemv");

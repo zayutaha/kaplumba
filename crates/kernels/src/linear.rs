@@ -283,6 +283,19 @@ pub struct LinearBufferRequest<'a> {
     pub out_features: usize,
     pub rate: Exl3Rate,
     pub codebook: Exl3Codebook,
+    /// EXL3 tile permutation the packed tensor was written with.
+    ///
+    /// **This field used not to exist, and the buffer path hardcoded 0.** The
+    /// target's repacked checkpoint is `"layout": "colmajor"`, which `model.rs`
+    /// turns into `permutation_mode = 1` for every layer linear — but the
+    /// *buffer* path (`gemm_chunk_buffer*`, which every DFlash drafter linear
+    /// and the tied head go through) ignored it. A caller could set a model's
+    /// permutation mode and observe bit-identical output, which is how the
+    /// drafter's permutation went unscored through three specifications.
+    /// `spec/dflash-round-30tps` D1.
+    ///
+    /// 0 = row-major, the default for every existing caller.
+    pub perm_mode: u32,
 }
 
 /// Fully GPU-resident single-query (decode) linear request.
@@ -940,6 +953,7 @@ impl LinearKernels {
             out_features,
             rate,
             codebook,
+            perm_mode,
         } = request;
         validate_buffer_shape(
             packed.length(),
@@ -978,7 +992,7 @@ impl LinearKernels {
             rate: rate.encoded(),
             codebook: codebook.encoded(),
             queries: 1,
-            perm_mode: 0u32,
+            perm_mode,
         };
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();
@@ -1120,6 +1134,7 @@ impl LinearKernels {
             out_features,
             rate,
             codebook,
+            perm_mode,
         } = request;
         let tokens = input.len() / in_features.max(1);
         validate_buffer_shape(
@@ -1156,7 +1171,7 @@ impl LinearKernels {
             in_features: to_u32(in_features, "input dimension")?,
             out_features: to_u32(out_features, "output dimension")?,
             queries: to_u32(tokens, "query count")?,
-            perm_mode: 0u32,
+            perm_mode,
         };
         let linear_params = LinearParams {
             in_features: to_u32(in_features, "input dimension")?,
@@ -1166,7 +1181,7 @@ impl LinearKernels {
             rate: rate.encoded(),
             codebook: codebook.encoded(),
             queries: to_u32(tokens, "query count")?,
-            perm_mode: 0u32,
+            perm_mode,
         };
         let stats = prefill_stats(tokens, in_features, out_features)?;
         let command_buffer = self.queue.new_command_buffer();
@@ -1256,6 +1271,7 @@ impl LinearKernels {
             out_features,
             rate,
             codebook,
+            perm_mode,
         } = request;
         let tokens = input.len() / in_features.max(1);
         validate_buffer_shape(
@@ -1292,7 +1308,7 @@ impl LinearKernels {
             in_features: to_u32(in_features, "input dimension")?,
             out_features: to_u32(out_features, "output dimension")?,
             queries: to_u32(tokens, "query count")?,
-            perm_mode: 0u32,
+            perm_mode,
         };
         let linear_params = LinearParams {
             in_features: to_u32(in_features, "input dimension")?,
@@ -1302,7 +1318,7 @@ impl LinearKernels {
             rate: rate.encoded(),
             codebook: codebook.encoded(),
             queries: to_u32(tokens, "query count")?,
-            perm_mode: 0u32,
+            perm_mode,
         };
         let command_buffer = self.queue.new_command_buffer();
         let encoder = command_buffer.new_compute_command_encoder();

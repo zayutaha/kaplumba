@@ -1780,6 +1780,7 @@ impl DflashModel {
             out_features: line.out_features,
             rate: line.rate,
             codebook: line.codebook,
+            perm_mode: line.permutation_mode,
         })?)
     }
 
@@ -1853,6 +1854,7 @@ impl DflashModel {
             out_features: line.out_features,
             rate: line.rate,
             codebook: line.codebook,
+            perm_mode: line.permutation_mode,
         })?)
     }
 
@@ -2565,6 +2567,7 @@ impl DflashModel {
                 out_features: head.out_features,
                 rate: head.rate,
                 codebook: head.codebook,
+                perm_mode: head.permutation_mode,
             },
             packed_bytes,
         )?;

@@ -266,6 +266,7 @@ fn metal_buffer_backed_linear_matches_slice_path() {
             out_features: 128,
             rate: Exl3Rate::Integer(3),
             codebook: Exl3Codebook::Mcg,
+            perm_mode: 0,
         })
         .unwrap();
     let expected_single = expected_gemv(
@@ -294,6 +295,7 @@ fn metal_buffer_backed_linear_matches_slice_path() {
             out_features: 128,
             rate: Exl3Rate::Integer(3),
             codebook: Exl3Codebook::Mcg,
+            perm_mode: 0,
         })
         .unwrap();
     assert_eq!(prefill.len(), 256);
