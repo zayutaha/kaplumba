@@ -152,6 +152,24 @@ pub enum LinearRoute {
     LargeBatchGemm,
 }
 
+#[cfg(test)]
+mod qkv_sign_tests {
+    use super::{projection_input_signs_match, qkv_input_signs_are_shared};
+
+    #[test]
+    fn shared_projection_transforms_require_identical_signs() {
+        let q = [0x3c00, 0xbc00, 0x3c00];
+        let same = [0x3c00, 0xbc00, 0x3c00];
+        let different = [0xbc00, 0xbc00, 0x3c00];
+
+        assert!(qkv_input_signs_are_shared(&q, &same, Some(&same)));
+        assert!(!qkv_input_signs_are_shared(&q, &different, Some(&same)));
+        assert!(qkv_input_signs_are_shared(&q, &same, None));
+        assert!(projection_input_signs_match(&q, &same));
+        assert!(!projection_input_signs_match(&q, &different));
+    }
+}
+
 /// The routing table for [`LinearRoute`].
 ///
 /// `tokens == 0` keeps the decode arm: `encode_gemv` already refuses zero work
@@ -1110,6 +1128,22 @@ pub struct DecoderLayer {
 }
 
 impl DecoderLayer {
+    /// Fused decode QKV kernels take one input-sign vector for all projections.
+    fn qkv_share_input_signs(&self) -> bool {
+        qkv_input_signs_are_shared(
+            &self.weights.q_proj.input_signs,
+            &self.weights.k_proj.input_signs,
+            self.weights.v_proj.as_ref().map(|v| v.input_signs.as_slice()),
+        )
+    }
+
+    fn gate_up_share_input_signs(&self) -> bool {
+        projection_input_signs_match(
+            &self.weights.gate_proj.input_signs,
+            &self.weights.up_proj.input_signs,
+        )
+    }
+
     pub fn new(config: LayerConfig, weights: DecoderLayerWeights) -> Result<Self, ModelError> {
         config.validate()?;
         weights.validate(&config)?;
@@ -1337,6 +1371,8 @@ impl DecoderLayer {
     ///     prefill would read `pos` and `offset` from the wrong place, and
     ///     prefill's norms may pick a different per-row kernel for large `rows`
     ///     (see the `norm_rope_qkv` comment above).
+    ///   * `KAPLUMBA_USE_CROSS_LAYER=1` -- off by default after the loaded target
+    ///     produced divergent layer-1 K/V and logits on this path.
     ///   * split-K2 -- the fused kernel reproduces `_sk2`'s 1024-thread
     ///     reduction. The sk4 finalize reduces four partials in a different
     ///     order and no-SK reduces one; neither is bit-identical to it.
@@ -1352,6 +1388,7 @@ impl DecoderLayer {
         next_layer: Option<&DecoderLayer>,
     ) -> bool {
         tokens == 1
+            && env_flag("KAPLUMBA_USE_CROSS_LAYER")
             && !env_flag("KAPLUMBA_NO_CROSS_LAYER")
             && self.weights.down_proj.permutation_mode == 1
             && self.weights.down_proj.out_features % 32 == 0
@@ -1477,6 +1514,8 @@ impl DecoderLayer {
         let inter_elements = tokens * inter;
         let full = config.full_attention;
         let offset = self.gpu_cache.next_position();
+        let qkv_share_input_signs = self.qkv_share_input_signs();
+        let gate_up_share_input_signs = self.gate_up_share_input_signs();
         // `encode_linear` routes on exactly this predicate, so one flag says
         // whether the shared input transform below is worth issuing.
         let decode = tokens == 1;
@@ -1490,7 +1529,7 @@ impl DecoderLayer {
         if input_norm_precomputed {
             // Nothing to do: `scratch.normed` and `scratch.transformed` were
             // written by the previous layer's fused finalize.
-        } else if decode && self.weights.q_proj.permutation_mode == 1 {
+        } else if decode && qkv_share_input_signs && self.weights.q_proj.permutation_mode == 1 {
             let q_input_signs = self
                 .weights
                 .q_proj
@@ -1522,7 +1561,7 @@ impl DecoderLayer {
                 tokens,
                 eps,
             )?;
-            if decode {
+            if decode && qkv_share_input_signs {
                 self.encode_input_transform(encoder, &self.weights.q_proj, &scratch.normed, scratch)?;
             }
         }
@@ -1534,7 +1573,7 @@ impl DecoderLayer {
         // the trailing norm/residual pairs below.
         profile.stamp(encoder, &format!("{}norm_transform", prefix()))?;
         timer.lap("norm_transform");
-        if decode && self.weights.q_proj.permutation_mode == 1 && self.weights.v_proj.is_some() {
+        if decode && qkv_share_input_signs && self.weights.q_proj.permutation_mode == 1 && self.weights.v_proj.is_some() {
             let v_proj = self.weights.v_proj.as_ref().unwrap();
             let packed_q = self.weights.q_proj.metal_buffer.as_ref().ok_or_else(|| {
                 ModelError::InvalidWeights("q_proj has no GPU-resident weights".to_string())
@@ -1606,7 +1645,7 @@ impl DecoderLayer {
             }
             profile.stamp(encoder, &format!("{}qkv_proj", prefix()))?;
             timer.lap("qkv_proj");
-        } else if decode && self.weights.q_proj.permutation_mode == 1 {
+        } else if decode && qkv_share_input_signs && self.weights.q_proj.permutation_mode == 1 {
             let packed_q = self.weights.q_proj.metal_buffer.as_ref().ok_or_else(|| {
                 ModelError::InvalidWeights("q_proj has no GPU-resident weights".to_string())
             })?;
@@ -1671,7 +1710,7 @@ impl DecoderLayer {
                 &scratch.q,
                 tokens,
                 scratch,
-                decode,
+                decode && qkv_share_input_signs,
             )?;
             profile.stamp(encoder, &format!("{}q_proj", prefix()))?;
             timer.lap("q_proj");
@@ -1682,7 +1721,7 @@ impl DecoderLayer {
                 &scratch.k,
                 tokens,
                 scratch,
-                decode,
+                decode && qkv_share_input_signs,
             )?;
             profile.stamp(encoder, &format!("{}k_proj", prefix()))?;
             timer.lap("k_proj");
@@ -1694,7 +1733,7 @@ impl DecoderLayer {
                     &scratch.v,
                     tokens,
                     scratch,
-                    true,
+                    decode && qkv_share_input_signs,
                 )?;
             } else {
                 // Full attention reuses the raw K projection as V, before K is
@@ -1970,6 +2009,7 @@ impl DecoderLayer {
         if decode
             && self.weights.o_proj.permutation_mode == 1
             && self.weights.gate_proj.permutation_mode == 1
+            && gate_up_share_input_signs
         {
             let packed_o = self.weights.o_proj.metal_buffer.as_ref().ok_or_else(|| {
                 ModelError::InvalidWeights("o_proj has no GPU-resident weights".to_string())
@@ -2152,7 +2192,7 @@ let use_sk4 = env_flag("KAPLUMBA_O_SK4")
             )?;
             profile.stamp(encoder, &format!("{}o_proj", prefix()))?;
             timer.lap("o_proj");
-            if decode && self.weights.gate_proj.permutation_mode == 1 {
+            if decode && gate_up_share_input_signs && self.weights.gate_proj.permutation_mode == 1 {
                 let gate_input_signs = self
                     .weights
                     .gate_proj
@@ -2221,7 +2261,7 @@ let use_sk4 = env_flag("KAPLUMBA_O_SK4")
 
             // gate and up read the same activation too -- decode only, for the
             // reason given above the q/k/v transform.
-            if decode {
+            if decode && gate_up_share_input_signs {
                 self.encode_input_transform(
                     encoder,
                     &self.weights.gate_proj,
@@ -2234,7 +2274,7 @@ let use_sk4 = env_flag("KAPLUMBA_O_SK4")
         }
         }
 
-        if decode && self.weights.gate_proj.permutation_mode == 1 {
+        if decode && gate_up_share_input_signs && self.weights.gate_proj.permutation_mode == 1 {
             let packed_gate = self
                 .weights
                 .gate_proj
@@ -2481,7 +2521,7 @@ let use_sk4 = env_flag("KAPLUMBA_O_SK4")
                 &scratch.gate,
                 tokens,
                 scratch,
-                decode,
+                decode && gate_up_share_input_signs,
             )?;
             profile.stamp(encoder, &format!("{}gate_proj", prefix()))?;
             timer.lap("gate_proj");
@@ -2492,7 +2532,7 @@ let use_sk4 = env_flag("KAPLUMBA_O_SK4")
                 &scratch.up,
                 tokens,
                 scratch,
-                decode,
+                decode && gate_up_share_input_signs,
             )?;
             profile.stamp(encoder, &format!("{}up_proj", prefix()))?;
             timer.lap("up_proj");
@@ -2517,7 +2557,7 @@ let use_sk4 = env_flag("KAPLUMBA_O_SK4")
             profile.stamp(encoder, &format!("{}down_proj", prefix()))?;
             timer.lap("down_proj");
         }
-        if !(decode && self.weights.gate_proj.permutation_mode == 1) {
+        if !(decode && gate_up_share_input_signs && self.weights.gate_proj.permutation_mode == 1) {
             if decode {
                 self.elements.encode_rms_norm_residual_layer_scale(
                     encoder,
@@ -3009,6 +3049,14 @@ let use_sk4 = env_flag("KAPLUMBA_O_SK4")
             })?),
         }
     }
+}
+
+fn projection_input_signs_match(left: &[u16], right: &[u16]) -> bool {
+    left == right
+}
+
+fn qkv_input_signs_are_shared(q: &[u16], k: &[u16], v: Option<&[u16]>) -> bool {
+    projection_input_signs_match(q, k) && v.is_none_or(|v| projection_input_signs_match(q, v))
 }
 
 /// What the LM head should do with the 262,144-wide row it just produced, and
