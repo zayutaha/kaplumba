@@ -480,6 +480,24 @@ sabotage. T13/T14 are not met. Next performance work must first reduce proposal
 round cost and address the late-depth horizon collapse; sampler tuning alone
 cannot plausibly close the measured gap.
 
+## 2026-10-14 — T16a unprocessed-anchor attempt rejected
+
+Temporarily changed `draft_and_verify` to verify `[anchor, proposals]` in one
+chunk, use target rows 0..n for proposal/correction p, retain anchor plus
+accepted verify taps, and retract `n - accepted`. This removed the separate
+one-token anchor forward from the test loop. The forced-load 200-token T12a
+stream failed exact greedy equality on prompt 0 at output index 77: DFlash chose
+token 99382, sequential target chose 84750. Failure was reported after 71.69 s;
+the assertion aborted before a throughput result was printed. Only the first
+prompt ran. The existing processed-anchor T12a stream passed all three prompts.
+
+Restored `dflash.rs` and `dflash_equivalence.rs` to the committed processed-anchor
+version. The likely issue is a small batched target-row difference at a near-tie,
+but this run did not retain logits at the mismatch and does not prove that cause.
+Do not ship or benchmark T16 as a speed result until row-zero parity is isolated
+and the exact-output stream passes. T16 remains open; the shortcut's potential
+one target decode saving is not enough to justify changing output.
+
 ## 2026-10-13 — T1c exact sampler policy
 
 Added public `DflashSamplingConfig` in `crates/engine/src/dflash.rs` with CLI
