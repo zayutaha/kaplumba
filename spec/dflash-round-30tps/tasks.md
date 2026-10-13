@@ -102,7 +102,7 @@ branches selected from those results, not mandatory simultaneous implementations
   Test independent probability fixtures, inclusive nucleus/ties, top-k boundaries,
   bad logits/uniforms and residual support; sabotage truncation/temperature.
   Eleven DFlash sampler tests pass. Top-p sabotage failed the named support
-  assertion; restored. Commit: pending.
+  assertion; restored. Commit: `f95b040`.
 - [ ] **T1b — transaction and ring rollback.**
   Files: `crates/engine/src/model.rs`, `gpu_cache.rs`, `dflash.rs`, and
   cache/round tests.
@@ -307,6 +307,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | T17 | done | offset binding, fp32 sliced API, multirow 4/6-bpw tests; `fda508d` |
 | T18 | complete | projection-sign routing repaired; cross-layer path disabled by default; greedy M=2/4/8/16 pass on 3 prompts; see implementation notes/commit |
 | T10a | done | six q temperatures × 15 rows × 3 prompts; no stable winner; temperature sabotage fails; `70f9578` |
+| T1c | done | Shared temp/top-k/top-p policy for p/q; 11 sampler tests and top-p sabotage; `f95b040` |
 | T19 | conditional design, held | GPU stage ownership/wait overhead needs measurement after correctness |
 | T1b.1 | done | 2048-slot sliding ring; boundary greedy identity, max logit delta 0.136719, 13.59 GiB phys_footprint, no swap; sabotage fails; `6e69bf7` |
 | T20.1 | done | exact fp16/fp32 mapped slices; host and full-context tests plus sabotage; `880b7e4` |
