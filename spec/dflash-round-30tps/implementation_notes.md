@@ -179,3 +179,23 @@ Validation on 2026-10-13:
 - Coverage sabotage: temporarily bypassed `align_packed_view`; the unaligned test failed with offset `409` instead of `0`; restored helper and reran successfully.
 - The first `target/release/kaplumba` was stale (timestamp 21:28, before the reset and T20). Rebuilt and ran the current release with `KAPLUMBA_LOAD_PROFILE=1 /usr/bin/time -l cargo run --release -p kaplumba-cli -- --model ~/.kaplumba/models/Gxma-repacked --prompt 'Say hello.' --max-new-tokens 1 --temperature 0 --metrics`.
 - Full 14.88 GB checkpoint load completed in 7,123 ms. Loader reported `pinned 411 trellis tensors, 11.22 GiB wired`; one-token generation completed. `/usr/bin/time -l` reported 0 swaps, 0 block input operations, and 12,432,015,360-byte max resident set; peak memory footprint was 13,598,074,960 bytes. Global `vm.swapusage` used bytes fell from 2,746.06 MiB before the run to 2,618.06 MiB after, so there was no system swap growth during this run. This validates residency for a short load/generation check, not a 30 tok/s throughput claim or a long decode.
+
+## 2026-10-13 — T20.1 exact slices for mapped DFlash projections
+
+`TextWeights::zero_copy_tensor_buffer` gives each DFlash line a Metal buffer
+covering the entire `.trellis` shard, with the tensor's `metal_offset` and
+`packed_len` stored separately. DFlash was calling the general fp16/fp32 buffer
+GEMM entry points, whose input validation treats the supplied length as the
+whole packed input. That path therefore rejected a correct large shard buffer
+as the wrong tensor size. `DflashModel::gemm` and `gemm_f32` now pass
+`packed_len * sizeof(u16)` to the sliced GEMM APIs together with `metal_offset`.
+This preserves zero-copy mmap/mlock ownership and does not modify target model
+loading.
+
+Validation on the Drafter checkpoint:
+
+- `scripts/gpuq try -- env KAPLUMBA_DFLASH_DIR="$HOME/.kaplumba/models/Drafter" cargo test --release -p kaplumba-engine --test dflash_golden dflash_exl3_decode_matches_host_on_every_linear -- --exact --nocapture` — passed, all 36 linears, worst absolute error `0.003663`.
+- `scripts/gpuq try -- env KAPLUMBA_DFLASH_DIR="$HOME/.kaplumba/models/Drafter" cargo test --release -p kaplumba-engine --test dflash_golden dflash_forward_block_with_context_matches_host -- --exact --nocapture` — passed, full block/context worst absolute difference `0.023227` (`0.0006` relative); includes fp32 `o_proj`/`down_proj` paths.
+- Coverage sabotage: temporarily replaced both sliced APIs with whole-buffer GEMM. The named linear test failed at the first projection with `packed buffer length 768973144 does not match 86704128`; restored exact slices and reran successfully.
+- `git diff --check` passed. Tests used `scripts/gpuq try`; each model test was run serially. Target loading and `sampler.rs` were not changed.
+- This repairs DFlash mapped projection execution. It does not connect DFlash to generation or establish any throughput gain. The contemporaneous plain decode observation remains about `12.6 tok/s`; the 30 tok/s acceptance gate is open.

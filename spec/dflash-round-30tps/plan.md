@@ -122,6 +122,16 @@ before asserting practical headroom.
 | `crates/engine/src/gpu_cache.rs` | `retract` only lowers cursor; sliding cache capacity equals window | reserve bounded chunk history in sliding rings; mask future rejected positions and validate cursor rollback |
 | `crates/engine/src/model.rs` | M=2 verify previously differed from sequential; projection-sign and cross-layer faults are repaired | keep attention window semantic unchanged, size physical sliding capacity for safe batched appends, prove boundary behavior |
 | `crates/engine/src/dflash.rs` + `crates/engine/src/weights.rs` | DFlash loader uses `File::read_exact` into per-tensor vectors and copies packed bytes into new Metal buffers | build a single-shard selection and pass it through existing `TextWeights::load_dedicated`; use zero-copy trellis views and retain `TextWeights` so its mmap and `mlock` lifetime covers every drafter buffer |
+
+### T20 follow-up — exact packed slices over shard-sized Metal buffers
+
+The zero-copy packed view retains a Metal buffer whose length is the whole shard,
+while each DFlash linear's `metal_offset` and `packed_len` identify one tensor.
+Both fp16 and fp32 buffer GEMM calls must validate and bind that exact tensor
+byte length (`packed_len * sizeof(u16)`) instead of inferring a slice from the
+end of the shard. The target API and mmap ownership remain unchanged. Validate
+all mapped DFlash linears against independent host decode and run a full-block
+context comparison, which exercises both fp16 and fp32 drafter projections.
 | `crates/engine/src/generate.rs` | plain generation only | experimental loop after round correctness |
 | `crates/cli/src/{args,main,chat}.rs` | no drafter selection | explicit flags, loading, errors and metrics; supported chat policy |
 | `crates/engine/tests/dflash_equivalence.rs` and a future verifier timing harness | existing evidence does not establish the full round | sequential-vs-batched control, ideal-proposal ceiling and round equivalence; final filenames chosen during implementation |
@@ -247,4 +257,4 @@ same interleaved plain baseline. Existing kernel-family restrictions apply.
 | AC8 | V0a, V0b |
 | AC9 | T1b, T3, T16, T12 |
 | AC10 | F1a, F1b, T13, T14 |
-| AC11 | T20 |
+| AC11 | T20, T20.1 |

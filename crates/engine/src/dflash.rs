@@ -1852,18 +1852,25 @@ impl DflashModel {
         let metal_buffer = line.metal_buffer.as_ref().ok_or_else(|| {
             DflashError::Kernels(format!("{name} has no GPU-resident packed buffer"))
         })?;
-        Ok(self.linear.gemm_chunk_buffer(LinearBufferRequest {
-            packed: metal_buffer,
-            packed_offset: line.metal_offset,
-            input,
-            input_signs: &line.input_signs,
-            output_signs: &line.output_signs,
-            in_features: line.in_features,
-            out_features: line.out_features,
-            rate: line.rate,
-            codebook: line.codebook,
-            perm_mode: line.permutation_mode,
-        })?)
+        let packed_bytes = line
+            .packed_len
+            .map(|words| (words as u64) * std::mem::size_of::<u16>() as u64)
+            .ok_or_else(|| DflashError::Shape(format!("{name} has no packed length")))?;
+        Ok(self.linear.gemm_chunk_buffer_sliced(
+            LinearBufferRequest {
+                packed: metal_buffer,
+                packed_offset: line.metal_offset,
+                input,
+                input_signs: &line.input_signs,
+                output_signs: &line.output_signs,
+                in_features: line.in_features,
+                out_features: line.out_features,
+                rate: line.rate,
+                codebook: line.codebook,
+                perm_mode: line.permutation_mode,
+            },
+            packed_bytes,
+        )?)
     }
 
     fn rms_norm(
@@ -1922,18 +1929,25 @@ impl DflashModel {
         let metal_buffer = line.metal_buffer.as_ref().ok_or_else(|| {
             DflashError::Kernels(format!("{name} has no GPU-resident packed buffer"))
         })?;
-        Ok(self.linear.gemm_chunk_buffer_f32(LinearBufferRequest {
-            packed: metal_buffer,
-            packed_offset: line.metal_offset,
-            input,
-            input_signs: &line.input_signs,
-            output_signs: &line.output_signs,
-            in_features: line.in_features,
-            out_features: line.out_features,
-            rate: line.rate,
-            codebook: line.codebook,
-            perm_mode: line.permutation_mode,
-        })?)
+        let packed_bytes = line
+            .packed_len
+            .map(|words| (words as u64) * std::mem::size_of::<u16>() as u64)
+            .ok_or_else(|| DflashError::Shape(format!("{name} has no packed length")))?;
+        Ok(self.linear.gemm_chunk_buffer_f32_sliced(
+            LinearBufferRequest {
+                packed: metal_buffer,
+                packed_offset: line.metal_offset,
+                input,
+                input_signs: &line.input_signs,
+                output_signs: &line.output_signs,
+                in_features: line.in_features,
+                out_features: line.out_features,
+                rate: line.rate,
+                codebook: line.codebook,
+                perm_mode: line.permutation_mode,
+            },
+            packed_bytes,
+        )?)
     }
 
     /// `residual` in f32. Separate rather than generic because the point is that

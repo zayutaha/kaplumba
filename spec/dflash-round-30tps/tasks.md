@@ -231,6 +231,18 @@ branches selected from those results, not mandatory simultaneous implementations
   `align_packed_view` (offset 409 instead of aligned offset 0), then passed when
   restored. Implementation commit: `6a5d36d`.
 
+- [x] **T20.1 — bind each mapped DFlash projection to its exact packed slice.**
+  Files: `crates/engine/src/dflash.rs`, DFlash mapped-weight integration tests,
+  and this spec's plan/tasks/notes. The mapped Metal buffer spans the shard, so
+  fp16 and fp32 GEMM must pass `packed_len * sizeof(u16)` as the tensor slice
+  length alongside `metal_offset`. Test every mapped drafter linear against
+  independent host decode and the full block/context path; temporarily restore
+  whole-buffer length inference and observe a diagnosable failure, then restore
+  the exact-slice calls. Keep target loading and mmap ownership unchanged. All
+  36 linears and full context block passed; sabotage failed with `packed buffer
+  length 768973144 does not match 86704128`. Implementation commit recorded in
+  the Status table.
+
 ## Conditional alternatives after the shared verifier gate
 
 - [ ] **F1a — lookup evaluation design and optional experiment.**
@@ -266,6 +278,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | T17 | done | offset binding, fp32 sliced API, multirow 4/6-bpw tests; `fda508d` |
 | T18 | complete | projection-sign routing repaired; cross-layer path disabled by default; greedy M=2/4/8/16 pass on 3 prompts; see implementation notes/commit |
 | T19 | conditional design, held | GPU stage ownership/wait overhead needs measurement after correctness |
+| T20.1 | done | exact fp16/fp32 mapped slices; host and full-context tests plus sabotage; see implementation notes |
 | T1c / T15 / T16 | drafted, held | sampling policy, measured length selection, new anchor contract |
 | T1b / T3 / T8 / T12 | open | correctness work before product wiring |
 | T1 / T2 / T4 | open | experimental product loop absent |

@@ -251,8 +251,8 @@ fn dflash_load_has_every_tensor_and_the_right_shapes() {
         "default DFlash load must use the mapped path; explicit resident mode must use the arena"
     );
     assert!(
-        weights.pinned_bytes() <= weights.mapped_trellis_bytes,
-        "mlock cannot account for more packed data than the mapped trellis"
+        weights.pinned_bytes() <= shard.file_size,
+        "page-rounded mlock accounting must stay within the shard mapping"
     );
     eprintln!(
         "DFlash loader: mapped={} bytes, mlocked={} bytes",
