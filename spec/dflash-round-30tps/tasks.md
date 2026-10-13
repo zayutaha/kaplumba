@@ -514,11 +514,15 @@ branches selected from those results, not mandatory simultaneous implementations
   Apache-2.0 metadata. Header-only review found 166 recognized names, identical
   key sets and architecture/tap config; the third trellis dimension is 96
   (=6 bpw) instead of the local checkpoint's 64 (=4 bpw). The owner says the
-  conversion was only briefly tested, so treat it as experimental. After T20.2,
-  load it from an isolated model directory, verify all 36 lines and exact greedy
-  output on the existing three 200-token prompts, then compare repeated
-  same-prompt timings, footprint and swap to the current drafter. No default
-  change from a single run or without exactness and stable measured gain.
+  conversion was only briefly tested, so treat it as experimental. Its source
+  header is 16,599 bytes; all packed starts are 3 mod 4 and currently trigger
+  36 alignment copies. Normalize one JSON-padding byte to the canonical 8-byte
+  header boundary in the isolated model copy, then verify the 1.15 GB payload is
+  unchanged and packed offsets map without copies. After T20.2, verify all 36
+  lines and exact greedy output on the existing three 200-token prompts, then
+  compare repeated same-prompt timings, footprint and swap to the current
+  drafter. No default change from a single run or without exactness and stable
+  measured gain.
 
 ## Status
 

@@ -344,8 +344,11 @@ probe's overlaps are not substitute measurements for this engine.
   `QuantizedLinear.rate`; malformed/fractional shapes fail with a named error.
   The candidate's 166 tensors are all recognized, its exact greedy stream
   matches the target, and any throughput claim uses repeated same-prompt runs
-  plus measured footprint/swap. The existing drafter remains default unless
-  exactness, stable gain, and memory acceptance all pass.
+  plus measured footprint/swap. If the source header misaligns packed tensors,
+  normalize only JSON whitespace padding and verify the tensor payload is
+  unchanged so the existing mmap/no-copy path remains usable. The existing
+  drafter remains default unless exactness, stable gain, and memory acceptance
+  all pass.
 
 ## Open questions / scheduled evidence
 

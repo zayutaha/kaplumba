@@ -319,9 +319,12 @@ automatically selected implementation:
   names/shapes apart from expected EXL3 tile depth. Its 1,153,033,071-byte
   Safetensors file is about 384 MB larger than the current local file. The
   loader currently hardcodes 4 bpw, so first infer rate from tile depth and
-  verify the MCG payload; then load only from an isolated directory. Its author
-  describes the conversion as briefly tested, so exact-stream and performance
-  measurements decide whether it is useful.
+  verify the MCG payload; then load only from an isolated directory. Its source
+  header is 16,599 bytes, leaving all packed starts at 3 mod 4 and forcing the
+  engine's alignment-copy fallback; normalize only header whitespace to the
+  canonical 8-byte boundary and verify the payload is unchanged before testing
+  the mapped path. Its author describes the conversion as briefly tested, so
+  exact-stream and performance measurements decide whether it is useful.
 
 For either candidate, compare complete cost and accepted-prefix survival to the
 same interleaved plain baseline. Existing kernel-family restrictions apply.

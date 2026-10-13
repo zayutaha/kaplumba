@@ -400,6 +400,34 @@ binary compiled with `cargo test --release -p kaplumba-engine --test
 dflash_equivalence --no-run`. Continue after the segmented transfer, verify its
 SHA-256, add config files, and run T20.2 before any forced-load generation.
 
+T20.2 implementation update: `DflashWeights::load` now derives integer bpw from
+`trellis.shape[2] / 16`, constructs each `QuantizedLinear` with that rate, and
+retains the existing exact mapped slice/MCG checks. The loader test checks every
+packed line's inferred rate and packed word count instead of assuming `fc` is
+always 4 bpw. Unit tests cover integer rates 1–8 and malformed/fractional shapes.
+The six `dflash::tests` passed; the rate-specific integration test passed on the
+current 4-bpw shard and reported 767,950,848 mapped bytes and 768,540,672 pinned
+bytes. A deliberately fixed-rate-4 inference failed the 6-bpw unit assertion
+with `left: 4, right: 6`; restoring shape inference made it pass. An initial
+test filter used `--exact` without the module-qualified name and ran zero tests;
+the corrected filter produced the intended failure and pass. One first draft
+of the fractional test incorrectly classified 48 tile words (integer 3 bpw) as
+fractional; corrected fractional tile depths to 24/40/56 and reran successfully.
+
+Candidate loader test first failed before rate assertions: `mapped_trellis_bytes`
+was 0 while the test expected 1,151,926,272. The source Safetensors header is
+16,599 bytes, so the data section begins at byte 16,607; all 36 relative
+trellis starts are 0 mod 4, making every absolute start 3 mod 4. The existing
+`align_packed_view` therefore takes its copy fallback for every packed line.
+The official Safetensors serializer rounds metadata to `next_multiple_of(8)` and
+space-pads the header (see `safetensors/safetensors/src/tensor.rs`, `prepare`),
+so a single whitespace byte makes this header 16,600 bytes and the data section
+start 16,608, aligning every candidate trellis without changing relative tensor
+offsets or payload bytes. F1d now requires this isolated header-only normalization
+and payload hash comparison before model timing. The unnormalized 6-bpw file is
+not yet accepted for throughput tests because it would hide the intended
+mmap/no-copy behavior behind 36 copies.
+
 ## 2026-10-14 — T12/T10 reruns and T16b unprocessed-anchor rejection
 
 After T11, the processed-anchor DFlash stream was rerun at trained B=16 for
