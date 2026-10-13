@@ -724,4 +724,40 @@ Forced-load target: `~/.kaplumba/models/Gxma-repacked`; every run used
 T18 closes only target greedy row equivalence. T0c/V0a (head/oracle controls,
 positions, ring boundaries), V0b (ideal ceiling), stochastic equivalence,
 rollback, and the product round loop remain open. No throughput run was made;
-30 tok/s remains unmet.
+30 tok/s remains unmet. Implementation commit: `6dade81`.
+
+## T1b.1 — sliding append history (2026-10-13)
+
+- Root cause: Gxma sliding cache capacity equalled its 1,024-token attention
+  window. `forward_verify` writes every batch row before attention. With prefix
+  length 1,023, row 1 at absolute position 1,024 overwrote ring slot 0 before
+  row 0 at 1,023 had read key position 0. Restoring the old row after verify
+  would not repair the already-computed logits.
+- `DecoderLayer::new` now allocates sliding capacity
+  `sliding_window + prefill_chunk()` (2,048 at the default chunk), while the
+  attention mask remains the configured 1,024. KV reserve accounting and its
+  independent layout formula include the physical slack. Gxma reserve changes
+  from 3,524,730,880 to 4,363,796,480 bytes, +839,065,600 bytes (0.781 GiB).
+- Added ignored forced-load test
+  `batched_verify_preserves_keys_at_sliding_window_boundary` in
+  `crates/engine/tests/dflash_verify_head.rs`. It pre-fills 1,023 tokens, writes
+  positions 1,023/1,024 together, asserts position 0 remains in the first
+  sliding-layer cache, then compares greedy outputs/logits with sequential
+  decode. Fixed-path maximum logit delta: 0.136719; greedy rows match; cursor
+  reaches 1,025.
+- Coverage sabotage: changed physical capacity back to `sliding_window`. The
+  new test failed at the named assertion: `batched row at position 1024 evicted
+  key position 0 before row 0 attended`. Restored capacity and reran.
+- Tests: `cargo test -p kaplumba-engine --lib` = 138 passed, 2 ignored;
+  checkpoint-backed reserve test = 1 passed; all four ignored
+  `dflash_verify_head` tests, forced-load and serial = 4 passed. Direct timed
+  boundary test: 26.06 s; `/usr/bin/time -l` reported max RSS 10,124,951,552 B,
+  peak footprint 2,745,147,456 B, and 0 swaps. The max-RSS and footprint fields
+  are distinct OS metrics; do not substitute RSS for footprint.
+- The default checkpoint directory used by the reserve test was stale
+  (`Gxma/Gxma` did not exist); changed its fallback to the present
+  `Gxma-repacked` checkpoint. First test invocation with the stale path failed
+  before model load; reran successfully with the actual local checkpoint.
+- Rollback after rejection/error, zero/partial/full acceptance, and stale-row
+  exclusion after cursor retract remain T1b.2. This subtask does not complete
+  transaction semantics. No 30 tok/s throughput measurement was made.

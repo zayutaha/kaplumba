@@ -229,10 +229,16 @@ probe's overlaps are not substitute measurements for this engine.
   strictly before P. Verify `[anchor, n proposals]` at P..P+n; verify row k
   predicts proposal k at P+k+1. After K acceptances retain target rows through
   P+K, retract n−K rows, and emit the correction/bonus at P+K+1 as the next
-  unprocessed anchor. Restore overwritten retained sliding-ring K/V and position
-  tags on rejection/error. Older keys needed by early queries must also remain
-  readable during the batched verify itself; restoring them afterward cannot
-  repair logits already computed from an incomplete window.
+  unprocessed anchor. Sliding caches must keep enough physical history for the
+  active `prefill_chunk()` while its rows attend (default 1,024 rows); physical
+  capacity is `sliding_window + prefill_chunk()`, while attention still applies
+  the configured window. Later rows in the same chunk may not overwrite keys
+  needed by the earliest query. Mask rejected future rows by
+  absolute position and make cursor rollback preserve accepted state. Test
+  zero/partial/full acceptance before, at, and after ring wrap, repeated
+  rejection, error rollback, and retained K/V/positions against sequential
+  decode. Restoring overwritten rows after verification cannot repair logits
+  already computed from an incomplete window.
   Adapt the existing processed-anchor API explicitly;
   mixing the two contracts is forbidden.
 * **C2 — tap ownership.** Copy accepted verify taps before a subsequent forward

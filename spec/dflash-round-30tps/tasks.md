@@ -39,7 +39,7 @@ branches selected from those results, not mandatory simultaneous implementations
 ## First gate: correct verifier and optimistic ceiling
 
 - [ ] **V0a — sequential versus batched target verification.**
-  Files: `crates/engine/tests/dflash_equivalence.rs` and `model.rs` only if a
+  Files: `crates/engine/tests/dflash_verify_head.rs` and `model.rs` only if a
   diagnostic interface is required. Compare identical prefixes, token IDs and
   positions at M=2/4/8/16. Reset/isolate state for each arm. Test per-row greedy
   identity, justified logit tolerance, cursor accounting and ring boundaries;
@@ -96,14 +96,24 @@ branches selected from those results, not mandatory simultaneous implementations
   Test independent probability fixtures, inclusive nucleus/ties, top-k boundaries,
   bad logits/uniforms and residual support; sabotage truncation/temperature.
 - [ ] **T1b — transaction and ring rollback.**
-  Files: `crates/engine/src/gpu_cache.rs`, `model.rs`, `dflash.rs`, and cache/round
-  tests as required by the proven design. Audit speculative writes, live-position
-  masks and cursor rollback; restore any overwritten retained data.
-  Preserve each query's required old ring rows during batched verification,
-  including full acceptance; post-verification restoration alone is insufficient.
-  Test: zero/partial/full acceptance before/at/after ring wrap, repeated rejection,
-  error rollback, and equality of retained K/V/positions with sequential decode.
-  Sabotage restoration and position accounting independently.
+  Files: `crates/engine/src/model.rs`, `gpu_cache.rs`, `dflash.rs`, and
+  cache/round tests.
+- [ ] **T1b.1 — preserve the attention window during chunk writes.**
+  Sliding physical capacity is `window + prefill_chunk()`; attention still masks
+  to the configured window. This preserves keys needed by the earliest query
+  during any bounded chunk append, including verify. Gxma's default reserve
+  increases by 839,065,600 bytes (0.78 GiB), from 3,524,730,880 to
+  4,363,796,480 bytes. Measure the actual process footprint with
+  `/usr/bin/time -l`. Test the 1024 boundary against sequential decode and
+  assert key position 0 remains present after the batched write. Sabotage the
+  physical capacity and confirm that named assertion fails.
+  Completed in `COMMIT_HASH_PENDING`.
+- [ ] **T1b.2 — transactional rollback after rejection or error.**
+  Rejected future rows must be excluded by absolute positions after cursor
+  rollback; verify stale rows cannot leak into later outputs. Test zero/partial/
+  full acceptance before/at/after ring wrap, repeated rejection, error rollback,
+  and equality of retained K/V/positions with sequential decode. Sabotage position
+  accounting and restoration independently.
 - [ ] **T3 — context and taps.**
   Files: `crates/engine/src/dflash.rs`, `generate.rs`, and round/context tests.
   Save old-anchor and accepted verify taps before scratch reuse; append each

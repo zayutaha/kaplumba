@@ -238,8 +238,14 @@ fn batched_and_sequential_layer_states_match() {
     eprintln!(
         "batched/sequential M=2 max hidden={max_hidden_diff} (L{max_hidden_layer}), K={max_k_diff} (L{max_k_layer}), V={max_v_diff} (L{max_v_layer})"
     );
-    assert!(max_k_diff < 0.01, "layer {max_k_layer} K diverges: {max_k_diff}");
-    assert!(max_v_diff < 0.1, "layer {max_v_layer} V diverges: {max_v_diff}");
+    assert!(
+        max_k_diff < 0.01,
+        "layer {max_k_layer} K diverges: {max_k_diff}"
+    );
+    assert!(
+        max_v_diff < 0.1,
+        "layer {max_v_layer} V diverges: {max_v_diff}"
+    );
     if let Some((layer, max_diff)) = hidden_diffs
         .iter()
         .copied()
@@ -291,5 +297,77 @@ fn batched_verify_head_carries_signal_on_every_row() {
         differing > compared / 100,
         "adjacent verify rows are nearly identical ({differing}/{compared}); the \
          read-back stride is probably wrong"
+    );
+}
+
+#[test]
+#[ignore = "requires KAPLUMBA_TEST_MODEL; loads the 16 GB target and crosses the sliding-window boundary"]
+fn batched_verify_preserves_keys_at_sliding_window_boundary() {
+    let path = model_path();
+    let mut model = TextModel::load_from_dir(Path::new(&path)).expect("target model");
+    let vocab = model.vocab_size();
+
+    // The first query is at position 1023 and must still see key 0. The second
+    // query writes position 1024, which aliases slot 0 in the old 1024-slot
+    // physical ring. Batched forwards write all rows before attention, so that
+    // write must not evict key 0 before row 0 has consumed it.
+    let prefix: Vec<u32> = (0..1023u32)
+        .map(|index| 1 + (index * 7919 + 17) % 4096)
+        .collect();
+    let prefix_positions: Vec<u32> = (0..prefix.len() as u32).collect();
+    let boundary_tokens = [137u32, 941];
+    let boundary_positions = [1023u32, 1024];
+
+    model.reset_gpu_caches();
+    model
+        .forward_buffer(&prefix, &prefix_positions)
+        .expect("prefill through position 1022");
+    let batched = model
+        .forward_verify(&boundary_tokens, &boundary_positions)
+        .expect("batched boundary verify");
+    assert_eq!(model.gpu_next_position(), 1025);
+    let (_, _, batched_positions, _, _, _) = model
+        .layer_kv_to_host(0)
+        .expect("read first sliding-layer cache");
+    assert!(
+        batched_positions.contains(&0),
+        "batched row at position 1024 evicted key position 0 before row 0 attended"
+    );
+
+    model.reset_gpu_caches();
+    model
+        .forward_buffer(&prefix, &prefix_positions)
+        .expect("sequential control prefill through position 1022");
+    let mut worst = 0.0f32;
+    let mut worst_at = (0usize, 0usize);
+    for row in 0..2 {
+        let sequential = model
+            .forward_buffer(&[boundary_tokens[row]], &[boundary_positions[row]])
+            .expect("sequential boundary row");
+        assert_eq!(model.gpu_next_position(), 1024 + row);
+        assert_eq!(
+            argmax_row(&batched, row, vocab),
+            argmax_row(&sequential, 0, vocab),
+            "greedy token differs at sliding boundary row {row}"
+        );
+        for column in 0..vocab {
+            let left = half::f16::from_bits(batched[row * vocab + column]).to_f32();
+            let right = half::f16::from_bits(sequential[column]).to_f32();
+            let diff = (left - right).abs();
+            if diff > worst {
+                worst = diff;
+                worst_at = (row, column);
+            }
+        }
+    }
+    eprintln!(
+        "sliding boundary M=2: max logit delta {worst:.6} at row {} col {}",
+        worst_at.0, worst_at.1
+    );
+    assert!(
+        worst < 2.0,
+        "batched boundary verify diverges from sequential by {worst} at row {} col {}",
+        worst_at.0,
+        worst_at.1
     );
 }

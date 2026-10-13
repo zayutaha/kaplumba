@@ -56,12 +56,14 @@ the first verify. TTFT ends at first emission; all subsequent work is timed.
    Target verify row k decides candidate k at P+k+1; full acceptance's bonus
    uses verify row n. The anchor is fed exactly once and is not reverified as
    a proposal. No caller-supplied previous-logit row is needed.
-3. Snapshot accepted-prefix taps from verify scratch before any next forward.
-   After K acceptances, retain target cache through P+K and discard n−K rows.
-   Preserve any sliding-ring rows overwritten by speculative append until the
-   transaction commits; audit the attention live-position filters as well.
-   Preservation must cover reads during verification: a batched write must not
-   remove keys still needed by its earliest query. Rollback alone is insufficient.
+3. Sliding caches keep `sliding_window + PREFILL_CHUNK` physical slots. The
+   attention mask remains the configured `sliding_window`; the extra chunk is
+   history slack so a batched append cannot overwrite a key needed by its first
+   query before attention reads it. Maximum append size is the bounded prefill
+   chunk (1024 rows), larger than the verify cap. After K acceptances, retain
+   target cache through P+K and lower the cursor by n−K; future rejected rows
+   are excluded by their absolute position and overwritten only when their
+   slots are reused. Snapshot accepted-prefix taps before any next forward.
 4. Emit accepted prefix and correction/bonus in order, honoring accepted EOS
    and length/context limits. A rejected draft EOS never terminates generation.
    Truncate both committed state and output consistently at limits.
@@ -117,8 +119,8 @@ before asserting practical headroom.
 | `crates/engine/tests/dflash_alpha_probe.rs` | overlap matrix on greedy target continuation; hardcoded speed decision | label overlap as diagnostic; align rows; replace speed threshold with measured round statistics |
 | `crates/kernels/src/linear.rs` | `perm_mode` present; fp16/fp32 buffer GEMM validates offset but binds packed bytes at zero | honor packed offset/length via offset-aware binding; then independently validate layout |
 | `crates/engine/src/dflash.rs` | T1a samples from retained q; temperature 1/top-k policy; existing processed-anchor method | complete sampler policy, unprocessed-anchor API, independent stage diagnosis and verified context ownership |
-| `crates/engine/src/gpu_cache.rs` | `retract` only lowers cursor | establish transactional safety at ring wrap, including data and position restoration |
-| `crates/engine/src/model.rs` | M=2 verify differs from sequential; layer-0 taps already differ; rows head uses sequential GEMVs | isolate first divergent projection/attention/residual; prove target equivalence before optimizing; preserve taps and rollback |
+| `crates/engine/src/gpu_cache.rs` | `retract` only lowers cursor; sliding cache capacity equals window | reserve bounded chunk history in sliding rings; mask future rejected positions and validate cursor rollback |
+| `crates/engine/src/model.rs` | M=2 verify previously differed from sequential; projection-sign and cross-layer faults are repaired | keep attention window semantic unchanged, size physical sliding capacity for safe batched appends, prove boundary behavior |
 | `crates/engine/src/generate.rs` | plain generation only | experimental loop after round correctness |
 | `crates/cli/src/{args,main,chat}.rs` | no drafter selection | explicit flags, loading, errors and metrics; supported chat policy |
 | `crates/engine/tests/dflash_equivalence.rs` and a future verifier timing harness | existing evidence does not establish the full round | sequential-vs-batched control, ideal-proposal ceiling and round equivalence; final filenames chosen during implementation |
