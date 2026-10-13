@@ -534,8 +534,13 @@ branches selected from those results, not mandatory simultaneous implementations
   unchanged and packed offsets map without copies. After T20.2, verify all 36
   lines and exact greedy output on the existing three 200-token prompts, then
   compare repeated same-prompt timings, footprint and swap to the current
-  drafter. No default change from a single run or without exactness and stable
-  measured gain.
+  drafter. Candidate mapped load, block implementation, and all-36-linears host
+  checks now pass under T20.2. A two-repeat B-A-B isolated block comparison was
+  70.41/70.08 ms at 6 bpw vs 69.71 ms at 4 bpw; this is a small slowdown, not
+  end-to-end evidence. The ignored target-vs-DFlash 3×200-token test remains
+  pending; current `gpuq status` reports 9.5 GiB available and 2.58 GiB swap,
+  below the 14 GiB model-run guard. No default change from isolated block timing
+  or without exactness and stable measured gain.
 
 ## Status
 

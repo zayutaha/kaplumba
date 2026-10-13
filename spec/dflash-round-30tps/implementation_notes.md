@@ -389,6 +389,21 @@ scripts/gpuq try -- env KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacke
   Always verify the path and inspect test output for an actual line result; a
   green test summary alone is insufficient here.
 
+F1d progress: `dflash_greedy_stream_matches_target_for_200_tokens_on_three_prompts`
+already checks emitted token IDs against plain greedy decode for all three
+prompts and reports per-arm tok/s/round timing. It is `#[ignore]` and requires
+both models. Candidate-only encoded block timings were compared in a B-A-B
+sequence (6-bpw candidate, current 4-bpw drafter, 6-bpw candidate):
+70.41 ms / 69.71 ms / 70.08 ms. The candidate's median was ~0.8% slower for
+this isolated block; another 4-bpw repeat measured 69.69 ms. This does not rule
+out an end-to-end gain from higher acceptance, but provides no block-speed gain.
+After the last candidate-only checks, `scripts/gpuq status` still reported
+9.5 GiB available and 2,578 MiB swap; target-plus-drafter generation remains
+held below the 14 GiB model-run guard. Once the memory gate clears, run the
+ignored exact-stream test with `KAPLUMBA_TEST_MODEL=$HOME/.kaplumba/models/Gxma-repacked`
+and `KAPLUMBA_DFLASH_DIR=$HOME/.kaplumba/models/Drafter-eepos-exl3-6bpw`, then
+repeat same-prompt B-A-B timing and collect `/usr/bin/time -l` footprint/swap.
+
 ## 2026-10-14 — T20.2/F1d candidate review and loader gap
 
 Found `eepos/gemma-4-31B-it-DFlash-exl3-6.0bpw` while searching for a same-
