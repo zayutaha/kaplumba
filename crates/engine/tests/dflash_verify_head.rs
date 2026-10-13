@@ -14,6 +14,7 @@
 use std::path::Path;
 
 use kaplumba_engine::model::TextModel;
+use kaplumba_engine::tokenizer::GemmaTokenizer;
 
 fn model_path() -> String {
     std::env::var("KAPLUMBA_TEST_MODEL").expect("KAPLUMBA_TEST_MODEL is required")
@@ -31,6 +32,167 @@ fn argmax_row(matrix: &[u16], row: usize, vocab: usize) -> u32 {
         }
     }
     best as u32
+}
+
+fn top_two_gap(row: &[u16]) -> f32 {
+    let mut best = f32::NEG_INFINITY;
+    let mut second = f32::NEG_INFINITY;
+    for bits in row {
+        let value = half::f16::from_bits(*bits).to_f32();
+        if value > best {
+            second = best;
+            best = value;
+        } else if value > second {
+            second = value;
+        }
+    }
+    best - second
+}
+
+#[test]
+#[ignore = "requires KAPLUMBA_TEST_MODEL; loads the target and runs real prompt tokens"]
+fn batched_m3_matches_sequential_at_dflash_prompt_token_77() {
+    let path = model_path();
+    let dir = Path::new(&path);
+    let tokenizer = GemmaTokenizer::from_model_dir(dir).expect("tokenizer");
+    let mut model = TextModel::load_from_dir(dir).expect("target model");
+    let vocab = model.vocab_size();
+    let prompt = "Explain the theory of relativity in simple terms. Special relativity says the speed of light is the same for every observer.";
+    let prompt_tokens = tokenizer.encode_prompt(prompt).expect("encode prompt");
+    let prompt_positions: Vec<u32> = (0..prompt_tokens.len() as u32).collect();
+
+    // Save an exact sequential prefix and the target row after every generated
+    // token. Output token 77 is the known divergence from the forced-first-
+    // proposal experiment (99382 batched, 84750 sequential).
+    model.reset_gpu_caches();
+    let mut logits = model
+        .forward_buffer(&prompt_tokens, &prompt_positions)
+        .expect("prompt prefill");
+    let mut generated = Vec::with_capacity(80);
+    let mut after_token_logits = Vec::with_capacity(80);
+    for index in 0..80usize {
+        let token = argmax_row(&logits, 0, vocab);
+        generated.push(token);
+        logits = model
+            .forward_buffer(&[token], &[(prompt_tokens.len() + index) as u32])
+            .expect("sequential target decode");
+        after_token_logits.push(logits.clone());
+    }
+    assert_eq!(generated[77], 84750, "natural-prefix fixture changed");
+
+    // B=4 DFlash verifies three proposal rows. At this prefix the preceding
+    // target rows are sequentially resident, so this isolates M=3 arithmetic.
+    let start = 74usize;
+    model.reset_gpu_caches();
+    model
+        .forward_buffer(&prompt_tokens, &prompt_positions)
+        .expect("re-prefill prompt");
+    for (index, token) in generated.iter().take(start).enumerate() {
+        model
+            .forward_buffer(&[*token], &[(prompt_tokens.len() + index) as u32])
+            .expect("replay sequential prefix");
+    }
+    let tokens = &generated[start..start + 3];
+    let positions: Vec<u32> = (0..3usize)
+        .map(|index| (prompt_tokens.len() + start + index) as u32)
+        .collect();
+    let batched = model
+        .forward_verify(tokens, &positions)
+        .expect("M=3 target verify");
+    for row in 0..3usize {
+        let expected = &after_token_logits[start + row];
+        let actual = &batched[row * vocab..(row + 1) * vocab];
+        let mut max_delta = 0.0f32;
+        for (actual, expected) in actual.iter().zip(expected) {
+            max_delta = max_delta.max(
+                (half::f16::from_bits(*actual).to_f32() - half::f16::from_bits(*expected).to_f32())
+                    .abs(),
+            );
+        }
+        let batched_token = argmax_row(&batched, row, vocab);
+        let sequential_token = argmax_row(expected, 0, vocab);
+        eprintln!(
+            "M=3 row={row} output_index={} batched={batched_token} sequential={sequential_token} sequential_gap={:.6} max_logit_delta={max_delta:.6}",
+            start + row + 1,
+            top_two_gap(expected)
+        );
+        assert_eq!(
+            batched_token,
+            sequential_token,
+            "M=3 greedy mismatch at output token {} (sequential gap {:.6}, max logit delta {max_delta:.6})",
+            start + row + 1,
+            top_two_gap(expected)
+        );
+    }
+    // The DFlash round retains only the first accepted proposal here and
+    // retracts the two speculative tail rows. The next target correction is
+    // token `start+1`; feeding it must still match sequential decode.
+    model.retract_gpu_caches(2);
+    let correction = generated[start + 1];
+    let continued = model
+        .forward_buffer(&[correction], &[(prompt_tokens.len() + start + 1) as u32])
+        .expect("continue from retracted M=3 cache");
+    let expected = &after_token_logits[start + 1];
+    let actual_token = argmax_row(&continued, 0, vocab);
+    let expected_token = argmax_row(expected, 0, vocab);
+    eprintln!(
+        "M=3 retracted continuation output_index={} actual={actual_token} sequential={expected_token} sequential_gap={:.6}",
+        start + 2,
+        top_two_gap(expected)
+    );
+    assert_eq!(
+        actual_token,
+        expected_token,
+        "M=3 cached continuation mismatch at output token {} (sequential gap {:.6})",
+        start + 2,
+        top_two_gap(expected)
+    );
+
+    // Reproduce a long series of real M=3 rounds with one accepted proposal
+    // each. The accepted proposal is the ground-truth token; two speculative
+    // tail rows are retracted, then the target correction is processed as the
+    // next single-row anchor. This catches small KV differences that compound
+    // across rounds even when each individual batched argmax matches.
+    model.reset_gpu_caches();
+    model
+        .forward_buffer(&prompt_tokens, &prompt_positions)
+        .expect("re-prefill for repeated M=3 rounds");
+    model
+        .forward_buffer(&[generated[0]], &[(prompt_tokens.len()) as u32])
+        .expect("process first target anchor");
+    let mut round_start = 1usize;
+    while round_start + 3 <= 80 {
+        let tokens = &generated[round_start..round_start + 3];
+        let positions: Vec<u32> = (0..3usize)
+            .map(|index| (prompt_tokens.len() + round_start + index) as u32)
+            .collect();
+        model
+            .forward_verify(tokens, &positions)
+            .expect("repeated M=3 verify");
+        model.retract_gpu_caches(2);
+
+        let correction_index = round_start + 1;
+        let continuation = model
+            .forward_buffer(
+                &[generated[correction_index]],
+                &[(prompt_tokens.len() + correction_index) as u32],
+            )
+            .expect("process target correction and next anchor");
+        let actual = argmax_row(&continuation, 0, vocab);
+        let expected = generated[correction_index + 1];
+        let gap = top_two_gap(&after_token_logits[correction_index]);
+        eprintln!(
+            "repeated M=3 start={round_start} output_index={} actual={actual} sequential={expected} gap={gap:.6}",
+            correction_index + 1
+        );
+        assert_eq!(
+            actual,
+            expected,
+            "repeated M=3 cached continuation mismatch at output token {} (gap {gap:.6})",
+            correction_index + 1
+        );
+        round_start += 2;
+    }
 }
 
 #[test]

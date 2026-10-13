@@ -943,13 +943,29 @@ output token 77: DFlash emitted 99382 while the sequential target emitted
 before reaching this affected verifier row; forcing the first token advanced
 the accepted prefix into the drift. Removed the override and its test assertion.
 
-This failure means the batched verifier is not proven greedy-identical for all
-rows it can reach, even though the existing verifier tests preserve argmax on
-their chosen prefixes and the old DFlash stream passed. The current branch has
-no change to generation behavior from this experiment. Next isolate the target
-row at output token 77: preserve the exact prompt/prefix and positions, compare
-all batched `forward_verify` rows with sequential target logits, record the
-argmax gap and max per-logit delta, and check cache/tap contents after the
-accepted prefix. Do not use a longer forced accepted prefix for speed until this
-is resolved. Failed experiment output: `/tmp/dflash-t19h-sabotage.log` and the
-clean divergent run was captured in the active command output.
+The T19i follow-up isolated that path. Recomputed the natural greedy prefix and
+compared the exact B=4 shape (M=3) with sequential decode: rows producing output
+tokens 75, 76 and 77 chose 563, 4512 and 84750 on both paths. At token 77 the
+sequential top-two gap was only 0.015625 and max per-logit delta was 0.046875,
+so this is a numerically sensitive row but not a mismatch from a clean cache.
+After retracting the two M=3 tail rows, continuation also matched. Repeated
+M=3 rounds accepting one ground-truth proposal and retracting two tails matched
+through output token 79.
+
+Then replayed the forced-override experiment's accepted-prefix pattern using
+the ground-truth target proposals. That altered path again flipped at output
+token 77 after start=73 accepted=3: its anchor chose 99382 vs sequential 84750,
+with max logit delta 0.048828 and sequential gap 0.015625. The accepted target
+cache had small accumulated K/V differences: 0.001953 at layer 0, growing to
+0.074219 at layer 39. Padding the same operation to M=4 did not remove it. This
+explains why the experimental override exposed a flip; it does not show a
+failure in the unmodified DFlash stream. The override and the diagnostic test
+that expected drift were removed. The remaining focused test covers natural
+prefix M=3 rows, cache rollback continuation and repeated one-accepted rounds.
+
+Coverage sabotage changed the M=3 positions by +1. The test failed with the
+diagnostic `positions must begin at the current cache position` before logits
+were compared. Restoring exact positions made the focused test pass in 33.98 s.
+The test also logged output-77's close margin. No model change was justified.
+Failed forced-override run: `/tmp/dflash-t19h-sabotage.log`; cache-drift replay
+numbers came from the temporary accepted-pattern diagnostic, which was removed.

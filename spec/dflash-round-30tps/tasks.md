@@ -393,14 +393,20 @@ branches selected from those results, not mandatory simultaneous implementations
   prompt 0, round 7. With the override enabled, exact greedy output failed at
   prompt 0, token 77 (emitted 99382 vs target 84750). Removed the override; do
   not retain it until the verifier discrepancy is fixed.
-- [ ] **T19i — isolate batched-verifier drift at the newly reached prefix.**
-  Files: `crates/engine/tests/dflash_equivalence.rs`, target verify tests,
-  `crates/engine/src/model.rs` only if needed, this spec's notes. Reproduce
-  prompt 0 through the first divergence; save the exact token prefix and compare
-  batched target rows against sequential rows, including top-two gaps, target
-  caches and captured taps. Explain why the batch chose 99382 while sequential
-  chose 84750. Add a test that fails under row/position/cache sabotage. Do not
-  optimize the proposal path until exact output holds through this prefix.
+- [x] **T19i — isolate the output-77 verifier drift from the rejected override.**
+  Files: `crates/engine/tests/dflash_verify_head.rs`, this spec's notes. On the
+  natural sequential prefix, M=3 rows 75–77 match sequential greedy, including
+  the close output-77 row (gap 0.015625; max logit delta 0.046875); retracted
+  continuation and repeated M=3 one-accepted rounds match through output 79.
+  Replaying the accepted-prefix pattern created only by T19h's rejected
+  target-token override reproduces the output-77 flip and exposes accumulated
+  batch-cache rounding drift. A +1 verify-position sabotage fails before
+  comparison with `positions must begin at the current cache position`; the
+  restored test passes. The cache drift explains the experimental failure but
+  does not identify a defect in the unmodified DFlash stream, which remains
+  greedy-exact on its measured prompts. Captured taps were not causal to this
+  investigation; no target-model change was justified. Do not retain T19h's
+  override or the diagnostic assertion that expects the altered path to drift.
 - [x] **T20 — load DFlash packed weights through base mmap + mlock path.**
   Files: `crates/engine/src/dflash.rs`, `crates/engine/tests/dflash_load.rs`,
   this spec's plan/tasks/notes. Replace the DFlash loader's per-tensor file reads

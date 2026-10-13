@@ -194,7 +194,7 @@ verify, plus the caller's 81 ms anchor forward. Do not build a longer chained
 proposal tree: current measurements show its per-token drafter cost dominates
 the saved target work.
 
-### P3 result — known-token proposal exposed batched verifier drift
+### P3 result — known-token proposal shortcut rejected; M=3 drift localized
 
 An experiment replaced DFlash proposal zero with the greedy target argmax
 already present in `previous_logits`. Coverage sabotage correctly failed the
@@ -204,12 +204,18 @@ stream emitted 99382 while sequential target decode emitted 84750. The prior
 stream had rejected before reaching the affected batch row, so its exact-output
 pass did not exercise that row. The override has been removed.
 
-This is a target-verifier correctness blocker, not evidence that the known
-token is wrong. The next task must reproduce the failure and retain batch and
-sequential logits at the first divergent row, including its top-two gap and
-cache/tap positions. Do not add more accepted-prefix shortcuts until the
-batched verifier's numerical behavior is understood and exact greedy output
-holds for the longer prefix.
+The follow-up compared clean M=3 rows 75–77 with sequential decode: all argmaxes
+matched, including output 77 (84750), despite a 0.015625 top-two gap and
+0.046875 maximum logit delta. Retracted continuation and repeated one-accepted
+M=3 rounds also matched through output 79. Replaying only the altered
+accepted-prefix pattern from the override reproduced the flip after start=73,
+accepted=3, with 99382 vs 84750; cache K/V deltas accumulated from 0.001953 at
+layer 0 to 0.074219 at layer 39. A padded M=4 replay had the same behavior.
+Thus the experiment exposed a numerical sensitivity of that changed trajectory,
+not a mismatch in the clean rows or measured unmodified DFlash streams. The
+override and the temporary test expecting the altered-path mismatch are gone.
+No target change is justified by these results. Keep exact-stream checks when
+changing proposal acceptance or batch trajectory.
 
 Measurement validity note: `gpuq status` previously showed 0 MiB swap because
 the parser read the first positional amount (`total`) and assumed it was
