@@ -215,7 +215,7 @@ branches selected from those results, not mandatory simultaneous implementations
   no product sampler changes. The fast fixture proves q changes with temperature
   while target p remains fixed. Sabotage the temperature divisor and observe
   the named assertion fail. Result: no stable cross-prompt temperature winner;
-  see implementation notes. Commit: pending.
+  see implementation notes. Commit: `70f9578`.
 - [ ] **T15 — choose length from complete cost and prefix survival.**
   Files: proposal/generation selection policy and notes. Select measured useful
   lengths; use plain continuation when speculation has no measured gain.
@@ -304,6 +304,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | V0b | done | 3 prefixes × 4 contexts × M=2/4/8/16 × 3 repeats; greedy identity; `00f8c38` |
 | T17 | done | offset binding, fp32 sliced API, multirow 4/6-bpw tests; `fda508d` |
 | T18 | complete | projection-sign routing repaired; cross-layer path disabled by default; greedy M=2/4/8/16 pass on 3 prompts; see implementation notes/commit |
+| T10a | done | six q temperatures × 15 rows × 3 prompts; no stable winner; temperature sabotage fails; `70f9578` |
 | T19 | conditional design, held | GPU stage ownership/wait overhead needs measurement after correctness |
 | T1b.1 | done | 2048-slot sliding ring; boundary greedy identity, max logit delta 0.136719, 13.59 GiB phys_footprint, no swap; sabotage fails; `6e69bf7` |
 | T20.1 | done | exact fp16/fp32 mapped slices; host and full-context tests plus sabotage; `880b7e4` |
