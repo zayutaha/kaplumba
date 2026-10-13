@@ -299,7 +299,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | T1b.1 | done | 2048-slot sliding ring; boundary greedy identity, max logit delta 0.136719, 13.59 GiB phys_footprint, no swap; sabotage fails; `6e69bf7` |
 | T20.1 | done | exact fp16/fp32 mapped slices; host and full-context tests plus sabotage; `880b7e4` |
 | T1c / T15 / T16 | drafted, held | sampling policy, measured length selection, new anchor contract |
-| T8 | done | 3 prompts × 15 depths; row mapping fixture and shift sabotage; overlap is diagnostic only; hash pending |
+| T8 | done | 3 prompts × 15 depths; row mapping fixture and shift sabotage; overlap is diagnostic only; `c2e63c9` |
 | T1b / T3 / T12 | open | correctness work before product wiring |
 | T1 / T2 / T4 | open | experimental product loop absent |
 | T9–T11 / T13 / T14 | open | measurements and performance acceptance outstanding |
