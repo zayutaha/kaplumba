@@ -278,7 +278,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | T17 | done | offset binding, fp32 sliced API, multirow 4/6-bpw tests; `fda508d` |
 | T18 | complete | projection-sign routing repaired; cross-layer path disabled by default; greedy M=2/4/8/16 pass on 3 prompts; see implementation notes/commit |
 | T19 | conditional design, held | GPU stage ownership/wait overhead needs measurement after correctness |
-| T20.1 | done | exact fp16/fp32 mapped slices; host and full-context tests plus sabotage; see implementation notes |
+| T20.1 | done | exact fp16/fp32 mapped slices; host and full-context tests plus sabotage; `880b7e4` |
 | T1c / T15 / T16 | drafted, held | sampling policy, measured length selection, new anchor contract |
 | T1b / T3 / T8 / T12 | open | correctness work before product wiring |
 | T1 / T2 / T4 | open | experimental product loop absent |
