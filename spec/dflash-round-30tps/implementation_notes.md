@@ -1340,3 +1340,48 @@ scripts/gpuq try -- env KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacke
   cargo test --release -p kaplumba-engine --test dflash_verify_ceiling \
   ideal_target_continuations_bound_verify_throughput -- --ignored --exact --nocapture
 ```
+
+## 2026-10-14 — F1d 6-bpw drafter candidate evaluation
+
+Candidate: `eepos/gemma-4-31B-it-DFlash-exl3-6.0bpw`, local test copy at
+`~/.kaplumba/models/Drafter-eepos-exl3-6bpw`; source payload SHA-256
+`aeed2f2160e5cf1e412d3300b5e18aa3c5554366c6b0019424c341e08425001a`. The
+test copy's safetensors header was padded by one JSON whitespace byte to make
+packed payload offsets 4-byte aligned; tensor payload bytes are unchanged.
+T20.2 rate inference and F1d's explicit-path failure check allowed the actual
+candidate to reach the full host/GPU checks.
+
+All 36 EXL3 linears passed host comparisons; maximum absolute GPU/host error
+was 0.002741. The encoded block test passed and measured 70.41 ms vs 93.55 ms
+for the slice path on that isolated operation. The 3×200-token end-to-end
+greedy streams matched the target exactly:
+
+```text
+candidate 6-bpw B16: 3.92 / 3.72 / 4.04 tok/s (median 3.92), accepted 130/124/126
+candidate 6-bpw B4 slice: 6.21 / 5.86 / 6.05 tok/s (median 6.05), accepted 119/115/115
+candidate 6-bpw B4 encoded: 6.49 / 6.09 / 6.31 tok/s (median 6.31), accepted 119/115/115
+candidate B2 p0: 5.27 tok/s, accepted 84; candidate B8 p0: 5.63 tok/s, accepted 131
+same-prompt B4 encoded A/B/A/B: existing 4-bpw 6.23/6.24; candidate 6-bpw 6.50/6.51 tok/s
+plain target decode in the same test process: 12.30–12.34 tok/s
+```
+
+The A/B/A/B comparison indicates a repeatable 4.3% improvement for this one
+prompt, but the candidate is not promoted: it stays far below the 30 tok/s
+goal and other prompts show no evidence that the larger drafter closes the
+gap. B4 encoded is the best measured mode among those tested, at 6.31 tok/s
+median across the three prompts.
+
+Short-prompt process peak `phys_footprint` was 14.44–14.53 GB and process
+swapouts were zero. These are not the required 2k-context memory results. In a
+target-plus-drafter run, the target pinned 11.22 GiB of trellis data; then
+`mlock` of the drafter failed on its first range (130,072,576 bytes for 6-bpw,
+86,720,512 bytes for the existing 4-bpw drafter, both after zero drafter bytes
+were locked). Thus the drafter is not guaranteed resident alongside the target
+under the current global wire budget. This failure is shared by both drafter
+rates and does not justify reducing target pinning or changing system limits.
+
+Reproduction used the release `dflash_golden` ignored tests with
+`--test-threads=1`, `scripts/gpuq try --`, and `/usr/bin/time -l` on the direct
+test binary for process footprint. See task F1d for per-prompt streams and
+candidate status. This candidate experiment is complete; the overall 30 tok/s
+acceptance remains open.
