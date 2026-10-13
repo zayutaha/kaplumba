@@ -360,6 +360,56 @@ scripts/gpuq try -- env KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacke
   ideal_target_continuations_bound_verify_throughput -- --ignored --exact --nocapture
 ```
 
+## 2026-10-14 — T12/T10 reruns and T16b unprocessed-anchor rejection
+
+After T11, the processed-anchor DFlash stream was rerun at trained B=16 for
+three prompts × 200 output tokens. All tokens remained exactly greedy. Rates
+were 3.77, 3.64 and 4.13 tok/s (mean 3.85), versus plain 12.30–12.33 tok/s;
+per-round anchor cost was 115–121 ms, draft+verify 541–542 ms, and context
+append 24 ms. This is unchanged from the prior 3.85–4.34 tok/s result within
+normal run spread. The verifier-head optimization does not materially improve
+the complete DFlash stream. Each run logged an 86,720,512-byte drafter range
+that `mlock` could not pin; it remained evictable.
+
+Shorter processed-anchor blocks were also tested on the same three prompts ×
+200 tokens using `KAPLUMBA_TEST_DFLASH_BLOCK_SIZE`:
+
+```text
+B=4: 5.95, 5.86, 6.01 tok/s; plain 12.30–12.35; accepted 115/85, 116/86, 115/84
+B=8: 5.34, 5.17, 5.77 tok/s; plain 12.32–12.34; accepted 127/77, 123/80, 127/72
+```
+
+All six streams were greedy-exact. B=4 is faster than B=8/B=16 but remains
+slower than plain decode. These were separate runs rather than interleaved
+length A/Bs, so T10/T15 remain open and no default changed.
+
+T16b tried the unprocessed-anchor contract after T11 corrected the 6-bpw head.
+The pure greedy stream failed at the same first divergence for both B=16 and
+B=4: output index 77 emitted 99382, while sequential target emitted 84750. The
+run used no T19h known-target proposal override. Unit fixtures for `[anchor,
+drafts]` row mapping, bonus row, and cache retention passed, but they cannot
+cover the real multi-round cache trajectory. The current unprocessed-anchor
+API and integration test were removed. This is enough to reject the path under
+the exact-greedy gate; the precise source of accumulated drift remains
+unisolated. No throughput from the failed path is reported.
+
+Commands:
+
+```bash
+scripts/gpuq try -- env KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacked" \
+  KAPLUMBA_DFLASH_DIR="$HOME/.kaplumba/models/Drafter" \
+  cargo test --release -p kaplumba-engine --test dflash_equivalence \
+  dflash_greedy_stream_matches_target_for_200_tokens_on_three_prompts \
+  -- --ignored --exact --nocapture
+
+scripts/gpuq try -- env KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacked" \
+  KAPLUMBA_DFLASH_DIR="$HOME/.kaplumba/models/Drafter" \
+  KAPLUMBA_TEST_DFLASH_BLOCK_SIZE=4 \
+  cargo test --release -p kaplumba-engine --test dflash_equivalence \
+  dflash_greedy_stream_matches_target_for_200_tokens_on_three_prompts \
+  -- --ignored --exact --nocapture
+```
+
 Run completed 1/1 in 957.49 s. For M=16 the median over 9 timings (3 prefixes ×
 3 repeats) was 377.699 / 410.785 / 421.480 / 461.548 ms at contexts 32 / 1024 /
 2048 / 8192. At context 8192, M=16 spread was 458.756–462.491 ms. Its perfect-

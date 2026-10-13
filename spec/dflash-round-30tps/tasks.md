@@ -170,6 +170,15 @@ branches selected from those results, not mandatory simultaneous implementations
   contract for general prompts. Reverted the experiment. T16 stays open pending
   an exact row-zero method. Original experiment commit: `7cebcd5`; follow-up:
   `ad37199`; spec correction: `4eef4f4`.
+- [x] **T16b — retry row-zero verification with the corrected head and small blocks; reject.**
+  Added a separate unprocessed-anchor API and tested its row mapping/retraction
+  fixtures. The one-prompt 200-token end-to-end test failed at the same output
+  index 77 for both B=16 and B=4: emitted 99382, sequential target 84750. This
+  path therefore fails greedy identity even without the rejected forced-target
+  proposal override from T19h. Removed the API and its integration harness;
+  T16 remains open. The failure is consistent with accumulated batched-cache
+  drift but does not isolate the first differing cache tensor. No performance
+  result is accepted for this path.
 - [x] **T5 — validate existing permutation propagation.**
   Plumbing landed in `9a4cf60`; this task adds direct setter coverage to
   `dflash_golden`: mode 0 must match the independent host reference at `fc`,
@@ -524,6 +533,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | F1a / F1b | conditional, held | alternative evaluation requires shared verifier evidence and design decisions |
 | F1c | done, candidate rejected | public same-target model uses dense BF16 linears and incompatible config; header-only review, no weights downloaded |
 | T11 | done | all-row greedy identity, offset sabotage, and short-context B-A-B timing; `aaa010c` |
+| T16b | experiment rejected | unprocessed anchor B=4 and B=16 both diverge at output 77 (99382 vs 84750); removed |
 
 Historical 2026-10-13 follow-up (before latest authorization): user had limited
 work to drafting and exllamav3 diagnostics.
