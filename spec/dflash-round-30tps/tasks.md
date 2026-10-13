@@ -360,8 +360,7 @@ branches selected from those results, not mandatory simultaneous implementations
   Before the fix, `sysctl -n vm.swapusage` showed about 3.2 GiB used while
   `gpuq status` incorrectly showed 0 MiB. Parser tests pass for M/G and missing
   fields fail closed. Coverage sabotage read `total` and failed all five swap
-  assertions; the restored parser passed the full script. Commit hash is
-  recorded in the following task-status update.
+  assertions; the restored parser passed the full script. Commit `161b9f2`.
 - [x] **T19g.6 — measure GPU tied-head encoding and reject if slower.**
   Files: `crates/engine/src/dflash.rs`, this spec's plan/tasks/notes.
   One prompt, B=4, exact output: encoded block + encoded head 6.69 tok/s;
