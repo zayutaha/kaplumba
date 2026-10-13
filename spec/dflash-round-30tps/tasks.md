@@ -95,12 +95,14 @@ branches selected from those results, not mandatory simultaneous implementations
   Test: deterministic quantile coverage, anchor-row skip, top_k=0, zero-mass
   entries, invalid uniforms, and argmax sabotage with a named failure.
   Completed in `2f35201`; focused DFlash suite 12/12 passes.
-- [ ] **T1c — complete supported sampler policy.**
+- [x] **T1c — complete supported sampler policy.**
   Files: `dflash.rs`, generation interfaces and sampling tests. Apply the same
   declared temperature/top-k/top-p to p and q; retain q used for the draw.
   Support CLI default (1,64,.95) and greedy, reject unsupported configurations.
   Test independent probability fixtures, inclusive nucleus/ties, top-k boundaries,
   bad logits/uniforms and residual support; sabotage truncation/temperature.
+  Eleven DFlash sampler tests pass. Top-p sabotage failed the named support
+  assertion; restored. Commit: pending.
 - [ ] **T1b — transaction and ring rollback.**
   Files: `crates/engine/src/model.rs`, `gpu_cache.rs`, `dflash.rs`, and
   cache/round tests.

@@ -1049,6 +1049,26 @@ fn sample_draft_tokens(
     top_k: usize,
     sample: &mut impl FnMut() -> f32,
 ) -> Result<(Vec<u32>, Vec<BTreeMap<u32, f32>>), DflashError> {
+    sample_draft_tokens_with_config(
+        logits,
+        vocab,
+        draft_rows,
+        DflashSamplingConfig {
+            temperature: 1.0,
+            top_k,
+            top_p: 1.0,
+        },
+        sample,
+    )
+}
+
+fn sample_draft_tokens_with_config(
+    logits: &[u16],
+    vocab: usize,
+    draft_rows: usize,
+    config: DflashSamplingConfig,
+    sample: &mut impl FnMut() -> f32,
+) -> Result<(Vec<u32>, Vec<BTreeMap<u32, f32>>), DflashError> {
     let needed = draft_rows
         .checked_add(1)
         .and_then(|rows| rows.checked_mul(vocab))
@@ -1064,7 +1084,12 @@ fn sample_draft_tokens(
     let mut proposals = Vec::with_capacity(draft_rows);
     for row in 1..=draft_rows {
         let base = row * vocab;
-        let q = sampler_distribution(&logits[base..base + vocab], vocab, top_k);
+        let q = sampler_distribution_with_config(&logits[base..base + vocab], vocab, config)
+            .map_err(|error| {
+                DflashError::Shape(format!(
+                    "invalid proposal distribution at block row {row}: {error}"
+                ))
+            })?;
         let token = sample_distribution(&q, sample).map_err(|reason| {
             DflashError::Shape(format!(
                 "invalid proposal distribution at block row {row}: {reason}"
@@ -1169,16 +1194,88 @@ fn verify_retract(drafted: usize, accepted: usize) -> usize {
 // 262,144 times per draft, so `acceptance` uses two sorted walks instead of a
 // hash map.
 
-/// `S(logits)`: softmax at temperature 1, truncated to the `k` largest entries,
-/// renormalised.
+/// Sampling policy used for both target p and draft q during exact rejection.
+/// Temperature zero selects greedy verification; sampled mode requires > 0.
+/// Defaults match the CLI's normal sampling policy.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct DflashSamplingConfig {
+    pub temperature: f32,
+    pub top_k: usize,
+    pub top_p: f32,
+}
+
+impl Default for DflashSamplingConfig {
+    fn default() -> Self {
+        Self {
+            temperature: 1.0,
+            top_k: 64,
+            top_p: 0.95,
+        }
+    }
+}
+
+impl DflashSamplingConfig {
+    pub fn validate(self, vocab: usize) -> Result<(), DflashError> {
+        if !self.temperature.is_finite() || self.temperature < 0.0 {
+            return Err(DflashError::Shape(
+                "sampling temperature must be finite and non-negative".to_string(),
+            ));
+        }
+        if self.top_k == 0 || vocab == 0 {
+            return Err(DflashError::Shape(
+                "sampling top_k and vocabulary must be positive".to_string(),
+            ));
+        }
+        if !self.top_p.is_finite() || self.top_p <= 0.0 || self.top_p > 1.0 {
+            return Err(DflashError::Shape(
+                "sampling top_p must be in (0, 1]".to_string(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn sampler_distribution(
+    logits: &[u16],
+    vocab: usize,
+    k: usize,
+) -> Result<BTreeMap<u32, f32>, DflashError> {
+    sampler_distribution_with_config(
+        logits,
+        vocab,
+        DflashSamplingConfig {
+            temperature: 1.0,
+            top_k: k,
+            top_p: 1.0,
+        },
+    )
+}
+
+/// Build the exact normalized support used for both speculative p and q.
 ///
-/// This is the sampler the round must be exact for (`dflash_alpha_probe`'s
-/// `top_k_distribution`, and z-lab's `_sampling_probs`). Passing the *sampler's*
-/// distribution rather than the full softmax is what makes speculative sampling
-/// exact for a truncated sampler: `draft x ~ S(q)`, accept with
-/// `min(1, S_p(x) / S_q(x))`, resample from the normalised residual, and the
-/// emitted marginal is exactly `S(p)`.
-fn sampler_distribution(logits: &[u16], vocab: usize, k: usize) -> BTreeMap<u32, f32> {
+/// Selection order is logit descending with token-id tie breaking, followed by
+/// temperature scaling, inclusive top-p truncation, and renormalization. The
+/// retained proposal map is the same distribution used to draw each draft.
+fn sampler_distribution_with_config(
+    logits: &[u16],
+    vocab: usize,
+    config: DflashSamplingConfig,
+) -> Result<BTreeMap<u32, f32>, DflashError> {
+    config.validate(vocab)?;
+    if logits.len() < vocab
+        || logits[..vocab]
+            .iter()
+            .any(|bits| !half::f16::from_bits(*bits).to_f32().is_finite())
+    {
+        return Err(DflashError::Shape(
+            "sampling logits must contain a finite vocabulary row".to_string(),
+        ));
+    }
+    if config.temperature == 0.0 {
+        return Err(DflashError::Shape(
+            "temperature zero uses greedy verification, not a sampled distribution".to_string(),
+        ));
+    }
     let values: Vec<f32> = logits
         .iter()
         .take(vocab)
@@ -1186,7 +1283,9 @@ fn sampler_distribution(logits: &[u16], vocab: usize, k: usize) -> BTreeMap<u32,
         .collect();
     let max = values.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     if !max.is_finite() {
-        return BTreeMap::new();
+        return Err(DflashError::Shape(
+            "sampling logits contain no finite maximum".to_string(),
+        ));
     }
     let mut order: Vec<u32> = (0..vocab as u32).collect();
     order.sort_by(|a, b| {
@@ -1195,20 +1294,36 @@ fn sampler_distribution(logits: &[u16], vocab: usize, k: usize) -> BTreeMap<u32,
             .unwrap_or(std::cmp::Ordering::Equal)
             .then(a.cmp(b))
     });
-    order.truncate(k);
+    order.truncate(config.top_k.min(vocab));
     let weights: Vec<f32> = order
         .iter()
-        .map(|token| (values[*token as usize] - max).exp())
+        .map(|token| ((values[*token as usize] - max) / config.temperature).exp())
         .collect();
     let total: f32 = weights.iter().sum();
-    if !(total > 0.0) {
-        return BTreeMap::new();
+    if !total.is_finite() || total <= 0.0 {
+        return Err(DflashError::Shape(
+            "sampling logits produced an invalid softmax".to_string(),
+        ));
     }
-    order
+    let mut kept = Vec::with_capacity(order.len());
+    let mut cumulative = 0.0f32;
+    for (token, weight) in order.into_iter().zip(weights) {
+        kept.push((token, weight));
+        cumulative += weight / total;
+        if cumulative >= config.top_p {
+            break;
+        }
+    }
+    let kept_total: f32 = kept.iter().map(|(_, weight)| *weight).sum();
+    if !kept_total.is_finite() || kept_total <= 0.0 {
+        return Err(DflashError::Shape(
+            "top-p truncation produced an empty distribution".to_string(),
+        ));
+    }
+    Ok(kept
         .into_iter()
-        .zip(weights)
-        .map(|(token, weight)| (token, weight / total))
-        .collect()
+        .map(|(token, weight)| (token, weight / kept_total))
+        .collect())
 }
 
 /// Draw one token from a sorted support with `uniform` in `[0, 1)`.
@@ -1267,8 +1382,8 @@ fn sample_residual(
 #[cfg(test)]
 mod sampler_tests {
     use super::{
-        sample_distribution, sample_draft_tokens, sample_residual, sample_sorted,
-        sampler_distribution,
+        DflashSamplingConfig, sample_distribution, sample_draft_tokens, sample_residual,
+        sample_sorted, sampler_distribution, sampler_distribution_with_config,
     };
     use half::f16;
     use std::collections::BTreeMap;
@@ -1286,7 +1401,7 @@ mod sampler_tests {
         // A row whose 5th entry is far below the top 4: top_k = 4 must drop it
         // and renormalise, not just zero it.
         let logits = row(&[10.0, 9.0, 8.0, 7.0, 0.0, 0.0, 0.0, 0.0]);
-        let dist = sampler_distribution(&logits, 8, 4);
+        let dist = sampler_distribution(&logits, 8, 4).unwrap();
         assert_eq!(dist.len(), 4, "top_k truncates the support");
         let total: f32 = dist.values().sum();
         assert!(
@@ -1297,11 +1412,123 @@ mod sampler_tests {
     }
 
     #[test]
-    fn a_degenerate_row_yields_an_empty_distribution() {
+    fn default_policy_matches_cli_and_temperature_zero_is_greedy_mode() {
+        assert_eq!(
+            DflashSamplingConfig::default(),
+            DflashSamplingConfig {
+                temperature: 1.0,
+                top_k: 64,
+                top_p: 0.95,
+            }
+        );
+        let error = sampler_distribution_with_config(
+            &row(&[3.0, 2.0]),
+            2,
+            DflashSamplingConfig {
+                temperature: 0.0,
+                top_k: 2,
+                top_p: 1.0,
+            },
+        )
+        .expect_err("temperature zero must not become a sampled softmax");
+        assert!(error.to_string().contains("uses greedy verification"));
+    }
+
+    #[test]
+    fn temperature_and_inclusive_top_p_produce_the_declared_support() {
+        let logits = row(&[0.0, 0.0, 0.0, -4.0]);
+        let policy = DflashSamplingConfig {
+            temperature: 1.0,
+            top_k: 4,
+            top_p: 0.5,
+        };
+        let distribution =
+            sampler_distribution_with_config(&logits, 4, policy).expect("valid nucleus policy");
+        // The first equal-probability token is below the threshold; the second
+        // crosses it and is included (the sampler's inclusive nucleus rule).
+        assert_eq!(distribution.keys().copied().collect::<Vec<_>>(), vec![0, 1]);
+        let total: f32 = distribution.values().sum();
+        assert!((total - 1.0).abs() < 1e-6);
+        assert!((distribution[&0] - 0.5).abs() < 1e-6);
+        assert!((distribution[&1] - 0.5).abs() < 1e-6);
+
+        let tied_top_k = sampler_distribution_with_config(
+            &row(&[2.0, 2.0, 2.0, 2.0]),
+            4,
+            DflashSamplingConfig {
+                temperature: 1.0,
+                top_k: 2,
+                top_p: 1.0,
+            },
+        )
+        .unwrap();
+        assert_eq!(tied_top_k.keys().copied().collect::<Vec<_>>(), vec![0, 1]);
+
+        let cool = sampler_distribution_with_config(
+            &row(&[0.0, -1.0, -2.0]),
+            3,
+            DflashSamplingConfig {
+                temperature: 0.5,
+                top_k: 3,
+                top_p: 1.0,
+            },
+        )
+        .unwrap();
+        let hot = sampler_distribution_with_config(
+            &row(&[0.0, -1.0, -2.0]),
+            3,
+            DflashSamplingConfig {
+                temperature: 2.0,
+                top_k: 3,
+                top_p: 1.0,
+            },
+        )
+        .unwrap();
+        assert!(cool[&0] > hot[&0]);
+    }
+
+    #[test]
+    fn sampler_policy_rejects_invalid_logits_and_boundaries() {
+        let finite = row(&[1.0, 0.0]);
+        let invalid = [f16::from_f32(f32::NAN).to_bits(), finite[1]];
+        for policy in [
+            DflashSamplingConfig {
+                temperature: f32::NAN,
+                top_k: 1,
+                top_p: 1.0,
+            },
+            DflashSamplingConfig {
+                temperature: 1.0,
+                top_k: 0,
+                top_p: 1.0,
+            },
+            DflashSamplingConfig {
+                temperature: 1.0,
+                top_k: 1,
+                top_p: 0.0,
+            },
+            DflashSamplingConfig {
+                temperature: 1.0,
+                top_k: 1,
+                top_p: 1.01,
+            },
+        ] {
+            assert!(sampler_distribution_with_config(&finite, 2, policy).is_err());
+        }
+        assert!(
+            sampler_distribution_with_config(&invalid, 2, DflashSamplingConfig::default()).is_err()
+        );
+        assert!(
+            sampler_distribution_with_config(&finite[..1], 2, DflashSamplingConfig::default())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn a_degenerate_row_is_rejected_as_invalid_distribution() {
         // All -inf (or NaN) must not panic or produce NaN probabilities.
         let logits = vec![f16::NEG_INFINITY.to_bits(); 8];
-        let dist = sampler_distribution(&logits, 8, 4);
-        assert!(dist.is_empty(), "no finite max means no distribution");
+        assert!(sampler_distribution(&logits, 8, 4).is_err());
     }
 
     /// Guards `sampler_distribution` against passing vacuously: a top_k larger
@@ -1309,7 +1536,7 @@ mod sampler_tests {
     #[test]
     fn a_large_top_k_returns_every_token() {
         let logits = row(&[3.0, 1.0, 0.5, 0.25]);
-        let dist = sampler_distribution(&logits, 4, 64);
+        let dist = sampler_distribution(&logits, 4, 64).unwrap();
         assert_eq!(dist.len(), 4);
     }
 
@@ -1440,7 +1667,7 @@ mod sampler_tests {
             "proposals must follow q≈(.75,.25), got token 1 in {token_one}/{draws}; \
              an argmax proposal path would produce {draws}/{draws}"
         );
-        let expected_q = sampler_distribution(&logits[vocab..2 * vocab], vocab, vocab);
+        let expected_q = sampler_distribution(&logits[vocab..2 * vocab], vocab, vocab).unwrap();
         assert_eq!(proposals[0], expected_q, "retain the exact q used to draw");
         assert_eq!(proposals[draws - 1], expected_q);
     }
@@ -2412,11 +2639,12 @@ impl DflashModel {
         anchor_token: u32,
         previous_logits: &[u16],
         anchor_position: usize,
-        greedy: bool,
-        top_k: usize,
+        sampling: DflashSamplingConfig,
         mut sample: impl FnMut() -> f32,
     ) -> Result<DflashRound, DflashError> {
         let vocab = target.head().out_features;
+        sampling.validate(vocab)?;
+        let greedy = sampling.temperature == 0.0;
         if previous_logits.len() < vocab {
             return Err(DflashError::Shape(format!(
                 "previous_logits holds {} of {vocab}",
@@ -2437,7 +2665,7 @@ impl DflashModel {
             None
         } else {
             let (tokens, distributions) =
-                sample_draft_tokens(&draft.logits, vocab, n, top_k, &mut sample)?;
+                sample_draft_tokens_with_config(&draft.logits, vocab, n, sampling, &mut sample)?;
             draft.tokens = tokens;
             Some(distributions)
         };
@@ -2478,7 +2706,7 @@ impl DflashModel {
                     break;
                 }
             } else {
-                let p = sampler_distribution(target_row, vocab, top_k);
+                let p = sampler_distribution_with_config(target_row, vocab, sampling)?;
                 validate_distribution(&p).map_err(|reason| {
                     DflashError::Shape(format!(
                         "invalid target distribution at draft {k}: {reason}"
@@ -2520,7 +2748,7 @@ impl DflashModel {
             next = if greedy {
                 argmax_row(last_row, vocab, 0)
             } else {
-                let p = sampler_distribution(last_row, vocab, top_k);
+                let p = sampler_distribution_with_config(last_row, vocab, sampling)?;
                 sample_sorted(&p, &mut sample)
             };
         }

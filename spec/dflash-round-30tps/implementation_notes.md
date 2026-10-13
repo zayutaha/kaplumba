@@ -432,3 +432,31 @@ before using this run to make any residency claim.
 `git diff --check` and rustfmt check passed. T10 remains open for actual
 acceptance and complete round cost; temperature tuning alone is not the path to
 30 tok/s.
+
+## 2026-10-13 — T1c exact sampler policy
+
+Added public `DflashSamplingConfig` in `crates/engine/src/dflash.rs` with CLI
+defaults temperature 1.0/top-k 64/top-p 0.95. `draft_and_verify` now takes this
+single policy; temperature zero selects the existing greedy path. In sampled
+mode, the same validated config creates target p and each proposal q. Candidate
+order is descending logit with ascending token-id ties; top-k is applied before
+temperature-scaled softmax, then inclusive top-p truncation and renormalization.
+The exact q map used for every sampled draft remains the one used by acceptance
+and residual correction. Non-finite/missing logits and invalid policy values
+return errors. No caller is wired yet, so CLI integration and full-round behavior
+remain T2/T12 work.
+
+Validation: `cargo test --release -p kaplumba-engine --lib
+dflash::sampler_tests -- --nocapture` — 11 passed. Coverage includes CLI defaults,
+greedy temperature, temperature shaping, inclusive nucleus cutoff, deterministic
+top-k ties, top-k > vocabulary, malformed logits/config, retained q, invalid
+uniforms, and residual sampling. Sabotage changing the top-p stop condition to
+`cumulative >= 1.0` failed the support assertion (`left: [0,1,2,3]`,
+`right: [0,1]`; exit 101); restored and reran all 11 successfully. A broad
+`cargo test --release -p kaplumba-engine sampler_tests` also tried compiling
+every integration target and failed on pre-existing `tests/test_residency_set.rs`
+using absent `ResidencySet::attach_to_queue`; using `--lib` correctly isolates
+the DFlash unit suite and passes.
+
+This step makes the exact sampled mode configurable but does not reduce draft or
+verification cost and therefore does not itself advance throughput.
