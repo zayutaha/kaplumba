@@ -468,14 +468,27 @@ branches selected from those results, not mandatory simultaneous implementations
   length 768973144 does not match 86704128`. Implementation commit recorded in
   the Status table.
 
-- [ ] **T20.2 — infer integer EXL3 rate from DFlash trellis shape.**
-  Files: `crates/engine/src/dflash.rs`, `crates/engine/tests/dflash_load.rs`,
-  notes. Replace the hardcoded 4-bpw/64-word assumption with shape-based integer
+- [x] **T20.2 — infer integer EXL3 rate from DFlash trellis shape.**
+  Files: `crates/engine/src/dflash.rs`,
+  `crates/engine/tests/dflash_load.rs`,
+  `crates/engine/tests/dflash_golden.rs`, notes. Replace the hardcoded
+  4-bpw/64-word assumption in the loader and independent host decoder with shape-based integer
   rate inference for supported EXL3 integer rates; retain exact byte-count,
   codebook and mapping checks. Generalize the real-shard checks for 4/6 bpw and
   add rate-table plus malformed/fractional rejection coverage. Sabotage the
   inferred rate back to 4 bpw and require the 6-bpw fixture/candidate loader to
   fail diagnostically. Keep the local drafter and runtime defaults unchanged.
+  Loader infers integer rates 1–8; six focused unit tests pass and fractional/
+  malformed shapes reject with tensor names. Fixed-4 inference sabotage failed
+  the 6-bpw unit assertion (`left: 4, right: 6`). The aligned candidate device
+  load mapped 1,151,926,272 bytes and mlocked 1,152,516,096. Candidate encoded
+  block passed (normal K/V/hidden relative errors below 0.1%; encoded median
+  70.41 ms vs 93.55 ms slice). Generalized `HostLinear` to infer rate from the
+  trellis shape; its 6-bpw all-36-linears comparison passed (worst absolute
+  difference 0.002741), as did the existing 4-bpw shard (0.003663). Fixed-4
+  host-oracle sabotage failed on candidate `layers.0.self_attn.q_proj` with
+  16,515,072 words found vs 11,010,048 expected. Candidate target-stream and
+  throughput checks remain F1d, not T20.2.
 
 ## Conditional alternatives after the shared verifier gate
 
@@ -551,7 +564,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | T19 | conditional design, held | GPU stage ownership/wait overhead needs measurement after correctness |
 | T1b.1 | done | 2048-slot sliding ring; boundary greedy identity, max logit delta 0.136719, 13.59 GiB phys_footprint, no swap; sabotage fails; `6e69bf7` |
 | T20.1 | done | exact fp16/fp32 mapped slices; host and full-context tests plus sabotage; `880b7e4` |
-| T20.2 | open | loader hardcodes 4 bpw; compatible candidate uses 6 bpw / 96 words per tile |
+| T20.2 | done | 1–8 bpw table/rejections, mapped candidate, encoded block, 4/6-bpw all-linears host comparisons and fixed-4 sabotage; commit recorded in notes |
 | T1c / T15 / T16 | drafted, held | sampling policy, measured length selection, new anchor contract |
 | T8 | done | 3 prompts × 15 depths; row mapping fixture and shift sabotage; overlap is diagnostic only; `c2e63c9` |
 | T1b / T3 / T12 | open | correctness work before product wiring |

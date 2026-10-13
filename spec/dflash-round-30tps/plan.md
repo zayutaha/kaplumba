@@ -141,6 +141,16 @@ byte length (`packed_len * sizeof(u16)`) instead of inferring a slice from the
 end of the shard. The target API and mmap ownership remain unchanged. Validate
 all mapped DFlash linears against independent host decode and run a full-block
 context comparison, which exercises both fp16 and fp32 drafter projections.
+
+### T20.2 follow-up — rate-aware host oracle
+
+The real 6-bpw candidate also reaches `crates/engine/tests/dflash_golden.rs`'s
+independent `HostLinear` decoder. That oracle currently reconstructs every
+trellis using integer 4 bpw, so it rejects a valid 6-bpw packed length before
+comparing GPU and host values. Derive the oracle rate from each trellis's third
+dimension, and retain the independent MCG decode, sign vectors, and all-36-line
+comparison. Run the same test against both the existing 4-bpw shard and the
+normalized candidate; a fixed-4 sabotage must fail the candidate test.
 | `crates/engine/src/generate.rs` | plain generation only | experimental loop after round correctness |
 | `crates/cli/src/{args,main,chat}.rs` | no drafter selection | explicit flags, loading, errors and metrics; supported chat policy |
 | `crates/engine/tests/dflash_equivalence.rs` and a future verifier timing harness | existing evidence does not establish the full round | sequential-vs-batched control, ideal-proposal ceiling and round equivalence; final filenames chosen during implementation |

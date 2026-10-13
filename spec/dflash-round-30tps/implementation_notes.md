@@ -360,6 +360,35 @@ scripts/gpuq try -- env KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacke
   ideal_target_continuations_bound_verify_throughput -- --ignored --exact --nocapture
 ```
 
+## 2026-10-14 — T20.2 candidate validation
+
+* `scripts/gpuq try -- env KAPLUMBA_DFLASH_DIR=... cargo test --release -p
+  kaplumba-engine --test dflash_load
+  dflash_load_has_every_tensor_and_the_right_shapes -- --exact --nocapture`
+  passed against the header-normalized 6-bpw candidate. It reported
+  `mapped=1151926272 bytes, mlocked=1152516096 bytes`; all 36 packed lines used
+  the inferred 6-bpw rate and aligned mmap views.
+* The first invocation of `dflash_gpu_encoded_block_matches_slice_block` was
+  ignored (the test carries `#[ignore]`). Rerunning with `--ignored` passed.
+  Empty/normal/sliding cases had K relative error ≤0.000895, V ≤0.000996,
+  hidden ≤0.000494. Normal block medians: encoded 70.41 ms, slice 93.55 ms.
+* The independent `HostLinear` in `dflash_golden.rs` had its own fixed-4 rate.
+  Candidate test failed before any comparison: `layers.0.self_attn.q_proj:
+  packed trellis has 16515072 words, expected 11010048`. It now derives
+  `BitRate` from the trellis third dimension and validates rank, tile geometry,
+  integer rate and supported range. The all-36-linears GPU-vs-host test passes
+  on candidate (worst absolute error 0.002741) and local 4-bpw checkpoint
+  (0.003663).
+* Deliberately forcing the host oracle back to 4 bpw failed on the candidate at
+  the named q-projection packed-word check (16,515,072 vs 11,010,048); restored
+  shape inference and reran the candidate test successfully. The candidate-only
+  block/linears checks do not load the target model and do not establish stream
+  exactness or end-to-end throughput. F1d still requires those checks.
+* A mistyped `KAPLUMBA_DFLASH_DIR` once caused the host test's existing
+  “checkpoint not present; skipping” path to return success without loading.
+  Always verify the path and inspect test output for an actual line result; a
+  green test summary alone is insufficient here.
+
 ## 2026-10-14 — T20.2/F1d candidate review and loader gap
 
 Found `eepos/gemma-4-31B-it-DFlash-exl3-6.0bpw` while searching for a same-
@@ -427,6 +456,31 @@ offsets or payload bytes. F1d now requires this isolated header-only normalizati
 and payload hash comparison before model timing. The unnormalized 6-bpw file is
 not yet accepted for throughput tests because it would hide the intended
 mmap/no-copy behavior behind 36 copies.
+
+The original file is preserved under
+`~/.kaplumba/models/Drafter-eepos-exl3-6bpw-source`; the test copy is under
+`~/.kaplumba/models/Drafter-eepos-exl3-6bpw`. Added exactly one trailing JSON
+space to the test copy's header and changed the 8-byte length from 16,599 to
+16,600. The original whole-file SHA-256 is the HF value above; the normalized
+file is 1,153,033,072 bytes. Streaming SHA-256 over tensor payload bytes before
+and after matches exactly:
+`aeed2f2160e5cf1e412d3300b5e18aa3c5554366c6b0019424c341e08425001a`. Header
+recheck reports all 36 packed starts 4-byte aligned. Config files are unchanged.
+
+The first candidate loader run was intentionally not repeated after alignment:
+`scripts/gpuq status` reports only 10 GiB available and 2,642 MiB swap, below
+the repo's 14 GiB model-run guard. It also showed the previous candidate loader
+failure due to unaligned source, not rate inference. `dflash_load --no-run`
+compiles with the revised mapped-byte assertion; wait for memory to recover
+before testing the aligned candidate or loading the target.
+
+2026-10-14 continuation: reran `cargo test --release -p kaplumba-engine --lib
+dflash::tests -- --nocapture` and compiled the `dflash_load` integration target
+with `--no-run`; both succeeded. Current `scripts/gpuq status` reports 9.7 GiB
+available and 2,610 MiB swap, so the aligned candidate device-load and
+target-model tests remain held by the 14 GiB guard. No model process holds the
+GPU lock. Do not interpret the successful unit/compile checks as candidate
+loader validation.
 
 ## 2026-10-14 — T12/T10 reruns and T16b unprocessed-anchor rejection
 

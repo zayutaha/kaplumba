@@ -120,6 +120,19 @@ struct HostLinear {
 impl HostLinear {
     fn build(dir: &Path, name: &str, in_features: usize, out_features: usize) -> Self {
         let trellis = f16_words(&stem_bytes(dir, &format!("{name}.trellis")));
+        let shard = read_shard_header(&dir.join("model.safetensors")).expect("header");
+        let trellis_name = format!("{name}.trellis");
+        let shape = &shard
+            .tensors
+            .get(&trellis_name)
+            .unwrap_or_else(|| panic!("missing {trellis_name}"))
+            .shape;
+        assert_eq!(shape.len(), 3, "{trellis_name} rank");
+        assert_eq!(shape[0], in_features / 16, "{trellis_name} input tiles");
+        assert_eq!(shape[1], out_features / 16, "{trellis_name} output tiles");
+        assert_eq!(shape[2] % 16, 0, "{trellis_name} integer MCG rate");
+        let bits = u8::try_from(shape[2] / 16).expect("integer EXL3 bpw");
+        assert!((1..=8).contains(&bits), "{trellis_name} rate {bits}");
         let raw_mcg = stem_bytes(dir, &format!("{name}.mcg"));
         let codebook = i32::from_le_bytes(raw_mcg[..4].try_into().unwrap());
         assert_eq!(
@@ -133,7 +146,7 @@ impl HostLinear {
             &trellis,
             in_features / 16,
             out_features / 16,
-            BitRate::Integer(4),
+            BitRate::Integer(bits),
             Codebook::Mcg,
             &input,
             &output,

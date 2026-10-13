@@ -12,6 +12,7 @@ use std::fs;
 use std::path::PathBuf;
 
 use kaplumba_engine::dflash::{DflashLoadError, DflashWeights};
+use kaplumba_kernels::exl3::Exl3Rate;
 
 fn dir() -> PathBuf {
     std::env::var("KAPLUMBA_DFLASH_DIR")
@@ -229,13 +230,16 @@ fn dflash_load_has_every_tensor_and_the_right_shapes() {
     // R1: one EXL3 linear per trellis stem.
     assert_eq!(weights.lines.len(), expected_stems());
 
-    // fc is the multi-tap projection: 6 x 5376 -> 5376. Its trellis shape is
-    // [2016, 336, 64] (in/16, out/16, codebook), which is the whole point of
-    // the "3-bit target, 4-bit drafter" pairing.
+    // fc is the multi-tap projection: 6 x 5376 -> 5376. Its trellis tile
+    // depth declares the integer EXL3 rate (64 words = 4 bpw, 96 = 6 bpw).
     let fc = weights.line("fc").expect("fc line");
     assert_eq!(fc.in_features, 32_256);
     assert_eq!(fc.out_features, 5_376);
-    assert_eq!(header_shape("fc.trellis"), vec![2_016, 336, 64]);
+    let fc_shape = header_shape("fc.trellis");
+    assert_eq!(&fc_shape[..2], &[2_016, 336]);
+    let fc_bits = u8::try_from(fc_shape[2] / 16).expect("integer EXL3 bpw");
+    assert_eq!(fc_shape[2], 16 * usize::from(fc_bits));
+    assert_eq!(fc.rate, Exl3Rate::Integer(fc_bits));
     let shard = kaplumba_engine::safetensors::read_shard_header(&d.join("model.safetensors"))
         .expect("drafter header");
     let trellis_bytes: u64 = shard
@@ -244,12 +248,44 @@ fn dflash_load_has_every_tensor_and_the_right_shapes() {
         .filter(|(name, _)| name.ends_with(".trellis"))
         .map(|(_, info)| info.byte_len())
         .sum();
+    for (name, info) in shard
+        .tensors
+        .iter()
+        .filter(|(name, _)| name.ends_with(".trellis"))
+    {
+        let shape = &info.shape;
+        assert_eq!(shape.len(), 3, "{name} rank");
+        let bits = u8::try_from(shape[2] / 16).expect("integer EXL3 bpw");
+        assert_eq!(shape[2], 16 * usize::from(bits), "{name} tile depth");
+        let line = weights.line(name.trim_end_matches(".trellis")).expect(name);
+        assert_eq!(line.rate, Exl3Rate::Integer(bits), "{name} rate");
+        assert_eq!(
+            line.packed_len,
+            Some(info.byte_len() as usize / 2),
+            "{name} words"
+        );
+    }
+    let mapped_trellis_bytes: u64 = shard
+        .tensors
+        .iter()
+        .filter(|(name, _)| name.ends_with(".trellis"))
+        .filter_map(|(name, info)| {
+            let (start, _) = shard.absolute_range(name).expect("trellis range");
+            // EXL3's Metal code pointer is u32-aligned.
+            (start % 4 == 0).then_some(info.byte_len())
+        })
+        .sum();
     let resident_mode = std::env::var_os("KAPLUMBA_RESIDENT_WEIGHTS").is_some();
     assert_eq!(
         weights.mapped_trellis_bytes,
-        if resident_mode { 0 } else { trellis_bytes },
-        "default DFlash load must use the mapped path; explicit resident mode must use the arena"
+        if resident_mode {
+            0
+        } else {
+            mapped_trellis_bytes
+        },
+        "mapped-byte accounting must include aligned mmap views only; unaligned views use the checked copy fallback"
     );
+    assert!(mapped_trellis_bytes <= trellis_bytes);
     assert!(
         weights.pinned_bytes() <= shard.file_size,
         "page-rounded mlock accounting must stay within the shard mapping"

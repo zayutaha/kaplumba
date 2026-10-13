@@ -8,15 +8,13 @@
 //! Three things about this checkpoint that are easy to get wrong, all measured
 //! off the file and recorded in `spec/dflash-correctness/implementation_notes.md`:
 //!
-//! 1. **The trellis is `[in/16, out/16, 64]` int16**, i.e. the *same* EXL3
-//!    packing and mcg codebook the target model uses (`mcg_multiplier
-//!    3417055213 == 0xCBAC1FED == MCG_MULTIPLIER`), so `QuantizedLinear` and
-//!    the existing EXL3 gemv/gemm kernels apply unchanged.
-//! 2. **The norm weights are stored WITHOUT Gemma's `+1` offset.** The
-//!    repacked *target* checkpoints have it baked in (their final norm reads
-//!    6.188, 8.0, 5.844...) and `rms_norm_weighted` multiplies by `weight`
-//!    alone, so this loader must add `1.0` itself. Skipping it is a ~2.3x
-//!    error on every residual stream and produces plausible-looking garbage.
+//! 1. **The trellis uses EXL3 MCG packing** (`mcg_multiplier
+//!    3417055213 == 0xCBAC1FED == MCG_MULTIPLIER). Its third dimension records
+//!    the packed words per tile and hence the integer bpw; `QuantizedLinear`
+//!    and the existing EXL3 GEMV/GEMM kernels consume that per-line rate.
+//! 2. **Norm weights are stored without Gemma's `+1` offset.** The drafter is
+//!    Qwen3, so its RMSNorm multiplies by the stored weight alone; the loader
+//!    must not add one.
 //! 3. **The scales are already fp16** (`.suh`/`.svh`), so there is no
 //!    bf16→f16 scale conversion and no packed `.su`/`.sv` path.
 
@@ -215,12 +213,8 @@ impl DflashWeights {
                 .get(name)
                 .map(|t| t.shape.clone())
                 .ok_or_else(|| DflashLoadError::Missing(name.clone()))?;
-            if shape.len() != 3 {
-                return Err(DflashLoadError::Tensor {
-                    name: name.clone(),
-                    message: format!("expected [in/16, out/16, 64], got {:?}", shape),
-                });
-            }
+            let bits = integer_bpw_from_trellis_shape(name, &shape)?;
+            let rate = kaplumba_kernels::exl3::Exl3Rate::Integer(bits);
             let in_tiles = shape[0];
             let out_tiles = shape[1];
             let in_features = in_tiles * 16;
@@ -237,7 +231,7 @@ impl DflashWeights {
                     ),
                 });
             }
-            let expected_words = in_tiles * out_tiles * BitRate::Integer(4).packed_words();
+            let expected_words = in_tiles * out_tiles * BitRate::Integer(bits).packed_words();
             let packed_words = usize::try_from(info.byte_len() / 2).unwrap_or(0);
             if info.dtype != DType::I16 || packed_words != expected_words {
                 return Err(DflashLoadError::Length {
@@ -312,7 +306,7 @@ impl DflashWeights {
             let linear = QuantizedLinear::from_metal_buffer(
                 in_features,
                 out_features,
-                kaplumba_kernels::exl3::Exl3Rate::Integer(4),
+                rate,
                 kaplumba_kernels::exl3::Exl3Codebook::Mcg,
                 buffer,
                 offset,
@@ -445,6 +439,38 @@ fn strip_any(name: &str, suffixes: &[&str]) -> String {
 
 fn len_of(info: &crate::safetensors::TensorInfo) -> usize {
     info.shape.iter().product()
+}
+
+fn integer_bpw_from_trellis_shape(name: &str, shape: &[usize]) -> Result<u8, DflashLoadError> {
+    if shape.len() != 3 || shape[0] == 0 || shape[1] == 0 {
+        return Err(DflashLoadError::Tensor {
+            name: name.to_string(),
+            message: format!(
+                "expected non-empty [in/16, out/16, 16*integer-bpw] trellis, got {shape:?}"
+            ),
+        });
+    }
+    let tile_words = shape[2];
+    if !tile_words.is_multiple_of(16) {
+        return Err(DflashLoadError::Tensor {
+            name: name.to_string(),
+            message: format!("trellis tile has {tile_words} words; MCG supports integer bpw only"),
+        });
+    }
+    let bits = tile_words / 16;
+    let Ok(bits) = u8::try_from(bits) else {
+        return Err(DflashLoadError::Tensor {
+            name: name.to_string(),
+            message: format!("unsupported integer EXL3 rate {bits} bpw"),
+        });
+    };
+    if !(1..=8).contains(&bits) || BitRate::Integer(bits).packed_words() != tile_words {
+        return Err(DflashLoadError::Tensor {
+            name: name.to_string(),
+            message: format!("unsupported integer EXL3 rate {bits} bpw"),
+        });
+    }
+    Ok(bits)
 }
 
 fn expect_f16_values(values: &[u16], name: &str, elements: usize) -> Result<(), DflashLoadError> {
@@ -1735,7 +1761,52 @@ mod sampler_tests {
 }
 #[cfg(test)]
 mod tests {
-    use super::{draft_verify_positions, select_draft_tokens, verify_retract};
+    use super::{
+        DflashLoadError, draft_verify_positions, integer_bpw_from_trellis_shape,
+        select_draft_tokens, verify_retract,
+    };
+    use kaplumba_kernels::exl3::Exl3Rate;
+
+    #[test]
+    fn trellis_tile_shape_selects_supported_integer_rate() {
+        for bits in [4, 6, 1, 2, 3, 5, 7, 8] {
+            assert_eq!(
+                integer_bpw_from_trellis_shape("fc.trellis", &[2016, 336, 16 * bits as usize])
+                    .unwrap(),
+                bits,
+                "{bits}-bpw trellis"
+            );
+            assert_eq!(
+                Exl3Rate::Integer(bits).packed_words(),
+                16 * bits as usize,
+                "inferred rate must describe the kernel tile stride"
+            );
+        }
+    }
+
+    #[test]
+    fn trellis_rate_inference_rejects_fractional_and_malformed_shapes() {
+        for shape in [&[2016, 336, 24][..], &[2016, 336, 40], &[2016, 336, 56]] {
+            let error = integer_bpw_from_trellis_shape("fc.trellis", shape).unwrap_err();
+            assert!(
+                matches!(error, DflashLoadError::Tensor { .. })
+                    && error.to_string().contains("fc.trellis"),
+                "fractional MCG shape {shape:?} must fail with tensor name: {error}"
+            );
+        }
+        for shape in [
+            &[][..],
+            &[8, 8][..],
+            &[0, 8, 64][..],
+            &[8, 8, 0][..],
+            &[8, 8, 144][..],
+        ] {
+            assert!(
+                integer_bpw_from_trellis_shape("bad.trellis", shape).is_err(),
+                "malformed/unsupported shape {shape:?} must fail"
+            );
+        }
+    }
 
     /// The retract count, derived position by position. The verify fed the n
     /// drafts at `P+1..=P+n`; only the accepted prefix of those rows holds the
