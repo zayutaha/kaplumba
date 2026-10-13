@@ -371,3 +371,91 @@ fn batched_verify_preserves_keys_at_sliding_window_boundary() {
         worst_at.1
     );
 }
+
+#[test]
+#[ignore = "requires KAPLUMBA_TEST_MODEL; loads the 16 GB target"]
+fn retracted_verify_rows_do_not_leak_into_the_following_decode() {
+    let path = model_path();
+    let mut model = TextModel::load_from_dir(Path::new(&path)).expect("target model");
+    let vocab = model.vocab_size();
+    let contexts = [
+        ("before-wrap", 40usize),
+        ("at-wrap", 1023),
+        ("after-wrap", 1030),
+    ];
+    let draft = [137u32, 941, 211, 1501];
+
+    for (label, prefix_len) in contexts {
+        let prefix: Vec<u32> = (0..prefix_len as u32)
+            .map(|index| 1 + (index * 7919 + 17) % 4096)
+            .collect();
+        let prefix_positions: Vec<u32> = (0..prefix_len as u32).collect();
+
+        for accepted in [0usize, 2, draft.len()] {
+            model.reset_gpu_caches();
+            model
+                .forward_buffer(&prefix, &prefix_positions)
+                .expect("prefill rollback prefix");
+            let verify_positions: Vec<u32> = (0..draft.len())
+                .map(|row| (prefix_len + row) as u32)
+                .collect();
+            model
+                .forward_verify(&draft, &verify_positions)
+                .expect("verify speculative rows");
+            model.retract_gpu_caches(draft.len() - accepted);
+            assert_eq!(
+                model.gpu_next_position(),
+                prefix_len + accepted,
+                "{label}, accepted={accepted}: cache cursor after retract"
+            );
+
+            let correction = 2048 + accepted as u32;
+            let correction_position = (prefix_len + accepted) as u32;
+            let rolled_back = model
+                .forward_buffer(&[correction], &[correction_position])
+                .expect("feed correction at first rejected position");
+            let continuation = argmax_row(&rolled_back, 0, vocab);
+            let rolled_back_next = model
+                .forward_buffer(&[continuation], &[correction_position + 1])
+                .expect("decode after correction");
+
+            // Independent sequential reference contains only the accepted draft
+            // prefix, followed by the target correction and its next greedy token.
+            model.reset_gpu_caches();
+            model
+                .forward_buffer(&prefix, &prefix_positions)
+                .expect("sequential reference prefill");
+            for row in 0..accepted {
+                model
+                    .forward_buffer(&[draft[row]], &[(prefix_len + row) as u32])
+                    .expect("sequential accepted draft");
+            }
+            let reference = model
+                .forward_buffer(&[correction], &[correction_position])
+                .expect("sequential target correction");
+            assert_eq!(
+                argmax_row(&rolled_back, 0, vocab),
+                argmax_row(&reference, 0, vocab),
+                "{label}, accepted={accepted}: correction greedy token"
+            );
+            let reference_continuation = argmax_row(&reference, 0, vocab);
+            let reference_next = model
+                .forward_buffer(&[reference_continuation], &[correction_position + 1])
+                .expect("sequential continuation");
+            let mut worst = 0.0f32;
+            for column in 0..vocab {
+                let actual = half::f16::from_bits(rolled_back_next[column]).to_f32();
+                let expected = half::f16::from_bits(reference_next[column]).to_f32();
+                worst = worst.max((actual - expected).abs());
+            }
+            assert!(
+                worst < 2.0,
+                "{label}, accepted={accepted}: post-retract logits differ by {worst}"
+            );
+            eprintln!(
+                "rollback {label}, accepted={accepted}/{}: next logits max delta {worst:.6}",
+                draft.len()
+            );
+        }
+    }
+}

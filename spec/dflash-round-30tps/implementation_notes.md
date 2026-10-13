@@ -460,3 +460,34 @@ the DFlash unit suite and passes.
 
 This step makes the exact sampled mode configurable but does not reduce draft or
 verification cost and therefore does not itself advance throughput.
+
+## 2026-10-13 — T1b.2a cache-retract integration probe
+
+Added ignored forced-load test
+`retracted_verify_rows_do_not_leak_into_the_following_decode` to
+`crates/engine/tests/dflash_verify_head.rs`. At context positions 40, 1023 (the
+ring boundary), and 1030 (after wrap), it verifies four rows, retracts for
+accepted prefixes 0/2/4, feeds the correction at the first rejected position,
+and compares that plus one more decode to a reset-cache sequential reference.
+All nine cases passed. Greedy correction IDs matched and the maximum next-row
+logit delta was 0.213806 (tolerance 2.0); the largest delta was at the ring
+boundary with four accepted rows. This establishes no observed stale future-row
+leak for those scenarios. It does not compare every retained K/V/position entry,
+exercise repeated rejection, or inject an error between verify and retract; the
+parent T1b.2 remains open for those checks.
+
+Before the GPU run, `scripts/gpuq status` reported 16 GiB available and no swap.
+The forced-load test ran via `scripts/gpuq try` and passed 1/1 in 154.52 s; no
+`mlock` warning or swap appeared in its log. Exact command:
+
+```bash
+scripts/gpuq try -- env KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacked" \
+  cargo test --release -p kaplumba-engine --test dflash_verify_head \
+  retracted_verify_rows_do_not_leak_into_the_following_decode -- --ignored --exact --nocapture
+```
+
+The existing `verify_retract` unit fixture was sabotaged to retract one too few
+(`drafted - accepted - 1`); it failed at the full-rejection assertion with
+14 versus 15 (exit 101). Restored and verified by the clean forced-load run's
+corrected cache cursor assertions. GPU queue returned to idle with 17 GiB
+available and 0 swap.
