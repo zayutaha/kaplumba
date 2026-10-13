@@ -319,8 +319,8 @@ branches selected from those results, not mandatory simultaneous implementations
   current DFlash attention shader and mask/window semantics; add a buffer-based
   request and encode method. Compare against `dflash_block_attention` for
   bidirectional and sliding modes, empty context, and block/context boundaries.
-  Exact parity and wrong-context-value-binding sabotage passed; commit recorded
-  in implementation notes.
+  Exact parity and wrong-context-value-binding sabotage passed; commit
+  `f1fd6e0`.
 - [ ] **T19g — port DFlash `forward_block` to bounded GPU scratch.**
   Files: `crates/engine/src/dflash.rs`, DFlash correctness tests, kernel buffer
   helpers as needed. Keep residual/projection precision unchanged, reuse scratch
