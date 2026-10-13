@@ -97,11 +97,13 @@ check position/cursor state. Include prompt positions before/at/after ring wrap.
 T1b provides retained-cache equivalence under rejection/error before round use.
 
 V0b uses saved target continuations as ideal proposals. Measure the complete
-verification wall time, with body and head as disjoint components, rather than
-assuming a projection microbenchmark represents a model pass. Start at a fixed
-short context, then report 1k/2k/8k context behavior. Use ≥3 prompts and ≥3
-interleaved runs per shape; record warmup, actual token counts, checkpoints,
-build and dispatch. All model runs use `gpuq status` then `gpuq try`.
+verification wall time rather than assuming a projection microbenchmark
+represents a model pass. Attribute body and head with GPU profiling at a
+representative short context; the profiler inserts a synchronization at each
+layer boundary, so its total wall time is not a throughput measurement. Report
+1k/2k/8k context behavior, ≥3 prompts and ≥3 interleaved runs per shape, actual
+token counts, checkpoint, build and dispatch. All model runs use `gpuq status`
+then `gpuq try`. The 2026-10-13 run is recorded in implementation notes.
 
 Report synthetic bounds separately for both contracts: M/T_verify for an
 unprocessed anchor, (M+1)/T_verify for a processed anchor omitting its additional

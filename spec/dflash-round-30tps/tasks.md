@@ -44,14 +44,16 @@ branches selected from those results, not mandatory simultaneous implementations
   positions at M=2/4/8/16. Reset/isolate state for each arm. Test per-row greedy
   identity, justified logit tolerance, cursor accounting and ring boundaries;
   sabotage row selection and positions and record diagnosable failures.
-- [ ] **V0b — ideal-proposal verification cost.**
-  Files: a Rust verifier timing harness under `crates/engine/tests/` and these
-  notes. Use saved correct target continuations; measure body/head/full wall
-  time at M=2/4/8/16, ≥3 prompts, short/1k/2k/8k context, ≥3 interleaved runs
-  per shape. Test row counts and timing boundaries. Report both anchor-contract
-  synthetic ceilings, medians/spread and remaining complete-cost budget for
-  30 tok/s. These results do not count as product throughput. If all ceilings
-  fail, record the existing verifier bottleneck before selecting a drafter.
+- [x] **V0b — ideal-proposal verification cost.**
+  Files: `crates/engine/tests/dflash_verify_ceiling.rs` and these notes. Saved
+  target-greedy continuations; full `forward_verify` wall time at M=2/4/8/16,
+  three deterministic prefixes, contexts 32/1k/2k/8k, and three interleaved
+  repeats (nine samples per shape). Every proposal row matched the saved next
+  target token. GPU body/head attribution was measured at M=16/short context;
+  profiling serializes dispatch boundaries, so only its GPU-own component
+  split is diagnostic and its profiled wall time is excluded. Both synthetic
+  anchor-contract ceilings, grouped medians/spread, and the 30 tok/s remaining
+  cost budget are in implementation notes. No result here is product throughput.
 
 ## Audit and existing evidence
 
@@ -276,7 +278,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | T6 sweep | prior work recorded | `6622031`; reference/default gate open |
 | T1a | done | code/tests `2f35201`; argmax sabotage failure in implementation notes |
 | V0a | done | 3 prompts × M=1/2/4/8/16 greedy identity; tap/KV and ring boundary parity; row and query-position sabotage both fail; see implementation notes |
-| V0b | open | ideal-proposal ceiling harness and interleaved timings remain |
+| V0b | done | 3 prefixes × 4 contexts × M=2/4/8/16 × 3 repeats; greedy identity; see 2026-10-13 notes |
 | T17 | done | offset binding, fp32 sliced API, multirow 4/6-bpw tests; `fda508d` |
 | T18 | complete | projection-sign routing repaired; cross-layer path disabled by default; greedy M=2/4/8/16 pass on 3 prompts; see implementation notes/commit |
 | T19 | conditional design, held | GPU stage ownership/wait overhead needs measurement after correctness |

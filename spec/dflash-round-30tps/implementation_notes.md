@@ -228,6 +228,52 @@ with worst logit delta `0.4375`. Taps/KV M=2 comparison also passed (hidden
 0.375, K 0.0022583, V 0.048828125). The sabotage coverage and final V0a
 evidence are recorded below.
 
+## 2026-10-13 — V0b ideal-proposal verifier ceiling
+
+Added ignored integration test `crates/engine/tests/dflash_verify_ceiling.rs`.
+It loads the target once, creates deterministic valid token prefixes at 32,
+1024, 2048, and 8192 tokens, saves 91 greedy target continuations, re-prefills,
+then interleaves M=2/4/8/16 verifier calls three times. Each verify row is
+asserted against the saved next greedy token; all 144 calls passed. The focused
+test was compiled in release mode and run through `scripts/gpuq try`:
+
+```bash
+scripts/gpuq try -- env KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacked" \
+  cargo test --release -p kaplumba-engine --test dflash_verify_ceiling \
+  ideal_target_continuations_bound_verify_throughput -- --ignored --exact --nocapture
+```
+
+Run completed 1/1 in 957.49 s. For M=16 the median over 9 timings (3 prefixes ×
+3 repeats) was 377.699 / 410.785 / 421.480 / 461.548 ms at contexts 32 / 1024 /
+2048 / 8192. At context 8192, M=16 spread was 458.756–462.491 ms. Its perfect-
+proposal ceilings are 34.66 tok/s for the unprocessed-anchor contract (16/M
+tokens divided by verify time) and 36.83 tok/s for the processed-anchor
+contract (17 tokens divided by verify time). At 30 tok/s, those leave only
+71.8 ms and 105.1 ms, respectively, for *all* drafting, sampling, context
+updates, and other round overhead. The historical one-block DFlash draft cost
+of 156.71 ms already exceeds either budget. At 2k, M=16 median is 421.480 ms;
+the budgets are 111.9 ms and 145.2 ms, still below that historical draft cost.
+At 1k, the budgets are 122.5 ms and 155.9 ms, also below it. At context 32,
+they are 155.6 ms and 189.0 ms, so only the processed-anchor ideal can cover
+that historical draft cost, before sampling or any other round overhead.
+Therefore the ideal ceiling crosses 30, but current measured DFlash end-to-end
+does not have enough cost budget. This test does not demonstrate product
+throughput or a representative natural-language prompt distribution.
+
+GPU attribution at M=16/context 32 reported 312.627 ms of body kernels and
+65.504 ms of target head GEMM rows (plus 0.115 ms final norm), 378.387 ms total
+GPU-own time. The profiler's synchronized full wall span was 495.425 ms, versus
+377.699 ms unprofiled median; do not use profiled wall time as a speed result.
+It identifies both the 60-layer body and 16-row tied head as substantial cost,
+with the head about 17% of GPU-own verify time. The short-context breakdown is
+not a decomposition of the 8k verify.
+
+The run had two large M=2 timing outliers (273.649 ms at 1k and 600.699 ms at
+2k); medians were used and the raw output retained temporarily at
+`/tmp/kaplumba-v0b-unprofiled.log`. V0b is complete. Remaining work is to repair
+the drafter signal/quality path and implement a measured complete round; target
+30 tok/s remains unmet.
+
 ### V0a completion — row and position sabotage
 
 - `scripts/gpuq try -- env KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacked" cargo test --release -p kaplumba-engine --test dflash_verify_head batched_verify_head_matches_sequential_single_row -- --ignored --exact --nocapture` — passed on three deterministic token prefixes at M=1/2/4/8/16. Every row kept greedy identity; worst absolute logit delta was `0.4375`.
