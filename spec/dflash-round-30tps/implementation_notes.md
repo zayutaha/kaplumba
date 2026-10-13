@@ -556,3 +556,46 @@ The existing `verify_retract` unit fixture was sabotaged to retract one too few
 14 versus 15 (exit 101). Restored and verified by the clean forced-load run's
 corrected cache cursor assertions. GPU queue returned to idle with 17 GiB
 available and 0 swap.
+
+## 2026-10-14 — T19a DFlash round timing split
+
+Added test-only timing buckets to the 3-prompt, 200-token greedy equivalence
+test: processed anchor target forward plus anchor tap read, draft-and-verify,
+verify tap read, and drafter context append. The logged mean per-round times
+were stable across all three prompts:
+
+| Prompt | DFlash total | Plain target | Anchor + taps | Draft + verify | Verify tap read | Context append |
+|---|---:|---:|---:|---:|---:|---:|
+| 0 | 50.747 s (3.94 tok/s) | 16.198 s (12.35 tok/s) | 82.32 ms | 544.52 ms | 0.05 ms | 23.70 ms |
+| 1 | 52.035 s (3.84 tok/s) | 16.187 s (12.36 tok/s) | 81.49 ms | 544.43 ms | 0.05 ms | 24.45 ms |
+| 2 | 46.174 s (4.33 tok/s) | 16.194 s (12.35 tok/s) | 81.52 ms | 544.46 ms | 0.05 ms | 24.30 ms |
+
+The processed-anchor pipeline remained exactly greedy-identical to sequential
+target generation for all 600 output tokens. The largest bucket is
+draft-and-verify at ~544 ms per round; context append is ~24 ms, anchor forward
+plus tap read ~82 ms, and tap read alone negligible. This confirms that
+round-level drafter and target verification work must be redesigned together;
+the timing does not identify their individual split yet. Current throughput
+remains 3.84–4.33 tok/s, far below the 30 tok/s target. This result is not a
+30 tok/s acceptance pass.
+
+Before the run, `scripts/gpuq status` reported 16 GiB available and 0 MiB swap.
+The test passed via `scripts/gpuq try` in 213.31 s. As in the prior baseline,
+one 86,720,512-byte range failed `mlock`; the test ran under that residency
+state, so do not treat the absolute rates as a pinned-memory benchmark. The
+plain and DFlash timings share the same process and residency state. Exact
+command:
+
+```bash
+scripts/gpuq try -- env KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacked" \
+  KAPLUMBA_DFLASH_DIR="$HOME/.kaplumba/models/Drafter" \
+  cargo test --release -p kaplumba-engine --test dflash_equivalence \
+  dflash_greedy_stream_matches_target_for_200_tokens_on_three_prompts \
+  -- --ignored --exact --nocapture
+```
+
+Validation: `cargo test --release -p kaplumba-engine --test
+dflash_equivalence --no-run` compiled the instrumented test; the forced-load
+run above passed 1/1. No product throughput code changed. The next T19 step is
+to split draft computation from target verification inside the round, then
+choose GPU-resident stage work based on those measurements.

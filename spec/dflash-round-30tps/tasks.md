@@ -270,12 +270,13 @@ branches selected from those results, not mandatory simultaneous implementations
   persistent draft KV. Test graph/precision/greedy equivalence and state ownership
   before any A/B performance claim. Use existing kernel bodies; no new family
   is authorized by this performance item.
-- [ ] **T19a — split the current processed-anchor round wall time.**
+- [x] **T19a — split the current processed-anchor round wall time.**
   Files: `dflash_equivalence.rs`, implementation notes. Record anchor target
   forward plus tap read, `draft_and_verify` (draft + target verify), DFlash
   context append, and total generation on the same 3 × 200 greedy prompts.
   Keep instrumentation opt-in/test-only. Compare sums against elapsed wall time;
   this localizes T19 before GPU-resident changes. Test output remains identical.
+  Completed: 3 × 200 greedy tokens exact; commit `PENDING`.
 - [x] **T20 — load DFlash packed weights through base mmap + mlock path.**
   Files: `crates/engine/src/dflash.rs`, `crates/engine/tests/dflash_load.rs`,
   this spec's plan/tasks/notes. Replace the DFlash loader's per-tensor file reads

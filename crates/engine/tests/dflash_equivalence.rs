@@ -112,11 +112,19 @@ fn dflash_greedy_stream_matches_target_for_200_tokens_on_three_prompts() {
         let generation_start = Instant::now();
         let mut rounds = 0usize;
         let mut accepted_total = 0usize;
+        let mut anchor_seconds = 0.0f64;
+        let mut draft_verify_seconds = 0.0f64;
+        let mut verify_tap_seconds = 0.0f64;
+        let mut context_seconds = 0.0f64;
         while output.len() < OUTPUT_TOKENS {
+            let anchor_start = Instant::now();
             let anchor_logits = target
                 .forward_buffer(&[anchor_token], &[anchor_position as u32])
                 .expect("process round anchor");
             let anchor_taps = target.take_taps(1).expect("save anchor taps");
+            anchor_seconds += anchor_start.elapsed().as_secs_f64();
+
+            let round_start = Instant::now();
             let round = drafter
                 .draft_and_verify(
                     &mut target,
@@ -128,9 +136,12 @@ fn dflash_greedy_stream_matches_target_for_200_tokens_on_three_prompts() {
                     || 0.5,
                 )
                 .expect("draft and verify");
+            draft_verify_seconds += round_start.elapsed().as_secs_f64();
+            let tap_start = Instant::now();
             let verify_taps = target
                 .take_taps(round.drafted)
                 .expect("capture verify taps before next target forward");
+            verify_tap_seconds += tap_start.elapsed().as_secs_f64();
 
             let accepted = round.accepted.len();
             let mut context_rows = Vec::with_capacity(1 + accepted);
@@ -141,6 +152,7 @@ fn dflash_greedy_stream_matches_target_for_200_tokens_on_three_prompts() {
             }
             let context_refs: Vec<&[u16]> = context_rows.iter().map(Vec::as_slice).collect();
             let correction_position = anchor_position + 1 + accepted;
+            let context_start = Instant::now();
             drafter
                 .append_context(
                     &context_refs,
@@ -149,6 +161,7 @@ fn dflash_greedy_stream_matches_target_for_200_tokens_on_three_prompts() {
                     &mut drafter_cache,
                 )
                 .expect("append anchor and accepted verify taps once");
+            context_seconds += context_start.elapsed().as_secs_f64();
 
             accepted_total += accepted;
             output.extend(round.accepted);
@@ -167,9 +180,13 @@ fn dflash_greedy_stream_matches_target_for_200_tokens_on_three_prompts() {
             "greedy DFlash output differs for prompt {prompt_index}"
         );
         eprintln!(
-            "prompt {prompt_index}: greedy exact, rounds={rounds}, accepted={accepted_total}, emitted={OUTPUT_TOKENS}, DFlash={elapsed:.3}s ({:.2} tok/s), plain={plain_elapsed:.3}s ({:.2} tok/s)",
+            "prompt {prompt_index}: greedy exact, rounds={rounds}, accepted={accepted_total}, emitted={OUTPUT_TOKENS}, DFlash={elapsed:.3}s ({:.2} tok/s), plain={plain_elapsed:.3}s ({:.2} tok/s), per-round anchor={:.2}ms round={:.2}ms tap-read={:.2}ms context={:.2}ms",
             OUTPUT_TOKENS as f64 / elapsed,
-            OUTPUT_TOKENS as f64 / plain_elapsed
+            OUTPUT_TOKENS as f64 / plain_elapsed,
+            anchor_seconds * 1000.0 / rounds as f64,
+            draft_verify_seconds * 1000.0 / rounds as f64,
+            verify_tap_seconds * 1000.0 / rounds as f64,
+            context_seconds * 1000.0 / rounds as f64,
         );
     }
 }
