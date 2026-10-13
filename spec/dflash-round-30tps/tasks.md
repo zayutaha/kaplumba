@@ -313,7 +313,7 @@ branches selected from those results, not mandatory simultaneous implementations
   focused linear tests. Encode the existing fp32-output pipeline into a caller
   encoder while binding exact packed offset/length; test nonzero offsets, 4/6
   bpw, row counts 1 and 4, slice parity, and invalid sizing. Passed parity and
-  offset-binding sabotage; commit hash recorded in notes.
+  offset-binding sabotage; commit `5a68534`.
 - [ ] **T19f — encode DFlash block attention into a caller encoder.**
   Files: `crates/kernels/src/attention.rs`, focused kernel tests. Preserve the
   current DFlash attention shader and mask/window semantics; add a buffer-based
