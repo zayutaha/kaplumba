@@ -146,7 +146,8 @@ branches selected from those results, not mandatory simultaneous implementations
   same argmax). A +1 retract sabotage failed at the cursor assertion
   (1023 vs 1022); restored test passed. Preflight error left the full layer-0
   snapshot unchanged. Commit recorded in Status. T1b.2 remains open for device
-  errors after dispatch and the broader accepted-prefix/ring matrix.
+  errors after dispatch and the broader accepted-prefix/ring matrix. Commit:
+  `b8e6781`.
 - [ ] **T3 — context and taps.**
   Files: `crates/engine/src/dflash.rs`, `generate.rs`, and round/context tests.
   Save old-anchor and accepted verify taps before scratch reuse; append each
@@ -485,7 +486,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | T10a | done | six q temperatures × 15 rows × 3 prompts; no stable winner; temperature sabotage fails; `70f9578` |
 | T1c | done | Shared temp/top-k/top-p policy for p/q; 11 sampler tests and top-p sabotage; `f95b040` |
 | T1b.2a | done | 9 cache rollback cases across ring boundary; off-by-one sabotage fails; no stale-row decode divergence; `e5a9be8` |
-| T1b.2b | done | six repeated full rejections across position 1024; live layer-0 K/V/positions exact to sequential; preflight failure atomic; retract sabotage fails; see implementation notes |
+| T1b.2b | done | six repeated full rejections across position 1024; live layer-0 K/V/positions exact to sequential; preflight failure atomic; retract sabotage fails; `b8e6781` |
 | T19h / T19i | override rejected / follow-up complete | forced proposal reached a sensitive altered trajectory; natural M=3 rows and repeated rollback match; position sabotage fails; `ad37199` |
 | T12a | done | 3 × 200 greedy tokens match exactly; DFlash 3.85–4.34 tok/s vs plain 12.30; `20be6d7` |
 | T16a | experiment rejected | unprocessed anchor differs from sequential greedy at token 77; reverted; exactness remains open; `7cebcd5` |
