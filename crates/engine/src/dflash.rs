@@ -969,6 +969,71 @@ fn select_draft_tokens(logits: &[u16], vocab: usize, draft_rows: usize) -> Vec<u
         .collect()
 }
 
+/// Sample each masked block row from and retain its exact proposal distribution.
+///
+/// Keeping the distribution used to draw each token prevents verification from
+/// accidentally using a different proposal than the one that generated it.
+fn sample_draft_tokens(
+    logits: &[u16],
+    vocab: usize,
+    draft_rows: usize,
+    top_k: usize,
+    sample: &mut impl FnMut() -> f32,
+) -> Result<(Vec<u32>, Vec<BTreeMap<u32, f32>>), DflashError> {
+    let needed = draft_rows
+        .checked_add(1)
+        .and_then(|rows| rows.checked_mul(vocab))
+        .ok_or_else(|| DflashError::Shape("draft logits shape overflow".to_string()))?;
+    if vocab == 0 || logits.len() < needed {
+        return Err(DflashError::Shape(format!(
+            "sampled drafting needs {needed} logits for {draft_rows} proposals, got {}",
+            logits.len()
+        )));
+    }
+
+    let mut tokens = Vec::with_capacity(draft_rows);
+    let mut proposals = Vec::with_capacity(draft_rows);
+    for row in 1..=draft_rows {
+        let base = row * vocab;
+        let q = sampler_distribution(&logits[base..base + vocab], vocab, top_k);
+        let token = sample_distribution(&q, sample).map_err(|reason| {
+            DflashError::Shape(format!(
+                "invalid proposal distribution at block row {row}: {reason}"
+            ))
+        })?;
+        tokens.push(token);
+        proposals.push(q);
+    }
+    Ok((tokens, proposals))
+}
+
+/// Draw from a finite, non-empty categorical distribution using one uniform.
+fn sample_distribution(
+    distribution: &BTreeMap<u32, f32>,
+    sample: &mut impl FnMut() -> f32,
+) -> Result<u32, &'static str> {
+    validate_distribution(distribution)?;
+    let uniform = sample();
+    if !uniform.is_finite() || !(0.0..1.0).contains(&uniform) {
+        return Err("uniform draw must be finite and in [0, 1)");
+    }
+    Ok(sample_sorted(distribution, &mut || uniform))
+}
+
+fn validate_distribution(distribution: &BTreeMap<u32, f32>) -> Result<(), &'static str> {
+    let mut total = 0.0f32;
+    for probability in distribution.values() {
+        if !probability.is_finite() || *probability < 0.0 {
+            return Err("probabilities must be finite and non-negative");
+        }
+        total += *probability;
+    }
+    if distribution.is_empty() || !total.is_finite() || total <= 0.0 {
+        return Err("distribution has no positive finite mass");
+    }
+    Ok(())
+}
+
 /// The absolute positions a round feeds its drafts to, derived from the one
 /// position everything in a round is anchored on.
 ///
@@ -1061,15 +1126,18 @@ fn sampler_distribution(logits: &[u16], vocab: usize, k: usize) -> BTreeMap<u32,
 fn sample_sorted(support: &BTreeMap<u32, f32>, sample: &mut impl FnMut() -> f32) -> u32 {
     let threshold = sample() * support.values().sum::<f32>();
     let mut cumulative = 0.0f32;
-    let mut last = 0u32;
+    let mut last_positive = 0u32;
     for (token, prob) in support {
+        if *prob <= 0.0 {
+            continue;
+        }
         cumulative += *prob;
-        last = *token;
-        if cumulative >= threshold {
+        last_positive = *token;
+        if cumulative > threshold {
             return *token;
         }
     }
-    last
+    last_positive
 }
 
 /// The rejection step of Leviathan/Chen: resample from the normalised residual
@@ -1109,7 +1177,10 @@ fn sample_residual(
 
 #[cfg(test)]
 mod sampler_tests {
-    use super::{sample_residual, sampler_distribution, sample_sorted};
+    use super::{
+        sample_distribution, sample_draft_tokens, sample_residual, sample_sorted,
+        sampler_distribution,
+    };
     use half::f16;
     use std::collections::BTreeMap;
 
@@ -1245,6 +1316,80 @@ mod sampler_tests {
             counter
         };
         assert_eq!(sample_sorted(&support, &mut next), 7);
+    }
+
+    #[test]
+    fn sampled_drafts_follow_the_retained_q_and_skip_the_anchor_row() {
+        let draws = 10_000usize;
+        let vocab = 2usize;
+        // Row zero deliberately favors token 1. Every proposal row has q close
+        // to (.75, .25); the sampled path must skip row zero and draw from q.
+        let mut logits = vec![0u16; (draws + 1) * vocab];
+        logits[1] = f16::from_f32(10.0).to_bits();
+        let row_one = [0.0f32, 3.0f32.ln()];
+        for row in 1..=draws {
+            for (column, value) in row_one.iter().enumerate() {
+                logits[row * vocab + column] = f16::from_f32(*value).to_bits();
+            }
+        }
+
+        let mut draw_index = 0usize;
+        let mut next = || {
+            let value = (draw_index as f32 + 0.5) / draws as f32;
+            draw_index += 1;
+            value
+        };
+        let (tokens, proposals) =
+            sample_draft_tokens(&logits, vocab, draws, vocab, &mut next).expect("sampled drafts");
+
+        assert_eq!(tokens.len(), draws);
+        assert_eq!(proposals.len(), draws);
+        assert_eq!(draw_index, draws, "one q draw per masked row");
+        let token_one = tokens.iter().filter(|token| **token == 1).count();
+        assert!(
+            (7_400..=7_600).contains(&token_one),
+            "proposals must follow q≈(.75,.25), got token 1 in {token_one}/{draws}; \
+             an argmax proposal path would produce {draws}/{draws}"
+        );
+        let expected_q = sampler_distribution(&logits[vocab..2 * vocab], vocab, vocab);
+        assert_eq!(proposals[0], expected_q, "retain the exact q used to draw");
+        assert_eq!(proposals[draws - 1], expected_q);
+    }
+
+    #[test]
+    fn sampled_drafts_reject_empty_distributions_and_bad_uniforms() {
+        let empty_logits = vec![f16::NEG_INFINITY.to_bits(); 4];
+        let mut next = || 0.5;
+        let error = sample_draft_tokens(&empty_logits, 2, 1, 2, &mut next)
+            .expect_err("empty q must not silently become token zero");
+        assert!(
+            matches!(&error, super::DflashError::Shape(message) if message.contains("block row 1")),
+            "unexpected empty-q error: {error}"
+        );
+        let valid_logits = [0u16, 0u16, 0u16, 0u16];
+        let error = sample_draft_tokens(&valid_logits, 2, 1, 0, &mut next)
+            .expect_err("top_k=0 must not silently become token zero");
+        assert!(
+            matches!(&error, super::DflashError::Shape(message) if message.contains("block row 1")),
+            "unexpected zero-top-k error: {error}"
+        );
+
+        let support = map(&[(0, 0.75), (1, 0.25)]);
+        for uniform in [f32::NAN, f32::INFINITY, -0.01, 1.0] {
+            let mut next = || uniform;
+            assert!(
+                sample_distribution(&support, &mut next).is_err(),
+                "invalid uniform {uniform:?} must be rejected"
+            );
+        }
+
+        let underflowed_support = map(&[(0, 0.0), (1, 1.0)]);
+        let mut zero = || 0.0;
+        assert_eq!(
+            sample_distribution(&underflowed_support, &mut zero),
+            Ok(1),
+            "a zero-mass top-k entry must never be proposed, including at uniform zero"
+        );
     }
 }
 #[cfg(test)]
@@ -2133,11 +2278,22 @@ impl DflashModel {
         }
         let head = target.head();
         let anchor_embedding = target.raw_embedding(&[anchor_token]);
-        let draft = self.draft_block(&anchor_embedding, anchor_position, drafter_cache, head)?;
+        let mut draft =
+            self.draft_block(&anchor_embedding, anchor_position, drafter_cache, head)?;
         let n = draft.tokens.len();
         if n == 0 {
-            return Err(DflashError::Shape("the drafter drafted no tokens".to_string()));
+            return Err(DflashError::Shape(
+                "the drafter drafted no tokens".to_string(),
+            ));
         }
+        let proposal_distributions = if greedy {
+            None
+        } else {
+            let (tokens, distributions) =
+                sample_draft_tokens(&draft.logits, vocab, n, top_k, &mut sample)?;
+            draft.tokens = tokens;
+            Some(distributions)
+        };
 
         // The target's row for each draft position. `L[0]` is the caller's
         // previous row and is NOT re-derived (see the header); `L[k>=1]` comes
@@ -2176,24 +2332,30 @@ impl DflashModel {
                 }
             } else {
                 let p = sampler_distribution(target_row, vocab, top_k);
+                validate_distribution(&p).map_err(|reason| {
+                    DflashError::Shape(format!(
+                        "invalid target distribution at draft {k}: {reason}"
+                    ))
+                })?;
                 // The proposal for draft k is the drafter's own row k+1: row 0
                 // is the anchor and predicts a token the target already
                 // emitted, so it is not a proposal for anything.
-                let q = if k + 1 < draft.logits.len() / vocab {
-                    let base = (k + 1) * vocab;
-                    sampler_distribution(&draft.logits[base..base + vocab], vocab, top_k)
-                } else {
-                    // The last draft has no row of its own in the block. Propose
-                    // from the target's row instead: the accept test is then
-                    // min(1, p/p) = 1 and the round degenerates to plain
-                    // sampling for that one position, which is exact.
-                    p.clone()
-                };
+                let q = &proposal_distributions
+                    .as_ref()
+                    .expect("sampled verification has sampled proposal distributions")[k];
                 let p_candidate = p.get(&candidate).copied().unwrap_or(0.0);
-                let q_candidate = q.get(&candidate).copied().unwrap_or(0.0);
-                let accepted_now = q_candidate <= 0.0
-                    || p_candidate >= q_candidate
-                    || (p_candidate / q_candidate) > sample();
+                let q_candidate = q.get(&candidate).copied().ok_or_else(|| {
+                    DflashError::Shape(format!(
+                        "sampled draft token {candidate} is outside proposal support at row {k}"
+                    ))
+                })?;
+                if q_candidate <= 0.0 || !q_candidate.is_finite() {
+                    return Err(DflashError::Shape(format!(
+                        "sampled draft token {candidate} has invalid proposal mass at row {k}"
+                    )));
+                }
+                let accepted_now =
+                    p_candidate >= q_candidate || sample() < (p_candidate / q_candidate);
                 if accepted_now {
                     accepted.push(candidate);
                 } else {
