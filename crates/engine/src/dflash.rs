@@ -32,7 +32,7 @@ use crate::safetensors::{DType, SafeTensorsIndex, read_shard_header};
 use crate::weights::TextWeights;
 use kaplumba_kernels::attention::{DflashBlockBufferRequest, DflashBlockRequest};
 use kaplumba_kernels::elements::RopeRequest;
-use kaplumba_kernels::linear::LinearBufferRequest;
+use kaplumba_kernels::linear::{LinearBufferRequest, LinearF32EncodeRequest, PrefillEncodeRequest};
 use metal::{Buffer, CommandQueue, Device, MTLResourceOptions};
 
 /// A drafter RMSNorm: `hidden_size` fp16 values, taken verbatim from the
@@ -739,7 +739,7 @@ pub struct DflashModel {
 /// Fixed-size intermediate storage for one DFlash block. Context K/V is input
 /// data and is staged separately; none of these scratch sizes depend on it.
 struct DflashGpuScratch {
-    hidden: [Buffer; 2],
+    hidden: [Buffer; 3],
     normed: Buffer,
     q: [Buffer; 3],
     k: [Buffer; 3],
@@ -1963,11 +1963,33 @@ fn write_f32_buffer(buffer: &Buffer, values: &[f32]) -> Result<(), DflashError> 
         ));
     }
     unsafe {
-        std::ptr::copy_nonoverlapping(
-            values.as_ptr(),
-            buffer.contents() as *mut f32,
-            values.len(),
-        );
+        std::ptr::copy_nonoverlapping(values.as_ptr(), buffer.contents() as *mut f32, values.len());
+    }
+    Ok(())
+}
+
+fn write_u16_buffer(buffer: &Buffer, values: &[u16]) -> Result<(), DflashError> {
+    let bytes = scratch_bytes(values.len(), size_of::<u16>())?;
+    if buffer.length() < bytes || buffer.contents().is_null() {
+        return Err(DflashError::Shape(
+            "DFlash u16 input does not fit its owned buffer".to_string(),
+        ));
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(values.as_ptr(), buffer.contents() as *mut u16, values.len());
+    }
+    Ok(())
+}
+
+fn write_u32_buffer(buffer: &Buffer, values: &[u32]) -> Result<(), DflashError> {
+    let bytes = scratch_bytes(values.len(), size_of::<u32>())?;
+    if buffer.length() < bytes || buffer.contents().is_null() {
+        return Err(DflashError::Shape(
+            "DFlash position input does not fit its owned buffer".to_string(),
+        ));
+    }
+    unsafe {
+        std::ptr::copy_nonoverlapping(values.as_ptr(), buffer.contents() as *mut u32, values.len());
     }
     Ok(())
 }
@@ -2031,6 +2053,7 @@ impl DflashGpuScratch {
             hidden: [
                 new_scratch_buffer(device, hidden, size_of::<f32>())?,
                 new_scratch_buffer(device, hidden, size_of::<f32>())?,
+                new_scratch_buffer(device, hidden, size_of::<f32>())?,
             ],
             normed: new_scratch_buffer(device, hidden, size_of::<u16>())?,
             q: [
@@ -2064,7 +2087,10 @@ impl DflashGpuScratch {
     }
 
     fn bytes(&self) -> u64 {
-        self.hidden.iter().map(|buffer| buffer.length()).sum::<u64>()
+        self.hidden
+            .iter()
+            .map(|buffer| buffer.length())
+            .sum::<u64>()
             + [
                 &self.normed,
                 &self.v,
@@ -2084,8 +2110,16 @@ impl DflashGpuScratch {
             .sum::<u64>()
             + self.q.iter().map(|buffer| buffer.length()).sum::<u64>()
             + self.k.iter().map(|buffer| buffer.length()).sum::<u64>()
-            + self.block_keys.iter().map(|buffer| buffer.length()).sum::<u64>()
-            + self.block_values.iter().map(|buffer| buffer.length()).sum::<u64>()
+            + self
+                .block_keys
+                .iter()
+                .map(|buffer| buffer.length())
+                .sum::<u64>()
+            + self
+                .block_values
+                .iter()
+                .map(|buffer| buffer.length())
+                .sum::<u64>()
     }
 }
 
@@ -2433,6 +2467,92 @@ impl DflashModel {
         Ok(self.elements.residual_add_f32(left, right)?)
     }
 
+    fn encode_linear16(
+        &self,
+        encoder: &mut kaplumba_kernels::encoder::MetalEncoder<'_>,
+        name: &str,
+        input: &Buffer,
+        output: &Buffer,
+    ) -> Result<(), DflashError> {
+        let line = self
+            .weights
+            .line(name)
+            .map_err(|_| DflashError::Missing(name.to_string()))?;
+        let packed = line.metal_buffer.as_ref().ok_or_else(|| {
+            DflashError::Kernels(format!("{name} has no GPU-resident packed buffer"))
+        })?;
+        if line.packed_len.is_none() {
+            return Err(DflashError::Shape(format!("{name} has no packed length")));
+        }
+        let (input_signs, output_signs) = self
+            .gpu_signs
+            .get(name)
+            .ok_or_else(|| DflashError::Missing(format!("cached signs for {name}")))?;
+        self.linear.encode_gemm(
+            encoder,
+            PrefillEncodeRequest {
+                packed,
+                packed_offset: line.metal_offset,
+                perm_mode: line.permutation_mode,
+                input,
+                input_signs,
+                output_signs,
+                transformed: &self.gpu_scratch.linear_transformed,
+                raw: &self.gpu_scratch.linear_raw,
+                output,
+                queries: self.config.block_size,
+                in_features: line.in_features,
+                out_features: line.out_features,
+                rate: line.rate,
+                codebook: line.codebook,
+            },
+        )?;
+        Ok(())
+    }
+
+    fn encode_linear_f32(
+        &self,
+        encoder: &mut kaplumba_kernels::encoder::MetalEncoder<'_>,
+        name: &str,
+        input: &Buffer,
+    ) -> Result<(), DflashError> {
+        let line = self
+            .weights
+            .line(name)
+            .map_err(|_| DflashError::Missing(name.to_string()))?;
+        let packed = line.metal_buffer.as_ref().ok_or_else(|| {
+            DflashError::Kernels(format!("{name} has no GPU-resident packed buffer"))
+        })?;
+        let packed_words = line
+            .packed_len
+            .ok_or_else(|| DflashError::Shape(format!("{name} has no packed length")))?;
+        let (input_signs, output_signs) = self
+            .gpu_signs
+            .get(name)
+            .ok_or_else(|| DflashError::Missing(format!("cached signs for {name}")))?;
+        self.linear.encode_gemm_f32(
+            encoder,
+            LinearF32EncodeRequest {
+                packed,
+                packed_offset: line.metal_offset,
+                packed_bytes: (packed_words * size_of::<u16>()) as u64,
+                perm_mode: line.permutation_mode,
+                input,
+                input_signs,
+                output_signs,
+                transformed: &self.gpu_scratch.linear_transformed,
+                raw: &self.gpu_scratch.linear_raw,
+                output: &self.gpu_scratch.linear_f32_output,
+                queries: self.config.block_size,
+                in_features: line.in_features,
+                out_features: line.out_features,
+                rate: line.rate,
+                codebook: line.codebook,
+            },
+        )?;
+        Ok(())
+    }
+
     /// `rms_norm` reading the f32 residual stream and writing the f16 that the
     /// EXL3 gemm consumes.
     fn rms_norm_f32_in(
@@ -2693,6 +2813,317 @@ impl DflashModel {
         let normed = self.rms_norm_f32_in("norm", &hidden_state, rows, hidden)?;
         Ok(DflashBlock {
             hidden: normed,
+            block_keys,
+            block_values,
+        })
+    }
+
+    /// GPU-resident implementation of one DFlash block. Inputs and fixed
+    /// intermediates stay in shared Metal buffers across all layers; only the
+    /// caller-owned context K/V is staged at the boundary and outputs are read
+    /// back after the single encoder completes.
+    pub fn forward_block_gpu(
+        &self,
+        context: &BlockContext<'_>,
+    ) -> Result<DflashBlock, DflashError> {
+        let config = &self.config;
+        let rows = config.block_size;
+        let hidden = config.hidden_size;
+        let head_dim = config.head_dim;
+        let kv_width = config.kv_heads * head_dim;
+        if context.anchor_embedding.len() != hidden {
+            return Err(DflashError::Shape(format!(
+                "anchor embedding has {} elements, expected {hidden}",
+                context.anchor_embedding.len()
+            )));
+        }
+        if context.ctx_keys.len() != config.num_layers
+            || context.ctx_values.len() != config.num_layers
+            || context.ctx_first.len() != config.num_layers
+        {
+            return Err(DflashError::Shape(format!(
+                "block context needs {} layers of K/V and first positions",
+                config.num_layers
+            )));
+        }
+        if self.mask_embedding.len() != hidden {
+            return Err(DflashError::Missing(
+                "the mask token's embedding row has not been supplied".to_string(),
+            ));
+        }
+
+        let mut positions_by_layer = Vec::with_capacity(config.num_layers);
+        let mut context_buffers = Vec::with_capacity(config.num_layers);
+        for layer in 0..config.num_layers {
+            let keys = &context.ctx_keys[layer];
+            let values = &context.ctx_values[layer];
+            if keys.len() != values.len() || !keys.len().is_multiple_of(kv_width) {
+                return Err(DflashError::Shape(format!(
+                    "layer {layer} context K/V has mismatched lengths or is not a multiple of {kv_width}"
+                )));
+            }
+            let n_ctx = keys.len() / kv_width;
+            if config.layer_is_sliding[layer]
+                && config.sliding_window > 0
+                && n_ctx > config.sliding_window
+            {
+                return Err(DflashError::Shape(format!(
+                    "layer {layer} is sliding but was handed {n_ctx} rows for a window of {}",
+                    config.sliding_window
+                )));
+            }
+            let mut positions = Vec::with_capacity(n_ctx + rows);
+            positions.extend((0..n_ctx).map(|i| (context.ctx_first[layer] + i) as u32));
+            positions.extend((0..rows).map(|i| (context.position + i) as u32));
+            positions_by_layer.push(positions);
+
+            // Metal buffers cannot be zero length; attention ignores the
+            // one-element sentinel when n_ctx is zero.
+            let key_buffer =
+                new_scratch_buffer(&self.gpu_device, keys.len().max(1), size_of::<u16>())?;
+            let value_buffer =
+                new_scratch_buffer(&self.gpu_device, values.len().max(1), size_of::<u16>())?;
+            if !keys.is_empty() {
+                write_u16_buffer(&key_buffer, keys)?;
+                write_u16_buffer(&value_buffer, values)?;
+            }
+            let positions_buffer = new_scratch_buffer(
+                &self.gpu_device,
+                positions_by_layer[layer].len(),
+                size_of::<u32>(),
+            )?;
+            write_u32_buffer(&positions_buffer, &positions_by_layer[layer])?;
+            context_buffers.push((key_buffer, value_buffer, positions_buffer));
+        }
+
+        let mut initial = vec![0.0_f32; rows * hidden];
+        for row in 0..rows {
+            let source = if row == 0 {
+                context.anchor_embedding
+            } else {
+                &self.mask_embedding
+            };
+            for (column, bits) in source.iter().enumerate() {
+                initial[row * hidden + column] = half::f16::from_bits(*bits).to_f32();
+            }
+        }
+        write_f32_buffer(&self.gpu_scratch.hidden[0], &initial)?;
+
+        let mut encoder = kaplumba_kernels::encoder::MetalEncoder::new(&self.gpu_queue)
+            .map_err(|error| DflashError::Kernels(error.to_string()))?;
+        let mut current = 0usize;
+        for layer in 0..config.num_layers {
+            let prefix = format!("layers.{layer}");
+            let n_ctx = context.ctx_keys[layer].len() / kv_width;
+            let input_norm_name = format!("{prefix}.input_layernorm");
+            let input_norm = self
+                .gpu_norms
+                .get(&input_norm_name)
+                .ok_or_else(|| DflashError::Missing(format!("cached norm {input_norm_name}")))?;
+            self.elements.encode_rms_norm_f32_in(
+                &mut encoder,
+                &self.gpu_scratch.hidden[current],
+                input_norm,
+                &self.gpu_scratch.normed,
+                rows,
+                hidden,
+                config.rms_norm_eps,
+            )?;
+
+            let q_prefix = format!("{prefix}.self_attn.q_proj");
+            self.encode_linear16(
+                &mut encoder,
+                &q_prefix,
+                &self.gpu_scratch.normed,
+                &self.gpu_scratch.q[0],
+            )?;
+            let q_norm_name = format!("{prefix}.self_attn.q_norm");
+            let q_norm = self
+                .gpu_norms
+                .get(&q_norm_name)
+                .ok_or_else(|| DflashError::Missing(format!("cached norm {q_norm_name}")))?;
+            self.elements.encode_rms_norm(
+                &mut encoder,
+                &self.gpu_scratch.q[0],
+                q_norm,
+                &self.gpu_scratch.q[1],
+                rows * config.q_heads,
+                head_dim,
+                config.rms_norm_eps,
+            )?;
+            self.elements.encode_rope(
+                &mut encoder,
+                &self.gpu_scratch.q[1],
+                &self.gpu_scratch.q[2],
+                kaplumba_kernels::elements::RopeBufferRequest {
+                    tokens: rows,
+                    heads: config.q_heads,
+                    head_dim,
+                    offset: context.position,
+                    theta: config.rope_theta,
+                    partial_factor: 1.0,
+                    proportional: false,
+                },
+            )?;
+
+            let k_prefix = format!("{prefix}.self_attn.k_proj");
+            self.encode_linear16(
+                &mut encoder,
+                &k_prefix,
+                &self.gpu_scratch.normed,
+                &self.gpu_scratch.k[0],
+            )?;
+            let k_norm_name = format!("{prefix}.self_attn.k_norm");
+            let k_norm = self
+                .gpu_norms
+                .get(&k_norm_name)
+                .ok_or_else(|| DflashError::Missing(format!("cached norm {k_norm_name}")))?;
+            self.elements.encode_rms_norm(
+                &mut encoder,
+                &self.gpu_scratch.k[0],
+                k_norm,
+                &self.gpu_scratch.k[1],
+                rows * config.kv_heads,
+                head_dim,
+                config.rms_norm_eps,
+            )?;
+            self.elements.encode_rope(
+                &mut encoder,
+                &self.gpu_scratch.k[1],
+                &self.gpu_scratch.block_keys[layer],
+                kaplumba_kernels::elements::RopeBufferRequest {
+                    tokens: rows,
+                    heads: config.kv_heads,
+                    head_dim,
+                    offset: context.position,
+                    theta: config.rope_theta,
+                    partial_factor: 1.0,
+                    proportional: false,
+                },
+            )?;
+            let v_prefix = format!("{prefix}.self_attn.v_proj");
+            self.encode_linear16(
+                &mut encoder,
+                &v_prefix,
+                &self.gpu_scratch.normed,
+                &self.gpu_scratch.block_values[layer],
+            )?;
+            let (ctx_keys, ctx_values, key_positions) = &context_buffers[layer];
+            self.attention.encode_dflash_block_attention(
+                &mut encoder,
+                DflashBlockBufferRequest {
+                    queries: &self.gpu_scratch.q[2],
+                    ctx_keys,
+                    ctx_values,
+                    block_keys: &self.gpu_scratch.block_keys[layer],
+                    block_values: &self.gpu_scratch.block_values[layer],
+                    key_positions,
+                    output: &self.gpu_scratch.attended,
+                    rows,
+                    n_ctx,
+                    q_heads: config.q_heads,
+                    kv_heads: config.kv_heads,
+                    head_dim,
+                    scale: 1.0 / (head_dim as f32).sqrt(),
+                    window: if config.layer_is_sliding[layer] {
+                        config.sliding_window
+                    } else {
+                        0
+                    },
+                    bidirectional: !config.layer_is_sliding[layer],
+                },
+            )?;
+
+            let o_prefix = format!("{prefix}.self_attn.o_proj");
+            self.encode_linear_f32(&mut encoder, &o_prefix, &self.gpu_scratch.attended)?;
+            let after_attention = (current + 1) % 3;
+            self.elements.encode_residual_add_f32(
+                &mut encoder,
+                &self.gpu_scratch.hidden[current],
+                &self.gpu_scratch.linear_f32_output,
+                &self.gpu_scratch.hidden[after_attention],
+                rows * hidden,
+            )?;
+
+            let post_norm_name = format!("{prefix}.post_attention_layernorm");
+            let post_norm = self
+                .gpu_norms
+                .get(&post_norm_name)
+                .ok_or_else(|| DflashError::Missing(format!("cached norm {post_norm_name}")))?;
+            self.elements.encode_rms_norm_f32_in(
+                &mut encoder,
+                &self.gpu_scratch.hidden[after_attention],
+                post_norm,
+                &self.gpu_scratch.normed,
+                rows,
+                hidden,
+                config.rms_norm_eps,
+            )?;
+            let gate_prefix = format!("{prefix}.mlp.gate_proj");
+            let up_prefix = format!("{prefix}.mlp.up_proj");
+            self.encode_linear16(
+                &mut encoder,
+                &gate_prefix,
+                &self.gpu_scratch.normed,
+                &self.gpu_scratch.gate,
+            )?;
+            self.encode_linear16(
+                &mut encoder,
+                &up_prefix,
+                &self.gpu_scratch.normed,
+                &self.gpu_scratch.up,
+            )?;
+            self.elements.encode_gated_silu(
+                &mut encoder,
+                &self.gpu_scratch.gate,
+                &self.gpu_scratch.up,
+                &self.gpu_scratch.activated,
+                rows * config.intermediate,
+            )?;
+            let down_prefix = format!("{prefix}.mlp.down_proj");
+            self.encode_linear_f32(&mut encoder, &down_prefix, &self.gpu_scratch.activated)?;
+            let next = (current + 2) % 3;
+            self.elements.encode_residual_add_f32(
+                &mut encoder,
+                &self.gpu_scratch.hidden[after_attention],
+                &self.gpu_scratch.linear_f32_output,
+                &self.gpu_scratch.hidden[next],
+                rows * hidden,
+            )?;
+            current = next;
+        }
+        let final_norm = self
+            .gpu_norms
+            .get("norm")
+            .ok_or_else(|| DflashError::Missing("cached norm norm".to_string()))?;
+        self.elements.encode_rms_norm_f32_in(
+            &mut encoder,
+            &self.gpu_scratch.hidden[current],
+            final_norm,
+            &self.gpu_scratch.final_norm,
+            rows,
+            hidden,
+            config.rms_norm_eps,
+        )?;
+        encoder
+            .commit_and_wait()
+            .map_err(|error| DflashError::Kernels(error.to_string()))?;
+
+        let mut block_keys = Vec::with_capacity(config.num_layers);
+        let mut block_values = Vec::with_capacity(config.num_layers);
+        let kv_elements = rows * kv_width;
+        for layer in 0..config.num_layers {
+            block_keys.push(read_u16_buffer(
+                &self.gpu_scratch.block_keys[layer],
+                kv_elements,
+            )?);
+            block_values.push(read_u16_buffer(
+                &self.gpu_scratch.block_values[layer],
+                kv_elements,
+            )?);
+        }
+        Ok(DflashBlock {
+            hidden: read_u16_buffer(&self.gpu_scratch.final_norm, rows * hidden)?,
             block_keys,
             block_values,
         })

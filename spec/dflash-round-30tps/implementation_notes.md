@@ -764,3 +764,50 @@ buffers. Both are below the 32 MiB / 16 MiB task bounds. The forced-load
 1/1 in 8.22 s. Sabotaging `gpu_scratch_bytes()` to omit hidden buffers failed
 with 4,947,968 vs 5,636,096; restored implementation passed again. No target
 model or decode run was involved in this allocation check.
+
+## 2026-10-14 — T19g.2 encoded DFlash block
+
+Added `DflashModel::forward_block_gpu`. It stages each layer's host context K/V
+and absolute key positions once, widens anchor/mask rows into owned f32 scratch,
+then encodes all five layers and final norm into one `MetalEncoder`. Residual
+streams remain f32; q/k norms, RoPE, values, gated SiLU, attention, and cached
+norm/sign views stay on Metal. Per-layer block K/V is written to fixed-size
+owned scratch; the only block readbacks happen after command completion. The
+original `forward_block` remains unchanged as the slice-path oracle.
+
+Added ignored real-checkpoint test `dflash_gpu_encoded_block_matches_slice_block`
+in `crates/engine/tests/dflash_golden.rs`. It loads only the drafter (not the
+host-dequantized reference matrices) and compares empty context, 20-row normal
+context, and a mixed sliding/non-sliding context whose sliding layers retain
+exactly the configured window. Clean GPUQ run passed 1/1 in 6.75 s. Maximum
+relative errors versus the slice path:
+
+| Context | K | V | final hidden |
+|---|---:|---:|---:|
+| empty | 8.795e-4 | 1.384e-3 | 4.241e-4 |
+| normal | 7.770e-4 | 1.299e-3 | 4.386e-4 |
+| sliding | 7.930e-4 | 9.135e-4 | 5.376e-4 |
+
+The encoded GEMM selects the eligible MMA path while `gemm_chunk_buffer_sliced`
+uses tiled GEMV, so outputs are not bit-identical; the measured difference is
+under 0.14% and the test uses a 0.5% max-relative bound. The next task must
+validate exact target generation through verify/rejection sampling and measure
+acceptance and complete-round speed before adopting this path.
+
+Coverage sabotage bound context K as context V. The test passed the empty case
+(which intentionally has no context) and failed the normal case with V relative
+error 5.844e-3 against the 5e-3 bound. Restored the V binding; reran clean and
+all three cases passed. Focused commands:
+
+```bash
+cargo test -p kaplumba-engine --test dflash_golden dflash_gpu_encoded_block_matches_slice_block --no-run
+scripts/gpuq status
+scripts/gpuq try -- cargo test -p kaplumba-engine --test dflash_golden dflash_gpu_encoded_block_matches_slice_block -- --ignored --nocapture
+```
+
+The third hidden f32 ping-pong buffer raises fixed scratch to 5,980,160 bytes
+(5.70 MiB); cached norm/sign data remains 1,090,048 bytes (1.04 MiB). The
+initial version of the forced test used `Harness::build()`, which also
+dequantized every checkpoint linear into host reference matrices and took
+285 s; switching this test to a drafter-only load reduced its full run to under
+7 s. No target model or decode run was involved.

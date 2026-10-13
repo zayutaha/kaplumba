@@ -381,7 +381,7 @@ fn dflash_gpu_scratch_is_block_sized_and_caches_norm_sign_buffers() {
     let kv = rows * kv_width;
     let inter = rows * intermediate;
     let max_linear = h.max(q).max(kv).max(inter);
-    let expected = 2 * h * 4
+    let expected = 3 * h * 4
         + h * 2
         + 3 * q * 2
         + 3 * kv * 2
@@ -403,6 +403,123 @@ fn dflash_gpu_scratch_is_block_sized_and_caches_norm_sign_buffers() {
     assert!(harness.model.gpu_cached_weight_bytes() > 0);
     assert!(harness.model.gpu_scratch_bytes() < 32 * 1024 * 1024);
     assert!(harness.model.gpu_cached_weight_bytes() < 16 * 1024 * 1024);
+}
+
+#[test]
+#[ignore = "loads the DFlash checkpoint and compares both block implementations"]
+fn dflash_gpu_encoded_block_matches_slice_block() {
+    let dir = dir();
+    if !dir.join("model.safetensors").exists() {
+        eprintln!("drafter checkpoint not present; skipping");
+        return;
+    }
+    let config = DflashConfig::load(&dir).expect("config");
+    let device = metal::Device::system_default().expect("device");
+    let weights = DflashWeights::load(&dir, &device).expect("weights");
+    let mut model = DflashModel::new(weights, config.clone()).expect("model");
+    let hidden = config.hidden_size;
+    let kv_width = config.kv_heads * config.head_dim;
+    let rows = config.block_size;
+    let anchor = pseudo(0x5EED_A11C, hidden, INPUT_SCALE);
+    let mask = pseudo(0x0A5C0FFE, hidden, INPUT_SCALE);
+    model.set_mask_embedding(&mask).expect("mask embedding");
+
+    for (case_name, position, counts) in [
+        ("empty", 24usize, vec![0usize; config.num_layers]),
+        ("normal", 20 + rows, vec![20usize; config.num_layers]),
+        (
+            "sliding",
+            config.sliding_window + rows + 3,
+            config
+                .layer_is_sliding
+                .iter()
+                .map(|sliding| {
+                    if *sliding {
+                        config.sliding_window
+                    } else {
+                        config.sliding_window + 3
+                    }
+                })
+                .collect(),
+        ),
+    ] {
+        let mut ctx_keys = Vec::with_capacity(config.num_layers);
+        let mut ctx_values = Vec::with_capacity(config.num_layers);
+        let mut ctx_first = Vec::with_capacity(config.num_layers);
+        for (layer, count) in counts.iter().copied().enumerate() {
+            ctx_keys.push(pseudo(0xDFA5_0000 + layer as u64, count * kv_width, 0.01));
+            ctx_values.push(pseudo(0xDFA6_0000 + layer as u64, count * kv_width, 0.01));
+            ctx_first.push(position.saturating_sub(count));
+        }
+        let context = kaplumba_engine::dflash::BlockContext {
+            anchor_embedding: &anchor,
+            ctx_keys: &ctx_keys,
+            ctx_values: &ctx_values,
+            ctx_first: &ctx_first,
+            position,
+        };
+        let sliced = model.forward_block(&context).expect("slice block");
+        let encoded = model.forward_block_gpu(&context).expect("encoded block");
+        let max_diff = |left: &[u16], right: &[u16]| -> f32 {
+            assert_eq!(left.len(), right.len());
+            left.iter()
+                .zip(right)
+                .map(|(a, b)| {
+                    (f16::from_bits(*a).to_f32() - f16::from_bits(*b).to_f32()).abs()
+                })
+                .fold(0.0_f32, f32::max)
+        };
+        let max_magnitude = |left: &[u16], right: &[u16]| -> f32 {
+            left.iter()
+                .chain(right)
+                .map(|bits| f16::from_bits(*bits).to_f32().abs())
+                .fold(0.0_f32, f32::max)
+        };
+        let k_diff = encoded
+            .block_keys
+            .iter()
+            .zip(&sliced.block_keys)
+            .map(|(a, b)| max_diff(a, b))
+            .fold(0.0_f32, f32::max);
+        let v_diff = encoded
+            .block_values
+            .iter()
+            .zip(&sliced.block_values)
+            .map(|(a, b)| max_diff(a, b))
+            .fold(0.0_f32, f32::max);
+        let hidden_diff = max_diff(&encoded.hidden, &sliced.hidden);
+        let k_scale = encoded
+            .block_keys
+            .iter()
+            .zip(&sliced.block_keys)
+            .map(|(a, b)| max_magnitude(a, b))
+            .fold(0.0_f32, f32::max);
+        let v_scale = encoded
+            .block_values
+            .iter()
+            .zip(&sliced.block_values)
+            .map(|(a, b)| max_magnitude(a, b))
+            .fold(0.0_f32, f32::max);
+        let hidden_scale = max_magnitude(&encoded.hidden, &sliced.hidden);
+        eprintln!(
+            "{case_name}: K {k_diff:.6}/{k_scale:.6} ({:.3e}), V {v_diff:.6}/{v_scale:.6} ({:.3e}), hidden {hidden_diff:.6}/{hidden_scale:.6} ({:.3e})",
+            k_diff / k_scale.max(f32::MIN_POSITIVE),
+            v_diff / v_scale.max(f32::MIN_POSITIVE),
+            hidden_diff / hidden_scale.max(f32::MIN_POSITIVE)
+        );
+        assert!(
+            k_diff / k_scale.max(f32::MIN_POSITIVE) < 5e-3,
+            "{case_name} K relative mismatch {k_diff}/{k_scale}"
+        );
+        assert!(
+            v_diff / v_scale.max(f32::MIN_POSITIVE) < 5e-3,
+            "{case_name} V relative mismatch {v_diff}/{v_scale}"
+        );
+        assert!(
+            hidden_diff / hidden_scale.max(f32::MIN_POSITIVE) < 5e-3,
+            "{case_name} hidden relative mismatch {hidden_diff}/{hidden_scale}"
+        );
+    }
 }
 
 fn max_of(values: &[f32]) -> f32 {

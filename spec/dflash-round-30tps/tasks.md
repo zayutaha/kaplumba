@@ -329,12 +329,16 @@ branches selected from those results, not mandatory simultaneous implementations
   mmap/mlock ownership unchanged. Real checkpoint allocated 5.37 MiB scratch
   and 1.04 MiB cached signs/norms; sizing sabotage failed as expected; commit
   `84c126c`.
-- [ ] **T19g.2 — encode `forward_block` on one bounded encoder.**
+- [x] **T19g.2 — encode `forward_block` on one bounded encoder.**
   Files: `crates/engine/src/dflash.rs`, DFlash correctness tests. Encode all five
   layers using the T19d–T19f APIs and existing f16 linear/RoPE paths. Preserve
   f32 residuals and exact block masks/positions. Compare hidden/K/V block output
-  against the slice implementation on empty, normal, and sliding contexts;
-  sabotage one buffer binding and require failure.
+  against the slice implementation on empty, normal, and sliding contexts
+  (relative max error <0.5%); sabotage one buffer binding and require failure.
+  All three contexts passed; the context-V binding sabotage failed on normal
+  context (V relative error 0.584% vs the 0.5% bound). Fixed scratch is now
+  5,980,160 bytes (5.70 MiB), including the third f32 residual buffer. Commit
+  hash to be recorded immediately after commit.
 - [ ] **T19g.3 — route draft generation through the encoded block and measure.**
   Files: `crates/engine/src/dflash.rs`, `dflash_equivalence.rs`, notes. Preserve
   the slice path as a test oracle; compare draft logits/argmax and exact target
