@@ -296,6 +296,30 @@ branches selected from those results, not mandatory simultaneous implementations
   Completed: B=4 verified on 3 × 200 tokens; B=2 repeated three times; B=4
   repeated three times; B=8 and B=16 compared. Result in notes; no runtime
   default changed. Implementation commit: `0d9c1a6`.
+- [ ] **T19d — add encoder APIs for existing f32 residual operations.**
+  Files: `crates/kernels/src/elements.rs`, `crates/kernels/tests/` focused
+  element tests. Add encoder-only `rms_norm_f32_in` and `residual_add_f32`
+  wrappers using the current pipelines, with validation matching slice APIs.
+  Compare encoder results to slice outputs at 1 and multiple rows, including
+  large residual values above fp16 range. No new Metal shader.
+- [ ] **T19e — add encoder APIs for gated SiLU and f32 GEMM output.**
+  Files: `crates/kernels/src/elements.rs`, `crates/kernels/src/linear.rs`,
+  focused kernel tests. Encode current gated-SiLU and fp32-output linear
+  pipelines into caller-owned buffers; test nonzero packed offsets, 4/6 bpw,
+  row counts 1 and 4, parity against current slice methods, and invalid sizing.
+- [ ] **T19f — encode DFlash block attention into a caller encoder.**
+  Files: `crates/kernels/src/attention.rs`, focused kernel tests. Preserve the
+  current DFlash attention shader and mask/window semantics; add a buffer-based
+  request and encode method. Compare against `dflash_block_attention` for
+  bidirectional and sliding modes, empty context, and block/context boundaries.
+- [ ] **T19g — port DFlash `forward_block` to bounded GPU scratch.**
+  Files: `crates/engine/src/dflash.rs`, DFlash correctness tests, kernel buffer
+  helpers as needed. Keep residual/projection precision unchanged, reuse scratch
+  sized only by block dimensions, batch encoder work, and read back only values
+  required by draft selection. Compare every block tensor and draft argmax to
+  the slice reference, sabotage one encoded binding and observe failure, then
+  run exact 3 × 200 generation and interleaved A/B. Keep the slice path until
+  parity, speed and footprint gates pass.
 - [x] **T20 — load DFlash packed weights through base mmap + mlock path.**
   Files: `crates/engine/src/dflash.rs`, `crates/engine/tests/dflash_load.rs`,
   this spec's plan/tasks/notes. Replace the DFlash loader's per-tensor file reads

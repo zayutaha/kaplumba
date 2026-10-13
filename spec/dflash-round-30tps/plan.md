@@ -143,6 +143,37 @@ context comparison, which exercises both fp16 and fp32 drafter projections.
 | `crates/cli/src/{args,main,chat}.rs` | no drafter selection | explicit flags, loading, errors and metrics; supported chat policy |
 | `crates/engine/tests/dflash_equivalence.rs` and a future verifier timing harness | existing evidence does not establish the full round | sequential-vs-batched control, ideal-proposal ceiling and round equivalence; final filenames chosen during implementation |
 
+### P1 follow-up — keep DFlash block intermediates on Metal
+
+T19a/T19b measured 170 ms in `draft_block` and 374 ms in target verification;
+proposal selection and acceptance/retraction are negligible in greedy mode.
+The current `DflashModel::forward_block` sends each layer operation through a
+slice API that creates input/output buffers, dispatches, waits, then copies the
+result into a host `Vec`. Its five-layer loop has 17 such operation boundaries
+per layer plus final norm (86 boundaries), before the target head and context
+projection/append. The implementation should reuse the existing Metal shader
+bodies through encoder-facing methods and a caller-owned, block-sized scratch
+set. Keep the f32 residual stream and current f16 projection/norm semantics.
+
+Implementation sequence:
+
+1. Add encoder-facing wrappers for missing existing operations (f32-in RMSNorm,
+   f32 residual add, gated SiLU, f32 output GEMM, and DFlash block attention).
+   Test each wrapper against its existing slice entry point on boundary shapes.
+2. Add explicit fixed-size ping-pong buffers for the block's hidden, projection,
+   attention, and MLP intermediates. Own them with the drafter; do not size them
+   from context length. Keep projected target taps/KV in the existing bounded
+   cache contract; do not introduce graph-shaped prefill scratch.
+3. Encode each complete drafter block into a bounded number of command buffers,
+   read back only values the current caller consumes, and compare every block
+   tensor/head logit against the slice reference before any speed claim.
+4. Run the exact 3 × 200 greedy stream, compare target IDs, then interleave A/B
+   timing and measure peak footprint/swap. Retain the port only if it improves
+   the complete round without changing exact output or memory limits.
+
+No new kernel family is needed or authorized by P1. The existing slice path
+remains the correctness oracle and fallback until all gates pass.
+
 ## Diagnostic controls
 
 ### L1 — drafter weight residency
@@ -257,7 +288,7 @@ same interleaved plain baseline. Existing kernel-family restrictions apply.
 | M1 | T4, T10, T13 |
 | M2 | T14 |
 | F1 | F1a, F1b |
-| P1 | T19, T14 |
+| P1 | T19, T19d–T19g, T14 |
 | AC1 | T2, T4 |
 | AC2, AC3 | T1a, T1c, T1b, T3, T12 |
 | AC4 | T0c, T5, T6, T7, T8 and each task's sabotage |
