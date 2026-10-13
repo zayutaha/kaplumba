@@ -404,6 +404,15 @@ ignored exact-stream test with `KAPLUMBA_TEST_MODEL=$HOME/.kaplumba/models/Gxma-
 and `KAPLUMBA_DFLASH_DIR=$HOME/.kaplumba/models/Drafter-eepos-exl3-6bpw`, then
 repeat same-prompt B-A-B timing and collect `/usr/bin/time -l` footprint/swap.
 
+F1d harness hardening: `Harness::build` now keeps optional skip behavior only
+when `KAPLUMBA_DFLASH_DIR` is unset. With an explicit nonexistent directory,
+`dflash_exl3_decode_matches_host_on_every_linear` fails at the named configured
+path (`configured DFlash checkpoint has no model.safetensors: ...`, exit 101)
+instead of returning a green skip. Rerunning with the real 6-bpw candidate
+passed through the harness and compared all 36 linears (worst absolute error
+0.002741). This closes the false-green path for explicit drafter selection; it
+does not load the target or prove exact stream behavior.
+
 ## 2026-10-14 — T20.2/F1d candidate review and loader gap
 
 Found `eepos/gemma-4-31B-it-DFlash-exl3-6.0bpw` while searching for a same-

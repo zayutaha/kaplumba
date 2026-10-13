@@ -521,7 +521,8 @@ branches selected from those results, not mandatory simultaneous implementations
   subsets) is external and does not show 30 tok/s here.
 
 - [ ] **F1d — evaluate a compatible same-target 6-bpw EXL3 DFlash candidate.**
-  Files: this spec's notes and acceptance status. Candidate:
+  Files: `crates/engine/tests/dflash_golden.rs`, this spec's notes and
+  acceptance status. Candidate:
   `eepos/gemma-4-31B-it-DFlash-exl3-6.0bpw`, repo commit
   `48be48d8035ec6c94d6b9b3f867c7dae1e4dc627`, 1,153,033,071-byte Safetensors,
   Apache-2.0 metadata. Header-only review found 166 recognized names, identical
@@ -540,7 +541,14 @@ branches selected from those results, not mandatory simultaneous implementations
   end-to-end evidence. The ignored target-vs-DFlash 3×200-token test remains
   pending; current `gpuq status` reports 9.5 GiB available and 2.58 GiB swap,
   below the 14 GiB model-run guard. No default change from isolated block timing
-  or without exactness and stable measured gain.
+  or without exactness and stable measured gain. Before more candidate tests,
+  make the golden-test harness fail when an explicitly configured checkpoint
+  path is absent; the current “checkpoint not present; skipping” returns green
+  and previously hid a path typo. Prove the negative path fails, then prove the
+  candidate path reaches its all-linears assertions. Implemented: a nonexistent
+  explicit path now fails with the path in the panic; the actual candidate then
+  passed all 36 host comparisons through the same harness. The target-stream
+  exactness and end-to-end performance/memory gates remain open.
 
 ## Status
 

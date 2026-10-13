@@ -342,7 +342,9 @@ probe's overlaps are not substitute measurements for this engine.
 * **AC12:** The loader assigns each DFlash line the rate declared by its trellis
   tile shape. Synthetic 4-bpw and 6-bpw checkpoints load with the expected
   `QuantizedLinear.rate`; malformed/fractional shapes fail with a named error.
-  The candidate's 166 tensors are all recognized, its exact greedy stream
+  The candidate's 166 tensors are all recognized, and tests that receive an
+  explicit `KAPLUMBA_DFLASH_DIR` fail if that directory or checkpoint is
+  missing instead of reporting a passing skip. Its exact greedy stream
   matches the target, and any throughput claim uses repeated same-prompt runs
   plus measured footprint/swap. If the source header misaligns packed tensors,
   normalize only JSON whitespace padding and verify the tensor payload is

@@ -151,6 +151,16 @@ comparing GPU and host values. Derive the oracle rate from each trellis's third
 dimension, and retain the independent MCG decode, sign vectors, and all-36-line
 comparison. Run the same test against both the existing 4-bpw shard and the
 normalized candidate; a fixed-4 sabotage must fail the candidate test.
+
+### F1d follow-up — fail closed on an explicit checkpoint path
+
+The DFlash golden-test harness currently returns `None` when the configured
+checkpoint is absent, and tests then return successfully. Keep optional skipping
+only when no checkpoint path was requested. If `KAPLUMBA_DFLASH_DIR` is set,
+missing directory/config/shard must fail with the configured path in the
+diagnostic. Validate this by running with a deliberately nonexistent explicit
+path and observing test failure, then rerun on the actual candidate and observe
+that it loads and reaches a named tensor comparison.
 | `crates/engine/src/generate.rs` | plain generation only | experimental loop after round correctness |
 | `crates/cli/src/{args,main,chat}.rs` | no drafter selection | explicit flags, loading, errors and metrics; supported chat policy |
 | `crates/engine/tests/dflash_equivalence.rs` and a future verifier timing harness | existing evidence does not establish the full round | sequential-vs-batched control, ideal-proposal ceiling and round equivalence; final filenames chosen during implementation |

@@ -324,6 +324,12 @@ impl Harness {
     fn build() -> Option<Self> {
         let dir = dir();
         if !dir.join("model.safetensors").exists() {
+            if std::env::var_os("KAPLUMBA_DFLASH_DIR").is_some() {
+                panic!(
+                    "configured DFlash checkpoint has no model.safetensors: {}",
+                    dir.display()
+                );
+            }
             eprintln!("drafter checkpoint not present; skipping");
             return None;
         }
