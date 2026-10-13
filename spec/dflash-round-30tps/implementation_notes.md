@@ -599,3 +599,39 @@ dflash_equivalence --no-run` compiled the instrumented test; the forced-load
 run above passed 1/1. No product throughput code changed. The next T19 step is
 to split draft computation from target verification inside the round, then
 choose GPU-resident stage work based on those measurements.
+
+## 2026-10-14 — T19b proposal/verify phase split
+
+Temporarily instrumented `DflashModel::draft_and_verify` behind
+`KAPLUMBA_DFLASH_PHASE_TIMING=1` and removed the hook after measurement. The
+forced-load 3 × 200 greedy run passed exact output equivalence for all 600
+tokens. Across 229 rounds, phase means were: `draft_block` 169.94 ms, proposal
+selection 0.00 ms (greedy), target `forward_verify` 374.45 ms, and acceptance
+plus cache retraction 0.69 ms; total 545.08 ms. This reconciles with T19a's
+~545 ms draft-and-verify bucket. There is no proposal-sampling cost in this
+greedy run; sampled verification still needs its own profile if considered for
+throughput.
+
+This makes the main tradeoff concrete: drafting and verifying 15 proposals
+costs ~544 ms while current runs accept only ~1.65 on average. Raising overlap
+is necessary, while the 170 ms drafter and 374 ms verifier also need reduction
+for 30 tok/s. The measurement alone does not establish either change will
+reach 30 tok/s.
+
+Exact timed command:
+
+```bash
+scripts/gpuq try -- env KAPLUMBA_DFLASH_PHASE_TIMING=1 \
+  KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacked" \
+  KAPLUMBA_DFLASH_DIR="$HOME/.kaplumba/models/Drafter" \
+  cargo test --release -p kaplumba-engine --test dflash_equivalence \
+  dflash_greedy_stream_matches_target_for_200_tokens_on_three_prompts \
+  -- --ignored --exact --nocapture
+```
+
+The instrumented run passed 1/1 in 213.23 s. The same 86,720,512-byte range
+again failed `mlock`; GPUQ reported 16 GiB available and no swap before the
+run, and 18 GiB available with no swap afterward. After removing the timing
+hook, `cargo test --release -p kaplumba-engine --test dflash_equivalence
+--no-run` compiled successfully. No persistent product behavior change was
+made by the profiler.
