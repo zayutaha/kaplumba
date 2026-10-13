@@ -1069,6 +1069,26 @@ fn draft_verify_positions(anchor_position: usize, n: usize) -> Vec<u32> {
         .collect()
 }
 
+/// How many of the verify's `drafted` cache rows the target must retract after
+/// a round in which `accepted` drafts survived.
+///
+/// The verify fed the drafts at `P+1..=P+n`, so the cache holds `n` rows for
+/// positions the round touched. Of those, exactly the first `accepted` are
+/// correct: the token emitted at position `P + accepted + 1` is `next` (the
+/// target's own token), not the rejected draft whose K/V currently sits there.
+/// Retracting `drafted - accepted` leaves the cache ending at `P + accepted`,
+/// so the caller's feed of `next` at `P + accepted + 1` appends exactly one
+/// row at an unused position.
+///
+/// Getting this off by one in either direction is silent: retracting one too
+/// few leaves a rejected draft's K/V under the emitted token (the next verify
+/// attends to a token that was never emitted); retracting one too many drops
+/// the last accepted draft (the next verify attends to a shorter history than
+/// the text claims). Neither crashes; both corrupt acceptance.
+fn verify_retract(drafted: usize, accepted: usize) -> usize {
+    drafted.saturating_sub(accepted)
+}
+
 // ============================================================================
 // `spec/dflash-30tps` L2: the round's distribution machinery
 // ============================================================================
@@ -1394,7 +1414,51 @@ mod sampler_tests {
 }
 #[cfg(test)]
 mod tests {
-    use super::{draft_verify_positions, select_draft_tokens};
+    use super::{draft_verify_positions, select_draft_tokens, verify_retract};
+
+    /// The retract count, derived position by position. The verify fed the n
+    /// drafts at `P+1..=P+n`; only the accepted prefix of those rows holds the
+    /// tokens the target actually emitted at those positions. The row at
+    /// `P + accepted + 1` holds the REJECTED draft's K/V, and keeping it means
+    /// the caller's feed of `next` appends a second key row at the same
+    /// position -- corrupting every later verify silently (T1 sabotage case).
+    #[test]
+    fn the_round_retracts_everything_past_the_accepted_prefix() {
+        // n drafted, k accepted -> retract n - k. This is T9's stated
+        // arithmetic ("31 drafted, k accepted -> retract 31 - k").
+        assert_eq!(
+            verify_retract(15, 0),
+            15,
+            "a fully rejected round must retract every verify row: each holds a \
+             draft token the target did not emit"
+        );
+        assert_eq!(
+            verify_retract(15, 1),
+            14,
+            "one accepted draft keeps one row (P+1); rows P+2..=P+15 hold \
+             rejected drafts and must go"
+        );
+        assert_eq!(
+            verify_retract(31, 31),
+            0,
+            "a fully accepted round keeps every row: `next` lands at P+32, an \
+             unused position, so nothing the verify wrote is wrong"
+        );
+        assert_eq!(
+            verify_retract(31, 30),
+            1,
+            "two-block arithmetic: 31 drafted, 30 accepted -> retract exactly \
+             the one rejected row"
+        );
+        // The off-by-one this replaced (`drafted - accepted - 1`) is what must
+        // NOT come back: it leaves the rejected draft's row in the cache.
+        assert_ne!(
+            verify_retract(15, 0),
+            14,
+            "retracting one too few keeps a rejected draft's K/V under an \
+             emitted token -- silent acceptance corruption"
+        );
+    }
 
     /// The drafts start one past the anchor, and the anchor's own slot is never
     /// fed. Both halves matter and both are silent when broken: dropping the
@@ -2378,13 +2442,18 @@ impl DflashModel {
             };
         }
 
-        // Cache accounting: the verify advanced `n` rows, `accepted.len() + 1`
-        // of which are correct. Retract the rest so the next round drafts are
-        // checked against the prefix the target actually emitted.
-        let correct = accepted.len() + 1;
-        if n > correct {
-            target.retract_gpu_caches(n - correct);
-        }
+        // Cache accounting: the verify advanced `n` rows (the drafts at
+        // `P+1..=P+n`); only the `accepted.len()` of them are correct. The row
+        // at `P + accepted.len() + 1` holds the *rejected* draft's K/V, while
+        // the token the target emitted at that position is `next` -- so that
+        // row must go, and the caller re-derives it by feeding `next` there
+        // (which is also what produces the next round's `previous_logits`).
+        //
+        // The `+ 1` this replaced kept the rejected row, which made the
+        // caller's feed of `next` append a second key row at the same
+        // position -- the exact corruption this function's header warns about
+        // for the anchor, silently, with every output still looking plausible.
+        target.retract_gpu_caches(verify_retract(n, accepted.len()));
 
         Ok(DflashRound {
             accepted,
