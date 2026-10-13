@@ -303,11 +303,12 @@ branches selected from those results, not mandatory simultaneous implementations
   Compare encoder results to slice outputs at 1 and multiple rows, including
   large residual values above fp16 range. No new Metal shader. Passed focused
   encoder test and binding sabotage; commit `6e7f582`.
-- [ ] **T19e — add an encoder API for gated SiLU.**
+- [x] **T19e — add an encoder API for gated SiLU.**
   Files: `crates/kernels/src/elements.rs`, `crates/kernels/tests/dflash_encode.rs`.
   Encode the current gated-SiLU pipeline into caller-owned buffers; test mixed
   positive/negative inputs, parity against the slice method, and invalid count
-  and buffer sizes.
+  and buffer sizes. Passed parity and wrong-binding sabotage; commit recorded
+  in the implementation notes.
 - [ ] **T19e.1 — add an offset-aware encoder API for f32-output GEMM.**
   Files: `crates/kernels/src/encoder.rs`, `crates/kernels/src/linear.rs`,
   focused linear tests. Encode the existing fp32-output pipeline into a caller

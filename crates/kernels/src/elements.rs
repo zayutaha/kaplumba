@@ -1471,6 +1471,36 @@ impl ElementKernels {
         )
     }
 
+    /// Encode the existing gated-SiLU operation into caller-owned buffers.
+    pub fn encode_gated_silu(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        gate: &Buffer,
+        up: &Buffer,
+        output: &Buffer,
+        count: usize,
+    ) -> Result<(), KernelError> {
+        if count == 0 {
+            return Err(KernelError::InvalidInput(
+                "gated SiLU count must be non-zero".to_string(),
+            ));
+        }
+        let bytes = (count * size_of::<u16>()) as u64;
+        if gate.length() < bytes || up.length() < bytes || output.length() < bytes {
+            return Err(KernelError::InvalidInput(
+                "gated SiLU buffer is smaller than its declared count".to_string(),
+            ));
+        }
+        let params = to_u32(count, "gated SiLU length")?;
+        encoder.dispatch_1d(
+            &self.gated_silu_pipeline,
+            &[Some(gate), Some(up), Some(output)],
+            &params.to_le_bytes(),
+            count as u64,
+            64,
+        )
+    }
+
     pub fn encode_rope(
         &self,
         encoder: &mut crate::encoder::MetalEncoder,

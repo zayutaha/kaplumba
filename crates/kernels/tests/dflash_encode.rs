@@ -92,7 +92,31 @@ fn dflash_f32_encode_operations_match_slice_paths_and_validate_buffers() {
     encoder.commit_and_wait().expect("residual completion");
     assert_eq!(read_f32(&output_buffer, left.len()), expected);
 
+    let gate: Vec<u16> = (0..67)
+        .map(|i| half::f16::from_f32((i as f32 - 31.0) * 0.25).to_bits())
+        .collect();
+    let up: Vec<u16> = (0..67)
+        .map(|i| half::f16::from_f32(2.0 - i as f32 * 0.015).to_bits())
+        .collect();
+    let expected = elements.gated_silu(&gate, &up).expect("slice gated SiLU");
+    let gate_buffer = buffer_with(&device, &gate);
+    let up_buffer = buffer_with(&device, &up);
+    let silu_output = zero_buffer(&device, gate.len() * size_of::<u16>());
+    let mut encoder = MetalEncoder::new(&queue).expect("encoder");
+    elements
+        .encode_gated_silu(
+            &mut encoder,
+            &gate_buffer,
+            &up_buffer,
+            &silu_output,
+            gate.len(),
+        )
+        .expect("encode gated SiLU");
+    encoder.commit_and_wait().expect("SiLU completion");
+    assert_eq!(read_u16(&silu_output, gate.len()), expected);
+
     let short = zero_buffer(&device, left.len() * size_of::<f32>() - 1);
+    let short_u16 = zero_buffer(&device, gate.len() * size_of::<u16>() - 1);
     let mut encoder = MetalEncoder::new(&queue).expect("encoder");
     assert!(
         elements
@@ -103,6 +127,22 @@ fn dflash_f32_encode_operations_match_slice_paths_and_validate_buffers() {
                 &short,
                 left.len(),
             )
+            .is_err()
+    );
+    assert!(
+        elements
+            .encode_gated_silu(
+                &mut encoder,
+                &gate_buffer,
+                &up_buffer,
+                &short_u16,
+                gate.len(),
+            )
+            .is_err()
+    );
+    assert!(
+        elements
+            .encode_gated_silu(&mut encoder, &gate_buffer, &up_buffer, &silu_output, 0,)
             .is_err()
     );
     assert!(

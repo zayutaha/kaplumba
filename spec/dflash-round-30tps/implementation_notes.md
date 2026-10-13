@@ -695,3 +695,15 @@ Coverage sabotage replaced the encoded residual's right operand with the left
 operand. The test failed at the output parity assertion (line 93; GPU output
 contained `left + left`, expected `left + right`; exit 101). The binding was
 restored and the test passed. This confirms the residual binding is exercised.
+
+## 2026-10-14 — T19e encoder-facing gated SiLU
+
+Added `ElementKernels::encode_gated_silu`, which enqueues the existing gated
+SiLU pipeline with caller-owned f16 gate/up/output buffers and rejects zero
+count or undersized buffers. The `dflash_encode` integration test compares 67
+mixed-sign inputs exactly against `ElementKernels::gated_silu`; the combined
+T19d/T19e focused test passed 1/1.
+
+Coverage sabotage bound `gate` in place of `up`. The test failed at the gated
+SiLU parity assertion (line 116; exit 101). Restored the binding; clean rerun
+passed 1/1. No shader was added.
