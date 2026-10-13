@@ -151,7 +151,8 @@ branches selected from those results, not mandatory simultaneous implementations
   (DFlash 99382, sequential target 84750). The processed-anchor stream remains
   the correctness-proved path. The mismatch may come from batched-row numeric
   drift; this run did not isolate logits, so that cause is unconfirmed. Reverted
-  the experiment. T16 stays open pending an exact row-zero method. Commit: pending.
+  the experiment. T16 stays open pending an exact row-zero method. Commit:
+  `7cebcd5`.
 - [ ] **T5 — validate existing permutation propagation.**
   Plumbing already landed in `9a4cf60`; do not implement it again.
   Files: existing kernel/drafter permutation tests and implementation notes.
@@ -333,7 +334,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | T1c | done | Shared temp/top-k/top-p policy for p/q; 11 sampler tests and top-p sabotage; `f95b040` |
 | T1b.2a | done | 9 cache rollback cases across ring boundary; off-by-one sabotage fails; no stale-row decode divergence; `e5a9be8` |
 | T12a | done | 3 × 200 greedy tokens match exactly; DFlash 3.85–4.34 tok/s vs plain 12.30; `20be6d7` |
-| T16a | experiment rejected | unprocessed anchor differs from sequential greedy at token 77; reverted; exactness remains open |
+| T16a | experiment rejected | unprocessed anchor differs from sequential greedy at token 77; reverted; exactness remains open; `7cebcd5` |
 | T19 | conditional design, held | GPU stage ownership/wait overhead needs measurement after correctness |
 | T1b.1 | done | 2048-slot sliding ring; boundary greedy identity, max logit delta 0.136719, 13.59 GiB phys_footprint, no swap; sabotage fails; `6e69bf7` |
 | T20.1 | done | exact fp16/fp32 mapped slices; host and full-context tests plus sabotage; `880b7e4` |
