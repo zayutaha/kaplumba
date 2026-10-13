@@ -302,7 +302,7 @@ branches selected from those results, not mandatory simultaneous implementations
   wrappers using the current pipelines, with validation matching slice APIs.
   Compare encoder results to slice outputs at 1 and multiple rows, including
   large residual values above fp16 range. No new Metal shader. Passed focused
-  encoder test and binding sabotage; implementation hash recorded below.
+  encoder test and binding sabotage; commit `6e7f582`.
 - [ ] **T19e — add encoder APIs for gated SiLU and f32 GEMM output.**
   Files: `crates/kernels/src/elements.rs`, `crates/kernels/src/linear.rs`,
   focused kernel tests. Encode current gated-SiLU and fp32-output linear
