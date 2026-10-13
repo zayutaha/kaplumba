@@ -229,7 +229,7 @@ branches selected from those results, not mandatory simultaneous implementations
   fallback separately. `cargo check -p kaplumba-engine` and all three focused
   loader tests passed. The unaligned test failed with a temporary bypass of
   `align_packed_view` (offset 409 instead of aligned offset 0), then passed when
-  restored. Implementation commit hash is recorded in the follow-up notes.
+  restored. Implementation commit: `6a5d36d`.
 
 ## Conditional alternatives after the shared verifier gate
 
