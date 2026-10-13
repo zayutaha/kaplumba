@@ -304,6 +304,188 @@ fn metal_buffer_backed_linear_matches_slice_path() {
 }
 
 #[test]
+fn buffer_gemm_honors_packed_offset_for_fp16_and_fp32() {
+    let kernels = LinearKernels::new().expect("Metal linear kernels should compile");
+    let device = Device::system_default().expect("Metal device");
+    let (row, input_signs, output_signs) = vectors();
+    let input: Vec<u16> = [1.0_f32, -0.5, 0.25, 0.75]
+        .into_iter()
+        .flat_map(|scale| {
+            row.iter().map(move |bits| {
+                f16::from_f32(f16::from_bits(*bits).to_f32() * scale).to_bits()
+            })
+        })
+        .collect();
+    const PREFIX_WORDS: usize = 64;
+    const SUFFIX_WORDS: usize = 32;
+    const PREFIX_BYTES: u64 = (PREFIX_WORDS * size_of::<u16>()) as u64;
+
+    let as_buffer = |words: &[u16]| {
+        device.new_buffer_with_data(
+            words.as_ptr() as *const c_void,
+            size_of_val(words) as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    };
+
+    for bits in [4, 6] {
+        let packed = matrix_packed_integer_shape(bits, 0xA13C + u32::from(bits), 8, 8);
+        let mut embedded = vec![0xA55A; PREFIX_WORDS];
+        embedded.extend_from_slice(&packed);
+        embedded.extend(std::iter::repeat_n(0x5AA5, SUFFIX_WORDS));
+        let plain_buffer = as_buffer(&packed);
+        let embedded_buffer = as_buffer(&embedded);
+        let packed_bytes = size_of_val(packed.as_slice()) as u64;
+
+        let plain_half = kernels
+            .gemm_chunk_buffer_sliced(
+                LinearBufferRequest {
+                    packed: &plain_buffer,
+                    packed_offset: 0,
+                    input: &input,
+                    input_signs: &input_signs,
+                    output_signs: &output_signs,
+                    in_features: 128,
+                    out_features: 128,
+                    rate: Exl3Rate::Integer(bits),
+                    codebook: Exl3Codebook::Mcg,
+                    perm_mode: 0,
+                },
+                packed_bytes,
+            )
+            .expect("zero-offset fp16 GEMM");
+        let offset_half = kernels
+            .gemm_chunk_buffer_sliced(
+                LinearBufferRequest {
+                    packed: &embedded_buffer,
+                    packed_offset: PREFIX_BYTES,
+                    input: &input,
+                    input_signs: &input_signs,
+                    output_signs: &output_signs,
+                    in_features: 128,
+                    out_features: 128,
+                    rate: Exl3Rate::Integer(bits),
+                    codebook: Exl3Codebook::Mcg,
+                    perm_mode: 0,
+                },
+                packed_bytes,
+            )
+            .expect("offset fp16 GEMM");
+        assert_eq!(
+            offset_half, plain_half,
+            "fp16 buffer GEMM read prefix canaries instead of the rate-{bits} tensor at byte offset {PREFIX_BYTES}"
+        );
+
+        let plain_f32 = kernels
+            .gemm_chunk_buffer_f32_sliced(
+                LinearBufferRequest {
+                    packed: &plain_buffer,
+                    packed_offset: 0,
+                    input: &input,
+                    input_signs: &input_signs,
+                    output_signs: &output_signs,
+                    in_features: 128,
+                    out_features: 128,
+                    rate: Exl3Rate::Integer(bits),
+                    codebook: Exl3Codebook::Mcg,
+                    perm_mode: 0,
+                },
+                packed_bytes,
+            )
+            .expect("zero-offset fp32 GEMM");
+        let offset_f32 = kernels
+            .gemm_chunk_buffer_f32_sliced(
+                LinearBufferRequest {
+                    packed: &embedded_buffer,
+                    packed_offset: PREFIX_BYTES,
+                    input: &input,
+                    input_signs: &input_signs,
+                    output_signs: &output_signs,
+                    in_features: 128,
+                    out_features: 128,
+                    rate: Exl3Rate::Integer(bits),
+                    codebook: Exl3Codebook::Mcg,
+                    perm_mode: 0,
+                },
+                packed_bytes,
+            )
+            .expect("offset fp32 GEMM");
+        assert_eq!(
+            offset_f32, plain_f32,
+            "fp32 buffer GEMM read prefix canaries instead of the rate-{bits} tensor at byte offset {PREFIX_BYTES}"
+        );
+
+        let bad_len = packed_bytes - size_of::<u16>() as u64;
+        for (output_kind, result) in [
+            (
+                "fp16",
+                kernels.gemm_chunk_buffer_sliced(
+                    LinearBufferRequest {
+                        packed: &embedded_buffer,
+                        packed_offset: PREFIX_BYTES,
+                        input: &input,
+                        input_signs: &input_signs,
+                        output_signs: &output_signs,
+                        in_features: 128,
+                        out_features: 128,
+                        rate: Exl3Rate::Integer(bits),
+                        codebook: Exl3Codebook::Mcg,
+                        perm_mode: 0,
+                    },
+                    bad_len,
+                )
+                .map(|_| ()),
+            ),
+            (
+                "fp32",
+                kernels
+                    .gemm_chunk_buffer_f32_sliced(
+                        LinearBufferRequest {
+                            packed: &embedded_buffer,
+                            packed_offset: PREFIX_BYTES,
+                            input: &input,
+                            input_signs: &input_signs,
+                            output_signs: &output_signs,
+                            in_features: 128,
+                            out_features: 128,
+                            rate: Exl3Rate::Integer(bits),
+                            codebook: Exl3Codebook::Mcg,
+                            perm_mode: 0,
+                        },
+                        bad_len,
+                    )
+                    .map(|_| ()),
+            ),
+        ] {
+            assert!(
+                result.is_err(),
+                "{output_kind} sliced GEMM accepted a packed region one word too short at rate {bits}"
+            );
+        }
+
+        let out_of_range = kernels.gemm_chunk_buffer_sliced(
+            LinearBufferRequest {
+                packed: &embedded_buffer,
+                packed_offset: embedded.len() as u64,
+                input: &input,
+                input_signs: &input_signs,
+                output_signs: &output_signs,
+                in_features: 128,
+                out_features: 128,
+                rate: Exl3Rate::Integer(bits),
+                codebook: Exl3Codebook::Mcg,
+                perm_mode: 0,
+            },
+            packed_bytes,
+        );
+        assert!(
+            out_of_range.is_err(),
+            "fp16 sliced GEMM accepted a rate-{bits} tensor range past the end of its Metal buffer"
+        );
+    }
+}
+
+#[test]
 fn metal_linear_matches_cpu_fractional_matrix() {
     let kernels = LinearKernels::new().expect("Metal linear kernels should compile");
     let (input, input_signs, output_signs) = vectors();

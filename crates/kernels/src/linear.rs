@@ -942,6 +942,7 @@ impl LinearKernels {
             codebook,
         } = request;
         validate_buffer_shape(
+            packed.length(),
             packed.length().saturating_sub(packed_offset),
             packed_offset,
             input.len(),
@@ -1122,6 +1123,7 @@ impl LinearKernels {
         } = request;
         let tokens = input.len() / in_features.max(1);
         validate_buffer_shape(
+            packed.length(),
             packed_bytes,
             packed_offset,
             input.len(),
@@ -1184,6 +1186,7 @@ impl LinearKernels {
             encoder,
             &self.gemv_tiled_pipeline,
             &[Some(packed), Some(&transformed), Some(&raw)],
+            packed_offset,
             params_bytes(&linear_params),
             (out_features / 16) as u64,
             tokens.div_ceil(16) as u64,
@@ -1221,6 +1224,28 @@ impl LinearKernels {
         &self,
         request: LinearBufferRequest<'_>,
     ) -> Result<Vec<f32>, KernelError> {
+        let packed_bytes = request
+            .packed
+            .length()
+            .saturating_sub(request.packed_offset);
+        self.gemm_chunk_buffer_f32_region(request, packed_bytes)
+    }
+
+    /// [`Self::gemm_chunk_buffer_f32`] for one tensor embedded in a larger
+    /// mapped buffer. `packed_bytes` is the tensor's exact byte length.
+    pub fn gemm_chunk_buffer_f32_sliced(
+        &self,
+        request: LinearBufferRequest<'_>,
+        packed_bytes: u64,
+    ) -> Result<Vec<f32>, KernelError> {
+        self.gemm_chunk_buffer_f32_region(request, packed_bytes)
+    }
+
+    fn gemm_chunk_buffer_f32_region(
+        &self,
+        request: LinearBufferRequest<'_>,
+        packed_bytes: u64,
+    ) -> Result<Vec<f32>, KernelError> {
         let LinearBufferRequest {
             packed,
             packed_offset,
@@ -1234,7 +1259,8 @@ impl LinearKernels {
         } = request;
         let tokens = input.len() / in_features.max(1);
         validate_buffer_shape(
-            packed.length().saturating_sub(packed_offset),
+            packed.length(),
+            packed_bytes,
             packed_offset,
             input.len(),
             input_signs.len(),
@@ -1295,6 +1321,7 @@ impl LinearKernels {
             encoder,
             &self.gemv_tiled_pipeline,
             &[Some(packed), Some(&transformed), Some(&raw)],
+            packed_offset,
             params_bytes(&linear_params),
             (out_features / 16) as u64,
             tokens.div_ceil(16) as u64,
@@ -1405,6 +1432,7 @@ impl LinearKernels {
             encoder,
             &self.gemv_tiled_pipeline,
             &[Some(&packed_buffer), Some(&transformed), Some(&raw)],
+            0,
             params_bytes(&linear_params),
             (out_features / 16) as u64,
             queries.div_ceil(16) as u64,
@@ -4109,13 +4137,15 @@ impl LinearKernels {
         encoder: &ComputeCommandEncoderRef,
         pipeline: &ComputePipelineState,
         bindings: &[Option<&Buffer>],
+        first_buffer_offset: u64,
         params: &[u8],
         groups_x: u64,
         groups_y: u64,
     ) {
         encoder.set_compute_pipeline_state(pipeline);
         for (index, binding) in bindings.iter().enumerate() {
-            encoder.set_buffer(index as u64, binding.map(|value| &**value), 0);
+            let offset = if index == 0 { first_buffer_offset } else { 0 };
+            encoder.set_buffer(index as u64, binding.map(|value| &**value), offset);
         }
         encoder.set_bytes(
             bindings.len() as u64,
@@ -4165,8 +4195,9 @@ fn validate_encode(
 
 #[allow(clippy::too_many_arguments)]
 fn validate_buffer_shape(
+    packed_buffer_bytes: u64,
     packed_bytes: u64,
-    _packed_offset: u64,
+    packed_offset: u64,
     input_len: usize,
     input_sign_len: usize,
     output_sign_len: usize,
@@ -4197,6 +4228,16 @@ fn validate_buffer_shape(
     if packed_bytes != expected as u64 {
         return Err(KernelError::InvalidInput(format!(
             "packed buffer length {packed_bytes} does not match {expected}"
+        )));
+    }
+    let Some(region_end) = packed_offset.checked_add(packed_bytes) else {
+        return Err(KernelError::InvalidInput(
+            "packed buffer range overflows".to_string(),
+        ));
+    };
+    if region_end > packed_buffer_bytes {
+        return Err(KernelError::InvalidInput(format!(
+            "packed tensor range {packed_offset}..{region_end} exceeds buffer length {packed_buffer_bytes}"
         )));
     }
     Ok(())
