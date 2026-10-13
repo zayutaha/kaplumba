@@ -379,6 +379,7 @@ branches selected from those results, not mandatory simultaneous implementations
   greedy 3 × 200 prompts and compare aggregate phase totals to the existing
   round timing. Removed the runtime hook after measurement. The 3 × 200 test
   stayed exact; phase medians and footprint are in implementation notes.
+  Commit `50c393e`.
 - [x] **T20 — load DFlash packed weights through base mmap + mlock path.**
   Files: `crates/engine/src/dflash.rs`, `crates/engine/tests/dflash_load.rs`,
   this spec's plan/tasks/notes. Replace the DFlash loader's per-tensor file reads
