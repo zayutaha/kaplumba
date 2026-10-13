@@ -21,14 +21,13 @@
 //!    bf16→f16 scale conversion and no packed `.su`/`.sv` path.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use metal::MTLResourceOptions;
-
 use crate::exl3::{BitRate, MCG_MULTIPLIER};
+use crate::metal::{MetalContext, resident_limit_bytes};
 use crate::model::QuantizedLinear;
-use crate::safetensors::{read_shard_header, DType};
+use crate::safetensors::{DType, SafeTensorsIndex, read_shard_header};
+use crate::weights::TextWeights;
 use kaplumba_kernels::attention::DflashBlockRequest;
 use kaplumba_kernels::elements::RopeRequest;
 use kaplumba_kernels::linear::LinearBufferRequest;
@@ -54,6 +53,13 @@ pub struct DflashWeights {
     /// ignoring — the caller should refuse to run rather than load a subtly
     /// wrong model.
     pub unknown_tensors: Vec<String>,
+    /// Packed trellis bytes bound directly from the shard mapping. Zero when
+    /// `KAPLUMBA_RESIDENT_WEIGHTS` selects the resident arena path.
+    pub mapped_trellis_bytes: u64,
+    /// Owns the mapped drafter shard and its no-copy Metal views. Its drop must
+    /// happen after every `QuantizedLinear` above releases the corresponding
+    /// Metal buffer.
+    storage: TextWeights,
 }
 
 /// Every tensor suffix this loader understands, and what it does with it.
@@ -87,20 +93,11 @@ pub enum DflashLoadError {
     #[error("unsupported dtype {dtype:?} for {name}")]
     DType { name: String, dtype: DType },
     #[error("{name} has {actual} elements, expected {expected}")]
-    Length { name: String, actual: usize, expected: usize },
-}
-
-fn read_exact_at(
-    file: &mut std::fs::File,
-    offset: u64,
-    len: usize,
-) -> Result<Vec<u8>, DflashLoadError> {
-    let mut bytes = vec![0u8; len];
-    file.seek(SeekFrom::Start(offset))
-        .map_err(|e| DflashLoadError::Io(e.to_string()))?;
-    file.read_exact(&mut bytes)
-        .map_err(|e| DflashLoadError::Io(e.to_string()))?;
-    Ok(bytes)
+    Length {
+        name: String,
+        actual: usize,
+        expected: usize,
+    },
 }
 
 impl DflashWeights {
@@ -110,29 +107,35 @@ impl DflashWeights {
     /// [`SUFFIX_RULES`] or reported by [`Self::unhandled_tensors`]; the caller
     /// is expected to check the latter, because a checkpoint we half-understand
     /// is worse than one we refuse.
-    pub fn load(dir: &Path, device: &metal::Device) -> Result<Self, DflashLoadError> {
+    pub fn load(dir: &Path, _device: &metal::Device) -> Result<Self, DflashLoadError> {
         let shard_path = dir.join("model.safetensors");
-        let shard = read_shard_header(&shard_path)
-            .map_err(|e| DflashLoadError::Shard(e.to_string()))?;
-        let mut file = std::fs::File::open(&shard_path)
-            .map_err(|e| DflashLoadError::Io(e.to_string()))?;
+        let shard =
+            read_shard_header(&shard_path).map_err(|e| DflashLoadError::Shard(e.to_string()))?;
+        let shard_name = "model.safetensors".to_string();
+        let weight_map = shard
+            .tensors
+            .keys()
+            .map(|name| (name.clone(), shard_name.clone()))
+            .collect();
+        let selection = crate::safetensors::load_text_selection(
+            dir,
+            SafeTensorsIndex {
+                metadata: BTreeMap::new(),
+                weight_map,
+            },
+        )
+        .map_err(|error| DflashLoadError::Shard(error.to_string()))?;
+        let context =
+            MetalContext::new().map_err(|error| DflashLoadError::Io(error.to_string()))?;
+        let storage = TextWeights::load_dedicated(dir, &selection, context, resident_limit_bytes())
+            .map_err(|error| DflashLoadError::Io(error.to_string()))?;
 
-        let mut trellis: BTreeMap<String, (Vec<u8>, DType)> = BTreeMap::new();
         let mut mcg: BTreeMap<String, i32> = BTreeMap::new();
         let mut suh: BTreeMap<String, Vec<u16>> = BTreeMap::new();
         let mut svh: BTreeMap<String, Vec<u16>> = BTreeMap::new();
-        let mut bf16_norms: BTreeMap<String, Vec<u8>> = BTreeMap::new();
         let mut unknown: BTreeSet<String> = BTreeSet::new();
 
-        for (name, info) in &shard.tensors {
-            let (start, end) = shard
-                .absolute_range(name)
-                .ok_or_else(|| DflashLoadError::Missing(name.clone()))?;
-            let bytes = read_exact_at(
-                &mut file,
-                start,
-                usize::try_from(end - start).unwrap_or(0),
-            )?;
+        for (name, info) in &selection.tensors {
             let known = SUFFIX_RULES
                 .iter()
                 .any(|(suffix, _)| name.ends_with(suffix));
@@ -141,8 +144,17 @@ impl DflashWeights {
                 continue;
             }
             if name.ends_with(".trellis") {
-                trellis.insert(strip(name, ".trellis"), (bytes, info.dtype));
+                // Packed weights are intentionally not copied to a `Vec` or a
+                // second Metal allocation. The base loader maps the shard,
+                // applies its mlock policy, and owns the no-copy view below.
+                continue;
             } else if name.ends_with(".mcg") {
+                let bytes = storage
+                    .read_tensor(name)
+                    .map_err(|error| DflashLoadError::Tensor {
+                        name: name.clone(),
+                        message: error.to_string(),
+                    })?;
                 if info.dtype != DType::I32 || bytes.len() != 4 {
                     return Err(DflashLoadError::Tensor {
                         name: name.clone(),
@@ -153,14 +165,27 @@ impl DflashWeights {
                         ),
                     });
                 }
-                mcg.insert(strip(name, ".mcg"), i32::from_le_bytes(bytes[..4].try_into().unwrap()));
+                mcg.insert(
+                    strip(name, ".mcg"),
+                    i32::from_le_bytes(bytes[..4].try_into().unwrap()),
+                );
             } else if name.ends_with(".suh") || name.ends_with(".su") {
-                expect_f16(&bytes, name, len_of(info))?;
-                let values = f16_bytes(&bytes);
+                let values = storage
+                    .read_f16(name)
+                    .map_err(|error| DflashLoadError::Tensor {
+                        name: name.clone(),
+                        message: error.to_string(),
+                    })?;
+                expect_f16_values(&values, name, len_of(info))?;
                 suh.insert(strip_any(name, &[".suh", ".su"]), values);
             } else if name.ends_with(".svh") || name.ends_with(".sv") {
-                expect_f16(&bytes, name, len_of(info))?;
-                let values = f16_bytes(&bytes);
+                let values = storage
+                    .read_f16(name)
+                    .map_err(|error| DflashLoadError::Tensor {
+                        name: name.clone(),
+                        message: error.to_string(),
+                    })?;
+                expect_f16_values(&values, name, len_of(info))?;
                 svh.insert(strip_any(name, &[".svh", ".sv"]), values);
             } else if name.ends_with(".weight") {
                 if info.dtype != DType::BF16 {
@@ -169,29 +194,27 @@ impl DflashWeights {
                         dtype: info.dtype,
                     });
                 }
-                if bytes.len() % 2 != 0 {
-                    return Err(DflashLoadError::Length {
-                        name: name.clone(),
-                        actual: bytes.len(),
-                        expected: (bytes.len() / 2) * 2,
-                    });
-                }
-                bf16_norms.insert(strip(name, ".weight"), bytes);
             }
         }
 
         let unknown = unknown.into_iter().collect::<Vec<_>>();
 
         let mut lines = BTreeMap::new();
-        for (stem, (packed, dtype)) in trellis {
-            let shape = shard
+        let mut mapped_trellis_bytes = 0_u64;
+        for (name, info) in selection
+            .tensors
+            .iter()
+            .filter(|(name, _)| name.ends_with(".trellis"))
+        {
+            let stem = strip(name, ".trellis");
+            let shape = selection
                 .tensors
-                .get(&format!("{stem}.trellis"))
+                .get(name)
                 .map(|t| t.shape.clone())
-                .ok_or_else(|| DflashLoadError::Missing(format!("{stem}.trellis")))?;
+                .ok_or_else(|| DflashLoadError::Missing(name.clone()))?;
             if shape.len() != 3 {
                 return Err(DflashLoadError::Tensor {
-                    name: format!("{stem}.trellis"),
+                    name: name.clone(),
                     message: format!("expected [in/16, out/16, 64], got {:?}", shape),
                 });
             }
@@ -212,10 +235,15 @@ impl DflashWeights {
                 });
             }
             let expected_words = in_tiles * out_tiles * BitRate::Integer(4).packed_words();
-            if dtype != DType::I16 || packed.len() / 2 != expected_words {
+            let packed_words = usize::try_from(info.byte_len() / 2).unwrap_or(0);
+            if info.dtype != DType::I16 || packed_words != expected_words {
                 return Err(DflashLoadError::Length {
-                    name: format!("{stem}.trellis"),
-                    actual: if dtype == DType::I16 { packed.len() / 2 } else { packed.len() },
+                    name: name.clone(),
+                    actual: if info.dtype == DType::I16 {
+                        packed_words
+                    } else {
+                        info.byte_len() as usize
+                    },
                     expected: expected_words,
                 });
             }
@@ -241,17 +269,42 @@ impl DflashWeights {
                     expected: out_features,
                 });
             }
-            let packed_words = packed.len() / 2;
-            let buffer = device.new_buffer(
-                packed.len().max(2) as u64,
-                MTLResourceOptions::StorageModeShared,
-            );
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    packed.as_ptr(),
-                    buffer.contents() as *mut u8,
-                    packed.len(),
-                );
+            let (source_buffer, source_offset, source_is_mapped) = match storage
+                .zero_copy_tensor_buffer(name)
+                .map_err(|error| DflashLoadError::Tensor {
+                    name: name.clone(),
+                    message: error.to_string(),
+                })? {
+                Some(view) => (view.0, view.1, true),
+                None => (
+                    storage
+                        .tensor_buffer(name)
+                        .map_err(|error| DflashLoadError::Tensor {
+                            name: name.clone(),
+                            message: error.to_string(),
+                        })?,
+                    0,
+                    false,
+                ),
+            };
+            let (buffer, offset) = crate::model::align_packed_view(
+                _device,
+                &source_buffer,
+                source_offset,
+                info.byte_len(),
+                name,
+            )
+            .map_err(|error| DflashLoadError::Tensor {
+                name: name.clone(),
+                message: error.to_string(),
+            })?;
+            if source_is_mapped && source_offset % crate::model::EXL3_PACKED_ALIGNMENT == 0 {
+                mapped_trellis_bytes = mapped_trellis_bytes
+                    .checked_add(info.byte_len())
+                    .ok_or_else(|| DflashLoadError::Tensor {
+                        name: name.clone(),
+                        message: "mapped trellis byte total overflow".to_string(),
+                    })?;
             }
             let linear = QuantizedLinear::from_metal_buffer(
                 in_features,
@@ -259,7 +312,7 @@ impl DflashWeights {
                 kaplumba_kernels::exl3::Exl3Rate::Integer(4),
                 kaplumba_kernels::exl3::Exl3Codebook::Mcg,
                 buffer,
-                0,
+                offset,
                 Some(packed_words),
                 input_signs,
                 output_signs,
@@ -307,14 +360,24 @@ impl DflashWeights {
         // BF16 is the top 16 bits of an f32, so widening is exact; narrow once,
         // to f16, at the very end.
         let mut norms = BTreeMap::new();
-        for (stem, bytes) in bf16_norms {
-            let mut values = Vec::with_capacity(bytes.len() / 2);
-            for pair in bytes.chunks_exact(2) {
-                let bits = u16::from_le_bytes([pair[0], pair[1]]);
-                let widened = f32::from_bits((bits as u32) << 16);
-                values.push(half::f16::from_f32(widened).to_bits());
+        for (name, info) in &selection.tensors {
+            if !name.ends_with(".weight") {
+                continue;
             }
-            norms.insert(stem, values);
+            if info.dtype != DType::BF16 {
+                return Err(DflashLoadError::DType {
+                    name: name.clone(),
+                    dtype: info.dtype,
+                });
+            }
+            let values = storage
+                .read_f16(name)
+                .map_err(|error| DflashLoadError::Tensor {
+                    name: name.clone(),
+                    message: error.to_string(),
+                })?;
+            expect_f16_values(&values, name, len_of(info))?;
+            norms.insert(strip(name, ".weight"), values);
         }
 
         Ok(Self {
@@ -323,7 +386,16 @@ impl DflashWeights {
             suh,
             svh,
             unknown_tensors: unknown,
+            mapped_trellis_bytes,
+            storage,
         })
+    }
+
+    /// Actual packed bytes successfully pinned by the base loader's `mlock`
+    /// policy. Zero is possible when the OS refuses the wire request, matching
+    /// target-weight load semantics.
+    pub fn pinned_bytes(&self) -> u64 {
+        self.storage.pinned_bytes()
     }
 
     pub fn line(&self, name: &str) -> Result<&QuantizedLinear, DflashLoadError> {
@@ -385,22 +457,15 @@ fn len_of(info: &crate::safetensors::TensorInfo) -> usize {
     info.shape.iter().product()
 }
 
-fn expect_f16(bytes: &[u8], name: &str, elements: usize) -> Result<(), DflashLoadError> {
-    if bytes.len() != elements * 2 {
+fn expect_f16_values(values: &[u16], name: &str, elements: usize) -> Result<(), DflashLoadError> {
+    if values.len() != elements {
         return Err(DflashLoadError::Length {
             name: name.to_string(),
-            actual: bytes.len() / 2,
+            actual: values.len(),
             expected: elements,
         });
     }
     Ok(())
-}
-
-fn f16_bytes(bytes: &[u8]) -> Vec<u16> {
-    bytes
-        .chunks_exact(2)
-        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -477,10 +542,7 @@ impl DflashConfig {
         if layer_types.len() != num_layers {
             return Err(DflashLoadError::Tensor {
                 name: "layer_types".to_string(),
-                message: format!(
-                    "{} entries for {num_layers} layers",
-                    layer_types.len()
-                ),
+                message: format!("{} entries for {num_layers} layers", layer_types.len()),
             });
         }
 
@@ -494,7 +556,9 @@ impl DflashConfig {
                     .map(|value| usize::try_from(value).unwrap_or(usize::MAX))
                     .collect::<Vec<_>>()
             })
-            .ok_or_else(|| DflashLoadError::Missing("dflash_config.target_layer_ids".to_string()))?;
+            .ok_or_else(|| {
+                DflashLoadError::Missing("dflash_config.target_layer_ids".to_string())
+            })?;
         if target_layer_ids.iter().any(|id| *id == usize::MAX) {
             return Err(DflashLoadError::Tensor {
                 name: "dflash_config.target_layer_ids".to_string(),
@@ -537,7 +601,6 @@ impl DflashConfig {
         )
         .map_err(|_| DflashLoadError::Missing("mask_token_id".to_string()))?;
 
-
         let config = Self {
             block_size,
             mask_token_id,
@@ -547,15 +610,23 @@ impl DflashConfig {
             q_heads: require(number("num_attention_heads"), "num_attention_heads")?,
             kv_heads: number("num_key_value_heads")
                 .map(|value| value as usize)
-                .unwrap_or_else(|| require(number("num_attention_heads"), "num_attention_heads").unwrap_or(1)),
+                .unwrap_or_else(|| {
+                    require(number("num_attention_heads"), "num_attention_heads").unwrap_or(1)
+                }),
             head_dim: number("head_dim")
                 .map(|value| value as usize)
                 .ok_or_else(|| DflashLoadError::Missing("head_dim".to_string()))?,
             intermediate: require(number("intermediate_size"), "intermediate_size")?,
-            sliding_window: number("sliding_window").map(|value| value as usize).unwrap_or(0),
+            sliding_window: number("sliding_window")
+                .map(|value| value as usize)
+                .unwrap_or(0),
             layer_is_sliding: layer_types,
-            rms_norm_eps: number("rms_norm_eps").map(|value| value as f32).unwrap_or(1e-6),
-            rope_theta: number("rope_theta").map(|value| value as f32).unwrap_or(10_000.0),
+            rms_norm_eps: number("rms_norm_eps")
+                .map(|value| value as f32)
+                .unwrap_or(1e-6),
+            rope_theta: number("rope_theta")
+                .map(|value| value as f32)
+                .unwrap_or(10_000.0),
             final_logit_softcapping: number("final_logit_softcapping")
                 .map(|value| value as f32)
                 .unwrap_or(0.0),
@@ -591,7 +662,6 @@ fn require(value: Option<f64>, name: &str) -> Result<usize, DflashLoadError> {
     }
     Ok(value as usize)
 }
-
 
 /// NaN/inf probe used by `dflash_nan_probe` to localise a bad stage, and by
 /// anyone debugging the drafter. Off unless `KAPLUMBA_DFLASH_TRACE` is set; the
@@ -893,7 +963,6 @@ impl DflashKvCache {
         self.total -= rows;
         Ok(())
     }
-
 }
 
 /// One draft-and-verify round's outcome (T9/R15).
@@ -1256,7 +1325,10 @@ mod sampler_tests {
             0.99
         };
         let token = sample_residual(&p, &q, &1u32, &mut draws_mut);
-        assert_eq!(token, 2, "the residual must not resample the rejected token");
+        assert_eq!(
+            token, 2,
+            "the residual must not resample the rejected token"
+        );
     }
 
     /// The exactness property the whole round rests on, checked numerically
@@ -1288,10 +1360,7 @@ mod sampler_tests {
             ),
             // A proposal that costs more than `p` allows it: `p/q >= 1` must
             // accept with probability 1, not 1/2.
-            (
-                map(&[(1, 0.6), (2, 0.4)]),
-                map(&[(1, 0.1), (2, 0.9)]),
-            ),
+            (map(&[(1, 0.6), (2, 0.4)]), map(&[(1, 0.1), (2, 0.9)])),
         ] {
             let quadrature = 2_000usize;
             let mut tally: BTreeMap<u32, f64> = BTreeMap::new();
@@ -1569,7 +1638,10 @@ mod tests {
         let with_anchor: Vec<u32> = (0..draft_rows)
             .map(|row| super::argmax_row(&logits, vocab, row))
             .collect();
-        assert_ne!(masked, with_anchor, "the two ranges must differ on this input");
+        assert_ne!(
+            masked, with_anchor,
+            "the two ranges must differ on this input"
+        );
     }
 }
 
@@ -1592,10 +1664,7 @@ impl From<kaplumba_kernels::exl3::KernelError> for DflashError {
 }
 
 impl DflashModel {
-    pub fn new(
-        weights: DflashWeights,
-        config: DflashConfig,
-    ) -> Result<Self, DflashError> {
+    pub fn new(weights: DflashWeights, config: DflashConfig) -> Result<Self, DflashError> {
         let model = Self {
             weights,
             config,
@@ -1711,7 +1780,10 @@ impl DflashModel {
                 }
             }
             for (name, width) in [
-                (format!("layers.{layer}.input_layernorm"), self.config.hidden_size),
+                (
+                    format!("layers.{layer}.input_layernorm"),
+                    self.config.hidden_size,
+                ),
                 (
                     format!("layers.{layer}.post_attention_layernorm"),
                     self.config.hidden_size,
@@ -1725,16 +1797,30 @@ impl DflashModel {
                     self.config.head_dim,
                 ),
             ] {
-                if self.weights.norm(&name).map(|values| values.len()).unwrap_or(0) != width {
+                if self
+                    .weights
+                    .norm(&name)
+                    .map(|values| values.len())
+                    .unwrap_or(0)
+                    != width
+                {
                     return Err(DflashError::Shape(format!(
                         "{name} does not have {width} values"
                     )));
                 }
             }
         }
-        if self.weights.norm("hidden_norm").map(|values| values.len()).unwrap_or(0)
+        if self
+            .weights
+            .norm("hidden_norm")
+            .map(|values| values.len())
+            .unwrap_or(0)
             != self.config.hidden_size
-            || self.weights.norm("norm").map(|values| values.len()).unwrap_or(0)
+            || self
+                .weights
+                .norm("norm")
+                .map(|values| values.len())
+                .unwrap_or(0)
                 != self.config.hidden_size
         {
             return Err(DflashError::Shape(
@@ -1751,11 +1837,7 @@ impl DflashModel {
     /// Public because the golden-reference harness (`dflash_golden`) needs to
     /// exercise the same entry point the block forward uses, and because a
     /// private copy in the test would not be the thing under test.
-    pub fn gemm(
-        &self,
-        name: &str,
-        input: &[u16],
-    ) -> Result<Vec<u16>, DflashError> {
+    pub fn gemm(&self, name: &str, input: &[u16]) -> Result<Vec<u16>, DflashError> {
         let line = self
             .weights
             .line(name)
@@ -1802,13 +1884,9 @@ impl DflashModel {
                 rows * width
             )));
         }
-        Ok(self.elements.rms_norm(
-            input,
-            weight,
-            rows,
-            width,
-            self.config.rms_norm_eps,
-        )?)
+        Ok(self
+            .elements
+            .rms_norm(input, weight, rows, width, self.config.rms_norm_eps)?)
     }
 
     fn residual(&self, left: &[u16], right: &[u16]) -> Result<Vec<u16>, DflashError> {
@@ -1890,13 +1968,9 @@ impl DflashModel {
                 rows * width
             )));
         }
-        Ok(self.elements.rms_norm_f32_in(
-            input,
-            weight,
-            rows,
-            width,
-            self.config.rms_norm_eps,
-        )?)
+        Ok(self
+            .elements
+            .rms_norm_f32_in(input, weight, rows, width, self.config.rms_norm_eps)?)
     }
 
     /// R4/R7: fuse the target's tap rows into the drafter's hidden width.
@@ -1906,11 +1980,7 @@ impl DflashModel {
     /// along the feature axis and projects once
     /// (`DFlashDraftModel.forward`, `dflash/model.py:582`), and that order is
     /// load-bearing: the fc weights were trained on that exact concatenation.
-    pub fn fuse_context(
-        &self,
-        taps: &[&[u16]],
-        n_ctx: usize,
-    ) -> Result<Vec<u16>, DflashError> {
+    pub fn fuse_context(&self, taps: &[&[u16]], n_ctx: usize) -> Result<Vec<u16>, DflashError> {
         let hidden = self.config.hidden_size;
         if taps.len() != self.config.num_taps() {
             return Err(DflashError::TapCount {
@@ -1939,10 +2009,7 @@ impl DflashModel {
     }
 
     /// R7/T3: run the 16-row block through all five layers.
-    pub fn forward_block(
-        &self,
-        context: &BlockContext<'_>,
-    ) -> Result<DflashBlock, DflashError> {
+    pub fn forward_block(&self, context: &BlockContext<'_>) -> Result<DflashBlock, DflashError> {
         let config = &self.config;
         let rows = config.block_size;
         let hidden = config.hidden_size;
@@ -2496,7 +2563,8 @@ impl DflashModel {
         })?;
         // Only the `block_size - 1` masked rows are new tokens; the anchor's own
         // logits predict a token the target has already produced.
-        let logits = self.draft_logits(&block.hidden, head, config.final_logit_softcapping, rows)?;
+        let logits =
+            self.draft_logits(&block.hidden, head, config.final_logit_softcapping, rows)?;
         let draft_rows = config.draft_tokens();
         if logits.len() < draft_rows * vocab {
             return Err(DflashError::Shape(format!(
@@ -2515,7 +2583,11 @@ impl DflashModel {
         // already emitted -- and dropped the last masked row. No test covered
         // this; `dflash_golden` only exercises `forward_block`.
         let tokens = select_draft_tokens(&logits, vocab, draft_rows);
-        Ok(DflashDraft { tokens, block, logits })
+        Ok(DflashDraft {
+            tokens,
+            block,
+            logits,
+        })
     }
 
     /// R11: apply the *target's* tied head and the drafter's softcap, exactly as

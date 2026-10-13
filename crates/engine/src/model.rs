@@ -6329,7 +6329,7 @@ pub(crate) const EXL3_PACKED_ALIGNMENT: u64 = 4;
 /// the first token fell from 11.42 (correct kernel) to 0.53 and the mean
 /// `|logit|` from 12.29 to 7.07, and the model emitted `edL laly own own owning
 /// own-CCCCCC`.
-fn align_packed_view(
+pub(crate) fn align_packed_view(
     device: &metal::Device,
     buffer: &Buffer,
     offset: u64,

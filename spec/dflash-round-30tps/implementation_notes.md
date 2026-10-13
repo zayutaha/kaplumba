@@ -152,3 +152,29 @@ next step is the full `(row, t)` acceptance matrix, which the probe already
 computes and prints only the best of. If the ridge is genuinely at t = r + 4,
 the block's position arithmetic (or the probe's comparison) is wrong and the
 real per-depth alpha is much closer to 0.85 than to 0.17.
+
+## 2026-10-13 — restore base weight residency for DFlash
+
+The requested reset to `d660a2e` left target `weights.rs` on its original mmap
+and `mlock` path, but DFlash had a separate loader in `dflash.rs` that called
+`File::read_exact` for each tensor and copied every packed `.trellis` into a new
+Metal buffer. That bypassed the intended old loading behavior for the drafter.
+
+`DflashWeights::load` now builds a single-shard `SafeTensorsIndex` and calls
+`TextWeights::load_dedicated`. Small MCG/scales/norm tensors are read from the
+base loader arena. Packed tensors use `zero_copy_tensor_buffer` and keep the
+`TextWeights` owner alive in `DflashWeights`; `pinned_bytes()` reports the
+loader's actual mlock accounting. Explicit `KAPLUMBA_RESIDENT_WEIGHTS` uses the
+base arena path. Packed offsets pass through the same `align_packed_view` used
+by target model loading; aligned ranges stay zero-copy, while misaligned ranges
+take its alignment-copy fallback. `model.rs` exposes that helper crate-wide.
+Target loading itself was not modified.
+
+Validation on 2026-10-13:
+
+- `cargo check -p kaplumba-engine` — passed.
+- `scripts/gpuq try -- cargo test -p kaplumba-engine --test dflash_load dflash_loader_uses_the_base_mmap_and_mlock_path -- --exact --nocapture` — passed on default mmap path.
+- `scripts/gpuq try -- env KAPLUMBA_RESIDENT_WEIGHTS=1 cargo test -p kaplumba-engine --test dflash_load dflash_loader_uses_the_base_mmap_and_mlock_path -- --exact --nocapture` — passed on explicit resident path.
+- `scripts/gpuq try -- cargo test -p kaplumba-engine --test dflash_load dflash_loader_realigns_misaligned_shard_views -- --exact --nocapture` — passed.
+- Coverage sabotage: temporarily bypassed `align_packed_view`; the unaligned test failed with offset `409` instead of `0`; restored helper and reran successfully.
+- No full 733 MB drafter/model run was started. The task was restoring loader semantics, and `gpuq status` showed 0.9 GiB available; no 30 tok/s throughput claim is made.

@@ -187,6 +187,11 @@ probe's overlaps are not substitute measurements for this engine.
 10. Preserve the target checkpoint and tokenizer. Alternative drafters must use
     the same target verifier; reduced draft vocabularies must not truncate p.
     Kernel-family and model-quality restrictions still apply to fallbacks.
+11. DFlash packed weights must use the base `TextWeights` mmap/no-copy Metal
+    path and its existing `mlock` policy. Keep the mapping owner alive for every
+    Metal view. Do not add a second `File::read_exact` plus per-tensor packed
+    copy loader for the drafter. Small scale and norm tensors may use the base
+    loader's resident arena.
 
 ## Requirements
 
@@ -218,6 +223,11 @@ probe's overlaps are not substitute measurements for this engine.
   tap_shift and export before Gemma layer_scalar against z-lab/HF post-layer
   semantics; record differences rather than adopting them blindly. Test combined
   layout/tap/embedding factors only with the correct head.
+* **L1 — shared residency path.** Load the DFlash safetensors shard through
+  `TextWeights`, so packed trellis ranges use the same mmap, no-copy Metal
+  views, and `mlock` policy as target weights. Retain the `TextWeights` owner
+  inside `DflashWeights`; keep scales and norms in its arena. Preserve the
+  target model's base loader unchanged.
 * **S1 — valid proposals.** For sampled mode draw every candidate from the exact
   q used by verification; greedy mode uses deterministic proposals. Match the
   supported temperature/top-k/top-p policy on p and q. The planned CLI path
@@ -308,6 +318,11 @@ probe's overlaps are not substitute measurements for this engine.
 * **AC10:** Any fallback has its own measured acceptance/cost/memory report and
   preserves exact target output semantics. Lookup gains on repetitive tasks do
   not establish 30 tok/s on general chat.
+* **AC11:** DFlash packed weights are sourced from the base `TextWeights` mmap
+  loader, pinned according to its `mlock` policy, and remain valid for the
+  drafter's lifetime. Tests confirm aligned no-copy views use the tensor's
+  actual packed offset and length, and misaligned views take the base loader's
+  required alignment-copy path without changing bytes.
 
 ## Open questions / scheduled evidence
 

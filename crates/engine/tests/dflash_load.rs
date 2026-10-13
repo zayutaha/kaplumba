@@ -8,6 +8,7 @@
 //! `DflashWeights::load` for the measurement and the exllamav3 citation.
 
 use std::collections::BTreeMap;
+use std::fs;
 use std::path::PathBuf;
 
 use kaplumba_engine::dflash::{DflashLoadError, DflashWeights};
@@ -55,6 +56,158 @@ fn expected_stems() -> usize {
         .count()
 }
 
+fn write_minimal_dflash_checkpoint(dir: &std::path::Path, misalign_trellis: bool) -> Vec<u8> {
+    fs::create_dir_all(dir).expect("fixture directory");
+    let padding = usize::from(misalign_trellis);
+    let trellis_end = padding + 8192;
+    let mcg_end = trellis_end + 4;
+    let suh_end = mcg_end + 256;
+    let svh_end = suh_end + 256;
+    let norm_end = svh_end + 256;
+    let mut entries = serde_json::Map::new();
+    if misalign_trellis {
+        entries.insert(
+            "padding".to_string(),
+            serde_json::json!({"dtype": "U8", "shape": [1], "data_offsets": [0, 1]}),
+        );
+    }
+    entries.insert(
+        "fc.mcg".to_string(),
+        serde_json::json!({"dtype": "I32", "shape": [1], "data_offsets": [trellis_end, mcg_end]}),
+    );
+    entries.insert(
+        "fc.suh".to_string(),
+        serde_json::json!({"dtype": "F16", "shape": [128], "data_offsets": [mcg_end, suh_end]}),
+    );
+    entries.insert(
+        "fc.svh".to_string(),
+        serde_json::json!({"dtype": "F16", "shape": [128], "data_offsets": [suh_end, svh_end]}),
+    );
+    entries.insert(
+        "fc.trellis".to_string(),
+        serde_json::json!({"dtype": "I16", "shape": [8, 8, 64], "data_offsets": [padding, trellis_end]}),
+    );
+    entries.insert(
+        "norm.weight".to_string(),
+        serde_json::json!({"dtype": "BF16", "shape": [128], "data_offsets": [svh_end, norm_end]}),
+    );
+    let header = serde_json::Value::Object(entries);
+    let mut header = serde_json::to_vec(&header).expect("fixture header json");
+    while !header.len().is_multiple_of(8) {
+        header.push(b' ');
+    }
+    let mut packed = Vec::with_capacity(8192);
+    for word in 0..4096_u16 {
+        packed.extend_from_slice(&word.to_le_bytes());
+    }
+    let mut payload = Vec::with_capacity(norm_end);
+    if misalign_trellis {
+        payload.push(0xa5);
+    }
+    payload.extend_from_slice(&packed);
+    payload.extend_from_slice(&kaplumba_engine::exl3::MCG_MULTIPLIER.to_le_bytes());
+    for _ in 0..256 {
+        payload.extend_from_slice(&0x3c00_u16.to_le_bytes());
+    }
+    for _ in 0..128 {
+        payload.extend_from_slice(&0x3f80_u16.to_le_bytes());
+    }
+    let mut file = Vec::new();
+    file.extend_from_slice(&(header.len() as u64).to_le_bytes());
+    file.extend_from_slice(&header);
+    file.extend_from_slice(&payload);
+    fs::write(dir.join("model.safetensors"), &file).expect("write fixture shard");
+    packed
+}
+
+#[test]
+fn dflash_loader_uses_the_base_mmap_and_mlock_path() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("kaplumba-dflash-loader-{stamp}"));
+    let expected_packed = write_minimal_dflash_checkpoint(&dir, false);
+    let shard = kaplumba_engine::safetensors::read_shard_header(&dir.join("model.safetensors"))
+        .expect("fixture header");
+    let device = metal::Device::system_default().expect("device");
+    {
+        let weights = DflashWeights::load(&dir, &device).expect("load synthetic drafter");
+        let line = weights.line("fc").expect("fc");
+        let resident_mode = std::env::var_os("KAPLUMBA_RESIDENT_WEIGHTS").is_some();
+        assert_eq!(
+            weights.mapped_trellis_bytes,
+            if resident_mode {
+                0
+            } else {
+                expected_packed.len() as u64
+            },
+            "drafter packed weights must follow the base loader's selected residency path"
+        );
+        assert!(
+            weights.pinned_bytes() <= shard.file_size,
+            "page-rounded mlock accounting must stay within the shard mapping"
+        );
+        assert!(
+            line.packed.is_empty(),
+            "packed weights must not be copied to a Vec"
+        );
+        assert_eq!(line.packed_len, Some(expected_packed.len() / 2));
+        let buffer = line.metal_buffer.as_ref().expect("packed Metal buffer");
+        assert!(line.metal_offset + expected_packed.len() as u64 <= buffer.length());
+        let actual = unsafe {
+            std::slice::from_raw_parts(
+                (buffer.contents() as *const u8).add(line.metal_offset as usize),
+                expected_packed.len(),
+            )
+        };
+        assert!(
+            actual == expected_packed.as_slice(),
+            "packed view bytes differ from the shard payload at offset {}",
+            line.metal_offset
+        );
+        if !resident_mode {
+            assert!(
+                line.metal_offset > 0,
+                "mmap view must retain the tensor offset"
+            );
+            assert_eq!(weights.mapped_trellis_bytes, 8192);
+        }
+        assert_eq!(weights.norm("norm").expect("norm").len(), 128);
+    }
+    fs::remove_dir_all(dir).expect("remove fixture");
+}
+
+#[test]
+fn dflash_loader_realigns_misaligned_shard_views() {
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_nanos();
+    let dir = std::env::temp_dir().join(format!("kaplumba-dflash-unaligned-{stamp}"));
+    let expected_packed = write_minimal_dflash_checkpoint(&dir, true);
+    let device = metal::Device::system_default().expect("device");
+    {
+        let weights = DflashWeights::load(&dir, &device).expect("load unaligned synthetic drafter");
+        let line = weights.line("fc").expect("fc");
+        assert!(weights.unknown_tensors.iter().any(|name| name == "padding"));
+        assert_eq!(weights.mapped_trellis_bytes, 0);
+        assert_eq!(
+            line.metal_offset, 0,
+            "unaligned views must be copied to an aligned buffer"
+        );
+        let buffer = line.metal_buffer.as_ref().expect("packed Metal buffer");
+        let actual = unsafe {
+            std::slice::from_raw_parts(buffer.contents() as *const u8, expected_packed.len())
+        };
+        assert!(
+            actual == expected_packed.as_slice(),
+            "realignment changed packed bytes"
+        );
+    }
+    fs::remove_dir_all(dir).expect("remove fixture");
+}
+
 #[test]
 fn dflash_load_has_every_tensor_and_the_right_shapes() {
     let d = dir();
@@ -83,6 +236,61 @@ fn dflash_load_has_every_tensor_and_the_right_shapes() {
     assert_eq!(fc.in_features, 32_256);
     assert_eq!(fc.out_features, 5_376);
     assert_eq!(header_shape("fc.trellis"), vec![2_016, 336, 64]);
+    let shard = kaplumba_engine::safetensors::read_shard_header(&d.join("model.safetensors"))
+        .expect("drafter header");
+    let trellis_bytes: u64 = shard
+        .tensors
+        .iter()
+        .filter(|(name, _)| name.ends_with(".trellis"))
+        .map(|(_, info)| info.byte_len())
+        .sum();
+    let resident_mode = std::env::var_os("KAPLUMBA_RESIDENT_WEIGHTS").is_some();
+    assert_eq!(
+        weights.mapped_trellis_bytes,
+        if resident_mode { 0 } else { trellis_bytes },
+        "default DFlash load must use the mapped path; explicit resident mode must use the arena"
+    );
+    assert!(
+        weights.pinned_bytes() <= weights.mapped_trellis_bytes,
+        "mlock cannot account for more packed data than the mapped trellis"
+    );
+    eprintln!(
+        "DFlash loader: mapped={} bytes, mlocked={} bytes",
+        weights.mapped_trellis_bytes,
+        weights.pinned_bytes()
+    );
+    assert!(
+        fc.packed.is_empty(),
+        "mapped EXL3 weights must not be copied to a Vec"
+    );
+    let fc_info = shard
+        .tensors
+        .get("fc.trellis")
+        .expect("fc trellis metadata");
+    assert_eq!(fc.packed_len, Some((fc_info.byte_len() / 2) as usize));
+    let buffer = fc.metal_buffer.as_ref().expect("fc Metal view");
+    let (start, _) = shard.absolute_range("fc.trellis").expect("fc range");
+    let page_offset = fc.metal_offset;
+    let packed_bytes = fc_info.byte_len() as usize;
+    assert!(page_offset + packed_bytes as u64 <= buffer.length());
+    let actual = unsafe {
+        std::slice::from_raw_parts(
+            (buffer.contents() as *const u8).add(page_offset as usize),
+            packed_bytes,
+        )
+    };
+    assert_eq!(
+        actual,
+        raw("fc.trellis"),
+        "mapped view must bind the exact tensor bytes"
+    );
+    if !resident_mode {
+        assert_ne!(start, 0, "fixture must exercise a nonzero shard offset");
+        assert!(
+            fc.metal_offset > 0,
+            "mapped view must preserve the tensor's intra-view offset"
+        );
+    }
 
     // Layer projections, from the header rather than from assumptions.
     for layer in 0..5 {
@@ -101,11 +309,31 @@ fn dflash_load_has_every_tensor_and_the_right_shapes() {
         let down = weights
             .line(&format!("layers.{layer}.mlp.down_proj"))
             .expect("down_proj");
-        assert_eq!((q.in_features, q.out_features), (5_376, 8_192), "layer {layer} q");
-        assert_eq!((k.in_features, k.out_features), (5_376, 1_024), "layer {layer} k");
-        assert_eq!((o.in_features, o.out_features), (8_192, 5_376), "layer {layer} o");
-        assert_eq!((gate.in_features, gate.out_features), (5_376, 10_752), "layer {layer} gate");
-        assert_eq!((down.in_features, down.out_features), (10_752, 5_376), "layer {layer} down");
+        assert_eq!(
+            (q.in_features, q.out_features),
+            (5_376, 8_192),
+            "layer {layer} q"
+        );
+        assert_eq!(
+            (k.in_features, k.out_features),
+            (5_376, 1_024),
+            "layer {layer} k"
+        );
+        assert_eq!(
+            (o.in_features, o.out_features),
+            (8_192, 5_376),
+            "layer {layer} o"
+        );
+        assert_eq!(
+            (gate.in_features, gate.out_features),
+            (5_376, 10_752),
+            "layer {layer} gate"
+        );
+        assert_eq!(
+            (down.in_features, down.out_features),
+            (10_752, 5_376),
+            "layer {layer} down"
+        );
         // 64 q heads x 128 = 8192 and 8 kv heads x 128 = 1024, from config.json.
         assert_eq!(q.out_features % (8 * 128), 0);
         assert_eq!(k.out_features % (8 * 128), 0);
@@ -115,7 +343,11 @@ fn dflash_load_has_every_tensor_and_the_right_shapes() {
     for name in ["fc", "layers.0.self_attn.q_proj", "layers.4.mlp.down_proj"] {
         let bytes = raw(&format!("{name}.mcg"));
         let value = i32::from_le_bytes(bytes[..4].try_into().unwrap());
-        assert_eq!(value as u32, kaplumba_engine::exl3::MCG_MULTIPLIER, "{name}");
+        assert_eq!(
+            value as u32,
+            kaplumba_engine::exl3::MCG_MULTIPLIER,
+            "{name}"
+        );
     }
 }
 
@@ -201,7 +433,11 @@ fn dflash_load_rejects_a_mismatched_codebook() {
     let staged = d.parent().unwrap().join("Drafter_bad_mcg");
     let _ = std::fs::remove_dir_all(&staged);
     std::fs::create_dir_all(&staged).expect("mkdir");
-    std::fs::copy(d.join("model.safetensors"), staged.join("model.safetensors")).expect("copy");
+    std::fs::copy(
+        d.join("model.safetensors"),
+        staged.join("model.safetensors"),
+    )
+    .expect("copy");
     std::fs::copy(d.join("config.json"), staged.join("config.json")).ok();
 
     // Corrupt one mcg in place: read the header, rewrite that tensor's four

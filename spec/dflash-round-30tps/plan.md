@@ -121,11 +121,23 @@ before asserting practical headroom.
 | `crates/engine/src/dflash.rs` | T1a samples from retained q; temperature 1/top-k policy; existing processed-anchor method | complete sampler policy, unprocessed-anchor API, independent stage diagnosis and verified context ownership |
 | `crates/engine/src/gpu_cache.rs` | `retract` only lowers cursor; sliding cache capacity equals window | reserve bounded chunk history in sliding rings; mask future rejected positions and validate cursor rollback |
 | `crates/engine/src/model.rs` | M=2 verify previously differed from sequential; projection-sign and cross-layer faults are repaired | keep attention window semantic unchanged, size physical sliding capacity for safe batched appends, prove boundary behavior |
+| `crates/engine/src/dflash.rs` + `crates/engine/src/weights.rs` | DFlash loader uses `File::read_exact` into per-tensor vectors and copies packed bytes into new Metal buffers | build a single-shard selection and pass it through existing `TextWeights::load_dedicated`; use zero-copy trellis views and retain `TextWeights` so its mmap and `mlock` lifetime covers every drafter buffer |
 | `crates/engine/src/generate.rs` | plain generation only | experimental loop after round correctness |
 | `crates/cli/src/{args,main,chat}.rs` | no drafter selection | explicit flags, loading, errors and metrics; supported chat policy |
 | `crates/engine/tests/dflash_equivalence.rs` and a future verifier timing harness | existing evidence does not establish the full round | sequential-vs-batched control, ideal-proposal ceiling and round equivalence; final filenames chosen during implementation |
 
 ## Diagnostic controls
+
+### L1 — drafter weight residency
+
+Construct a `TextTensorSelection` for the drafter's single safetensors shard,
+then call the base `TextWeights::load_dedicated` path. That loader maps the shard,
+pins `.trellis` ranges with its existing `LlamaMlock` policy, and supplies
+page-aligned Metal views. Build each drafter `QuantizedLinear` from the returned
+view and tensor offset; keep `TextWeights` owned by `DflashWeights` for the
+mapping lifetime. Read `.mcg`, scale vectors, and BF16 norm tensors from the
+loader's arena. If `KAPLUMBA_RESIDENT_WEIGHTS` selects the arena path, bind the
+resident tensor buffer instead. Do not change target weight loading.
 
 Index full head output with row stride `head.out_features`, then select columns.
 Compare the same inputs, packing, signs, permutation, transform normalization,
@@ -235,3 +247,4 @@ same interleaved plain baseline. Existing kernel-family restrictions apply.
 | AC8 | V0a, V0b |
 | AC9 | T1b, T3, T16, T12 |
 | AC10 | F1a, F1b, T13, T14 |
+| AC11 | T20 |

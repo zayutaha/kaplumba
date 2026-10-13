@@ -218,6 +218,18 @@ branches selected from those results, not mandatory simultaneous implementations
   persistent draft KV. Test graph/precision/greedy equivalence and state ownership
   before any A/B performance claim. Use existing kernel bodies; no new family
   is authorized by this performance item.
+- [x] **T20 — load DFlash packed weights through base mmap + mlock path.**
+  Files: `crates/engine/src/dflash.rs`, `crates/engine/tests/dflash_load.rs`,
+  this spec's plan/tasks/notes. Replace the DFlash loader's per-tensor file reads
+  and packed copies with `TextWeights::load_dedicated`, use exact zero-copy
+  tensor offsets/lengths, and retain the `TextWeights` owner in `DflashWeights`.
+  Keep the target model loader unchanged. Test a DFlash checkpoint load, tensor
+  byte/shape parity, pinned-byte reporting, and both default mmap and explicit
+  `KAPLUMBA_RESIDENT_WEIGHTS` arena paths. Verified the unaligned offset
+  fallback separately. `cargo check -p kaplumba-engine` and all three focused
+  loader tests passed. The unaligned test failed with a temporary bypass of
+  `align_packed_view` (offset 409 instead of aligned offset 0), then passed when
+  restored. Implementation commit hash is recorded in the follow-up notes.
 
 ## Conditional alternatives after the shared verifier gate
 
