@@ -574,3 +574,122 @@ right: 1`. Restored the print and reran.
 1 ignored (checkpoint-only). `git diff --check` passed. The successful syscall
 ledger remains separate from full-model OS region wire verification. Source
 commit `81df21a`.
+
+## 2026-10-14 — D2 live screenshot diagnosis; documentation only
+
+User steering: after inspecting Activity Monitor, requested investigation and
+amendment only, explicitly no code. Existing model PID 39967 remained loaded;
+no second instance was started and this task changed no product/test/script/model
+file. Two unrelated concurrent edits appeared in `crates/engine/src/exl3.rs`
+and `crates/kernels/src/linear.metal` after the initially clean status. They are
+left untouched and excluded from the documentation commit.
+Source tree `a118f23`, successful-summary implementation `81df21a`.
+
+Reload used `scripts/gpuq status` then
+`scripts/gpuq try -- ./target/release/kaplumba --model
+"$HOME/.kaplumba/models/Gxma-repacked" --chat`, interactive PTY session 97128.
+Preload report: 0.2 GiB available, 5.8 GiB active pages mislabeled as process use,
+2,713 MiB swap. User had expressly requested a forced reload. Load took
+3,278 ms. Complete summary (no profiling flag):
+
+```text
+eligible_page_bytes=12046221312 requested_page_bytes=12046221312
+attempted_page_bytes=12046221312 locked_page_bytes=12046221312
+failed_page_bytes=0 evictable_page_bytes=0 disabled_page_bytes=0
+excluded_tensor_bytes=0 copied_tensor_bytes=0 failure=none
+```
+
+User screenshot at 08:08:48: PID 39967 / kaplumba 1.81 GB, physical memory
+24.00 GB, memory used 19.23 GB, cached files 4.75 GB, swap 3.22 GB,
+app memory 2.29 GB, wired 14.67 GB, compressed 1.54 GB; graph green with an
+earlier transient peak. Preserve displayed GB as displayed; do not silently
+convert this screenshot into exact binary bytes or full-workload acceptance.
+
+Read-only commands at 08:09:55:
+
+```sh
+ps -p 39967 -o pid,comm
+vmmap -summary 39967
+vmmap -wide -interleaved 39967 > /tmp/kaplumba-live-39967-vmmap.txt
+sysctl -n vm.swapusage
+top -l 1 -n 0
+```
+
+Selected live OS output:
+
+```text
+Physical footprint: 1.8G; peak: 2.2G
+REGION                     VIRTUAL RESIDENT DIRTY   SWAPPED
+IOAccelerator (graphics)   1.8G    1.6G     5888K   1.6G
+mapped file                16.0G   11.2G    0K      0K
+TOTAL                      405.5G  13.1G    87.1M   1.7G
+model-00002-of-00002.safetensors: [7.0G 5.9G 0K 0K] r--/r-x SM=SHM
+model-00001-of-00002.safetensors: [7.9G 5.3G 0K 0K] r--/r-x SM=SHM
+vm.swapusage: used=3203.69M
+PhysMem: 23G used (15G wired, 1319M compressor), 104M unused
+```
+
+`vmmap` reports rounded sizes. Its graphics resident/swapped/shared counters
+can overlap; adding those columns would fabricate demand. The 1.8 GiB footprint
+omits the large clean shared file residency observed here. It does not mean
+weights are unprotected. Real lock syscall success is observed; current
+`vmmap -help` exposes no per-region user-wire-count option, so that independent
+full-hot-set gate remains unproven. Global wired memory is supporting evidence,
+not a substitute. Source `weights.rs:1513–1516` has no lock-ledger Drop unlock;
+`weights.rs:1603–1608` calls real `libc::mlock`; `weights.rs:1761–1775` maps
+read-only shared; backing `munmap` releases the wire on shard destruction.
+
+Paging is still observed in non-file/graphics regions. System swap increased
+about 491 MiB relative to the reload baseline, but this is a desktop-wide
+delta without host attribution. Green idle pressure and no swapped mapped-file
+bytes are insufficient to claim AC3 passed or full wiring independently proven.
+`evictable_page_bytes=0` describes selected packed hot pages, not KV/scratch,
+uploaded side vectors or every byte in the model process.
+
+Allocation diagnosis: local config has 50 sliding layers, 10 full layers,
+window=1024, KV heads=16, sliding head width=256. Default prefill chunk=1024.
+`model.rs:1187–1215` constructs sliding caches at window + prefill chunk=2048;
+`gpu_cache.rs:90–124` allocates separate shared keys, values and tags. Per K/V
+buffer: 2048*16*256*2=16,777,216 bytes. Aggregate: 100 buffers,
+1,677,721,600 bytes (1.5625 GiB) plus 409,600 logical tag bytes. Read-only
+region inspection finds exactly 100 16.0M graphics regions both in PID 39967
+and the prior diagnostic's `/tmp/kaplumba-t5-diagnostics/idle-regions.txt`.
+Example from PID 39967:
+
+```text
+10c854000-10d854000 [16.0M 16.0M 80K 15.9M] rw-/rw- SM=SHM PURGE=N
+10d854000-10e854000 [16.0M 16.0M 96K 15.9M] rw-/rw- SM=SHM PURGE=N
+```
+
+Matching shape/count is strong evidence of eager KV demand but does not prove
+pointer ownership for every region. T5a must correlate actual buffer addresses.
+`model.rs:4078–4117` warms two-token prefill, resets, then one-token decode and
+pipelined decode, then resets again. Idle caches need far less than 2048 slots.
+
+Prior diagnostic session PID 34645 (same T3b build): preload available 0.7 GiB,
+swap 1968.56 MiB; loaded in 4909 ms; complete 12,046,221,312-byte lock summary.
+Post-load idle swap 2874.31 MiB and later 2944.56 MiB after one short turn.
+Its vmmap graphics class had about 1.2 GiB swapped; mapped files remained clean,
+resident and unswapped. Prompt "Say hi." with max-new-tokens=1 used 16 prefill
+tokens. The printed ~903 tok/s from one generated token is not useful decode
+throughput. Temporary logs are scratch only, not durable evidence dependencies.
+Core findings are transcribed above. No matched A/B acceptance exists.
+
+Plan decision: evaluate sliding KV growth at the common forward boundary,
+preserving retained-window + append overlap and exact absolute-position mapping.
+`gpu_cache.rs:220–294` currently copies a prefix for full caches; reusing it
+on a wrapped sliding ring would lose/misplace data. `model.rs:4843` already
+waits for prefill staging; one-token pipelined growth also requires prior GPU
+completion. Physical ring reorder may change floating-point accumulation, so
+byte-preserving migration alone cannot establish output exactness. Measure
+replacement/autorelease peaks. Full 2048-slot capacity can still be needed for
+long chunks; this proposed reduction has no demonstrated 8k benefit yet.
+
+`scripts/gpuq:155–160` says a low-memory load is usually enough because model
+pages are evicted on demand. That is incompatible with the required hot-set
+wire policy. Its active-page figure is not measured process ownership. T5c
+corrects both in a later implementation; this turn leaves scripts untouched.
+
+D2 validation: `git diff --check -- spec/mlock-clean-mmap` and scoped documentation diff review; no new
+code/test-coverage or successful paging-fix claim. T5a–T5d and full T4/T6 remain
+unchecked. D2 commit is recorded by the immediate metadata follow-up.

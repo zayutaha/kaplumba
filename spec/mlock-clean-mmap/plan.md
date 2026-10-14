@@ -7,6 +7,11 @@ Amendment status (2026-10-14): T1–T3 do not satisfy full acceptance. The force
 model process. Keep the shared mapping fix, but require T3b diagnostics and T5
 allocation/capacity attribution before selecting further product changes.
 
+D2 amendment: T3b is implemented. PID 39967's live idle snapshot records a
+complete 12,046,221,312-byte lock ledger, clean shared resident weight mappings,
+and substantial swapped graphics allocations. The first reduction to evaluate
+is eager sliding KV allocation. This amendment changes documentation only.
+
 Preserve the existing path:
 
 ```text
@@ -171,6 +176,66 @@ alongside process footprint; neither number alone is total unified-memory use.
 
 ## Sequencing, risks and fallbacks
 
+### D2 selected allocation candidate and evidence sequence
+
+1. **T5a: prove ownership and current wiring.** Reconcile actual cache buffer
+   addresses/lengths with graphics VM regions; record exact logical/allocated
+   bytes rather than adding overlapping `vmmap` columns. Independently inspect
+   the merged hot layer/head page ranges for user wiring after binding/warmup,
+   prefill, decode and idle/resume using supported native SDK/OS diagnostics.
+   Missing permission or missing tooling leaves the relevant gate open. The
+   1.8 GiB process footprint, 11.2 GiB mapped residency and ~15 GiB system wiring
+   are distinct observations, not a full per-region wire proof.
+2. **T5b: grow sliding caches on demand.** Touch `gpu_cache.rs` for a dedicated
+   sliding growth operation, `model.rs` for construction and forward-boundary
+   growth, and `tests/kv_growth_policy.rs` plus relevant GPU attention/model
+   regressions. Start with enough slots for the two-token load warmup rather
+   than 2,048 slots per sliding layer. Before an append at cursor `p` of `n`
+   tokens, require at least `min(p, window) + n` slots, with checked arithmetic
+   and the existing window + maximum supported append bound. Define and test
+   any geometric growth rounding explicitly; do not silently allocate a new
+   worst-case reserve. Retain existing maximum-chunk behavior.
+3. On growth, carry the retained absolute positions into `position % new_capacity`
+   slots, copying their exact FP16 K/V bytes from `position % old_capacity`;
+   initialize every unused position tag to `EMPTY_POSITION`. Full-attention
+   growth's contiguous-prefix copy is unsuitable after a sliding ring wraps.
+   Preserve or explicitly reject invalid/missing positions before GPU dispatch.
+   Do not overwrite an oldest key needed by an early query when a whole chunk
+   is appended before attention.
+4. Grow at the common forward boundary used by ordinary and pipelined decode.
+   Drain all previously queued GPU work once before CPU migration/replacement;
+   retain old buffers through completion. Reuse the existing prefill staging
+   barrier where safe. No per-layer wait or pressure polling on each decode
+   token. Measure old/new overlap, migration and any autorelease retention;
+   avoid replacing all 50 layers' buffers before releasing retired storage.
+5. Changing ring capacity also changes physical attention scan order after
+   wrap. FP16 byte preservation alone does not prove numerical/output equality.
+   Test attention results and matched greedy generation across repeated wraps,
+   growth and multi-turn chunks against the current 2,048-slot implementation.
+   If the existing kernels cannot preserve the required quality/exactness,
+   amend the design before proceeding; do not waive the restriction silently.
+6. **T5c: honest diagnostics.** Touch `scripts/gpuq`, its existing memory-report
+   tests, and named load diagnostics only after the measured ledger exists.
+   Remove the assertion that locked weights are reclaimable/evictable and the
+   unconditional low-memory reassurance. Label `vm_stat` active pages accurately,
+   preserve unit handling, and retain the engine as the sole GPU lock owner.
+   Warn and continue for insufficient supply, without an invented safe cutoff.
+7. **T5d/T4: measure acceptance.** Compare the unchanged current release with the
+   selected allocation change, A/B/A/B with matched desktop conditions and one
+   model at a time. Include post-warmup idle, short chat, 1k/2k/8k, repeated
+   turns, ring growth and idle/resume. Record actual savings and replacement
+   peaks as well as wire state, swap, attributable weight I/O, output and timing.
+   Expect the full sliding allocation at large chunks; lower idle demand cannot
+   by itself close the long-context gate. Preserve failed runs and background
+   confounders. Do not change hot locks to manufacture a passing result.
+
+Source touchpoints: `model.rs:1187–1215` eagerly constructs sliding KV;
+`gpu_cache.rs:90–124` allocates keys/values/tags;
+`gpu_cache.rs:220–294` grows only full caches with prefix migration;
+`model.rs:4789` is the common forward chunk path;
+`model.rs:4843` waits before prefill host staging;
+`model.rs:4078` warms two-token prefill then one-token decode with resets.
+
 T1 (mapping) precedes T2/T3 (accounting and failure reporting). T4's first forced
 run failed. T3b then precedes T5 allocation/capacity diagnosis and its selected
 small fixes; rerun the failed T4 gates after those changes. T6 reconciles docs and
@@ -198,6 +263,8 @@ records acceptance. None authorizes DFlash work.
 | R6 | T4, T5, T6 |
 | R7 | T3b, T4, T5 |
 | R8 | T4, T5 |
+| R9 | T5a, T5b, T5d, T4 |
+| R10 | T3b, T5a, T5c, T4 |
 | AC1 | T1 |
 | AC2 | T2, T3, T3b |
 | AC3, AC4 | T4, T5 |

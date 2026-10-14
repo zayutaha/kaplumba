@@ -4,7 +4,7 @@ Every implementation step requires its meaningful tests, a demonstrated failing
 negative control before any coverage claim, notes, status update and commit.
 
 Current result: **acceptance failed** on the forced 1,034-token candidate run.
-This amendment changes documentation only. Completed T1–T3 are component work,
+This amendment changes documentation only. Completed T1–T3b are component work,
 not a completed paging fix; all subsequent implementation remains unchecked.
 
 - [x] **D0 — investigate the regression and draft the spec.**
@@ -83,6 +83,33 @@ not a completed paging fix; all subsequent implementation remains unchecked.
   duplicates, KV replacement peaks and whole-shard Metal residency. Preserve
   precision and all-hot real locking. Benchmark every selected reduction;
   untested candidate ideas do not become completed tasks.
+- [ ] **T5a — attribute sliding KV and independently inspect hot-region wires.**
+  Files: a bounded opt-in diagnostic if necessary, notes. Match live Metal cache
+  addresses/lengths to VM regions and measure phase allocation; inspect every
+  selected layer/head range's observed wiring. Use existing supported diagnostics
+  first. Resident pages and successful syscall counts alone cannot close AC6.
+  Record failure controls before claiming any new diagnostic coverage.
+- [ ] **T5b — allocate sliding KV on demand with safe ring migration.**
+  Files: `crates/engine/src/gpu_cache.rs`, `crates/engine/src/model.rs`,
+  `crates/engine/tests/kv_growth_policy.rs` and named attention/model regressions.
+  Follow D2's plan: small warmup capacity, checked retained-window + chunk
+  capacity, absolute-position remapping, empty tags, completed GPU references
+  before migration, and bounded replacement overlap. Test unwrapped/wrapped
+  growth, window/chunk boundaries, repeated wraps, reset/retract interactions,
+  invalid inputs, no-op growth and queued GPU writes. Sabotage ring remapping,
+  synchronization and chunk capacity separately; require diagnostic failures.
+  Verify attention/greedy equality despite changed physical scan order.
+- [ ] **T5c — correct reclaimability and capacity reporting.**
+  Files: `scripts/gpuq`, existing report tests and precisely selected load
+  diagnostics. Explain active-page counts accurately; remove claims that wired
+  hot weights are evictable and that every low-memory load is safe. Preserve
+  warning-and-continue, unit parsing and the engine-owned GPU lock. Test both
+  healthy/degraded reports and demonstrate failure under wrong messaging.
+- [ ] **T5d — demonstrate selected reduction and resume T4.**
+  Files: acceptance evidence and notes. A/B/A/B idle/short/1k/2k/8k workloads,
+  repeated turns and idle/resume. Measure demand and replacement peaks, confirm
+  hot locks persist, and verify output/throughput and paging/I/O acceptance.
+  No measured allocation saving or full-spec success is claimed yet.
 - [ ] **T6 — reconcile stale claims and close acceptance.**
   Files: this folder and the specific historical loader documentation whose
   claims contradict the new evidence. Mark old `MAP_PRIVATE`-is-clean-under-lock
@@ -98,3 +125,13 @@ not a completed paging fix; all subsequent implementation remains unchecked.
   mechanism evidence, not actual-loader/full-model coverage. Require visible
   successful summaries and allocation/capacity attribution. Validate document
   consistency and `git diff --check`. Completed `2026-10-14`; commit `2a1646c`.
+- [x] **D2 — diagnose the live screenshot and amend documentation only.**
+  Files: this folder's four documents. Inspect existing PID 39967 without a
+  second load. Record the complete lock summary, screenshot/system accounting,
+  live clean shared mappings and swapped graphics regions. Match cache-shape
+  arithmetic to 100 observed 16 MiB regions, retaining pointer attribution and
+  per-region wire checks as open gates. Specify sliding growth and truthful
+  capacity reporting as future tasks; record numerical-order and GPU-lifetime
+  risks. No implementation or code-test coverage claim. Verify diff and ensure
+  this task changed only the four spec documents. Completed `2026-10-14`;
+  commit recorded in the metadata follow-up.

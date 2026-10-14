@@ -1,7 +1,8 @@
 # spec/mlock-clean-mmap
 
 Status: T1–T3b are implemented; full-model acceptance FAILED on the forced run.
-T5 allocation and capacity work remains open.
+T5 allocation and capacity work remains open. D2 identifies eager sliding KV
+allocation as the first reduction to evaluate; no allocation fix is implemented.
 User confirmed scope after clarification: ordinary chat with `Gxma-repacked`,
 green memory pressure and no repeated weight streaming after load, 1k/2k/8k
 contexts, and warning-and-continue when locking fails. DFlash work remains paused.
@@ -19,7 +20,7 @@ preserve output quality, decode throughput, and load/TTFT behavior.
 Current baseline: `e1032d44984000f1f4e5e2946810089c63599fe1`.
 Preserved pre-reset comparison: `d6354c54def4ca87a4abb08811e3848a4111473e`.
 
-| Behavior | Preserved loader | Current loader |
+| Behavior | Preserved loader | D0 baseline loader (before T1–T3b) |
 |---|---|---|
 | Read-only shard mapping | `MAP_SHARED` | `MAP_PRIVATE` |
 | Lock set | Budgeted layer trellis, excluding output head | All aligned mapped trellis, including output head; no byte budget |
@@ -78,6 +79,56 @@ owners and the host share of the swap growth remain to be measured. Claims that
 the entire model is not locked, or that the packed weights themselves were
 swapped, are not established by this run. The current design fails the user's
 no-paging outcome and requires allocation/capacity work before further acceptance.
+
+### D2 — live Activity Monitor check and allocation diagnosis (2026-10-14)
+
+The user requested a reload and then documentation only. The existing release
+build (`a118f23` tree, T3b source `81df21a`) loaded `Gxma-repacked` as PID 39967
+in 3,278 ms, then stayed idle at the chat prompt. Its unconditional summary
+reported requested=attempted=locked=12,046,221,312 bytes, failed=evictable=0,
+failure=none. That is successful real `mlock` accounting, not a sampled kernel
+wire count for each region.
+
+The user's 08:08:48 screenshot shows kaplumba 1.81 GB, system wired 14.67 GB,
+green pressure, and 3.22 GB existing swap. Live `vmmap` at 08:09:55 reports
+footprint 1.8 GiB (peak 2.2 GiB), mapped-file resident 11.2 GiB, dirty=0,
+swapped=0. The two checkpoint mappings are read-only `SM=SHM`, with rounded
+resident sizes 5.9 GiB and 5.3 GiB. Thus the small process figure does not mean
+the large shared weight working set disappeared or is available for eviction.
+The lock ledger and system wired total support successful wiring; direct
+per-hot-region verification remains AC6. Neither a resident snapshot nor green
+pressure alone proves that every required page remains locked.
+
+At the same sample, `IOAccelerator (graphics)` reports 1.8 GiB virtual,
+1.6 GiB resident, 5,888 KiB dirty and 1.6 GiB swapped. These columns must not
+be summed as disjoint physical allocations: shared Metal accounting can overlap.
+System swap was 2,713 MiB before this reload and 3,203.69 MiB at inspection
+(about +491 MiB); the host share of that increase is unresolved. The screenshot
+is a green idle snapshot, not a no-paging acceptance result.
+
+The first identified excess allocation is sliding KV: 50 layers preallocate
+2,048 positions (1,024 window + 1,024 maximum append chunk). Each layer owns
+two 16 MiB FP16 buffers (16 KV heads × 256 head width), totaling
+1,677,721,600 bytes / 1.5625 GiB, plus 409,600 bytes of position tags. Both
+live inspections contain exactly 100 graphics regions of 16 MiB, mostly
+swapped in the idle snapshots. This matches the cache shape and identifies a
+strong allocation candidate; definitive pointer-to-region ownership remains
+required before claiming every one of those swapped regions is KV. Warmup
+uses only two prefill tokens, resets, then one-token decode steps. Allocating
+the maximum cache at construction is unnecessary for that idle workload.
+
+The actual remaining problem is excessive pageable runtime demand beside the
+locked hot weights, compounded by desktop demand. Small side-weight GPU copies
+are also outside the packed-weight lock set; do not claim all model allocations
+are wired. Evaluate sliding KV allocation on demand while preserving the exact
+window, chunk overlap, safe GPU retirement and output requirements. The intended
+benefit is lower idle/short-chat allocation; long prefill can require the full 2,048
+slots. No result yet proves this candidate fixes 1k/2k/8k paging.
+
+`scripts/gpuq` also wrongly reassures that the locked model is reclaimable and
+can be evicted on demand. Its active-page count is labeled as process ownership.
+Those claims conflict with the intended real locking and must be corrected in
+a future implementation step.
 
 ## Non-goals / restrictions
 
@@ -153,6 +204,19 @@ no-paging outcome and requires allocation/capacity work before further acceptanc
    over-capacity desktop pass green/no-swap acceptance. Healthy acceptance needs
    a recorded desktop supply that covers the measured total demand; arbitrary
    background workloads cannot be promised zero swap.
+9. **R9 — allocate sliding KV for actual demand.** Evaluate a small initial
+   sliding cache with growth before append to hold the retained attention
+   window plus the incoming chunk. Preserve all live absolute positions and
+   FP16 K/V bytes when ring capacity changes; synchronize before reading or
+   replacing buffers referenced by queued GPU work. Keep the existing maximum
+   chunk/window behavior and context policy. Demonstrate lower idle/short-chat
+   allocation and replacement peaks without output or throughput regression.
+   Do not mark this requirement met from predicted byte savings.
+10. **R10 — explain lock and capacity state accurately.** Report packed hot-set
+    locking separately from pageable side weights, KV/scratch and host demand.
+    A low Activity Monitor process footprint must not trigger weight copying or
+    a claim of failed locking. Capacity diagnostics must never describe locked
+    pages as evictable cache or active pages as summed process ownership.
 
 ## Acceptance criteria
 
@@ -189,6 +253,11 @@ no-paging outcome and requires allocation/capacity work before further acceptanc
   can overlap. Prove any selected allocation fix reduces its measured demand.
   Forced insufficient-capacity runs must visibly report degraded capacity and
   remain failed acceptance even if all weight locks succeed.
+  For R9/R10, correlate KV buffers to regions, compare idle/short/long-chat
+  allocation and growth peaks, and verify diagnostics do not promise eviction
+  of locked weights. Ring-growth tests must fail under deliberately broken
+  modulo remapping, missing GPU synchronization and insufficient chunk capacity;
+  preserve exact output across wrap, growth, reset and repeated turns.
 
 ## Open questions / evidence gates
 
@@ -199,6 +268,8 @@ of live private copies in a full baseline run; whether restoring shared mapping
 alone with the existing hot lock set meets normal-chat pressure/I/O acceptance;
 which runtime/desktop allocations account for the forced run's swap growth;
 and the smallest allocation reduction that satisfies the recorded desktop
-budget. Further physical-memory work is now required for the failing workload.
+budget. D2 identifies sliding KV preallocation as a measured-shape candidate;
+pointer attribution, actual savings and output/pressure acceptance remain open.
+Further physical-memory work is required for the failing workload.
 The exact full-model OS wire state remains unrecorded. These are explicit
 measurement gates, not defaults silently chosen by this draft.
