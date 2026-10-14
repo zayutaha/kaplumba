@@ -1,8 +1,7 @@
 # spec/mlock-clean-mmap
 
-Status: T1–T3 are committed; full-model acceptance FAILED on the forced run.
-The 2026-10-14 amendment is investigation/specification only. T3b and T5
-describe required follow-up implementation; neither is implemented.
+Status: T1–T3b are implemented; full-model acceptance FAILED on the forced run.
+T5 allocation and capacity work remains open.
 User confirmed scope after clarification: ordinary chat with `Gxma-repacked`,
 green memory pressure and no repeated weight streaming after load, 1k/2k/8k
 contexts, and warning-and-continue when locking fails. DFlash work remains paused.

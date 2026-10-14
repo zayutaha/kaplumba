@@ -42,14 +42,15 @@ not a completed paging fix; all subsequent implementation remains unchecked.
   second load still reports its shortfall. Sabotage warning emission and
   demonstrate a named failure. Completed `2026-10-14`; implementation commit
   `6cecdd6`.
-- [ ] **T3b — expose successful locks on every load.**
+- [x] **T3b — expose successful locks on every load.**
   Files: `crates/engine/src/weights.rs`, focused load-output tests and notes.
   Always print one compact lock/policy summary, including full success,
   without requiring `KAPLUMBA_LOAD_PROFILE`. Test complete, partial, disabled,
   excluded/copied and repeated loads. Suppress the successful summary as a
   negative control, require a named missing-summary failure, then restore.
   Independent OS wire verification remains T5/T4; do not label syscall counts
-  alone as that verification.
+  alone as that verification. Completed `2026-10-14`; implementation commit
+  pending.
 - [ ] **T4 — prove ordinary-chat memory and I/O behavior.**
   Files: a bounded acceptance harness if required and notes. Run single-model
   `Gxma-repacked` A/B/A/B at 1k/2k/8k with generation inside the existing limit,

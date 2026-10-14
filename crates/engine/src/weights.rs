@@ -1176,7 +1176,7 @@ impl TextWeights {
                 "warning: {}; continuing with evictable or excluded packed weights. Increase vm.user_wire_limit / vm.global_user_wire_limit or RLIMIT_MEMLOCK if the lock failure is unexpected",
                 format_mlock_summary(&summary)
             );
-        } else if std::env::var_os("KAPLUMBA_LOAD_PROFILE").is_some() {
+        } else {
             eprintln!("{}", format_mlock_summary(&summary));
         }
         if pinned_tensors > 0 && std::env::var_os("KAPLUMBA_LOAD_PROFILE").is_some() {
@@ -2046,8 +2046,8 @@ mod tests {
     const LOCK_SELECTION_CHILD: &str = "KAPLUMBA_LOCK_SELECTION_CHILD";
 
     #[test]
-    fn disabled_or_copied_weights_report_no_mapped_lock_bytes() {
-        for copied in [false, true] {
+    fn complete_disabled_or_copied_loads_report_their_lock_state() {
+        for mode in ["complete", "disabled", "copied"] {
             let mut command = std::process::Command::new(std::env::current_exe().unwrap());
             command
                 .args([
@@ -2057,19 +2057,45 @@ mod tests {
                 ])
                 .env(LOCK_SELECTION_CHILD, "1")
                 .env_remove("KAPLUMBA_NO_PIN_TRELLIS")
-                .env_remove("KAPLUMBA_RESIDENT_WEIGHTS");
-            if copied {
+                .env_remove("KAPLUMBA_RESIDENT_WEIGHTS")
+                .env_remove("KAPLUMBA_LOAD_PROFILE");
+            if mode == "copied" {
                 command.env("KAPLUMBA_RESIDENT_WEIGHTS", "1");
-            } else {
+            } else if mode == "disabled" {
                 command.env("KAPLUMBA_NO_PIN_TRELLIS", "1");
             }
-            let status = command
-                .status()
+            let output = command
+                .output()
                 .expect("failed to run lock-selection child");
             assert!(
-                status.success(),
-                "lock-selection child failed (copied={copied})"
+                output.status.success(),
+                "lock-selection child failed (mode={mode}): {}",
+                String::from_utf8_lossy(&output.stderr)
             );
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert_eq!(
+                stderr.matches("mlock summary model=").count(),
+                1,
+                "each {mode} load must emit one lock summary without profiling: {stderr}"
+            );
+            let page = page_size();
+            match mode {
+                "complete" => {
+                    assert!(!stderr.contains("warning: mlock summary"));
+                    assert!(stderr.contains(&format!("requested_page_bytes={page}")));
+                    assert!(stderr.contains(&format!("locked_page_bytes={page}")));
+                    assert!(stderr.contains("failure=none"));
+                }
+                "disabled" => {
+                    assert!(stderr.contains("warning: mlock summary"));
+                    assert!(stderr.contains(&format!("disabled_page_bytes={page}")));
+                }
+                "copied" => {
+                    assert!(stderr.contains("warning: mlock summary"));
+                    assert!(stderr.contains("copied_tensor_bytes=128"));
+                }
+                _ => unreachable!(),
+            }
         }
     }
 
@@ -2106,21 +2132,30 @@ mod tests {
             .expect("child fixture must contain an aligned packed range");
         let weights = TextWeights::load_dedicated(&dir, &selection, context, 1024 * 1024)
             .expect("fixture must still load when locking is disabled or weights are copied");
-        assert_eq!(weights.pinned_bytes(), 0);
-        assert_eq!(weights.pinned_unique_bytes(), 0);
         let tensor = weights.tensor(name).unwrap();
         let copied = std::env::var_os("KAPLUMBA_RESIDENT_WEIGHTS").is_some();
+        let disabled = std::env::var_os("KAPLUMBA_NO_PIN_TRELLIS").is_some();
         assert_eq!(!tensor.spans.is_empty(), copied);
         let summary = weights.mlock_summary();
         if copied {
+            assert_eq!(weights.pinned_bytes(), 0);
+            assert_eq!(weights.pinned_unique_bytes(), 0);
             assert_eq!(summary.copied_tensor_bytes, payload.len() as u64);
             assert_eq!(summary.excluded_tensor_bytes, payload.len() as u64);
             assert_eq!(summary.eligible_page_bytes, 0);
-        } else {
+        } else if disabled {
+            assert_eq!(weights.pinned_bytes(), 0);
+            assert_eq!(weights.pinned_unique_bytes(), 0);
             assert_eq!(summary.eligible_page_bytes, page_size() as u64);
             assert_eq!(summary.requested_page_bytes, 0);
             assert_eq!(summary.disabled_page_bytes, page_size() as u64);
             assert_eq!(summary.evictable_page_bytes, page_size() as u64);
+        } else {
+            assert_eq!(weights.pinned_bytes(), payload.len() as u64);
+            assert_eq!(weights.pinned_unique_bytes(), page_size() as u64);
+            assert_eq!(summary.requested_page_bytes, page_size() as u64);
+            assert_eq!(summary.locked_page_bytes, page_size() as u64);
+            assert_eq!(summary.evictable_page_bytes, 0);
         }
         if copied {
             assert_eq!(weights.read_tensor(name).unwrap(), payload);

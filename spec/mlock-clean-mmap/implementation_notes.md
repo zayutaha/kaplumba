@@ -553,3 +553,24 @@ prompt_tokens=1034 generated_tokens=200 stopped_on_eos=false load_ms=7201.167 tt
          11380756850  cycles elapsed
           2592942688  peak memory footprint
 ```
+
+## 2026-10-14 — T3b complete-load lock summaries
+
+The normal complete-lock path now prints `format_mlock_summary` once on every
+load without `KAPLUMBA_LOAD_PROFILE`. Incomplete, disabled and copied cases
+retain their warnings. The existing per-load failure-injection test continues
+to exercise two different failing models.
+
+Extended the real-loader child fixture across three modes: complete mapped
+locking, explicit disabled locking, and copied weights. The parent captures
+stderr and requires exactly one summary, the correct page/source-byte fields,
+and warning status in each mode. The complete case uses real `mlock` on a
+16 KiB-rounded fixture and checks requested=locked with failure=none. A
+deliberately suppressed complete summary made the parent fail at the named
+assertion with `each complete load must emit one lock summary ... left: 0,
+right: 1`. Restored the print and reran.
+
+`cargo test -q -p kaplumba-engine --lib weights::tests` passed: 22 passed,
+1 ignored (checkpoint-only). `git diff --check` passed. The successful syscall
+ledger remains separate from full-model OS region wire verification. Source
+commit pending.
