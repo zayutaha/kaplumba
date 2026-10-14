@@ -1,9 +1,9 @@
 # Tasks: Decode 17+ tok/s (up to 4k) and 15+ tok/s (up to 16k)
 
-- [ ] **T1 — Fix grid launch sizing for `linear_gemv_ishizuki_k3_fused2_2col` in `encode_gemv_fused2_mlp`.**
+- [x] **T1 — Fix grid launch sizing for `linear_gemv_ishizuki_k3_fused2_2col` in `encode_gemv_fused2_mlp`.**
   - Files: `crates/kernels/src/linear.rs`, `crates/engine/tests/probe_mlpdispatch_tree.rs`.
   - Intent: `fused2_2col` calculates 2 columns of A and 2 columns of B per threadgroup, meaning `pairs_a = tiles_a / 2` threadgroups cover the entire computation. Launching `(tiles_a + tiles_b) / 2 = tiles_a` threadgroups causes exactly half the threadgroups to exit immediately on `tgid >= pairs_a`, polluting the Metal command queue. Launch exactly `tiles_a / 2` threadgroups.
-  - Testing: Sabotage threadgroup count to `tiles_a / 4` and verify `probe_mlpdispatch_tree` fails loudly. Revert sabotage. Run `cargo test -p kaplumba-engine --test probe_mlpdispatch_tree` and confirm 19/19 tests pass. Commit.
+  - Testing: Sabotaged threadgroup count to `tiles_a / 4` and verified `probe_mlpdispatch_tree` failed with `left: 336 right: 672`. Reverted sabotage. Ran `cargo test -p kaplumba-engine --test probe_mlpdispatch_tree` and confirmed 19/19 tests passed. Commit: pending.
 
 - [ ] **T2 — Scalar 32-bit MCG extraction in `linear_gemv_ishizuki_k3_fused2_sk2` and `fused3_sk2`.**
   - Files: `crates/kernels/src/linear_repacked.metal`.

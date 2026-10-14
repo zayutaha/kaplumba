@@ -1543,8 +1543,8 @@ fn colmajor_default_env_selects_two_col_everywhere() {
 
     let m = mlp_tree(LINEAR_RS).select(&facts["gate_up"]);
     assert_eq!(m.kernel, "linear_gemv_ishizuki_k3_fused2_2col");
-    assert_eq!(m.groups, 1344, "gate+up: (1344 + 1344) / 2");
-    assert_eq!(m.threads(), 1344 * 256);
+    assert_eq!(m.groups, 672, "gate+up: 672 threadgroups (pairs_a = tiles_a / 2)");
+    assert_eq!(m.threads(), 672 * 256);
 
     let f2 = fused2_tree(LINEAR_RS).select(&facts["qk_full"]);
     assert_eq!(f2.kernel, "linear_gemv_ishizuki_k3_fused2_sk2");
