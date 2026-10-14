@@ -1,0 +1,48 @@
+# Tasks
+
+## Authorized documentation task
+
+- [x] **D0** `spec.md`, `plan.md`, `tasks.md`, `findings.md`,
+  `implementation_notes.md`: audit GitHub tip, interview/confirmation, independent
+  CPU extraction experiment with failing mutations, standalone GPU fused2
+  comparison with active-shader sabotage, specify ALU and tg/s work.
+  Validation: source citations, CPU/GPU results/limits, requirement mapping and
+  `git diff --check`. Commit: recorded immediately after documentation commit.
+
+## Future implementation/measurement tasks — not performed or authorized here
+
+Each task is separately verified and committed if implementation is later
+requested. Update spec/plan before any layout or interface scope change.
+
+- [ ] **T1** External baseline harness; future diagnostic touchpoints
+  `linear.rs`, `generate.rs`, `weights.rs`, spec notes: inventory exact live
+  chat route and tensor bytes; hash binary/model and measure short/2k/8k/16k
+  supported contexts, temperature 0 and fixed-seed sampling. Check GPU status
+  before each model run. No throughput result without actual forward counts.
+- [ ] **T2** External tests; if necessary `metrics.rs`, `generate.rs`:
+  validate independent application timing, early EOS, 1/2/512-token cases,
+  callback effects and diagnostic-route differences; prepare active-branch
+  GPU/raw-FP32/FP16 gates and red controls. Measure baseline ABBA variability.
+- [ ] **T3** `linear_repacked.metal`, variant registration in `linear.rs`,
+  targeted GPU test: extraction-only variant of `fused2_sk2`; preserve split
+  and expression order. Test all states/ring boundaries/real shapes, sabotage
+  actual candidate, benchmark full chat ABBA; retain only verified tg/s win.
+- [ ] **T4** Same files, separately: `fused3_sk2` extraction-only variant;
+  separate red control, numerical gates and application ABBA. Do not assume
+  T3's result transfers to three streams.
+- [ ] **T5** `linear_repacked.metal` and isolated external harnesses: one
+  experiment/commit at a time for shift-class specialization, register lifetime,
+  unchanged-order unroll/lookahead and exact load sharing. Verify tail/grid
+  boundaries, raw bits, compiler output and paired tg/s; record every negative.
+- [ ] **T6** `generate.rs`, `sampler.rs`, existing sampling kernels if reachable:
+  profile sampled-chat overhead; one measured allocation/conversion/handoff
+  change at a time. Test filtering/ties/RNG/seed parity, EOS, slow callbacks,
+  >=512 sampled and greedy tokens, and matched ABBA end-to-end throughput.
+- [ ] **T7** `encoder.rs`, `model.rs`, attention/elements kernels or `weights.rs`
+  only when measurements justify them: isolate remaining encoding gaps,
+  unchanged-order attention scheduling or residency defects. One change per
+  commit; test ordering/caches, supported contexts, prefill, memory and ABBA.
+- [ ] **T8** Spec notes/findings: consolidate only validated wins, repeat full
+  quality/context acceptance, compute application GB/s and measured roofline,
+  report feasible tg/s and whether 250 is met. Include exact reproducible
+  commands, raw observations, unsupported cases and all unresolved failures.
