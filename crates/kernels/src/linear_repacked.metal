@@ -62,78 +62,7 @@ static inline void extract_v_mcg_32(uint wa, uint wb, uint sh0, uint rsh0, threa
     v[4] = float(h4.x + h4.y); v[5] = float(h5.x + h5.y); v[6] = float(h6.x + h6.y); v[7] = float(h7.x + h7.y);
 }
 
-static inline void decode_and_accum_4tile_2col(
-    uint w0_0_0, uint w0_0_1,
-    uint w1_0_0, uint w1_0_1,
-    uint w0_1_0, uint w0_1_1,
-    uint w1_1_0, uint w1_1_1,
-    uint sh0, uint rsh0,
-    float p00, float p01, float p02, float p03,
-    float p10, float p11, float p12, float p13,
-    thread float &acc0_0, thread float &acc0_1,
-    thread float &acc1_0, thread float &acc1_1
-) {
-    const uint A0_hi = (w0_0_0 << sh0) | (w0_0_1 >> rsh0), A0_lo = w0_0_1 << sh0;
-    const uint A1_hi = (w1_0_0 << sh0) | (w1_0_1 >> rsh0), A1_lo = w1_0_1 << sh0;
-    const uint A2_hi = (w0_1_0 << sh0) | (w0_1_1 >> rsh0), A2_lo = w0_1_1 << sh0;
-    const uint A3_hi = (w1_1_0 << sh0) | (w1_1_1 >> rsh0), A3_lo = w1_1_1 << sh0;
 
-    uint4 c0_0 = uint4((A0_hi >> 16) & 0xffffu, (A0_hi >> 13) & 0xffffu, (A0_hi >> 10) & 0xffffu, (A0_hi >> 7) & 0xffffu);
-    uint4 c0_1 = uint4((A1_hi >> 16) & 0xffffu, (A1_hi >> 13) & 0xffffu, (A1_hi >> 10) & 0xffffu, (A1_hi >> 7) & 0xffffu);
-    uint4 c0_2 = uint4((A2_hi >> 16) & 0xffffu, (A2_hi >> 13) & 0xffffu, (A2_hi >> 10) & 0xffffu, (A2_hi >> 7) & 0xffffu);
-    uint4 c0_3 = uint4((A3_hi >> 16) & 0xffffu, (A3_hi >> 13) & 0xffffu, (A3_hi >> 10) & 0xffffu, (A3_hi >> 7) & 0xffffu);
-
-    c0_0 = 0x3b603b60u ^ ((c0_0 * 0xCBAC1FEDu) & 0x8fff8fffu);
-    c0_1 = 0x3b603b60u ^ ((c0_1 * 0xCBAC1FEDu) & 0x8fff8fffu);
-    c0_2 = 0x3b603b60u ^ ((c0_2 * 0xCBAC1FEDu) & 0x8fff8fffu);
-    c0_3 = 0x3b603b60u ^ ((c0_3 * 0xCBAC1FEDu) & 0x8fff8fffu);
-
-    half2 h0_0 = as_type<half2>(c0_0.x), h0_1 = as_type<half2>(c0_0.y), h0_2 = as_type<half2>(c0_0.z), h0_3 = as_type<half2>(c0_0.w);
-    float v0_0 = float(h0_0.x + h0_0.y), v0_1 = float(h0_1.x + h0_1.y), v0_2 = float(h0_2.x + h0_2.y), v0_3 = float(h0_3.x + h0_3.y);
-
-    half2 h1_0 = as_type<half2>(c0_1.x), h1_1 = as_type<half2>(c0_1.y), h1_2 = as_type<half2>(c0_1.z), h1_3 = as_type<half2>(c0_1.w);
-    float v1_0 = float(h1_0.x + h1_0.y), v1_1 = float(h1_1.x + h1_1.y), v1_2 = float(h1_2.x + h1_2.y), v1_3 = float(h1_3.x + h1_3.y);
-
-    half2 h2_0 = as_type<half2>(c0_2.x), h2_1 = as_type<half2>(c0_2.y), h2_2 = as_type<half2>(c0_2.z), h2_3 = as_type<half2>(c0_2.w);
-    float v2_0 = float(h2_0.x + h2_0.y), v2_1 = float(h2_1.x + h2_1.y), v2_2 = float(h2_2.x + h2_2.y), v2_3 = float(h2_3.x + h2_3.y);
-
-    half2 h3_0 = as_type<half2>(c0_3.x), h3_1 = as_type<half2>(c0_3.y), h3_2 = as_type<half2>(c0_3.z), h3_3 = as_type<half2>(c0_3.w);
-    float v3_0 = float(h3_0.x + h3_0.y), v3_1 = float(h3_1.x + h3_1.y), v3_2 = float(h3_2.x + h3_2.y), v3_3 = float(h3_3.x + h3_3.y);
-
-    uint4 c1_0 = uint4((A0_hi >> 4) & 0xffffu, (A0_hi >> 1) & 0xffffu, ((A0_hi << 2) | (A0_lo >> 30)) & 0xffffu, ((A0_hi << 5) | (A0_lo >> 27)) & 0xffffu);
-    uint4 c1_1 = uint4((A1_hi >> 4) & 0xffffu, (A1_hi >> 1) & 0xffffu, ((A1_hi << 2) | (A1_lo >> 30)) & 0xffffu, ((A1_hi << 5) | (A1_lo >> 27)) & 0xffffu);
-    uint4 c1_2 = uint4((A2_hi >> 4) & 0xffffu, (A2_hi >> 1) & 0xffffu, ((A2_hi << 2) | (A2_lo >> 30)) & 0xffffu, ((A2_hi << 5) | (A2_lo >> 27)) & 0xffffu);
-    uint4 c1_3 = uint4((A3_hi >> 4) & 0xffffu, (A3_hi >> 1) & 0xffffu, ((A3_hi << 2) | (A3_lo >> 30)) & 0xffffu, ((A3_hi << 5) | (A3_lo >> 27)) & 0xffffu);
-
-    c1_0 = 0x3b603b60u ^ ((c1_0 * 0xCBAC1FEDu) & 0x8fff8fffu);
-    c1_1 = 0x3b603b60u ^ ((c1_1 * 0xCBAC1FEDu) & 0x8fff8fffu);
-    c1_2 = 0x3b603b60u ^ ((c1_2 * 0xCBAC1FEDu) & 0x8fff8fffu);
-    c1_3 = 0x3b603b60u ^ ((c1_3 * 0xCBAC1FEDu) & 0x8fff8fffu);
-
-    half2 h0_4 = as_type<half2>(c1_0.x), h0_5 = as_type<half2>(c1_0.y), h0_6 = as_type<half2>(c1_0.z), h0_7 = as_type<half2>(c1_0.w);
-    float v0_4 = float(h0_4.x + h0_4.y), v0_5 = float(h0_5.x + h0_5.y), v0_6 = float(h0_6.x + h0_6.y), v0_7 = float(h0_7.x + h0_7.y);
-
-    half2 h1_4 = as_type<half2>(c1_1.x), h1_5 = as_type<half2>(c1_1.y), h1_6 = as_type<half2>(c1_1.z), h1_7 = as_type<half2>(c1_1.w);
-    float v1_4 = float(h1_4.x + h1_4.y), v1_5 = float(h1_5.x + h1_5.y), v1_6 = float(h1_6.x + h1_6.y), v1_7 = float(h1_7.x + h1_7.y);
-
-    half2 h2_4 = as_type<half2>(c1_2.x), h2_5 = as_type<half2>(c1_2.y), h2_6 = as_type<half2>(c1_2.z), h2_7 = as_type<half2>(c1_2.w);
-    float v2_4 = float(h2_4.x + h2_4.y), v2_5 = float(h2_5.x + h2_5.y), v2_6 = float(h2_6.x + h2_6.y), v2_7 = float(h2_7.x + h2_7.y);
-
-    half2 h3_4 = as_type<half2>(c1_3.x), h3_5 = as_type<half2>(c1_3.y), h3_6 = as_type<half2>(c1_3.z), h3_7 = as_type<half2>(c1_3.w);
-    float v3_4 = float(h3_4.x + h3_4.y), v3_5 = float(h3_5.x + h3_5.y), v3_6 = float(h3_6.x + h3_6.y), v3_7 = float(h3_7.x + h3_7.y);
-
-    acc0_0 += p00 * v0_0 + p01 * v0_1 + p02 * v0_2 + p03 * v0_3;
-    acc0_1 += p00 * v0_4 + p01 * v0_5 + p02 * v0_6 + p03 * v0_7;
-
-    acc0_0 += p10 * v1_0 + p11 * v1_1 + p12 * v1_2 + p13 * v1_3;
-    acc0_1 += p10 * v1_4 + p11 * v1_5 + p12 * v1_6 + p13 * v1_7;
-
-    acc1_0 += p00 * v2_0 + p01 * v2_1 + p02 * v2_2 + p03 * v2_3;
-    acc1_1 += p00 * v2_4 + p01 * v2_5 + p02 * v2_6 + p03 * v2_7;
-
-    acc1_0 += p10 * v3_0 + p11 * v3_1 + p12 * v3_2 + p13 * v3_3;
-    acc1_1 += p10 * v3_4 + p11 * v3_5 + p12 * v3_6 + p13 * v3_7;
-}
 
 static inline void extract_v_mcg_fast(ulong A, thread float v[8]) {
     const uint A_hi = uint(A >> 32);
@@ -560,128 +489,6 @@ kernel void linear_gemv_ishizuki_k3_fused2_2col(
         const uint k_unroll_end = (tiles_k / step) * step;
 
         uint tk = sg * 2u;
-        uint w0_0_0 = 0, w0_0_1 = 0, w1_0_0 = 0, w1_0_1 = 0;
-        uint w0_1_0 = 0, w0_1_1 = 0, w1_1_0 = 0, w1_1_1 = 0;
-        float p00 = 0, p01 = 0, p02 = 0, p03 = 0, p10 = 0, p11 = 0, p12 = 0, p13 = 0;
-        if (tk + 3u * step < k_unroll_end) {
-            const device uint *t0_0 = col0 + (tk + 0u) * stride;
-            const device uint *t1_0 = col0 + (tk + 1u) * stride;
-            const device uint *t0_1 = col1 + (tk + 0u) * stride;
-            const device uint *t1_1 = col1 + (tk + 1u) * stride;
-            w0_0_0 = t0_0[j0]; w0_0_1 = t0_0[j1];
-            w1_0_0 = t1_0[j0]; w1_0_1 = t1_0[j1];
-            w0_1_0 = t0_1[j0]; w0_1_1 = t0_1[j1];
-            w1_1_0 = t1_1[j0]; w1_1_1 = t1_1[j1];
-            const device half *xr0 = x + (tk + 0u) * 16u + r0;
-            p00 = float(xr0[0]); p01 = float(xr0[1]); p02 = float(xr0[8]); p03 = float(xr0[9]);
-            const device half *xr1 = x + (tk + 1u) * 16u + r0;
-            p10 = float(xr1[0]); p11 = float(xr1[1]); p12 = float(xr1[8]); p13 = float(xr1[9]);
-        }
-
-        for (; tk + 3u * step < k_unroll_end; tk += 4u * step) {
-            // 1. Prefetch Trip 1 words and activations ahead of Trip 0 compute
-            const uint tk1 = tk + step;
-            const device uint *u0_0 = col0 + (tk1 + 0u) * stride;
-            const device uint *u1_0 = col0 + (tk1 + 1u) * stride;
-            const device uint *u0_1 = col1 + (tk1 + 0u) * stride;
-            const device uint *u1_1 = col1 + (tk1 + 1u) * stride;
-            const uint x0_0_0 = u0_0[j0], x0_0_1 = u0_0[j1];
-            const uint x1_0_0 = u1_0[j0], x1_0_1 = u1_0[j1];
-            const uint x0_1_0 = u0_1[j0], x0_1_1 = u0_1[j1];
-            const uint x1_1_0 = u1_1[j0], x1_1_1 = u1_1[j1];
-            const device half *xr0b = x + (tk1 + 0u) * 16u + r0;
-            const float q00 = float(xr0b[0]), q01 = float(xr0b[1]), q02 = float(xr0b[8]), q03 = float(xr0b[9]);
-            const device half *xr1b = x + (tk1 + 1u) * 16u + r0;
-            const float q10 = float(xr1b[0]), q11 = float(xr1b[1]), q12 = float(xr1b[8]), q13 = float(xr1b[9]);
-
-            // Trip 0: compute using preloaded w... and p...
-            decode_and_accum_4tile_2col(
-                w0_0_0, w0_0_1, w1_0_0, w1_0_1,
-                w0_1_0, w0_1_1, w1_1_0, w1_1_1,
-                sh0, rsh0,
-                p00, p01, p02, p03,
-                p10, p11, p12, p13,
-                acc0_0, acc0_1, acc1_0, acc1_1
-            );
-
-            // 2. Prefetch Trip 2 words and activations ahead of Trip 1 compute
-            const uint tk2 = tk + 2u * step;
-            const device uint *y0_0 = col0 + (tk2 + 0u) * stride;
-            const device uint *y1_0 = col0 + (tk2 + 1u) * stride;
-            const device uint *y0_1 = col1 + (tk2 + 0u) * stride;
-            const device uint *y1_1 = col1 + (tk2 + 1u) * stride;
-            const uint y0_0_0 = y0_0[j0], y0_0_1 = y0_0[j1];
-            const uint y1_0_0 = y1_0[j0], y1_0_1 = y1_0[j1];
-            const uint y0_1_0 = y0_1[j0], y0_1_1 = y0_1[j1];
-            const uint y1_1_0 = y1_1[j0], y1_1_1 = y1_1[j1];
-            const device half *xr0c = x + (tk2 + 0u) * 16u + r0;
-            const float r00 = float(xr0c[0]), r01 = float(xr0c[1]), r02 = float(xr0c[8]), r03 = float(xr0c[9]);
-            const device half *xr1c = x + (tk2 + 1u) * 16u + r0;
-            const float r10 = float(xr1c[0]), r11 = float(xr1c[1]), r12 = float(xr1c[8]), r13 = float(xr1c[9]);
-
-            // Trip 1: compute using preloaded x... and q...
-            decode_and_accum_4tile_2col(
-                x0_0_0, x0_0_1, x1_0_0, x1_0_1,
-                x0_1_0, x0_1_1, x1_1_0, x1_1_1,
-                sh0, rsh0,
-                q00, q01, q02, q03,
-                q10, q11, q12, q13,
-                acc0_0, acc0_1, acc1_0, acc1_1
-            );
-
-            // 3. Prefetch Trip 3 words and activations ahead of Trip 2 compute
-            const uint tk3 = tk + 3u * step;
-            const device uint *z0_0 = col0 + (tk3 + 0u) * stride;
-            const device uint *z1_0 = col0 + (tk3 + 1u) * stride;
-            const device uint *z0_1 = col1 + (tk3 + 0u) * stride;
-            const device uint *z1_1 = col1 + (tk3 + 1u) * stride;
-            const uint z0_0_0 = z0_0[j0], z0_0_1 = z0_0[j1];
-            const uint z1_0_0 = z1_0[j0], z1_0_1 = z1_0[j1];
-            const uint z0_1_0 = z0_1[j0], z0_1_1 = z0_1[j1];
-            const uint z1_1_0 = z1_1[j0], z1_1_1 = z1_1[j1];
-            const device half *xr0d = x + (tk3 + 0u) * 16u + r0;
-            const float s00 = float(xr0d[0]), s01 = float(xr0d[1]), s02 = float(xr0d[8]), s03 = float(xr0d[9]);
-            const device half *xr1d = x + (tk3 + 1u) * 16u + r0;
-            const float s10 = float(xr1d[0]), s11 = float(xr1d[1]), s12 = float(xr1d[8]), s13 = float(xr1d[9]);
-
-            // Trip 2: compute using preloaded y... and r...
-            decode_and_accum_4tile_2col(
-                y0_0_0, y0_0_1, y1_0_0, y1_0_1,
-                y0_1_0, y0_1_1, y1_1_0, y1_1_1,
-                sh0, rsh0,
-                r00, r01, r02, r03,
-                r10, r11, r12, r13,
-                acc0_0, acc0_1, acc1_0, acc1_1
-            );
-
-            // 4. Prefetch next iteration's Trip 0 if there is another iteration
-            const uint next_tk = tk + 4u * step;
-            if (next_tk + 3u * step < k_unroll_end) {
-                const device uint *next_t0_0 = col0 + (next_tk + 0u) * stride;
-                const device uint *next_t1_0 = col0 + (next_tk + 1u) * stride;
-                const device uint *next_t0_1 = col1 + (next_tk + 0u) * stride;
-                const device uint *next_t1_1 = col1 + (next_tk + 1u) * stride;
-                w0_0_0 = next_t0_0[j0]; w0_0_1 = next_t0_0[j1];
-                w1_0_0 = next_t1_0[j0]; w1_0_1 = next_t1_0[j1];
-                w0_1_0 = next_t0_1[j0]; w0_1_1 = next_t0_1[j1];
-                w1_1_0 = next_t1_1[j0]; w1_1_1 = next_t1_1[j1];
-                const device half *next_xr0 = x + (next_tk + 0u) * 16u + r0;
-                p00 = float(next_xr0[0]); p01 = float(next_xr0[1]); p02 = float(next_xr0[8]); p03 = float(next_xr0[9]);
-                const device half *next_xr1 = x + (next_tk + 1u) * 16u + r0;
-                p10 = float(next_xr1[0]); p11 = float(next_xr1[1]); p12 = float(next_xr1[8]); p13 = float(next_xr1[9]);
-            }
-
-            // Trip 3: compute using preloaded z... and s...
-            decode_and_accum_4tile_2col(
-                z0_0_0, z0_0_1, z1_0_0, z1_0_1,
-                z0_1_0, z0_1_1, z1_1_0, z1_1_1,
-                sh0, rsh0,
-                s00, s01, s02, s03,
-                s10, s11, s12, s13,
-                acc0_0, acc0_1, acc1_0, acc1_1
-            );
-        }
-
         for (; tk < k_unroll_end; tk += step) {
             const device half *xr0 = x + (tk + 0u) * 16u + r0;
             const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
@@ -694,19 +501,28 @@ kernel void linear_gemv_ishizuki_k3_fused2_2col(
             const device uint *t0_1 = col1 + (tk + 0u) * stride;
             const device uint *t1_1 = col1 + (tk + 1u) * stride;
 
+            float v[8];
+
             const uint w0_0_0 = t0_0[j0], w0_0_1 = t0_0[j1];
             const uint w1_0_0 = t1_0[j0], w1_0_1 = t1_0[j1];
             const uint w0_1_0 = t0_1[j0], w0_1_1 = t0_1[j1];
             const uint w1_1_0 = t1_1[j0], w1_1_1 = t1_1[j1];
 
-            decode_and_accum_4tile_2col(
-                w0_0_0, w0_0_1, w1_0_0, w1_0_1,
-                w0_1_0, w0_1_1, w1_1_0, w1_1_1,
-                sh0, rsh0,
-                p00, p01, p02, p03,
-                p10, p11, p12, p13,
-                acc0_0, acc0_1, acc1_0, acc1_1
-            );
+            extract_v_mcg_32(w0_0_0, w0_0_1, sh0, rsh0, v);
+            acc0_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+            acc0_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+
+            extract_v_mcg_32(w1_0_0, w1_0_1, sh0, rsh0, v);
+            acc0_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+            acc0_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+
+            extract_v_mcg_32(w0_1_0, w0_1_1, sh0, rsh0, v);
+            acc1_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+            acc1_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+
+            extract_v_mcg_32(w1_1_0, w1_1_1, sh0, rsh0, v);
+            acc1_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+            acc1_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
         }
 
         for (tk = k_unroll_end + sg; tk < tiles_k; tk += SG) {
@@ -1688,128 +1504,6 @@ kernel void linear_gemv_ishizuki_k3_fused3_2col(
         const uint k_unroll_end = (tiles_k / step) * step;
 
         uint tk = sg * 2u;
-        uint w0_0_0 = 0, w0_0_1 = 0, w1_0_0 = 0, w1_0_1 = 0;
-        uint w0_1_0 = 0, w0_1_1 = 0, w1_1_0 = 0, w1_1_1 = 0;
-        float p00 = 0, p01 = 0, p02 = 0, p03 = 0, p10 = 0, p11 = 0, p12 = 0, p13 = 0;
-        if (tk + 3u * step < k_unroll_end) {
-            const device uint *t0_0 = col0 + (tk + 0u) * stride;
-            const device uint *t1_0 = col0 + (tk + 1u) * stride;
-            const device uint *t0_1 = col1 + (tk + 0u) * stride;
-            const device uint *t1_1 = col1 + (tk + 1u) * stride;
-            w0_0_0 = t0_0[j0]; w0_0_1 = t0_0[j1];
-            w1_0_0 = t1_0[j0]; w1_0_1 = t1_0[j1];
-            w0_1_0 = t0_1[j0]; w0_1_1 = t0_1[j1];
-            w1_1_0 = t1_1[j0]; w1_1_1 = t1_1[j1];
-            const device half *xr0 = x + (tk + 0u) * 16u + r0;
-            p00 = float(xr0[0]); p01 = float(xr0[1]); p02 = float(xr0[8]); p03 = float(xr0[9]);
-            const device half *xr1 = x + (tk + 1u) * 16u + r0;
-            p10 = float(xr1[0]); p11 = float(xr1[1]); p12 = float(xr1[8]); p13 = float(xr1[9]);
-        }
-
-        for (; tk + 3u * step < k_unroll_end; tk += 4u * step) {
-            // 1. Prefetch Trip 1 words and activations ahead of Trip 0 compute
-            const uint tk1 = tk + step;
-            const device uint *u0_0 = col0 + (tk1 + 0u) * stride;
-            const device uint *u1_0 = col0 + (tk1 + 1u) * stride;
-            const device uint *u0_1 = col1 + (tk1 + 0u) * stride;
-            const device uint *u1_1 = col1 + (tk1 + 1u) * stride;
-            const uint x0_0_0 = u0_0[j0], x0_0_1 = u0_0[j1];
-            const uint x1_0_0 = u1_0[j0], x1_0_1 = u1_0[j1];
-            const uint x0_1_0 = u0_1[j0], x0_1_1 = u0_1[j1];
-            const uint x1_1_0 = u1_1[j0], x1_1_1 = u1_1[j1];
-            const device half *xr0b = x + (tk1 + 0u) * 16u + r0;
-            const float q00 = float(xr0b[0]), q01 = float(xr0b[1]), q02 = float(xr0b[8]), q03 = float(xr0b[9]);
-            const device half *xr1b = x + (tk1 + 1u) * 16u + r0;
-            const float q10 = float(xr1b[0]), q11 = float(xr1b[1]), q12 = float(xr1b[8]), q13 = float(xr1b[9]);
-
-            // Trip 0: compute using preloaded w... and p...
-            decode_and_accum_4tile_2col(
-                w0_0_0, w0_0_1, w1_0_0, w1_0_1,
-                w0_1_0, w0_1_1, w1_1_0, w1_1_1,
-                sh0, rsh0,
-                p00, p01, p02, p03,
-                p10, p11, p12, p13,
-                acc0_0, acc0_1, acc1_0, acc1_1
-            );
-
-            // 2. Prefetch Trip 2 words and activations ahead of Trip 1 compute
-            const uint tk2 = tk + 2u * step;
-            const device uint *y0_0 = col0 + (tk2 + 0u) * stride;
-            const device uint *y1_0 = col0 + (tk2 + 1u) * stride;
-            const device uint *y0_1 = col1 + (tk2 + 0u) * stride;
-            const device uint *y1_1 = col1 + (tk2 + 1u) * stride;
-            const uint y0_0_0 = y0_0[j0], y0_0_1 = y0_0[j1];
-            const uint y1_0_0 = y1_0[j0], y1_0_1 = y1_0[j1];
-            const uint y0_1_0 = y0_1[j0], y0_1_1 = y0_1[j1];
-            const uint y1_1_0 = y1_1[j0], y1_1_1 = y1_1[j1];
-            const device half *xr0c = x + (tk2 + 0u) * 16u + r0;
-            const float r00 = float(xr0c[0]), r01 = float(xr0c[1]), r02 = float(xr0c[8]), r03 = float(xr0c[9]);
-            const device half *xr1c = x + (tk2 + 1u) * 16u + r0;
-            const float r10 = float(xr1c[0]), r11 = float(xr1c[1]), r12 = float(xr1c[8]), r13 = float(xr1c[9]);
-
-            // Trip 1: compute using preloaded x... and q...
-            decode_and_accum_4tile_2col(
-                x0_0_0, x0_0_1, x1_0_0, x1_0_1,
-                x0_1_0, x0_1_1, x1_1_0, x1_1_1,
-                sh0, rsh0,
-                q00, q01, q02, q03,
-                q10, q11, q12, q13,
-                acc0_0, acc0_1, acc1_0, acc1_1
-            );
-
-            // 3. Prefetch Trip 3 words and activations ahead of Trip 2 compute
-            const uint tk3 = tk + 3u * step;
-            const device uint *z0_0 = col0 + (tk3 + 0u) * stride;
-            const device uint *z1_0 = col0 + (tk3 + 1u) * stride;
-            const device uint *z0_1 = col1 + (tk3 + 0u) * stride;
-            const device uint *z1_1 = col1 + (tk3 + 1u) * stride;
-            const uint z0_0_0 = z0_0[j0], z0_0_1 = z0_0[j1];
-            const uint z1_0_0 = z1_0[j0], z1_0_1 = z1_0[j1];
-            const uint z0_1_0 = z0_1[j0], z0_1_1 = z0_1[j1];
-            const uint z1_1_0 = z1_1[j0], z1_1_1 = z1_1[j1];
-            const device half *xr0d = x + (tk3 + 0u) * 16u + r0;
-            const float s00 = float(xr0d[0]), s01 = float(xr0d[1]), s02 = float(xr0d[8]), s03 = float(xr0d[9]);
-            const device half *xr1d = x + (tk3 + 1u) * 16u + r0;
-            const float s10 = float(xr1d[0]), s11 = float(xr1d[1]), s12 = float(xr1d[8]), s13 = float(xr1d[9]);
-
-            // Trip 2: compute using preloaded y... and r...
-            decode_and_accum_4tile_2col(
-                y0_0_0, y0_0_1, y1_0_0, y1_0_1,
-                y0_1_0, y0_1_1, y1_1_0, y1_1_1,
-                sh0, rsh0,
-                r00, r01, r02, r03,
-                r10, r11, r12, r13,
-                acc0_0, acc0_1, acc1_0, acc1_1
-            );
-
-            // 4. Prefetch next iteration's Trip 0 if there is another iteration
-            const uint next_tk = tk + 4u * step;
-            if (next_tk + 3u * step < k_unroll_end) {
-                const device uint *next_t0_0 = col0 + (next_tk + 0u) * stride;
-                const device uint *next_t1_0 = col0 + (next_tk + 1u) * stride;
-                const device uint *next_t0_1 = col1 + (next_tk + 0u) * stride;
-                const device uint *next_t1_1 = col1 + (next_tk + 1u) * stride;
-                w0_0_0 = next_t0_0[j0]; w0_0_1 = next_t0_0[j1];
-                w1_0_0 = next_t1_0[j0]; w1_0_1 = next_t1_0[j1];
-                w0_1_0 = next_t0_1[j0]; w0_1_1 = next_t0_1[j1];
-                w1_1_0 = next_t1_1[j0]; w1_1_1 = next_t1_1[j1];
-                const device half *next_xr0 = x + (next_tk + 0u) * 16u + r0;
-                p00 = float(next_xr0[0]); p01 = float(next_xr0[1]); p02 = float(next_xr0[8]); p03 = float(next_xr0[9]);
-                const device half *next_xr1 = x + (next_tk + 1u) * 16u + r0;
-                p10 = float(next_xr1[0]); p11 = float(next_xr1[1]); p12 = float(next_xr1[8]); p13 = float(next_xr1[9]);
-            }
-
-            // Trip 3: compute using preloaded z... and s...
-            decode_and_accum_4tile_2col(
-                z0_0_0, z0_0_1, z1_0_0, z1_0_1,
-                z0_1_0, z0_1_1, z1_1_0, z1_1_1,
-                sh0, rsh0,
-                s00, s01, s02, s03,
-                s10, s11, s12, s13,
-                acc0_0, acc0_1, acc1_0, acc1_1
-            );
-        }
-
         for (; tk < k_unroll_end; tk += step) {
             const device half *xr0 = x + (tk + 0u) * 16u + r0;
             const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
@@ -1822,19 +1516,28 @@ kernel void linear_gemv_ishizuki_k3_fused3_2col(
             const device uint *t0_1 = col1 + (tk + 0u) * stride;
             const device uint *t1_1 = col1 + (tk + 1u) * stride;
 
+            float v[8];
+
             const uint w0_0_0 = t0_0[j0], w0_0_1 = t0_0[j1];
             const uint w1_0_0 = t1_0[j0], w1_0_1 = t1_0[j1];
             const uint w0_1_0 = t0_1[j0], w0_1_1 = t0_1[j1];
             const uint w1_1_0 = t1_1[j0], w1_1_1 = t1_1[j1];
 
-            decode_and_accum_4tile_2col(
-                w0_0_0, w0_0_1, w1_0_0, w1_0_1,
-                w0_1_0, w0_1_1, w1_1_0, w1_1_1,
-                sh0, rsh0,
-                p00, p01, p02, p03,
-                p10, p11, p12, p13,
-                acc0_0, acc0_1, acc1_0, acc1_1
-            );
+            extract_v_mcg_32(w0_0_0, w0_0_1, sh0, rsh0, v);
+            acc0_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+            acc0_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+
+            extract_v_mcg_32(w1_0_0, w1_0_1, sh0, rsh0, v);
+            acc0_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+            acc0_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+
+            extract_v_mcg_32(w0_1_0, w0_1_1, sh0, rsh0, v);
+            acc1_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+            acc1_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+
+            extract_v_mcg_32(w1_1_0, w1_1_1, sh0, rsh0, v);
+            acc1_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+            acc1_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
         }
 
         for (tk = k_unroll_end + sg; tk < tiles_k; tk += SG) {
@@ -2432,132 +2135,11 @@ kernel void linear_gemv_ishizuki_k3_colmajor_2col(
         const uint k_unroll_end = (tiles_k / step) * step;
 
         uint tk = sg * 2u;
-        uint w0_0_0 = 0, w0_0_1 = 0, w1_0_0 = 0, w1_0_1 = 0;
-        uint w0_1_0 = 0, w0_1_1 = 0, w1_1_0 = 0, w1_1_1 = 0;
-        float p00 = 0, p01 = 0, p02 = 0, p03 = 0, p10 = 0, p11 = 0, p12 = 0, p13 = 0;
-        if (tk + 3u * step < k_unroll_end) {
-            const device uint *t0_0 = col0 + (tk + 0u) * stride;
-            const device uint *t1_0 = col0 + (tk + 1u) * stride;
-            const device uint *t0_1 = col1 + (tk + 0u) * stride;
-            const device uint *t1_1 = col1 + (tk + 1u) * stride;
-            w0_0_0 = t0_0[j0]; w0_0_1 = t0_0[j1];
-            w1_0_0 = t1_0[j0]; w1_0_1 = t1_0[j1];
-            w0_1_0 = t0_1[j0]; w0_1_1 = t0_1[j1];
-            w1_1_0 = t1_1[j0]; w1_1_1 = t1_1[j1];
-            const device half *xr0 = x + (tk + 0u) * 16u + r0;
-            p00 = float(xr0[0]); p01 = float(xr0[1]); p02 = float(xr0[8]); p03 = float(xr0[9]);
-            const device half *xr1 = x + (tk + 1u) * 16u + r0;
-            p10 = float(xr1[0]); p11 = float(xr1[1]); p12 = float(xr1[8]); p13 = float(xr1[9]);
-        }
-
-        for (; tk + 3u * step < k_unroll_end; tk += 4u * step) {
-            // 1. Prefetch Trip 1 words and activations ahead of Trip 0 compute
-            const uint tk1 = tk + step;
-            const device uint *u0_0 = col0 + (tk1 + 0u) * stride;
-            const device uint *u1_0 = col0 + (tk1 + 1u) * stride;
-            const device uint *u0_1 = col1 + (tk1 + 0u) * stride;
-            const device uint *u1_1 = col1 + (tk1 + 1u) * stride;
-            const uint x0_0_0 = u0_0[j0], x0_0_1 = u0_0[j1];
-            const uint x1_0_0 = u1_0[j0], x1_0_1 = u1_0[j1];
-            const uint x0_1_0 = u0_1[j0], x0_1_1 = u0_1[j1];
-            const uint x1_1_0 = u1_1[j0], x1_1_1 = u1_1[j1];
-            const device half *xr0b = x + (tk1 + 0u) * 16u + r0;
-            const float q00 = float(xr0b[0]), q01 = float(xr0b[1]), q02 = float(xr0b[8]), q03 = float(xr0b[9]);
-            const device half *xr1b = x + (tk1 + 1u) * 16u + r0;
-            const float q10 = float(xr1b[0]), q11 = float(xr1b[1]), q12 = float(xr1b[8]), q13 = float(xr1b[9]);
-
-            // Trip 0: compute using preloaded w... and p...
-            decode_and_accum_4tile_2col(
-                w0_0_0, w0_0_1, w1_0_0, w1_0_1,
-                w0_1_0, w0_1_1, w1_1_0, w1_1_1,
-                sh0, rsh0,
-                p00, p01, p02, p03,
-                p10, p11, p12, p13,
-                acc0_0, acc0_1, acc1_0, acc1_1
-            );
-
-            // 2. Prefetch Trip 2 words and activations ahead of Trip 1 compute
-            const uint tk2 = tk + 2u * step;
-            const device uint *y0_0 = col0 + (tk2 + 0u) * stride;
-            const device uint *y1_0 = col0 + (tk2 + 1u) * stride;
-            const device uint *y0_1 = col1 + (tk2 + 0u) * stride;
-            const device uint *y1_1 = col1 + (tk2 + 1u) * stride;
-            const uint y0_0_0 = y0_0[j0], y0_0_1 = y0_0[j1];
-            const uint y1_0_0 = y1_0[j0], y1_0_1 = y1_0[j1];
-            const uint y0_1_0 = y0_1[j0], y0_1_1 = y0_1[j1];
-            const uint y1_1_0 = y1_1[j0], y1_1_1 = y1_1[j1];
-            const device half *xr0c = x + (tk2 + 0u) * 16u + r0;
-            const float r00 = float(xr0c[0]), r01 = float(xr0c[1]), r02 = float(xr0c[8]), r03 = float(xr0c[9]);
-            const device half *xr1c = x + (tk2 + 1u) * 16u + r0;
-            const float r10 = float(xr1c[0]), r11 = float(xr1c[1]), r12 = float(xr1c[8]), r13 = float(xr1c[9]);
-
-            // Trip 1: compute using preloaded x... and q...
-            decode_and_accum_4tile_2col(
-                x0_0_0, x0_0_1, x1_0_0, x1_0_1,
-                x0_1_0, x0_1_1, x1_1_0, x1_1_1,
-                sh0, rsh0,
-                q00, q01, q02, q03,
-                q10, q11, q12, q13,
-                acc0_0, acc0_1, acc1_0, acc1_1
-            );
-
-            // 3. Prefetch Trip 3 words and activations ahead of Trip 2 compute
-            const uint tk3 = tk + 3u * step;
-            const device uint *z0_0 = col0 + (tk3 + 0u) * stride;
-            const device uint *z1_0 = col0 + (tk3 + 1u) * stride;
-            const device uint *z0_1 = col1 + (tk3 + 0u) * stride;
-            const device uint *z1_1 = col1 + (tk3 + 1u) * stride;
-            const uint z0_0_0 = z0_0[j0], z0_0_1 = z0_0[j1];
-            const uint z1_0_0 = z1_0[j0], z1_0_1 = z1_0[j1];
-            const uint z0_1_0 = z0_1[j0], z0_1_1 = z0_1[j1];
-            const uint z1_1_0 = z1_1[j0], z1_1_1 = z1_1[j1];
-            const device half *xr0d = x + (tk3 + 0u) * 16u + r0;
-            const float s00 = float(xr0d[0]), s01 = float(xr0d[1]), s02 = float(xr0d[8]), s03 = float(xr0d[9]);
-            const device half *xr1d = x + (tk3 + 1u) * 16u + r0;
-            const float s10 = float(xr1d[0]), s11 = float(xr1d[1]), s12 = float(xr1d[8]), s13 = float(xr1d[9]);
-
-            // Trip 2: compute using preloaded y... and r...
-            decode_and_accum_4tile_2col(
-                y0_0_0, y0_0_1, y1_0_0, y1_0_1,
-                y0_1_0, y0_1_1, y1_1_0, y1_1_1,
-                sh0, rsh0,
-                r00, r01, r02, r03,
-                r10, r11, r12, r13,
-                acc0_0, acc0_1, acc1_0, acc1_1
-            );
-
-            // 4. Prefetch next iteration's Trip 0 if there is another iteration
-            const uint next_tk = tk + 4u * step;
-            if (next_tk + 3u * step < k_unroll_end) {
-                const device uint *next_t0_0 = col0 + (next_tk + 0u) * stride;
-                const device uint *next_t1_0 = col0 + (next_tk + 1u) * stride;
-                const device uint *next_t0_1 = col1 + (next_tk + 0u) * stride;
-                const device uint *next_t1_1 = col1 + (next_tk + 1u) * stride;
-                w0_0_0 = next_t0_0[j0]; w0_0_1 = next_t0_0[j1];
-                w1_0_0 = next_t1_0[j0]; w1_0_1 = next_t1_0[j1];
-                w0_1_0 = next_t0_1[j0]; w0_1_1 = next_t0_1[j1];
-                w1_1_0 = next_t1_1[j0]; w1_1_1 = next_t1_1[j1];
-                const device half *next_xr0 = x + (next_tk + 0u) * 16u + r0;
-                p00 = float(next_xr0[0]); p01 = float(next_xr0[1]); p02 = float(next_xr0[8]); p03 = float(next_xr0[9]);
-                const device half *next_xr1 = x + (next_tk + 1u) * 16u + r0;
-                p10 = float(next_xr1[0]); p11 = float(next_xr1[1]); p12 = float(next_xr1[8]); p13 = float(next_xr1[9]);
-            }
-
-            // Trip 3: compute using preloaded z... and s...
-            decode_and_accum_4tile_2col(
-                z0_0_0, z0_0_1, z1_0_0, z1_0_1,
-                z0_1_0, z0_1_1, z1_1_0, z1_1_1,
-                sh0, rsh0,
-                s00, s01, s02, s03,
-                s10, s11, s12, s13,
-                acc0_0, acc0_1, acc1_0, acc1_1
-            );
-        }
         for (; tk < k_unroll_end; tk += step) {
-            const device half *xr0s = x + (tk + 0u) * 16u + r0;
-            const float p00 = float(xr0s[0]), p01 = float(xr0s[1]), p02 = float(xr0s[8]), p03 = float(xr0s[9]);
-            const device half *xr1s = x + (tk + 1u) * 16u + r0;
-            const float p10 = float(xr1s[0]), p11 = float(xr1s[1]), p12 = float(xr1s[8]), p13 = float(xr1s[9]);
+            const device half *xr0 = x + (tk + 0u) * 16u + r0;
+            const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
+            const device half *xr1 = x + (tk + 1u) * 16u + r0;
+            const float p10 = float(xr1[0]), p11 = float(xr1[1]), p12 = float(xr1[8]), p13 = float(xr1[9]);
 
             const device uint *t0_0 = col0 + (tk + 0u) * stride;
             const device uint *t1_0 = col0 + (tk + 1u) * stride;
@@ -2565,19 +2147,31 @@ kernel void linear_gemv_ishizuki_k3_colmajor_2col(
             const device uint *t0_1 = col1 + (tk + 0u) * stride;
             const device uint *t1_1 = col1 + (tk + 1u) * stride;
 
+            float v[8];
+
+            // Col 0: 2 contiguous sub-steps along K
             const uint w0_0_0 = t0_0[j0], w0_0_1 = t0_0[j1];
             const uint w1_0_0 = t1_0[j0], w1_0_1 = t1_0[j1];
+
+            extract_v_mcg_32(w0_0_0, w0_0_1, sh0, rsh0, v);
+            acc0_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+            acc0_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+
+            extract_v_mcg_32(w1_0_0, w1_0_1, sh0, rsh0, v);
+            acc0_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+            acc0_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+
+            // Col 1: 2 contiguous sub-steps along K
             const uint w0_1_0 = t0_1[j0], w0_1_1 = t0_1[j1];
             const uint w1_1_0 = t1_1[j0], w1_1_1 = t1_1[j1];
 
-            decode_and_accum_4tile_2col(
-                w0_0_0, w0_0_1, w1_0_0, w1_0_1,
-                w0_1_0, w0_1_1, w1_1_0, w1_1_1,
-                sh0, rsh0,
-                p00, p01, p02, p03,
-                p10, p11, p12, p13,
-                acc0_0, acc0_1, acc1_0, acc1_1
-            );
+            extract_v_mcg_32(w0_1_0, w0_1_1, sh0, rsh0, v);
+            acc1_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+            acc1_1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+
+            extract_v_mcg_32(w1_1_0, w1_1_1, sh0, rsh0, v);
+            acc1_0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+            acc1_1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
         }
 
         for (tk = k_unroll_end + sg; tk < tiles_k; tk += SG) {
@@ -2931,112 +2525,6 @@ kernel void linear_gemv_ishizuki_k3_colmajor_2col_sk2(
         const uint k_unroll_end = k_start + ((k_end - k_start) / step) * step;
 
         uint tk = k_start + sg * 2u;
-        for (; tk + 3u * step < k_unroll_end; tk += 4u * step) {
-            // Trip 0: tk, tk+1
-            {
-                const device half *xr0 = x + (tk + 0u) * 16u + r0;
-                const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
-                const device half *xr1 = x + (tk + 1u) * 16u + r0;
-                const float p10 = float(xr1[0]), p11 = float(xr1[1]), p12 = float(xr1[8]), p13 = float(xr1[9]);
-
-                const device uint *t0_0 = col0 + (tk + 0u) * stride;
-                const device uint *t1_0 = col0 + (tk + 1u) * stride;
-                const device uint *t0_1 = col1 + (tk + 0u) * stride;
-                const device uint *t1_1 = col1 + (tk + 1u) * stride;
-
-                decode_and_accum_4tile_2col(
-                    t0_0[j0], t0_0[j1],
-                    t1_0[j0], t1_0[j1],
-                    t0_1[j0], t0_1[j1],
-                    t1_1[j0], t1_1[j1],
-                    sh0, rsh0,
-                    p00, p01, p02, p03,
-                    p10, p11, p12, p13,
-                    acc0_0, acc0_1,
-                    acc1_0, acc1_1
-                );
-            }
-
-            // Trip 1: tk+step, tk+step+1
-            {
-                const uint tkx = tk + step;
-                const device half *xr0b = x + (tkx + 0u) * 16u + r0;
-                const float q00 = float(xr0b[0]), q01 = float(xr0b[1]), q02 = float(xr0b[8]), q03 = float(xr0b[9]);
-                const device half *xr1b = x + (tkx + 1u) * 16u + r0;
-                const float q10 = float(xr1b[0]), q11 = float(xr1b[1]), q12 = float(xr1b[8]), q13 = float(xr1b[9]);
-
-                const device uint *u0_0 = col0 + (tkx + 0u) * stride;
-                const device uint *u1_0 = col0 + (tkx + 1u) * stride;
-                const device uint *u0_1 = col1 + (tkx + 0u) * stride;
-                const device uint *u1_1 = col1 + (tkx + 1u) * stride;
-
-                decode_and_accum_4tile_2col(
-                    u0_0[j0], u0_0[j1],
-                    u1_0[j0], u1_0[j1],
-                    u0_1[j0], u0_1[j1],
-                    u1_1[j0], u1_1[j1],
-                    sh0, rsh0,
-                    q00, q01, q02, q03,
-                    q10, q11, q12, q13,
-                    acc0_0, acc0_1,
-                    acc1_0, acc1_1
-                );
-            }
-
-            // Trip 2: tk+2*step, tk+2*step+1
-            {
-                const uint tky = tk + 2u * step;
-                const device half *xr0c = x + (tky + 0u) * 16u + r0;
-                const float r00 = float(xr0c[0]), r01 = float(xr0c[1]), r02 = float(xr0c[8]), r03 = float(xr0c[9]);
-                const device half *xr1c = x + (tky + 1u) * 16u + r0;
-                const float r10 = float(xr1c[0]), r11 = float(xr1c[1]), r12 = float(xr1c[8]), r13 = float(xr1c[9]);
-
-                const device uint *y0_0 = col0 + (tky + 0u) * stride;
-                const device uint *y1_0 = col0 + (tky + 1u) * stride;
-                const device uint *y0_1 = col1 + (tky + 0u) * stride;
-                const device uint *y1_1 = col1 + (tky + 1u) * stride;
-
-                decode_and_accum_4tile_2col(
-                    y0_0[j0], y0_0[j1],
-                    y1_0[j0], y1_0[j1],
-                    y0_1[j0], y0_1[j1],
-                    y1_1[j0], y1_1[j1],
-                    sh0, rsh0,
-                    r00, r01, r02, r03,
-                    r10, r11, r12, r13,
-                    acc0_0, acc0_1,
-                    acc1_0, acc1_1
-                );
-            }
-
-            // Trip 3: tk+3*step, tk+3*step+1
-            {
-                const uint tkz = tk + 3u * step;
-                const device half *xr0d = x + (tkz + 0u) * 16u + r0;
-                const float s00 = float(xr0d[0]), s01 = float(xr0d[1]), s02 = float(xr0d[8]), s03 = float(xr0d[9]);
-                const device half *xr1d = x + (tkz + 1u) * 16u + r0;
-                const float s10 = float(xr1d[0]), s11 = float(xr1d[1]), s12 = float(xr1d[8]), s13 = float(xr1d[9]);
-
-                const device uint *z0_0 = col0 + (tkz + 0u) * stride;
-                const device uint *z1_0 = col0 + (tkz + 1u) * stride;
-                const device uint *z0_1 = col1 + (tkz + 0u) * stride;
-                const device uint *z1_1 = col1 + (tkz + 1u) * stride;
-
-                decode_and_accum_4tile_2col(
-                    z0_0[j0], z0_0[j1],
-                    z1_0[j0], z1_0[j1],
-                    z0_1[j0], z0_1[j1],
-                    z1_1[j0], z1_1[j1],
-                    sh0, rsh0,
-                    s00, s01, s02, s03,
-                    s10, s11, s12, s13,
-                    acc0_0, acc0_1,
-                    acc1_0, acc1_1
-                );
-            }
-        }
-
-
         for (; tk < k_unroll_end; tk += step) {
             const device half *xr0 = x + (tk + 0u) * 16u + r0;
             const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
