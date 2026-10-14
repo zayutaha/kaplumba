@@ -73,3 +73,8 @@
   this barrier; otherwise growth would silently restore immediate commits for
   the rest of that step. `cargo test -p kaplumba-kernels deferred_ --lib` passes
   4/4 including this case.
+- T2 readiness guard: a deferred encoder now rejects all submit/flush paths
+  while it owns work and the caller has not called
+  `mark_deferred_inputs_staged()`. T3's model row staging calls this only after
+  the raw mmap row copy succeeds. Empty cache-growth barriers remain legal;
+  they preserve deferred mode and still do not submit model dispatches.

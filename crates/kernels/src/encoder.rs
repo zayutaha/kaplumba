@@ -71,6 +71,7 @@ pub struct MetalEncoder<'q> {
     /// host input they read. Used only for sparse-embedding decode steps.
     deferred: Vec<CommandBuffer>,
     defer_submissions: bool,
+    deferred_inputs_staged: bool,
     /// Encoded dispatches in the current command buffer. A buffer is committed
     /// once it reaches `MAX_DISPATCHES_PER_BUFFER`.
     dispatches: u32,
@@ -291,6 +292,7 @@ impl<'q> MetalEncoder<'q> {
             in_flight: Vec::new(),
             deferred: Vec::new(),
             defer_submissions: false,
+            deferred_inputs_staged: false,
             dispatches: 0,
             dispatches_total: 0,
             ended: false,
@@ -311,6 +313,31 @@ impl<'q> MetalEncoder<'q> {
     pub fn defer_submissions(&mut self) {
         debug_assert!(self.deferred.is_empty() && self.dispatches_total == 0);
         self.defer_submissions = true;
+        self.deferred_inputs_staged = false;
+    }
+
+    /// Authorize submission after the caller has populated the shared input
+    /// buffers referenced by this deferred step.
+    pub fn mark_deferred_inputs_staged(&mut self) -> Result<(), KernelError> {
+        if !self.defer_submissions {
+            return Err(KernelError::InvalidInput(
+                "encoder has no deferred step awaiting host input".to_string(),
+            ));
+        }
+        self.deferred_inputs_staged = true;
+        Ok(())
+    }
+
+    fn ensure_deferred_inputs_staged(&self) -> Result<(), KernelError> {
+        if self.defer_submissions
+            && !self.deferred_inputs_staged
+            && (self.dispatches > 0 || !self.deferred.is_empty())
+        {
+            return Err(KernelError::InvalidInput(
+                "deferred submission before shared input staging".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// A fresh command buffer and the compute encoder on it, both retained.
@@ -620,6 +647,7 @@ impl<'q> MetalEncoder<'q> {
         if self.dispatches == 0 && self.in_flight.is_empty() && self.deferred.is_empty() {
             return Ok(());
         }
+        self.ensure_deferred_inputs_staged()?;
         self.end();
         self.submit_deferred();
         self.command_buffer.commit();
@@ -642,6 +670,7 @@ impl<'q> MetalEncoder<'q> {
     /// empty command buffer on the same queue and waiting for it retires all
     /// earlier committed work in queue order.
     pub fn flush_and_wait_queue(&mut self) -> Result<(), KernelError> {
+        self.ensure_deferred_inputs_staged()?;
         self.end();
         self.submit_deferred();
         self.command_buffer.commit();
@@ -667,6 +696,7 @@ impl<'q> MetalEncoder<'q> {
         self.end();
         self.deferred.clear();
         self.defer_submissions = false;
+        self.deferred_inputs_staged = false;
     }
 
     /// Commit without waiting, so several command buffers can be in flight.
@@ -692,11 +722,13 @@ impl<'q> MetalEncoder<'q> {
             !self.ended,
             "commit_terminal is terminal: this encoder has already been ended",
         );
+        self.ensure_deferred_inputs_staged()?;
         self.end();
         self.submit_deferred();
         self.command_buffer.commit();
         self.in_flight.push(self.command_buffer.clone());
         self.defer_submissions = false;
+        self.deferred_inputs_staged = false;
         Ok(())
     }
 
@@ -720,10 +752,12 @@ impl<'q> MetalEncoder<'q> {
     }
 
     pub fn commit_and_wait(mut self) -> Result<(), KernelError> {
+        self.ensure_deferred_inputs_staged()?;
         self.end();
         self.submit_deferred();
         self.command_buffer.commit();
         self.defer_submissions = false;
+        self.deferred_inputs_staged = false;
         self.command_buffer.wait_until_completed();
         // Buffers rolled out mid-forward are committed but unfinished. On one
         // in-order queue the wait above already covers them, but drain them
@@ -764,6 +798,7 @@ impl<'q> MetalEncoder<'q> {
     /// bound; drain it periodically (it is also what bounds GPU work in
     /// flight, since nothing here waits).
     pub fn commit_stamped(&mut self, label: &str) -> Result<(), KernelError> {
+        self.ensure_deferred_inputs_staged()?;
         self.end();
         self.submit_deferred();
         self.command_buffer.set_label(label);
@@ -822,10 +857,12 @@ impl<'q> MetalEncoder<'q> {
     /// with this, not with a drop. The buffer committed here is normally empty,
     /// which costs a few microseconds.
     pub fn finish(&mut self) -> Result<(), KernelError> {
+        self.ensure_deferred_inputs_staged()?;
         self.end();
         self.submit_deferred();
         self.command_buffer.commit();
         self.defer_submissions = false;
+        self.deferred_inputs_staged = false;
         self.command_buffer.wait_until_completed();
         for buffer in std::mem::take(&mut self.in_flight) {
             buffer.wait_until_completed();
@@ -1072,6 +1109,18 @@ kernel void burn(device float* out [[buffer(0)]],
         );
 
         let rolled = encoder.deferred.clone();
+        let early = encoder
+            .commit_terminal()
+            .expect_err("terminal submit must require staged shared input");
+        assert!(early
+            .to_string()
+            .contains("deferred submission before shared input staging"));
+        assert!(rolled
+            .iter()
+            .all(|buffer| buffer.status() == MTLCommandBufferStatus::NotEnqueued));
+        encoder
+            .mark_deferred_inputs_staged()
+            .expect("mark host input ready");
         encoder.commit_terminal().expect("terminal commit");
         encoder.wait();
         for buffer in rolled.iter().chain(encoder.in_flight.iter()) {
