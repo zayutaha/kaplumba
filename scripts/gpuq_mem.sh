@@ -20,7 +20,7 @@
 # so "7.4 GiB" read as "4", and a single-token "17G" having no space before the
 # unit. `gpuq status` prints one fixed shape:
 #
-#   memory: 0.1 GiB available (reclaimable), 9.0 GiB in use by processes, 0 MiB swap
+#   memory: 0.1 GiB top-unused, 9.0 GiB system active pages, 0 MiB swap
 #
 # (scripts/gpuq:150). We take that number verbatim and require the literal
 # " GiB ", so a line in ANY other shape fails to match. Failing to match is the
@@ -155,13 +155,13 @@ _physmem_field() {
 
 # --- `gpuq status` body readers ----------------------------------------------
 
-# Print the available GiB from a `gpuq status` body read on stdin.
+# Print the top-unused GiB from a `gpuq status` body read on stdin.
 # Prints NOTHING when the body is missing, malformed, or in another shape.
 gpuq_mem_available_gib() {
-  sed -n 's/^memory: \([0-9.]*\) GiB available (reclaimable).*/\1/p' | head -1
+  sed -n 's/^memory: \([0-9.]*\) GiB top-unused.*/\1/p' | head -1
 }
 
-# Is the box healthy?  $1 = min available GiB (default 4).  stdin = gpuq status.
+# Is the box healthy?  $1 = min top-unused GiB (default 4).  stdin = gpuq status.
 # Fails closed: no parseable number is unhealthy, never healthy.
 gpuq_mem_healthy() {
   local min=${1:-4} avail

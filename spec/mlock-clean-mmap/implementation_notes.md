@@ -746,5 +746,30 @@ whole graphics region is not attributed to KV solely from aggregate shape.
 
 The current implementation leaves PID 39841 open at the interactive prompt,
 using session 38102. Do not start another model until it exits. T5b code/test
-commit `4e36728`. T5a, T5c, T5d and T4 remain open; no claim of green
-pressure/no-swap during generation or full 1k/2k/8k acceptance.
+commit `4e36728`. At that point T5a, T5c, T5d and T4 remained open; no claim of
+green pressure/no-swap during generation or full 1k/2k/8k acceptance.
+
+## T5c — gpuq wording correction (2026-10-14)
+
+The Activity Monitor screenshot reports Kaplumba's 274.6 MB physical footprint;
+that does not describe mapped-file pages or prove their lock state. A previous
+live `vmmap` sample for PID 39841 showed 11.2 GiB mapped-file resident, clean,
+and unswapped, while the loader lock ledger reported 12,046,221,312 selected
+hot bytes locked. These are distinct measurements; `gpuq status` cannot claim
+per-process lock status from its host-wide `top`/`vm_stat` snapshot.
+
+Changed `scripts/gpuq` labels to `top-unused` and `system active pages`. Removed
+the old unsupported statements that low-memory loads were safe because clean
+weight cache is evicted on demand, and that a load needs a fixed amount of
+“unreclaimable” memory. It continues to warn below the existing 11 GiB
+preflight threshold and continues without acquiring the engine lock. Updated
+the shared memory parser's fixture format and live test assertions.
+
+Validation: `bash scripts/test_gpuq_mem.sh` passed, including all parser,
+classifier and harness dispatch cases. The new status assertion was challenged
+by temporarily inserting “clean reclaimable pages are evicted on demand” into
+the warning; the test failed with `status still makes an unsupported
+reclaimability/load-safety claim`. Restored the status. No model run was done;
+PID 39841 remained open and host swap was already about 3.4 GiB. This task only
+corrects host-report wording and does not prove the weights are individually
+locked or eliminate paging.

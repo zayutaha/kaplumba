@@ -34,16 +34,16 @@ check() { # name expected_healthy input
   else printf '  FAIL %-26s expected healthy=%s got %s\n' "$1" "$2" "$got"; fail=1; fi
 }
 
-echo "== synthetic (gpuq's fixed 'memory: N GiB available (reclaimable)' format) =="
-check "healthy 11.0 GiB"      1 "memory: 11.0 GiB available (reclaimable), 4.4 GiB in use by processes, 0 MiB swap"
-check "healthy 4.0 GiB (==)"  1 "memory: 4.0 GiB available (reclaimable), 7 GiB in use, 0 MiB swap"
+echo "== synthetic (gpuq's fixed 'memory: N GiB top-unused' format) =="
+check "healthy 11.0 GiB"      1 "memory: 11.0 GiB top-unused, 4.4 GiB system active pages, 0 MiB swap"
+check "healthy 4.0 GiB (==)"  1 "memory: 4.0 GiB top-unused, 7 GiB in use, 0 MiB swap"
 # The exact historical bug: a multi-digit decimal must not be read as its last
 # digit run. This is the case a `[^0-9]*` sed expression got wrong.
-check "healthy 7.4 GiB"       1 "memory: 7.4 GiB available (reclaimable), 8 GiB in use, 0 MiB swap"
-check "stalled 0.12 GiB"      0 "memory: 0.12 GiB available (reclaimable), 23 GiB in use, 0 MiB swap"
-check "unhealthy 1.47 GiB"    0 "memory: 1.47 GiB available (reclaimable), 0 GiB in use, 0 MiB swap"
+check "healthy 7.4 GiB"       1 "memory: 7.4 GiB top-unused, 8 GiB in use, 0 MiB swap"
+check "stalled 0.12 GiB"      0 "memory: 0.12 GiB top-unused, 23 GiB in use, 0 MiB swap"
+check "unhealthy 1.47 GiB"    0 "memory: 1.47 GiB top-unused, 0 GiB in use, 0 MiB swap"
 # The OQ5 stall signature, already normalised by gpuq.
-check "OQ5 stall 0.12"       0 "memory: 0.12 GiB available (reclaimable), 23 GiB in use by processes, 0 MiB swap"
+check "OQ5 stall 0.12"       0 "memory: 0.12 GiB top-unused, 23 GiB system active pages, 0 MiB swap"
 
 echo "== swap usage uses the named 'used' field from sysctl =="
 SWAP=$(printf '%s\n' 'total = 4096.00M used = 3296.25M free = 799.75M' | gpuq_swap_used_mib_from_stdin)
@@ -79,9 +79,9 @@ fi
 
 echo "== must be treated as UNHEALTHY (fail closed, never invent a number) =="
 check "no memory line"       0 "queue: 0 waiting"
-check "wrong shape (17G)"    0 "memory: 17G available (reclaimable), 1G in use, 0 MiB swap"
-check "unreclaimable only"   0 "warning: only 2.0 GiB available (unreclaimable); a load needs ~11 GiB"
-check "garbage line"         0 "memory: no available (reclaimable), ???"
+check "wrong shape (17G)"    0 "memory: 17G top-unused, 1G in use, 0 MiB swap"
+check "unreclaimable only"   0 "warning: only 2.0 GiB top-unused; a load needs ~11 GiB"
+check "garbage line"         0 "memory: no top-unused, ???"
 check "empty"                0 ""
 
 echo "== the 554 MiB trap that AGENTS.md 10.3 records =="
@@ -105,6 +105,19 @@ LIVE=$(scripts/gpuq status 2>/dev/null)
 printf '  raw: %s\n' "$(printf '%s\n' "$LIVE" | grep '^memory:')"
 AVAIL=$(printf '%s\n' "$LIVE" | gpuq_mem_available_gib)
 printf '  parsed: %s GiB (threshold %s)\n' "${AVAIL:-<EMPTY>}" "$MIN_UNUSED_GIB"
+if ! printf '%s\n' "$LIVE" | grep -q 'system active pages'; then
+  echo "  FAIL: status does not label the second value as system-wide active pages"; fail=1
+fi
+if printf '%s\n' "$LIVE" | grep -Eiq 'reclaimable|evicted on demand|usually ENOUGH|enough available memory'; then
+  echo "  FAIL: status still makes an unsupported reclaimability/load-safety claim"; fail=1
+else
+  echo "  ok   status avoids reclaimability and load-safety claims"
+fi
+if ! printf '%s\n' "$LIVE" | grep -Eiq 'does not confirm per-process locks|does not show per-process locks'; then
+  echo "  FAIL: status omits that host memory does not prove per-process locking"; fail=1
+else
+  echo "  ok   status says host snapshot does not prove per-process locks"
+fi
 if [ -z "$AVAIL" ]; then echo "  FAIL: live parse empty"; fail=1
 elif printf '%s\n' "$LIVE" | gpuq_mem_healthy "$MIN_UNUSED_GIB"; then echo "  live verdict: healthy"
 else echo "  live verdict: unhealthy (not a failure -- the box is busy)"; fi
@@ -264,11 +277,11 @@ printf '  ok   %-26s %s\n' "no time output" "$(cat "$TD/c3")"
 
 echo "== sabotage checks (AGENTS.md 3.4: a test that cannot fail is not a test) =="
 # 1. An unreachable threshold must make the gate refuse a healthy box.
-if printf '%s\n' "memory: 11.0 GiB available (reclaimable)" | gpuq_mem_healthy 1000000; then
+if printf '%s\n' "memory: 11.0 GiB top-unused" | gpuq_mem_healthy 1000000; then
   echo "  FAIL: gate passed an impossible threshold"; fail=1
 else echo "  ok   gate rejects an unreachable threshold"; fi
 # 2. The parser must not be fooled back into the greedy-digit bug.
-P=$(printf '%s\n' "memory: 7.4 GiB available (reclaimable)" | gpuq_mem_available_gib)
+P=$(printf '%s\n' "memory: 7.4 GiB top-unused" | gpuq_mem_available_gib)
 if [ "$P" = "7.4" ]; then echo "  ok   greedy-digit bug stays fixed ($P)"; else
   echo "  FAIL: parser returned '$P' for 7.4"; fail=1; fi
 
@@ -284,7 +297,7 @@ cat > "$STUB" <<STUBEOF
 if [ "\${1:-}" = "status" ]; then
   echo "gpu: none"
   echo "queue: 0 waiting"
-  echo "memory: no available (reclaimable), ??? GiB in use by processes"
+  echo "memory: no top-unused, ??? GiB system active pages"
   exit 0
 fi
 : > "$SENTINEL"
@@ -303,7 +316,7 @@ cat > "$STUB2" <<'STUBEOF'
 # command it was handed -- an earlier version just exited 0, so the stub binary was
 # never invoked and the positive control was asserting against an empty log.
 if [ "${1:-}" = "status" ]; then
-  echo "memory: 9.9 GiB available (reclaimable), 4 GiB in use by processes, 0 MiB swap"
+  echo "memory: 9.9 GiB top-unused, 4 GiB system active pages, 0 MiB swap"
   exit 0
 fi
 shift
