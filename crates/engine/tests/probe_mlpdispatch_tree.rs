@@ -1542,8 +1542,8 @@ fn colmajor_default_env_selects_two_col_everywhere() {
     let facts = &colmajor_layer_facts();
 
     let m = mlp_tree(LINEAR_RS).select(&facts["gate_up"]);
-    assert_eq!(m.kernel, "linear_gemv_ishizuki_k3_fused2_co");
-    assert_eq!(m.groups, 1344, "gate+up: 1344 threadgroups (one per tile_a)");
+    assert_eq!(m.kernel, "linear_gemv_ishizuki_k3_fused2_2col");
+    assert_eq!(m.groups, 1344, "gate+up: (1344 + 1344) / 2");
     assert_eq!(m.threads(), 1344 * 256);
 
     let f2 = fused2_tree(LINEAR_RS).select(&facts["qk_full"]);
@@ -1584,13 +1584,14 @@ fn the_five_decode_kernels_are_exactly_three_layer_kernels_and_a_head() {
         names,
         vec![
             "linear_gemv_ishizuki_k3_colmajor_1col_sk2",
-            "linear_gemv_ishizuki_k3_fused2_co",
+            "linear_gemv_ishizuki_k3_fused2_2col",
             "linear_gemv_ishizuki_k3_fused2_sk2",
             "linear_gemv_ishizuki_k3_fused3_sk2",
         ],
         "a fusion landed or an arm was reordered: the layer decode kernels changed"
     );
     for co in [
+        "linear_gemv_ishizuki_k3_fused2_co",
         "linear_gemv_ishizuki_k3_fused2_co4",
         "linear_gemv_ishizuki_k3_fused2_4col",
     ] {
@@ -1623,20 +1624,20 @@ fn fused2_co_is_shadowed_by_fused2_2col_in_the_mlp_entry_point() {
     let t = mlp_tree(LINEAR_RS);
     let base = colmajor_layer_facts()["gate_up"].clone();
 
-    // Default: `_co`.
-    assert_eq!(t.select(&base).kernel, "linear_gemv_ishizuki_k3_fused2_co");
+    // Default: `_2col`.
+    assert_eq!(t.select(&base).kernel, "linear_gemv_ishizuki_k3_fused2_2col");
 
-    // Disabling `_co` reaches `_2col`.
-    let without_co = base.clone().flag("KAPLUMBA_NO_FUSED2_CO");
-    let pick = t.select(&without_co);
+    // `_co` is arm index 3 in the flattened order and needs arm 1 disabled.
+    let without_2col = base.clone().flag("KAPLUMBA_NO_FUSED2_2COL");
+    let pick = t.select(&without_2col);
     assert_eq!(
-        pick.kernel, "linear_gemv_ishizuki_k3_fused2_2col",
-        "disabling the `_co` arm does not reach `_2col`; the arm order changed"
+        pick.kernel, "linear_gemv_ishizuki_k3_fused2_co",
+        "disabling the `_2col` arm does not reach `_co`; the arm order changed"
     );
-    assert_eq!(pick.groups, (INTERMEDIATE as u64 / 16) * 2 / 2);
+    assert_eq!(pick.groups, INTERMEDIATE as u64 / 16, "one TG per gate tile");
 
     // `_co4` sits inside the `_co` arm and needs its own flag on top.
-    let with_co4 = base.clone().flag("KAPLUMBA_FUSED2_CO4");
+    let with_co4 = without_2col.clone().flag("KAPLUMBA_FUSED2_CO4");
     let pick = t.select(&with_co4);
     assert_eq!(pick.kernel, "linear_gemv_ishizuki_k3_fused2_co4");
     assert_eq!(pick.groups, INTERMEDIATE as u64 / 16 / 2);
@@ -1676,13 +1677,13 @@ fn the_two_fused2_entry_points_disagree_about_co_and_2col_order() {
             "linear_gemv_ishizuki_k3_fused2_sk2",
             // the chain, in source order
             "linear_gemv_ishizuki_k3_fused2_4col",
+            "linear_gemv_ishizuki_k3_fused2_2col",
             // the `_co` guard's own nested chain
             "linear_gemv_ishizuki_k3_fused2_co4",
             "linear_gemv_ishizuki_k3_fused2_co",
             "linear_gemv_ishizuki_k3_fused2",
             "linear_gemv_ishizuki_k3_fused2_co",
             "linear_gemv_ishizuki_k3_fused2",
-            "linear_gemv_ishizuki_k3_fused2_2col",
             // the chain's terminal `else`
             "linear_gemv_ishizuki_k3_fused2",
         ],
@@ -2186,16 +2187,16 @@ fn fusion_does_not_reduce_the_weight_traffic() {
 // ===========================================================================
 
 #[test]
-fn inverting_the_co_opt_out_moves_the_selection_to_2col() {
+fn inverting_the_2col_opt_out_moves_the_selection_to_co() {
     let t = mlp_tree(LINEAR_RS);
     let facts = colmajor_layer_facts()["gate_up"].clone();
-    assert_eq!(t.select(&facts).kernel, "linear_gemv_ishizuki_k3_fused2_co");
+    assert_eq!(t.select(&facts).kernel, "linear_gemv_ishizuki_k3_fused2_2col");
 
     // The anchor includes `out_features_gate`, so the mutation lands in
     // `encode_gemv_fused2_mlp` and not in the earlier `encode_gemv_fused2`.
     let mutated = LINEAR_RS.replacen(
-        "out_features_gate == out_features_up && !env_flag(\"KAPLUMBA_NO_FUSED2_CO\")",
-        "out_features_gate == out_features_up && env_flag(\"KAPLUMBA_NO_FUSED2_CO\")",
+        "!env_flag(\"KAPLUMBA_NO_FUSED2_2COL\")\n            && out_features_gate % 32 == 0",
+        "env_flag(\"KAPLUMBA_NO_FUSED2_2COL\")\n            && out_features_gate % 32 == 0",
         1,
     );
     assert_ne!(
@@ -2204,7 +2205,7 @@ fn inverting_the_co_opt_out_moves_the_selection_to_2col() {
     );
     assert_eq!(
         mlp_tree(&mutated).select(&facts).kernel,
-        "linear_gemv_ishizuki_k3_fused2_2col",
+        "linear_gemv_ishizuki_k3_fused2_co",
         "inverting the opt-out did not move the selection, so the evaluator is \
          not reading the guard"
     );
@@ -2303,17 +2304,17 @@ fn a_mutated_kernel_name_makes_the_pipeline_lookup_fail_closed() {
     let facts = colmajor_layer_facts()["gate_up"].clone();
     assert_eq!(
         mlp_tree(LINEAR_RS).select(&facts).kernel,
-        "linear_gemv_ishizuki_k3_fused2_co"
+        "linear_gemv_ishizuki_k3_fused2_2col"
     );
     let mutated = LINEAR_RS.replacen(
-        "out_features_gate == out_features_up && !env_flag(\"KAPLUMBA_NO_FUSED2_CO\")",
-        "out_features_gate == out_features_up && !env_flag(\"KAPLUMBA_NO_FUSED2_CO\") && self.ishizuki_gemv_pipeline_by_name(\"linear_gemv_ishizuki_k3_fused2_co_RENAMED\").is_some()",
+        "\"linear_gemv_ishizuki_k3_fused2_2col\").is_some()",
+        "\"linear_gemv_ishizuki_k3_fused2_2col_RENAMED\").is_some()",
         1,
     );
     assert_ne!(mutated, LINEAR_RS);
     assert_eq!(
         mlp_tree(&mutated).select(&facts).kernel,
-        "linear_gemv_ishizuki_k3_fused2_2col",
+        "linear_gemv_ishizuki_k3_fused2_co",
         "an `.is_some()` guard naming a kernel no shader defines must fail closed"
     );
 }

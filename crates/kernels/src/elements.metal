@@ -1032,8 +1032,8 @@ kernel void sample_draw(
     const float maximum = sample_key_float(mv[0]);
     float total = 0.0f;
     for (uint i = 0u; i < top_k; ++i) {
-        const float weight = exp((sample_key_float(mv[i * 2u]) - maximum) / params.temperature);
-        mv[i * 2u] = as_type<uint>(weight);
+        const float weight = exp((sample_key_float(mv[i]) - maximum) / params.temperature);
+        mv[i] = as_type<uint>(weight);
         total += weight;
     }
     // `sampler.rs:110-128`: top-k FIRST, truncating to `top_k`, and only then
@@ -1042,7 +1042,7 @@ kernel void sample_draw(
     float cumulative = 0.0f;
     uint selected = 0u;
     for (uint i = 0u; i < top_k; ++i) {
-        cumulative += as_type<float>(mv[i * 2u]) / total;
+        cumulative += as_type<float>(mv[i]) / total;
         selected = i;
         if (cumulative >= params.top_p) {
             break;
@@ -1050,7 +1050,7 @@ kernel void sample_draw(
     }
     float selected_total = 0.0f;
     for (uint i = 0u; i <= selected; ++i) {
-        selected_total += as_type<float>(mv[i * 2u]);
+        selected_total += as_type<float>(mv[i]);
     }
     const SampleRng draw = sample_rng_next(*rng);
     *rng = draw.state;
@@ -1058,7 +1058,7 @@ kernel void sample_draw(
     float running = 0.0f;
     uint token = mi[selected];
     for (uint i = 0u; i <= selected; ++i) {
-        running += as_type<float>(mv[i * 2u]);
+        running += as_type<float>(mv[i]);
         if (target <= running) {
             token = mi[i];
             break;
