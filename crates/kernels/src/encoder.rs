@@ -222,6 +222,11 @@ fn command_failed(buffer: &CommandBuffer) -> KernelError {
 /// longer has to wait for the encode as well.
 pub const MAX_DISPATCHES_PER_BUFFER: u32 = 50;
 
+/// Deferred sparse embedding decode holds rolled buffers until the host stages
+/// the selected embedding row. A 31B decode step is about 2,100 dispatches;
+/// 100 dispatches per buffer keeps it near 21 buffers, below the deferred cap.
+pub const DEFERRED_SPARSE_DISPATCHES_PER_BUFFER: u32 = 100;
+
 /// Command buffers allowed in flight. MLX's `MAX_ACTIVE_TASKS = 10`
 /// (`mlx/transforms.cpp`); past it the host blocks on a condvar. We measured
 /// `new_command_buffer()` blocking ~175 ms once ~64 buffers were outstanding,
@@ -1176,6 +1181,30 @@ kernel void burn(device float* out [[buffer(0)]],
             "unexpected bound error: {error}"
         );
         encoder.abandon();
+    }
+
+    #[test]
+    fn deferred_decode_sized_step_fits_below_the_buffer_limit() {
+        let Some((_device, queue, pipeline, out)) = burn_context() else {
+            return;
+        };
+        let mut encoder = MetalEncoder::new(&queue).expect("encoder");
+        encoder.set_max_dispatches(DEFERRED_SPARSE_DISPATCHES_PER_BUFFER);
+        encoder.defer_submissions();
+        for _ in 0..2100 {
+            burn(&mut encoder, &pipeline, &out, CHEAP_ITERS);
+        }
+
+        assert_eq!(encoder.deferred.len(), 21);
+        assert!(encoder.deferred.len() < 32);
+        assert!(encoder.deferred.iter().all(|buffer| {
+            buffer.status() == MTLCommandBufferStatus::NotEnqueued
+        }));
+        encoder
+            .mark_deferred_inputs_staged()
+            .expect("stage deferred inputs");
+        encoder.commit_terminal().expect("submit decode-sized step");
+        encoder.wait();
     }
 
     #[test]

@@ -3568,6 +3568,15 @@ pub struct TextModel {
     _residency_set: Option<crate::metal::ResidencySet>,
 }
 
+fn cache_retract_counts(before: &[usize], after: &[usize]) -> Vec<usize> {
+    assert_eq!(before.len(), after.len());
+    before
+        .iter()
+        .zip(after)
+        .map(|(&before, &after)| after.saturating_sub(before))
+        .collect()
+}
+
 /// f16 bit pattern scaled by `scale`, returned as f32. Used by the speculative
 /// host path to apply the embedding scale without a kernel round trip.
 fn f16_scaled(bits: u16, scale: f32) -> f32 {
@@ -4368,6 +4377,9 @@ impl TextModel {
         }
         if defer_sparse_embedding {
             encoder.defer_submissions();
+            encoder.set_max_dispatches(
+                kaplumba_kernels::encoder::DEFERRED_SPARSE_DISPATCHES_PER_BUFFER,
+            );
         }
         if let Some(t) = token {
             if t as usize >= self.vocab_size {
@@ -4394,7 +4406,13 @@ impl TextModel {
         let next_token_buffer = self.scratch.token_ids_decode[next_slot].clone();
         let host_token_buffer = self.scratch.host_tokens.clone();
 
-        self.forward_chunk_pick(
+        let cache_positions_before = defer_sparse_embedding.then(|| {
+            self.layers
+                .iter()
+                .map(|layer| layer.gpu_cache.next_position())
+                .collect::<Vec<_>>()
+        });
+        let forward_result = self.forward_chunk_pick(
             &[token.unwrap_or(0)],
             &[position],
             encoder,
@@ -4408,7 +4426,31 @@ impl TextModel {
             }),
             self.sparse_embedding && !defer_sparse_embedding,
             defer_sparse_embedding,
-        )?;
+        );
+        if let Err(error) = forward_result {
+            if let Some(positions_before) = cache_positions_before {
+                // Deferred buffers have not been submitted, so it is safe to
+                // discard them. A failed forward may have advanced only the
+                // layers encoded before the error; restore each independently.
+                encoder.abandon();
+                let positions_after = self
+                    .layers
+                    .iter()
+                    .map(|layer| layer.gpu_cache.next_position())
+                    .collect::<Vec<_>>();
+                for (layer, retract) in self
+                    .layers
+                    .iter_mut()
+                    .zip(cache_retract_counts(&positions_before, &positions_after))
+                {
+                    if retract > 0 {
+                        layer.gpu_cache.retract(retract);
+                    }
+                }
+                self.pending_sparse_embedding_slot = None;
+            }
+            return Err(error);
+        }
         if defer_sparse_embedding {
             self.pending_sparse_embedding_slot = Some(slot);
         }
@@ -6679,11 +6721,18 @@ fn read_sign_component(
 
 #[cfg(test)]
 mod sparse_embedding_tests {
-    use super::gather_embedding_rows;
+    use super::{cache_retract_counts, gather_embedding_rows};
     use crate::metal::MetalContext;
     use kaplumba_kernels::elements::ElementKernels;
     use kaplumba_kernels::encoder::MetalEncoder;
     use metal::MTLResourceOptions;
+
+    #[test]
+    fn partial_sparse_forward_rollback_is_per_layer() {
+        let before = [16, 16, 16, 16];
+        let after = [17, 17, 16, 16];
+        assert_eq!(cache_retract_counts(&before, &after), [1, 1, 0, 0]);
+    }
 
     fn upload(context: &MetalContext, bytes: &[u8]) -> metal::Buffer {
         context.device().new_buffer_with_data(

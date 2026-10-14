@@ -43,6 +43,7 @@ host has safely replaced that row.
 |---|---|---|
 | `crates/kernels/src/encoder.rs` | `roll()` immediately commits each full command buffer. | Add explicit bounded deferred-submission mode for a single step; terminal commit submits deferred buffers in order, while abandon/drop discards them safely. Preserve normal behavior by default. |
 | `crates/engine/src/model.rs` | Sparse decode drains before slot writes and gathers the row inside `forward_chunk_pick`. | Keep token/position slot rules; allow sparse pipelined encoding to refer to row scratch before it is populated, and expose a narrow stage-row operation after the previous step completes. Keep prefill and synchronous paths unchanged. |
+| `crates/kernels/src/encoder.rs` | Deferred sparse forwards still roll at 50 dispatches, requiring about 42 unsubmitted buffers for the measured 2,100-dispatch decode step, beyond the hard cap of 32. | Give deferred sparse decode a 100-dispatch slice size (about 21 rolled buffers for the measured step); retain the hard cap and ensure failure abandons partial work and restores per-layer cache positions. |
 | `crates/engine/src/generate.rs` | Encodes and submits next step before waiting on current output. | Encode next step while current runs, wait/read/EOS-check, stage the raw embedding row, then submit the prepared encoder. Preserve error cleanup and token accounting. |
 | `crates/engine/src/chat.rs` | Encodes pending work before previous wait and drops pending on EOS. | Retain this shape; stage the row after previous wait and before committing pending work. |
 | `crates/kernels/src/encoder.rs` tests | Cover ordinary rolling and flush behavior. | Add deferred submission, ordering, abandonment, terminality, and bound tests with a negative control. |
@@ -108,3 +109,4 @@ public checkpoint or chat formats.
 | 7 chat/CLI and sampling regressions | T4, T5 |
 | 8 sabotage-proven ordering regression | T2, T3 |
 | 9 throughput and memory acceptance | T1, T6 |
+| 10 deferred-buffer capacity and failed-step cache rollback | T7 |

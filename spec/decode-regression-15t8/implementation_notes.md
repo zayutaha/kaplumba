@@ -119,3 +119,47 @@
   system active pages, and 1,908 MiB swap. Per AGENTS.md §10, no model was
   started. The requested >=15.8 tok/s and `--chat` verification are not yet
   demonstrated; T1/T6 remain open.
+
+## 2026-10-14 — user-reported chat failure: deferred cap too low
+
+- User ran the release chat after T4 and observed: load succeeded in 2,661 ms;
+  first turn printed `Hello` then failed with `invalid kernel input: deferred
+  command-buffer limit 32 exceeded`; the next turn failed with sliding cache
+  slot 16 still at `u32::MAX`, expected 16.
+- Root cause confirmed in code: `MAX_DISPATCHES_PER_BUFFER = 50`, while
+  `encoder.rs` records an approximately 2,100-dispatch decode step. Deferred
+  chat therefore needs about 42 rolled buffers, exceeding the hard cap of 32.
+  The prior T2 note's 1,617 dispatch estimate understated the actual step; the
+  `a_decode_sized_step_rolls_rather_than_using_one_buffer` test already models
+  2,100 dispatches.
+- The second error follows from `forward_step_pipelined` returning during
+  partial layer encoding: KV positions advance per encoded layer, while the
+  caller's `?` drops the encoder but does not restore layer positions. A later
+  turn then sees inconsistent cache state. The correction is to use 100
+  dispatches per buffer only for deferred sparse decode (~21 rolls), retain the
+  32-buffer safety cap, and snapshot/restore each layer's own cache position if
+  deferred forward encoding fails. All deferred work must be abandoned on that
+  failure.
+
+- Implemented the deferred sparse-only slice size as 100 dispatches. The
+  `deferred_decode_sized_step_fits_below_the_buffer_limit` Metal test encoded
+  2,100 dispatches into 21 unsubmitted buffers, staged, submitted, and waited
+  successfully. Ordinary and prefill defaults remain 50.
+- `forward_step_pipelined` snapshots every layer's cache cursor before sparse
+  deferred encoding. On error it abandons the encoder, retracts only layers
+  advanced beyond their own snapshot, clears pending sparse-row state, and
+  returns the original error.
+- `cargo test -p kaplumba-kernels --lib`: 39 passed. `cargo test
+  -p kaplumba-engine --lib`: 146 passed, 2 ignored. `cargo test
+  -p kaplumba-engine --test multi_turn_chat`: 8 passed, 4 model-backed ignored.
+  Release CLI build passed. Negative control replaced `encoder.abandon()` with
+  `encoder.wait()`; the new source guard failed with `discard all unsubmitted
+  command buffers`; restored and reran successfully.
+- Rollback math has a unit case for mixed layer progress (`[17,17,16,16]`
+  restored to `[16,16,16,16]`). The multi-turn source regression checks that
+  the deferred failure branch abandons before per-layer retraction. An injected
+  failure in a live model forward has not been exercised.
+- No live model retry yet: `scripts/gpuq status` reports about 1 GiB
+  top-unused and ~1.9 GiB swap, below the repo's safe model-load threshold.
+  User must rerun the rebuilt binary when memory is available to prove first
+  reply and second-turn sliding-cache correctness.

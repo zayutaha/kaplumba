@@ -66,3 +66,23 @@
   exact output IDs and environment. Reach >=15.8 tok/s canonical median or keep
   the task open with evidence and a next measured cause. Update old claims and
   close only demonstrated acceptance criteria.
+- [ ] **T7 — prevent deferred decode overflow and roll back failed sparse steps.**
+  Files: `crates/kernels/src/encoder.rs`, `crates/engine/src/model.rs`, their
+  tests, and this spec. Use 100 dispatches per command buffer for deferred
+  sparse decode so the measured ~2,100-dispatch step rolls about 21 times under
+  the 32-buffer cap. If encoding fails, abandon all unsubmitted buffers and
+  restore each layer's cache position to its own step-start value. Test a
+  2,100-dispatch deferred encoder step through terminal submission and the
+  per-layer partial-advance rollback calculation. Rebuild the release
+  CLI. `cargo test -p kaplumba-kernels --lib` passed 39/39, including the
+  2,100-dispatch case (21 deferred buffers); engine library passed 146/146 (2
+  ignored), chat integration passed 8/8 (4 model tests ignored), and release CLI
+  built. A deliberate `encoder.abandon()` removal made
+  `failed_deferred_forward_abandons_work_and_restores_each_cache_cursor` fail
+  with `discard all unsubmitted command buffers`; restored and reran it
+  successfully. The test proves the abandon/restore path structurally and
+  exercises rollback deltas with partially advanced layers; it does not inject
+  a failing model forward. Implementation checkpoint committed as `HASH`.
+  Model-backed first/second-turn chat verification remains pending: latest
+  `scripts/gpuq status` has under 2 GiB top-unused, below the 14 GiB safe load
+  threshold. Keep this task open until the release chat retry completes.

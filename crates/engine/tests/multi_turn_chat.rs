@@ -687,6 +687,37 @@ fn cli_sparse_row_is_staged_after_wait_and_before_submit() {
     );
 }
 
+#[test]
+fn failed_deferred_forward_abandons_work_and_restores_each_cache_cursor() {
+    let src = std::fs::read_to_string(format!(
+        "{}/src/model.rs",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("model.rs");
+    let step = src
+        .split("pub fn forward_step_pipelined(")
+        .nth(1)
+        .and_then(|body| body.split("pub fn stage_pipelined_embedding_row").next())
+        .expect("forward_step_pipelined body");
+    let snapshot = step
+        .find("let cache_positions_before = defer_sparse_embedding.then")
+        .expect("save each layer's position before deferred encoding");
+    let forward = step
+        .find("let forward_result = self.forward_chunk_pick(")
+        .expect("encode the forward");
+    let failure = step
+        .find("if let Err(error) = forward_result")
+        .expect("handle a partial encode failure");
+    let abandon = step[failure..]
+        .find("encoder.abandon()")
+        .expect("discard all unsubmitted command buffers");
+    let restore = step[failure..]
+        .find("cache_retract_counts(&positions_before, &positions_after)")
+        .expect("restore each cache by its own partial advance");
+    assert!(snapshot < forward && forward < failure);
+    assert!(abandon < restore);
+}
+
 /// The `read_host_token` invariant the reorder had to preserve: a GPU-staged
 /// token is never read before the encoder that staged it has been waited on.
 /// The reorder moves the encode earlier; it must NOT move the read earlier too,

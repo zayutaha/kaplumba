@@ -67,6 +67,11 @@ the current lower rate before a performance fix is accepted.
    record ordinary chat throughput at 1k/2k/8k contexts as comparisons; these
    longer contexts are not subject to the canonical 15.8 floor. Record load,
    TTFT, decode median/spread, memory pressure, locked bytes, and swap deltas.
+10. Sparse deferred chat must size its command buffers so a decode-sized
+    forward of about 2,100 dispatches stays below the 32-buffer per-step limit.
+    If deferred encoding still fails, discard its unsubmitted work and restore
+    each layer's KV position to its per-step starting position so one failed
+    chat turn cannot leave the next turn with inconsistent sliding-cache state.
 
 ## Acceptance criteria
 
