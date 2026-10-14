@@ -1,5 +1,10 @@
 # Implementation notes — investigation only
 
+D0 documentation and preserved standalone evidence committed as `61be419`.
+The follow-up documentation commit records this hash in tasks.md. No production
+source was staged. Scratch snapshot/binaries/logs removed after preserving source
+and all raw measurement logs here; no benchmark process left running.
+
 ## D0 — 2026-10-14
 
 - User confirmed scope before spec creation; later explicitly requested tg/s

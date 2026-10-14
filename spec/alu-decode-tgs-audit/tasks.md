@@ -7,7 +7,7 @@
   CPU extraction experiment with failing mutations, standalone GPU fused2
   comparison with active-shader sabotage, specify ALU and tg/s work.
   Validation: source citations, CPU/GPU results/limits, requirement mapping and
-  `git diff --check`. Commit: recorded immediately after documentation commit.
+  `git diff --cached --check`. Commit: `61be419`.
 
 ## Future implementation/measurement tasks — not performed or authorized here
 
