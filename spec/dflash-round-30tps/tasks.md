@@ -249,11 +249,20 @@ branches selected from those results, not mandatory simultaneous implementations
 
 ## Performance work after measured correctness
 
-- [ ] **T9 — define any two-block experiment.**
-  Files: `dflash.rs`, proposal tests and notes. Establish conditioning and exact
-  count first: two re-anchored B16 blocks give 30 proposals. Self-draft K/V is
-  distinct from target-feature context. Test positions, q conditioning, anchor
-  deduplication and rollback before claiming a 31-proposal path.
+- [ ] **T9 — probe the re-anchored two-block B16 proposal.**
+  Files: `crates/engine/src/dflash.rs`, a focused DFlash integration test,
+  `spec/dflash-round-30tps/{spec,plan,tasks,implementation_notes}.md`. Preserve
+  target-feature K/V as the base context. Block 1 proposes `p+1..p+15`; block 2
+  uses the sampled token at `p+15` as anchor and appends only block 1's own K/V
+  rows at `p..p+14`, then proposes `p+16..p+30`. Retain q distributions from
+  both forwards and verify all 30 proposals in one target pass. First measure
+  the 30-row verifier alone; run full generation only if correctness passes and
+  measured cost leaves a plausible ≥30 tok/s path. Do not wire this into the
+  default or CLI in T9. Test exact positions and proposal count, q-distribution
+  conditioning, anchor deduplication, sliding-window absolute positions, and
+  target-cache rollback at rejection depths 0, 1, 14, 15, 16, 29, and 30.
+  Sabotage the anchor-row slice and a q-row mapping and confirm named tests fail.
+  Report actual end-to-end throughput; the 30 tok/s gate remains open otherwise.
 - [ ] **T10 — measure trained B16 and shorter proposal prefixes.**
   Files: benchmark harness and notes. With the proposal-temperature diagnostic
   in T10a complete, measure trained B16 and shorter prefixes with actual

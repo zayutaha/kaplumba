@@ -1,5 +1,22 @@
 # spec/dflash-round-30tps — implementation notes
 
+## 2026-10-14 — T9 proposal contract
+
+The two-block B=16 experiment is defined as 30 distinct proposal positions:
+first block proposes `p+1..p+15`; the second block anchors on the sampled token
+at `p+15` and proposes `p+16..p+30`. Its temporary context retains the
+target-feature cache and appends first-block drafter K/V only at `p..p+14`;
+the `p+15` row is omitted because the second block recomputes that anchor.
+Second-block q distributions are the actual logits from that forward, including
+its sampled anchor and temporary context. This is a conditional proposal
+process, not a claim that masked-state K/V equals target-feature K/V.
+
+This is a bounded correctness/feasibility probe only; no generation or CLI
+integration is authorized by T9. First measure the target's 30-row verify cost,
+then run full generation only if exactness and observed-prefix cost leave a
+plausible route to 30 tok/s. At this point this is a design contract; no code,
+model run, or throughput result has validated it.
+
 Append as work proceeds. Tone: factual and dense; specifics (paths, numbers,
 commit hashes) over narrative.
 

@@ -196,6 +196,30 @@ new engine/kernel implementation and the exactness/memory work above. Keep
 weights and implementation held; revisit only with a concrete speed plan that
 can pass the target-device gates.
 
+### T9 — re-anchored two-block B=16 proposal
+
+Use two existing 16-row DFlash forwards to produce 30 proposals for one target
+verification pass. For a first-block anchor at position `p`, block 1 proposes
+`p+1..p+15`. Sample those rows using their retained q distributions. Create a
+temporary second-block context by cloning the target-feature `DflashKvCache`
+and appending block 1's drafter K/V rows at positions `p..p+14`; do not append
+the row at `p+15`, because block 2 recomputes that same position from the
+sampled final proposal as its anchor. Run block 2 at `p+15`; retain only rows
+1..15 as proposals at `p+16..p+30`. The target verifies the concatenated 30
+tokens at those contiguous positions, and speculative acceptance uses each
+proposal's actual conditional q distribution in order.
+
+This does not claim the masked-state K/V from block 1 is a target feature or a
+token-recomputed drafter state. It defines a legal conditional proposal process:
+block 2's q rows are the distributions actually produced from that temporary
+context and sampled anchor. Tests must establish that sampling and verification
+use those same distributions, that there is no duplicated anchor position,
+that sliding context retains the correct absolute positions, and that target
+cache rollback is correct at every rejection depth. Measure the 30-row target
+verify independently before an end-to-end run; reject the branch if total
+30-token throughput cannot exceed 30 tok/s at observed accepted-prefix
+survival.
+
 ### P1 follow-up — keep DFlash block intermediates on Metal
 
 T19a/T19b measured 170 ms in `draft_block` and 374 ms in target verification;

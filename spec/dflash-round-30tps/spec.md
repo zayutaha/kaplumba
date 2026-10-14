@@ -279,8 +279,14 @@ probe's overlaps are not substitute measurements for this engine.
   trained B=16. Measure shorter proposal prefixes and their actual draft cost.
   B=32 is a later experiment requiring evidence that extending this B=16
   checkpoint is meaningful; it is not a default or assumed quality improvement.
-  A two-block experiment needs its own exact count and conditioning contract;
-  self-generated draft K/V must not silently replace target-feature context.
+  A two-block B=16 experiment uses 30 distinct proposals: block 1 proposes
+  positions `p+1..p+15`; block 2 anchors on the sampled proposal at `p+15` and
+  proposes `p+16..p+30`. Preserve target-feature context and append block 1's
+  drafter K/V rows only through `p+14` to block 2's context; omit block 1's
+  `p+15` K/V because block 2 recomputes that position as its anchor. Keep the
+  exact q distribution used for every proposal and verify the combined sequence
+  in one target pass. This is an experimental proposal distribution, not an
+  assumption that masked-state K/V is equivalent to target-feature K/V.
 * **R2 — head and target-body gates.** `encode_gemm` is not a ready replacement.
   The reproduced 19.247559 M=2 discrepancy compares full target forwards; it
   does not isolate the head. Repair the layer-0 batch/decode discrepancy and
