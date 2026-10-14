@@ -1,6 +1,8 @@
 # spec/mlock-clean-mmap
 
-Status: approved for implementation; T1–T3 are complete, T4 is in progress.
+Status: T1–T3 are committed; full-model acceptance FAILED on the forced run.
+The 2026-10-14 amendment is investigation/specification only. T3b and T5
+describe required follow-up implementation; neither is implemented.
 User confirmed scope after clarification: ordinary chat with `Gxma-repacked`,
 green memory pressure and no repeated weight streaming after load, 1k/2k/8k
 contexts, and warning-and-continue when locking fails. DFlash work remains paused.
@@ -39,6 +41,44 @@ lock set is 12,046,221,312 bytes including the head and 10,989,240,320 excluding
 it. Alignment copies are not the cause for this checkpoint. The historical head
 exclusion explains a 1,056,980,992-byte lock-set difference. This spec retains
 the head lock to protect its repeated reads.
+
+### Forced-run failure and corrected diagnosis (2026-10-14)
+
+Candidate `0bb4309`, built from the main working tree, generated 200 tokens
+after a 1,034-token prompt. System swap rose from 1,017.88 MiB before launch
+to a sampled 2,930 MiB during/at completion, then 2,850 MiB afterward. This
+fails AC3. The run started with only 3.5 GiB reported available and roughly
+8.2 GiB of active pages; neither figure is an exact desktop allocation total.
+The user explicitly requested the forced load despite that baseline.
+
+Live `vmmap` showed 11.2 GiB resident in the mapped-file class, zero dirty or
+swapped bytes in that class, and approximately 724.9 MiB swapped in other
+regions of the model process. System wired memory was about 13 GiB; the process
+peak footprint was only 2,592,942,688 bytes (2.415 GiB). A lower Activity Monitor
+process figure therefore does not establish that locking stopped. Clean shared
+wired pages can sit outside that figure while using physical RAM.
+
+The complete-lock summary was gated on `KAPLUMBA_LOAD_PROFILE`, which was not
+set. Thus the run did NOT record its exact successful lock count or inspect
+every hot region's wire count. No incomplete-lock warning appeared. Together
+with the clean resident mapped pages and increased system wiring this supports
+successful wiring, but it does not close the full-model locking evidence gate.
+The source still calls real `mlock`, keeps locking enabled by default, and does
+not unlock when its temporary accounting object drops.
+
+A separate 16 MiB lock/32 MiB mapping probe retained `user_wired_count=1`
+through Metal no-copy binding, residency registration, a GPU read and residency
+release, with no copied/anonymous/modified pages. Deliberate `munlock` made the
+wire assertion fail; restoration passed. This rules out automatic lock loss in
+that small sequence; it is not full-model acceptance.
+
+Diagnosis: shared backing removes the reproduced private-copy mechanism but
+does not make the locked hot set free. The forced workload displaced pageable
+memory, including allocations in the model process itself. The exact allocation
+owners and the host share of the swap growth remain to be measured. Claims that
+the entire model is not locked, or that the packed weights themselves were
+swapped, are not established by this run. The current design fails the user's
+no-paging outcome and requires allocation/capacity work before further acceptance.
 
 ## Non-goals / restrictions
 
@@ -97,6 +137,23 @@ the head lock to protect its repeated reads.
    sparse embedding faults and steady decode weight I/O. Compare matched
    workloads A/B/A/B and report medians and spread for load, TTFT, prefill and
    decode. No new scheduler or polling in the generation hot path.
+7. **R7 — visible successful locking.** Emit one compact per-load summary even
+   when every requested lock succeeds. Include policy state, requested/attempted/
+   successful/evictable unique page bytes, excluded/copy bytes and syscall error.
+   Distinguish syscall success from independently observed OS wire state. Verify
+   layer and head regions after binding/warmup, prefill, decode and idle/resume
+   in an opt-in diagnostic, without generation hot-path polling. A missing
+   profiling environment flag must not hide whether the hot set was locked.
+8. **R8 — bound the whole live workload.** Measure mapped hot pages, anonymous
+   side weights and duplicates, embedding working set, Metal residency scope,
+   KV growth overlap, retained scratch, CPU/tokenizer/driver memory and desktop
+   pressure. Attribute model-region swapped bytes separately from host swap.
+   Preserve real locks and reduce unnecessary live allocations before changing
+   capacity policy. Report an insufficient-capacity load as degraded and keep
+   warning-and-continue. Raising wire limits or forcing a load cannot make an
+   over-capacity desktop pass green/no-swap acceptance. Healthy acceptance needs
+   a recorded desktop supply that covers the measured total demand; arbitrary
+   background workloads cannot be promised zero swap.
 
 ## Acceptance criteria
 
@@ -110,6 +167,8 @@ the head lock to protect its repeated reads.
   must fail a diagnostic assertion before restoration. The warning path loads,
   preserves readable weight bytes and states the unprotected bytes. Greedy output
   equality is checked in AC4 on normal acceptance runs.
+  A complete load must also print its successful summary without profiling flags;
+  sabotage summary suppression and require a diagnostic failure (T3b).
 - **AC3 (R2/R4/R6):** In recorded normal desktop conditions with a single target
   loaded, corrected ordinary-chat runs remain at normal memory-pressure level,
   with Activity Monitor green, no new swap growth attributable to the run, and
@@ -123,7 +182,14 @@ the head lock to protect its repeated reads.
   actual physical demand on the 24 GiB machine, not a footprint-only prediction.
 - **AC5:** Every implementation task is individually tested, documented and
   committed. Failed measurements remain visible; the spec is not complete until
-  AC1–AC4 pass.
+  AC1–AC4 and AC6 pass.
+- **AC6 (R7/R8):** Inspect all selected hot regions, including the head, for real
+  wiring after load/Metal binding and at the acceptance phases. Build an allocation
+  ledger that explains swapped model regions and the pressure peak. Reconcile
+  external/shared pages without blindly adding footprint and locked bytes, which
+  can overlap. Prove any selected allocation fix reduces its measured demand.
+  Forced insufficient-capacity runs must visibly report degraded capacity and
+  remain failed acceptance even if all weight locks succeed.
 
 ## Open questions / evidence gates
 
@@ -132,5 +198,8 @@ No unresolved user requirements. The user additionally restated that real
 the size
 of live private copies in a full baseline run; whether restoring shared mapping
 alone with the existing hot lock set meets normal-chat pressure/I/O acceptance;
-and whether further physical-memory changes are needed. These are explicit
+which runtime/desktop allocations account for the forced run's swap growth;
+and the smallest allocation reduction that satisfies the recorded desktop
+budget. Further physical-memory work is now required for the failing workload.
+The exact full-model OS wire state remains unrecorded. These are explicit
 measurement gates, not defaults silently chosen by this draft.

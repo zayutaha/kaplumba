@@ -3,6 +3,10 @@
 Every implementation step requires its meaningful tests, a demonstrated failing
 negative control before any coverage claim, notes, status update and commit.
 
+Current result: **acceptance failed** on the forced 1,034-token candidate run.
+This amendment changes documentation only. Completed T1–T3 are component work,
+not a completed paging fix; all subsequent implementation remains unchecked.
+
 - [x] **D0 — investigate the regression and draft the spec.**
   Files: this folder's `spec.md`, `plan.md`, `tasks.md`,
   `implementation_notes.md`. Compare current `e1032d4` with preserved `d6354c5`,
@@ -38,6 +42,14 @@ negative control before any coverage claim, notes, status update and commit.
   second load still reports its shortfall. Sabotage warning emission and
   demonstrate a named failure. Completed `2026-10-14`; implementation commit
   `6cecdd6`.
+- [ ] **T3b — expose successful locks on every load.**
+  Files: `crates/engine/src/weights.rs`, focused load-output tests and notes.
+  Always print one compact lock/policy summary, including full success,
+  without requiring `KAPLUMBA_LOAD_PROFILE`. Test complete, partial, disabled,
+  excluded/copied and repeated loads. Suppress the successful summary as a
+  negative control, require a named missing-summary failure, then restore.
+  Independent OS wire verification remains T5/T4; do not label syscall counts
+  alone as that verification.
 - [ ] **T4 — prove ordinary-chat memory and I/O behavior.**
   Files: a bounded acceptance harness if required and notes. Run single-model
   `Gxma-repacked` A/B/A/B at 1k/2k/8k with generation inside the existing limit,
@@ -47,6 +59,11 @@ negative control before any coverage claim, notes, status update and commit.
   memory, swap deltas and attributed warm-window layer/head I/O. Record load,
   TTFT, prefill and decode medians/spread and all negative findings. Initial load
   and sparse embedding reads must not be mislabeled as repeated weight paging.
+  **First candidate run failed AC3:** 1,034 prompt + 200 generated tokens;
+  system swap 1,017.88 → sampled 2,930 MiB; model non-file regions ~724.9 MiB
+  swapped. Exact full hot-set OS wiring was not captured. No valid A/B,
+  2k/8k, repeated-turn or idle/resume acceptance result exists. Resume the matrix
+  after T3b and T5 diagnosis/selected fixes.
 - [ ] **T5 — resolve any remaining physical-memory demand.**
   Files: spec/plan first, then named loader/allocation files only if selected,
   notes. If T4 passes, record that shared mapping with the existing hot locks is
@@ -56,10 +73,27 @@ negative control before any coverage claim, notes, status update and commit.
   fix. Retain actual `mlock` for the hot set; an unlocked-weight workaround
   cannot close this task. Repeat only the failed/affected acceptance cases after
   a change, with appropriate regressions and failure controls.
+  T4 has now failed, activating this task. Sequence small independent steps:
+  first diagnostic allocation/region ownership with before/after phase snapshots;
+  then full hot-set observed wire verification after GPU binding/read/idle;
+  then one measured allocation reduction at a time (amend the plan with exact
+  files/tests before each); finally capacity reporting and honest `gpuq` wording
+  in `scripts/gpuq`. Explicitly account scratch retention, side-vector/arena
+  duplicates, KV replacement peaks and whole-shard Metal residency. Preserve
+  precision and all-hot real locking. Benchmark every selected reduction;
+  untested candidate ideas do not become completed tasks.
 - [ ] **T6 — reconcile stale claims and close acceptance.**
   Files: this folder and the specific historical loader documentation whose
   claims contradict the new evidence. Mark old `MAP_PRIVATE`-is-clean-under-lock
   and footprint-only shared-residency claims as superseded with source/result
   links. Preserve historical measurements and their environments. Map evidence
-  to AC1–AC5, record exact commands/commits and unresolved gates. Mark the full
+  to AC1–AC6, record exact commands/commits and unresolved gates. Mark the full
   spec complete only when its actual acceptance results pass.
+- [x] **D1 — investigate the forced-run failure and amend the spec.**
+  Files: this folder's four documents only. Preserve failed metrics and sampled
+  swap/model-region state; inspect actual lock call/lifetime and Metal ownership.
+  Run a bounded native shared-mapping/Metal-read probe with observed wire counts,
+  deliberate `munlock` failure and restored passing result. Record that it is
+  mechanism evidence, not actual-loader/full-model coverage. Require visible
+  successful summaries and allocation/capacity attribution. Validate document
+  consistency and `git diff --check`. Completed `2026-10-14`; commit pending.
