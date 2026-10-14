@@ -295,11 +295,14 @@ probe's overlaps are not substitute measurements for this engine.
   footprint at 1k/2k/8k. The 14-token ≤350 ms TTFT target is a measured gate,
   not an established baseline. Preserve <20 GiB at 2k with the drafter resident.
 * **F1 — conditional fallback evaluation.** Compare lookup proposals and, if
-  selected later, the Gemma-specific EAGLE-3 drafter using the same correct target
-  verifier. Lookup q is a deterministic point mass; sampled acceptance/residual
-  must preserve p. EAGLE-3 needs explicit feature, vocabulary mapping, loader,
-  cache and memory contracts before implementation. Record useful workload
-  limits and reject candidates whose complete cost exceeds their measured gain.
+  selected later, the Gemma-4-31B EAGLE-3 draft head using the same correct
+  target verifier. Lookup q is a deterministic point mass; sampled
+  acceptance/residual must preserve p. EAGLE-3 needs explicit feature,
+  vocabulary mapping, loader, cache and memory contracts before implementation.
+  The Thoughtworks candidate is 1.297 GB BF16 with a 32k draft vocabulary,
+  three target taps and one draft layer; its existing engine-path fit and local
+  speed remain unproven. Record workload limits and reject candidates whose
+  complete cost exceeds their measured gain.
 * **P1 — GPU ownership after correctness.** Measure host staging, allocations,
   per-operation waits and draft wall time. Exllamav3 keeps features, projections
   and KV on the GPU; evaluate an equivalent bounded Rust/Metal flow with existing

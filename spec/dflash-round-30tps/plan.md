@@ -180,6 +180,22 @@ the same prompt/block for A/B/A/B timings. Capture `/usr/bin/time -l`, mlock
 warnings, and swap; no result from the candidate counts toward AC5 unless the
 end-to-end 30 tok/s gate itself passes.
 
+### F1b — Gemma-4-31B EAGLE-3 feasibility result
+
+The Thoughtworks checkpoint is more compact than the DFlash variants and uses
+the same 5376 target hidden width, but it is not a drop-in drafter. Its header
+contains BF16 `fc.weight [5376, 16128]`, one dense `midlayer`, BF16
+`lm_head.weight [32000, 5376]`, `d2t I64[32000]`, and `t2d BOOL[262144]`; its
+full shard is 1,296,995,832 bytes. The output token space must be mapped back to
+the target vocabulary while target p remains 262144-wide. Its published draft
+context maximum is 4096, below the target's 8192 limit. Estimated memory is
+within the <20 GB budget, but no loaded measurement exists. The largest
+published speedup is 1.72× on 8×H200; that does not establish a 30 tok/s path on
+M4 Pro. The codebase has no dense BF16 GEMM interface, so this would require a
+new engine/kernel implementation and the exactness/memory work above. Keep
+weights and implementation held; revisit only with a concrete speed plan that
+can pass the target-device gates.
+
 ### P1 follow-up — keep DFlash block intermediates on Metal
 
 T19a/T19b measured 170 ms in `draft_block` and 374 ms in target verification;
@@ -337,12 +353,23 @@ automatically selected implementation:
   Test no match, ambiguous match, history boundaries and exact residual behavior.
   Measure repetition/copying workloads separately from general chat. Keep lookup
   storage bounded; future cache sizing/eviction is an unresolved design choice.
-- **EAGLE-3:** evaluate `RedHatAI/gemma-4-31B-it-speculator.eagle3` only after
-  a separate loader/state/vocabulary/memory design is reviewed. Its published
-  config has one transformer layer, 32000 draft vocabulary entries, and taps
-  [2,30,57]. Full target p still spans 262144 entries. Verify mapping, embeddings,
-  trained target compatibility and sampled q; public acceptance is external
-  evidence, not an M4 throughput prediction. Model weights stay outside the repo.
+- **EAGLE-3:** read-only review of
+  `thoughtworks/Gemma-4-31B-Eagle3` found a compatible 5376-wide target and
+  three taps `[2,29,56]`, but a different one-layer dense BF16 draft stack,
+  32000-token draft vocabulary, `d2t`/`t2d` maps, and a 4096 draft position
+  limit. Its 1,296,995,832-byte shard is small enough for the measured process
+  footprint budget by estimate (target + existing DFlash footprint plus the
+  0.336 GB size delta from the 5-bpw drafter), but has not been loaded and the
+  2k peak is not measured. The current engine has no dense BF16 GEMM path for
+  its `fc`, attention, MLP and reduced-vocabulary head; implementation also
+  needs feature-layer parity, target-embedding lookup, vocabulary-map semantics,
+  full-target-p exact rejection/residual, recurrent draft state, and long-context
+  behavior beyond its configured 4096 positions. The model card reports
+  1.05–1.72× on 8×H200; applying the best ratio to this machine's 12.3 tok/s
+  baseline gives 21.2 tok/s as a rough comparison, not a prediction. No weights
+  were downloaded; only config and the first 65,536 Safetensors bytes were read.
+  Keep implementation held: this is substantial new kernel/loader work with no
+  evidence it can reach 30 tok/s here.
 - **Alternate DFlash checkpoint:** the public Red Hat Gemma-4 DFlash card reports
   stronger acceptance on its evaluation sets, but its published artifact uses
   BF16 dense linears and a different config schema from this engine's EXL3 DFlash

@@ -1472,3 +1472,61 @@ For B8/B16, set `KAPLUMBA_TEST_DFLASH_BLOCK_SIZE` to `8`/`16`. The repeated
 A/B/A/B run used the same command with `KAPLUMBA_DFLASH_GPU_BLOCK=1` and
 `KAPLUMBA_TEST_PROMPT_COUNT=1`, alternating `Drafter` and the 5-bpw path. No
 project code changed for F1e.
+
+## 2026-10-14 — F1b Gemma-4 EAGLE-3 feasibility review
+
+Read-only review selected `thoughtworks/Gemma-4-31B-Eagle3` as the concrete
+Gemma-4-31B EAGLE-3 artifact. No model weights were downloaded. The Hugging Face
+tree lists `model.safetensors` at 1,296,995,832 bytes, LFS SHA-256
+`fff0c01d917611706321a74418b3000333d0e756fbcd2b47a00cee2c25030000`. Its
+config specifies hidden size 5376, auxiliary taps `[2,29,56]`, one draft layer,
+42 Q heads / 14 KV heads, head dimension128, 32,000 draft vocab, and maximum
+position4096. The Safetensors header was read via HTTP Range for bytes0–65,535
+only (header length1,520). It contains:
+
+```text
+fc.weight                         BF16 [5376, 16128]
+midlayer.self_attn.{q,k,v,o}     BF16, one dense decoder layer
+midlayer.mlp.{gate,up,down}_proj BF16, intermediate 16384
+lm_head.weight                   BF16 [32000, 5376]
+d2t                              I64  [32000]
+t2d                              BOOL [262144]
+```
+
+This is not loadable by `DflashWeights`: there are no EXL3 trellis/MCG/scales,
+and the model is an EAGLE3 decoder rather than a five-layer masked DFlash block.
+The existing target tap API can capture the 5376-wide target layers, but feature
+layer indexing and runtime parity with the checkpoint's SGLang training backend
+need direct validation. Draft IDs must map through `d2t`; `t2d` identifies the
+reduced-vocabulary subset. Exact sampled verification must preserve the complete
+262,144-entry target p, use the mapped draft q only on its 32k support, and draw
+the rejection residual from full target support. The target embedding is not a
+checkpoint tensor; the shared target embedding lookup must map draft IDs through
+`d2t`. Position4096 also leaves the target's 8192 context limit unsupported
+without a new strategy.
+
+Footprint estimate: the measured target + current 5-bpw DFlash short-prompt peak
+is 14.55 GB; replacing its 961 MB draft shard by this 1.297 GB shard adds about
+0.336 GB, or ~14.89 GB before draft-specific scratch/cache differences. This is
+below20 GB as an estimate, not the required measured 2k result. Target-plus-draft
+`mlock` already fails for a 0.96 GB DFlash file after target pins11.22 GiB, so
+the 1.30 GB EAGLE3 weights would not have proven residency without a new measured
+wire budget. No load was attempted.
+
+The current kernel crate exposes EXL3 quantized GEMM but no dense BF16 GEMM
+interface. EAGLE3 would need a dense path for `fc`, attention, MLP, and the
+32k-output head, plus mapped embedding/cache/state code. This is substantial
+new kernel and model work. The model card reports 1.05–1.72× on 8×H200 for
+different datasets; applying1.72× illustratively to local plain12.3 tok/s gives
+21.2 tok/s. This arithmetic is not a local prediction and gives no evidence
+for30. Design conclusion: no weights/code, no implementation selected; F1b
+feasibility review is complete but the overall 30 tok/s objective remains open.
+
+Sources:
+
+- Model config/header/card: <https://huggingface.co/thoughtworks/Gemma-4-31B-Eagle3>
+- Publisher benchmark table and H200 context: <https://huggingface.co/thoughtworks/Gemma-4-31B-Eagle3/blob/main/README.md>
+- SGLang EAGLE3 auxiliary hidden-state configuration:
+  <https://github.com/sgl-project/sglang/blob/main/python/sglang/srt/model_executor/model_runner_components/spec_aux_hidden_state.py>
+- SpecForge reduced-vocabulary teacher/token mapping:
+  <https://github.com/sgl-project/SpecForge/blob/main/specforge/algorithms/eagle3/model.py>
