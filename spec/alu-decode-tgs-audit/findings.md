@@ -127,6 +127,34 @@ slower 4-column/cooperative-load variants, or attention split reassociation
 without new evidence and the stated quality gates. Current spec history records
 128-token gates that missed long-context token divergence.
 
+## Authorized T3/T4 implementation trial on local branch tip 95969c5
+
+After the user authorized implementation, scalar extraction was applied to the
+active `fused2_sk2` and `fused3_sk2` kernels. The tests compared the exact
+candidate body against the pre-478c 64-bit shader body, then injected an
+output-changing mutation into the actual candidate before recording timings.
+These are a new harness/run set relative to the earlier exploratory fused2
+figures above; preserve both records rather than treat their timing medians as
+one sample. Complete command output, paired values, harness and limitations are
+in `implementation_notes.md` and `harnesses/raw_compare3.swift`.
+
+The final `fused2_sk2` run matched 62,208 raw FP32 words over three shapes and
+its mutation changed 12,288 / 18,432 / 192. Paired median kernel gains were
++4.621% and +4.321% on larger shapes (16/16 and 14/16 wins), and +0.531% on the
+small shape (11/16 wins). `fused3_sk2` matched 32,768 / 40,960 / 1,024 raw words;
+its mutation changed 16,384 / 20,480 / 256. Paired median gains were +4.197%
+and +4.767% (12/16 and 14/16 wins) on larger shapes, and +1.340% (13/16) on the
+small shape, whose spread included a large outlier. These timings indicate the
+kernel experiment is promising, but are synthetic repeated-dispatch times, not
+full-model decode or DRAM rates. `cargo test -p kaplumba-engine --test
+fused_bit_exact -- --nocapture` passed 4/4 (34.96 s) on the combined edits.
+
+The change remains experimental: no Gxma chat token-ID comparison or
+end-to-end `tg/s` run was possible because `scripts/gpuq status` reported under
+1 GiB top-unused with about 3.3 GiB swap, below the model-run threshold. Thus
+the objective to improve application `tg/s`, and 250 useful GB/s, remain
+unproven.
+
 ## The 250 GB/s target and tg/s arithmetic
 
 Historical useful-weight accounting is **12.039487488 GB/token**, not 2.164 GB.
