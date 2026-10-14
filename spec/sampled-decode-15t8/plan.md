@@ -18,6 +18,13 @@ In `crates/engine/src/generate.rs`:
   5. CPU commits step $N+1$.
 This completely removes the 512 KB logit copy to host and CPU float conversions from the hot path.
 
+### 3. Multi-Input-Vector Support for Fused Projections (fused2_mlp and fused3)
+Gxma-repacked assigns distinct Hadamard/sign vectors (`suh`) to `gate_proj`, `up_proj`, `q_proj`, `k_proj`, and `v_proj`. Fused kernels previously assumed a single shared input activation vector, forcing decode to fall back to separate `encode_linear` calls.
+By adding `stride_x` to `linear_gemv_ishizuki_k3_fused2_2col` and `fused3_2col`:
+- Threadgroups processing matrix A read $x$, threadgroups for B read $x + \text{stride\_x}$, and C read $x + 2 \times \text{stride\_x}$.
+- `encode_input_transform` prepares each projection's transformed input vector at distinct offsets in `scratch.transformed`.
+- This eliminates 6 redundant kernel dispatches per layer and restores fused `gate_up_gelu` and fused `qkv_proj` with 100% bit-exact correctness.
+
 ## File Touchpoints
 
 1. `crates/kernels/src/linear_repacked.metal`:
