@@ -846,3 +846,24 @@ All GPU commands completed. This proves full-resource wiring for this local
 mechanism and motivates T5f/T5g; it is not full-model/no-swap acceptance.
 No autorelease pool exists in current Rust code, but that remains a separate
 candidate rather than the explanation for the demonstrated ~4 GiB active jump.
+
+## T5f — bounded tensor Metal resources
+
+`ShardReader` now caches page-rounded `(start, length)` views and returns local
+tensor offsets, retaining shared mmap and the unchanged hot lock set. Different
+pages no longer share a whole-shard resource; identical rounded spans do share.
+Range tests cover local pointers/bytes, crossing pages, partial final page,
+same/disjoint cache identities, zero lengths, EOF and overflow. Weight tests
+passed 23 with 1 ignored, including existing actual-loader/GPU-read tests.
+Whole-shard sabotage failed `resource must exclude cold pages`: 65,536 bytes
+versus required 16,384; restored the source and reran the focused regression.
+
+Release narrow-view run: same 39-token request + 160 greedy outputs; all 160 IDs
+match `/tmp/kaplumba-decode-paging/baseline-generation.log`. Load 3,308 ms,
+TTFT 1,336 ms, decode 11.194 tok/s (single instrumented run, not an A/B speed
+claim). Telemetry peak wire count 1,174,210 = 17.917 GiB; previously sampled
+baseline peak was 19.095 GiB. Swap usage 2,099.88 → 2,083.88 MiB, Swapouts
+remained 183,276,527 throughout this run. Active graphics 319.7 MiB virtual,
+159.3 MiB resident, zero swapped; mapped weights remained 11.2 GiB clean/
+resident/unswapped. The different desktop conditions do not close AC3 or prove
+a throughput change. T5g must avoid GPU-binding the full embedding table.

@@ -1722,9 +1722,9 @@ fn read_exact_at(
 ///
 /// Bulk tensor bytes are pulled with `read_at` straight into their destination
 /// Metal arena buffers. Zero-copy tensors (trellis and embed_tokens) are bound
-/// directly out of the shard's Metal buffer (`metal_buffer`).
+/// directly out of page-rounded tensor views of the shard.
 struct ShardReader {
-    metal_buffer: Mutex<Option<Buffer>>,
+    metal_views: Mutex<BTreeMap<(u64, u64), Buffer>>,
     file: File,
     pointer: NonNull<u8>,
     length: usize,
@@ -1784,7 +1784,7 @@ impl ShardReader {
             message: "mmap returned null".to_string(),
         })?;
         Ok(Self {
-            metal_buffer: Mutex::new(None),
+            metal_views: Mutex::new(BTreeMap::new()),
             file,
             pointer,
             length,
@@ -1793,36 +1793,10 @@ impl ShardReader {
         })
     }
 
-    /// Wrap the entire mapped shard into a single page-aligned Metal buffer
-    /// (StorageModeShared).
-    ///
-    /// The mmap base address is naturally page-aligned (16 KiB on Apple Silicon),
-    /// and length is rounded to whole pages. Tensors index into this buffer by byte offset,
-    /// matching llama.cpp's `ggml_metal_buffer_map`.
-    fn metal_buffer(&self, device: &metal::Device) -> Result<Buffer, WeightError> {
-        let mut guard = self.metal_buffer.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(ref buffer) = *guard {
-            return Ok(buffer.clone());
-        }
-        let page = page_size();
-        let length_aligned = self.length.next_multiple_of(page);
-        let max_len = device.max_buffer_length() as usize;
-        if length_aligned > max_len {
-            return Err(WeightError::InvalidSegmentSize(length_aligned as u64));
-        }
-        let buffer = device.new_buffer_with_bytes_no_copy(
-            self.pointer.as_ptr() as *const std::ffi::c_void,
-            length_aligned as u64,
-            metal::MTLResourceOptions::StorageModeShared
-                | metal::MTLResourceOptions::HazardTrackingModeUntracked,
-            None,
-        );
-        *guard = Some(buffer.clone());
-        Ok(buffer)
-    }
-
     /// Wrap `[offset, offset+len)` of this shard in a Metal buffer without
-    /// copying, returning the shard-level buffer and the tensor's byte offset inside it.
+    /// copying. Metal wires a bound resource's full span, so exposing the whole
+    /// shard would also wire unrelated embedding/multimodal pages. Cache only
+    /// the outward page-rounded range and return the tensor's local offset.
     fn no_copy_view(
         &self,
         device: &metal::Device,
@@ -1830,8 +1804,29 @@ impl ShardReader {
         len: u64,
     ) -> Result<(Buffer, u64), WeightError> {
         self.check_range(offset, len)?;
-        let buffer = self.metal_buffer(device)?;
-        Ok((buffer, offset))
+        if len == 0 {
+            return Err(WeightError::InvalidSegmentSize(0));
+        }
+        let page = page_size() as u64;
+        let start = offset / page * page;
+        let end = offset.checked_add(len).ok_or(WeightError::ArithmeticOverflow)?;
+        let rounded_end = end.checked_add(page - 1)
+            .ok_or(WeightError::ArithmeticOverflow)? / page * page;
+        let length = rounded_end - start;
+        if length > device.max_buffer_length() {
+            return Err(WeightError::InvalidSegmentSize(length));
+        }
+        let mut views = self.metal_views.lock().unwrap_or_else(|e| e.into_inner());
+        let buffer = views.entry((start, length)).or_insert_with(|| {
+            device.new_buffer_with_bytes_no_copy(
+                unsafe { self.pointer.as_ptr().add(start as usize) }.cast(),
+                length,
+                metal::MTLResourceOptions::StorageModeShared
+                    | metal::MTLResourceOptions::HazardTrackingModeUntracked,
+                None,
+            )
+        });
+        Ok((buffer.clone(), offset - start))
     }
 
     /// R3: `madvise(MADV_RANDOM)` over the tensor's outward-rounded page range
@@ -1882,9 +1877,7 @@ unsafe impl Send for ShardReader {}
 
 impl Drop for ShardReader {
     fn drop(&mut self) {
-        if let Ok(mut buf) = self.metal_buffer.lock() {
-            buf.take();
-        }
+        self.metal_views.get_mut().unwrap_or_else(|e| e.into_inner()).clear();
         unsafe {
             libc::munmap(self.pointer.as_ptr().cast(), self.length);
         }
@@ -2774,10 +2767,9 @@ mod tests {
     /// so every copied tensor is resident twice until this pass drops it (11.00
     /// GiB at 3 bpw, 14.66 GiB at 4 bpw -- `spec/memory-swap-cliff/
     /// implementation_notes.md` §5.1). That duplicate is what drove the
-    /// Zero-copy shard views are backed by a single page-aligned Metal buffer
-    /// per shard file (StorageModeShared), matching llama.cpp's `ggml_metal_buffer_map`.
+    /// Zero-copy tensor views retain page-aligned bases and lengths.
     #[test]
-    fn shard_metal_buffer_is_page_aligned_and_covers_entire_shard() {
+    fn tensor_metal_buffer_is_page_aligned() {
         let Some(context) = context_or_skip() else {
             return;
         };
@@ -2810,10 +2802,9 @@ mod tests {
         fs::remove_dir_all(dir).unwrap();
     }
 
-    /// Multiple zero-copy tensors from the same shard reuse the exact same
-    /// Metal buffer instance, eliminating fragile sub-buffer slicing.
+    /// Tensors occupying the same rounded page range reuse one Metal view.
     #[test]
-    fn no_copy_views_share_shard_metal_buffer() {
+    fn no_copy_views_share_identical_page_ranges() {
         let Some(context) = context_or_skip() else {
             return;
         };
@@ -2842,9 +2833,44 @@ mod tests {
         assert_eq!(
             buf1.as_ptr(),
             buf2.as_ptr(),
-            "both tensors belong to the same shard and must share the same Metal buffer"
+            "both tensors occupy the same page range and must share that view"
         );
         assert_ne!(off1, off2, "tensors must have distinct offsets in the shard");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn no_copy_views_exclude_unrelated_pages_and_check_boundaries() {
+        let device = metal::Device::system_default().expect("Metal device");
+        let dir = temp_dir("bounded-views");
+        let path = dir.join("mapped.bin");
+        let page = page_size();
+        let data: Vec<u8> = (0..page * 3 + 7).map(|i| (i / page + 1) as u8).collect();
+        fs::write(&path, &data).unwrap();
+        let reader = ShardReader::open(&path).unwrap();
+        for (offset, len, expected_start, expected_length) in [
+            (0, 1, 0, page),
+            (page + 4, 128, page, page),
+            (page - 1, 2, 0, page * 2),
+            (page * 3, 7, page * 3, page),
+        ] {
+            let (buffer, local) = reader.no_copy_view(&device, offset as u64, len as u64).unwrap();
+            assert_eq!(buffer.length() as usize, expected_length, "resource must exclude cold pages");
+            assert_eq!(buffer.contents() as usize, reader.pointer.as_ptr() as usize + expected_start);
+            assert_eq!(local as usize, offset - expected_start);
+            let actual = unsafe { std::slice::from_raw_parts(
+                (buffer.contents() as *const u8).add(local as usize), len,
+            ) };
+            assert_eq!(actual, &data[offset..offset + len]);
+        }
+        let (first, _) = reader.no_copy_view(&device, page as u64 + 4, 128).unwrap();
+        let (same, _) = reader.no_copy_view(&device, page as u64 + 8, 64).unwrap();
+        let (other, _) = reader.no_copy_view(&device, (page * 2) as u64, 64).unwrap();
+        assert_eq!(first.as_ptr(), same.as_ptr(), "reuse identical rounded ranges");
+        assert_ne!(first.as_ptr(), other.as_ptr(), "disjoint pages need independent views");
+        assert!(matches!(reader.no_copy_view(&device, u64::MAX, 2), Err(WeightError::ArithmeticOverflow)));
+        assert!(matches!(reader.no_copy_view(&device, data.len() as u64, 1), Err(WeightError::Range { .. })));
+        assert!(matches!(reader.no_copy_view(&device, 0, 0), Err(WeightError::InvalidSegmentSize(0))));
         fs::remove_dir_all(dir).unwrap();
     }
 
