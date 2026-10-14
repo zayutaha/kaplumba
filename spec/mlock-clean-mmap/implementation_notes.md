@@ -573,4 +573,4 @@ right: 1`. Restored the print and reran.
 `cargo test -q -p kaplumba-engine --lib weights::tests` passed: 22 passed,
 1 ignored (checkpoint-only). `git diff --check` passed. The successful syscall
 ledger remains separate from full-model OS region wire verification. Source
-commit pending.
+commit `81df21a`.

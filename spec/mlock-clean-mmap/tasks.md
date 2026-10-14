@@ -50,7 +50,7 @@ not a completed paging fix; all subsequent implementation remains unchecked.
   negative control, require a named missing-summary failure, then restore.
   Independent OS wire verification remains T5/T4; do not label syscall counts
   alone as that verification. Completed `2026-10-14`; implementation commit
-  pending.
+  `81df21a`.
 - [ ] **T4 — prove ordinary-chat memory and I/O behavior.**
   Files: a bounded acceptance harness if required and notes. Run single-model
   `Gxma-repacked` A/B/A/B at 1k/2k/8k with generation inside the existing limit,
