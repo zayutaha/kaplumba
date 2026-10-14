@@ -83,6 +83,9 @@
   successfully. The test proves the abandon/restore path structurally and
   exercises rollback deltas with partially advanced layers; it does not inject
   a failing model forward. Implementation checkpoint committed as `fd3cc67`.
-  Model-backed first/second-turn chat verification remains pending: latest
-  `scripts/gpuq status` has under 2 GiB top-unused, below the 14 GiB safe load
-  threshold. Keep this task open until the release chat retry completes.
+  User reran the release binary: the 14-token prefill + 9-token `hi` turn
+  completed, and a longer second turn began without either error. Its output
+  ended before the turn-rate line, so full two-turn completion remains
+  unconfirmed. The 12.39 tok/s short-turn result does not prove the performance
+  target. Keep T7 open until a longer `--chat` run completes and the rate is
+  checked; current `gpuq status` remains below the safe load threshold.

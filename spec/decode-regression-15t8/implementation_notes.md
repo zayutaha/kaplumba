@@ -159,7 +159,15 @@
   restored to `[16,16,16,16]`). The multi-turn source regression checks that
   the deferred failure branch abandons before per-layer retraction. An injected
   failure in a live model forward has not been exercised.
-- No live model retry yet: `scripts/gpuq status` reports about 1 GiB
-  top-unused and ~1.9 GiB swap, below the repo's safe model-load threshold.
-  User must rerun the rebuilt binary when memory is available to prove first
-  reply and second-turn sliding-cache correctness.
+- At implementation time, no live model retry was safe: `scripts/gpuq status`
+  reported about 1 GiB top-unused and ~1.9 GiB swap, below the repo's safe
+  model-load threshold.
+- Follow-up from the user after rebuilding: Gxma-repacked loaded in 904 ms;
+  mlock reported all 12,046,221,312 eligible bytes successfully locked and no
+  evictable bytes. `hi` completed with 14 prefill + 9 generated tokens at
+  12.39 tok/s and no deferred-limit error. A second, longer prompt began
+  generating without a sliding-cache error, but output was interrupted before
+  its turn-rate line. This smoke check supports the overflow fix; it does not
+  prove the 15.8 tok/s target. The observed 9-token turn is too short for a
+  stable comparison. At the subsequent check, gpuq showed no active model,
+  0.5 GiB top-unused, and 1,860 MiB swap.
