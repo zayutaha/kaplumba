@@ -818,3 +818,31 @@ loaded in 3,339 ms and `hi` completed with 14 prompt + 9 generated tokens
 error. Loader reported all 12,046,221,312 eligible hot bytes locked. The process
 is left open in exec session 61152 for Activity Monitor. This live chat is a
 focused regression check, not the full 1k/2k/8k paging acceptance.
+
+## Decode paging reproduction and resource-span mechanism (2026-10-14)
+
+PID 40288, release `30b7bb3` plus user GEMV diff, chat temperature 0/max-new 160:
+`Write a detailed numbered explanation of how a computer executes a program,
+from loading it to executing instructions. Give at least twenty steps.`
+39 prefill + 160 generated, TTFT 1,551 ms, decode 8.86 tok/s. Host swap
+2,143.56 → 2,244.81 MiB; Swapouts 183,261,403 → 183,268,395 (+6,992 pages,
+109.25 MiB at 16 KiB/page). Wired count 969,875 idle → 1,251,401 sampled active
+(+4.296 GiB), returning near 968,588 when idle. Mapped files stayed 11.2 GiB
+resident/clean/unswapped. Graphics grew 227.9 → 454.1 MiB virtual; final sample
+had 281.2 MiB swapped. Thus successful weight locking does not close paging.
+Temporary phase logs: `/tmp/kaplumba-decode-paging/baseline-*`. PID exited cleanly.
+
+Checkpoint headers: shard sizes 8,498,859,202 + 7,529,529,792 bytes. Embedding
+2,818,572,288 bytes; second-shard non-trellis data 1,160,714,166 bytes, including
+cold multimodal tensors. `ShardReader::no_copy_view` exposes each entire shard
+to GPU commands. The difference from the hot lock set is about 3.98 GB.
+
+Native SDK probe `/tmp/kaplumba-decode-paging/resource_probe.m` compiled with
+`xcrun clang -fobjc-arc -framework Foundation -framework Metal ...`; a spin
+kernel reads only element zero of a mapped buffer. Alternate 256 MiB/16 KiB
+resources from the same mmap: wide wire deltas 362,201,088 (cold) and 268,533,760
+bytes (repeat); narrow deltas -134,316,032 (previous resource retiring) and 0.
+All GPU commands completed. This proves full-resource wiring for this local
+mechanism and motivates T5f/T5g; it is not full-model/no-swap acceptance.
+No autorelease pool exists in current Rust code, but that remains a separate
+candidate rather than the explanation for the demonstrated ~4 GiB active jump.

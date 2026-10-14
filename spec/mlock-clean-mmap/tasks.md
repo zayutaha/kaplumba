@@ -117,6 +117,20 @@ not a completed paging fix; all subsequent implementation remains unchecked.
   release model answered `hi` (14 prompt + 9 generated) across multiple growth
   points with the user's GEMV kernel diff still present. Completed
   `2026-10-14`; implementation commit `30b7bb3`.
+- [ ] **T5f — bound no-copy Metal views to tensor page spans.**
+  Files: `crates/engine/src/weights.rs`, range/GPU-view tests and notes. Cache
+  page-rounded ranges, return local offsets, preserve map/lock lifetime and
+  backing bytes. Test repeated/overlapping/disjoint ranges, page/EOF/overflow
+  bounds and live GPU access; sabotage whole-shard views and require a size/span
+  failure. Rebuild and measure the affected decode resource demand.
+- [ ] **T5g — stage sparse raw embeddings for ordinary chat.**
+  Files: `crates/engine/src/model.rs`, focused embedding tests and notes. Add
+  bounded raw-row staging, cross-encoder completion before CPU token/read/write,
+  identity row IDs, existing GPU conversion/scaling and a full-table A/B control.
+  Test BF16/FP16 exact bits, nonzero source offsets, duplicate/boundary IDs,
+  invalid IDs, short buffers and real pipelined generation. Sabotage row selection
+  or offset handling; verify failing diagnostics. Record output equality,
+  throughput, wire and swap changes; do not close all acceptance from one run.
 - [ ] **T5d — demonstrate selected reduction and resume T4.**
   Files: acceptance evidence and notes. A/B/A/B idle/short/1k/2k/8k workloads,
   repeated turns and idle/resume. Measure demand and replacement peaks, confirm

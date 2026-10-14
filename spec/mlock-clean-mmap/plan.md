@@ -256,6 +256,31 @@ records acceptance. None authorizes DFlash work.
 | Metal binding changes page accounting | Require the actual loader + GPU-read regression and full-model region inspection |
 | Historical budget contradicts current OS accounting | Retain the historical result with its assumptions; derive any new budget from current measurements |
 
+## Decode resource-span correction (T5f/T5g)
+
+The 160-token decode reproduction increased host swap by 101.25 MiB and system
+wiring by about 4 GiB while mapped-file residency remained 11.2 GiB. The shards
+total 16,028,388,994 bytes; the hot lock set is 12,046,221,312 bytes. A native
+Metal probe reading one float from a 256 MiB mapped resource caused an additional
+268,533,760 wired bytes on the repeated wide arm; a 16 KiB resource caused no
+comparable increase. GPU resource residency must therefore be bounded independently
+of which elements the kernel indexes.
+
+T5f changes `ShardReader`'s one-buffer-per-shard cache into a cache keyed by
+page-rounded `(start, length)` tensor ranges. Return offsets relative to those
+ranges; validate EOF, overflow, repeated ranges, page boundaries and actual GPU
+bytes. T5g adds bounded raw embedding-row scratch to `ForwardScratch`. At the
+common ordinary forward boundary, finish preceding queue work, read actual input
+IDs from the active token buffer, copy raw rows from the mapped embedding, stage
+identity row IDs, and call the existing embedding kernel with the gathered table.
+No new numerical kernel, embedding-table copy, quantization or hot-weight unlocking.
+Small constructed models retain their existing path; `KAPLUMBA_FULL_EMBEDDING=1`
+is a diagnostic control for checkpoint models. Verify offset-aware BF16 and FP16
+output bits and invalid input/buffer bounds, then compare matched real generation
+and swap/wire/region deltas. DFlash's separate verify paths remain outside this
+ordinary-chat acceptance. Autorelease lifetime remains a measured follow-up
+candidate; it is not substituted for the demonstrated resource-span correction.
+
 ## Requirement → task mapping
 
 | Requirement | Tasks |
@@ -270,6 +295,8 @@ records acceptance. None authorizes DFlash work.
 | R8 | T4, T5 |
 | R9 | T5a, T5b, T5d, T4 |
 | R10 | T3b, T5a, T5c, T4 |
+| R11 | T5f, T4 |
+| R12 | T5g, T4 |
 | AC1 | T1 |
 | AC2 | T2, T3, T3b |
 | AC3, AC4 | T4, T5 |

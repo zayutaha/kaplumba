@@ -221,6 +221,17 @@ a future implementation step.
     a claim of failed locking. Capacity diagnostics must never describe locked
     pages as evictable cache or active pages as summed process ownership.
 
+11. **R11 — bound Metal resource spans.** GPU bindings for packed tensors must
+    cover only their outward page-rounded tensor range, with the correct local
+    byte offset. Repeated identical ranges share one view; unrelated cold ranges
+    must not become part of a hot resource. Retain the backing mapping and locks.
+12. **R12 — sparse embedding residency for ordinary chat.** Stage only the raw
+    embedding rows required by the current forward into bounded shared scratch.
+    Preserve the existing GPU BF16/FP16 conversion, rounding and scaling exactly.
+    When a pipelined input token is still on the GPU, wait for the preceding queue
+    work before reading it or reusing staging. Measure the synchronization cost
+    and wired-memory reduction. Keep a diagnostic full-table control for A/B.
+
 ## Acceptance criteria
 
 - **AC1 (R1/R5):** Actual loader-created mappings, before and after successful
