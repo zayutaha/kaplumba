@@ -270,6 +270,42 @@ memory-pressure and SSD read acceptance.
 
 T2 implementation commit: `413e01e` (`spec/mlock-clean-mmap: T2 unique lock accounting`).
 
+## 2026-10-14 — T3 per-load lock summaries
+
+Added a per-`TextWeights` `MlockSummary` with the model path, unique eligible,
+requested, attempted, locked, failed and evictable page bytes, plus disabled,
+excluded and arena-copied source bytes and the first syscall error. The loader
+prints an incomplete/disabled/excluded summary on each affected load; it no
+longer suppresses a later model's warning process-wide. Complete loads print
+the summary only under `KAPLUMBA_LOAD_PROFILE`. Lock injection is private to
+the loader implementation and leaves the normal system `mlock` call unchanged.
+
+Failure-injection checks exercise a first `ENOMEM` and a later `EPERM`, verify
+the successful prefix remains accounted, prove the fixture's no-copy packed
+bytes remain readable, and load a second model to confirm its own warning and
+summary. The test captures child-process stderr and checks exactly two warning
+lines with their respective errors. The fixture validates loader continuation
+and bytes; normal generation output equality remains the full-model AC4 gate.
+
+Negative control: replaced the per-load `eprintln!` with an unused formatted
+string. The two-load test failed diagnostically (`expected 2 warning lines,
+observed 0`). Restored warning emission and reran successfully. This checks
+warning visibility, not actual kernel lock success; injected syscall outcomes
+are accounting tests.
+
+Commands passed:
+
+```sh
+cargo test -q -p kaplumba-engine --lib weights::tests
+cargo test -q -p kaplumba-engine --test probe_llama_mlock
+cargo test -q -p kaplumba-engine --test dflash_load --no-run
+git diff --check
+```
+
+Results: weights tests 22 passed, 1 ignored (checkpoint-only); mlock probe 3/3;
+DFlash loader integration target compiled. Existing workspace warnings are
+unrelated. No Gxma model was loaded for T3. Implementation commit pending.
+
 D0 draft was committed as `5abcb0c`; the scratch probe and its logs were removed
 after preserving source, commands and observations above. No standalone probe
 process or temporary project harness remains.

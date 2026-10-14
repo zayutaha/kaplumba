@@ -1,6 +1,6 @@
 # spec/mlock-clean-mmap
 
-Status: approved for implementation; T1 and T2 are complete, T3 is in progress.
+Status: approved for implementation; T1–T3 are complete, T4 is in progress.
 User confirmed scope after clarification: ordinary chat with `Gxma-repacked`,
 green memory pressure and no repeated weight streaming after load, 1k/2k/8k
 contexts, and warning-and-continue when locking fails. DFlash work remains paused.
@@ -22,7 +22,7 @@ Preserved pre-reset comparison: `d6354c54def4ca87a4abb08811e3848a4111473e`.
 |---|---|---|
 | Read-only shard mapping | `MAP_SHARED` | `MAP_PRIVATE` |
 | Lock set | Budgeted layer trellis, excluding output head | All aligned mapped trellis, including output head; no byte budget |
-| Lock failure | Continue with warning | Continue with warning, printed once per process |
+| Lock failure | Continue with warning | Continue with warning, historically printed once per process (D0 baseline) |
 | Forced arena weights | Separate arena policy | Mapped-trellis pass skips arena allocations |
 | Misaligned zero-copy weights | Copied to aligned buffers | Copied to aligned buffers |
 
@@ -107,8 +107,9 @@ the head lock to protect its repeated reads.
 - **AC2 (R2/R3/R4):** Page-ledger tests cover disjoint/overlapping ranges, partial
   locks, first failure, disabled locking, final partial page, empty ranges and
   copied tensors. Force a lock failure and corrupt a byte count separately; each
-  must fail a diagnostic assertion before restoration. The warning path loads
-  and generates correctly and states the unprotected bytes.
+  must fail a diagnostic assertion before restoration. The warning path loads,
+  preserves readable weight bytes and states the unprotected bytes. Greedy output
+  equality is checked in AC4 on normal acceptance runs.
 - **AC3 (R2/R4/R6):** In recorded normal desktop conditions with a single target
   loaded, corrected ordinary-chat runs remain at normal memory-pressure level,
   with Activity Monitor green, no new swap growth attributable to the run, and

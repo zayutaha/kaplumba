@@ -29,13 +29,15 @@ negative control before any coverage claim, notes, status update and commit.
   overlap count and a partial-prefix count; require diagnostic failures before
   restoration. Do not introduce a lock cap or cold-gap locking in this step.
   Completed `2026-10-14`; implementation commit `413e01e`.
-- [ ] **T3 — make incomplete locking visible per load.**
+- [x] **T3 — make incomplete locking visible per load.**
   Files: `crates/engine/src/weights.rs`, focused load/failure tests, notes.
   Summarize requested/locked/evictable bytes per model and distinguish disabled,
   excluded, copied and failed paths. Keep warning-and-continue. Inject first and
   later `ENOMEM`/permission failures, verify retained successful bytes, and
-  generate correctly after a partial lock. Ensure a second load still reports
-  its shortfall. Sabotage the failure summary and demonstrate a named failure.
+  continue with exact readable fixture bytes after a partial lock. Ensure a
+  second load still reports its shortfall. Sabotage warning emission and
+  demonstrate a named failure. Completed `2026-10-14`; implementation commit
+  pending.
 - [ ] **T4 — prove ordinary-chat memory and I/O behavior.**
   Files: a bounded acceptance harness if required and notes. Run single-model
   `Gxma-repacked` A/B/A/B at 1k/2k/8k with generation inside the existing limit,

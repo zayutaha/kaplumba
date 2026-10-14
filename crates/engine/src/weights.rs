@@ -524,6 +524,45 @@ fn locked_tensor_prefix_bytes(
     Ok(tensor_end.min(locked_until).saturating_sub(tensor_start))
 }
 
+/// Per-model report of which mapped packed-weight pages were selected and
+/// successfully held. Tensor byte fields can differ from page-byte fields
+/// because VM locking rounds outward to complete pages.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct MlockSummary {
+    pub model: String,
+    pub eligible_page_bytes: u64,
+    pub requested_page_bytes: u64,
+    pub attempted_page_bytes: u64,
+    pub locked_page_bytes: u64,
+    pub failed_page_bytes: u64,
+    pub evictable_page_bytes: u64,
+    pub disabled_page_bytes: u64,
+    /// Source bytes skipped because they are arena-copied, misaligned for the
+    /// zero-copy packed path, or unavailable in a retained shard mapping.
+    pub excluded_tensor_bytes: u64,
+    /// Source bytes already copied into arena spans. This is a subset of the
+    /// excluded source bytes above.
+    pub copied_tensor_bytes: u64,
+    pub failure: Option<String>,
+}
+
+fn format_mlock_summary(summary: &MlockSummary) -> String {
+    format!(
+        "mlock summary model={} eligible_page_bytes={} requested_page_bytes={} attempted_page_bytes={} locked_page_bytes={} failed_page_bytes={} evictable_page_bytes={} disabled_page_bytes={} excluded_tensor_bytes={} copied_tensor_bytes={} failure={}",
+        summary.model,
+        summary.eligible_page_bytes,
+        summary.requested_page_bytes,
+        summary.attempted_page_bytes,
+        summary.locked_page_bytes,
+        summary.failed_page_bytes,
+        summary.evictable_page_bytes,
+        summary.disabled_page_bytes,
+        summary.excluded_tensor_bytes,
+        summary.copied_tensor_bytes,
+        summary.failure.as_deref().unwrap_or("none")
+    )
+}
+
 pub struct TextWeights {
     arena: WeightArena,
     tensors: BTreeMap<String, LoadedTensor>,
@@ -545,6 +584,8 @@ pub struct TextWeights {
     pinned: Mutex<Vec<(String, u64)>>,
     /// Unique page bytes successfully wired across disjoint shard runs.
     pinned_unique_bytes: Mutex<u64>,
+    /// Full per-model mlock outcome, including the warning-and-continue path.
+    mlock_summary: Mutex<MlockSummary>,
     /// R3: `Some(ok)` after [`Self::advise_embedding_random`] ran on a *mapped*
     /// embedding (`ok` = `madvise(MADV_RANDOM)` succeeded), `None` when the
     /// table is arena-resident and the advice does not apply.
@@ -607,6 +648,29 @@ impl TextWeights {
         limit_bytes: u64,
         segment_bytes: u64,
         dedicated: bool,
+    ) -> Result<Self, WeightError> {
+        let enabled = pin_trellis();
+        Self::load_internal_with_mlock(
+            model_dir,
+            selection,
+            context,
+            limit_bytes,
+            segment_bytes,
+            dedicated,
+            enabled,
+            &mut system_mlock_range,
+        )
+    }
+
+    fn load_internal_with_mlock(
+        model_dir: &Path,
+        selection: &TextTensorSelection,
+        context: MetalContext,
+        limit_bytes: u64,
+        segment_bytes: u64,
+        dedicated: bool,
+        mlock_enabled: bool,
+        mlock_range: &mut dyn FnMut(*const std::ffi::c_void, usize) -> io::Result<()>,
     ) -> Result<Self, WeightError> {
         let mut shards = BTreeMap::new();
         for (shard_name, shard) in &selection.shards {
@@ -848,16 +912,17 @@ impl TextWeights {
             zero_copy_views: Mutex::new(Vec::new()),
             pinned: Mutex::new(Vec::new()),
             pinned_unique_bytes: Mutex::new(0),
+            mlock_summary: Mutex::new(MlockSummary::default()),
             embedding_madvise_random: Mutex::new(None),
         };
         // R3 first: the embedding must never be wired, only advised for
         // single-row access. Then R2: wire the trellis.
         weights.advise_embedding_random();
-        weights.pin_trellis_pages();
+        weights.pin_trellis_pages(model_dir, mlock_enabled, mlock_range);
         Ok(weights)
     }
 
-    /// Pin the `.trellis` pages in physical memory.
+    /// Pin the aligned mapped `.trellis` pages and report this model's outcome.
     ///
     /// # Why this exists -- and why `mlock` is back after `e1b05c1` removed it
     ///
@@ -896,21 +961,21 @@ impl TextWeights {
     ///   read per token through the zero-copy in-kernel path, so eviction costs
     ///   a 10.7 KB page-in, not a re-stream.
     ///
-    /// Pages are pinned, not dirtied: they remain read-only file-backed pages, so
-    /// there is no swap and no compression, and a run that cannot pin is still
-    /// numerically correct. `mlock` can fail against `RLIMIT_MEMLOCK` or the
-    /// kernel's `user_wire_limit`; the first failure is reported and the rest are
-    /// skipped rather than spamming 411 warnings.
+    /// Pages remain read-only file-backed pages. `mlock` can fail against
+    /// `RLIMIT_MEMLOCK` or the kernel's `user_wire_limit`; failure does not
+    /// change correctness, and this method reports each load's shortfall.
     ///
     /// **Amends `spec/green-memory-residency` R1** ("the engine must not call
     /// `libc::mlock` under any circumstances"), which is unsatisfiable alongside
     /// its own R5 on this box: a 17.7 GiB hot set on 24 GiB will be compressed
     /// unless those pages are wired. R5 was the user-facing requirement; R1 was
     /// a means. The conflict and the numbers above are recorded there too.
-    fn pin_trellis_pages(&self) {
-        if !pin_trellis() {
-            return;
-        }
+    fn pin_trellis_pages(
+        &self,
+        model_dir: &Path,
+        enabled: bool,
+        mlock_range: &mut dyn FnMut(*const std::ffi::c_void, usize) -> io::Result<()>,
+    ) {
         // Group the mapped `.trellis` ranges by shard, then merge only ranges
         // that *touch* after the outward rounding: one `LlamaMlock` per merged
         // run, grown incrementally once per tensor -- the same driver pattern
@@ -919,11 +984,25 @@ impl TextWeights {
         // what keeps R3 ("`embed_tokens` is never wired") true even when the
         // embedding shares a shard with trellis tensors.
         let mut by_shard: BTreeMap<String, Vec<(usize, usize, String)>> = BTreeMap::new();
+        let mut excluded_tensor_bytes = 0_u64;
+        let mut copied_tensor_bytes = 0_u64;
         for (name, tensor) in &self.tensors {
-            if !name.ends_with(".trellis") || !tensor.spans.is_empty() {
+            if !name.ends_with(".trellis") {
+                continue;
+            }
+            if !tensor.spans.is_empty() {
+                excluded_tensor_bytes = excluded_tensor_bytes
+                    .checked_add(tensor.source_len)
+                    .expect("excluded packed-weight bytes fit u64");
+                copied_tensor_bytes = copied_tensor_bytes
+                    .checked_add(tensor.source_len)
+                    .expect("copied packed-weight bytes fit u64");
                 continue;
             }
             let Some(reader) = self.shards.get(&tensor.shard) else {
+                excluded_tensor_bytes = excluded_tensor_bytes
+                    .checked_add(tensor.source_len)
+                    .expect("excluded packed-weight bytes fit u64");
                 continue;
             };
             // `mlock` wants a page-aligned start, and a safetensors tensor
@@ -960,6 +1039,9 @@ impl TextWeights {
             // crawled). `pin_realigned_copy` wires the live copy instead, and
             // this tensor's file range is then never faulted at all.
             if tensor.start % EXL3_PACKED_ALIGNMENT != 0 {
+                excluded_tensor_bytes = excluded_tensor_bytes
+                    .checked_add(tensor.source_len)
+                    .expect("excluded packed-weight bytes fit u64");
                 continue;
             }
             by_shard
@@ -967,6 +1049,22 @@ impl TextWeights {
                 .or_default()
                 .push((start, end, name.clone()));
         }
+
+        let eligible_ranges: Vec<_> = by_shard
+            .values()
+            .flat_map(|ranges| ranges.iter().map(|(start, end, _)| (*start, *end)))
+            .collect();
+        let eligible_page_bytes = unique_page_bytes(&eligible_ranges)
+            .expect("validated eligible page ranges fit the address space");
+        let mut summary = MlockSummary {
+            model: model_dir.display().to_string(),
+            eligible_page_bytes,
+            requested_page_bytes: if enabled { eligible_page_bytes } else { 0 },
+            disabled_page_bytes: if enabled { 0 } else { eligible_page_bytes },
+            excluded_tensor_bytes,
+            copied_tensor_bytes,
+            ..MlockSummary::default()
+        };
 
         let mut pinned_bytes = 0_u64;
         let mut pinned_tensors = 0_usize;
@@ -976,6 +1074,9 @@ impl TextWeights {
             .unwrap_or_else(|error| error.into_inner());
         let mut unique_bytes_this_load = 0_u64;
         for (_shard, mut ranges) in by_shard {
+            if !enabled {
+                continue;
+            }
             ranges.sort();
             let mut runs: Vec<Vec<(usize, usize, String)>> = Vec::new();
             for range in ranges {
@@ -997,14 +1098,25 @@ impl TextWeights {
                     .expect("validated page ranges fit the address space");
                 let mut lock = LlamaMlock::init(run_start as *const std::ffi::c_void);
                 for range in &run {
-                    lock.grow_to(range.1 - run_start);
+                    lock.grow_to_with(range.1 - run_start, mlock_range);
                 }
                 // A failed grow leaves earlier pages wired. `size()` is the
                 // exact successful prefix and counts overlapping tensor page
                 // windows once.
-                debug_assert!(lock.size() as u64 <= planned_unique_bytes);
+                debug_assert!(
+                    u64::try_from(lock.size()).expect("lock size fits u64") <= planned_unique_bytes
+                );
                 let actual_locked_bytes = u64::try_from(lock.size())
                     .expect("successful lock size fits the accounting type");
+                let attempted_bytes = u64::try_from(lock.attempted_bytes())
+                    .expect("attempted lock size fits the accounting type");
+                summary.attempted_page_bytes = summary
+                    .attempted_page_bytes
+                    .checked_add(attempted_bytes)
+                    .expect("attempted lock bytes fit u64");
+                if summary.failure.is_none() {
+                    summary.failure = lock.failure().map(|failure| failure.to_string());
+                }
                 unique_bytes_this_load = unique_bytes_this_load
                     .checked_add(actual_locked_bytes)
                     .expect("mapped lock bytes fit the address space");
@@ -1041,10 +1153,32 @@ impl TextWeights {
             }
         }
         drop(record);
+        summary.locked_page_bytes = unique_bytes_this_load;
+        summary.failed_page_bytes = summary
+            .attempted_page_bytes
+            .saturating_sub(summary.locked_page_bytes);
+        summary.evictable_page_bytes = summary
+            .eligible_page_bytes
+            .saturating_sub(summary.locked_page_bytes);
         *self
             .pinned_unique_bytes
             .lock()
             .unwrap_or_else(|error| error.into_inner()) = unique_bytes_this_load;
+        *self
+            .mlock_summary
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = summary.clone();
+        if summary.disabled_page_bytes > 0
+            || summary.locked_page_bytes < summary.requested_page_bytes
+            || summary.excluded_tensor_bytes > 0
+        {
+            eprintln!(
+                "warning: {}; continuing with evictable or excluded packed weights. Increase vm.user_wire_limit / vm.global_user_wire_limit or RLIMIT_MEMLOCK if the lock failure is unexpected",
+                format_mlock_summary(&summary)
+            );
+        } else if std::env::var_os("KAPLUMBA_LOAD_PROFILE").is_some() {
+            eprintln!("{}", format_mlock_summary(&summary));
+        }
         if pinned_tensors > 0 && std::env::var_os("KAPLUMBA_LOAD_PROFILE").is_some() {
             eprintln!(
                 "load profile: pinned {pinned_tensors} trellis tensors, {:.2} GiB wired",
@@ -1180,6 +1314,15 @@ impl TextWeights {
             .pinned_unique_bytes
             .lock()
             .unwrap_or_else(|error| error.into_inner())
+    }
+
+    /// Lock outcomes for this specific model load. Each `TextWeights` owns its
+    /// own summary so a previous load cannot suppress a later warning.
+    pub fn mlock_summary(&self) -> MlockSummary {
+        self.mlock_summary
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .clone()
     }
 
     /// R3 probe hook: see [`Self::embedding_madvise_random`].
@@ -1361,10 +1504,9 @@ fn pin_trellis() -> bool {
 ///   `llama-model-loader.cpp:1662` relies on when it grows one mapping once
 ///   per tensor (`lmlock->grow_to(weight->offs + n_size)`).
 /// * A failed `mlock` (`ENOMEM` from `vm.user_wire_limit`/`RLIMIT_MEMLOCK`, or
-///   `EPERM`) sets `failed_already`: the failure is logged once with llama.cpp's
-///   Darwin-side suggestion, every later `grow_to` is a no-op, and the caller
-///   keeps loading. Wiring is a performance property; correctness never
-///   depends on it (the mapping stays readable either way).
+///   `EPERM`) sets `failed_already`: every later `grow_to` on this range is a
+///   no-op, the successful prefix stays recorded, and the model load continues.
+///   The caller reports the failure in a per-model summary.
 ///
 /// Deliberate divergences from llama.cpp:
 ///
@@ -1372,13 +1514,12 @@ fn pin_trellis() -> bool {
 ///   region belongs to `ShardReader`'s `mmap`, and unlocking on drop would undo
 ///   `pin_trellis_pages` the moment it returned. `munmap` in `ShardReader`s
 ///   `Drop` releases the wire.
-/// * The failure warning is printed once per *process* rather than once per
-///   lock object: a checkpoint wires ~411 ranges against one shared wire
-///   limit, so the per-object repetition is pure spam.
 pub struct LlamaMlock {
     addr: usize,
     size: usize,
+    attempted_bytes: usize,
     failed_already: bool,
+    failure: Option<String>,
 }
 
 impl LlamaMlock {
@@ -1387,7 +1528,9 @@ impl LlamaMlock {
         Self {
             addr: addr as usize,
             size: 0,
+            attempted_bytes: 0,
             failed_already: false,
+            failure: None,
         }
     }
 
@@ -1403,6 +1546,14 @@ impl LlamaMlock {
     /// must reach `mlock` and come back `ENOMEM`, not overflow-panic in a debug
     /// build.
     pub fn grow_to(&mut self, target_size: usize) {
+        self.grow_to_with(target_size, &mut system_mlock_range);
+    }
+
+    fn grow_to_with(
+        &mut self,
+        target_size: usize,
+        mlock_range: &mut dyn FnMut(*const std::ffi::c_void, usize) -> io::Result<()>,
+    ) {
         if self.failed_already {
             return;
         }
@@ -1411,13 +1562,19 @@ impl LlamaMlock {
         if target_size > self.size {
             let slice = (self.addr + self.size) as *const std::ffi::c_void;
             let len = target_size - self.size;
-            let rc = unsafe { libc::mlock(slice, len) };
-            if rc == 0 {
-                self.size = target_size;
-            } else {
-                let source = std::io::Error::last_os_error();
-                self.failed_already = true;
-                warn_mlock_once(len, self.size, source);
+            self.attempted_bytes = self
+                .attempted_bytes
+                .checked_add(len)
+                .expect("attempted mlock bytes fit usize");
+            match mlock_range(slice, len) {
+                Ok(()) => self.size = target_size,
+                Err(source) => {
+                    self.failed_already = true;
+                    self.failure = Some(match source.raw_os_error() {
+                        Some(code) => format!("errno={code}: {source}"),
+                        None => source.to_string(),
+                    });
+                }
             }
         }
     }
@@ -1433,22 +1590,22 @@ impl LlamaMlock {
     pub fn failed(&self) -> bool {
         self.failed_already
     }
+
+    fn attempted_bytes(&self) -> usize {
+        self.attempted_bytes
+    }
+
+    fn failure(&self) -> Option<&str> {
+        self.failure.as_deref()
+    }
 }
 
-/// First `mlock` failure in the process gets llama.cpp's `MLOCK_SUGGESTION`
-/// for `__APPLE__` (`llama-mmap.cpp:706`); later ones are dropped.
-fn warn_mlock_once(len: usize, already: usize, source: std::io::Error) {
-    use std::sync::atomic::{AtomicBool, Ordering};
-    static WARNED: AtomicBool = AtomicBool::new(false);
-    if WARNED.swap(true, Ordering::Relaxed) {
-        return;
+fn system_mlock_range(address: *const std::ffi::c_void, length: usize) -> io::Result<()> {
+    if unsafe { libc::mlock(address, length) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
     }
-    eprintln!(
-        "warning: failed to mlock {len}-byte range (after previously locking {already} bytes): {source}\n\
-         Try increasing the sysctl values 'vm.user_wire_limit' and 'vm.global_user_wire_limit' and/or \
-         decreasing 'vm.global_no_user_wire_amount'. Also try increasing RLIMIT_MEMLOCK (ulimit -l).\n\
-         The range stays evictable; decode will re-read it from disk under memory pressure"
-    );
 }
 
 fn classify_tensor(name: &str, dtype: DType) -> Result<(WeightStorage, DType, bool), WeightError> {
@@ -1954,6 +2111,17 @@ mod tests {
         let tensor = weights.tensor(name).unwrap();
         let copied = std::env::var_os("KAPLUMBA_RESIDENT_WEIGHTS").is_some();
         assert_eq!(!tensor.spans.is_empty(), copied);
+        let summary = weights.mlock_summary();
+        if copied {
+            assert_eq!(summary.copied_tensor_bytes, payload.len() as u64);
+            assert_eq!(summary.excluded_tensor_bytes, payload.len() as u64);
+            assert_eq!(summary.eligible_page_bytes, 0);
+        } else {
+            assert_eq!(summary.eligible_page_bytes, page_size() as u64);
+            assert_eq!(summary.requested_page_bytes, 0);
+            assert_eq!(summary.disabled_page_bytes, page_size() as u64);
+            assert_eq!(summary.evictable_page_bytes, page_size() as u64);
+        }
         if copied {
             assert_eq!(weights.read_tensor(name).unwrap(), payload);
         } else {
@@ -1967,6 +2135,200 @@ mod tests {
             assert_eq!(actual, payload.as_slice());
         }
         drop(weights);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn mlock_failure_latches_and_retains_successful_prefix() {
+        let page = LlamaMlock::lock_granularity();
+        let mut first_failure = LlamaMlock::init(0x10_000 as *const std::ffi::c_void);
+        let mut first_calls = 0;
+        first_failure.grow_to_with(page, &mut |_, length| {
+            first_calls += 1;
+            assert_eq!(length, page);
+            Err(io::Error::from_raw_os_error(libc::ENOMEM))
+        });
+        assert_eq!(first_failure.size(), 0);
+        assert_eq!(first_failure.attempted_bytes(), page);
+        assert!(first_failure.failed());
+        assert!(
+            first_failure
+                .failure()
+                .unwrap()
+                .contains(&format!("errno={}", libc::ENOMEM))
+        );
+        first_failure.grow_to_with(2 * page, &mut |_, _| {
+            panic!("grow after failure must not call mlock")
+        });
+        assert_eq!(first_calls, 1);
+
+        let mut later_failure = LlamaMlock::init(0x20_000 as *const std::ffi::c_void);
+        let mut calls = 0;
+        let mut injected = |_, length| {
+            calls += 1;
+            if calls == 1 {
+                assert_eq!(length, page);
+                Ok(())
+            } else {
+                assert_eq!(length, 2 * page);
+                Err(io::Error::from_raw_os_error(libc::EPERM))
+            }
+        };
+        later_failure.grow_to_with(page, &mut injected);
+        later_failure.grow_to_with(3 * page, &mut injected);
+        later_failure.grow_to_with(4 * page, &mut injected);
+        assert_eq!(later_failure.size(), page, "successful prefix must remain");
+        assert_eq!(later_failure.attempted_bytes(), 3 * page);
+        assert!(later_failure.failed());
+        assert!(
+            later_failure
+                .failure()
+                .unwrap()
+                .contains(&format!("errno={}", libc::EPERM))
+        );
+        assert_eq!(calls, 2, "later grows after EPERM must be skipped");
+    }
+
+    #[test]
+    fn partial_lock_loads_and_each_model_keeps_its_own_warning_summary() {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "weights::tests::child_partial_lock_summaries_are_per_model",
+                "--nocapture",
+            ])
+            .env("KAPLUMBA_PARTIAL_LOCK_SUMMARY_CHILD", "1")
+            .output()
+            .expect("failed to run partial-lock summary child");
+        assert!(
+            output.status.success(),
+            "partial-lock child failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert_eq!(
+            stderr.matches("warning: mlock summary").count(),
+            2,
+            "each load must print a warning even after a previous load warned: {stderr}"
+        );
+        assert!(stderr.contains(&format!("errno={}", libc::EPERM)));
+        assert!(stderr.contains(&format!("errno={}", libc::ENOMEM)));
+    }
+
+    #[test]
+    fn child_partial_lock_summaries_are_per_model() {
+        if std::env::var_os("KAPLUMBA_PARTIAL_LOCK_SUMMARY_CHILD").is_none() {
+            return;
+        }
+        let context = context_or_skip().expect("failure-injection test requires Metal");
+        let first = "model.language_model.layers.0.self_attn.q_proj.trellis";
+        let second = "model.language_model.layers.0.self_attn.k_proj.trellis";
+        let page = page_size();
+        let first_payload = vec![0x31_u8; 128];
+        let second_payload = vec![0x72_u8; 128];
+        let (dir, selection) = (1..65)
+            .find_map(|pad| {
+                let dir = temp_dir(&format!("partial-lock-{pad}"));
+                let selection = selection_for(
+                    &dir,
+                    vec![
+                        ("headpad.bytes", DType::U8, vec![pad], vec![0_u8; pad]),
+                        (first, DType::I16, vec![64], first_payload.clone()),
+                        ("gap.bytes", DType::U8, vec![2 * page], vec![0_u8; 2 * page]),
+                        (second, DType::I16, vec![64], second_payload.clone()),
+                    ],
+                );
+                let first_start = selection.absolute_range(first).unwrap().0;
+                let second_start = selection.absolute_range(second).unwrap().0;
+                if first_start.is_multiple_of(EXL3_PACKED_ALIGNMENT as u64)
+                    && second_start.is_multiple_of(EXL3_PACKED_ALIGNMENT as u64)
+                {
+                    Some((dir, selection))
+                } else {
+                    fs::remove_dir_all(dir).unwrap();
+                    None
+                }
+            })
+            .expect("fixture must produce two aligned ranges separated by a cold gap");
+
+        let mut calls = 0;
+        let mut fail_later = |_, _| {
+            calls += 1;
+            if calls == 1 {
+                Ok(())
+            } else {
+                Err(io::Error::from_raw_os_error(libc::EPERM))
+            }
+        };
+        let weights = TextWeights::load_internal_with_mlock(
+            &dir,
+            &selection,
+            context,
+            4 * 1024 * 1024,
+            DEFAULT_SEGMENT_BYTES,
+            true,
+            true,
+            &mut fail_later,
+        )
+        .expect("partial mlock must warn and continue loading");
+        let summary = weights.mlock_summary();
+        assert_eq!(summary.eligible_page_bytes, 2 * page as u64);
+        assert_eq!(summary.requested_page_bytes, 2 * page as u64);
+        assert_eq!(summary.attempted_page_bytes, 2 * page as u64);
+        assert_eq!(summary.locked_page_bytes, page as u64);
+        assert_eq!(summary.failed_page_bytes, page as u64);
+        assert_eq!(summary.evictable_page_bytes, page as u64);
+        assert!(
+            summary
+                .failure
+                .as_deref()
+                .unwrap()
+                .contains(&format!("errno={}", libc::EPERM))
+        );
+        assert_eq!(weights.pinned_tensors().len(), 1);
+        assert_eq!(weights.pinned_bytes(), first_payload.len() as u64);
+        assert!(format_mlock_summary(&summary).contains(&summary.model));
+        for (name, expected) in [(first, &first_payload), (second, &second_payload)] {
+            let (buffer, offset) = weights.zero_copy_tensor_buffer(name).unwrap().unwrap();
+            let actual = unsafe {
+                std::slice::from_raw_parts(
+                    (buffer.contents() as *const u8).add(offset as usize),
+                    expected.len(),
+                )
+            };
+            assert_eq!(
+                actual,
+                expected.as_slice(),
+                "partial lock changed tensor data"
+            );
+        }
+        drop(weights);
+
+        let context = context_or_skip().expect("second failure-injection load requires Metal");
+        let mut fail_first = |_, _| Err(io::Error::from_raw_os_error(libc::ENOMEM));
+        let second_weights = TextWeights::load_internal_with_mlock(
+            &dir,
+            &selection,
+            context,
+            4 * 1024 * 1024,
+            DEFAULT_SEGMENT_BYTES,
+            true,
+            true,
+            &mut fail_first,
+        )
+        .expect("first-call lock errors must remain warning-and-continue");
+        let second_summary = second_weights.mlock_summary();
+        assert_eq!(second_summary.locked_page_bytes, 0);
+        assert_eq!(second_summary.failed_page_bytes, 2 * page as u64);
+        assert!(
+            second_summary
+                .failure
+                .as_deref()
+                .unwrap()
+                .contains(&format!("errno={}", libc::ENOMEM))
+        );
+        assert!(format_mlock_summary(&second_summary).contains(&second_summary.model));
+        drop(second_weights);
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -2095,8 +2457,15 @@ mod tests {
 
         let tensor = weights.tensor(name).unwrap();
         assert!(tensor.spans.is_empty(), "packed weights must stay no-copy");
-        assert_eq!(weights.pinned_tensors().len(), 1, "mlock must remain enabled");
-        assert!(weights.pinned_bytes() > 0, "the fixture must be actually locked");
+        assert_eq!(
+            weights.pinned_tensors().len(),
+            1,
+            "mlock must remain enabled"
+        );
+        assert!(
+            weights.pinned_bytes() > 0,
+            "the fixture must be actually locked"
+        );
 
         let reader = weights.shards.get("model.safetensors").unwrap();
         let (buffer, offset) = weights.zero_copy_tensor_buffer(name).unwrap().unwrap();

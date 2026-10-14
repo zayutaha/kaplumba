@@ -32,7 +32,7 @@ must not be ported as current physical-memory facts.
 |---|---|---|
 | `crates/engine/src/weights.rs` (`ShardReader`) | Read-only `MAP_PRIVATE`; whole shard wrapped without copying | Read-only `MAP_SHARED`; preserve buffer offset/lifetime and error handling |
 | `crates/engine/src/weights.rs` (`pin_trellis_pages`) | All aligned mapped trellis selected; `pinned_bytes` sums fully covered tensor windows | Record successful unique wired page bytes separately from source tensor bytes; include any successful prefix of a tensor |
-| `crates/engine/src/weights.rs:1237` (`LlamaMlock`) | Incremental locks; latched failure; warning once per process | Keep soft failure semantics; make caller summary accurate per model; retain successful prefix |
+| `crates/engine/src/weights.rs` (`LlamaMlock`) | Incremental locks; latched failure; D0 baseline warned once per process | Keep soft failure semantics; make caller summary accurate and warn per model; retain successful prefix |
 | `crates/engine/src/model.rs:3811` | Normal target loads through `load_dedicated` | Supply actual configured KV/scratch reserve only if measurements require a byte cap |
 | `crates/engine/src/model.rs:6299` | Misaligned view copied into shared Metal buffer | Compatibility checks only; no new copy path or buffer-pointer lock |
 | `crates/engine/src/dflash.rs:131` | Uses the same `TextWeights` loader | Loader regression only; no generation/performance changes |
