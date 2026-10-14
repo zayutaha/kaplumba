@@ -552,7 +552,7 @@ branches selected from those results, not mandatory simultaneous implementations
   gate remain open. Candidate B16/B4 stream evidence is in implementation notes;
   results recorded in `implementation_notes.md` at `2601faf`.
 
-- [ ] **F1e — evaluate the official same-target 5-bpw EXL3 DFlash quant.**
+- [x] **F1e — evaluate the official same-target 5-bpw EXL3 DFlash quant.**
   Files: `crates/engine/tests/dflash_golden.rs`, this spec's
   implementation notes and acceptance status. Candidate:
   `turboderp/gemma4-31b-it-DFlash-exl3`, branch `5.00bpw`, shard size
@@ -563,8 +563,14 @@ branches selected from those results, not mandatory simultaneous implementations
   mlock profile; run all 36 host linears; run exact 3 × 200 greedy streams at
   B=4/8/16 with `--test-threads=1`; compare B=4/8/16 to the existing drafter
   with repeated same-prompt A/B/A/B; record `phys_footprint` and swap. Drop it
-  without promotion if exactness, stable gain or memory acceptance fail. This
-  evaluation cannot satisfy the 30 tok/s gate without a measured ≥30 result.
+  without promotion if exactness, stable gain or memory acceptance fail. All
+  36 host linears passed (worst abs error 0.002120); exact B4/B8/B16 medians
+  were 6.00/5.53/3.91 tok/s. Prompt-0 encoded B4 A/B/A/B was 4-bpw
+  6.22/6.24 vs candidate 5-bpw 6.46/6.46; a small +3.5% prompt-local gain.
+  Target pinned 11.22 GiB but drafter mlock failed; process footprint was
+  14.53–14.55 GB with zero swapouts and block input operations. Do not promote;
+  the candidate does not solve 30 tok/s. Full measurements are in notes at
+  `bddf913`.
 
 ## Status
 
@@ -602,7 +608,7 @@ branches selected from those results, not mandatory simultaneous implementations
 | F1a / F1b | conditional, held | alternative evaluation requires shared verifier evidence and design decisions |
 | F1c | done, candidate rejected | public same-target model uses dense BF16 linears and incompatible config; header-only review, no weights downloaded |
 | F1d | evaluated; not promoted | 3×200 exact, B4 prompt-0 A/B/A/B +4.3%, but only 6.31 tok/s median and drafter mlock fails with target resident; see notes |
-| F1e | open | official 5-bpw candidate is downloading outside the repository; no local model results yet |
+| F1e | evaluated; not promoted | all 3×200 exact at B4/B8/B16; best median 6.00 tok/s, only +3.5% prompt-0 encoded B4 gain; target-resident drafter mlock fails; notes `bddf913` |
 | T11 | done | all-row greedy identity, offset sabotage, and short-context B-A-B timing; `aaa010c` |
 | T16b | experiment rejected | unprocessed anchor B=4 and B=16 both diverge at output 77 (99382 vs 84750); removed; `cb9de00` |
 
