@@ -8,7 +8,7 @@
 - [x] **T2 — Enforce strict top_k <= 1024 bound and wire pipelined sampling into generate.rs.**
   - Files: `crates/engine/src/generate.rs`, `crates/engine/src/chat.rs`.
   - Intent: Reject `top_k > 1024` with `SamplerError::DeviceTopKTooLarge`. Support `HeadPick::Sample(params)` in pipelined decode loop in `generate.rs`.
-  - Testing: Sabotaged `GenerationConfig::validate` limit to 2048 and confirmed `generation_config_rejects_top_k_above_1024` failed with `expected DeviceTopKTooLarge, got Ok(())`. Reverted. Added unit test in `chat.rs` and `generate.rs`. All 148 library tests passed. Commit: (pending).
+  - Testing: Sabotaged `GenerationConfig::validate` limit to 2048 and confirmed `generation_config_rejects_top_k_above_1024` failed with `expected DeviceTopKTooLarge, got Ok(())`. Reverted. Added unit test in `chat.rs` and `generate.rs`. All 148 library tests passed. Commit: 819a551.
 
 - [ ] **T3 — Benchmark and demonstrate >= 15.8 tok/s at temp=1.0 and temp=0.**
   - Files: `spec/sampled-decode-15t8/implementation_notes.md`.
