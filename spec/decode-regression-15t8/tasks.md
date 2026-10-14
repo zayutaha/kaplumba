@@ -82,7 +82,7 @@
   with `discard all unsubmitted command buffers`; restored and reran it
   successfully. The test proves the abandon/restore path structurally and
   exercises rollback deltas with partially advanced layers; it does not inject
-  a failing model forward. Implementation checkpoint committed as `HASH`.
+  a failing model forward. Implementation checkpoint committed as `fd3cc67`.
   Model-backed first/second-turn chat verification remains pending: latest
   `scripts/gpuq status` has under 2 GiB top-unused, below the 14 GiB safe load
   threshold. Keep this task open until the release chat retry completes.
