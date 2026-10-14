@@ -21,13 +21,14 @@ negative control before any coverage claim, notes, status update and commit.
   to `MAP_PRIVATE`; require a named dirty/private-page failure, restore and
   rerun. Preserve existing weight/alignment regression results. Completed
   `2026-10-14`; implementation commit `8143e6e`.
-- [ ] **T2 — account for unique locked pages and partial prefixes.**
+- [x] **T2 — account for unique locked pages and partial prefixes.**
   Files: `crates/engine/src/weights.rs` and focused lock-ledger tests, notes.
   Separate tensor coverage from unique merged page bytes and preserve successful
   prefixes on failure. Test disjoint/touching/overlapping windows, EOF rounding,
   empty ranges, no lock, copied weights and arithmetic boundaries. Sabotage an
   overlap count and a partial-prefix count; require diagnostic failures before
   restoration. Do not introduce a lock cap or cold-gap locking in this step.
+  Completed `2026-10-14`; implementation commit `TBD`.
 - [ ] **T3 — make incomplete locking visible per load.**
   Files: `crates/engine/src/weights.rs`, focused load/failure tests, notes.
   Summarize requested/locked/evictable bytes per model and distinguish disabled,

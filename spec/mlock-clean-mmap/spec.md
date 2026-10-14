@@ -1,6 +1,6 @@
 # spec/mlock-clean-mmap
 
-Status: approved for implementation; T1 is in progress.
+Status: approved for implementation; T1 and T2 are complete, T3 is in progress.
 User confirmed scope after clarification: ordinary chat with `Gxma-repacked`,
 green memory pressure and no repeated weight streaming after load, 1k/2k/8k
 contexts, and warning-and-continue when locking fails. DFlash work remains paused.
@@ -105,7 +105,7 @@ the head lock to protect its repeated reads.
   anonymous packed-weight pages. A deliberate `MAP_PRIVATE` substitution makes
   the named regression test fail; restore it and rerun before claiming coverage.
 - **AC2 (R2/R3/R4):** Page-ledger tests cover disjoint/overlapping ranges, partial
-  locks, first failure, no lock, policy cap, final partial page, empty ranges and
+  locks, first failure, disabled locking, final partial page, empty ranges and
   copied tensors. Force a lock failure and corrupt a byte count separately; each
   must fail a diagnostic assertion before restoration. The warning path loads
   and generates correctly and states the unprotected bytes.

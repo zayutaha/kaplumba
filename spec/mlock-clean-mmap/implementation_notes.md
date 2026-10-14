@@ -184,7 +184,7 @@ int main(int argc, char **argv) {
 No full model was loaded for this investigation. No new green-pressure, paging,
 throughput or zero-swap acceptance result is claimed. D0 validation is limited
 to source comparison, header arithmetic, the standalone mechanism probe and
-documentation review. Product implementation tasks remain unchecked.
+documentation review. All implementation tasks were still pending at that point.
 
 ## 2026-10-14 — T1 shared shard mapping
 
@@ -231,6 +231,43 @@ These are fixture tests on the real Metal device, not a model run. Full
 unmeasured and are still T4 gates.
 
 T1 implementation commit: `8143e6e` (`spec/mlock-clean-mmap: T1 shared mmap locking`).
+
+## 2026-10-14 — T2 unique page and prefix accounting
+
+Added checked page rounding for shard tensor intervals, clamped to the OS-rounded
+mapping extent so EOF and sub-page shards include the final mapped page. Lock
+selection still filters to aligned, mapped `.trellis` tensors and retains the
+same per-tensor incremental `mlock` growth; it does not span cold gaps or add a
+budget. After each lock run, `pinned_unique_bytes()` now sums the actual
+successful `LlamaMlock::size()` prefixes, so shared/overlapping tensor windows
+are counted once. `pinned_bytes()` and `pinned_tensors()` remain source-tensor
+coverage views, and now include a tensor's covered prefix if a later grow fails.
+The current public payload sum may double-count overlapping tensor bytes by
+design; use the new unique-page accessor for physical lock totals.
+
+Focused tests cover disjoint/touching/overlapping intervals, empty/reversed
+ranges, final partial-page EOF, empty tensors, out-of-file bounds, page-rounding
+overflow, address overflow, partial tensor prefixes, explicitly disabled
+locking, and an arena-copied tensor. The real dedicated
+loader test also checks the unique total against its actual lock run and checks
+the sub-page fixture is counted as one page. Existing misalignment coverage
+continues to prove copied/misaligned trellis ranges are not counted as mapped
+locks. Lock failure injection and end-to-end per-model warning assertions are
+T3.
+
+Sabotage controls:
+
+- Replaced union accounting with a naïve sum. The overlap test failed
+  diagnostically: actual `32`, expected unique `24`.
+- Replaced prefix clipping with full tensor length. The partial-prefix test
+  failed diagnostically: actual `100`, expected `50`.
+
+Restored both helpers. `cargo test -p kaplumba-engine --lib weights::tests`
+passed: 19 passed, 1 ignored. The ignored case requires a real checkpoint.
+The focused suite does not load a model or establish T4 memory-pressure and SSD
+read acceptance.
+
+T2 implementation commit: `TBD`.
 
 D0 draft was committed as `5abcb0c`; the scratch probe and its logs were removed
 after preserving source, commands and observations above. No standalone probe

@@ -433,6 +433,97 @@ fn span_total(spans: &[ArenaSpan]) -> Result<u64, WeightError> {
     })
 }
 
+fn checked_page_round_up(value: usize, page: usize) -> Result<usize, WeightError> {
+    if page == 0 || !page.is_power_of_two() {
+        return Err(WeightError::InvalidSegmentSize(page as u64));
+    }
+    value
+        .checked_add(page - 1)
+        .map(|rounded| rounded & !(page - 1))
+        .ok_or(WeightError::ArithmeticOverflow)
+}
+
+/// Outward-rounded page range for a byte interval inside a mapped shard.
+/// `mapping_len` may end in a partial file page; the kernel still maps that
+/// final page, so clamp to the rounded mapping extent rather than raw EOF.
+fn page_rounded_mapping_range(
+    mapping_base: usize,
+    mapping_len: usize,
+    start_offset: usize,
+    end_offset: usize,
+    page: usize,
+) -> Result<Option<(usize, usize)>, WeightError> {
+    if end_offset < start_offset || end_offset > mapping_len {
+        return Err(WeightError::Range {
+            shard: "page range outside mapped shard".to_string(),
+        });
+    }
+    if start_offset == end_offset {
+        return Ok(None);
+    }
+    let mapping_end = mapping_base
+        .checked_add(mapping_len)
+        .ok_or(WeightError::ArithmeticOverflow)?;
+    let mapping_page_end = checked_page_round_up(mapping_end, page)?;
+    let absolute_start = mapping_base
+        .checked_add(start_offset)
+        .ok_or(WeightError::ArithmeticOverflow)?;
+    let absolute_end = mapping_base
+        .checked_add(end_offset)
+        .ok_or(WeightError::ArithmeticOverflow)?;
+    let start = absolute_start & !(page - 1);
+    let end = checked_page_round_up(absolute_end, page)?.min(mapping_page_end);
+    if end <= start {
+        Ok(None)
+    } else {
+        Ok(Some((start, end)))
+    }
+}
+
+/// Merge touching/overlapping page intervals, rejecting malformed boundaries.
+fn merge_page_ranges(ranges: &[(usize, usize)]) -> Result<Vec<(usize, usize)>, WeightError> {
+    let mut sorted = ranges.to_vec();
+    if sorted.iter().any(|(start, end)| end < start) {
+        return Err(WeightError::InvalidSpan {
+            name: "reversed lock range".to_string(),
+        });
+    }
+    sorted.retain(|(start, end)| start != end);
+    sorted.sort_unstable();
+    let mut merged: Vec<(usize, usize)> = Vec::with_capacity(sorted.len());
+    for (start, end) in sorted {
+        match merged.last_mut() {
+            Some(last) if start <= last.1 => last.1 = last.1.max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    Ok(merged)
+}
+
+fn unique_page_bytes(ranges: &[(usize, usize)]) -> Result<u64, WeightError> {
+    merge_page_ranges(ranges)?
+        .into_iter()
+        .try_fold(0_u64, |total, (start, end)| {
+            let length = u64::try_from(end - start).map_err(|_| WeightError::ArithmeticOverflow)?;
+            total
+                .checked_add(length)
+                .ok_or(WeightError::ArithmeticOverflow)
+        })
+}
+
+fn locked_tensor_prefix_bytes(
+    tensor_start: usize,
+    tensor_end: usize,
+    locked_until: usize,
+) -> Result<usize, WeightError> {
+    if tensor_end < tensor_start {
+        return Err(WeightError::InvalidSpan {
+            name: "reversed tensor range".to_string(),
+        });
+    }
+    Ok(tensor_end.min(locked_until).saturating_sub(tensor_start))
+}
+
 pub struct TextWeights {
     arena: WeightArena,
     tensors: BTreeMap<String, LoadedTensor>,
@@ -452,6 +543,8 @@ pub struct TextWeights {
     /// assert from this set that `embed_tokens` is never wired (R3) and that the
     /// wired total tracks the trellis size, without re-deriving the ranges.
     pinned: Mutex<Vec<(String, u64)>>,
+    /// Unique page bytes successfully wired across disjoint shard runs.
+    pinned_unique_bytes: Mutex<u64>,
     /// R3: `Some(ok)` after [`Self::advise_embedding_random`] ran on a *mapped*
     /// embedding (`ok` = `madvise(MADV_RANDOM)` succeeded), `None` when the
     /// table is arena-resident and the advice does not apply.
@@ -754,6 +847,7 @@ impl TextWeights {
             shards,
             zero_copy_views: Mutex::new(Vec::new()),
             pinned: Mutex::new(Vec::new()),
+            pinned_unique_bytes: Mutex::new(0),
             embedding_madvise_random: Mutex::new(None),
         };
         // R3 first: the embedding must never be wired, only advised for
@@ -836,22 +930,24 @@ impl TextWeights {
             // offset is not page-aligned, so the range is rounded *outward*.
             // That can pin a page shared with an adjacent side-tensor; those
             // pages are read every token too, so the overshoot is harmless.
-            let page = page_size();
             let base = reader.pointer.as_ptr() as usize;
-            let start = (base + tensor.start as usize) & !(page - 1);
-            // Clamp the outward rounding to the mapping instead of skipping on
-            // overshoot: `mmap` covers whole pages, so locking up to the file's
-            // last (possibly partial) page is legal -- while the old
-            // `end > base + length -> continue` silently skipped every tensor
-            // whose rounded end passed EOF, i.e. the last tensor of every shard
-            // whose file length is not page-aligned, and *all* tensors of a
-            // sub-page fixture shard.
-            let end = (base + tensor.end as usize)
-                .next_multiple_of(page)
-                .min(base + reader.length);
-            if end <= start {
+            let start_offset = usize::try_from(tensor.start)
+                .expect("validated tensor offset fits the mapped address space");
+            let end_offset = usize::try_from(tensor.end)
+                .expect("validated tensor end fits the mapped address space");
+            // The OS rounds a file mapping to full pages even when its length
+            // ends mid-page. Keep the final page lockable, including a shard
+            // smaller than one page.
+            let Some((start, end)) = page_rounded_mapping_range(
+                base,
+                reader.length,
+                start_offset,
+                end_offset,
+                page_size(),
+            )
+            .expect("tensor range was validated when the shard was loaded") else {
                 continue;
-            }
+            };
             // A tensor whose absolute shard offset is not a multiple of
             // `EXL3_PACKED_ALIGNMENT` (4) cannot be bound zero-copy:
             // `align_packed_view` (`model.rs:5689`) copies it into an anonymous
@@ -878,6 +974,7 @@ impl TextWeights {
             .pinned
             .lock()
             .unwrap_or_else(|error| error.into_inner());
+        let mut unique_bytes_this_load = 0_u64;
         for (_shard, mut ranges) in by_shard {
             ranges.sort();
             let mut runs: Vec<Vec<(usize, usize, String)>> = Vec::new();
@@ -894,24 +991,60 @@ impl TextWeights {
                 // run's lowest address -- the lock's base.
                 let run_start = run.first().map_or(0, |first| first.0);
                 run.sort_by_key(|range| range.1);
+                let run_page_ranges: Vec<_> =
+                    run.iter().map(|(start, end, _)| (*start, *end)).collect();
+                let planned_unique_bytes = unique_page_bytes(&run_page_ranges)
+                    .expect("validated page ranges fit the address space");
                 let mut lock = LlamaMlock::init(run_start as *const std::ffi::c_void);
                 for range in &run {
                     lock.grow_to(range.1 - run_start);
                 }
-                // A failed run locks only up to `size()`; record exactly the
-                // tensors whose range is fully inside that prefix.
-                let locked_upto = run_start + lock.size();
-                for (start, end, name) in run {
-                    if end <= locked_upto {
-                        let bytes = (end - start) as u64;
-                        pinned_bytes += bytes;
-                        pinned_tensors += 1;
+                // A failed grow leaves earlier pages wired. `size()` is the
+                // exact successful prefix and counts overlapping tensor page
+                // windows once.
+                debug_assert!(lock.size() as u64 <= planned_unique_bytes);
+                let actual_locked_bytes = u64::try_from(lock.size())
+                    .expect("successful lock size fits the accounting type");
+                unique_bytes_this_load = unique_bytes_this_load
+                    .checked_add(actual_locked_bytes)
+                    .expect("mapped lock bytes fit the address space");
+                let locked_upto = run_start
+                    .checked_add(lock.size())
+                    .expect("successful lock prefix fits the address space");
+                let mapping_base = self.shards[&_shard].pointer.as_ptr() as usize;
+                for (_start, _end, name) in run {
+                    let tensor = &self.tensors[&name];
+                    let tensor_start_offset = usize::try_from(tensor.start)
+                        .expect("validated tensor start fits the mapped address space");
+                    let tensor_end_offset = usize::try_from(tensor.end)
+                        .expect("validated tensor end fits the mapped address space");
+                    let tensor_start = mapping_base
+                        .checked_add(tensor_start_offset)
+                        .expect("validated tensor start fits the address space");
+                    let tensor_end = mapping_base
+                        .checked_add(tensor_end_offset)
+                        .expect("validated tensor end fits the address space");
+                    let bytes = locked_tensor_prefix_bytes(tensor_start, tensor_end, locked_upto)
+                        .expect("validated tensor range is ordered");
+                    if bytes > 0 {
+                        let bytes =
+                            u64::try_from(bytes).expect("tensor prefix fits the accounting type");
+                        pinned_bytes = pinned_bytes
+                            .checked_add(bytes)
+                            .expect("tensor lock accounting fits u64");
+                        pinned_tensors = pinned_tensors
+                            .checked_add(1)
+                            .expect("locked tensor count fits usize");
                         record.push((name, bytes));
                     }
                 }
             }
         }
         drop(record);
+        *self
+            .pinned_unique_bytes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner()) = unique_bytes_this_load;
         if pinned_tensors > 0 && std::env::var_os("KAPLUMBA_LOAD_PROFILE").is_some() {
             eprintln!(
                 "load profile: pinned {pinned_tensors} trellis tensors, {:.2} GiB wired",
@@ -1029,7 +1162,9 @@ impl TextWeights {
             .clone()
     }
 
-    /// Total bytes this load wired through `LlamaMlock` (R2 probe hook).
+    /// Sum of source tensor bytes covered by successful locks. Overlapping
+    /// tensor byte windows can be counted more than once; use
+    /// [`Self::pinned_unique_bytes`] for the unique page total.
     pub fn pinned_bytes(&self) -> u64 {
         self.pinned
             .lock()
@@ -1037,6 +1172,14 @@ impl TextWeights {
             .iter()
             .map(|(_, bytes)| *bytes)
             .sum()
+    }
+
+    /// Unique page bytes successfully wired by this load (R2/R3 probe hook).
+    pub fn pinned_unique_bytes(&self) -> u64 {
+        *self
+            .pinned_unique_bytes
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
     }
 
     /// R3 probe hook: see [`Self::embedding_madvise_random`].
@@ -1690,6 +1833,144 @@ mod tests {
     }
 
     #[test]
+    fn unique_page_accounting_merges_disjoint_touching_and_overlapping_ranges() {
+        assert_eq!(unique_page_bytes(&[]).unwrap(), 0, "empty lock set");
+        assert_eq!(unique_page_bytes(&[(0, 10), (20, 30)]).unwrap(), 20);
+        assert_eq!(unique_page_bytes(&[(0, 16), (16, 32)]).unwrap(), 32);
+        assert_eq!(unique_page_bytes(&[(0, 16), (8, 24)]).unwrap(), 24);
+        assert_eq!(
+            merge_page_ranges(&[(0, 16), (16, 32)]).unwrap(),
+            vec![(0, 32)]
+        );
+        assert_eq!(
+            merge_page_ranges(&[(0, 16), (8, 24)]).unwrap(),
+            vec![(0, 24)]
+        );
+        assert_eq!(
+            merge_page_ranges(&[(8, 8)]).unwrap(),
+            Vec::<(usize, usize)>::new()
+        );
+        assert!(
+            merge_page_ranges(&[(9, 8)]).is_err(),
+            "reversed interval must fail"
+        );
+    }
+
+    #[test]
+    fn page_rounding_handles_eof_empty_ranges_and_arithmetic_edges() {
+        let base = 0x10_000;
+        let page = 0x1000;
+        // The file mapping ends 1 byte into its last page. The last tensor
+        // locks the whole VM page that the kernel mapped for it.
+        assert_eq!(
+            page_rounded_mapping_range(base, 0x3001, 0x2ff0, 0x3001, page).unwrap(),
+            Some((base + 0x2000, base + 0x4000))
+        );
+        assert_eq!(
+            page_rounded_mapping_range(base, 4, 2, 2, page).unwrap(),
+            None,
+            "empty byte range must not lock a page"
+        );
+        assert!(page_rounded_mapping_range(base, 4, 2, 5, page).is_err());
+        assert!(page_rounded_mapping_range(base, 4, 3, 2, page).is_err());
+        assert!(checked_page_round_up(usize::MAX, page).is_err());
+        assert!(page_rounded_mapping_range(usize::MAX - 1, 4, 0, 1, page).is_err());
+    }
+
+    #[test]
+    fn partial_lock_prefix_accounts_only_tensor_bytes_it_reaches() {
+        assert_eq!(locked_tensor_prefix_bytes(100, 200, 150).unwrap(), 50);
+        assert_eq!(locked_tensor_prefix_bytes(100, 200, 200).unwrap(), 100);
+        assert_eq!(locked_tensor_prefix_bytes(100, 200, 99).unwrap(), 0);
+        assert_eq!(locked_tensor_prefix_bytes(100, 100, 150).unwrap(), 0);
+        assert!(locked_tensor_prefix_bytes(200, 100, 150).is_err());
+    }
+
+    const LOCK_SELECTION_CHILD: &str = "KAPLUMBA_LOCK_SELECTION_CHILD";
+
+    #[test]
+    fn disabled_or_copied_weights_report_no_mapped_lock_bytes() {
+        for copied in [false, true] {
+            let mut command = std::process::Command::new(std::env::current_exe().unwrap());
+            command
+                .args([
+                    "--exact",
+                    "weights::tests::child_lock_selection_is_truthful",
+                    "--nocapture",
+                ])
+                .env(LOCK_SELECTION_CHILD, "1")
+                .env_remove("KAPLUMBA_NO_PIN_TRELLIS")
+                .env_remove("KAPLUMBA_RESIDENT_WEIGHTS");
+            if copied {
+                command.env("KAPLUMBA_RESIDENT_WEIGHTS", "1");
+            } else {
+                command.env("KAPLUMBA_NO_PIN_TRELLIS", "1");
+            }
+            let status = command
+                .status()
+                .expect("failed to run lock-selection child");
+            assert!(
+                status.success(),
+                "lock-selection child failed (copied={copied})"
+            );
+        }
+    }
+
+    #[test]
+    fn child_lock_selection_is_truthful() {
+        if std::env::var_os(LOCK_SELECTION_CHILD).is_none() {
+            return;
+        }
+        let context = context_or_skip().expect("lock-selection child requires Metal");
+        let name = "model.language_model.layers.0.self_attn.q_proj.trellis";
+        let payload = vec![0x5a_u8; 128];
+        let (dir, selection) = (1..65)
+            .find_map(|pad| {
+                let dir = temp_dir(&format!("lock-selection-child-{pad}"));
+                let selection = selection_for(
+                    &dir,
+                    vec![
+                        ("pad.bytes", DType::U8, vec![pad], vec![0_u8; pad]),
+                        (name, DType::I16, vec![64], payload.clone()),
+                    ],
+                );
+                if selection
+                    .absolute_range(name)
+                    .unwrap()
+                    .0
+                    .is_multiple_of(EXL3_PACKED_ALIGNMENT as u64)
+                {
+                    Some((dir, selection))
+                } else {
+                    fs::remove_dir_all(dir).unwrap();
+                    None
+                }
+            })
+            .expect("child fixture must contain an aligned packed range");
+        let weights = TextWeights::load_dedicated(&dir, &selection, context, 1024 * 1024)
+            .expect("fixture must still load when locking is disabled or weights are copied");
+        assert_eq!(weights.pinned_bytes(), 0);
+        assert_eq!(weights.pinned_unique_bytes(), 0);
+        let tensor = weights.tensor(name).unwrap();
+        let copied = std::env::var_os("KAPLUMBA_RESIDENT_WEIGHTS").is_some();
+        assert_eq!(!tensor.spans.is_empty(), copied);
+        if copied {
+            assert_eq!(weights.read_tensor(name).unwrap(), payload);
+        } else {
+            let (buffer, offset) = weights.zero_copy_tensor_buffer(name).unwrap().unwrap();
+            let actual = unsafe {
+                std::slice::from_raw_parts(
+                    (buffer.contents() as *const u8).add(offset as usize),
+                    payload.len(),
+                )
+            };
+            assert_eq!(actual, payload.as_slice());
+        }
+        drop(weights);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
     fn converts_plain_bf16_without_changing_size() {
         let Some(context) = context_or_skip() else {
             return;
@@ -1780,8 +2061,7 @@ mod tests {
 
     #[test]
     fn dedicated_loader_keeps_locked_packed_shard_clean_and_zero_copy() {
-        let context = context_or_skip()
-            .expect("the clean mmap regression requires a Metal device");
+        let context = context_or_skip().expect("the clean mmap regression requires a Metal device");
         let name = "model.language_model.layers.0.self_attn.q_proj.trellis";
         let payload_len = 2 * 1024 * 1024;
         let payload: Vec<u8> = (0..payload_len).map(|index| (index % 251) as u8).collect();
@@ -1827,7 +2107,11 @@ mod tests {
                 payload_len,
             )
         };
-        assert_eq!(mapped, payload.as_slice(), "no-copy Metal view changed bytes");
+        assert_eq!(
+            mapped,
+            payload.as_slice(),
+            "no-copy Metal view changed bytes"
+        );
         assert_eq!(
             fs::read(shard_path).unwrap()[offset as usize..][..payload_len],
             payload
@@ -1841,6 +2125,11 @@ mod tests {
         let start = tensor_start & !(page - 1);
         let end = (tensor_start + payload_len).next_multiple_of(page);
         let mapped_len = end - start;
+        assert_eq!(
+            weights.pinned_unique_bytes(),
+            mapped_len as u64,
+            "one actual lock run must count each mapped page once"
+        );
         let page_count = mapped_len / page;
         let mut page_state = vec![0_i8; page_count];
         let rc = unsafe {
@@ -1892,14 +2181,12 @@ mod tests {
             fs::metadata(dir.join("model.safetensors")).unwrap().len() < page_size() as u64,
             "fixture must end inside its first VM page"
         );
-        let weights = TextWeights::load_dedicated(
-            &dir,
-            &selection,
-            context,
-            1024 * 1024,
-        )
-        .unwrap();
-        assert!(weights.pinned_bytes() > 0, "sub-page packed data must be locked");
+        let weights = TextWeights::load_dedicated(&dir, &selection, context, 1024 * 1024).unwrap();
+        assert!(
+            weights.pinned_bytes() > 0,
+            "sub-page packed data must be locked"
+        );
+        assert_eq!(weights.pinned_unique_bytes(), page_size() as u64);
         let (buffer, offset) = weights.zero_copy_tensor_buffer(name).unwrap().unwrap();
         let actual = unsafe {
             std::slice::from_raw_parts(
