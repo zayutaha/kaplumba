@@ -109,14 +109,14 @@ not a completed paging fix; all subsequent implementation remains unchecked.
   status with “clean reclaimable pages are evicted on demand” failed at the new
   live-report assertion. Completed `2026-10-14`; implementation commit
   `d0f8cdc`.
-- [ ] **T5e — make sliding growth wait across pipelined encoders.**
+- [x] **T5e — make sliding growth wait across pipelined encoders.**
   Files: `crates/kernels/src/encoder.rs`, `crates/engine/src/gpu_cache.rs`,
-  `crates/kernels/src/encoder.rs` tests, and `crates/engine/tests/kv_growth_policy.rs`.
-  A fresh empty encoder must commit and wait on its queue before CPU migration,
-  so earlier committed decode work on that queue has finished. Add a shared-event
-  barrier regression and a GPU cache append/growth regression. Prove the barrier
-  test fails if the empty-encoder path returns early; then rebuild and reproduce
-  ordinary chat through repeated sliding growth. Keep unrelated kernel edits.
+  `crates/engine/tests/kv_growth_policy.rs`. A fresh empty encoder commits and
+  waits on its queue before CPU migration. Shared-event negative control failed
+  in 208 ns under the old early return; both regressions pass with the fix. The
+  release model answered `hi` (14 prompt + 9 generated) across multiple growth
+  points with the user's GEMV kernel diff still present. Completed
+  `2026-10-14`; implementation commit `30b7bb3`.
 - [ ] **T5d — demonstrate selected reduction and resume T4.**
   Files: acceptance evidence and notes. A/B/A/B idle/short/1k/2k/8k workloads,
   repeated turns and idle/resume. Measure demand and replacement peaks, confirm
