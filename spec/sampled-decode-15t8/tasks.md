@@ -3,7 +3,7 @@
 - [x] **T1 — Revert GEMV kernel register bloat in linear_repacked.metal.**
   - Files: `crates/kernels/src/linear_repacked.metal`.
   - Intent: Restore lean 2-trip burst loop with single `float v[8]` reuse in `linear_gemv_ishizuki_k3_colmajor_2col`, `linear_gemv_ishizuki_k3_colmajor_2col_sk2`, `linear_gemv_ishizuki_k3_fused2_2col`, and `linear_gemv_ishizuki_k3_fused3_2col`.
-  - Testing: Sabotage in `linear_gemv_ishizuki_k3_colmajor_2col` produced 22708 mismatches in `live_kernel_bit_exact`. Reverted; `live_kernel_bit_exact`, `repacked_golden`, and `fused_bit_exact` all passed 100%. Commit: (pending).
+  - Testing: Sabotage in `linear_gemv_ishizuki_k3_colmajor_2col` produced 22708 mismatches in `live_kernel_bit_exact`. Reverted; `live_kernel_bit_exact`, `repacked_golden`, and `fused_bit_exact` all passed 100%. Commit: 4e5c769.
 
 - [ ] **T2 — Enforce strict top_k <= 1024 bound and wire pipelined sampling into generate.rs.**
   - Files: `crates/engine/src/generate.rs`, `crates/engine/src/chat.rs`.
