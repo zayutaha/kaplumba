@@ -208,7 +208,10 @@ a future implementation step.
    sliding cache with growth before append to hold the retained attention
    window plus the incoming chunk. Preserve all live absolute positions and
    FP16 K/V bytes when ring capacity changes; synchronize before reading or
-   replacing buffers referenced by queued GPU work. Keep the existing maximum
+   replacing buffers referenced by queued GPU work, including work submitted
+   by a different pipelined encoder. A fresh empty encoder must still create a
+   queue barrier; its no-op `flush_and_wait` does not retire prior encoders'
+   commands. Keep the existing maximum
    chunk/window behavior and context policy. Demonstrate lower idle/short-chat
    allocation and replacement peaks without output or throughput regression.
    Do not mark this requirement met from predicted byte savings.

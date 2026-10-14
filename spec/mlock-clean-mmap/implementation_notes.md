@@ -773,3 +773,29 @@ reclaimability/load-safety claim`. Restored the status. No model run was done;
 PID 39841 remained open and host swap was already about 3.4 GiB. This task only
 corrects host-report wording and does not prove the weights are individually
 locked or eliminate paging.
+
+## T5e — live chat failure and queue-barrier diagnosis (2026-10-14)
+
+User report: loading `~/.kaplumba/models/Gxma-repacked` completed with the full
+12,046,221,312-byte mlock summary, but entering `hi` streamed `Hello! How can`
+then returned `sliding cache slot 14 contains position 4294967295, expected
+14`. Reproduced with the same release binary; it loaded in 1,299 ms and failed
+the same prompt at slot 14. The process remains interactive in exec session
+86888 until implementation verification/exit.
+
+Inspected the uncommitted `crates/kernels/src/linear_repacked.metal` diff. It
+only changes local weight-word loads and accumulator arrangement inside
+`linear_gemv_ishizuki_k3_colmajor_contig4`; it does not touch KV buffers,
+`position_cache`, `cache_append`, or `norm_rope_qkv_cache`. Leave that user edit
+untouched. The separate uncommitted `crates/engine/src/exl3.rs` change is also
+unrelated and must remain untouched.
+
+Root cause: pipelined decode schedules adjacent steps through distinct
+`MetalEncoder`s sharing the model command queue. At the sliding-growth boundary,
+the new encoder can be empty. `wait_for_sliding_growth` calls
+`MetalEncoder::flush_and_wait`, whose empty/current-no-inflight fast path returns
+without committing a queue command or waiting for the previous encoder. CPU
+migration then reads `positions` before the prior decode's GPU write completes;
+the tag still contains `EMPTY_POSITION`. The initial T5b tests covered queued
+writes in the same encoder, not a preceding separate encoder. T5e adds a forced
+empty-encoder queue barrier and shared-event regression.

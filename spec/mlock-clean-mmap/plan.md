@@ -206,7 +206,12 @@ alongside process footprint; neither number alone is total unified-memory use.
    Drain all previously queued GPU work once before CPU migration/replacement;
    retain old buffers through completion. Reuse the existing prefill staging
    barrier where safe. No per-layer wait or pressure polling on each decode
-   token. Measure old/new overlap, migration and any autorelease retention;
+   token. In pipelined decode, prior work may belong to a different
+   `MetalEncoder`; a fresh encoder's ordinary `flush_and_wait` is a no-op when
+   empty. Growth must enqueue and wait for an empty queue barrier on the same
+   command queue. Test with prior work held behind a shared Metal event, then
+   verify migration sees every completed position tag. Measure old/new overlap,
+   migration and any autorelease retention;
    avoid replacing all 50 layers' buffers before releasing retired storage.
 5. Changing ring capacity also changes physical attention scan order after
    wrap. FP16 byte preservation alone does not prove numerical/output equality.
