@@ -1564,8 +1564,48 @@ impl DecoderLayer {
                 tokens,
                 eps,
             )?;
-            if decode && qkv_share_input_signs {
-                self.encode_input_transform(encoder, &self.weights.q_proj, &scratch.normed, scratch)?;
+            if decode {
+                if qkv_share_input_signs {
+                    self.encode_input_transform(encoder, &self.weights.q_proj, &scratch.normed, scratch)?;
+                } else {
+                    let k_proj = &self.weights.k_proj;
+                    let q_signs = self.weights.q_proj.input_signs_buffer.as_ref().ok_or_else(|| {
+                        ModelError::InvalidWeights("q_proj input signs are not resident".to_string())
+                    })?;
+                    let k_signs = k_proj.input_signs_buffer.as_ref().ok_or_else(|| {
+                        ModelError::InvalidWeights("k_proj input signs are not resident".to_string())
+                    })?;
+                    let in_features = self.weights.q_proj.in_features;
+                    self.linear.encode_input_transform_offset(
+                        encoder,
+                        &scratch.normed,
+                        q_signs,
+                        &scratch.transformed,
+                        0,
+                        in_features,
+                    )?;
+                    self.linear.encode_input_transform_offset(
+                        encoder,
+                        &scratch.normed,
+                        k_signs,
+                        &scratch.transformed,
+                        (in_features * 2) as u64,
+                        in_features,
+                    )?;
+                    if let Some(v_proj) = &self.weights.v_proj {
+                        let v_signs = v_proj.input_signs_buffer.as_ref().ok_or_else(|| {
+                            ModelError::InvalidWeights("v_proj input signs are not resident".to_string())
+                        })?;
+                        self.linear.encode_input_transform_offset(
+                            encoder,
+                            &scratch.normed,
+                            v_signs,
+                            &scratch.transformed,
+                            (2 * in_features * 2) as u64,
+                            in_features,
+                        )?;
+                    }
+                }
             }
         }
         // Boundary 1 of 15. The input norm -- and, in decode, the shared
@@ -1576,7 +1616,7 @@ impl DecoderLayer {
         // the trailing norm/residual pairs below.
         profile.stamp(encoder, &format!("{}norm_transform", prefix()))?;
         timer.lap("norm_transform");
-        if decode && qkv_share_input_signs && self.weights.q_proj.permutation_mode == 1 && self.weights.v_proj.is_some() {
+        if decode && self.weights.q_proj.permutation_mode == 1 && self.weights.v_proj.is_some() {
             let v_proj = self.weights.v_proj.as_ref().unwrap();
             let packed_q = self.weights.q_proj.metal_buffer.as_ref().ok_or_else(|| {
                 ModelError::InvalidWeights("q_proj has no GPU-resident weights".to_string())
@@ -1617,6 +1657,11 @@ impl DecoderLayer {
             if kaplumba_kernels::ablated("qkv_gemv") {
                 // KAPLUMBA_ABLATE=qkv_gemv: timing-only.
             } else {
+            let stride_x = if qkv_share_input_signs {
+                0
+            } else {
+                self.weights.q_proj.in_features as u32
+            };
             self.linear
                 .encode_gemv_fused3(
                     encoder,
@@ -1643,12 +1688,13 @@ impl DecoderLayer {
                     &scratch.raw_c,
                     self.weights.q_proj.in_features,
                     true,
+                    stride_x,
                 )
                 .map_err(ModelError::Kernel)?;
             }
             profile.stamp(encoder, &format!("{}qkv_proj", prefix()))?;
             timer.lap("qkv_proj");
-        } else if decode && qkv_share_input_signs && self.weights.q_proj.permutation_mode == 1 {
+        } else if decode && self.weights.q_proj.permutation_mode == 1 {
             let packed_q = self.weights.q_proj.metal_buffer.as_ref().ok_or_else(|| {
                 ModelError::InvalidWeights("q_proj has no GPU-resident weights".to_string())
             })?;
@@ -1679,6 +1725,11 @@ impl DecoderLayer {
                 .ok_or_else(|| {
                     ModelError::InvalidWeights("q_proj input signs are not resident".to_string())
                 })?;
+            let stride_x = if qkv_share_input_signs {
+                0
+            } else {
+                self.weights.q_proj.in_features as u32
+            };
             self.linear
                 .encode_gemv_fused2(
                     encoder,
@@ -1699,6 +1750,7 @@ impl DecoderLayer {
                     &scratch.raw_b,
                     self.weights.q_proj.in_features,
                     true,
+                    stride_x,
                 )
                 .map_err(ModelError::Kernel)?;
             self.elements
@@ -2262,20 +2314,46 @@ let use_sk4 = env_flag("KAPLUMBA_O_SK4")
 
             // gate and up read the same activation too -- decode only, for the
             // reason given above the q/k/v transform.
-            if decode && gate_up_share_input_signs {
-                self.encode_input_transform(
-                    encoder,
-                    &self.weights.gate_proj,
-                    &scratch.normed,
-                    scratch,
-                )?;
+            if decode {
+                if gate_up_share_input_signs {
+                    self.encode_input_transform(
+                        encoder,
+                        &self.weights.gate_proj,
+                        &scratch.normed,
+                        scratch,
+                    )?;
+                } else {
+                    let gate_signs = self.weights.gate_proj.input_signs_buffer.as_ref().ok_or_else(|| {
+                        ModelError::InvalidWeights("gate_proj input signs are not resident".to_string())
+                    })?;
+                    let up_signs = self.weights.up_proj.input_signs_buffer.as_ref().ok_or_else(|| {
+                        ModelError::InvalidWeights("up_proj input signs are not resident".to_string())
+                    })?;
+                    let in_features = self.weights.gate_proj.in_features;
+                    self.linear.encode_input_transform_offset(
+                        encoder,
+                        &scratch.normed,
+                        gate_signs,
+                        &scratch.transformed,
+                        0,
+                        in_features,
+                    )?;
+                    self.linear.encode_input_transform_offset(
+                        encoder,
+                        &scratch.normed,
+                        up_signs,
+                        &scratch.transformed,
+                        (in_features * 2) as u64,
+                        in_features,
+                    )?;
+                }
             }
             profile.stamp(encoder, &format!("{}pre_ffn_norm_transform", prefix()))?;
             timer.lap("pre_ffn_norm_transform");
         }
         }
 
-        if decode && gate_up_share_input_signs && self.weights.gate_proj.permutation_mode == 1 {
+        if decode && self.weights.gate_proj.permutation_mode == 1 {
             let packed_gate = self
                 .weights
                 .gate_proj
@@ -2324,6 +2402,11 @@ let use_sk4 = env_flag("KAPLUMBA_O_SK4")
             if kaplumba_kernels::ablated("gate_up_gemv") {
                 // KAPLUMBA_ABLATE=gate_up_gemv: timing-only.
             } else {
+            let stride_x = if gate_up_share_input_signs {
+                0
+            } else {
+                self.weights.gate_proj.in_features as u32
+            };
             self.linear
                 .encode_gemv_fused2_mlp(
                     encoder,
@@ -2344,6 +2427,7 @@ let use_sk4 = env_flag("KAPLUMBA_O_SK4")
                     &scratch.raw_b,
                     self.weights.gate_proj.in_features,
                     true,
+                    stride_x,
                 )
                 .map_err(ModelError::Kernel)?;
             }

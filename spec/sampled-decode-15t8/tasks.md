@@ -10,10 +10,10 @@
   - Intent: Reject `top_k > 1024` with `SamplerError::DeviceTopKTooLarge`. Support `HeadPick::Sample(params)` in pipelined decode loop in `generate.rs`.
   - Testing: Sabotaged `GenerationConfig::validate` limit to 2048 and confirmed `generation_config_rejects_top_k_above_1024` failed with `expected DeviceTopKTooLarge, got Ok(())`. Reverted. Added unit test in `chat.rs` and `generate.rs`. All 148 library tests passed. Commit: 819a551.
 
-- [ ] **T3 — Multi-input-vector support in fused GEMV kernels and model decode integration.**
-  - Files: `crates/kernels/src/linear_repacked.metal`, `crates/kernels/src/linear.rs`, `crates/engine/src/model.rs`.
+- [x] **T3 — Multi-input-vector support in fused GEMV kernels and model decode integration.**
+  - Files: `crates/kernels/src/linear_repacked.metal`, `crates/kernels/src/linear.rs`, `crates/engine/src/model.rs`, `crates/engine/tests/fused_bit_exact.rs`.
   - Intent: Add `stride_x` support to `linear_gemv_ishizuki_k3_fused2_2col` and `fused3_2col` so each projection receives its own transformed input vector according to its Hadamard signs. Enable fused MLP (`gate_up_gelu`) and fused QKV in `model.rs` for decode without sign sharing.
-  - Testing: Sabotage vector routing; verify `fused_bit_exact` and `live_kernel_bit_exact` fail under sabotage, and pass when correct.
+  - Testing: Added `fused2_matches_dual_independent_encodes_with_stride_x`. Sabotaged `stride_x` to 0, confirmed test failed loudly (`got_b != ref_b`). Reverted sabotage. All tests passed. Commit: pending.
 
 - [ ] **T4 — Benchmark and demonstrate >= 15.8 tok/s at temp=1.0 and temp=0.**
   - Files: `spec/sampled-decode-15t8/implementation_notes.md`.

@@ -1007,7 +1007,7 @@ fn a_decode_step_commits_fifteen_command_buffers_and_blocks_six_times() {
     );
     assert!(
         ENCODER_RS.contains(
-            "self.in_flight.push(self.command_buffer.clone());\n        if self.in_flight.len() > max_in_flight() {\n            let oldest = self.in_flight.remove(0);\n            oldest.wait_until_completed();\n        }"
+            "self.in_flight.push(self.command_buffer.clone());\n            if self.in_flight.len() > max_in_flight() {\n                let oldest = self.in_flight.remove(0);\n                oldest.wait_until_completed();\n            }"
         ),
         "roll()'s commit/track/wait sequence moved; the wait count must be \
          re-derived from the new shape"

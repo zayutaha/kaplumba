@@ -958,6 +958,7 @@ fn dispatch(kernels: &LinearKernels, enc: &mut MetalEncoder, bench: &Bench, c: &
                 &bench.raw,
                 c.k,
                 true,
+                0,
             )
             .expect("encode_gemv_fused2_mlp");
         return;

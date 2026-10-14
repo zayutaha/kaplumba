@@ -1064,6 +1064,7 @@ fn dispatch_row(enc: &mut MetalEncoder, l: &Loaded) {
                 &l.scratch.raw_b,
                 k,
                 false,
+                0,
             )
             .expect("gemv_fused2_mlp"),
         Route::Fused3 => l
@@ -1093,6 +1094,7 @@ fn dispatch_row(enc: &mut MetalEncoder, l: &Loaded) {
                 &l.scratch.raw,
                 k,
                 false,
+                0,
             )
             .expect("gemv_fused3"),
         Route::Named(name) => l

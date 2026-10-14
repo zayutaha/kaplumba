@@ -193,6 +193,7 @@ fn fused2_matches_two_independent_encodes() {
                 &sc_b.raw,
                 *in_f,
                 false,
+                0,
             )
             .unwrap_or_else(|e| panic!("fused2 {label}: {e}"));
         e.commit_and_wait().expect("wait");
@@ -260,6 +261,7 @@ fn fused3_matches_three_independent_encodes() {
                 &sa.raw, &sb.raw, &sc.raw,
                 *in_f,
                 false,
+                0,
             )
             .unwrap_or_else(|e| panic!("fused3 {label}: {e}"));
         e.commit_and_wait().expect("wait");
@@ -305,7 +307,7 @@ fn the_fused_comparison_can_fail() {
                 &buf, 0, out_b, &ones(&device, out_b), &upload(&device, &vec![0u16; out_b]),
                 &sc.input, &sc.input_signs, &sc.transformed,
                 &sc.raw, &device.new_buffer((out_b * 16) as u64, MTLResourceOptions::StorageModeShared),
-                in_f, false,
+                in_f, false, 0,
             )
             .expect("encode");
         e.commit_and_wait().expect("wait");
@@ -332,4 +334,114 @@ fn the_fused_comparison_can_fail() {
         clean.iter().zip(&sabotaged).filter(|(a, b)| a != b).count(),
         clean.len()
     );
+}
+
+#[test]
+fn fused2_matches_dual_independent_encodes_with_stride_x() {
+    let device = metal::Device::system_default().expect("no metal device");
+    let queue = device.new_command_queue();
+    let kernels = LinearKernels::new().expect("kernels");
+
+    let in_f = 5376usize;
+    let (out_a, out_b) = (21504usize, 21504usize);
+    let pa = build(in_f, out_a, 1);
+    let pb = build(in_f, out_b, 2);
+
+    // Two distinct input vectors: A gets 1.0, B gets 2.0
+    let input_a_vals = vec![f16::from_f32(1.0).to_bits(); in_f];
+    let input_b_vals = vec![f16::from_f32(2.0).to_bits(); in_f];
+    let buf_input_a = upload(&device, &input_a_vals);
+    let buf_input_b = upload(&device, &input_b_vals);
+
+    let signs_a = ones(&device, in_f);
+    let signs_b = ones(&device, in_f);
+    let out_signs_a = ones(&device, out_a);
+    let out_signs_b = ones(&device, out_b);
+
+    // Reference A: single linear with input A
+    let sc_a = scratch(&device, in_f, out_a);
+    let mut ea = MetalEncoder::new(&queue).expect("encoder");
+    let ba = upload(&device, &pa);
+    kernels
+        .encode_gemv(
+            &mut ea,
+            LinearEncodeRequest {
+                packed: &ba,
+                packed_offset: 0,
+                perm_mode: 1,
+                input: &buf_input_a,
+                input_signs: &signs_a,
+                output_signs: &out_signs_a,
+                transformed: &sc_a.transformed,
+                raw: &sc_a.raw,
+                output: &sc_a.out,
+                in_features: in_f,
+                out_features: out_a,
+                rate: Exl3Rate::Integer(BITS),
+                codebook: Exl3Codebook::Mcg,
+                pretransformed: false,
+            },
+        )
+        .expect("encode a");
+    ea.commit_and_wait().expect("wait");
+    let ref_a = read_u16(&sc_a.out, out_a);
+
+    // Reference B: single linear with input B
+    let sc_b = scratch(&device, in_f, out_b);
+    let mut eb = MetalEncoder::new(&queue).expect("encoder");
+    let bb = upload(&device, &pb);
+    kernels
+        .encode_gemv(
+            &mut eb,
+            LinearEncodeRequest {
+                packed: &bb,
+                packed_offset: 0,
+                perm_mode: 1,
+                input: &buf_input_b,
+                input_signs: &signs_b,
+                output_signs: &out_signs_b,
+                transformed: &sc_b.transformed,
+                raw: &sc_b.raw,
+                output: &sc_b.out,
+                in_features: in_f,
+                out_features: out_b,
+                rate: Exl3Rate::Integer(BITS),
+                codebook: Exl3Codebook::Mcg,
+                pretransformed: false,
+            },
+        )
+        .expect("encode b");
+    eb.commit_and_wait().expect("wait");
+    let ref_b = read_u16(&sc_b.out, out_b);
+
+    // Fused dual-input: stage transformed inputs sequentially at offset 0 and in_f * 2 bytes
+    let mut combined_transformed = Vec::with_capacity(in_f * 2);
+    // pretransform A: input_a * signs_a
+    combined_transformed.extend_from_slice(&read_u16(&sc_a.transformed, in_f));
+    // pretransform B: input_b * signs_b
+    combined_transformed.extend_from_slice(&read_u16(&sc_b.transformed, in_f));
+    let buf_combined_transformed = upload(&device, &combined_transformed);
+
+    let fused_sc_a = scratch(&device, in_f, out_a);
+    let fused_sc_b = scratch(&device, in_f, out_b);
+    let mut ef = MetalEncoder::new(&queue).expect("encoder");
+    kernels
+        .encode_gemv_fused2(
+            &mut ef,
+            &ba, 0, out_a, &out_signs_a, &fused_sc_a.out,
+            &bb, 0, out_b, &out_signs_b, &fused_sc_b.out,
+            &buf_input_a, &signs_a, &buf_combined_transformed,
+            &fused_sc_a.raw, &fused_sc_b.raw,
+            in_f,
+            true, // pretransformed
+            in_f as u32, // stride_x
+        )
+        .expect("encode fused2 with stride_x");
+    ef.commit_and_wait().expect("wait");
+
+    let got_a = read_u16(&fused_sc_a.out, out_a);
+    let got_b = read_u16(&fused_sc_b.out, out_b);
+
+    assert_eq!(got_a, ref_a, "dual-input fused2 output A did not match reference");
+    assert_eq!(got_b, ref_b, "dual-input fused2 output B did not match reference");
 }

@@ -2253,13 +2253,29 @@ impl LinearKernels {
         transformed: &Buffer,
         in_features: usize,
     ) -> Result<(), KernelError> {
+        self.encode_input_transform_offset(encoder, input, input_signs, transformed, 0, in_features)
+    }
+
+    pub fn encode_input_transform_offset(
+        &self,
+        encoder: &mut crate::encoder::MetalEncoder,
+        input: &Buffer,
+        input_signs: &Buffer,
+        transformed: &Buffer,
+        transformed_offset_bytes: u64,
+        in_features: usize,
+    ) -> Result<(), KernelError> {
         if crate::ablated("input_transform") {
             return Ok(());
         }
         let input_blocks = to_u32(in_features / 128, "input dimension")?;
-        encoder.dispatch_1d(
+        encoder.dispatch_1d_offset(
             &self.input_pipeline,
-            &[Some(input), Some(input_signs), Some(transformed)],
+            &[
+                crate::encoder::TensorRef::new(input, 0),
+                crate::encoder::TensorRef::new(input_signs, 0),
+                crate::encoder::TensorRef::new(transformed, transformed_offset_bytes),
+            ],
             &input_blocks.to_le_bytes(),
             u64::from(input_blocks) * 32,
             32,
@@ -2715,6 +2731,7 @@ impl LinearKernels {
         raw_b: &Buffer,
         in_features: usize,
         pretransformed: bool,
+        stride_x: u32,
     ) -> Result<(), KernelError> {
         if !pretransformed {
             let input_blocks = to_u32(in_features / 128, "input dimension")?;
@@ -2732,6 +2749,7 @@ impl LinearKernels {
             to_u32(in_features, "in_features")?,
             to_u32(out_features_a, "out_features_a")?,
             to_u32(out_features_b, "out_features_b")?,
+            stride_x,
         ];
         // The fused QKV GEMVs split K by default. `fused2_sk2` / `fused3_sk2`
         // launch `(tiles_a + tiles_b[+ tiles_c]) * 2` threadgroups against the
@@ -2892,6 +2910,7 @@ impl LinearKernels {
         raw_up: &Buffer,
         in_features: usize,
         pretransformed: bool,
+        stride_x: u32,
     ) -> Result<(), KernelError> {
         if !pretransformed {
             let input_blocks = to_u32(in_features / 128, "input dimension")?;
@@ -2909,6 +2928,7 @@ impl LinearKernels {
             to_u32(in_features, "in_features")?,
             to_u32(out_features_gate, "out_features_gate")?,
             to_u32(out_features_up, "out_features_up")?,
+            stride_x,
         ];
         if env_flag("KAPLUMBA_USE_SK") {
             if let Some(pipeline) =
@@ -3095,6 +3115,7 @@ impl LinearKernels {
         raw_c: &Buffer,
         in_features: usize,
         pretransformed: bool,
+        stride_x: u32,
     ) -> Result<(), KernelError> {
         if !pretransformed {
             let input_blocks = to_u32(in_features / 128, "input dimension")?;
@@ -3114,6 +3135,7 @@ impl LinearKernels {
             to_u32(out_features_a, "out_features_a")?,
             to_u32(out_features_b, "out_features_b")?,
             to_u32(out_features_c, "out_features_c")?,
+            stride_x,
         ];
         // The fused QKV GEMVs split K by default. `fused2_sk2` / `fused3_sk2`
         // launch `(tiles_a + tiles_b[+ tiles_c]) * 2` threadgroups against the
