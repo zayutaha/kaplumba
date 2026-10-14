@@ -1,0 +1,16 @@
+# Tasks: Sampled Decode 15.8 tok/s
+
+- [ ] **T1 — Revert GEMV kernel register bloat in linear_repacked.metal.**
+  - Files: `crates/kernels/src/linear_repacked.metal`.
+  - Intent: Restore lean 2-trip burst loop with single `float v[8]` reuse in `linear_gemv_ishizuki_k3_colmajor_2col`, `linear_gemv_ishizuki_k3_colmajor_2col_sk2`, `linear_gemv_ishizuki_k3_fused2_2col`, and `linear_gemv_ishizuki_k3_fused3_2col`.
+  - Testing: Sabotage a line in `linear_gemv_ishizuki_k3_colmajor_2col` to observe failure; run `cargo test -p kaplumba-engine --test live_kernel_bit_exact` (must pass 0 diffs). Run `gemv_bandwidth` test.
+
+- [ ] **T2 — Enforce strict top_k <= 1024 bound and wire pipelined sampling into generate.rs.**
+  - Files: `crates/engine/src/generate.rs`, `crates/engine/src/chat.rs`.
+  - Intent: Reject `top_k > 1024` with `SamplerError::DeviceTopKTooLarge`. Support `HeadPick::Sample(params)` in pipelined decode loop in `generate.rs`.
+  - Testing: Unit test for `top_k = 1025` error; verify `cargo test -p kaplumba-engine --lib`.
+
+- [ ] **T3 — Benchmark and demonstrate >= 15.8 tok/s at temp=1.0 and temp=0.**
+  - Files: `spec/sampled-decode-15t8/implementation_notes.md`.
+  - Intent: Run canonical 32-token benchmark under `temp = 1.0, top_k = 64, top_p = 0.95` and `temp = 0.0` using `scripts/gpuq try --`.
+  - Testing: Verify throughput $\ge 15.8\text{ tok/s}$ and verify output coherence.
