@@ -692,4 +692,4 @@ corrects both in a later implementation; this turn leaves scripts untouched.
 
 D2 validation: `git diff --check -- spec/mlock-clean-mmap` and scoped documentation diff review; no new
 code/test-coverage or successful paging-fix claim. T5a–T5d and full T4/T6 remain
-unchecked. D2 commit is recorded by the immediate metadata follow-up.
+unchecked. D2 documentation commit `b50f0d2`.

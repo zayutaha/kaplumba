@@ -134,4 +134,4 @@ not a completed paging fix; all subsequent implementation remains unchecked.
   capacity reporting as future tasks; record numerical-order and GPU-lifetime
   risks. No implementation or code-test coverage claim. Verify diff and ensure
   this task changed only the four spec documents. Completed `2026-10-14`;
-  commit recorded in the metadata follow-up.
+  documentation commit `b50f0d2`.
