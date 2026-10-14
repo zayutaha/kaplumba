@@ -13,7 +13,7 @@
 - [x] **T3 — Multi-input-vector support in fused GEMV kernels and model decode integration.**
   - Files: `crates/kernels/src/linear_repacked.metal`, `crates/kernels/src/linear.rs`, `crates/engine/src/model.rs`, `crates/engine/tests/fused_bit_exact.rs`.
   - Intent: Add `stride_x` support to `linear_gemv_ishizuki_k3_fused2_2col` and `fused3_2col` so each projection receives its own transformed input vector according to its Hadamard signs. Enable fused MLP (`gate_up_gelu`) and fused QKV in `model.rs` for decode without sign sharing.
-  - Testing: Added `fused2_matches_dual_independent_encodes_with_stride_x`. Sabotaged `stride_x` to 0, confirmed test failed loudly (`got_b != ref_b`). Reverted sabotage. All tests passed. Commit: pending.
+  - Testing: Added `fused2_matches_dual_independent_encodes_with_stride_x`. Sabotaged `stride_x` to 0, confirmed test failed loudly (`got_b != ref_b`). Reverted sabotage. All tests passed. Commit: 0d74319.
 
 - [ ] **T4 — Benchmark and demonstrate >= 15.8 tok/s at temp=1.0 and temp=0.**
   - Files: `spec/sampled-decode-15t8/implementation_notes.md`.
