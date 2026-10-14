@@ -20,7 +20,7 @@ use kaplumba_engine::gpu_cache::{
 };
 use kaplumba_kernels::elements::ElementKernels;
 use kaplumba_kernels::encoder::MetalEncoder;
-use metal::Device;
+use metal::{Device, MTLResourceOptions};
 
 /// What `model.rs:3396` puts in `LayerConfig::max_sequence_len`.
 const MAX_POSITION_EMBEDDINGS: usize = 262_144;
@@ -296,4 +296,58 @@ fn sliding_growth_waits_for_queued_gpu_writes_before_migration() {
 
     cache.ensure_sliding_capacity(&device, 2, 2, 8).unwrap();
     assert_eq!(unsafe { *(cache.keys().contents() as *const u16) }, 0x1234);
+}
+
+#[test]
+fn sliding_growth_waits_for_a_separate_encoder_before_migration() {
+    let device = device();
+    let queue = device.new_command_queue();
+    let kernels = ElementKernels::shared().unwrap();
+    let mut cache = GpuKvCache::new(&device, 15, 1, 1).unwrap();
+    let keys = device.new_buffer(15 * 2, MTLResourceOptions::StorageModeShared);
+    let values = device.new_buffer(15 * 2, MTLResourceOptions::StorageModeShared);
+    unsafe {
+        let key_ptr = keys.contents() as *mut u16;
+        let value_ptr = values.contents() as *mut u16;
+        for position in 0..15usize {
+            *key_ptr.add(position) = (position + 10) as u16;
+            *value_ptr.add(position) = (position + 30) as u16;
+        }
+    }
+
+    // Simulate the prior pipelined decode encoder: it writes all current tags
+    // and commits, while the next forward uses a distinct, empty encoder.
+    let mut producer = MetalEncoder::new(&queue).unwrap();
+    kernels
+        .encode_cache_append(
+            &mut producer,
+            &keys,
+            &values,
+            cache.keys(),
+            cache.values(),
+            cache.positions(),
+            15,
+            1,
+            cache.capacity(),
+            0,
+            0,
+        )
+        .unwrap();
+    cache.advance(15);
+    producer.commit_terminal().unwrap();
+
+    let mut next_forward = MetalEncoder::new(&queue).unwrap();
+    wait_for_sliding_growth(&mut next_forward).unwrap();
+    cache
+        .ensure_sliding_capacity(&device, 1024, 1, 2048)
+        .unwrap();
+
+    let (actual_keys, actual_values, positions) = cache.read_to_host();
+    for position in 0..15usize {
+        let slot = position % cache.capacity();
+        assert_eq!(positions[slot], position as u32, "position {position}");
+        assert_eq!(actual_keys[slot], (position + 10) as u16);
+        assert_eq!(actual_values[slot], (position + 30) as u16);
+    }
+    next_forward.abandon();
 }

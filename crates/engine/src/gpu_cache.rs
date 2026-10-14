@@ -90,7 +90,7 @@ pub enum GpuCacheError {
 /// buffers that pending Metal commands may still reference.
 pub fn wait_for_sliding_growth(encoder: &mut MetalEncoder<'_>) -> Result<(), GpuCacheError> {
     encoder
-        .flush_and_wait()
+        .flush_and_wait_queue()
         .map_err(|error| GpuCacheError::Queue(error.to_string()))?;
     Ok(())
 }

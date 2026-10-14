@@ -799,3 +799,22 @@ migration then reads `positions` before the prior decode's GPU write completes;
 the tag still contains `EMPTY_POSITION`. The initial T5b tests covered queued
 writes in the same encoder, not a preceding separate encoder. T5e adds a forced
 empty-encoder queue barrier and shared-event regression.
+
+Fix: added `MetalEncoder::flush_and_wait_queue`, which commits and waits even
+when the current encoder has no dispatches; growth uses it before reading or
+replacing cache buffers. Added (1) a deterministic shared-event unit test that
+holds an earlier command buffer until a helper thread signals it, and (2) a GPU
+cache test that appends positions 0–14 through the real Metal append kernel,
+commits encoder A, grows via empty encoder B, and verifies every position/K/V.
+
+Validation: the barrier test passed; the combined `kv_growth_policy` integration
+test passed 10/10. Negative control restored the empty-encoder early return; the
+barrier test failed diagnostically in 208 ns (`empty encoder returned before
+prior queue work was released`) rather than waiting for the event. Restored the
+fix and reran both test groups successfully. Release build succeeded. With the
+user's uncommitted `linear_repacked.metal` diff still present, the repacked model
+loaded in 3,339 ms and `hi` completed with 14 prompt + 9 generated tokens
+(context 23), crossing multiple sliding growth boundaries without the cache
+error. Loader reported all 12,046,221,312 eligible hot bytes locked. The process
+is left open in exec session 61152 for Activity Monitor. This live chat is a
+focused regression check, not the full 1k/2k/8k paging acceptance.

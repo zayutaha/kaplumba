@@ -600,6 +600,28 @@ impl<'q> MetalEncoder<'q> {
         Ok(())
     }
 
+    /// Commit and wait for this queue even when this encoder has no work.
+    ///
+    /// A pipelined caller can submit work through encoder A, then reach a host
+    /// read/migration through a fresh encoder B before A has completed. The
+    /// ordinary [`Self::flush_and_wait`] is intentionally a no-op for an empty
+    /// encoder, so it cannot serve as a cross-encoder barrier. Committing B's
+    /// empty command buffer on the same queue and waiting for it retires all
+    /// earlier committed work in queue order.
+    pub fn flush_and_wait_queue(&mut self) -> Result<(), KernelError> {
+        self.end();
+        self.command_buffer.commit();
+        for buffer in std::mem::take(&mut self.in_flight) {
+            buffer.wait_until_completed();
+        }
+        self.command_buffer.wait_until_completed();
+        if self.command_buffer.status() != MTLCommandBufferStatus::Completed {
+            return Err(command_failed(&self.command_buffer));
+        }
+        self.rearm();
+        Ok(())
+    }
+
     /// End the encoder and drop the work without committing.
     ///
     /// The automatic path is [`Drop`], which ends any encoder still open, so an
@@ -928,6 +950,40 @@ kernel void burn(device float* out [[buffer(0)]],
             );
         }
         encoder.abandon();
+    }
+
+    #[test]
+    fn empty_encoder_queue_barrier_waits_for_prior_encoder_work() {
+        let Some((_device, queue, _pipeline, _out)) = burn_context() else {
+            return;
+        };
+        let event = _device.new_shared_event();
+        let prior = queue.new_command_buffer();
+        prior.encode_wait_for_event(&event, 1);
+        prior.commit();
+
+        // B is a fresh encoder with no dispatches. Its ordinary flush is a
+        // no-op; the queue barrier must enqueue an empty command buffer after
+        // A's event-blocked work and wait until the helper thread signals it.
+        let mut barrier = MetalEncoder::new(&queue).expect("barrier encoder");
+        let signal_event = event.clone();
+        let signal = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(40));
+            signal_event.set_signaled_value(1);
+        });
+        let started = Instant::now();
+        barrier
+            .flush_and_wait_queue()
+            .expect("cross-encoder queue barrier");
+        let elapsed = started.elapsed();
+        signal.join().expect("event signal thread");
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(30),
+            "empty encoder returned before prior queue work was released: {elapsed:?}"
+        );
+        assert_eq!(prior.status(), MTLCommandBufferStatus::Completed);
+        barrier.abandon();
     }
 
     #[test]
