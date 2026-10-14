@@ -156,7 +156,7 @@ pub fn decode_flash_min_keys() -> usize {
         std::env::var("KAPLUMBA_DECODE_FLASH_MIN_KEYS")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(4096)
+            .unwrap_or(512)
     })
 }
 

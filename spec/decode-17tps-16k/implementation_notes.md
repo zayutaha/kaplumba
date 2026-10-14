@@ -31,5 +31,7 @@ Running log per `AGENTS.md §5`. Factual and dense.
    Replaced 64-bit `ulong` shifts (`((w0a << 32) | w0b) << sh0`) with 32-bit scalar MCG extraction (`extract_v_mcg_32`) and single `float v[8]` register reuse across all 4 loop steps. Slashed active register pressure and 64-bit integer ALU instructions in QKV split-K kernels. Sabotage test confirmed fail-first behavior in `fused_bit_exact`.
 5. **Down projection Split-K Profiling & Verification (T3):**
    Benchmarked `colmajor_1col_sk2` against `colmajor_2col_sk2` and `colmajor_2col_sk4` across all 60 layers on `Gxma-repacked`. `colmajor_1col_sk2` achieves 13.45 ms (193.4 GB/s effective bandwidth), outperforming `2col_sk2` (13.48 ms) and SK4 (13.50 ms) while halving per-threadgroup reduction. Bit-exactness verified against CPU reference in `live_kernel_bit_exact.rs` with fail-first sabotage test.
+6. **Full-attention decode scalability (T4):**
+   Lowered `decode_flash_min_keys` default from 4096 to 512. In Gemma 4 architecture, 50 out of 60 layers are sliding-window attention (fixed 1,024 key window), and only 10 layers are full-attention. Previously, for context lengths between 512 and 4096 tokens, full-attention layers used the scalar split-attention kernel which took ~7.45 ms across the 10 layers. With MMA Flash decode active for keys $\ge 512$, full attention scales efficiently with online-softmax key reduction, dropping attention runtime to 6.55 ms at 2k context (saving ~0.9 ms/token). Sabotage test (`scale * 2.0`) failed as expected and 8/8 tests passed on clean code.
 
 

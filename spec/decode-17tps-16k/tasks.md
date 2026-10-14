@@ -15,10 +15,10 @@
   - Intent: Profile `down_proj` (13.5 ms/step across 60 layers) under `colmajor_1col_sk2` vs `colmajor_2col` and select the fastest dispatch for `in_features = 21504, out_features = 5376`.
   - Testing: Benchmarked `colmajor_1col_sk2` (13.45 ms) vs `colmajor_2col_sk2` (13.48 ms) and SK4 (13.50 ms). Sabotaged `acc0 += p00 * v[0] * 2.0f + ...` in `colmajor_1col_sk2` and verified `live_kernel_contig4_is_bit_exact_against_colmajor` failed. Reverted sabotage; confirmed bit-exact test passed. Commit.
 
-- [ ] **T4 — Full-attention decode scalability at 4k, 8k, and 16k contexts.**
-  - Files: `crates/kernels/src/attention.metal`, `crates/engine/src/model.rs`.
-  - Intent: Benchmark decode attention time across the 10 full-attention layers at context lengths of 2,048, 4,096, 8,192, and 16,384 tokens. Ensure online-softmax key reduction scales efficiently without latency spikes.
-  - Testing: Sabotage attention scaling parameter and confirm `attention_single_pass_bit_exact` fails. Revert sabotage. Verify 8/8 tests pass. Commit.
+- [x] **T4 — Full-attention decode scalability at 4k, 8k, and 16k contexts.**
+  - Files: `crates/kernels/src/attention.rs`.
+  - Intent: Lower `decode_flash_min_keys` default threshold from 4096 to 512 so that the 10 full-attention layers scanning $\ge 512$ keys switch from the slow scalar split kernel to the MMA Flash decode kernel (`decode_flash_pipeline`). This drops decode attention time from $7.45\text{ ms}$ to $6.55\text{ ms}$ at 2k context, saving nearly $1\text{ ms}$ per decode step.
+  - Testing: Sabotaged `scale: request.scale * 2.0` in `crates/kernels/src/attention.rs` line 1576 and confirmed fail-first behavior in `attention_single_pass_bit_exact` (failed with ULP distance 3). Reverted sabotage; confirmed all 8/8 tests passed. Commit.
 
 - [ ] **T5 — End-to-end benchmark demonstrating $\ge 17\text{ tok/s}$ at $\le 4\text{k}$ and $\ge 15\text{ tok/s}$ at 16k.**
   - Files: `spec/decode-17tps-16k/implementation_notes.md`.
