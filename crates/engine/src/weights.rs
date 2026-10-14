@@ -1272,11 +1272,25 @@ impl TextWeights {
     /// build, which is after every trellis view and the embedding view exist,
     /// so one set covers the whole weight footprint.
     pub fn create_residency_set(&self) -> Result<crate::metal::ResidencySet, WeightError> {
+        self.create_residency_set_excluding(&[])
+    }
+
+    /// Creates the normal model residency set while omitting specific
+    /// zero-copy views. The backing mappings and their POSIX locks are owned
+    /// separately and remain alive; callers use this only for CPU-staged,
+    /// non-GPU resources such as sparse embedding sources.
+    pub fn create_residency_set_excluding(
+        &self,
+        excluded: &[&Buffer],
+    ) -> Result<crate::metal::ResidencySet, WeightError> {
         let views = self
             .zero_copy_views
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        self.arena.create_residency_set_with(&views)
+        let included = views
+            .as_slice();
+        let included = residency_views_excluding(included, excluded);
+        self.arena.create_residency_set_with(&included)
     }
 
     /// Number of distinct zero-copy views registered so far (R4 probe hook).
@@ -1478,6 +1492,14 @@ impl TextWeights {
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
             .collect())
     }
+}
+
+fn residency_views_excluding(views: &[Buffer], excluded: &[&Buffer]) -> Vec<Buffer> {
+    views
+        .iter()
+        .filter(|view| !excluded.iter().any(|item| item.as_ptr() == view.as_ptr()))
+        .cloned()
+        .collect()
 }
 
 /// Whether `.trellis` pages should be pinned with `mlock` at load.
@@ -1901,6 +1923,7 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use half::bf16;
+    use metal::{Device, MTLResourceOptions, foreign_types::ForeignType};
     use serde_json::json;
 
     use super::*;
@@ -1917,6 +1940,21 @@ mod tests {
         ));
         fs::create_dir_all(&path).unwrap();
         path
+    }
+
+    #[test]
+    fn sparse_residency_filter_excludes_only_the_selected_view() {
+        let device = Device::system_default().expect("Metal device");
+        let packed_a = device.new_buffer(16, MTLResourceOptions::StorageModeShared);
+        let embedding = device.new_buffer(64, MTLResourceOptions::StorageModeShared);
+        let packed_b = device.new_buffer(32, MTLResourceOptions::StorageModeShared);
+        let views = vec![packed_a.clone(), embedding.clone(), packed_b.clone()];
+        let included = residency_views_excluding(&views, &[&embedding]);
+        let included_ptrs = included.iter().map(|b| b.as_ptr()).collect::<Vec<_>>();
+        assert_eq!(included.len(), 2);
+        assert!(included_ptrs.contains(&packed_a.as_ptr()));
+        assert!(included_ptrs.contains(&packed_b.as_ptr()));
+        assert!(!included_ptrs.contains(&embedding.as_ptr()));
     }
 
     fn write_shard(path: &Path, entries: Vec<(&str, DType, Vec<usize>, Vec<u8>)>) {

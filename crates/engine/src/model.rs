@@ -3252,6 +3252,8 @@ pub struct ForwardScratch {
     pub max_tokens: usize,
     pub hidden_a: Buffer,
     pub hidden_b: Buffer,
+    /// Bounded raw embedding rows staged from the mmap before GPU lookup.
+    pub embedding_rows: Buffer,
     pub normed: Buffer,
     pub q: Buffer,
     pub k: Buffer,
@@ -3421,6 +3423,7 @@ impl ForwardScratch {
             max_tokens,
             hidden_a: u16_elements(max_tokens, hidden)?,
             hidden_b: u16_elements(max_tokens, hidden)?,
+            embedding_rows: u16_elements(max_tokens, hidden)?,
             normed: u16_elements(max_tokens, hidden)?,
             q: u16_elements(max_tokens, q_max)?,
             k: u16_elements(max_tokens, kv_max)?,
@@ -3493,6 +3496,7 @@ impl ForwardScratch {
         [
             &self.hidden_a,
             &self.hidden_b,
+            &self.embedding_rows,
             &self.normed,
             &self.q,
             &self.k,
@@ -3535,6 +3539,7 @@ pub struct TextModel {
     /// `embedding_buffer` holds raw BF16 exactly as stored in the checkpoint, so
     /// the embedding kernel must widen it. True when the table is offloaded.
     embedding_is_bf16: bool,
+    sparse_embedding: bool,
     vocab_size: usize,
     hidden_size: usize,
     layers: Vec<DecoderLayer>,
@@ -3565,6 +3570,70 @@ pub struct TextModel {
 /// host path to apply the embedding scale without a kernel round trip.
 fn f16_scaled(bits: u16, scale: f32) -> f32 {
     half::f16::from_bits(bits).to_f32() * scale
+}
+
+/// Copy the exact checkpoint bytes for each active token into bounded shared
+/// scratch and rewrite token IDs to the gathered rows' identity indices.
+/// Callers must retire all earlier GPU work before invoking this helper.
+fn gather_embedding_rows(
+    source: &Buffer,
+    source_offset: u64,
+    token_ids: &Buffer,
+    destination: &Buffer,
+    tokens: usize,
+    hidden: usize,
+    vocab: usize,
+) -> Result<(), ModelError> {
+    let invalid = |message: &str| ModelError::InvalidInput(message.to_string());
+    let row_bytes = hidden
+        .checked_mul(std::mem::size_of::<u16>())
+        .ok_or_else(|| invalid("embedding row size overflows"))?;
+    let source_bytes = vocab
+        .checked_mul(row_bytes)
+        .and_then(|bytes| u64::try_from(bytes).ok())
+        .and_then(|bytes| source_offset.checked_add(bytes))
+        .ok_or_else(|| invalid("embedding source size overflows"))?;
+    let ids_bytes = tokens
+        .checked_mul(std::mem::size_of::<u32>())
+        .ok_or_else(|| invalid("embedding token buffer size overflows"))?;
+    let destination_bytes = tokens
+        .checked_mul(row_bytes)
+        .ok_or_else(|| invalid("embedding staging size overflows"))?;
+    if tokens == 0 || tokens > u32::MAX as usize || hidden == 0 || vocab == 0 {
+        return Err(invalid("embedding staging dimensions are invalid"));
+    }
+    if source_bytes as u128 > source.length() as u128
+        || ids_bytes as u128 > token_ids.length() as u128
+        || destination_bytes as u128 > destination.length() as u128
+    {
+        return Err(invalid("embedding staging buffer is too short"));
+    }
+
+    let ids = token_ids.contents() as *const u32;
+    for index in 0..tokens {
+        let id = unsafe { *ids.add(index) } as usize;
+        if id >= vocab {
+            return Err(invalid("embedding token id is outside the vocabulary"));
+        }
+    }
+    let source_ptr = source.contents() as *const u8;
+    let destination_ptr = destination.contents() as *mut u8;
+    for index in 0..tokens {
+        let id = unsafe { *ids.add(index) } as usize;
+        let row_offset = source_offset as usize + id * row_bytes;
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                source_ptr.add(row_offset),
+                destination_ptr.add(index * row_bytes),
+                row_bytes,
+            );
+        }
+    }
+    let ids = token_ids.contents() as *mut u32;
+    for index in 0..tokens {
+        unsafe { *ids.add(index) = index as u32 };
+    }
+    Ok(())
 }
 
 impl TextModel {
@@ -3679,14 +3748,26 @@ impl TextModel {
             attn_pass_state,
         )?;
         let forward_queue = device.new_command_queue();
-        let residency_set = checkpoint_weights
-            .as_ref()
-            .and_then(|w| w.create_residency_set().ok());
+        let sparse_embedding = embedding_buffer.is_some()
+            && checkpoint_weights.is_some()
+            && !env_flag("KAPLUMBA_FULL_EMBEDDING");
+        let residency_set = checkpoint_weights.as_ref().and_then(|weights| {
+            if sparse_embedding {
+                embedding_buffer.as_ref().and_then(|embedding| {
+                    weights
+                        .create_residency_set_excluding(&[embedding])
+                        .ok()
+                })
+            } else {
+                weights.create_residency_set().ok()
+            }
+        });
         Ok(Self {
             embedding,
             embedding_buffer,
             embedding_offset,
             embedding_is_bf16,
+            sparse_embedding,
             vocab_size,
             hidden_size,
             layers,
@@ -4264,6 +4345,11 @@ impl TextModel {
         let slot = slot % 2;
         let next_slot = 1 - slot;
         self.scratch.active_slot = slot;
+        if self.sparse_embedding {
+            // The token and position buffers are ping-ponged. Retire the prior
+            // command buffer before the host reuses either slot.
+            encoder.flush_and_wait_queue()?;
+        }
         if let Some(t) = token {
             if t as usize >= self.vocab_size {
                 return Err(ModelError::InvalidInput(format!(
@@ -4290,18 +4376,19 @@ impl TextModel {
         let next_token_buffer = self.scratch.token_ids_decode[next_slot].clone();
         let host_token_buffer = self.scratch.host_tokens.clone();
 
-        self.forward_chunk(
+        self.forward_chunk_pick(
             &[token.unwrap_or(0)],
             &[position],
             encoder,
             &mut gpu,
             true,
-            pick,
+            Some(pick),
             Some(HeadOut {
                 next_token: &next_token_buffer,
                 host_token: &host_token_buffer,
                 step_idx,
             }),
+            self.sparse_embedding,
         )?;
         if profile {
             gpu.drain(encoder)?;
@@ -4690,6 +4777,7 @@ impl TextModel {
                 true,
                 pick,
                 None,
+                false,
             )
         } else {
             // Only the last chunk's logits survive this loop, so only the last
@@ -4713,6 +4801,7 @@ impl TextModel {
                         last,
                         pick,
                         None,
+                        false,
                     ) {
                     // Report what ran before the failure rather than throwing
                     // the measurements away; then propagate.
@@ -4769,7 +4858,7 @@ impl TextModel {
         out: Option<HeadOut<'_>>,
     ) -> Result<(), ModelError> {
         self.forward_chunk_pick(
-            token_ids, positions, encoder, gpu, run_head, Some(pick), out,
+            token_ids, positions, encoder, gpu, run_head, Some(pick), out, false,
         )
     }
 
@@ -4785,6 +4874,7 @@ impl TextModel {
         run_head: bool,
         pick: Option<HeadPick>,
         out: Option<HeadOut<'_>>,
+        encoder_already_drained: bool,
     ) -> Result<(), ModelError> {
         if token_ids.len() != positions.len() || token_ids.is_empty() {
             return Err(ModelError::InvalidInput(
@@ -4792,6 +4882,8 @@ impl TextModel {
             ));
         }
         let tokens = token_ids.len();
+        let hidden = self.hidden_size;
+        let vocab = self.vocab_size;
         // Chunks resume at an absolute position past the cache cursor when
         // their cache append is skipped by an attribution switch
         // (KAPLUMBA_LINEARS_ONLY / KAPLUMBA_SKIP_ATTENTION); any other gap is
@@ -4865,6 +4957,7 @@ impl TextModel {
         } else {
             false
         };
+        let mut queue_drained = encoder_already_drained || encoder_drained_for_growth;
 
         // Shared-memory staging for the two small host-side arrays.
         //
@@ -4876,8 +4969,13 @@ impl TextModel {
         // the previous chunk's scratch is reused by this one regardless, so the
         // GPU had to reach that point before this chunk could start anyway.
         if tokens > 1 {
-            if !encoder_drained_for_growth {
-                encoder.flush_and_wait()?;
+            if !queue_drained {
+                if self.sparse_embedding {
+                    encoder.flush_and_wait_queue()?;
+                } else {
+                    encoder.flush_and_wait()?;
+                }
+                queue_drained = true;
             }
             unsafe {
                 let position_ptr = self.scratch.query_positions.contents() as *mut u32;
@@ -4885,6 +4983,24 @@ impl TextModel {
                 let token_ptr = self.scratch.token_ids.contents() as *mut u32;
                 std::ptr::copy_nonoverlapping(token_ids.as_ptr(), token_ptr, tokens);
             }
+        }
+
+        if self.sparse_embedding {
+            if !queue_drained {
+                encoder.flush_and_wait_queue()?;
+            }
+            let embedding = self.embedding_buffer.as_ref().ok_or_else(|| {
+                ModelError::InvalidConfig("sparse embedding source is absent".to_string())
+            })?;
+            gather_embedding_rows(
+                embedding,
+                self.embedding_offset,
+                self.scratch.active_token_ids(tokens),
+                &self.scratch.embedding_rows,
+                tokens,
+                hidden,
+                vocab,
+            )?;
         }
 
         // KAPLUMBA_PROFILE_PHASES=1 commits and waits at each phase boundary
@@ -4919,8 +5035,6 @@ impl TextModel {
                 }
             };
         }
-        let hidden = self.hidden_size;
-        let vocab = self.vocab_size;
         let scale = (hidden as f32).sqrt();
 
         // MEASUREMENT AID: a deliberately slow dispatch inside the chunk, so a
@@ -4952,10 +5066,13 @@ impl TextModel {
 
         // Layer 0 consumes the embedding, then layers ping-pong between the two
         // hidden buffers. Input/output never alias within a layer.
-        let embedding_buffer = self
-            .embedding_buffer
-            .as_ref()
-            .ok_or_else(|| ModelError::InvalidConfig("model has no GPU embedding".to_string()))?;
+        let embedding_buffer = if self.sparse_embedding {
+            &self.scratch.embedding_rows
+        } else {
+            self.embedding_buffer
+                .as_ref()
+                .ok_or_else(|| ModelError::InvalidConfig("model has no GPU embedding".to_string()))?
+        };
         self.elements.encode_embedding_scaled(
             encoder,
             self.scratch.active_token_ids(tokens),
@@ -4963,9 +5080,9 @@ impl TextModel {
             &self.scratch.hidden_a,
             tokens,
             hidden,
-            vocab,
+            if self.sparse_embedding { tokens } else { vocab },
             scale,
-            self.embedding_offset,
+            if self.sparse_embedding { 0 } else { self.embedding_offset },
             self.embedding_is_bf16,
         )?;
         gpu_flush!();
@@ -6474,6 +6591,142 @@ fn read_sign_component(
         )));
     }
     Ok(values)
+}
+
+#[cfg(test)]
+mod sparse_embedding_tests {
+    use super::gather_embedding_rows;
+    use crate::metal::MetalContext;
+    use kaplumba_kernels::elements::ElementKernels;
+    use kaplumba_kernels::encoder::MetalEncoder;
+    use metal::MTLResourceOptions;
+
+    fn upload(context: &MetalContext, bytes: &[u8]) -> metal::Buffer {
+        context.device().new_buffer_with_data(
+            bytes.as_ptr() as *const std::ffi::c_void,
+            bytes.len() as u64,
+            MTLResourceOptions::StorageModeShared,
+        )
+    }
+
+    fn read_u16(buffer: &metal::Buffer, count: usize) -> Vec<u16> {
+        unsafe { std::slice::from_raw_parts(buffer.contents() as *const u16, count) }.to_vec()
+    }
+
+    #[test]
+    fn gathered_embedding_kernel_is_bit_identical_for_bf16_and_fp16() {
+        let context = MetalContext::new().expect("Metal context");
+        let hidden = 8;
+        let vocab = 5;
+        let tokens = [4_u32, 0, 4, 2];
+        let source_offset = 18_u64;
+        let mut bytes = vec![0xA5; source_offset as usize];
+        for value in 0..vocab * hidden {
+            let raw = (0x3c00_u16.wrapping_add((value * 7) as u16)).to_ne_bytes();
+            bytes.extend_from_slice(&raw);
+        }
+        let source = upload(&context, &bytes);
+        let original_ids = upload(&context, unsafe {
+            std::slice::from_raw_parts(tokens.as_ptr() as *const u8, std::mem::size_of_val(&tokens))
+        });
+        let scale = (hidden as f32).sqrt();
+        let elements = ElementKernels::shared().expect("element kernels");
+        let queue = context.device().new_command_queue();
+
+        for bf16 in [false, true] {
+            let staged_ids = upload(&context, unsafe {
+                std::slice::from_raw_parts(
+                    tokens.as_ptr() as *const u8,
+                    std::mem::size_of_val(&tokens),
+                )
+            });
+            let gathered = context
+                .allocate_shared((tokens.len() * hidden * 2) as u64)
+                .expect("gathered rows");
+            gather_embedding_rows(
+                &source,
+                source_offset,
+                &staged_ids,
+                &gathered,
+                tokens.len(),
+                hidden,
+                vocab,
+            )
+            .expect("gather raw rows");
+            assert_eq!(
+                unsafe {
+                    std::slice::from_raw_parts(staged_ids.contents() as *const u32, tokens.len())
+                },
+                &[0, 1, 2, 3]
+            );
+
+            let full_output = context
+                .allocate_shared((tokens.len() * hidden * 2) as u64)
+                .expect("full output");
+            let sparse_output = context
+                .allocate_shared((tokens.len() * hidden * 2) as u64)
+                .expect("sparse output");
+            let mut encoder = MetalEncoder::new(&queue).expect("encoder");
+            elements
+                .encode_embedding_scaled(
+                    &mut encoder,
+                    &original_ids,
+                    &source,
+                    &full_output,
+                    tokens.len(),
+                    hidden,
+                    vocab,
+                    scale,
+                    source_offset,
+                    bf16,
+                )
+                .expect("full embedding kernel");
+            elements
+                .encode_embedding_scaled(
+                    &mut encoder,
+                    &staged_ids,
+                    &gathered,
+                    &sparse_output,
+                    tokens.len(),
+                    hidden,
+                    tokens.len(),
+                    scale,
+                    0,
+                    bf16,
+                )
+                .expect("sparse embedding kernel");
+            encoder.commit_and_wait().expect("GPU completion");
+            assert_eq!(
+                read_u16(&full_output, tokens.len() * hidden),
+                read_u16(&sparse_output, tokens.len() * hidden),
+                "bf16={bf16}"
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_embedding_ids_and_short_buffers_do_not_mutate_staging() {
+        let context = MetalContext::new().expect("Metal context");
+        let source = upload(&context, &[0; 32]);
+        let ids = upload(&context, unsafe {
+            std::slice::from_raw_parts([0_u32, 5].as_ptr() as *const u8, 8)
+        });
+        let destination = upload(&context, &[0xCC; 32]);
+        let before = read_u16(&destination, 16);
+        assert!(gather_embedding_rows(&source, 0, &ids, &destination, 2, 8, 5).is_err());
+        assert_eq!(
+            unsafe { std::slice::from_raw_parts(ids.contents() as *const u32, 2) },
+            &[0, 5]
+        );
+        assert_eq!(read_u16(&destination, 16), before);
+
+        let good_ids = upload(&context, unsafe {
+            std::slice::from_raw_parts([4_u32, 0].as_ptr() as *const u8, 8)
+        });
+        assert!(gather_embedding_rows(&source, 1, &good_ids, &destination, 2, 8, 5).is_err());
+        assert_eq!(read_u16(&destination, 16), before);
+        assert!(gather_embedding_rows(&source, 0, &good_ids, &destination, 2, usize::MAX, 5).is_err());
+    }
 }
 
 #[cfg(test)]
