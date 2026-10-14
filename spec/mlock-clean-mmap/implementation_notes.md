@@ -186,7 +186,50 @@ throughput or zero-swap acceptance result is claimed. D0 validation is limited
 to source comparison, header arithmetic, the standalone mechanism probe and
 documentation review. Product implementation tasks remain unchecked.
 
-D0 draft committed as `5abcb0c`; staged `git diff --check` passed. The four spec
-documents are the only repository changes. The scratch probe and its logs were
-removed after preserving source, commands and observations here; no process or
-temporary project harness remains.
+## 2026-10-14 — T1 shared shard mapping
+
+Changed `ShardReader::open` from read-only `MAP_PRIVATE` to read-only
+`MAP_SHARED`. `LlamaMlock`, its enabled-by-default policy, the selected lock
+set (including `lm_head.trellis`), buffer offsets and mapping lifetime are
+unchanged. Updated the `ShardReader` thread-safety comment to state the actual
+mapping mode.
+
+Added `weights::tests::dedicated_loader_keeps_locked_packed_shard_clean_and_zero_copy`
+beside the private loader internals. It loads a 2 MiB packed fixture through
+`TextWeights::load_dedicated`, brute-forces an actually four-byte-aligned tensor
+offset, checks the loader recorded a successful lock, verifies the Metal
+no-copy buffer aliases the mmap and returns unchanged bytes, reads the shard
+back from disk, and checks `mincore` reports zero modified pages for the locked
+range. It repeats loading with a shard smaller than one VM page to cover the
+final partial page. A companion test preserves missing-file and empty-shard
+errors. Keeping this test inside `weights.rs` avoids exposing private mapping
+state as a production API.
+
+Negative control: temporarily changed the actual loader back to `MAP_PRIVATE`
+and ran the focused test. It failed at the named page-state assertion with
+`locked mmap pages became modified/private (129/129); expected clean shared file
+backing`. Restored `MAP_SHARED` and reran successfully. The initial fixture
+attempt also caught the existing four-byte alignment filter: a non-aligned
+header offset had `pinned_tensors().len() == 0`. The test now brute-forces and
+measures the aligned absolute offset, so it cannot pass without exercising
+`mlock`.
+
+Commands that passed with the restored source:
+
+```sh
+cargo test -p kaplumba-engine --lib weights::tests::dedicated_loader_keeps_locked_packed_shard_clean_and_zero_copy -- --exact --nocapture
+cargo test -p kaplumba-engine --lib weights::tests::shard_open_preserves_missing_and_empty_file_errors -- --exact --nocapture
+cargo test -p kaplumba-engine --lib weights::tests::retains_packed_exl3_bytes -- --exact
+cargo test -p kaplumba-engine --lib weights::tests::pinning_follows_the_realigned_copy_split -- --exact
+cargo test -p kaplumba-engine --lib weights::tests::trellis_stays_zero_copy_even_in_the_dedicated_loader -- --exact
+git diff --check
+```
+
+All five focused tests passed. Existing unrelated compiler warnings remain.
+These are fixture tests on the real Metal device, not a model run. Full
+`Gxma-repacked` chat pressure, swap, SSD-I/O and 1k/2k/8k acceptance remain
+unmeasured and are still T4 gates.
+
+D0 draft was committed as `5abcb0c`; the scratch probe and its logs were removed
+after preserving source, commands and observations above. No standalone probe
+process or temporary project harness remains.

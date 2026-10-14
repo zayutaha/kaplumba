@@ -30,13 +30,13 @@ must not be ported as current physical-memory facts.
 
 | Path | Current behavior | Planned change |
 |---|---|---|
-| `crates/engine/src/weights.rs:1427` (`ShardReader`) | Read-only `MAP_PRIVATE`; whole shard wrapped without copying | Read-only `MAP_SHARED`; preserve buffer offset/lifetime and error handling |
+| `crates/engine/src/weights.rs` (`ShardReader`) | Read-only `MAP_PRIVATE`; whole shard wrapped without copying | Read-only `MAP_SHARED`; preserve buffer offset/lifetime and error handling |
 | `crates/engine/src/weights.rs:816` (`pin_trellis_pages`) | All aligned mapped trellis selected; sum of fully covered tensor windows | Unique-page ledger, partial-prefix accounting, explicit exclusions and policy selected from measurements |
 | `crates/engine/src/weights.rs:1237` (`LlamaMlock`) | Incremental locks; latched failure; warning once per process | Keep soft failure semantics; make caller summary accurate per model; retain successful prefix |
 | `crates/engine/src/model.rs:3811` | Normal target loads through `load_dedicated` | Supply actual configured KV/scratch reserve only if measurements require a byte cap |
 | `crates/engine/src/model.rs:6299` | Misaligned view copied into shared Metal buffer | Compatibility checks only; no new copy path or buffer-pointer lock |
 | `crates/engine/src/dflash.rs:131` | Uses the same `TextWeights` loader | Loader regression only; no generation/performance changes |
-| `crates/engine/tests/clean_mmap_locking.rs` (new) | No test proving actual loader pages stay clean under lock + GPU use | Small shard fixture using real loader and no-copy read; OS page-state assertions and private-map sabotage |
+| `crates/engine/src/weights.rs` test module | Existing loader tests do not prove actual locked shard pages stay clean | Small shard fixture using `TextWeights::load_dedicated` and a no-copy Metal view; OS page-state assertions and private-map sabotage. Keep the test beside private `ShardReader` state rather than widening production APIs for an integration test. |
 | `crates/engine/tests/probe_llama_mlock.rs`, weight/alignment tests | Incremental locking and layout checks | Extend meaningful partial/failure/unique-page assertions; preserve existing behavior |
 | This spec's notes and an acceptance harness if needed | No matched full-chat evidence for the proposed fix | Record workload, pressure, I/O, regions, memory and interleaved timing evidence |
 

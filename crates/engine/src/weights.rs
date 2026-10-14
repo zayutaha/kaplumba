@@ -1460,14 +1460,15 @@ impl ShardReader {
             path: path.to_path_buf(),
             message: "shard does not fit in the address space".to_string(),
         })?;
-        // Map the shard read-only so large tensors can be bound straight from the
-        // page cache instead of being copied into anonymous memory.
+        // Keep the shard read-only and shared so locking its file-backed pages
+        // does not create private COW copies. Large tensors bind straight from
+        // this mapping instead of being copied into anonymous memory.
         let pointer = unsafe {
             libc::mmap(
                 std::ptr::null_mut(),
                 length,
                 libc::PROT_READ,
-                libc::MAP_PRIVATE,
+                libc::MAP_SHARED,
                 file.as_raw_fd(),
                 0,
             )
@@ -1574,7 +1575,7 @@ impl ShardReader {
     }
 }
 
-// The mapping is PROT_READ/MAP_PRIVATE and never written, so sharing the reader
+// The mapping is PROT_READ/MAP_SHARED and never written, so sharing the reader
 // across threads (and handing those pages to the GPU) is sound.
 unsafe impl Sync for ShardReader {}
 unsafe impl Send for ShardReader {}
@@ -1774,6 +1775,163 @@ mod tests {
             std::slice::from_raw_parts((buffer.contents() as *const u8).add(offset as usize), 4)
         };
         assert_eq!(mapped.to_vec(), vec![0x34, 0x12, 0x78, 0x56]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dedicated_loader_keeps_locked_packed_shard_clean_and_zero_copy() {
+        let context = context_or_skip()
+            .expect("the clean mmap regression requires a Metal device");
+        let name = "model.language_model.layers.0.self_attn.q_proj.trellis";
+        let payload_len = 2 * 1024 * 1024;
+        let payload: Vec<u8> = (0..payload_len).map(|index| (index % 251) as u8).collect();
+        let (dir, selection) = (1..65)
+            .find_map(|pad| {
+                let dir = temp_dir(&format!("clean-mmap-locking-{pad}"));
+                let selection = selection_for(
+                    &dir,
+                    vec![
+                        ("pad.bytes", DType::U8, vec![pad], vec![0_u8; pad]),
+                        (name, DType::I16, vec![payload_len / 2], payload.clone()),
+                    ],
+                );
+                let start = selection.absolute_range(name).unwrap().0;
+                if start.is_multiple_of(EXL3_PACKED_ALIGNMENT as u64) {
+                    Some((dir, selection))
+                } else {
+                    fs::remove_dir_all(dir).unwrap();
+                    None
+                }
+            })
+            .expect("fixture must produce an actually lockable aligned tensor");
+        let shard_path = dir.join("model.safetensors");
+        let weights = TextWeights::load_dedicated(
+            &dir,
+            &selection,
+            context,
+            (payload_len + 1024 * 1024) as u64,
+        )
+        .unwrap();
+
+        let tensor = weights.tensor(name).unwrap();
+        assert!(tensor.spans.is_empty(), "packed weights must stay no-copy");
+        assert_eq!(weights.pinned_tensors().len(), 1, "mlock must remain enabled");
+        assert!(weights.pinned_bytes() > 0, "the fixture must be actually locked");
+
+        let reader = weights.shards.get("model.safetensors").unwrap();
+        let (buffer, offset) = weights.zero_copy_tensor_buffer(name).unwrap().unwrap();
+        assert_eq!(buffer.contents() as usize, reader.pointer.as_ptr() as usize);
+        let mapped = unsafe {
+            std::slice::from_raw_parts(
+                (buffer.contents() as *const u8).add(offset as usize),
+                payload_len,
+            )
+        };
+        assert_eq!(mapped, payload.as_slice(), "no-copy Metal view changed bytes");
+        assert_eq!(
+            fs::read(shard_path).unwrap()[offset as usize..][..payload_len],
+            payload
+        );
+
+        // `mlock` on a private mapping faults private COW pages on Darwin. The
+        // mapped pages must remain clean after the real loader and Metal view
+        // have touched every page.
+        let page = page_size();
+        let tensor_start = reader.pointer.as_ptr() as usize + offset as usize;
+        let start = tensor_start & !(page - 1);
+        let end = (tensor_start + payload_len).next_multiple_of(page);
+        let mapped_len = end - start;
+        let page_count = mapped_len / page;
+        let mut page_state = vec![0_i8; page_count];
+        let rc = unsafe {
+            libc::mincore(
+                start as *const std::ffi::c_void,
+                mapped_len,
+                page_state.as_mut_ptr(),
+            )
+        };
+        assert_eq!(rc, 0, "mincore failed: {}", io::Error::last_os_error());
+        let modified = page_state
+            .iter()
+            .filter(|state| **state as u8 & libc::MINCORE_MODIFIED as u8 != 0)
+            .count();
+        assert_eq!(
+            modified, 0,
+            "locked mmap pages became modified/private ({modified}/{page_count}); expected clean shared file backing"
+        );
+
+        drop(buffer);
+        drop(weights);
+        fs::remove_dir_all(dir).unwrap();
+
+        // A shard smaller than one VM page still maps, locks, and binds. This
+        // exercises the final partial file page independently of the multi-page
+        // fixture above.
+        let context = context_or_skip().expect("the clean mmap regression requires a Metal device");
+        let tiny_payload = vec![0x34_u8, 0x12];
+        let (dir, selection) = (1..65)
+            .find_map(|pad| {
+                let dir = temp_dir(&format!("clean-mmap-subpage-{pad}"));
+                let selection = selection_for(
+                    &dir,
+                    vec![
+                        ("pad.bytes", DType::U8, vec![pad], vec![0_u8; pad]),
+                        (name, DType::I16, vec![1], tiny_payload.clone()),
+                    ],
+                );
+                let start = selection.absolute_range(name).unwrap().0;
+                if start.is_multiple_of(EXL3_PACKED_ALIGNMENT as u64) {
+                    Some((dir, selection))
+                } else {
+                    fs::remove_dir_all(dir).unwrap();
+                    None
+                }
+            })
+            .expect("sub-page fixture must produce an aligned packed tensor");
+        assert!(
+            fs::metadata(dir.join("model.safetensors")).unwrap().len() < page_size() as u64,
+            "fixture must end inside its first VM page"
+        );
+        let weights = TextWeights::load_dedicated(
+            &dir,
+            &selection,
+            context,
+            1024 * 1024,
+        )
+        .unwrap();
+        assert!(weights.pinned_bytes() > 0, "sub-page packed data must be locked");
+        let (buffer, offset) = weights.zero_copy_tensor_buffer(name).unwrap().unwrap();
+        let actual = unsafe {
+            std::slice::from_raw_parts(
+                (buffer.contents() as *const u8).add(offset as usize),
+                tiny_payload.len(),
+            )
+        };
+        assert_eq!(actual, tiny_payload.as_slice());
+        drop(buffer);
+        drop(weights);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn shard_open_preserves_missing_and_empty_file_errors() {
+        let dir = temp_dir("shard-open-errors");
+        let missing = match ShardReader::open(&dir.join("missing.safetensors")) {
+            Ok(_) => panic!("missing shard unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert!(matches!(missing, WeightError::Io { .. }));
+
+        let empty_path = dir.join("empty.safetensors");
+        fs::write(&empty_path, []).unwrap();
+        let empty = match ShardReader::open(&empty_path) {
+            Ok(_) => panic!("empty shard unexpectedly opened"),
+            Err(error) => error,
+        };
+        assert!(
+            empty.to_string().contains("cannot read an empty shard"),
+            "unexpected empty-shard error: {empty}"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 

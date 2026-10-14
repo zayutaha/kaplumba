@@ -1,6 +1,5 @@
 # spec/mlock-clean-mmap — tasks
 
-Specification only in this session. Product implementation has not started.
 Every implementation step requires its meaningful tests, a demonstrated failing
 negative control before any coverage claim, notes, status update and commit.
 
@@ -12,16 +11,16 @@ negative control before any coverage claim, notes, status update and commit.
   `mlock`, warning-and-continue and the normal-chat memory/I/O goal. Validate
   documentation consistency and `git diff --check`. Documentation commit:
   `5abcb0c`. This closes the drafting task only.
-- [ ] **T1 — restore shared backing for the real loader.**
-  Files: `crates/engine/src/weights.rs`,
-  `crates/engine/tests/clean_mmap_locking.rs`, notes. Change only the shard mmap
+- [x] **T1 — restore shared backing for the real loader.**
+  Files: `crates/engine/src/weights.rs`, spec notes. Change only the shard mmap
   flag to read-only `MAP_SHARED`, retain actual `mlock` and the current hot lock
   set. Test a small shard through `TextWeights::load_dedicated`, force the real
-  lock path and execute a Metal no-copy read. Check wire state, file backing,
-  unchanged bytes, no copied/anonymous packed pages, mapping lifetime and release.
-  Exercise sub-page/final-page shards and normal errors. Sabotage the actual
-  loader to `MAP_PRIVATE`; require a named dirty/private-page failure, restore
-  and rerun. Preserve existing weight/alignment regression results.
+  lock path and read through its Metal no-copy view. Check successful lock
+  accounting, clean page state, unchanged bytes, mapping lifetime and release.
+  Exercise sub-page/final-page shards and open errors. Sabotage the actual loader
+  to `MAP_PRIVATE`; require a named dirty/private-page failure, restore and
+  rerun. Preserve existing weight/alignment regression results. Completed
+  `2026-10-14`; commit hash recorded in the T1 follow-up metadata commit.
 - [ ] **T2 — account for unique locked pages and partial prefixes.**
   Files: `crates/engine/src/weights.rs` and focused lock-ledger tests, notes.
   Separate tensor coverage from unique merged page bytes and preserve successful

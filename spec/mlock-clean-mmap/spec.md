@@ -1,6 +1,6 @@
 # spec/mlock-clean-mmap
 
-Status: draft for implementation; specification only in this session.
+Status: approved for implementation; T1 is in progress.
 User confirmed scope after clarification: ordinary chat with `Gxma-repacked`,
 green memory pressure and no repeated weight streaming after load, 1k/2k/8k
 contexts, and warning-and-continue when locking fails. DFlash work remains paused.
@@ -42,7 +42,6 @@ the head lock to protect its repeated reads.
 
 ## Non-goals / restrictions
 
-- This deliverable is a spec; product implementation starts in a later task.
 - Do not resume DFlash generation, change its checkpoint, or pursue 30 tok/s here.
 - No weight/KV quantization changes, numerical changes, model downloads or edits
   to model files. Preserve existing mmap/no-copy Metal ownership and alignment.
