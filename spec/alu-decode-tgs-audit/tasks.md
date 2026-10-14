@@ -33,7 +33,7 @@ requested. Update spec/plan before any layout or interface scope change.
   `fused3_sk2`; compared every raw FP32 output against its 64-bit version,
   passed the fused integration suite and a sabotaged-kernel red control. Larger
   synthetic shapes showed +4.197% and +4.767% paired median kernel gains;
-  small shape was noisy. No full-chat attribution. Commit: pending.
+  small shape was noisy. No full-chat attribution. Commit: `73bd6fa`.
 - [ ] **T5** `linear_repacked.metal` and isolated external harnesses: one
   experiment/commit at a time for shift-class specialization, register lifetime,
   unchanged-order unroll/lookahead and exact load sharing. Verify tail/grid
