@@ -9,10 +9,15 @@
   Validation: source citations, CPU/GPU results/limits, requirement mapping and
   `git diff --cached --check`. Commit: `61be419`.
 
-## Future implementation/measurement tasks — not performed or authorized here
+## Implementation and measurement status
 
-Each task is separately verified and committed if implementation is later
-requested. Update spec/plan before any layout or interface scope change.
+The user authorized implementation after the initial audit. T3/T4 are
+implemented and tested as isolated QKV kernel trials. T1/T2 and T5–T8 remain
+necessary before end-to-end retention/acceptance; no full-model result is
+claimed. Follow the normal one-task/one-commit workflow for each remaining task.
+
+Each remaining task is separately verified and committed. Update spec/plan
+before any layout or interface scope change.
 
 - [ ] **T1** External baseline harness; future diagnostic touchpoints
   `linear.rs`, `generate.rs`, `weights.rs`, spec notes: inventory exact live

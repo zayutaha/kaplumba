@@ -12,9 +12,15 @@ an evidenced feasibility limit is an acceptable research result.
 
 ## Authorization and restrictions
 
-- This deliverable is investigation, standalone tests and documentation only. Future implementation
-  tasks below are **not authorized by this request**. No product, kernel, test,
-  script, checkpoint or reference code is changed by this audit.
+- The initial audit was documentation-only. The user subsequently authorized
+  implementation and testing. That authorization has been used for the narrow
+  scalar 32-bit extraction experiment in the active `fused2_sk2` and
+  `fused3_sk2` QKV kernels, plus an isolated raw-FP32 Metal comparison harness.
+  Other kernel families, sampler, dispatch, attention, layout, and residency
+  work remain unimplemented.
+- The two QKV variants are experimental until full Gxma chat token-identity and
+  end-to-end `tg/s` acceptance is measured. Synthetic kernel wins alone do not
+  authorize declaring the full spec complete or the 250 GB/s target met.
 - The user confirmed GitHub tip, Gxma-repacked chat, broad quality-preserving
   investigation, the end-to-end bandwidth definition, and documentation writes.
   They subsequently explicitly added finding ways to increase `tg/s`.
@@ -74,9 +80,13 @@ an evidenced feasibility limit is an acceptable research result.
 
 ## Acceptance criteria
 
-- **AC1 (this documentation task):** findings distinguish source-verified facts,
-  newly executed standalone CPU/GPU experiments, historical measurements and future hypotheses;
-  include reproducible extraction checks and their failing negative controls.
+- **AC1 (audit and narrow trial):** findings distinguish source-verified facts,
+  newly executed standalone CPU/GPU experiments, historical measurements and
+  future hypotheses; include reproducible checks and failing negative controls.
+- **AC1a (T3/T4 kernel trial):** scalar state extraction matches the original
+  active QKV split-K kernels at raw FP32 output bits on the recorded synthetic
+  shapes; the real fused-kernel integration suite passes; sabotaging each tested
+  candidate changes outputs. This gate is met for the tested shapes only.
 - **AC2 (future experiments):** dispatch inventory, exact commands, executable
   and checkpoint identity, token IDs, raw ABBA measurements and quality gates
   accompany every claimed improvement. No silent shader/test skip or stale build.
@@ -91,8 +101,11 @@ an evidenced feasibility limit is an acceptable research result.
 
 ## Open questions
 
-None about the authorized scope. Fresh baseline throughput, live dispatch
-counts, actual W, sampler costs and the attainable ceiling are research outputs
-to be measured by T1–T8, not assumptions resolved here. Standalone GPU evidence
-is limited to the synthetic fused2 split-K probe described in findings.md;
-no full-model performance or complete model-quality gate was run.
+No user-scope questions remain. Still unresolved as measured acceptance work:
+fresh end-to-end baseline throughput, live dispatch counts, audited useful
+bytes/token, sampled-chat cost, full raw/logit/token identity for the checkpoint,
+short/2k/8k/16k behavior, and the attainable application bandwidth ceiling.
+The fused2/fused3 evidence is a synthetic kernel comparison; no full-model
+performance or complete model-quality gate has run. GPU status at the end of this
+implementation showed under 1 GiB top-unused and about 3.3 GiB swap, below the
+repository's 14 GiB model-run threshold, so model acceptance remains pending.

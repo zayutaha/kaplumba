@@ -160,3 +160,16 @@ changed traffic/overlap makes them non-additive and outputs are invalid.
 
 R1 -> T1; R2 -> T1,T2; R3 -> T2,T3,T4,T5,T6,T7;
 R4 -> T3,T4,T5; R5 -> T6,T7; R6 -> T2–T8; R7 -> T1,T2,T8.
+
+## Execution status after implementation authorization
+
+T3 and T4 now apply scalar 32-bit state extraction to `fused2_sk2` and
+`fused3_sk2`, respectively. Their exact kernel bodies passed a standalone
+raw-FP32 comparison against the 64-bit baseline on synthetic shapes, including
+an output-changing sabotage control; `fused_bit_exact` passed 4/4. Two larger
+shapes per fused family showed promising paired median kernel gains, but these
+are not application measurements and have timing spread. T1/T2 have not
+established the live model baseline. T5–T8 and all checkpoint-level token,
+context, sampling, `tg/s`, memory, and useful-GB/s acceptance remain pending.
+The implementation is therefore an experimental candidate, not a completed
+performance acceptance.
