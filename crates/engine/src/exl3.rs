@@ -788,6 +788,44 @@ mod tests {
         }
     }
 
+    #[test]
+    fn test_msb_window_u32_matches_64bit() {
+        let patterns = [
+            (0u32, 0u32),
+            (u32::MAX, u32::MAX),
+            (0x12345678, 0x9abcdef0),
+            (0xdeadbeef, 0xfeedface),
+            (0x00000001, 0x80000000),
+            (0x80000000, 0x00000001),
+            (0x55555555, 0xaaaaaaaa),
+            (0xaaaaaaaa, 0x55555555),
+        ];
+        for shift in 0..=63u32 {
+            for &(wa, wb) in &patterns {
+                let wide = ((u64::from(wa) << 32) | u64::from(wb))
+                    .wrapping_shl(shift)
+                    >> 48;
+                let from_a = if shift < 32 {
+                    (wa.wrapping_shl(shift)) >> 16
+                } else {
+                    0
+                };
+                let from_b = if shift > 48 {
+                    (wb.wrapping_shl(shift - 48)) & 0xffff
+                } else if shift > 16 {
+                    (wb >> (48 - shift)) & 0xffff
+                } else {
+                    0
+                };
+                assert_eq!(
+                    wide as u32,
+                    from_a | from_b,
+                    "shift={shift}, wa={wa:08x}, wb={wb:08x}"
+                );
+            }
+        }
+    }
+
     fn integer_states(bits: u8, seed: u32) -> Vec<u16> {
         let mask = (1_u32 << bits) - 1;
         let mut value = seed;
