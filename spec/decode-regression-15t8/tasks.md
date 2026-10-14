@@ -89,14 +89,22 @@
   18 prefill + 45 generated at 12.42 tok/s. This closes the reported lifecycle
   failure while confirming the performance target remains open. Completed
   2026-10-14; implementation commit `fd3cc67`.
-- [ ] **T8 — isolate the active K3 contig4 kernel regression before new ALU
-  work.** Files: this folder's notes and isolated worktrees only unless the A/B
-  identifies a source change to retain. Preserve the user's patches, confirm
-  the active kernel with `KAPLUMBA_TRACE_GEMV=1`, then benchmark committed
-  one-array reuse against the dirty four-array/hoisted-word loop at the same
-  HEAD with separate target directories and at least five interleaved pairs.
-  Verify identical greedy IDs. If clean recovers >=15.8 tok/s, retire the dirty
-  kernel experiment; otherwise begin a correctness-aware commit bisect after
-  `223ea09`. Test: canonical 32-token benchmark, median/spread, lock summary,
-  swap delta, and optional Metal register/occupancy evidence. Do not begin the
-  broader EXL3 ALU optimization spec until this task establishes the baseline.
+- [x] **T8a — restore one-array decode reuse in the active K3 contig4 kernel.**
+  Files: `crates/kernels/src/linear_repacked.metal`. Removed the four live
+  `float[8]` arrays and hoisted four-substep decode from the user's dirty edit;
+  the file now matches committed HEAD, which uses sequential decode into one
+  reused array while preserving each substep's accumulation order. Test:
+  `cargo build --release -p kaplumba-cli` passed;
+  `cargo test -p kaplumba-engine --test live_kernel_bit_exact -- --nocapture`
+  passed, with zero fp16 output differences for the live contig4 kernel on
+  down_proj, gate_proj, and o_proj. Completed 2026-10-14; no source commit is
+  needed because the restored kernel is the committed HEAD implementation.
+- [ ] **T8b — prove canonical throughput after restoring register reuse.**
+  Files: this folder's notes and, only if needed, an isolated worktree. Confirm
+  the active kernel using `KAPLUMBA_TRACE_GEMV=1`. Run at least five
+  interleaved canonical 32-token samples using `scripts/gpuq try --`, identical
+  greedy token IDs, lock summary, and swap delta. If the restored kernel median
+  is >=15.8 tok/s, accept T8a. Otherwise reconstruct the prior four-array
+  variant in an isolated worktree with a separate target directory, compare
+  variants, and then bisect correctness-safe commits after `223ea09` if needed.
+  Do not begin broader EXL3 ALU optimization until this establishes the baseline.

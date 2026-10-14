@@ -220,5 +220,28 @@
   Use the canonical 32-token greedy prompt and require identical token IDs.
   If clean does not recover the target, start a correctness-aware bisect after
   verified 15.849/15.839 tok/s commit `223ea09`.
-- No model was loaded for this investigation and no source code was changed.
-  Broader ALU decode planning remains sequenced after baseline restoration.
+- During the initial read-only investigation, no model was loaded and no source
+  code was changed. Broader ALU decode planning remains sequenced after
+  baseline restoration.
+- Follow-up at the user's request: removed the dirty experiment from
+  `linear_gemv_ishizuki_k3_colmajor_contig4`. The file now matches committed
+  HEAD, whose loop uses the historical sequential `float v[8]` reuse shape.
+  Each of the four K substeps is decoded and accumulated before reusing the
+  array, preserving the accumulation order and removing the former hoisted
+  packed words and four simultaneously live decoded arrays from the hot loop.
+- `cargo build --release -p kaplumba-cli` passed. The first attempted package
+  selector `-p kaplumba` was invalid because the binary package is named
+  `kaplumba-cli`; no files were affected by that failed command.
+- `cargo test -p kaplumba-engine --test live_kernel_bit_exact -- --nocapture`
+  passed 1/1. The live contig4 fp16 outputs matched the reference for down_proj
+  (5,376 outputs), gate_proj (21,504), and o_proj (5,376), with zero fp16
+  differences. The test also printed f32 differences from the reference due to
+  expected accumulation reassociation; these are not a regression from this
+  change because the sequential per-substep accumulation order was restored.
+- The kernel file now has no net source diff from HEAD. The release build above
+  was made while the kernel body already matched HEAD; only whitespace differed.
+- No canonical throughput run was started: `scripts/gpuq status` showed only
+  0.2 GiB top-unused and 1,836 MiB existing swap. This is below AGENTS.md's
+  14 GiB model-load threshold. The source restoration is provisional until the
+  canonical >=15.8 tok/s test runs; if it misses, reconstruct the former
+  four-array variant in an isolated worktree and perform the specified A/B.

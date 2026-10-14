@@ -39,12 +39,14 @@ sufficient because step N+1 is not submitted until step N has completed and the
 host has safely replaced that row.
 
 That pipeline now survives a two-turn chat run, so the remaining throughput
-investigation moves to the active K3 repacked GEMV. The local tree changes its
-inner loop from one reused `float v[8]` to four simultaneously live
-`float[8]` arrays and hoists eight packed words. Commit `5a344a8` previously
-introduced the one-array shape specifically to reduce register pressure. The
-current edit therefore needs a direct clean-versus-dirty A/B before any new
-kernel design or historical engine bisect.
+investigation moves to the active K3 repacked GEMV. The former local edit
+changed its inner loop from one reused `float v[8]` to four simultaneously
+live `float[8]` arrays and hoisted eight packed words. Commit `5a344a8`
+previously introduced the one-array shape specifically to reduce register
+pressure. At the user's direction, the active kernel has been restored to that
+one-array shape. The canonical benchmark now decides whether this recovers the
+target; if it does not, reconstruct the old four-array variant in a separate
+worktree and compare it under the controlled A/B protocol.
 
 ## Touchpoints
 
@@ -58,15 +60,15 @@ kernel design or historical engine bisect.
 | `crates/kernels/src/encoder.rs` tests | Cover ordinary rolling and flush behavior. | Add deferred submission, ordering, abandonment, terminality, and bound tests with a negative control. |
 | `crates/engine/src/model.rs` and `crates/engine/tests/*` | Cover exact sparse row staging and pipeline behavior. | Exercise exact token row bytes, two-slot sequences, EOS, cache growth, reset, and error paths. |
 | `spec/mlock-clean-mmap/*` | T5g records memory changes and an unrelated 12.334 tok/s run. | Add cross-reference to the decode regression outcome and clarify that the old number is not a matched performance comparison. |
-| `crates/kernels/src/linear_repacked.metal` | The user-owned dirty edit keeps four decoded arrays live in the active K3 contig4 loop; committed HEAD reuses one array. | Preserve the patch, compare clean and dirty variants without source differences elsewhere, and only revert or revise it after measured attribution. No edit occurs during the specification-only phase. |
+| `crates/kernels/src/linear_repacked.metal` | The former local edit kept four decoded arrays live in the active K3 contig4 loop; the kernel now reuses one array. | Benchmark this provisional restoration. If it misses the target, reconstruct the four-array variant in an isolated worktree for A/B before further optimization. |
 
 ## Sequencing and dependencies
 
-1. Pin the canonical benchmark and snapshot the user's two dirty patches. Make
-   isolated clean-kernel and dirty-kernel worktrees at the same committed HEAD,
-   each with its own `CARGO_TARGET_DIR`. Confirm with
-   `KAPLUMBA_TRACE_GEMV=1` that the workload dispatches
-   `linear_gemv_ishizuki_k3_colmajor_contig4`.
+1. Pin the canonical benchmark and confirm with `KAPLUMBA_TRACE_GEMV=1` that it
+   dispatches `linear_gemv_ishizuki_k3_colmajor_contig4`. Benchmark the restored
+   one-array kernel first. If it reaches the target with identical token IDs,
+   retain it. If it does not, build the four-array variant in an isolated
+   worktree with its own `CARGO_TARGET_DIR` and run the controlled comparison.
 2. Implement encoder deferral and its isolated lifecycle tests.
 3. Separate sparse-row preparation from sparse-row use in `TextModel`, keeping
    synchronous/prefill behavior on the established path.
@@ -104,9 +106,9 @@ public checkpoint or chat formats.
 - Retaining many unsubmitted command buffers can expose Metal queue limits.
   Bound them to one step and test worst-case dispatch count against the real
   decode limit before model benchmarking.
-- The user's uncommitted GEMV-kernel edit and extractor test are measurement
-  confounders. Preserve both. Apply only the shader patch to the dirty A/B
-  worktree and keep the extractor test out of both benchmark binaries.
+- The user's uncommitted EXL3 extractor test remains in the main worktree; keep
+  it out of benchmark source differences. Reconstruct the former dirty GEMV
+  variant only in an isolated worktree if the restored kernel fails acceptance.
 - Four live decode arrays may be optimized away by the compiler, or may raise
   register use enough to reduce occupancy or spill. Treat source structure as a
   hypothesis; use latency first and counters/disassembly only if available.

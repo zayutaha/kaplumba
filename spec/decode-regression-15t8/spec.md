@@ -78,12 +78,12 @@ further optimization is accepted.
     If deferred encoding still fails, discard its unsubmitted work and restore
     each layer's KV position to its per-step starting position so one failed
     chat turn cannot leave the next turn with inconsistent sliding-cache state.
-11. Treat the current uncommitted `linear_repacked.metal` change as the leading
-    regression hypothesis, not as established causality. Its four simultaneously
-    live `float[8]` decode arrays and hoisted weight words must be tested against
-    the committed one-array reuse shape with all engine, model, prompt, output,
-    build, and machine conditions held constant. Preserve the user's patch while
-    constructing the comparison.
+11. The active K3 contig4 loop uses one reusable `float[8]` decode array and
+    accumulates each sub-step before decoding the next, matching the historical
+    register-pressure reduction. This is a provisional fix based on the leading
+    hypothesis; it is not accepted until the canonical benchmark reaches the
+    target. If it remains slow, reconstruct the four-array variant in an
+    isolated worktree and perform the planned controlled A/B.
 12. Do not begin broader EXL3 ALU or 250 GB/s optimization work until the clean
     15.8 tok/s baseline is restored or this regression is conclusively shown to
     have a different cause.
