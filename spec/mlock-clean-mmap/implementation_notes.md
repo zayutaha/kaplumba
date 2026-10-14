@@ -230,6 +230,8 @@ These are fixture tests on the real Metal device, not a model run. Full
 `Gxma-repacked` chat pressure, swap, SSD-I/O and 1k/2k/8k acceptance remain
 unmeasured and are still T4 gates.
 
+T1 implementation commit: `8143e6e` (`spec/mlock-clean-mmap: T1 shared mmap locking`).
+
 D0 draft was committed as `5abcb0c`; the scratch probe and its logs were removed
 after preserving source, commands and observations above. No standalone probe
 process or temporary project harness remains.

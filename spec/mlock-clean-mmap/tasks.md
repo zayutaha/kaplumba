@@ -20,7 +20,7 @@ negative control before any coverage claim, notes, status update and commit.
   Exercise sub-page/final-page shards and open errors. Sabotage the actual loader
   to `MAP_PRIVATE`; require a named dirty/private-page failure, restore and
   rerun. Preserve existing weight/alignment regression results. Completed
-  `2026-10-14`; commit hash recorded in the T1 follow-up metadata commit.
+  `2026-10-14`; implementation commit `8143e6e`.
 - [ ] **T2 — account for unique locked pages and partial prefixes.**
   Files: `crates/engine/src/weights.rs` and focused lock-ledger tests, notes.
   Separate tensor coverage from unique merged page bytes and preserve successful
