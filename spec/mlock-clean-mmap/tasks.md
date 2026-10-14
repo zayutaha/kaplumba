@@ -28,7 +28,7 @@ negative control before any coverage claim, notes, status update and commit.
   empty ranges, no lock, copied weights and arithmetic boundaries. Sabotage an
   overlap count and a partial-prefix count; require diagnostic failures before
   restoration. Do not introduce a lock cap or cold-gap locking in this step.
-  Completed `2026-10-14`; implementation commit `TBD`.
+  Completed `2026-10-14`; implementation commit `413e01e`.
 - [ ] **T3 — make incomplete locking visible per load.**
   Files: `crates/engine/src/weights.rs`, focused load/failure tests, notes.
   Summarize requested/locked/evictable bytes per model and distinguish disabled,

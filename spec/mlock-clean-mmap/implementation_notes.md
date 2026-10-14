@@ -264,10 +264,11 @@ Sabotage controls:
 
 Restored both helpers. `cargo test -p kaplumba-engine --lib weights::tests`
 passed: 19 passed, 1 ignored. The ignored case requires a real checkpoint.
-The focused suite does not load a model or establish T4 memory-pressure and SSD
-read acceptance.
+`cargo test -p kaplumba-engine --test dflash_load --no-run` compiled the shared
+loader consumer. The focused suite does not load a model or establish T4
+memory-pressure and SSD read acceptance.
 
-T2 implementation commit: `TBD`.
+T2 implementation commit: `413e01e` (`spec/mlock-clean-mmap: T2 unique lock accounting`).
 
 D0 draft was committed as `5abcb0c`; the scratch probe and its logs were removed
 after preserving source, commands and observations above. No standalone probe
