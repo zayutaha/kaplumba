@@ -37,7 +37,7 @@ negative control before any coverage claim, notes, status update and commit.
   continue with exact readable fixture bytes after a partial lock. Ensure a
   second load still reports its shortfall. Sabotage warning emission and
   demonstrate a named failure. Completed `2026-10-14`; implementation commit
-  pending.
+  `6cecdd6`.
 - [ ] **T4 — prove ordinary-chat memory and I/O behavior.**
   Files: a bounded acceptance harness if required and notes. Run single-model
   `Gxma-repacked` A/B/A/B at 1k/2k/8k with generation inside the existing limit,

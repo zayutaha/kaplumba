@@ -304,7 +304,8 @@ git diff --check
 
 Results: weights tests 22 passed, 1 ignored (checkpoint-only); mlock probe 3/3;
 DFlash loader integration target compiled. Existing workspace warnings are
-unrelated. No Gxma model was loaded for T3. Implementation commit pending.
+unrelated. No Gxma model was loaded for T3. Implementation commit:
+`6cecdd6` (`spec/mlock-clean-mmap: T3 per-load lock summaries`).
 
 D0 draft was committed as `5abcb0c`; the scratch probe and its logs were removed
 after preserving source, commands and observations above. No standalone probe
