@@ -7,11 +7,12 @@ the next token ID into the next decode slot. With the dense embedding table, the
 following GPU step can consume that ID directly. T5g avoids registering the
 large embedding table with Metal: it copies the selected raw BF16/FP16 row from
 the shared mmap into a small host-visible row buffer before the GPU embedding
-kernel runs. The current implementation drains the queue before this copy,
-including at `forward_step_pipelined` entry, so it serializes the host encoder
-and GPU execution.
+kernel runs. T5g originally drained the queue before this copy, including at
+`forward_step_pipelined` entry, which serialized the host encoder and GPU
+execution. T2 through T7 replaced that unsafe/serialized lifecycle with the
+bounded deferred path below.
 
-The selected design separates encoding from submission for sparse pipelined
+The implemented design separates encoding from submission for sparse pipelined
 steps:
 
 1. Begin a sparse decode step with bounded deferred submission enabled. Encode
@@ -37,6 +38,14 @@ multiple decode steps unboundedly queued. One shared embedding row buffer remain
 sufficient because step N+1 is not submitted until step N has completed and the
 host has safely replaced that row.
 
+That pipeline now survives a two-turn chat run, so the remaining throughput
+investigation moves to the active K3 repacked GEMV. The local tree changes its
+inner loop from one reused `float v[8]` to four simultaneously live
+`float[8]` arrays and hoists eight packed words. Commit `5a344a8` previously
+introduced the one-array shape specifically to reduce register pressure. The
+current edit therefore needs a direct clean-versus-dirty A/B before any new
+kernel design or historical engine bisect.
+
 ## Touchpoints
 
 | Path | Current behavior | Intended change |
@@ -49,22 +58,28 @@ host has safely replaced that row.
 | `crates/kernels/src/encoder.rs` tests | Cover ordinary rolling and flush behavior. | Add deferred submission, ordering, abandonment, terminality, and bound tests with a negative control. |
 | `crates/engine/src/model.rs` and `crates/engine/tests/*` | Cover exact sparse row staging and pipeline behavior. | Exercise exact token row bytes, two-slot sequences, EOS, cache growth, reset, and error paths. |
 | `spec/mlock-clean-mmap/*` | T5g records memory changes and an unrelated 12.334 tok/s run. | Add cross-reference to the decode regression outcome and clarify that the old number is not a matched performance comparison. |
+| `crates/kernels/src/linear_repacked.metal` | The user-owned dirty edit keeps four decoded arrays live in the active K3 contig4 loop; committed HEAD reuses one array. | Preserve the patch, compare clean and dirty variants without source differences elsewhere, and only revert or revise it after measured attribution. No edit occurs during the specification-only phase. |
 
 ## Sequencing and dependencies
 
-1. Pin benchmark and capture a matched baseline/current comparison; inspect
-   commit-level changes that can affect steady decode, especially T5b (cache
-   sizing/growth), T5e (queue barrier), T5f (resource views), and T5g (sparse
-   embedding synchronization). Do not remove T5e's growth barrier without a
-   separate correctness proof.
+1. Pin the canonical benchmark and snapshot the user's two dirty patches. Make
+   isolated clean-kernel and dirty-kernel worktrees at the same committed HEAD,
+   each with its own `CARGO_TARGET_DIR`. Confirm with
+   `KAPLUMBA_TRACE_GEMV=1` that the workload dispatches
+   `linear_gemv_ishizuki_k3_colmajor_contig4`.
 2. Implement encoder deferral and its isolated lifecycle tests.
 3. Separate sparse-row preparation from sparse-row use in `TextModel`, keeping
    synchronous/prefill behavior on the established path.
 4. Integrate stage-then-submit ordering in both generation callers and test EOS,
    error, reset, and cache-growth boundaries.
-5. Run the full relevant unit/integration suites, then the single-model
-   interleaved throughput and memory acceptance matrix.
-6. Update historical claims and close the tasks only with measured evidence.
+5. Run the full relevant unit/integration suites, then compare clean and dirty
+   kernels in at least five interleaved pairs with identical prompt, generated
+   count, greedy IDs, release settings, lock accounting, and swap observation.
+6. If the committed kernel restores the target, retire only the dirty
+   experiment. If it does not, bisect correctness-safe committed changes after
+   `223ea09`, including cache, resource-view, and sparse pipeline work. Do not
+   remove the cache-growth barrier without a separate correctness proof.
+7. Update historical claims and close the tasks only with measured evidence.
 
 ## Interfaces
 
@@ -89,12 +104,16 @@ public checkpoint or chat formats.
 - Retaining many unsubmitted command buffers can expose Metal queue limits.
   Bound them to one step and test worst-case dispatch count against the real
   decode limit before model benchmarking.
-- The user's uncommitted GEMV-kernel edit and test edit are measurement
-  confounders. Preserve them and record the dirty tree; use a controlled
-  snapshot comparison only if they prevent causal attribution.
-- If matched measurements show T5g is not the dominant cause, keep the safe
-  encoder lifecycle change only if it improves or preserves performance, and
-  add a separate measured remedy for any other responsible commit.
+- The user's uncommitted GEMV-kernel edit and extractor test are measurement
+  confounders. Preserve both. Apply only the shader patch to the dirty A/B
+  worktree and keep the extractor test out of both benchmark binaries.
+- Four live decode arrays may be optimized away by the compiler, or may raise
+  register use enough to reduce occupancy or spill. Treat source structure as a
+  hypothesis; use latency first and counters/disassembly only if available.
+- Existing pre/post-T5g logs are different from the canonical workload, but
+  their nearly equal 12.439 and 12.334 tok/s results rule out T5g as a plausible
+  explanation for the whole 15.8-to-12.4 loss. Preserve the safe deferred
+  encoder work while investigating the kernel and earlier commits.
 
 ## Requirement-to-task mapping
 
@@ -110,3 +129,5 @@ public checkpoint or chat formats.
 | 8 sabotage-proven ordering regression | T2, T3 |
 | 9 throughput and memory acceptance | T1, T6 |
 | 10 deferred-buffer capacity and failed-step cache rollback | T7 |
+| 11 isolate dirty active-kernel experiment | T1, T8 |
+| 12 defer broader ALU work until baseline restoration | T8 |

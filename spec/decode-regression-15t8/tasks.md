@@ -6,10 +6,11 @@
   --check`. Completed `2026-10-14`; documentation commit hash will be recorded
   in this entry before finalizing the commit. Commit `38ba6c3`.
 - [ ] **T1 — pin the matched decode baseline and causal changes.** Files: this
-  folder's notes and, if needed, a temporary isolated build/worktree. Compare
-  the canonical 32-token workload on the current tree and pre-T5g reference;
-  interleave at least five pairs, preserve the user's dirty edits, record exact
-  hashes, IDs, timings, lock/swap state, then isolate relevant T5 changes.
+  folder's notes and temporary isolated build/worktrees. Compare the canonical
+  32-token workload at the same HEAD with the committed hot kernel versus the
+  user's dirty hot-kernel experiment; interleave at least five pairs, preserve
+  the user's dirty edits, record exact hashes, IDs, timings, lock/swap state,
+  and only then isolate historical commits if the kernel does not explain it.
   Test: `scripts/gpuq status`, then `scripts/gpuq try --` for each model run;
   treat exit 75 as GPU busy. Commit evidence and note if the local machine cannot
   provide a clean matched comparison.
@@ -66,7 +67,7 @@
   exact output IDs and environment. Reach >=15.8 tok/s canonical median or keep
   the task open with evidence and a next measured cause. Update old claims and
   close only demonstrated acceptance criteria.
-- [ ] **T7 — prevent deferred decode overflow and roll back failed sparse steps.**
+- [x] **T7 — prevent deferred decode overflow and roll back failed sparse steps.**
   Files: `crates/kernels/src/encoder.rs`, `crates/engine/src/model.rs`, their
   tests, and this spec. Use 100 dispatches per command buffer for deferred
   sparse decode so the measured ~2,100-dispatch step rolls about 21 times under
@@ -83,9 +84,19 @@
   successfully. The test proves the abandon/restore path structurally and
   exercises rollback deltas with partially advanced layers; it does not inject
   a failing model forward. Implementation checkpoint committed as `fd3cc67`.
-  User reran the release binary: the 14-token prefill + 9-token `hi` turn
-  completed, and a longer second turn began without either error. Its output
-  ended before the turn-rate line, so full two-turn completion remains
-  unconfirmed. The 12.39 tok/s short-turn result does not prove the performance
-  target. Keep T7 open until a longer `--chat` run completes and the rate is
-  checked; current `gpuq status` remains below the safe load threshold.
+  User reran the release binary and completed two turns without the deferred
+  limit or sliding-cache error: 14 prefill + 9 generated at 12.61 tok/s, then
+  18 prefill + 45 generated at 12.42 tok/s. This closes the reported lifecycle
+  failure while confirming the performance target remains open. Completed
+  2026-10-14; implementation commit `fd3cc67`.
+- [ ] **T8 — isolate the active K3 contig4 kernel regression before new ALU
+  work.** Files: this folder's notes and isolated worktrees only unless the A/B
+  identifies a source change to retain. Preserve the user's patches, confirm
+  the active kernel with `KAPLUMBA_TRACE_GEMV=1`, then benchmark committed
+  one-array reuse against the dirty four-array/hoisted-word loop at the same
+  HEAD with separate target directories and at least five interleaved pairs.
+  Verify identical greedy IDs. If clean recovers >=15.8 tok/s, retire the dirty
+  kernel experiment; otherwise begin a correctness-aware commit bisect after
+  `223ea09`. Test: canonical 32-token benchmark, median/spread, lock summary,
+  swap delta, and optional Metal register/occupancy evidence. Do not begin the
+  broader EXL3 ALU optimization spec until this task establishes the baseline.

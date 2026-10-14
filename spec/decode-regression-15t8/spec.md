@@ -1,17 +1,22 @@
-# Restore pipelined ordinary decode after sparse embedding staging
+# Restore 15.8 tok/s ordinary decode and isolate the active GEMV regression
 
 ## Goal
 
 Restore ordinary greedy decode throughput on the M4 Pro while retaining the
 working shared-mmap and hot-weight `mlock` path and the sparse embedding memory
-reduction. The canonical performance target is at least 15.8 tok/s on the
-documented 32-token counting benchmark with DFlash disabled. A controlled
-comparison must identify the change or combination of changes responsible for
-the current lower rate before a performance fix is accepted.
+reduction. The sparse deferred-command work has restored correct multi-turn
+chat, but a 45-token user run still measured 12.42 tok/s. The canonical
+performance target is at least 15.8 tok/s on the documented 32-token counting
+benchmark with DFlash disabled. A controlled comparison must first isolate the
+uncommitted active-GEMV kernel experiment from the committed engine before any
+further optimization is accepted.
 
 ## Non-goals and restrictions
 
-- Do not change Metal kernels or the model/checkpoint format for this work.
+- Do not design or introduce a new Metal algorithm before the current dirty
+  `linear_gemv_ishizuki_k3_colmajor_contig4` edit has been measured against the
+  committed kernel. A measured reversion of that experiment is in scope.
+- Do not change the model/checkpoint format.
 - Do not disable or weaken the actual hot-weight `mlock`, MAP_SHARED mapping,
   sparse embedding staging, bounded Metal resource views, or the warning on
   partial lock failure.
@@ -21,7 +26,7 @@ the current lower rate before a performance fix is accepted.
   dtype conversion/scaling, KV precision, or cache correctness.
 - Do not optimize DFlash in this change; it is disabled for the target workload.
 - Do not claim that the 15.8 tok/s floor applies to every prompt, context length,
-  or sampling mode. The user's exact historical prompt and context are unknown.
+  or sampling mode. It applies to the repository's documented canonical prompt.
 - Keep queue submissions bounded to one prepared decode step; do not add a
   general graph queue, unbounded command-buffer retention, or another model
   instance.
@@ -34,8 +39,9 @@ the current lower rate before a performance fix is accepted.
    --metrics`, model `~/.kaplumba/models/Gxma-repacked`. Record build hash,
    dirty-tree state, model header identity, context, token IDs, timing samples,
    and system swap deltas. Use interleaved measurements and report median and
-   spread. Compare the current tree to a diagnostic build before T5g
-   (`88205a0`) and then isolate relevant commits where feasible.
+   spread. First compare the current dirty hot kernel with the committed kernel
+   at the same HEAD. Only if that does not explain the loss, compare the current
+   tree to historical revisions and isolate relevant commits.
 2. Preserve the memory behavior established by `spec/mlock-clean-mmap` T5g:
    MAP_SHARED zero-copy mappings, the same eligible locked-byte set, sparse
    embedding source excluded from the Metal residency set, bounded row scratch,
@@ -72,6 +78,15 @@ the current lower rate before a performance fix is accepted.
     If deferred encoding still fails, discard its unsubmitted work and restore
     each layer's KV position to its per-step starting position so one failed
     chat turn cannot leave the next turn with inconsistent sliding-cache state.
+11. Treat the current uncommitted `linear_repacked.metal` change as the leading
+    regression hypothesis, not as established causality. Its four simultaneously
+    live `float[8]` decode arrays and hoisted weight words must be tested against
+    the committed one-array reuse shape with all engine, model, prompt, output,
+    build, and machine conditions held constant. Preserve the user's patch while
+    constructing the comparison.
+12. Do not begin broader EXL3 ALU or 250 GB/s optimization work until the clean
+    15.8 tok/s baseline is restored or this regression is conclusively shown to
+    have a different cause.
 
 ## Acceptance criteria
 
@@ -89,13 +104,16 @@ the current lower rate before a performance fix is accepted.
 - `implementation_notes.md` records the exact commands, revisions, outputs,
   environmental state, and any limits. Older throughput claims are marked with
   their actual workload so unlike measurements are not conflated.
+- The active GEMV path is confirmed with `KAPLUMBA_TRACE_GEMV=1` before its A/B
+  result is interpreted. The clean and dirty kernel variants use separate
+  worktrees and target directories, produce identical greedy token IDs, and are
+  compared with at least five interleaved pairs.
 
 ## Open questions
 
-- The user's prior 15.8 tok/s observation was ordinary decode with DFlash off,
-  but the exact prompt/context are unavailable. The documented canonical
-  benchmark is the reproducible acceptance workload; the original observation
-  remains an unverified comparison.
-- The exact share of the 15.8-to-12.25 tok/s drop caused by T5g is unmeasured.
-  Existing notes include a 12.439 tok/s run before T5g on a different 39-token
-  prompt and 160-token generation. Attribute causality only from matched runs.
+- Does restoring the committed one-array K3 contig4 kernel recover the canonical
+  15.8 tok/s median? Existing source history makes this the leading hypothesis,
+  but no controlled A/B has established it.
+- If it does not, which committed change after the verified `223ea09` baseline
+  accounts for the remaining loss? This requires a correctness-aware revision
+  bisect because `223ea09` predates a later logits safety fix.

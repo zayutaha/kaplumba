@@ -171,3 +171,54 @@
   prove the 15.8 tok/s target. The observed 9-token turn is too short for a
   stable comparison. At the subsequent check, gpuq showed no active model,
   0.5 GiB top-unused, and 1,860 MiB swap.
+
+## 2026-10-14 — corrected attribution after successful two-turn chat
+
+- The user completed a longer ordinary-chat run on the fixed release binary.
+  Gxma-repacked loaded in 1,501 ms and reported all 12,046,221,312 eligible
+  bytes locked, with zero failed or evictable bytes. Turn 1 measured 12.61 tok/s
+  for 9 generated tokens; turn 2 measured 12.42 tok/s for 45 generated tokens
+  at context 86. The second result is long enough to confirm that throughput is
+  still in the roughly 12.4 tok/s band after the chat lifecycle fix.
+- This run separates correctness from speed: T7's deferred-buffer overflow and
+  sliding-cache corruption are fixed, while the >=15.8 tok/s acceptance target
+  remains unmet. Full successful locking and a stable second-turn rate point
+  away from failed `mlock` as the direct explanation. No system swap delta was
+  captured during the user run, so it does not prove that swapouts were zero.
+- Existing logs further weaken the original T5g attribution:
+  `/tmp/kaplumba-decode-paging/baseline-generation.log` records 12.439 tok/s
+  before T5g, while `/tmp/kaplumba-decode-paging/t5g-generation.log` records
+  12.334 tok/s after T5g for the same 39-prompt/160-generation workload. They
+  are not the canonical acceptance workload, but the 0.105 tok/s difference
+  cannot explain the historical 15.8-to-12.4 drop. The sparse pipeline work
+  fixed safety and restored overlap; it did not create the dominant regression.
+- The leading unmeasured hypothesis is the user-owned dirty change in
+  `crates/kernels/src/linear_repacked.metal` at
+  `linear_gemv_ishizuki_k3_colmajor_contig4`, the active Gxma-repacked decode
+  family. Committed HEAD decodes one sub-step into a reusable `float v[8]` and
+  accumulates it before reuse. The dirty version hoists eight packed `uint`
+  words and decodes four sub-steps into `v0[8]` through `v3[8]` before any
+  accumulation, substantially increasing source-level live values in the hot
+  K loop.
+- Commit `5a344a8` previously made the reverse transformation in this kernel
+  family under T3, replacing four live decode arrays with one reusable array to
+  reduce register pressure. Commit `32830cb` later hoisted packed words only in
+  `linear_gemv_ishizuki_k3_fused2_co` while retaining one decoded array; it does
+  not validate four simultaneously live decoded arrays in the active contig4
+  kernel. Project measurements repeatedly show occupancy and spill cliffs from
+  excess live arrays/registers. This history makes the dirty edit the strongest
+  current suspect, but compiler behavior and causal impact remain unproven.
+- Dispatch slicing is not a credible explanation for a 21% throughput loss.
+  `spec/decode-3bpw-gap-19t/implementation_notes.md` records 50, 250, and 2,500
+  dispatches per buffer at 15.93 and 15.88 tok/s, effectively unchanged. The
+  sparse deferred slice increase from 50 to 100 fixed capacity without evidence
+  for a multi-tok/s cost.
+- Required next measurement: preserve the user's dirty patches, use isolated
+  worktrees and separate target directories at the same HEAD, confirm the
+  active dispatch with `KAPLUMBA_TRACE_GEMV=1`, and compare committed one-array
+  reuse against only the dirty shader edit in at least five interleaved pairs.
+  Use the canonical 32-token greedy prompt and require identical token IDs.
+  If clean does not recover the target, start a correctness-aware bisect after
+  verified 15.849/15.839 tok/s commit `223ea09`.
+- No model was loaded for this investigation and no source code was changed.
+  Broader ALU decode planning remains sequenced after baseline restoration.
