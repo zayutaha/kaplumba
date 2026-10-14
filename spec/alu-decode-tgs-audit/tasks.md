@@ -23,12 +23,12 @@ requested. Update spec/plan before any layout or interface scope change.
   validate independent application timing, early EOS, 1/2/512-token cases,
   callback effects and diagnostic-route differences; prepare active-branch
   GPU/raw-FP32/FP16 gates and red controls. Measure baseline ABBA variability.
-- [ ] **T3** `linear_repacked.metal`: change `fused2_sk2` from the existing
+- [x] **T3** `linear_repacked.metal`: change `fused2_sk2` from the existing
   vector MCG helper to scalar 32-bit state extraction plus original scalar MCG.
   Preserve split and accumulation order. Compare raw FP32 outputs against the
   64-bit kernel, run `fused_bit_exact`, sabotage the actual kernel, and measure
   the kernel ABBA/noise control. 62,208 raw words equal; sabotage differs;
-  fused suite 4/4. Full chat remains later; verified change ready to commit.
+  fused suite 4/4. Full chat remains later. Commit: `fcf1eab`.
 - [ ] **T4** Same file, separately: apply and validate scalar extraction in
   `fused3_sk2`; compare every raw FP32 output against its 64-bit version and
   run its real integration tests. Do not assume T3's result transfers to three

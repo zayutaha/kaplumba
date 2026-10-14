@@ -5,6 +5,9 @@ The follow-up documentation commit records this hash in tasks.md. No production
 source was staged. Scratch snapshot/binaries/logs removed after preserving source
 and all raw measurement logs here; no benchmark process left running.
 
+T3 scalar fused2 extraction committed as `fcf1eab`; tasks.md records the code
+commit in the follow-up ledger commit.
+
 ## D0 — 2026-10-14
 
 - User confirmed scope before spec creation; later explicitly requested tg/s
