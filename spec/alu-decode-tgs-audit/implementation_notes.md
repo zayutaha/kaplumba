@@ -334,3 +334,118 @@ PAIR 14 A_ms=0.003531 B_ms=0.003188 gain_pct=10.784
 PAIR 15 A_ms=0.003539 B_ms=0.003518 gain_pct=0.592
 RESULT bytes=85248 A_median_ms=0.003505 B_median_ms=0.003500 paired_gain_median_pct=0.533 gain_min=-7.893 gain_max=10.784 positive_pairs=9/16
 ```
+
+## T3 — exact scalar extraction in `fused2_sk2`
+
+The 478c7de path called the existing **vector** MCG helper. My earlier standalone
+A/B found 6,607 of 24,576 raw FP32 outputs differed, although finalized output
+integration tests passed. T3 therefore replaced only fused2's helper calls with
+`extract_v_mcg_32_scalar`: an eight-state, unrolled scalar loop calls the original
+`decode_state_mcg` unchanged. Existing vector helper and fused3 remain untouched
+for T4. Split geometry, float multiply/add expressions and accumulator order do
+not change.
+
+Direct GPU comparison compiled the original 64-bit fused2 function body from
+parent `478c7de^` beside the exact current fused2 shader body. Seeded random
+packed ring words and finite FP16 x; K=5376 realistic q/kv shape pairs plus a
+592-feature split-tail case. Compare every raw split partial (not just finalized
+fp16) and run an acc0 mutation negative control:
+
+```text
+5376 / 8192 / 4096: 24,576 words, candidate 0 diffs, sabotaged 12,288 diffs
+5376 / 16384 / 2048: 36,864 words, candidate 0 diffs, sabotaged 18,432 diffs
+592 / 256 / 128: 768 words, candidate 0 diffs, sabotaged 192 diffs
+```
+
+`cargo test -p kaplumba-engine --test fused_bit_exact -- --nocapture` in the
+isolated worktree: **4 passed, 0 failed**, 35.59 s; includes real equal/unequal
+QKV shapes, stride-x and existing fail-first weight mutation.
+
+Standalone warmed synthetic kernel timings, ABBA with 16 pairs and 8 A/A controls;
+no model or DRAM claim:
+
+| K/Na/Nb | baseline ms | scalar ms | paired gain median | range | wins |
+|---|---:|---:|---:|---:|---:|
+| 5376/8192/4096 | .139527 | .133243 | +4.621% | +3.289..+9.675% | 16/16 |
+| 5376/16384/2048 | .207406 | .198815 | +4.321% | -16.030..+11.191% | 14/16 |
+| 592/256/128 | .003194 | .002980 | +.531% | -4.852..+8.800% | 11/16 |
+
+A/A median/range: +0.539% [-5.893,+6.397], -0.146% [-2.844,+6.531],
+-0.350% [-8.692,+0.972]. Preserve the wide/outlier ranges. Timings are from
+short repeated GPU dispatch buffers and host memory pressure remained high; use
+only as evidence the kernel trial is worthwhile. They are not end-to-end tg/s.
+
+Reproduce from an isolated worktree at the post-478c revision: the baseline source
+is `git show 478c7de^:crates/kernels/src/linear_repacked.metal`; the current
+kernel and scalar helper come from the worktree; compile the preserved Swift
+source below with `swiftc -g -O raw_compare.swift -o raw_compare`, then run
+`scripts/gpuq status` and `scripts/gpuq try -- ./raw_compare "$PWD"`. It acquires
+the GPU flock nonblocking. Full fused2 integration command above. No full model
+run: available memory remained <3 GiB and swap was already elevated. T3 does not
+claim model decode latency or sampled/greedy token identity.
+
+## T3 standalone raw comparator source
+
+```swift
+import Foundation
+import Metal
+import Darwin
+setbuf(stdout,nil)
+let root=CommandLine.arguments[1]
+let lockPath=ProcessInfo.processInfo.environment["KAPLUMBA_GPU_LOCK_FILE"] ?? NSHomeDirectory()+"/.kaplumba/gpu.lock"
+let fd=open(lockPath,O_RDWR|O_CREAT,mode_t(0o600)); guard fd>=0 && flock(fd,LOCK_EX|LOCK_NB)==0 else {print("GPU busy");exit(75)}; defer{flock(fd,LOCK_UN);close(fd)}
+let src=try String(contentsOfFile:root+"/crates/kernels/src/linear_repacked.metal",encoding:.utf8)
+let old=try String(contentsOfFile:root+"/base_linear_repacked.metal",encoding:.utf8)
+let lin=try String(contentsOfFile:root+"/crates/kernels/src/linear.metal",encoding:.utf8)
+func slice(_ s:String,_ a:String,_ b:String)->String{let x=s.range(of:a)!.lowerBound;let y=s.range(of:b,range:x..<s.endIndex)!.lowerBound;return String(s[x..<y])}
+let mcg=slice(lin,"static inline float decode_state_mcg(","static float decode_state(")
+let helpers=slice(src,"static inline void extract_v_mcg_32(","static inline void extract_v_mcg_fast(")
+let kernel="kernel void linear_gemv_ishizuki_k3_fused2_sk2("
+let end="kernel void linear_gemv_ishizuki_k3_fused3("
+let base=slice(old,kernel,end).replacingOccurrences(of:"linear_gemv_ishizuki_k3_fused2_sk2",with:"probe_a")
+let active=slice(src,kernel,end)
+guard active.contains("extract_v_mcg_32_scalar(t0[j0], t0[j1], sh0, rsh0, v);") else {fatalError("current fused2 kernel does not call the scalar extraction")}
+let cand=active.replacingOccurrences(of:"linear_gemv_ishizuki_k3_fused2_sk2",with:"probe_b")
+let bad=cand.replacingOccurrences(of:"probe_b",with:"probe_bad").replacingOccurrences(of:"extract_v_mcg_32_scalar(t0[j0], t0[j1], sh0, rsh0, v);",with:"extract_v_mcg_32_scalar(t0[j0], t0[j1], sh0, rsh0, v); v[0] += 1.0f;")
+let msl="#include <metal_stdlib>\nusing namespace metal;\n"+mcg+helpers+base+cand+bad
+try msl.write(toFile:root+"/raw_compare.metal",atomically:true,encoding:.utf8)
+guard let dev=MTLCreateSystemDefaultDevice(),let q=dev.makeCommandQueue() else{fatalError("Metal unavailable")}
+let lib=try dev.makeLibrary(source:msl,options:nil)
+let ps=try ["probe_a","probe_b","probe_bad"].map{try dev.makeComputePipelineState(function:lib.makeFunction(name:$0)!)}
+func median(_ a:[Double])->Double{let s=a.sorted();return(s[(s.count-1)/2]+s[s.count/2])/2}
+func test(_ K:Int,_ Na:Int,_ Nb:Int)throws{
+ var seed:UInt64=0x8765432101234567;func rnd()->UInt32{seed ^= seed<<13;seed ^= seed>>7;seed ^= seed<<17;return UInt32(truncatingIfNeeded:seed)}
+ func packed(_ n:Int)->MTLBuffer{let b=dev.makeBuffer(length:n,options:.storageModeShared)!;let p=b.contents().bindMemory(to:UInt32.self,capacity:n/4);for i in 0..<n/4{p[i]=rnd()};return b}
+ let a=packed(K*Na*3/8),b=packed(K*Nb*3/8),x=dev.makeBuffer(length:K*2,options:.storageModeShared)!;let xp=x.contents().bindMemory(to:UInt16.self,capacity:K);for i in 0..<K{xp[i]=Float16(Float(Int(rnd()%2001)-1000)/1024).bitPattern}
+ let outs=(0..<3).map{_ in [dev.makeBuffer(length:Na*8,options:.storageModeShared)!,dev.makeBuffer(length:Nb*8,options:.storageModeShared)!]}
+ let shape:[UInt32]=[UInt32(K),UInt32(Na),UInt32(Nb),0]
+ func run(_ arm:Int,_ rep:Int)->Double{let cb=q.makeCommandBuffer()!,e=cb.makeComputeCommandEncoder()!;e.setComputePipelineState(ps[arm]);e.setBuffer(a,offset:0,index:0);e.setBuffer(b,offset:0,index:1);e.setBuffer(x,offset:0,index:2);e.setBuffer(outs[arm][0],offset:0,index:3);e.setBuffer(outs[arm][1],offset:0,index:4);shape.withUnsafeBytes{e.setBytes($0.baseAddress!,length:$0.count,index:5)};for _ in 0..<rep{e.dispatchThreadgroups(MTLSize(width:(Na+Nb)/16*2,height:1,depth:1),threadsPerThreadgroup:MTLSize(width:256,height:1,depth:1))};e.endEncoding();cb.commit();cb.waitUntilCompleted();guard cb.status == .completed else{fatalError("command buffer failed \(String(describing:cb.error))")};return(cb.gpuEndTime-cb.gpuStartTime)*1000/Double(rep)}
+ for arm in 0..<3{_=run(arm,1)}
+ var mismatch=0,badCount=0;for col in 0..<2{let n=(col==0 ? Na:Nb)*2;let ar=outs[0][col].contents().bindMemory(to:UInt32.self,capacity:n),br=outs[1][col].contents().bindMemory(to:UInt32.self,capacity:n),cr=outs[2][col].contents().bindMemory(to:UInt32.self,capacity:n);for i in 0..<n{if ar[i] != br[i]{mismatch+=1};if ar[i] != cr[i]{badCount+=1}}}
+ print("CHECK K=\(K) Na=\(Na) Nb=\(Nb) raw_f32_words=\((Na+Nb)*2) candidate_differences=\(mismatch) sabotaged_differences=\(badCount)")
+ guard mismatch==0 && badCount>0 else{fatalError("raw equality or sabotage failed")}
+ for _ in 0..<96{_=run(0,8);_=run(1,8)}
+ var gains=[Double](),controls=[Double](),aTimes=[Double](),bTimes=[Double]()
+ for _ in 0..<16{let a1=run(0,8),b1=run(1,8),b2=run(1,8),a2=run(0,8);aTimes.append((a1+a2)/2);bTimes.append((b1+b2)/2);gains.append(100*((a1+a2)/(b1+b2)-1))}
+ for _ in 0..<8{let a1=run(0,8),b1=run(0,8),b2=run(0,8),a2=run(0,8);controls.append(100*((a1+a2)/(b1+b2)-1))}
+ print(String(format:"RESULT baseline_ms=%.6f scalar_ms=%.6f paired_gain_median=%.3f%% range=[%.3f,%.3f] positive=%d/16 AA_median=%.3f%% AA_range=[%.3f,%.3f]",median(aTimes),median(bTimes),median(gains),gains.min()!,gains.max()!,gains.filter{$0>0}.count,median(controls),controls.min()!,controls.max()!))
+ print("PAIRED_GAINS \(gains.map{String(format:"%.3f",$0)}.joined(separator:","))")
+}
+print("DEVICE \(dev.name); old 64-bit body vs exact current scalar body; seed random packed data/FP16 x; raw FP32; synthetic kernel time only")
+try test(5376,8192,4096);try test(5376,16384,2048);try test(592,256,128)
+```
+
+## T3 standalone raw comparator raw output
+
+```text
+DEVICE Apple M4 Pro; old 64-bit body vs exact current scalar body; seed random packed data/FP16 x; raw FP32; synthetic kernel time only
+CHECK K=5376 Na=8192 Nb=4096 raw_f32_words=24576 candidate_differences=0 sabotaged_differences=12288
+RESULT baseline_ms=0.139527 scalar_ms=0.133243 paired_gain_median=4.621% range=[3.289,9.675] positive=16/16 AA_median=0.539% AA_range=[-5.893,6.397]
+PAIRED_GAINS 9.675,9.483,8.146,4.110,3.759,6.658,5.000,4.679,4.564,3.289,4.452,5.843,3.885,5.407,4.231,4.249
+CHECK K=5376 Na=16384 Nb=2048 raw_f32_words=36864 candidate_differences=0 sabotaged_differences=18432
+RESULT baseline_ms=0.207406 scalar_ms=0.198815 paired_gain_median=4.321% range=[-16.030,11.191] positive=14/16 AA_median=-0.146% AA_range=[-2.844,6.531]
+PAIRED_GAINS 6.972,-16.030,4.164,0.680,0.287,5.178,-0.295,4.403,4.477,11.191,3.972,9.514,7.058,2.517,4.240,4.569
+CHECK K=592 Na=256 Nb=128 raw_f32_words=768 candidate_differences=0 sabotaged_differences=192
+RESULT baseline_ms=0.003194 scalar_ms=0.002980 paired_gain_median=0.531% range=[-4.852,8.800] positive=11/16 AA_median=-0.350% AA_range=[-8.692,0.972]
+PAIRED_GAINS 0.533,3.287,0.444,-0.439,0.528,0.178,0.896,0.533,-0.957,-0.081,7.895,-4.852,5.887,1.534,-2.227,8.800
+```

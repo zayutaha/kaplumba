@@ -74,8 +74,10 @@ not Gemini's four-state replacement. Prove reachable offsets at each call site;
 if a future caller admits s=0 it needs guarded shifts. Do not extrapolate this
 K=3 helper to fractional or other integer rates.
 
-Compare original QKV split-K kernels with extraction-only variants. Start with
-fused2, then fused3 separately. No change to split count, tile ownership,
+Compare original QKV split-K kernels with extraction-only variants. Use the
+scalar `decode_state_mcg` call per state: the pre-existing vector helper changed
+6,607/24,576 synthetic raw FP32 words despite finalized-output tests passing.
+Start with fused2, then fused3 separately. No change to split count, tile ownership,
 register scheduling or buffers in the same comparison. The baseline loop has
 `#pragma unroll` and constant K: per-state shifts may already fold to constants.
 Source ulong removal therefore predicts no particular gain; measure actual
