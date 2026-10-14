@@ -127,9 +127,12 @@ not a completed paging fix; all subsequent implementation remains unchecked.
   65,536 vs 16,384 bytes. All 160 real greedy IDs identical; sampled wire peak
   17.917 GiB and no new Swapouts on this run. Implementation commit `182006e`.
 - [ ] **T5g — stage sparse raw embeddings for ordinary chat.**
-  Files: `crates/engine/src/model.rs`, focused embedding tests and notes. Add
-  bounded raw-row staging, cross-encoder completion before CPU token/read/write,
-  identity row IDs, existing GPU conversion/scaling and a full-table A/B control.
+  Files: `crates/engine/src/model.rs`, `crates/engine/src/weights.rs`, focused
+  embedding/residency tests and notes. Add bounded raw-row staging,
+  cross-encoder completion before CPU token/read/write, identity row IDs,
+  existing GPU conversion/scaling and a full-table A/B control. Sparse mode must
+  omit the full embedding view from the existing Metal residency set while
+  preserving its mmap and lock; all packed hot-weight views remain registered.
   Test BF16/FP16 exact bits, nonzero source offsets, duplicate/boundary IDs,
   invalid IDs, short buffers and real pipelined generation. Sabotage row selection
   or offset handling; verify failing diagnostics. Record output equality,

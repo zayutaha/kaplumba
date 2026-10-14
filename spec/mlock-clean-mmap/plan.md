@@ -269,7 +269,13 @@ of which elements the kernel indexes.
 T5f changes `ShardReader`'s one-buffer-per-shard cache into a cache keyed by
 page-rounded `(start, length)` tensor ranges. Return offsets relative to those
 ranges; validate EOF, overflow, repeated ranges, page boundaries and actual GPU
-bytes. T5g adds bounded raw embedding-row scratch to `ForwardScratch`. At the
+bytes. T5g adds bounded raw embedding-row scratch to `ForwardScratch`. It also
+excludes the full source embedding view from the model's existing residency set
+for the sparse path: merely avoiding a kernel binding is insufficient while
+the full-table view remains explicitly registered. The source mmap stays alive
+and locked by the current hot-page policy; every packed hot-weight view remains
+in the residency set. `KAPLUMBA_FULL_EMBEDDING=1` retains both the full binding
+and its residency registration as the diagnostic control. At the
 common ordinary forward boundary, finish preceding queue work, read actual input
 IDs from the active token buffer, copy raw rows from the mapped embedding, stage
 identity row IDs, and call the existing embedding kernel with the gathered table.

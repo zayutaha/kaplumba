@@ -230,7 +230,10 @@ a future implementation step.
     Preserve the existing GPU BF16/FP16 conversion, rounding and scaling exactly.
     When a pipelined input token is still on the GPU, wait for the preceding queue
     work before reading it or reusing staging. Measure the synchronization cost
-    and wired-memory reduction. Keep a diagnostic full-table control for A/B.
+    and wired-memory reduction. Exclude the full source embedding view from the
+    existing Metal residency set while sparse staging is active; retain the
+    mapped source and its `mlock`, and keep all packed hot-weight views registered.
+    Keep a diagnostic full-table control for A/B.
 
 ## Acceptance criteria
 

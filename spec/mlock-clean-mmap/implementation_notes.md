@@ -867,3 +867,14 @@ remained 183,276,527 throughout this run. Active graphics 319.7 MiB virtual,
 159.3 MiB resident, zero swapped; mapped weights remained 11.2 GiB clean/
 resident/unswapped. The different desktop conditions do not close AC3 or prove
 a throughput change. T5g must avoid GPU-binding the full embedding table.
+
+### T5g scope correction — residency registration
+
+The existing `TextWeights::create_residency_set()` registers every zero-copy
+view, including the 2.82 GB source embedding view. Avoiding a GPU embedding
+kernel bind alone would therefore leave that entire resource explicitly
+requested resident. T5g now excludes only that view in sparse ordinary-chat
+mode. Its source mmap and current POSIX lock remain alive; packed hot-weight
+views and arena allocations stay registered. The full-table diagnostic retains
+its prior registration. This is a correction to membership in the existing set,
+not a new residency policy. No code has been changed for T5g yet.
