@@ -48,7 +48,7 @@
   by tests; `cargo test -p kaplumba-engine --lib` passed 145/145 (2 ignored),
   and `cargo test -p kaplumba-engine --test multi_turn_chat` passed 7/7 (4
   model tests ignored). Full model runs remain in T6. Completed 2026-10-14;
-  implementation commit recorded below.
+  implementation commit `5b25451`.
 - [x] **T5 — prove no regressions in memory and command lifecycle.** Files:
   focused tests and this folder's notes. Demonstrate deferred buffers remain
   bounded to one step, only submit after row staging, and release on EOS/error.
@@ -58,7 +58,7 @@
   tests ignored). Encoder readiness sabotage was recorded under T2. The latest
   `scripts/gpuq status` reported 0.9 GiB top-unused and 1,908 MiB swap, so no
   model was loaded and no memory claim is made. Completed 2026-10-14; commit
-  recorded below.
+  `5b25451`.
 - [ ] **T6 — benchmark, attribute, and reconcile claims.** Files: this folder
   and specific superseded historical notes. Run interleaved canonical decode
   acceptance (at least five pairs), plus 1k/2k/8k ordinary-chat comparisons
