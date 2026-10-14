@@ -20,11 +20,12 @@
   error/drop, max bound, and terminal misuse; sabotage early commit and record
   the named failing assertion. `cargo test -p kaplumba-kernels --lib` passed
   36/36 before adding the bound test; `cargo test -p kaplumba-kernels deferred_
-  --lib` passed 3/3 after it. Early-commit sabotage failed with
+  --lib` passed 4/4 after it. An empty cache-growth queue barrier preserves
+  deferred mode for subsequent rolls. Early-commit sabotage failed with
   `a rolled buffer was submitted before shared input staging` (`Committed` vs
   `NotEnqueued`). A 64-buffer cap test stalled in Metal command-buffer creation;
   reduced the explicit bound to 32, and the 32-buffer overflow case passed.
-  Completed `2026-10-14`; commit `87630f7`.
+  Completed `2026-10-14`; implementation commits `87630f7` and T2b follow-up.
 - [ ] **T3 — separate sparse row staging from forward encoding.** Files:
   `crates/engine/src/model.rs` and focused model tests. Remove unconditional
   steady-state drains, encode sparse pipelined work against bounded row scratch,

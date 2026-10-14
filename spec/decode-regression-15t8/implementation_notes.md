@@ -68,3 +68,8 @@
   6.7 GiB active pages, and 1,948 MiB existing swap. Per §10 this is below the
   safe available-memory threshold; no model run was started. T1's matched model
   comparison remains open.
+- Follow-up before T3: an empty `flush_and_wait_queue` is used by the sliding
+  KV growth path before any new decode dispatch. Deferred mode now survives
+  this barrier; otherwise growth would silently restore immediate commits for
+  the rest of that step. `cargo test -p kaplumba-kernels deferred_ --lib` passes
+  4/4 including this case.

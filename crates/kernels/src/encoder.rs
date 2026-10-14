@@ -597,7 +597,6 @@ impl<'q> MetalEncoder<'q> {
             buffer.commit();
             self.in_flight.push(buffer);
         }
-        self.defer_submissions = false;
     }
 
     /// End the current compute encoder, commit, and wait, without consuming self.
@@ -697,6 +696,7 @@ impl<'q> MetalEncoder<'q> {
         self.submit_deferred();
         self.command_buffer.commit();
         self.in_flight.push(self.command_buffer.clone());
+        self.defer_submissions = false;
         Ok(())
     }
 
@@ -723,6 +723,7 @@ impl<'q> MetalEncoder<'q> {
         self.end();
         self.submit_deferred();
         self.command_buffer.commit();
+        self.defer_submissions = false;
         self.command_buffer.wait_until_completed();
         // Buffers rolled out mid-forward are committed but unfinished. On one
         // in-order queue the wait above already covers them, but drain them
@@ -824,6 +825,7 @@ impl<'q> MetalEncoder<'q> {
         self.end();
         self.submit_deferred();
         self.command_buffer.commit();
+        self.defer_submissions = false;
         self.command_buffer.wait_until_completed();
         for buffer in std::mem::take(&mut self.in_flight) {
             buffer.wait_until_completed();
@@ -1123,6 +1125,28 @@ kernel void burn(device float* out [[buffer(0)]],
                 .to_string()
                 .contains("deferred command-buffer limit 32"),
             "unexpected bound error: {error}"
+        );
+        encoder.abandon();
+    }
+
+    #[test]
+    fn empty_queue_barrier_preserves_deferred_mode_for_cache_growth() {
+        let Some((_device, queue, pipeline, out)) = burn_context() else {
+            return;
+        };
+        let mut encoder = MetalEncoder::new(&queue).expect("encoder");
+        encoder.set_max_dispatches(1);
+        encoder.defer_submissions();
+        encoder
+            .flush_and_wait_queue()
+            .expect("empty cache-growth barrier");
+        assert!(encoder.defer_submissions);
+
+        burn(&mut encoder, &pipeline, &out, CHEAP_ITERS);
+        assert_eq!(encoder.deferred.len(), 1);
+        assert_eq!(
+            encoder.deferred[0].status(),
+            MTLCommandBufferStatus::NotEnqueued
         );
         encoder.abandon();
     }
