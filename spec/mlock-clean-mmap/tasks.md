@@ -100,12 +100,15 @@ not a completed paging fix; all subsequent implementation remains unchecked.
   synchronization and chunk capacity separately; require diagnostic failures.
   Verify attention/greedy equality despite changed physical scan order. Completed
   `2026-10-14`; code/test commit `4e36728`.
-- [ ] **T5c — correct reclaimability and capacity reporting.**
-  Files: `scripts/gpuq`, existing report tests and precisely selected load
-  diagnostics. Explain active-page counts accurately; remove claims that wired
-  hot weights are evictable and that every low-memory load is safe. Preserve
-  warning-and-continue, unit parsing and the engine-owned GPU lock. Test both
-  healthy/degraded reports and demonstrate failure under wrong messaging.
+- [x] **T5c — correct reclaimability and capacity reporting.**
+  Files: `scripts/gpuq`, `scripts/gpuq_mem.sh`, `scripts/test_gpuq_mem.sh`.
+  Status now labels `top`'s unused number and system-wide active pages; removed
+  claims that clean weights can be evicted on demand and that a memory snapshot
+  proves a model load safe. Preserved warning-and-continue, parsing threshold,
+  and engine-owned lock. `bash scripts/test_gpuq_mem.sh` passed; sabotaging the
+  status with “clean reclaimable pages are evicted on demand” failed at the new
+  live-report assertion. Completed `2026-10-14`; implementation commit
+  `d0f8cdc`.
 - [ ] **T5d — demonstrate selected reduction and resume T4.**
   Files: acceptance evidence and notes. A/B/A/B idle/short/1k/2k/8k workloads,
   repeated turns and idle/resume. Measure demand and replacement peaks, confirm
