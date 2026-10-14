@@ -1028,7 +1028,13 @@ where
                             crate::model::HeadPick::Argmax,
                         )?;
                         crate::model::record_decode_step_tallies(&next_enc);
-                        next_enc.commit_terminal().map_err(ModelError::from)?;
+                        let row_pending = model.pipelined_embedding_row_pending();
+                        if !row_pending {
+                            if let Err(error) = next_enc.commit_terminal() {
+                                model.retract_gpu_caches(1);
+                                return Err(ModelError::from(error).into());
+                            }
+                        }
 
                         in_flight_enc.wait();
                         let step_ms = step_start.elapsed().as_secs_f64() * 1e3;
@@ -1038,17 +1044,44 @@ where
                         kaplumba_kernels::pipeline_audit::assert_no_builds_since(load_mark);
 
                         let step_token = model.read_host_token(in_flight_step);
-                        generated_ids.push(step_token);
-                        if let Some(chunk) = detokenizer.push(step_token)? {
-                            text.push_str(&chunk);
-                            on_text(&chunk)?;
+                        let output_result = (|| -> Result<(), GenerationError> {
+                            generated_ids.push(step_token);
+                            if let Some(chunk) = detokenizer.push(step_token)? {
+                                text.push_str(&chunk);
+                                on_text(&chunk)?;
+                            }
+                            Ok(())
+                        })();
+                        if let Err(error) = output_result {
+                            if row_pending {
+                                let _ = model.discard_pipelined_embedding_row(slot);
+                            } else {
+                                next_enc.wait();
+                            }
+                            model.retract_gpu_caches(1);
+                            return Err(error);
                         }
 
                         if config.eos_ids.contains(&step_token) {
                             stopped_on_eos = true;
-                            next_enc.wait();
+                            if row_pending {
+                                model.discard_pipelined_embedding_row(slot)?;
+                            } else {
+                                next_enc.wait();
+                            }
                             model.retract_gpu_caches(1);
                             break;
+                        }
+
+                        if row_pending {
+                            if let Err(error) =
+                                model.stage_pipelined_embedding_row(&mut next_enc, slot)
+                            {
+                                let _ = model.discard_pipelined_embedding_row(slot);
+                                model.retract_gpu_caches(1);
+                                return Err(ModelError::from(error).into());
+                            }
+                            next_enc.commit_terminal().map_err(ModelError::from)?;
                         }
 
                         in_flight_enc = next_enc;

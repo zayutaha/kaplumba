@@ -605,8 +605,11 @@ fn the_pipelined_chat_loop_encodes_before_it_waits_and_commits_after() {
         .find("previous.wait()")
         .expect("the pipelined loop must wait on the previous encoder");
     let commit = pipelined
-        .find("commit_terminal()")
+        .rfind("enc.commit_terminal()")
         .expect("the pipelined loop must commit a command buffer");
+    let stage = pipelined
+        .find("stage_pipelined_embedding_row(&mut enc")
+        .expect("the prepared sparse row must be staged before submission");
 
     assert!(
         encode < wait,
@@ -618,11 +621,69 @@ fn the_pipelined_chat_loop_encodes_before_it_waits_and_commits_after() {
     );
 
     assert!(
-        wait < commit,
+        wait < stage && stage < commit,
         "the pipelined chat loop commits step N+1 at offset {commit}, before waiting \
-         on step N at offset {wait}. Committing before the EOS check submits a step \
+         on step N at offset {wait}, or stages the sparse row after commit at {stage}. \
+         Committing before the EOS check submits a step \
          whose result is then discarded -- a constant ~132 ms on every EOS-terminated \
          turn, which in a multi-turn chat is most of them."
+    );
+
+    let model_src = std::fs::read_to_string(format!(
+        "{}/src/model.rs",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("model.rs");
+    let step = model_src
+        .split("pub fn forward_step_pipelined(")
+        .nth(1)
+        .and_then(|body| body.split("pub fn read_host_token").next())
+        .expect("forward_step_pipelined body");
+    let defer = step
+        .find("encoder.defer_submissions()")
+        .expect("sparse pipeline must defer command-buffer submission");
+    let forward = step
+        .find("self.forward_chunk_pick(")
+        .expect("the decode forward must be encoded");
+    let queue_wait = step
+        .find("encoder.flush_and_wait_queue()")
+        .expect("synchronous sparse paths retain their required queue barrier");
+    let wait_guard = step[..queue_wait]
+        .rfind("if self.sparse_embedding && !defer_sparse_embedding")
+        .expect("steady-state sparse decode must guard its queue barrier");
+    assert!(
+        defer < forward && wait_guard < queue_wait,
+        "sparse decode must defer work without an unconditional nested queue wait"
+    );
+}
+
+#[test]
+fn cli_sparse_row_is_staged_after_wait_and_before_submit() {
+    let src = std::fs::read_to_string(format!(
+        "{}/src/generate.rs",
+        env!("CARGO_MANIFEST_DIR")
+    ))
+    .expect("generate.rs");
+    let pipelined = src
+        .split("for step_idx in 1..total_to_generate")
+        .nth(1)
+        .and_then(|body| body.split("if !stopped_on_eos").next())
+        .expect("pipelined generation loop");
+    let encode = pipelined
+        .find("forward_step_pipelined(")
+        .expect("encode the next step");
+    let wait = pipelined
+        .find("in_flight_enc.wait()")
+        .expect("wait for the prior step");
+    let stage = pipelined
+        .find("stage_pipelined_embedding_row(&mut next_enc")
+        .expect("stage the raw row");
+    let commit = pipelined
+        .rfind("next_enc.commit_terminal()")
+        .expect("submit the prepared step");
+    assert!(
+        encode < wait && wait < stage && stage < commit,
+        "CLI pipeline order must be encode N+1, wait/read N, stage row, then submit N+1"
     );
 }
 

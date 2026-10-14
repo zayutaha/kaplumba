@@ -549,22 +549,53 @@ impl<'a> ChatSession<'a> {
                         // *encoding* (`model.rs:1720`), not while executing, so an
                         // uncommitted step has still moved the position.
                         if pending.is_some() {
+                            if self.model.pipelined_embedding_row_pending() {
+                                self.model
+                                    .discard_pipelined_embedding_row(step % 2)
+                                    .map_err(ModelError::from)?;
+                            } else if let Some(enc) = pending.as_mut() {
+                                // A diagnostic/full-embedding forward can have
+                                // rolled and submitted buffers before EOS is
+                                // known. Retire them before retracting host KV.
+                                enc.commit_terminal().map_err(ModelError::from)?;
+                                enc.wait();
+                            }
                             self.model.retract_gpu_caches(1);
                         }
                         break;
                     }
-                    generated.push(token);
-                    if show_token_timing {
-                        let now = std::time::Instant::now();
-                        let delta_ms = now.duration_since(last_token_instant).as_secs_f64() * 1000.0;
-                        eprintln!("\n[timing] token {}: id={} delta={:.2} ms", generated.len(), token, delta_ms);
-                        last_token_instant = now;
-                    }
-                    if let Some(chunk) = detokenizer.push(token)? {
-                        if !chunk.is_empty() {
-                            reply.push_str(&chunk);
-                            on_text(&chunk).map_err(ChatError::from_output)?;
+                    let output_result = (|| -> Result<(), ChatError> {
+                        generated.push(token);
+                        if show_token_timing {
+                            let now = std::time::Instant::now();
+                            let delta_ms =
+                                now.duration_since(last_token_instant).as_secs_f64() * 1000.0;
+                            eprintln!(
+                                "\n[timing] token {}: id={} delta={:.2} ms",
+                                generated.len(),
+                                token,
+                                delta_ms
+                            );
+                            last_token_instant = now;
                         }
+                        if let Some(chunk) = detokenizer.push(token)? {
+                            if !chunk.is_empty() {
+                                reply.push_str(&chunk);
+                                on_text(&chunk).map_err(ChatError::from_output)?;
+                            }
+                        }
+                        Ok(())
+                    })();
+                    if let Err(error) = output_result {
+                        if let Some(enc) = pending.as_mut() {
+                            if self.model.pipelined_embedding_row_pending() {
+                                let _ = self.model.discard_pipelined_embedding_row(step % 2);
+                            } else if enc.commit_terminal().is_ok() {
+                                enc.wait();
+                            }
+                            self.model.retract_gpu_caches(1);
+                        }
+                        return Err(error);
                     }
                 }
 
@@ -579,7 +610,18 @@ impl<'a> ChatSession<'a> {
                 // idle for well under a millisecond. What it buys is that a step
                 // whose token turns out to be EOS is never submitted at all.
                 if let Some(mut enc) = pending {
-                    enc.commit_terminal().map_err(ModelError::from)?;
+                    if let Err(error) = self
+                        .model
+                        .stage_pipelined_embedding_row(&mut enc, step % 2)
+                    {
+                        let _ = self.model.discard_pipelined_embedding_row(step % 2);
+                        self.model.retract_gpu_caches(1);
+                        return Err(ModelError::from(error).into());
+                    }
+                    if let Err(error) = enc.commit_terminal() {
+                        self.model.retract_gpu_caches(1);
+                        return Err(ModelError::from(error).into());
+                    }
                     prev = Some(enc);
                 }
                 step += 1;

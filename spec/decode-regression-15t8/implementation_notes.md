@@ -101,3 +101,21 @@
   BF16/FP16 kernel comparison failed at
   `model::sparse_embedding_tests::gathered_embedding_kernel_is_bit_identical_for_bf16_and_fp16`
   with `bf16=false`; restored the correct index.
+
+## 2026-10-14 — T4 chat/CLI integration and T5 lifecycle checks
+
+- Both generation loops now keep sparse-row dependent command buffers deferred
+  until after the prior prediction is waited and the exact mmap row has been
+  staged. EOS drops that unsubmitted work and retracts the speculative KV
+  position. Error callbacks discard pending row state or retire already-submitted
+  diagnostic work before retracting cache state.
+- Chat and CLI static ordering tests verify encode-next → wait/read-prior →
+  stage-row → submit-next. The multi-turn chat suite passed 7 tests; 4
+  model-backed tests were ignored because no model run was safe/available.
+- `cargo test -p kaplumba-engine --lib`: 145 passed, 2 ignored.
+  `cargo test -p kaplumba-kernels --lib`: 38 passed. `git diff --check` clean.
+- Model runs remain blocked by measured host memory state, not GPU lock
+  contention: latest `scripts/gpuq status` reported 0.9 GiB top-unused, 8.2 GiB
+  system active pages, and 1,908 MiB swap. Per AGENTS.md §10, no model was
+  started. The requested >=15.8 tok/s and `--chat` verification are not yet
+  demonstrated; T1/T6 remain open.

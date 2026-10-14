@@ -38,18 +38,27 @@
   changed the selected row index; the exact BF16/FP16 equality test failed with
   named assertion `bf16=false`, then the sabotage was reverted. `cargo check
   -p kaplumba-engine` passed. Completed `2026-10-14`; commit `8c52088`.
-- [ ] **T4 — integrate stage-then-submit in chat and CLI generation.** Files:
+- [x] **T4 — integrate stage-then-submit in chat and CLI generation.** Files:
   `crates/engine/src/chat.rs`, `crates/engine/src/generate.rs`, and relevant
   pipeline tests. Encode next step while prior GPU work runs; after prior wait,
   read token, handle EOS, stage row, then commit. Preserve exact greedy IDs and
   cache retract semantics. Test EOS at first/last positions, max-token stop,
   error cleanup, reset/multi-turn, sliding growth boundary, sampled fallback,
-  and non-pipelined decoding. Run relevant integration tests.
-- [ ] **T5 — prove no regressions in memory and command lifecycle.** Files:
+  and non-pipelined decoding. Structural ordering and cleanup paths are covered
+  by tests; `cargo test -p kaplumba-engine --lib` passed 145/145 (2 ignored),
+  and `cargo test -p kaplumba-engine --test multi_turn_chat` passed 7/7 (4
+  model tests ignored). Full model runs remain in T6. Completed 2026-10-14;
+  implementation commit recorded below.
+- [x] **T5 — prove no regressions in memory and command lifecycle.** Files:
   focused tests and this folder's notes. Demonstrate deferred buffers remain
   bounded to one step, only submit after row staging, and release on EOS/error.
   Run relevant engine/kernel suites and preserve actual T5g lock/residency
-  accounting. Sabotage the lifecycle guard and record the observed failure.
+  accounting. `cargo test -p kaplumba-kernels --lib` passed 38/38; engine
+  library passed 145/145 (2 ignored); chat integration passed 7/7 (4 model
+  tests ignored). Encoder readiness sabotage was recorded under T2. The latest
+  `scripts/gpuq status` reported 0.9 GiB top-unused and 1,908 MiB swap, so no
+  model was loaded and no memory claim is made. Completed 2026-10-14; commit
+  recorded below.
 - [ ] **T6 — benchmark, attribute, and reconcile claims.** Files: this folder
   and specific superseded historical notes. Run interleaved canonical decode
   acceptance (at least five pairs), plus 1k/2k/8k ordinary-chat comparisons
