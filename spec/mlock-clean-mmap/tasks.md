@@ -99,7 +99,7 @@ not a completed paging fix; all subsequent implementation remains unchecked.
   invalid inputs, no-op growth and queued GPU writes. Sabotage ring remapping,
   synchronization and chunk capacity separately; require diagnostic failures.
   Verify attention/greedy equality despite changed physical scan order. Completed
-  `2026-10-14`; code/test commit recorded in the metadata follow-up.
+  `2026-10-14`; code/test commit `4e36728`.
 - [ ] **T5c — correct reclaimability and capacity reporting.**
   Files: `scripts/gpuq`, existing report tests and precisely selected load
   diagnostics. Explain active-page counts accurately; remove claims that wired

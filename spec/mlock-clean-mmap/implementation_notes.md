@@ -745,7 +745,6 @@ and independent `user_wired_count` for every hot region are still open; the
 whole graphics region is not attributed to KV solely from aggregate shape.
 
 The current implementation leaves PID 39841 open at the interactive prompt,
-using session 38102. Do not start another model until it exits. T5b changes are
-not yet documented in a commit hash here; task metadata is updated by the
-immediate follow-up commit. T5a, T5c, T5d and T4 remain open; no claim of green
+using session 38102. Do not start another model until it exits. T5b code/test
+commit `4e36728`. T5a, T5c, T5d and T4 remain open; no claim of green
 pressure/no-swap during generation or full 1k/2k/8k acceptance.
