@@ -1385,3 +1385,90 @@ Reproduction used the release `dflash_golden` ignored tests with
 test binary for process footprint. See task F1d for per-prompt streams and
 candidate status. This candidate experiment is complete; the overall 30 tok/s
 acceptance remains open.
+
+## 2026-10-14 — F1e official 5-bpw candidate (in progress)
+
+The Hugging Face tree for `turboderp/gemma4-31b-it-DFlash-exl3`, branch
+`5.00bpw`, lists one 961,045,318-byte `model.safetensors` shard with LFS SHA-256
+`5ae9ffe6f4c6250d7f08f0265b1aaff17bca6645b0879097e24aa447bd2f95ca`. Its
+`config.json` matches the local five-layer DFlash geometry, block size 16, tap
+IDs `[1, 12, 23, 35, 46, 57]`, 8 KV heads × 128, and declares 5 bpw. Download
+to `~/.kaplumba/models/Drafter-turboderp-5bpw` was started after the F1e task
+was added in `d155172`; no model test has run yet. The transfer is slow (~1.1
+MB/s); verify full file size/hash and header alignment before loading. The
+pre-run `gpuq status` was 16.0 GiB available with 3160 MiB system swap; rerun
+the required guard immediately before any GPU test.
+
+The in-progress shard already exposes a 16,558-byte Safetensors header. Its 36
+trellis absolute starts are all 2 mod 4; the data section begins at byte 16,566.
+After download, retain the original and make the isolated test copy with two
+trailing JSON whitespace bytes (header length 16,560, data offset 16,568), then
+verify the packed payload SHA-256 before testing the mmap/no-copy route.
+
+The download completed at exactly 961,045,318 bytes and matched the expected
+LFS SHA-256. The test copy is 961,045,320 bytes; the original remains in
+`Drafter-turboderp-5bpw-source`. The packed-payload hash is identical before and
+after normalization:
+`4efc195cae66af89741db141cafe9f9a2c78b17704735e50c011b376cab8bbc6`.
+The normalized header is 16,560 bytes; all 36 packed starts are now 0 mod 4.
+Header rate dimension is 80 for all trellises (5 bpw), with 166 recognized
+tensors and the expected tap/attention config.
+
+`dflash_exl3_decode_matches_host_on_every_linear` passed all 36 linears; the
+worst absolute GPU/host error was 0.002120. Loaded alone, the candidate mmap
+loader pinned all 36 trellis tensors, 0.89 GiB. Under a target-plus-drafter
+stream, the target pinned 11.22 GiB, then candidate `mlock` failed on the first
+108,396,544-byte range after zero drafter bytes were locked. Existing 4-bpw
+also failed at its first 86,720,512-byte range. The candidate and A/B controls
+both had that residency limitation.
+
+The complete 3 × 200 greedy tests matched the sequential target at every block
+size. Results (tok/s, accepted drafts, and rounds in prompt order):
+
+```text
+B4:  6.18 / 5.84 / 6.00; accepted 118 / 115 / 115; rounds 82 / 87 / 84; median 6.00
+B8:  5.57 / 5.29 / 5.53; accepted 131 / 125 / 124; rounds 74 / 78 / 75; median 5.53
+B16: 3.92 / 3.80 / 3.91; accepted 130 / 126 / 124; rounds 75 / 77 / 75; median 3.91
+plain target during these runs: 12.31–12.37 tok/s
+```
+
+`/usr/bin/time -l` at B4/B8/B16 reported peak `phys_footprint` of
+14,533,208,336 / 14,538,041,640 / 14,552,345,400 bytes. Each process reported
+zero process swapouts and zero block input operations; system swap moved from
+3048 MiB before the B4 run to 3175 MiB after B8, so do not infer absence of
+system-wide pressure from process counters alone.
+
+Interleaved prompt-0 B4 encoded A/B/A/B used the existing 4-bpw drafter for A
+and the official candidate for B. All four streams were greedy-exact:
+
+```text
+A (4 bpw): 6.22 / 6.24 tok/s, accepted 115 each
+B (5 bpw): 6.46 / 6.46 tok/s, accepted 118 each
+```
+
+The 5-bpw candidate gains about 3.5% on that one prompt under the best encoded
+B4 route. It does not improve B4 throughput across the three prompts in the
+default slice route, gives no B8/B16 advantage, and remains far below 30 tok/s.
+Do not promote it. The result reinforces the prior 6-bpw finding: small precision
+or calibration gains do not solve the long-prefix survival and complete-round
+cost limits. F1e is evaluated; AC5 remains unmet.
+
+Commands, all through `scripts/gpuq try --` after `scripts/gpuq status`:
+
+```bash
+KAPLUMBA_DFLASH_DIR="$HOME/.kaplumba/models/Drafter-turboderp-5bpw" \
+  target/release/deps/dflash_golden-fa25a1842fb94bb7 \
+  dflash_exl3_decode_matches_host_on_every_linear --exact --nocapture
+
+KAPLUMBA_TEST_MODEL="$HOME/.kaplumba/models/Gxma-repacked" \
+KAPLUMBA_DFLASH_DIR="$HOME/.kaplumba/models/Drafter-turboderp-5bpw" \
+KAPLUMBA_TEST_DFLASH_BLOCK_SIZE=4 KAPLUMBA_TEST_PROMPT_COUNT=3 \
+  target/release/deps/dflash_equivalence-2b02cd992899a095 \
+  dflash_greedy_stream_matches_target_for_200_tokens_on_three_prompts \
+  --exact --ignored --nocapture --test-threads=1
+```
+
+For B8/B16, set `KAPLUMBA_TEST_DFLASH_BLOCK_SIZE` to `8`/`16`. The repeated
+A/B/A/B run used the same command with `KAPLUMBA_DFLASH_GPU_BLOCK=1` and
+`KAPLUMBA_TEST_PROMPT_COUNT=1`, alternating `Drafter` and the 5-bpw path. No
+project code changed for F1e.
