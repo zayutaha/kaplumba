@@ -33,5 +33,15 @@ Running log per `AGENTS.md §5`. Factual and dense.
    Benchmarked `colmajor_1col_sk2` against `colmajor_2col_sk2` and `colmajor_2col_sk4` across all 60 layers on `Gxma-repacked`. `colmajor_1col_sk2` achieves 13.45 ms (193.4 GB/s effective bandwidth), outperforming `2col_sk2` (13.48 ms) and SK4 (13.50 ms) while halving per-threadgroup reduction. Bit-exactness verified against CPU reference in `live_kernel_bit_exact.rs` with fail-first sabotage test.
 6. **Full-attention decode scalability (T4):**
    Lowered `decode_flash_min_keys` default from 4096 to 512. In Gemma 4 architecture, 50 out of 60 layers are sliding-window attention (fixed 1,024 key window), and only 10 layers are full-attention. Previously, for context lengths between 512 and 4096 tokens, full-attention layers used the scalar split-attention kernel which took ~7.45 ms across the 10 layers. With MMA Flash decode active for keys $\ge 512$, full attention scales efficiently with online-softmax key reduction, dropping attention runtime to 6.55 ms at 2k context (saving ~0.9 ms/token). Sabotage test (`scale * 2.0`) failed as expected and 8/8 tests passed on clean code.
+7. **End-to-End Context Scalability Measurements (T5):**
+   Canonical 32 generated tokens on `Gxma-repacked` across prompt context lengths:
+   - **31 tokens:** 14.98 tok/s (greedy), 14.92 tok/s (sampled: `temp=1.0, top_k=64, top_p=0.95`). Peak RSS: 12.58 GiB. Output: `4, 5, 6, 7, 8, 9, 10, 11, 12, 13`.
+   - **1,994 tokens (2k):** 13.99 tok/s (greedy), 14.09 tok/s (sampled), prefill: 89.5 tok/s. Peak RSS: 12.69 GiB. Output: `Albert Einstein’s Theory of Relativity is actually composed of two separate theories...`
+   - **3,974 tokens (4k):** 13.99 tok/s (greedy), prefill: 85.5 tok/s. Peak RSS: 12.71 GiB. Output: `Because you asked many times, I will provide a comprehensive explanation...`
+   - **7,994 tokens (8k):** 13.76 tok/s (greedy), prefill: 81.7 tok/s. Peak RSS: 12.85 GiB. Output: coherent.
+   - **15,974 tokens (16k):** 13.05 tok/s (greedy), prefill: 73.8 tok/s. Peak RSS: 12.86 GiB. Output: coherent.
+   - **Swap & Memory Safety:** Zero swap growth detected during 8k and 16k execution (`sysctl vm.swapusage` showed zero swap paging). Peak resident memory at 16k context remained $\le 12.86\text{ GiB}$, well within the 24 GiB unified RAM capacity.
+   - **Attention Scaling Flatness:** Total decode step time increased from 66.7 ms (short context) to 76.6 ms (16k context) — an increase of only 9.9 ms across the entire 60-layer model (0.165 ms/layer), confirming that MMA Flash attention scales flatly without latency spikes.
+
 
 
