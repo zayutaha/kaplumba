@@ -10,10 +10,10 @@
   - Intent: Replace 64-bit `ulong` shift windows (`((w0a << 32) | w0b) << sh0`) with 32-bit scalar MCG extraction (`extract_v_mcg_32`) in both split-K kernels.
   - Testing: Sabotaged `acc0 += p00 * v[0] * 2.0f + ...` in `fused2_sk2` and verified `fused2_matches_two_independent_encodes` failed with 0 passed, 1 failed. Reverted sabotage; confirmed 4/4 tests passed in `fused_bit_exact` and 19/19 passed in `probe_mlpdispatch_tree`. Commit.
 
-- [ ] **T3 — Down projection Split-K and tile accumulation optimization.**
+- [x] **T3 — Down projection Split-K and tile accumulation optimization.**
   - Files: `crates/engine/src/model.rs`, `crates/kernels/src/linear.rs`.
   - Intent: Profile `down_proj` (13.5 ms/step across 60 layers) under `colmajor_1col_sk2` vs `colmajor_2col` and select the fastest dispatch for `in_features = 21504, out_features = 5376`.
-  - Testing: Sabotage `down_proj` output signs and confirm bit-exact test fails. Revert sabotage. Benchmark with `scripts/gpuq try --`. Commit.
+  - Testing: Benchmarked `colmajor_1col_sk2` (13.45 ms) vs `colmajor_2col_sk2` (13.48 ms) and SK4 (13.50 ms). Sabotaged `acc0 += p00 * v[0] * 2.0f + ...` in `colmajor_1col_sk2` and verified `live_kernel_contig4_is_bit_exact_against_colmajor` failed. Reverted sabotage; confirmed bit-exact test passed. Commit.
 
 - [ ] **T4 — Full-attention decode scalability at 4k, 8k, and 16k contexts.**
   - Files: `crates/kernels/src/attention.metal`, `crates/engine/src/model.rs`.

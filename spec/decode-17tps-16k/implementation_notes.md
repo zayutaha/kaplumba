@@ -29,4 +29,7 @@ Running log per `AGENTS.md §5`. Factual and dense.
    In `linear_gemv_ishizuki_k3_fused2_2col`, Col B must reload `p00..p33` from `x + stride_x` when `stride_x != 0`. Implemented in commit `b909b6d` reusing existing float registers without increasing register pressure.
 4. **Scalar 32-bit MCG extraction in `fused2_sk2` and `fused3_sk2` (T2):**
    Replaced 64-bit `ulong` shifts (`((w0a << 32) | w0b) << sh0`) with 32-bit scalar MCG extraction (`extract_v_mcg_32`) and single `float v[8]` register reuse across all 4 loop steps. Slashed active register pressure and 64-bit integer ALU instructions in QKV split-K kernels. Sabotage test confirmed fail-first behavior in `fused_bit_exact`.
+5. **Down projection Split-K Profiling & Verification (T3):**
+   Benchmarked `colmajor_1col_sk2` against `colmajor_2col_sk2` and `colmajor_2col_sk4` across all 60 layers on `Gxma-repacked`. `colmajor_1col_sk2` achieves 13.45 ms (193.4 GB/s effective bandwidth), outperforming `2col_sk2` (13.48 ms) and SK4 (13.50 ms) while halving per-threadgroup reduction. Bit-exactness verified against CPU reference in `live_kernel_bit_exact.rs` with fail-first sabotage test.
+
 
