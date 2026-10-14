@@ -10,8 +10,8 @@ negative control before any coverage claim, notes, status update and commit.
   inspect the selected checkpoint's headers, and reproduce private-versus-shared
   locking in an isolated scratch probe. Confirm user scope and preserve real
   `mlock`, warning-and-continue and the normal-chat memory/I/O goal. Validate
-  documentation consistency and `git diff --check`; record the documentation
-  commit after creation. This closes the drafting task only.
+  documentation consistency and `git diff --check`. Documentation commit:
+  `5abcb0c`. This closes the drafting task only.
 - [ ] **T1 — restore shared backing for the real loader.**
   Files: `crates/engine/src/weights.rs`,
   `crates/engine/tests/clean_mmap_locking.rs`, notes. Change only the shard mmap

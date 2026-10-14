@@ -185,3 +185,8 @@ No full model was loaded for this investigation. No new green-pressure, paging,
 throughput or zero-swap acceptance result is claimed. D0 validation is limited
 to source comparison, header arithmetic, the standalone mechanism probe and
 documentation review. Product implementation tasks remain unchecked.
+
+D0 draft committed as `5abcb0c`; staged `git diff --check` passed. The four spec
+documents are the only repository changes. The scratch probe and its logs were
+removed after preserving source, commands and observations here; no process or
+temporary project harness remains.
