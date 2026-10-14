@@ -3,12 +3,12 @@
 - [x] **T1 — Fix grid launch sizing for `linear_gemv_ishizuki_k3_fused2_2col` in `encode_gemv_fused2_mlp`.**
   - Files: `crates/kernels/src/linear.rs`, `crates/engine/tests/probe_mlpdispatch_tree.rs`.
   - Intent: `fused2_2col` calculates 2 columns of A and 2 columns of B per threadgroup, meaning `pairs_a = tiles_a / 2` threadgroups cover the entire computation. Launching `(tiles_a + tiles_b) / 2 = tiles_a` threadgroups causes exactly half the threadgroups to exit immediately on `tgid >= pairs_a`, polluting the Metal command queue. Launch exactly `tiles_a / 2` threadgroups.
-  - Testing: Sabotaged threadgroup count to `tiles_a / 4` and verified `probe_mlpdispatch_tree` failed with `left: 336 right: 672`. Reverted sabotage. Ran `cargo test -p kaplumba-engine --test probe_mlpdispatch_tree` and confirmed 19/19 tests passed. Commit: pending.
+  - Testing: Sabotaged threadgroup count to `tiles_a / 4` and verified `probe_mlpdispatch_tree` failed with `left: 336 right: 672`. Reverted sabotage. Ran `cargo test -p kaplumba-engine --test probe_mlpdispatch_tree` and confirmed 19/19 tests passed. Commit: fc51f24.
 
-- [ ] **T2 — Scalar 32-bit MCG extraction in `linear_gemv_ishizuki_k3_fused2_sk2` and `fused3_sk2`.**
+- [x] **T2 — Scalar 32-bit MCG extraction in `linear_gemv_ishizuki_k3_fused2_sk2` and `fused3_sk2`.**
   - Files: `crates/kernels/src/linear_repacked.metal`.
   - Intent: Replace 64-bit `ulong` shift windows (`((w0a << 32) | w0b) << sh0`) with 32-bit scalar MCG extraction (`extract_v_mcg_32`) in both split-K kernels.
-  - Testing: Sabotage one bit in `extract_v_mcg_32` call in `fused2_sk2` and confirm `fused_bit_exact` fails. Revert sabotage. Verify `fused_bit_exact` passes 4/4 tests. Commit.
+  - Testing: Sabotaged `acc0 += p00 * v[0] * 2.0f + ...` in `fused2_sk2` and verified `fused2_matches_two_independent_encodes` failed with 0 passed, 1 failed. Reverted sabotage; confirmed 4/4 tests passed in `fused_bit_exact` and 19/19 passed in `probe_mlpdispatch_tree`. Commit.
 
 - [ ] **T3 — Down projection Split-K and tile accumulation optimization.**
   - Files: `crates/engine/src/model.rs`, `crates/kernels/src/linear.rs`.

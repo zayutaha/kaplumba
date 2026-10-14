@@ -1213,6 +1213,7 @@ kernel void linear_gemv_ishizuki_k3_fused2_sk2(
 
     const uint lo0 = (lane * 8u + 1u) * 3u + RING - 16u;
     const uint sh0 = lo0 % 32u;
+    const uint rsh0 = 32u - sh0;
     const uint hi0 = lo0 / 32u;
     const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
     const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
@@ -1250,16 +1251,6 @@ kernel void linear_gemv_ishizuki_k3_fused2_sk2(
         const device uint *t2 = column + (tk + 2u) * stride;
         const device uint *t3 = column + (tk + 3u) * stride;
 
-        const ulong w0a = t0[j0], w0b = t0[j1];
-        const ulong w1a = t1[j0], w1b = t1[j1];
-        const ulong w2a = t2[j0], w2b = t2[j1];
-        const ulong w3a = t3[j0], w3b = t3[j1];
-
-        const ulong A0 = ((w0a << 32) | w0b) << sh0;
-        const ulong A1 = ((w1a << 32) | w1b) << sh0;
-        const ulong A2 = ((w2a << 32) | w2b) << sh0;
-        const ulong A3 = ((w3a << 32) | w3b) << sh0;
-
         const device half *xr0 = x_cur + (tk + 0u) * 16u + r0;
         const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
         const device half *xr1 = x_cur + (tk + 1u) * 16u + r0;
@@ -1269,38 +1260,31 @@ kernel void linear_gemv_ishizuki_k3_fused2_sk2(
         const device half *xr3 = x_cur + (tk + 3u) * 16u + r0;
         const float p30 = float(xr3[0]), p31 = float(xr3[1]), p32 = float(xr3[8]), p33 = float(xr3[9]);
 
-        float v0[8], v1[8], v2[8], v3[8];
-        #pragma unroll
-        for (uint i = 0; i < 8u; ++i) {
-            const uint rad = i * KA + 16u;
-            v0[i] = decode_state_mcg(uint(A0 >> (64u - rad)) & 0xffffu);
-            v1[i] = decode_state_mcg(uint(A1 >> (64u - rad)) & 0xffffu);
-            v2[i] = decode_state_mcg(uint(A2 >> (64u - rad)) & 0xffffu);
-            v3[i] = decode_state_mcg(uint(A3 >> (64u - rad)) & 0xffffu);
-        }
+        float v[8];
 
-        acc0 += p00 * v0[0] + p01 * v0[1] + p02 * v0[2] + p03 * v0[3];
-        acc1 += p00 * v0[4] + p01 * v0[5] + p02 * v0[6] + p03 * v0[7];
-        acc0 += p10 * v1[0] + p11 * v1[1] + p12 * v1[2] + p13 * v1[3];
-        acc1 += p10 * v1[4] + p11 * v1[5] + p12 * v1[6] + p13 * v1[7];
-        acc0 += p20 * v2[0] + p21 * v2[1] + p22 * v2[2] + p23 * v2[3];
-        acc1 += p20 * v2[4] + p21 * v2[5] + p22 * v2[6] + p23 * v2[7];
-        acc0 += p30 * v3[0] + p31 * v3[1] + p32 * v3[2] + p33 * v3[3];
-        acc1 += p30 * v3[4] + p31 * v3[5] + p32 * v3[6] + p33 * v3[7];
+        extract_v_mcg_32(t0[j0], t0[j1], sh0, rsh0, v);
+        acc0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+        acc1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+
+        extract_v_mcg_32(t1[j0], t1[j1], sh0, rsh0, v);
+        acc0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+        acc1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+
+        extract_v_mcg_32(t2[j0], t2[j1], sh0, rsh0, v);
+        acc0 += p20 * v[0] + p21 * v[1] + p22 * v[2] + p23 * v[3];
+        acc1 += p20 * v[4] + p21 * v[5] + p22 * v[6] + p23 * v[7];
+
+        extract_v_mcg_32(t3[j0], t3[j1], sh0, rsh0, v);
+        acc0 += p30 * v[0] + p31 * v[1] + p32 * v[2] + p33 * v[3];
+        acc1 += p30 * v[4] + p31 * v[5] + p32 * v[6] + p33 * v[7];
     }
 
     for (tk = k_unroll_end + sg; tk < k_end; tk += SG) {
         const device uint *t0 = column + tk * stride;
-        const ulong a0 = t0[j0], a1 = t0[j1];
-        const ulong A0 = ((a0 << 32) | a1) << sh0;
         const device half *xr0 = x_cur + tk * 16u + r0;
         const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
         float v[8];
-        #pragma unroll
-        for (uint i = 0; i < 8u; ++i) {
-            const uint rad = i * KA + 16u;
-            v[i] = decode_state_mcg(uint(A0 >> (64u - rad)) & 0xffffu);
-        }
+        extract_v_mcg_32(t0[j0], t0[j1], sh0, rsh0, v);
         acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
         acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
     }
@@ -1661,6 +1645,7 @@ kernel void linear_gemv_ishizuki_k3_fused3_sk2(
 
     const uint lo0 = (lane * 8u + 1u) * 3u + RING - 16u;
     const uint sh0 = lo0 % 32u;
+    const uint rsh0 = 32u - sh0;
     const uint hi0 = lo0 / 32u;
     const uint j0 = hi0 >= WORDS ? hi0 - WORDS : hi0;
     const uint j1 = j0 + 1u >= WORDS ? j0 + 1u - WORDS : j0 + 1u;
@@ -1718,16 +1703,6 @@ kernel void linear_gemv_ishizuki_k3_fused3_sk2(
         const device uint *t2 = column + (tk + 2u) * stride;
         const device uint *t3 = column + (tk + 3u) * stride;
 
-        const ulong w0a = t0[j0], w0b = t0[j1];
-        const ulong w1a = t1[j0], w1b = t1[j1];
-        const ulong w2a = t2[j0], w2b = t2[j1];
-        const ulong w3a = t3[j0], w3b = t3[j1];
-
-        const ulong A0 = ((w0a << 32) | w0b) << sh0;
-        const ulong A1 = ((w1a << 32) | w1b) << sh0;
-        const ulong A2 = ((w2a << 32) | w2b) << sh0;
-        const ulong A3 = ((w3a << 32) | w3b) << sh0;
-
         const device half *xr0 = x_cur + (tk + 0u) * 16u + r0;
         const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
         const device half *xr1 = x_cur + (tk + 1u) * 16u + r0;
@@ -1737,38 +1712,31 @@ kernel void linear_gemv_ishizuki_k3_fused3_sk2(
         const device half *xr3 = x_cur + (tk + 3u) * 16u + r0;
         const float p30 = float(xr3[0]), p31 = float(xr3[1]), p32 = float(xr3[8]), p33 = float(xr3[9]);
 
-        float v0[8], v1[8], v2[8], v3[8];
-        #pragma unroll
-        for (uint i = 0; i < 8u; ++i) {
-            const uint rad = i * KA + 16u;
-            v0[i] = decode_state_mcg(uint(A0 >> (64u - rad)) & 0xffffu);
-            v1[i] = decode_state_mcg(uint(A1 >> (64u - rad)) & 0xffffu);
-            v2[i] = decode_state_mcg(uint(A2 >> (64u - rad)) & 0xffffu);
-            v3[i] = decode_state_mcg(uint(A3 >> (64u - rad)) & 0xffffu);
-        }
+        float v[8];
 
-        acc0 += p00 * v0[0] + p01 * v0[1] + p02 * v0[2] + p03 * v0[3];
-        acc1 += p00 * v0[4] + p01 * v0[5] + p02 * v0[6] + p03 * v0[7];
-        acc0 += p10 * v1[0] + p11 * v1[1] + p12 * v1[2] + p13 * v1[3];
-        acc1 += p10 * v1[4] + p11 * v1[5] + p12 * v1[6] + p13 * v1[7];
-        acc0 += p20 * v2[0] + p21 * v2[1] + p22 * v2[2] + p23 * v2[3];
-        acc1 += p20 * v2[4] + p21 * v2[5] + p22 * v2[6] + p23 * v2[7];
-        acc0 += p30 * v3[0] + p31 * v3[1] + p32 * v3[2] + p33 * v3[3];
-        acc1 += p30 * v3[4] + p31 * v3[5] + p32 * v3[6] + p33 * v3[7];
+        extract_v_mcg_32(t0[j0], t0[j1], sh0, rsh0, v);
+        acc0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
+        acc1 += p00 * v[4] + p01 * v[5] + p02 * v[6] + p03 * v[7];
+
+        extract_v_mcg_32(t1[j0], t1[j1], sh0, rsh0, v);
+        acc0 += p10 * v[0] + p11 * v[1] + p12 * v[2] + p13 * v[3];
+        acc1 += p10 * v[4] + p11 * v[5] + p12 * v[6] + p13 * v[7];
+
+        extract_v_mcg_32(t2[j0], t2[j1], sh0, rsh0, v);
+        acc0 += p20 * v[0] + p21 * v[1] + p22 * v[2] + p23 * v[3];
+        acc1 += p20 * v[4] + p21 * v[5] + p22 * v[6] + p23 * v[7];
+
+        extract_v_mcg_32(t3[j0], t3[j1], sh0, rsh0, v);
+        acc0 += p30 * v[0] + p31 * v[1] + p32 * v[2] + p33 * v[3];
+        acc1 += p30 * v[4] + p31 * v[5] + p32 * v[6] + p33 * v[7];
     }
 
     for (tk = k_unroll_end + sg; tk < k_end; tk += SG) {
         const device uint *t0 = column + tk * stride;
-        const ulong a0 = t0[j0], a1 = t0[j1];
-        const ulong A0 = ((a0 << 32) | a1) << sh0;
         const device half *xr0 = x_cur + tk * 16u + r0;
         const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
         float v[8];
-        #pragma unroll
-        for (uint i = 0; i < 8u; ++i) {
-            const uint rad = i * KA + 16u;
-            v[i] = decode_state_mcg(uint(A0 >> (64u - rad)) & 0xffffu);
-        }
+        extract_v_mcg_32(t0[j0], t0[j1], sh0, rsh0, v);
         acc0 += p0 * v[0] + p1 * v[1] + p2 * v[2] + p3 * v[3];
         acc1 += p0 * v[4] + p1 * v[5] + p2 * v[6] + p3 * v[7];
     }
