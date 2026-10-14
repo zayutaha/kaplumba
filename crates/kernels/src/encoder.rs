@@ -67,6 +67,10 @@ pub struct MetalEncoder<'q> {
     /// applies back-pressure: the GPU is never starved, and the host is never
     /// allowed to queue without limit.
     in_flight: Vec<CommandBuffer>,
+    /// Rolled command buffers held back until the caller has staged any shared
+    /// host input they read. Used only for sparse-embedding decode steps.
+    deferred: Vec<CommandBuffer>,
+    defer_submissions: bool,
     /// Encoded dispatches in the current command buffer. A buffer is committed
     /// once it reaches `MAX_DISPATCHES_PER_BUFFER`.
     dispatches: u32,
@@ -124,9 +128,9 @@ pub trait CommandBufferGpuTiming {
 mod gpu_time {
     use std::ffi::CStr;
 
-    use metal::CommandBufferRef;
     use metal::objc::__send_message;
-    use metal::objc::runtime::{Sel, sel_registerName};
+    use metal::objc::runtime::{sel_registerName, Sel};
+    use metal::CommandBufferRef;
 
     use super::CommandBufferGpuTiming;
 
@@ -285,6 +289,8 @@ impl<'q> MetalEncoder<'q> {
             encoder,
             queue,
             in_flight: Vec::new(),
+            deferred: Vec::new(),
+            defer_submissions: false,
             dispatches: 0,
             dispatches_total: 0,
             ended: false,
@@ -297,6 +303,14 @@ impl<'q> MetalEncoder<'q> {
     /// Override the dispatch limit before rolling to a new command buffer.
     pub fn set_max_dispatches(&mut self, max: u32) {
         self.max_dispatches = max;
+    }
+
+    /// Hold rolled command buffers unsubmitted until this step is terminally
+    /// committed. The caller must stage every shared host input before that
+    /// commit. The mode is opt-in and bounded to one decode step.
+    pub fn defer_submissions(&mut self) {
+        debug_assert!(self.deferred.is_empty() && self.dispatches_total == 0);
+        self.defer_submissions = true;
     }
 
     /// A fresh command buffer and the compute encoder on it, both retained.
@@ -557,14 +571,33 @@ impl<'q> MetalEncoder<'q> {
     /// queue executes them in commit order.
     fn roll(&mut self) -> Result<(), KernelError> {
         self.end();
-        self.command_buffer.commit();
-        self.in_flight.push(self.command_buffer.clone());
-        if self.in_flight.len() > max_in_flight() {
-            let oldest = self.in_flight.remove(0);
-            oldest.wait_until_completed();
+        if self.defer_submissions {
+            const MAX_DEFERRED_BUFFERS: usize = 32;
+            if self.deferred.len() >= MAX_DEFERRED_BUFFERS {
+                return Err(KernelError::InvalidInput(format!(
+                    "deferred command-buffer limit {MAX_DEFERRED_BUFFERS} exceeded"
+                )));
+            }
+            self.deferred.push(self.command_buffer.clone());
+        } else {
+            self.command_buffer.commit();
+            self.in_flight.push(self.command_buffer.clone());
+            if self.in_flight.len() > max_in_flight() {
+                let oldest = self.in_flight.remove(0);
+                oldest.wait_until_completed();
+            }
         }
         self.rearm();
         Ok(())
+    }
+
+    /// Commit deferred buffers in their original queue order.
+    fn submit_deferred(&mut self) {
+        for buffer in std::mem::take(&mut self.deferred) {
+            buffer.commit();
+            self.in_flight.push(buffer);
+        }
+        self.defer_submissions = false;
     }
 
     /// End the current compute encoder, commit, and wait, without consuming self.
@@ -585,10 +618,11 @@ impl<'q> MetalEncoder<'q> {
     /// also applies back-pressure in submission order, and taking the buffers
     /// out of the vector means a panic mid-drain cannot drop the tail.
     pub fn flush_and_wait(&mut self) -> Result<(), KernelError> {
-        if self.dispatches == 0 && self.in_flight.is_empty() {
+        if self.dispatches == 0 && self.in_flight.is_empty() && self.deferred.is_empty() {
             return Ok(());
         }
         self.end();
+        self.submit_deferred();
         self.command_buffer.commit();
         for buffer in std::mem::take(&mut self.in_flight) {
             buffer.wait_until_completed();
@@ -610,6 +644,7 @@ impl<'q> MetalEncoder<'q> {
     /// earlier committed work in queue order.
     pub fn flush_and_wait_queue(&mut self) -> Result<(), KernelError> {
         self.end();
+        self.submit_deferred();
         self.command_buffer.commit();
         for buffer in std::mem::take(&mut self.in_flight) {
             buffer.wait_until_completed();
@@ -631,6 +666,8 @@ impl<'q> MetalEncoder<'q> {
     /// releases the bound resources sooner.
     pub fn abandon(&mut self) {
         self.end();
+        self.deferred.clear();
+        self.defer_submissions = false;
     }
 
     /// Commit without waiting, so several command buffers can be in flight.
@@ -657,6 +694,7 @@ impl<'q> MetalEncoder<'q> {
             "commit_terminal is terminal: this encoder has already been ended",
         );
         self.end();
+        self.submit_deferred();
         self.command_buffer.commit();
         self.in_flight.push(self.command_buffer.clone());
         Ok(())
@@ -683,6 +721,7 @@ impl<'q> MetalEncoder<'q> {
 
     pub fn commit_and_wait(mut self) -> Result<(), KernelError> {
         self.end();
+        self.submit_deferred();
         self.command_buffer.commit();
         self.command_buffer.wait_until_completed();
         // Buffers rolled out mid-forward are committed but unfinished. On one
@@ -725,6 +764,7 @@ impl<'q> MetalEncoder<'q> {
     /// flight, since nothing here waits).
     pub fn commit_stamped(&mut self, label: &str) -> Result<(), KernelError> {
         self.end();
+        self.submit_deferred();
         self.command_buffer.set_label(label);
         self.command_buffer.commit();
         self.stamped
@@ -782,6 +822,7 @@ impl<'q> MetalEncoder<'q> {
     /// which costs a few microseconds.
     pub fn finish(&mut self) -> Result<(), KernelError> {
         self.end();
+        self.submit_deferred();
         self.command_buffer.commit();
         self.command_buffer.wait_until_completed();
         for buffer in std::mem::take(&mut self.in_flight) {
@@ -1002,6 +1043,88 @@ kernel void burn(device float* out [[buffer(0)]],
         for buffer in &encoder.in_flight {
             assert_eq!(buffer.status(), MTLCommandBufferStatus::Completed);
         }
+    }
+
+    #[test]
+    fn deferred_rolls_stay_unsubmitted_until_terminal_commit() {
+        let Some((_device, queue, pipeline, out)) = burn_context() else {
+            return;
+        };
+        let mut encoder = MetalEncoder::new(&queue).expect("encoder");
+        encoder.set_max_dispatches(2);
+        encoder.defer_submissions();
+        for _ in 0..5 {
+            burn(&mut encoder, &pipeline, &out, CHEAP_ITERS);
+        }
+
+        assert_eq!(encoder.deferred.len(), 2);
+        assert_eq!(
+            encoder.deferred[0].status(),
+            MTLCommandBufferStatus::NotEnqueued,
+            "a rolled buffer was submitted before shared input staging"
+        );
+        assert_eq!(
+            encoder.deferred[1].status(),
+            MTLCommandBufferStatus::NotEnqueued,
+            "deferred buffers must remain unsubmitted until the step is ready"
+        );
+
+        let rolled = encoder.deferred.clone();
+        encoder.commit_terminal().expect("terminal commit");
+        encoder.wait();
+        for buffer in rolled.iter().chain(encoder.in_flight.iter()) {
+            assert_eq!(buffer.status(), MTLCommandBufferStatus::Completed);
+        }
+        assert!(encoder.deferred.is_empty());
+    }
+
+    #[test]
+    fn abandoning_deferred_rolls_never_submits_them() {
+        let Some((_device, queue, pipeline, out)) = burn_context() else {
+            return;
+        };
+        let mut encoder = MetalEncoder::new(&queue).expect("encoder");
+        encoder.set_max_dispatches(1);
+        encoder.defer_submissions();
+        burn(&mut encoder, &pipeline, &out, CHEAP_ITERS);
+        let rolled = encoder.deferred[0].clone();
+        encoder.abandon();
+        drop(encoder);
+
+        assert_eq!(
+            rolled.status(),
+            MTLCommandBufferStatus::NotEnqueued,
+            "abandon must discard deferred work without submission"
+        );
+    }
+
+    #[test]
+    fn deferred_roll_count_has_a_hard_limit() {
+        let Some((_device, queue, pipeline, out)) = burn_context() else {
+            return;
+        };
+        let mut encoder = MetalEncoder::new(&queue).expect("encoder");
+        encoder.set_max_dispatches(1);
+        encoder.defer_submissions();
+        for _ in 0..32 {
+            burn(&mut encoder, &pipeline, &out, CHEAP_ITERS);
+        }
+        let error = encoder
+            .dispatch_1d(
+                &pipeline,
+                &[Some(&out)],
+                &CHEAP_ITERS.to_ne_bytes(),
+                THREADS,
+                THREADS_PER_GROUP,
+            )
+            .expect_err("33rd rolled buffer must exceed the per-step bound");
+        assert!(
+            error
+                .to_string()
+                .contains("deferred command-buffer limit 32"),
+            "unexpected bound error: {error}"
+        );
+        encoder.abandon();
     }
 
     /// The rolling scheme is not a prefill-only optimisation: every `dispatch_*`

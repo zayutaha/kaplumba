@@ -46,3 +46,25 @@
 - No model was run for this investigation. Before any GPU run, check
   `scripts/gpuq status` and use `scripts/gpuq try --`; only one model process at
   a time.
+
+## 2026-10-14 — T2 deferred encoder lifecycle
+
+- Added opt-in `MetalEncoder::defer_submissions()`. Rolled buffers are ended
+  and retained without commit; `commit_terminal`, wait/flush paths, and finish
+  submit them in original order. `abandon` drops all deferred buffers without
+  submitting them. Normal encoders retain the existing immediate-roll path.
+- Hard cap is 32 deferred rolled buffers per encoder. A decode step has about
+  1,617 dispatches and the default 50-dispatch slices, or 32 rolled buffers plus
+  its tail. A 64-buffer test reached Metal's uncommitted command-buffer creation
+  stall before our error guard; reducing the limit to 32 made the overflow
+  diagnostic test complete. If the production measured dispatch count exceeds
+  this cap, amend it only with a safe, bounded design.
+- Tests: `cargo test -p kaplumba-kernels --lib` passed 36/36 before the explicit
+  cap test. Then `cargo test -p kaplumba-kernels deferred_ --lib` passed 3/3
+  (deferred submit ordering, abandon, hard bound). A deliberate early-commit
+  sabotage failed as expected: `a rolled buffer was submitted before shared
+  input staging`, `Committed` vs `NotEnqueued`; sabotage was reverted.
+- `scripts/gpuq status` before any model baseline reported 0.1 GiB top-unused,
+  6.7 GiB active pages, and 1,948 MiB existing swap. Per §10 this is below the
+  safe available-memory threshold; no model run was started. T1's matched model
+  comparison remains open.

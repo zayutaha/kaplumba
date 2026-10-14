@@ -4,7 +4,7 @@
   four documents. Record scope, constraints, current evidence, technical
   sequencing, and acceptance. Validate document consistency and `git diff
   --check`. Completed `2026-10-14`; documentation commit hash will be recorded
-  in this entry before finalizing the commit. Commit `cb0564f`.
+  in this entry before finalizing the commit. Commit `38ba6c3`.
 - [ ] **T1 — pin the matched decode baseline and causal changes.** Files: this
   folder's notes and, if needed, a temporary isolated build/worktree. Compare
   the canonical 32-token workload on the current tree and pre-T5g reference;
@@ -13,12 +13,18 @@
   Test: `scripts/gpuq status`, then `scripts/gpuq try --` for each model run;
   treat exit 75 as GPU busy. Commit evidence and note if the local machine cannot
   provide a clean matched comparison.
-- [ ] **T2 — add bounded deferred command-buffer submission.** Files:
+- [x] **T2 — add bounded deferred command-buffer submission.** Files:
   `crates/kernels/src/encoder.rs` and its tests. Add opt-in deferred rolling,
   ordered terminal submission, and safe abandonment/drop. Keep default encoder
   semantics unchanged. Test rollover, submission order, no early execution,
   error/drop, max bound, and terminal misuse; sabotage early commit and record
-  the named failing assertion. Run the encoder test target.
+  the named failing assertion. `cargo test -p kaplumba-kernels --lib` passed
+  36/36 before adding the bound test; `cargo test -p kaplumba-kernels deferred_
+  --lib` passed 3/3 after it. Early-commit sabotage failed with
+  `a rolled buffer was submitted before shared input staging` (`Committed` vs
+  `NotEnqueued`). A 64-buffer cap test stalled in Metal command-buffer creation;
+  reduced the explicit bound to 32, and the 32-buffer overflow case passed.
+  Completed `2026-10-14`; commit hash will be recorded in this entry.
 - [ ] **T3 — separate sparse row staging from forward encoding.** Files:
   `crates/engine/src/model.rs` and focused model tests. Remove unconditional
   steady-state drains, encode sparse pipelined work against bounded row scratch,
