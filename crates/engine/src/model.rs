@@ -2642,7 +2642,7 @@ let use_sk4 = env_flag("KAPLUMBA_O_SK4")
             profile.stamp(encoder, &format!("{}down_proj", prefix()))?;
             timer.lap("down_proj");
         }
-        if !(decode && gate_up_share_input_signs && self.weights.gate_proj.permutation_mode == 1) {
+        if !(decode && self.weights.gate_proj.permutation_mode == 1) {
             if decode {
                 self.elements.encode_rms_norm_residual_layer_scale(
                     encoder,

@@ -945,6 +945,7 @@ kernel void linear_gemv_ishizuki_k3_fused2_co4(
     constexpr uint WORDS = RING / 32u;
     const uint K = shape[0];
     const uint N_a = shape[1];
+    const uint stride_x = shape[3];
     const uint tiles_a = N_a / 16u;
     const uint tiles_k = K / 16u;
     const uint pairs_a = tiles_a / 2u;
@@ -986,13 +987,13 @@ kernel void linear_gemv_ishizuki_k3_fused2_co4(
         #pragma unroll(2)
         for (; tk < k_unroll_end; tk += step) {
             const device half *xr0 = x + (tk + 0u) * 16u + r0;
-            const float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
+            float p00 = float(xr0[0]), p01 = float(xr0[1]), p02 = float(xr0[8]), p03 = float(xr0[9]);
             const device half *xr1 = x + (tk + 1u) * 16u + r0;
-            const float p10 = float(xr1[0]), p11 = float(xr1[1]), p12 = float(xr1[8]), p13 = float(xr1[9]);
+            float p10 = float(xr1[0]), p11 = float(xr1[1]), p12 = float(xr1[8]), p13 = float(xr1[9]);
             const device half *xr2 = x + (tk + 2u) * 16u + r0;
-            const float p20 = float(xr2[0]), p21 = float(xr2[1]), p22 = float(xr2[8]), p23 = float(xr2[9]);
+            float p20 = float(xr2[0]), p21 = float(xr2[1]), p22 = float(xr2[8]), p23 = float(xr2[9]);
             const device half *xr3 = x + (tk + 3u) * 16u + r0;
-            const float p30 = float(xr3[0]), p31 = float(xr3[1]), p32 = float(xr3[8]), p33 = float(xr3[9]);
+            float p30 = float(xr3[0]), p31 = float(xr3[1]), p32 = float(xr3[8]), p33 = float(xr3[9]);
 
             const device uint *t0_a0 = col_a0 + (tk + 0u) * stride;
             const device uint *t1_a0 = col_a0 + (tk + 1u) * stride;
@@ -1050,6 +1051,17 @@ kernel void linear_gemv_ishizuki_k3_fused2_co4(
             acc_a1_0 += p30 * v[0] + p31 * v[1] + p32 * v[2] + p33 * v[3];
             acc_a1_1 += p30 * v[4] + p31 * v[5] + p32 * v[6] + p33 * v[7];
 
+            if (stride_x != 0u) {
+                const device half *xb0 = x + stride_x + (tk + 0u) * 16u + r0;
+                p00 = float(xb0[0]); p01 = float(xb0[1]); p02 = float(xb0[8]); p03 = float(xb0[9]);
+                const device half *xb1 = x + stride_x + (tk + 1u) * 16u + r0;
+                p10 = float(xb1[0]); p11 = float(xb1[1]); p12 = float(xb1[8]); p13 = float(xb1[9]);
+                const device half *xb2 = x + stride_x + (tk + 2u) * 16u + r0;
+                p20 = float(xb2[0]); p21 = float(xb2[1]); p22 = float(xb2[8]); p23 = float(xb2[9]);
+                const device half *xb3 = x + stride_x + (tk + 3u) * 16u + r0;
+                p30 = float(xb3[0]); p31 = float(xb3[1]); p32 = float(xb3[8]); p33 = float(xb3[9]);
+            }
+
             // Col B0: 4 contiguous sub-steps along K
             extract_v_mcg_32(t0_b0[j0], t0_b0[j1], sh0, rsh0, v);
             acc_b0_0 += p00 * v[0] + p01 * v[1] + p02 * v[2] + p03 * v[3];
@@ -1087,7 +1099,7 @@ kernel void linear_gemv_ishizuki_k3_fused2_co4(
 
         for (tk = k_unroll_end + sg; tk < tiles_k; tk += SG) {
             const device half *xr0 = x + tk * 16u + r0;
-            const float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
+            float p0 = float(xr0[0]), p1 = float(xr0[1]), p2 = float(xr0[8]), p3 = float(xr0[9]);
 
             const device uint *t0_a0 = col_a0 + tk * stride;
             float v_a0[8];
@@ -1100,6 +1112,11 @@ kernel void linear_gemv_ishizuki_k3_fused2_co4(
             extract_v_mcg_32(t0_a1[j0], t0_a1[j1], sh0, rsh0, v_a1);
             acc_a1_0 += p0 * v_a1[0] + p1 * v_a1[1] + p2 * v_a1[2] + p3 * v_a1[3];
             acc_a1_1 += p0 * v_a1[4] + p1 * v_a1[5] + p2 * v_a1[6] + p3 * v_a1[7];
+
+            if (stride_x != 0u) {
+                const device half *xb0 = x + stride_x + tk * 16u + r0;
+                p0 = float(xb0[0]); p1 = float(xb0[1]); p2 = float(xb0[8]); p3 = float(xb0[9]);
+            }
 
             const device uint *t0_b0 = col_b0 + tk * stride;
             float v_b0[8];
