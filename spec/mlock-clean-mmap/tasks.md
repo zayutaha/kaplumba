@@ -117,12 +117,15 @@ not a completed paging fix; all subsequent implementation remains unchecked.
   release model answered `hi` (14 prompt + 9 generated) across multiple growth
   points with the user's GEMV kernel diff still present. Completed
   `2026-10-14`; implementation commit `30b7bb3`.
-- [ ] **T5f — bound no-copy Metal views to tensor page spans.**
+- [x] **T5f — bound no-copy Metal views to tensor page spans.**
   Files: `crates/engine/src/weights.rs`, range/GPU-view tests and notes. Cache
   page-rounded ranges, return local offsets, preserve map/lock lifetime and
   backing bytes. Test repeated/overlapping/disjoint ranges, page/EOF/overflow
   bounds and live GPU access; sabotage whole-shard views and require a size/span
-  failure. Rebuild and measure the affected decode resource demand.
+  failure. Rebuild and measure the affected decode resource demand. Completed
+  `2026-10-14`: weight tests 23 passed/1 ignored; whole-shard sabotage failed
+  65,536 vs 16,384 bytes. All 160 real greedy IDs identical; sampled wire peak
+  17.917 GiB and no new Swapouts on this run. Implementation commit `182006e`.
 - [ ] **T5g — stage sparse raw embeddings for ordinary chat.**
   Files: `crates/engine/src/model.rs`, focused embedding tests and notes. Add
   bounded raw-row staging, cross-encoder completion before CPU token/read/write,
