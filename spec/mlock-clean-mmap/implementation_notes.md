@@ -693,3 +693,59 @@ corrects both in a later implementation; this turn leaves scripts untouched.
 D2 validation: `git diff --check -- spec/mlock-clean-mmap` and scoped documentation diff review; no new
 code/test-coverage or successful paging-fix claim. T5a–T5d and full T4/T6 remain
 unchecked. D2 documentation commit `b50f0d2`.
+
+## 2026-10-14 — T5b sliding KV allocation on demand
+
+Changed `gpu_cache.rs`, `model.rs` and `tests/kv_growth_policy.rs`. Sliding
+layers now construct two positions of KV and grow before a chunk to fit the
+retained window plus the chunk. Growth remaps the last live absolute positions
+from old ring slots to new ring slots, copies exact FP16 K/V bytes, and marks
+unused tags `EMPTY_POSITION`. It rejects a missing live tag before swapping
+buffers. The shared forward path checks capacity before layer dispatch and
+drains queued work once before migrating any sliding cache; this also covers
+the pipelined decode route. The existing prefill staging reuses that barrier.
+Full-attention growth is unchanged.
+
+Focused tests cover required capacity boundaries/overflow, wrapped remapping,
+FP16 key/value preservation, empty tags, capacity bounds, missing slots, whole
+chunk separation from the retained window, retract/reset, and a queued Metal
+write completed before host migration. `cargo test -q -p kaplumba-engine --test
+kv_growth_policy`: 9 passed. Full engine library suite: 141 passed, 2 ignored.
+`cargo build --release -p kaplumba-cli` passed. Existing compiler warnings are
+unrelated (unused imports/fields, legacy `objc` cfg and current profiling
+variables).
+
+Negative controls were run and restored:
+
+- Changed remapping to `(absolute + 1) % target`; wrapped migration failed at
+  `positions[slot]`, left `u32::MAX`, expected position `4`.
+- Removed the growth wait; queued-write test failed at command buffer count,
+  left `1`, expected `2`. Restored the `flush_and_wait` path and reran all nine
+  tests successfully.
+
+Full model check used the exact D1 prompt (`"Explain the theory of relativity. "`
+repeated 170 times, 1,034 actual tokens), greedy 200 tokens, `--show-ids`. The
+200 generated token IDs matched the recorded fixed-capacity D1 sequence exactly,
+including after the sliding ring wrapped. Candidate metrics: load 1,374 ms,
+TTFT 11,533 ms, prefill 89.672 tok/s, decode 11.278 tok/s. The old D1 sample was
+7,201 ms / 11,413 ms / 90.624 tok/s / 11.175 tok/s; one run each under different
+cache/desktop conditions does not establish a throughput comparison. Candidate
+system swap rose from 3,028 to 4,251 MiB (+1,223 MiB), so this full chat does not
+pass AC3; per-process region state was not captured during generation.
+
+After the candidate idle load, PID 39841 was sampled live at
+`/tmp/kaplumba-sliding-growth-idle-vmmap.txt` with `vmmap -summary` and
+`vmmap -wide -interleaved`. It reports 11.2 GiB mapped-file resident, dirty=0,
+swapped=0; complete `mlock` summary again reports 12,046,221,312 locked bytes.
+Graphics is 227.9 MiB virtual, 85.0 MiB resident and 0 swapped, versus the
+fixed-capacity PID 39967's 1.8 GiB virtual / 1.6 GiB resident / 1.6 GiB swapped.
+This is a 1.57 GiB smaller graphics virtual allocation at idle and supports the
+expected 1.5625 GiB sliding KV reduction. Actual per-buffer pointer correlation
+and independent `user_wired_count` for every hot region are still open; the
+whole graphics region is not attributed to KV solely from aggregate shape.
+
+The current implementation leaves PID 39841 open at the interactive prompt,
+using session 38102. Do not start another model until it exits. T5b changes are
+not yet documented in a commit hash here; task metadata is updated by the
+immediate follow-up commit. T5a, T5c, T5d and T4 remain open; no claim of green
+pressure/no-swap during generation or full 1k/2k/8k acceptance.

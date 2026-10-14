@@ -89,7 +89,7 @@ not a completed paging fix; all subsequent implementation remains unchecked.
   selected layer/head range's observed wiring. Use existing supported diagnostics
   first. Resident pages and successful syscall counts alone cannot close AC6.
   Record failure controls before claiming any new diagnostic coverage.
-- [ ] **T5b — allocate sliding KV on demand with safe ring migration.**
+- [x] **T5b — allocate sliding KV on demand with safe ring migration.**
   Files: `crates/engine/src/gpu_cache.rs`, `crates/engine/src/model.rs`,
   `crates/engine/tests/kv_growth_policy.rs` and named attention/model regressions.
   Follow D2's plan: small warmup capacity, checked retained-window + chunk
@@ -98,7 +98,8 @@ not a completed paging fix; all subsequent implementation remains unchecked.
   growth, window/chunk boundaries, repeated wraps, reset/retract interactions,
   invalid inputs, no-op growth and queued GPU writes. Sabotage ring remapping,
   synchronization and chunk capacity separately; require diagnostic failures.
-  Verify attention/greedy equality despite changed physical scan order.
+  Verify attention/greedy equality despite changed physical scan order. Completed
+  `2026-10-14`; code/test commit recorded in the metadata follow-up.
 - [ ] **T5c — correct reclaimability and capacity reporting.**
   Files: `scripts/gpuq`, existing report tests and precisely selected load
   diagnostics. Explain active-page counts accurately; remove claims that wired

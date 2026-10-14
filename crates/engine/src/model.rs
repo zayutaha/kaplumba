@@ -17,7 +17,9 @@ use kaplumba_kernels::linear::{
 };
 
 use crate::exl3::unpack_signs;
-use crate::gpu_cache::{GpuCacheError, GpuKvCache};
+use crate::gpu_cache::{
+    GpuCacheError, GpuKvCache, sliding_capacity_needed, wait_for_sliding_growth,
+};
 use crate::kv_cache::{FullKvCache, KvCache, KvCacheError, SlidingKvCache};
 use crate::metal::{MetalContext, MetalError};
 use crate::safetensors::inspect_model_dir;
@@ -1153,6 +1155,7 @@ impl DecoderLayer {
         // the worst case up front was most of the KV footprint for conversations
         // that only need a few hundred positions.
         const INITIAL_FULL_CACHE: usize = 512;
+        const INITIAL_SLIDING_CACHE: usize = 2;
 
         // `KAPLUMBA_KV_INITIAL` preallocates instead of growing there.
         //
@@ -1192,20 +1195,9 @@ impl DecoderLayer {
                 config.head_dim,
             )?
         } else {
-            // Chunked verification writes every query's K/V before attention
-            // runs. Keep one configured window plus one maximum append chunk so
-            // early queries can still see the oldest live key after later rows
-            // are written. Attention itself continues to mask to
-            // `config.sliding_window` below.
-            let sliding_capacity = config
-                .sliding_window
-                .checked_add(prefill_chunk())
-                .ok_or_else(|| {
-                    ModelError::InvalidConfig("sliding KV capacity overflows".to_string())
-                })?;
             GpuKvCache::new(
                 &device,
-                sliding_capacity,
+                INITIAL_SLIDING_CACHE,
                 config.kv_heads,
                 config.head_dim,
             )?
@@ -1898,10 +1890,8 @@ impl DecoderLayer {
             profile.stamp(encoder, &format!("{}kv_norm_rope", prefix()))?;
             timer.lap("kv_norm_rope");
 
-            // Full-attention caches start small and grow on demand (see
-            // `GpuKvCache::ensure_capacity`); the 10 full layers at 8192 positions
-            // were most of the 1.4 GiB KV footprint. Sliding caches ring at a fixed
-            // window and are left alone.
+            // Sliding caches grow at the shared forward boundary before a chunk
+            // so the full attention window and append remain available.
             if full {
                 let device = system_device()?;
                 self.gpu_cache
@@ -4830,6 +4820,52 @@ impl TextModel {
             self.calibrate_gpu_profile(encoder, gpu)?;
         }
 
+        // Sliding buffers are migrated only when this chunk exceeds the
+        // current capacity. A queued decode may still be writing the old ring,
+        // so drain the encoder once before replacing any layer's buffers.
+        let mut needs_sliding_growth = false;
+        for layer in &self.layers {
+            if layer.config.full_attention {
+                continue;
+            }
+            let required = sliding_capacity_needed(
+                layer.gpu_cache.next_position(),
+                tokens,
+                layer.config.sliding_window,
+            )?;
+            if required > layer.gpu_cache.capacity() {
+                needs_sliding_growth = true;
+                break;
+            }
+        }
+        let encoder_drained_for_growth = if needs_sliding_growth {
+            // Sliding cache growth copies host-visible Metal buffers. This
+            // barrier retires any pipelined KV writes before migration.
+            wait_for_sliding_growth(encoder)?;
+            let device = system_device()?;
+            for layer in &mut self.layers {
+                if layer.config.full_attention {
+                    continue;
+                }
+                let max_capacity = layer
+                    .config
+                    .sliding_window
+                    .checked_add(prefill_chunk())
+                    .ok_or_else(|| {
+                        ModelError::InvalidConfig("sliding KV capacity overflows".to_string())
+                    })?;
+                layer.gpu_cache.ensure_sliding_capacity(
+                    &device,
+                    layer.config.sliding_window,
+                    tokens,
+                    max_capacity,
+                )?;
+            }
+            true
+        } else {
+            false
+        };
+
         // Shared-memory staging for the two small host-side arrays.
         //
         // These are HOST writes into SHARED memory, so every command buffer
@@ -4840,7 +4876,9 @@ impl TextModel {
         // the previous chunk's scratch is reused by this one regardless, so the
         // GPU had to reach that point before this chunk could start anyway.
         if tokens > 1 {
-            encoder.flush_and_wait()?;
+            if !encoder_drained_for_growth {
+                encoder.flush_and_wait()?;
+            }
             unsafe {
                 let position_ptr = self.scratch.query_positions.contents() as *mut u32;
                 std::ptr::copy_nonoverlapping(positions.as_ptr(), position_ptr, tokens);

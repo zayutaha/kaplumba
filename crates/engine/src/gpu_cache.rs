@@ -13,6 +13,8 @@
 use metal::{Buffer, Device, MTLResourceOptions};
 use thiserror::Error;
 
+use kaplumba_kernels::encoder::MetalEncoder;
+
 use crate::generate::DEFAULT_CONTEXT_LIMIT;
 use crate::kv_cache::KvCacheError;
 
@@ -72,8 +74,25 @@ pub enum GpuCacheError {
     InvalidPosition { expected: usize, got: usize },
     #[error("position {position} exceeds capacity {capacity}")]
     PositionOutOfRange { position: usize, capacity: usize },
+    #[error("sliding cache slot {slot} contains position {got}, expected {expected}")]
+    SlidingPositionMismatch {
+        slot: usize,
+        expected: u32,
+        got: u32,
+    },
     #[error(transparent)]
     Cache(#[from] KvCacheError),
+    #[error("Metal queue failed before sliding-cache growth: {0}")]
+    Queue(String),
+}
+
+/// Finish queued work before host migration reads cache buffers or replaces
+/// buffers that pending Metal commands may still reference.
+pub fn wait_for_sliding_growth(encoder: &mut MetalEncoder<'_>) -> Result<(), GpuCacheError> {
+    encoder
+        .flush_and_wait()
+        .map_err(|error| GpuCacheError::Queue(error.to_string()))?;
+    Ok(())
 }
 
 pub struct GpuKvCache {
@@ -205,9 +224,9 @@ impl GpuKvCache {
     /// Full-attention caches are the memory bulk of the KV state (10 layers at
     /// 8192 positions versus 50 sliding layers at 1024), but a short conversation
     /// only ever touches the first few hundred. Allocating for the worst case up
-    /// front cost ~1.4 GiB of resident memory for nothing, so these start small
-    /// and step up here. Sliding caches are never grown: their capacity is fixed
-    /// at the window size and they ring.
+    /// front cost ~1.4 GiB of resident memory for nothing, so full caches start
+    /// small and step up here. Sliding caches grow through
+    /// [`Self::ensure_sliding_capacity`].
     ///
     /// `max_capacity` is the caller's *stated* bound and is clamped to
     /// [`MAX_POLICY_CAPACITY`] before it is trusted, so no caller -- however it
@@ -301,6 +320,84 @@ impl GpuKvCache {
         Ok(())
     }
 
+    /// Ensure a sliding cache can retain its live window while appending a
+    /// whole chunk. Sliding caches start small and grow only when a prompt or
+    /// decode step needs more slots than have been allocated so far.
+    ///
+    /// The caller must finish all GPU work that can reference this cache before
+    /// calling this method. Growth migrates the last `window` absolute positions
+    /// into the new ring layout, rather than copying a prefix as full caches do.
+    pub fn ensure_sliding_capacity(
+        &mut self,
+        device: &Device,
+        window: usize,
+        tokens: usize,
+        max_capacity: usize,
+    ) -> Result<(), GpuCacheError> {
+        let needed = sliding_capacity_needed(self.next_position, tokens, window)?;
+        let max_capacity = max_capacity.min(MAX_POLICY_CAPACITY);
+        let target = growth_target(self.capacity, needed, max_capacity)?;
+        if target == self.capacity {
+            return Ok(());
+        }
+
+        let key_bytes = target
+            .checked_mul(self.stream_len)
+            .and_then(|n| n.checked_mul(2))
+            .and_then(|n| u64::try_from(n).ok())
+            .ok_or(GpuCacheError::ShapeOverflow)?;
+        let position_bytes = target
+            .checked_mul(4)
+            .and_then(|n| u64::try_from(n).ok())
+            .ok_or(GpuCacheError::ShapeOverflow)?;
+        let options = MTLResourceOptions::StorageModeShared;
+        let new_keys = device.new_buffer(key_bytes, options);
+        let new_values = device.new_buffer(key_bytes, options);
+        let new_positions = device.new_buffer(position_bytes, options);
+        unsafe {
+            std::ptr::write_bytes(new_positions.contents() as *mut u8, 0xFF, target * 4);
+        }
+
+        let live_start = self.next_position.saturating_sub(window);
+        let element_bytes = self
+            .stream_len
+            .checked_mul(2)
+            .ok_or(GpuCacheError::ShapeOverflow)?;
+        for absolute in live_start..self.next_position {
+            let expected = u32::try_from(absolute).map_err(|_| GpuCacheError::ShapeOverflow)?;
+            let old_slot = absolute % self.capacity;
+            let new_slot = absolute % target;
+            let old_position =
+                unsafe { *((self.positions.contents() as *const u32).add(old_slot)) };
+            if old_position != expected {
+                return Err(GpuCacheError::SlidingPositionMismatch {
+                    slot: old_slot,
+                    expected,
+                    got: old_position,
+                });
+            }
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    (self.keys.contents() as *const u8).add(old_slot * element_bytes),
+                    (new_keys.contents() as *mut u8).add(new_slot * element_bytes),
+                    element_bytes,
+                );
+                std::ptr::copy_nonoverlapping(
+                    (self.values.contents() as *const u8).add(old_slot * element_bytes),
+                    (new_values.contents() as *mut u8).add(new_slot * element_bytes),
+                    element_bytes,
+                );
+                *((new_positions.contents() as *mut u32).add(new_slot)) = expected;
+            }
+        }
+
+        self.keys = new_keys;
+        self.values = new_values;
+        self.positions = new_positions;
+        self.capacity = target;
+        Ok(())
+    }
+
     /// Validate that a chunk may be appended at `position` and return its slot.
     pub fn reserve(
         &self,
@@ -376,6 +473,22 @@ impl GpuKvCache {
         }
         (keys, values, positions)
     }
+}
+
+/// Minimum ring capacity that lets a chunk append without overwriting any key
+/// still visible to the earliest query in that chunk.
+pub fn sliding_capacity_needed(
+    position: usize,
+    tokens: usize,
+    window: usize,
+) -> Result<usize, GpuCacheError> {
+    if tokens == 0 || window == 0 {
+        return Err(GpuCacheError::InvalidDimensions);
+    }
+    position
+        .min(window)
+        .checked_add(tokens)
+        .ok_or(GpuCacheError::ShapeOverflow)
 }
 
 /// Capacity growth factor: 1.25x, as `GROWTH_NUM / GROWTH_DEN`.
