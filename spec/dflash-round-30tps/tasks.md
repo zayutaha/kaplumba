@@ -9,7 +9,7 @@ Execution order:
 T17/T18 → V0a → V0b → verifier decision. If adequate headroom exists, T0c/T5/T6/T7/T8
 establish independent drafter evidence; T1c/T1b/T16/T3 establish the new round
 contract; T12's round harness precedes T1/T2/T4 and its end-to-end checks follow
-CLI wiring. T10/T15/T13/T14 demonstrate real gain. T9 and F1a/F1b are conditional
+CLI wiring. T10/T15/T13/T14 demonstrate real gain. T9 and F1a are conditional
 branches selected from those results, not mandatory simultaneous implementations.
 
 ## Proved blockers from the exllamav3 review
@@ -499,14 +499,22 @@ branches selected from those results, not mandatory simultaneous implementations
   no/ambiguous match, token bounds, EOS, sampled rejection/residual and sabotage.
   Measure copying/repetition and general chat separately. Implementation remains
   conditional; zero model cost is not proof of an end-to-end speedup.
-- [ ] **F1b — EAGLE-3 feasibility design.**
-  Files: spec/plan/notes only until selected. Review the Gemma-specific checkpoint's
-  loader, feature taps, embedding, draft-vocabulary mapping, recurrence/cache and
-  exact sampled policy; calculate then measure footprint in a separately
-  authorized experiment. External model-card acceptance is not local evidence.
-  Test/design gate: no target p truncation, exact verifier contract, compatible
-  target/tokenizer and <20 GiB at 2k. A loader implementation needs an amended
-  concrete file/task plan; this item does not authorize downloading or coding.
+- [x] **F1b — complete EAGLE-3 feasibility design; hold implementation.**
+  Files: this spec's spec/plan/notes only. Reviewed
+  `thoughtworks/Gemma-4-31B-Eagle3` without downloading weights; fetched config
+  and only the first 65,536 Safetensors bytes. Same 5376 hidden width, taps
+  `[2,29,56]`, one dense BF16 decoder layer, `fc.weight [5376,16128]`, reduced
+  32k `lm_head`, `d2t`/`t2d` maps, and 4096 position limit. The 1,296,995,832-byte
+  shard implies an estimated <20 GB short-context footprint, but no load or 2k
+  memory measurement exists. Exact sampled decoding can preserve full target p
+  only by mapping q's 32k support back to the full 262144 target vocabulary and
+  using the exact verifier/residual; no target truncation is allowed. Current
+  engine has no dense BF16 GEMM for its draft matrices. The publisher's 1.05–1.72×
+  H200 results are external; even 1.72× applied illustratively to local 12.3 tok/s
+  is ~21.2 tok/s, not evidence for 30. A compatible loader, kernels, mapping and
+  target-feature parity would be a substantial new implementation with no
+  demonstrated path to AC5, so weights/code remain held. Details and source links
+  are in implementation notes/plan; feasibility review commit `a926319`.
 - [x] **F1c — review same-target DFlash checkpoint compatibility.**
   Files: this spec's spec/plan/tasks/notes. Compare the public RedHatAI
   Gemma-4-31B DFlash config and tensor header with the existing loader without
@@ -605,7 +613,8 @@ branches selected from those results, not mandatory simultaneous implementations
 | T1b / T3 / T12 | open | correctness work before product wiring |
 | T1 / T2 / T4 | open | experimental product loop absent |
 | T9–T11 / T13 / T14 | open | measurements and performance acceptance outstanding |
-| F1a / F1b | conditional, held | alternative evaluation requires shared verifier evidence and design decisions |
+| F1a | conditional, held | lookup remains workload-dependent; not selected |
+| F1b | feasibility complete; implementation held | Thoughtworks EAGLE3 needs dense BF16 kernels and 32k→262k mapping; no measured route to 30 tok/s |
 | F1c | done, candidate rejected | public same-target model uses dense BF16 linears and incompatible config; header-only review, no weights downloaded |
 | F1d | evaluated; not promoted | 3×200 exact, B4 prompt-0 A/B/A/B +4.3%, but only 6.31 tok/s median and drafter mlock fails with target resident; see notes |
 | F1e | evaluated; not promoted | all 3×200 exact at B4/B8/B16; best median 6.00 tok/s, only +3.5% prompt-0 encoded B4 gain; target-resident drafter mlock fails; notes `bddf913` |
