@@ -81,6 +81,25 @@ impl Default for GenerationConfig {
     }
 }
 
+impl GenerationConfig {
+    pub fn validate(&self) -> Result<(), GenerationError> {
+        if self.max_new_tokens == 0 {
+            return Err(GenerationError::ZeroNewTokens);
+        }
+        if self.context_limit == 0 {
+            return Err(GenerationError::InvalidContextLimit);
+        }
+        if self.sampler.top_k > crate::sampler::MAX_DEVICE_TOP_K {
+            return Err(SamplerError::DeviceTopKTooLarge {
+                top_k: self.sampler.top_k,
+                limit: crate::sampler::MAX_DEVICE_TOP_K,
+            }
+            .into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum GenerationError {
     #[error(transparent)]
@@ -125,12 +144,7 @@ pub fn generate<F>(
 where
     F: FnMut(&str) -> Result<(), String>,
 {
-    if config.max_new_tokens == 0 {
-        return Err(GenerationError::ZeroNewTokens);
-    }
-    if config.context_limit == 0 {
-        return Err(GenerationError::InvalidContextLimit);
-    }
+    config.validate()?;
     ensure_agx_relax_ctxstore_timeout();
     let request_started = Instant::now();
     let prompt_ids = tokenizer.encode_prompt(prompt)?;
@@ -247,12 +261,7 @@ pub fn generate_gpu<F>(
 where
     F: FnMut(&str) -> Result<(), String>,
 {
-    if config.max_new_tokens == 0 {
-        return Err(GenerationError::ZeroNewTokens);
-    }
-    if config.context_limit == 0 {
-        return Err(GenerationError::InvalidContextLimit);
-    }
+    config.validate()?;
     ensure_agx_relax_ctxstore_timeout();
     let request_started = Instant::now();
     let prompt_ids = tokenizer.encode_prompt(prompt)?;
@@ -266,7 +275,25 @@ where
             limit: config.context_limit,
         });
     }
+    let device_params = if config.sampler.temperature == 0.0 {
+        None
+    } else {
+        Some(crate::sampler::SamplerParams::from_config(
+            config.sampler,
+            model.vocab_size(),
+        )?)
+    };
     if config.sampler.temperature == 0.0 {
+        let mut on_text = on_text;
+        return generate_gpu_greedy(
+            model,
+            tokenizer,
+            &prompt_ids,
+            config,
+            &mut move |chunk| on_text(chunk).map_err(GenerationError::Output),
+            request_started,
+        );
+    } else if device_params.is_some() {
         let mut on_text = on_text;
         return generate_gpu_greedy(
             model,
@@ -962,12 +989,35 @@ where
         // a decode table.
         crate::decode_profile::record_prefill(prefill_duration.as_secs_f64() * 1e3, prompt_len);
 
-        // Read after the wait: the prefill's device argmax yields the first generated token.
-        let mut token = model.last_token();
-        if margins.enabled {
+        let (pick, mut sampler) = if config.sampler.temperature == 0.0 {
+            (crate::model::HeadPick::Argmax, None)
+        } else {
+            let params = crate::sampler::SamplerParams::from_config(
+                config.sampler,
+                model.vocab_size(),
+            )?;
+            let sampler = Sampler::new(config.sampler, config.seed)?;
+            (crate::model::HeadPick::Sample(params), Some(sampler))
+        };
+
+        // Read after the wait: the prefill's device argmax or host-sampled logit row yields the first generated token.
+        let mut token = if let Some(ref mut s) = sampler {
             let logits = model.last_logits();
-            margins.record(generated_ids.len(), argmax_with_margin(&logits));
-        }
+            let last_f32: Vec<f32> = logits
+                .iter()
+                .map(|bits| half::f16::from_bits(*bits).to_f32())
+                .collect();
+            let t = s.sample(&last_f32)?;
+            model.seed_device_sampler(s.state());
+            t
+        } else {
+            let t = model.last_token();
+            if margins.enabled {
+                let logits = model.last_logits();
+                margins.record(generated_ids.len(), argmax_with_margin(&logits));
+            }
+            t
+        };
         let pipelined = !margins.enabled
             && crate::decode_profile::active_mode() == crate::decode_profile::Mode::Off
             && std::env::var_os("KAPLUMBA_NO_PIPELINE").is_none();
@@ -1000,7 +1050,7 @@ where
                         Some(token),
                         0,
                         0,
-                        crate::model::HeadPick::Argmax,
+                        pick,
                     )?;
                     crate::model::record_decode_step_tallies(&enc0);
                     enc0.commit_terminal().map_err(ModelError::from)?;
@@ -1025,7 +1075,7 @@ where
                             None,
                             slot,
                             step_idx as u32,
-                            crate::model::HeadPick::Argmax,
+                            pick,
                         )?;
                         crate::model::record_decode_step_tallies(&next_enc);
                         let row_pending = model.pipelined_embedding_row_pending();
@@ -1044,6 +1094,7 @@ where
                         kaplumba_kernels::pipeline_audit::assert_no_builds_since(load_mark);
 
                         let step_token = model.read_host_token(in_flight_step);
+                        let is_eos = config.eos_ids.contains(&step_token);
                         let output_result = (|| -> Result<(), GenerationError> {
                             generated_ids.push(step_token);
                             if let Some(chunk) = detokenizer.push(step_token)? {
@@ -1062,7 +1113,7 @@ where
                             return Err(error);
                         }
 
-                        if config.eos_ids.contains(&step_token) {
+                        if is_eos {
                             stopped_on_eos = true;
                             if row_pending {
                                 model.discard_pipelined_embedding_row(slot)?;
@@ -1164,11 +1215,21 @@ where
                 decode_duration += Duration::from_secs_f64(step_ms / 1e3);
                 segments.record(generated_ids.len(), position, step_ms);
                 kaplumba_kernels::pipeline_audit::assert_no_builds_since(load_mark);
-                token = model.last_token();
-                if margins.enabled {
+                token = if let Some(ref mut s) = sampler {
                     let logits = model.last_logits();
-                    margins.record(generated_ids.len(), argmax_with_margin(&logits));
-                }
+                    let last_f32: Vec<f32> = logits
+                        .iter()
+                        .map(|bits| half::f16::from_bits(*bits).to_f32())
+                        .collect();
+                    s.sample(&last_f32)?
+                } else {
+                    let t = model.last_token();
+                    if margins.enabled {
+                        let logits = model.last_logits();
+                        margins.record(generated_ids.len(), argmax_with_margin(&logits));
+                    }
+                    t
+                };
             }
         }
 
@@ -1433,5 +1494,22 @@ mod tests {
     #[should_panic(expected = "needs two entries")]
     fn margin_rejects_a_single_entry_row() {
         let _ = argmax_with_margin(&row(&[42.0]));
+    }
+
+    #[test]
+    fn generation_config_rejects_top_k_above_1024() {
+        use crate::sampler::SamplerError;
+        let mut config = super::GenerationConfig::default();
+        config.sampler.top_k = 1025;
+        match config.validate() {
+            Err(super::GenerationError::Sampler(SamplerError::DeviceTopKTooLarge {
+                top_k,
+                limit,
+            })) => {
+                assert_eq!(top_k, 1025);
+                assert_eq!(limit, 1024);
+            }
+            other => panic!("expected DeviceTopKTooLarge, got {other:?}"),
+        }
     }
 }

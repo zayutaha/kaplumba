@@ -238,6 +238,13 @@ impl<'a> ChatSession<'a> {
         eos_ids: Vec<u32>,
         context_limit: usize,
     ) -> Result<Self, ChatError> {
+        if sampler.top_k > crate::sampler::MAX_DEVICE_TOP_K {
+            return Err(SamplerError::DeviceTopKTooLarge {
+                top_k: sampler.top_k,
+                limit: crate::sampler::MAX_DEVICE_TOP_K,
+            }
+            .into());
+        }
         // Fail loudly at startup on a renumbered checkpoint, before any turn.
         let _ = resolve_markers(tokenizer)?;
         let sampler = Sampler::new(sampler, seed)?;
@@ -396,11 +403,17 @@ impl<'a> ChatSession<'a> {
         let device_params = if self.greedy {
             None
         } else {
-            crate::sampler::SamplerParams::from_config(
+            if self.sampler.config().top_k > crate::sampler::MAX_DEVICE_TOP_K {
+                return Err(SamplerError::DeviceTopKTooLarge {
+                    top_k: self.sampler.config().top_k,
+                    limit: crate::sampler::MAX_DEVICE_TOP_K,
+                }
+                .into());
+            }
+            Some(crate::sampler::SamplerParams::from_config(
                 self.sampler.config(),
                 self.model.vocab_size(),
-            )
-            .ok()
+            )?)
         };
         let pipelined = (self.greedy || device_params.is_some())
             && std::env::var_os("KAPLUMBA_NO_PIPELINE").is_none();
@@ -868,5 +881,26 @@ mod device_sampler_gate_tests {
         let mut sampler = Sampler::new(SamplerConfig::default(), 1).unwrap();
         let logits: Vec<f32> = (0..1024).map(|i| -(i as f32)).collect();
         let _ = sampler.sample(&logits).unwrap();
+    }
+
+    #[test]
+    fn chat_rejects_top_k_above_1024() {
+        let mut config = SamplerConfig::default();
+        config.top_k = 1025;
+        let limit = crate::sampler::MAX_DEVICE_TOP_K;
+        assert_eq!(
+            if config.top_k > limit {
+                Err(SamplerError::DeviceTopKTooLarge {
+                    top_k: config.top_k,
+                    limit,
+                })
+            } else {
+                Ok(())
+            },
+            Err(SamplerError::DeviceTopKTooLarge {
+                top_k: 1025,
+                limit: 1024,
+            })
+        );
     }
 }
