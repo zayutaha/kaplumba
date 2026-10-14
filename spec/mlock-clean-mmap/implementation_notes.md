@@ -461,7 +461,7 @@ Removed the unused comparison worktree, its target directory, prompt files,
 native diagnostic binaries/logs and original scratch run log after preserving
 the diagnostic source and complete run log below. No model/probe process remains.
 
-Diagnosis and spec amendment commit pending. No further full-model run was
+Diagnosis and spec amendment commit: `2a1646c`. No further full-model run was
 started after the user's report. Probe source is preserved below for reproduction.
 
 ### D1 diagnostic source (external scratch, not product code)

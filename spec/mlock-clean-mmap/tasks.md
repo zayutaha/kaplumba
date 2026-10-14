@@ -96,4 +96,4 @@ not a completed paging fix; all subsequent implementation remains unchecked.
   deliberate `munlock` failure and restored passing result. Record that it is
   mechanism evidence, not actual-loader/full-model coverage. Require visible
   successful summaries and allocation/capacity attribution. Validate document
-  consistency and `git diff --check`. Completed `2026-10-14`; commit pending.
+  consistency and `git diff --check`. Completed `2026-10-14`; commit `2a1646c`.
