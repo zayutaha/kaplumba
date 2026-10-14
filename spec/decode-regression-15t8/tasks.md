@@ -37,8 +37,7 @@
   library suite passed 145/145 (2 fixture-dependent ignored). Deliberately
   changed the selected row index; the exact BF16/FP16 equality test failed with
   named assertion `bf16=false`, then the sabotage was reverted. `cargo check
-  -p kaplumba-engine` passed. Completed `2026-10-14`; commit hash will be
-  recorded in this entry.
+  -p kaplumba-engine` passed. Completed `2026-10-14`; commit `8c52088`.
 - [ ] **T4 — integrate stage-then-submit in chat and CLI generation.** Files:
   `crates/engine/src/chat.rs`, `crates/engine/src/generate.rs`, and relevant
   pipeline tests. Encode next step while prior GPU work runs; after prior wait,
