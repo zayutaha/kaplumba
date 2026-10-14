@@ -452,3 +452,58 @@ CHECK K=592 Na=256 Nb=128 raw_f32_words=768 candidate_differences=0 sabotaged_di
 RESULT baseline_ms=0.003194 scalar_ms=0.002980 paired_gain_median=0.531% range=[-4.852,8.800] positive=11/16 AA_median=-0.350% AA_range=[-8.692,0.972]
 PAIRED_GAINS 0.533,3.287,0.444,-0.439,0.528,0.178,0.896,0.533,-0.957,-0.081,7.895,-4.852,5.887,1.534,-2.227,8.800
 ```
+
+## T4 — fused3 scalar extraction trial
+
+Changed only the five decoder call sites in `linear_gemv_ishizuki_k3_fused3_sk2`
+to call the same scalar `extract_v_mcg_32_scalar` helper introduced in T3. The
+four-stream body and all FP32 multiply/add expressions stayed in their original
+order. No other kernel family changed.
+
+The independent Swift/Metal raw comparator compiled the exact baseline fused3
+body from `git show 478c7de^:crates/kernels/src/linear_repacked.metal`, the
+current edited body, and a candidate with `v[0] += 1.0f` injected after the
+actual decode call. It compared raw split FP32 output words and required the
+mutation to fail before timing. `fused3_sk2` owns three packed streams and
+three output buffers; the comparator used the actual fused3 shape buffer and
+grid formula, deterministic packed data, FP16 activations, repeated dispatches,
+and 16 ABBA pairs plus eight A/A control pairs per shape.
+
+```text
+DEVICE Apple M4 Pro; pinned 64-bit fused3 vs actual scalar fused3, raw split partials, synthetic
+CHECK3 K=5376 Ns=[8192, 4096, 4096] words=32768 candidate_differences=0 sabotage_differences=16384
+TIMING3 A=0.187047 B=0.179448 gain=4.197% spread=[-2.849,5.108] wins=12/16 AA=-0.313% [-3.796, 3.891]
+GAINS3 -0.226,1.192,4.924,4.320,4.582,0.463,-2.849,4.505,4.671,4.465,4.091,-1.950,2.703,5.108,4.304,-0.943
+CHECK3 K=5376 Ns=[16384, 2048, 2048] words=40960 candidate_differences=0 sabotage_differences=20480
+TIMING3 A=0.231385 B=0.220882 gain=4.767% spread=[-1.839,9.403] wins=14/16 AA=0.288% [-2.746, 6.838]
+GAINS3 1.652,-1.708,4.889,3.301,5.114,8.469,1.839,5.148,4.546,9.066,1.583,4.851,7.684,9.403,-1.839,4.683
+CHECK3 K=592 Ns=[256, 128, 128] words=1024 candidate_differences=0 sabotage_differences=256
+TIMING3 A=0.003809 B=0.003703 gain=1.340% spread=[-4.598,79.512] wins=13/16 AA=-0.025% [-5.274, 2.859]
+GAINS3 0.615,-4.598,-3.117,4.419,1.673,1.375,0.891,1.966,6.201,0.555,2.017,1.305,0.950,15.324,79.512,-1.583
+```
+
+The red control changed 16,384 / 20,480 / 256 words for the three shapes.
+The first two paired medians exceed their A/A medians and are a promising
+kernel-only signal, while their ranges overlap noise; the tiny shape is plainly
+noise dominated. These are synthetic repeated-dispatch timings, not physical
+DRAM bandwidth or model throughput.
+
+Validation on the edited T3+T4 shader:
+`scripts/gpuq try -- env CARGO_TARGET_DIR=/tmp/kaplumba-alu-target cargo test -p kaplumba-engine --test fused_bit_exact -- --nocapture`
+passed **4/4**, 34.96 s. The suite reports the `fused2` and `fused3` independent
+encodes and exercises the existing fail-first weight mutation (128/21,504
+outputs changed). The standalone raw comparator source is
+`spec/alu-decode-tgs-audit/harnesses/raw_compare3.swift`; it compiles the exact
+edited and pre-478c Metal bodies, checks raw output bits, injects a bad decoder
+result, and measures ABBA timings. Copy the harness beside an isolated worktree
+root as `raw_compare3.swift`, create `base_linear_repacked.metal` with the `git
+show` command above, then compile it with `swiftc -g -O raw_compare3.swift -o
+raw_compare3`. Check GPU availability and invoke
+`scripts/gpuq try -- ./raw_compare3 "$PWD"`. The comparator writes a generated
+Metal source into that root, so use a disposable worktree and remove generated
+files afterward.
+
+T4 changes and limitations: scalar path passes raw FP32 identity against the
+old 64-bit implementation and the repo suite. It does not yet show full Gxma
+greedy/sampled token identity, tg/s, context-length scaling, useful GB/s, or
+250 GB/s acceptance; those require later baseline and end-to-end tasks.

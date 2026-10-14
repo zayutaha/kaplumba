@@ -29,10 +29,11 @@ requested. Update spec/plan before any layout or interface scope change.
   64-bit kernel, run `fused_bit_exact`, sabotage the actual kernel, and measure
   the kernel ABBA/noise control. 62,208 raw words equal; sabotage differs;
   fused suite 4/4. Full chat remains later. Commit: `fcf1eab`.
-- [ ] **T4** Same file, separately: apply and validate scalar extraction in
-  `fused3_sk2`; compare every raw FP32 output against its 64-bit version and
-  run its real integration tests. Do not assume T3's result transfers to three
-  streams. Full-chat attribution follows T5/T8.
+- [x] **T4** `linear_repacked.metal`: applied scalar extraction separately in
+  `fused3_sk2`; compared every raw FP32 output against its 64-bit version,
+  passed the fused integration suite and a sabotaged-kernel red control. Larger
+  synthetic shapes showed +4.197% and +4.767% paired median kernel gains;
+  small shape was noisy. No full-chat attribution. Commit: pending.
 - [ ] **T5** `linear_repacked.metal` and isolated external harnesses: one
   experiment/commit at a time for shift-class specialization, register lifetime,
   unchanged-order unroll/lookahead and exact load sharing. Verify tail/grid
