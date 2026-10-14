@@ -3540,6 +3540,8 @@ pub struct TextModel {
     /// the embedding kernel must widen it. True when the table is offloaded.
     embedding_is_bf16: bool,
     sparse_embedding: bool,
+    /// Decode slot whose raw embedding row is encoded but not yet staged.
+    pending_sparse_embedding_slot: Option<usize>,
     vocab_size: usize,
     hidden_size: usize,
     layers: Vec<DecoderLayer>,
@@ -3768,6 +3770,7 @@ impl TextModel {
             embedding_offset,
             embedding_is_bf16,
             sparse_embedding,
+            pending_sparse_embedding_slot: None,
             vocab_size,
             hidden_size,
             layers,
@@ -4345,10 +4348,26 @@ impl TextModel {
         let slot = slot % 2;
         let next_slot = 1 - slot;
         self.scratch.active_slot = slot;
-        if self.sparse_embedding {
+        if self.pending_sparse_embedding_slot.is_some() {
+            return Err(ModelError::InvalidInput(
+                "previous sparse decode step has not been staged or discarded".to_string(),
+            ));
+        }
+        let profile = env_flag("KAPLUMBA_GPU_PROFILE") && env_flag("KAPLUMBA_GPU_PROFILE_DECODE");
+        let profiling_forces_sync = profile
+            || env_flag("KAPLUMBA_PROFILE_PHASES")
+            || crate::decode_profile::active_mode() != crate::decode_profile::Mode::Off;
+        let defer_sparse_embedding =
+            self.sparse_embedding && token.is_none() && !profiling_forces_sync;
+        if self.sparse_embedding && !defer_sparse_embedding {
             // The token and position buffers are ping-ponged. Retire the prior
-            // command buffer before the host reuses either slot.
+            // command buffer before reading a GPU-produced token on the
+            // synchronous/profiled path. Steady-state sparse decode defers the
+            // row gather until its caller has waited for that token.
             encoder.flush_and_wait_queue()?;
+        }
+        if defer_sparse_embedding {
+            encoder.defer_submissions();
         }
         if let Some(t) = token {
             if t as usize >= self.vocab_size {
@@ -4366,7 +4385,6 @@ impl TextModel {
             *pos_ptr = position;
         }
 
-        let profile = env_flag("KAPLUMBA_GPU_PROFILE") && env_flag("KAPLUMBA_GPU_PROFILE_DECODE");
         let mut gpu = GpuProfile::new(profile);
         gpu.tokens = 1;
         gpu.layers = self.layers.len();
@@ -4388,13 +4406,74 @@ impl TextModel {
                 host_token: &host_token_buffer,
                 step_idx,
             }),
-            self.sparse_embedding,
+            self.sparse_embedding && !defer_sparse_embedding,
+            defer_sparse_embedding,
         )?;
+        if defer_sparse_embedding {
+            self.pending_sparse_embedding_slot = Some(slot);
+        }
         if profile {
             gpu.drain(encoder)?;
             self.report_gpu_profile(&gpu);
         }
         Ok(())
+    }
+
+    /// Stage the exact raw embedding row for a prepared sparse decode step.
+    /// The caller must first wait for the preceding command buffer that wrote
+    /// this slot's predicted token ID.
+    pub fn stage_pipelined_embedding_row(
+        &mut self,
+        encoder: &mut MetalEncoder,
+        slot: usize,
+    ) -> Result<(), ModelError> {
+        let slot = slot % 2;
+        if !self.sparse_embedding || self.pending_sparse_embedding_slot.is_none() {
+            return Ok(());
+        }
+        if self.pending_sparse_embedding_slot != Some(slot)
+            || self.scratch.active_slot % 2 != slot
+        {
+            return Err(ModelError::InvalidInput(
+                "no matching sparse decode row is pending".to_string(),
+            ));
+        }
+        let embedding = self.embedding_buffer.as_ref().ok_or_else(|| {
+            ModelError::InvalidConfig("sparse embedding source is absent".to_string())
+        })?;
+        gather_embedding_rows(
+            embedding,
+            self.embedding_offset,
+            self.scratch.active_token_ids(1),
+            &self.scratch.embedding_rows,
+            1,
+            self.hidden_size,
+            self.vocab_size,
+        )?;
+        encoder.mark_deferred_inputs_staged()?;
+        self.pending_sparse_embedding_slot = None;
+        Ok(())
+    }
+
+    /// Discard a prepared sparse row when the preceding step produced EOS.
+    pub fn discard_pipelined_embedding_row(&mut self, slot: usize) -> Result<(), ModelError> {
+        let slot = slot % 2;
+        if !self.sparse_embedding || self.pending_sparse_embedding_slot.is_none() {
+            return Ok(());
+        }
+        if self.pending_sparse_embedding_slot != Some(slot) {
+            return Err(ModelError::InvalidInput(
+                "no matching sparse decode row is pending".to_string(),
+            ));
+        }
+        self.pending_sparse_embedding_slot = None;
+        Ok(())
+    }
+
+    /// Whether the most recent sparse pipelined step is waiting for its host
+    /// row copy and must remain unsubmitted.
+    pub fn pipelined_embedding_row_pending(&self) -> bool {
+        self.pending_sparse_embedding_slot.is_some()
     }
 
     pub fn read_host_token(&self, step_idx: usize) -> u32 {
@@ -4778,6 +4857,7 @@ impl TextModel {
                 pick,
                 None,
                 false,
+                false,
             )
         } else {
             // Only the last chunk's logits survive this loop, so only the last
@@ -4801,6 +4881,7 @@ impl TextModel {
                         last,
                         pick,
                         None,
+                        false,
                         false,
                     ) {
                     // Report what ran before the failure rather than throwing
@@ -4858,7 +4939,7 @@ impl TextModel {
         out: Option<HeadOut<'_>>,
     ) -> Result<(), ModelError> {
         self.forward_chunk_pick(
-            token_ids, positions, encoder, gpu, run_head, Some(pick), out, false,
+            token_ids, positions, encoder, gpu, run_head, Some(pick), out, false, false,
         )
     }
 
@@ -4875,6 +4956,7 @@ impl TextModel {
         pick: Option<HeadPick>,
         out: Option<HeadOut<'_>>,
         encoder_already_drained: bool,
+        defer_sparse_embedding: bool,
     ) -> Result<(), ModelError> {
         if token_ids.len() != positions.len() || token_ids.is_empty() {
             return Err(ModelError::InvalidInput(
@@ -4985,7 +5067,7 @@ impl TextModel {
             }
         }
 
-        if self.sparse_embedding {
+        if self.sparse_embedding && !defer_sparse_embedding {
             if !queue_drained {
                 encoder.flush_and_wait_queue()?;
             }
@@ -5839,6 +5921,7 @@ impl TextModel {
     }
 
     pub fn reset_gpu_caches(&mut self) {
+        self.pending_sparse_embedding_slot = None;
         for layer in &mut self.layers {
             layer.gpu_cache.reset();
         }
@@ -5987,6 +6070,7 @@ impl TextModel {
     }
 
     pub fn reset_caches(&mut self) -> Result<(), ModelError> {
+        self.pending_sparse_embedding_slot = None;
         for layer in &mut self.layers {
             layer.reset_cache()?;
         }

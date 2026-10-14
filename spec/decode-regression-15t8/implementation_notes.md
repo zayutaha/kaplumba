@@ -78,3 +78,26 @@
   `mark_deferred_inputs_staged()`. T3's model row staging calls this only after
   the raw mmap row copy succeeds. Empty cache-growth barriers remain legal;
   they preserve deferred mode and still do not submit model dispatches.
+
+## 2026-10-14 — T3 sparse row preparation split
+
+- `forward_step_pipelined` no longer drains the queue for the unknown-token
+  sparse steady-state step. It encodes the forward against `embedding_rows` in
+  deferred-submission mode, records the active slot as pending, and returns.
+  Known-token first steps and diagnostic modes that flush within the forward
+  retain the synchronous stage path. Prefill and non-pipelined calls retain the
+  existing gather behavior.
+- Added `stage_pipelined_embedding_row(encoder, slot)`: after the caller waits
+  for the prior prediction, it gathers raw mmap bytes for the active decode
+  slot and marks encoder shared inputs ready. Added explicit discard for EOS and
+  pending state validation. Resetting KV cache clears pending row state.
+- Retained the single bounded row buffer. Because the prepared encoder cannot
+  submit before staging, the prior GPU read finishes before the host overwrites
+  the buffer. `encoder.defer_submissions()` is not disabled by the empty queue
+  wait on the sliding-KV growth path.
+- `cargo check -p kaplumba-engine` passed. `cargo test -p kaplumba-engine --lib`
+  passed 145, ignored 2 (requires `KAPLUMBA_TEST_MODEL`).
+- Negative control: changed gather selection from `id` to `id ^ 1`; the
+  BF16/FP16 kernel comparison failed at
+  `model::sparse_embedding_tests::gathered_embedding_kernel_is_bit_identical_for_bf16_and_fp16`
+  with `bf16=false`; restored the correct index.

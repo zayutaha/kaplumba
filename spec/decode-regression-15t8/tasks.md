@@ -27,14 +27,18 @@
   `NotEnqueued`). A 64-buffer cap test stalled in Metal command-buffer creation;
   reduced the explicit bound to 32, and the 32-buffer overflow case passed.
   Completed `2026-10-14`; implementation commits `87630f7`, `5c9bc02`, and
-  T2c readiness guard.
-- [ ] **T3 — separate sparse row staging from forward encoding.** Files:
+  `c4417c9` readiness guard.
+- [x] **T3 — separate sparse row staging from forward encoding.** Files:
   `crates/engine/src/model.rs` and focused model tests. Remove unconditional
   steady-state drains, encode sparse pipelined work against bounded row scratch,
   and expose post-wait exact-row staging. Keep prefill/synchronous staging and
   KV growth barriers. Test exact BF16/FP16 bits, offset, duplicate/boundary IDs,
-  slot identity, invalid IDs, and staging-before-submit ordering; sabotage row
-  selection and require a named failure. Run engine library tests.
+  slot identity, invalid IDs, and staging-before-submit ordering. Full engine
+  library suite passed 145/145 (2 fixture-dependent ignored). Deliberately
+  changed the selected row index; the exact BF16/FP16 equality test failed with
+  named assertion `bf16=false`, then the sabotage was reverted. `cargo check
+  -p kaplumba-engine` passed. Completed `2026-10-14`; commit hash will be
+  recorded in this entry.
 - [ ] **T4 — integrate stage-then-submit in chat and CLI generation.** Files:
   `crates/engine/src/chat.rs`, `crates/engine/src/generate.rs`, and relevant
   pipeline tests. Encode next step while prior GPU work runs; after prior wait,
