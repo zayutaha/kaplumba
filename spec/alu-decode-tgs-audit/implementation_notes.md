@@ -507,3 +507,10 @@ T4 changes and limitations: scalar path passes raw FP32 identity against the
 old 64-bit implementation and the repo suite. It does not yet show full Gxma
 greedy/sampled token identity, tg/s, context-length scaling, useful GB/s, or
 250 GB/s acceptance; those require later baseline and end-to-end tasks.
+
+Final merged-branch rerun after fast-forwarding T3/T4:
+`scripts/gpuq try -- env CARGO_TARGET_DIR=/tmp/kaplumba-alu-final-target cargo test -p kaplumba-engine --test fused_bit_exact -- --nocapture`
+passed **4/4**, 35.02 s. This directly compiled the committed branch state;
+the test output exercised `fused2_matches_two_independent_encodes`,
+`fused2_matches_dual_independent_encodes_with_stride_x`,
+`fused3_matches_three_independent_encodes`, and the fail-first comparison test.
