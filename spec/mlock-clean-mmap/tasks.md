@@ -126,13 +126,23 @@ not a completed paging fix; all subsequent implementation remains unchecked.
   `2026-10-14`: weight tests 23 passed/1 ignored; whole-shard sabotage failed
   65,536 vs 16,384 bytes. All 160 real greedy IDs identical; sampled wire peak
   17.917 GiB and no new Swapouts on this run. Implementation commit `182006e`.
-- [ ] **T5g — stage sparse raw embeddings for ordinary chat.**
+- [x] **T5g — stage sparse raw embeddings for ordinary chat.**
   Files: `crates/engine/src/model.rs`, `crates/engine/src/weights.rs`, focused
   embedding/residency tests and notes. Add bounded raw-row staging,
   cross-encoder completion before CPU token/read/write, identity row IDs,
   existing GPU conversion/scaling and a full-table A/B control. Sparse mode must
   omit the full embedding view from the existing Metal residency set while
   preserving its mmap and lock; all packed hot-weight views remain registered.
+  Completed `2026-10-14`, implementation commit `692652c`. BF16/FP16 Metal
+  embedding outputs were bit-identical; invalid IDs and short buffers were
+  rejected without staging mutation. Row-zero sabotage failed exact equality;
+  residency-filter sabotage failed 3-versus-2 allocation count. Full engine
+  library suite: 145 passed, 2 ignored. Release Gxma-repacked decode generated
+  160/160 baseline-identical IDs at 12.334 tok/s; all 12,046,221,312 eligible
+  bytes reported locked. Swap usage remained 1,987.81 MiB and sampled Swapouts
+  remained 183,276,527. One active `top` sample showed 15 GiB wired and 90 MiB
+  unused; after process exit wired memory returned to 3.9 GiB. This is not the
+  multi-context Activity Monitor acceptance in T4/T5d.
   Test BF16/FP16 exact bits, nonzero source offsets, duplicate/boundary IDs,
   invalid IDs, short buffers and real pipelined generation. Sabotage row selection
   or offset handling; verify failing diagnostics. Record output equality,

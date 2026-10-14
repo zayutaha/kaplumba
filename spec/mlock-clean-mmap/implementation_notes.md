@@ -878,3 +878,49 @@ mode. Its source mmap and current POSIX lock remain alive; packed hot-weight
 views and arena allocations stay registered. The full-table diagnostic retains
 its prior registration. This is a correction to membership in the existing set,
 not a new residency policy. No code has been changed for T5g yet.
+
+## T5g — sparse ordinary-chat embedding staging
+
+`692652c` adds a `max_tokens × hidden × 2` shared scratch buffer and gathers
+only the active BF16/FP16 checkpoint rows from the still-mapped source. The GPU
+embedding kernel remains the numerical conversion/scaling path; row IDs are
+rewritten to the gathered table's identity indices. Ordinary checkpoint chat
+waits for prior queue work before reusing ping-pong token/position buffers or
+reading GPU-produced token IDs. `KAPLUMBA_FULL_EMBEDDING=1` retains full-table
+binding and residency as a diagnostic control. `TextWeights` excludes only the
+full embedding view from the sparse path's existing residency set; the source
+mapping and page locks, arena allocations and packed hot views remain held.
+Small constructed models retain the old full-table path.
+
+Verification on 2026-10-14:
+
+- `cargo check -p kaplumba-engine` passed.
+- `cargo test -p kaplumba-engine sparse_embedding_tests --lib`: 2 passed. Both
+  BF16 and FP16 output buffers from the existing Metal kernel matched full-table
+  output bit-for-bit with a nonzero source offset, duplicate IDs and boundary
+  vocabulary rows. Invalid IDs, short source and arithmetic overflow were
+  rejected; invalid input did not change IDs or destination bytes.
+- `cargo test -p kaplumba-engine weights::tests::sparse_residency_filter_excludes_only_the_selected_view --lib` passed.
+- The row-selection sabotage (force every source row to row 0) failed the Metal
+  equality assertion (`bf16=false`) with distinct output vectors. Restored and
+  rerun: pass.
+- The residency sabotage (include excluded views) failed with `left: 3, right: 2`.
+  Restored and rerun: pass.
+- `cargo test -p kaplumba-engine --lib`: 145 passed, 2 ignored (both require
+  `KAPLUMBA_TEST_MODEL`). Release build: `cargo build --release -p kaplumba-cli`.
+- Real Gxma-repacked request, same 39-token prompt and 160 greedy tokens as the
+  baseline. Saved run: `/tmp/kaplumba-decode-paging/t5g-generation.log`.
+  All 160 token IDs exactly equal `/tmp/kaplumba-decode-paging/baseline-generation.log`.
+  Load 1,043 ms, TTFT 1,331 ms, prefill 29.31 tok/s, decode 12.334 tok/s,
+  `peak_resident_pages_bytes` 12,764,135,424. Loader summary reported all
+  12,046,221,312 eligible bytes locked and zero failed/evictable bytes. A second
+  unsaved 160-token sample decoded at 12.116 tok/s; do not treat the difference
+  from the 12.439 tok/s baseline as an A/B result.
+- During the saved run, `top` sampled 15 GiB wired, 2,554 MiB compressor and
+  90 MiB unused; system swap stayed 1,987.81 MiB. Sampled `Swapouts` remained
+  183,276,527 during and after the run. After process exit, `top` showed 3.9 GiB
+  wired. This is a successful no-new-swap sample, not proof of Activity Monitor
+  staying green or of 1k/2k/8k and repeated-turn acceptance. T5d remains open.
+
+The test suite emitted pre-existing compiler warnings in kernels/engine; no new
+warning was introduced by the sparse staging or residency filter.
